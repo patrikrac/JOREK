@@ -58,7 +58,7 @@ module matio_module
     use phys_module, only: n_tor, n_var
     integer :: rank, ng, nl, nt, nv, nd, nnz, ierr
     integer(HID_T) fid
-    CHARACTER(LEN=10)                                    :: fname
+    CHARACTER(LEN=13)                                    :: fname
     integer, dimension(:), pointer                       :: irn, jcn
     real(kind=c_double), dimension(:), pointer           :: val
     integer, dimension(:), pointer, optional             :: l2g

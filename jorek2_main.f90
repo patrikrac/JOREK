@@ -86,6 +86,9 @@ program JOREK2
 #ifdef USE_CATALYST
   use mod_catalyst_adaptor
 #endif
+#ifdef SAVEMATRIX
+  use matio_module, only: save_mat_h5
+#endif
 
   use, intrinsic :: iso_c_binding
   use, intrinsic :: iso_fortran_env, only : stdin=>input_unit, &
@@ -181,6 +184,8 @@ program JOREK2
   type(type_SP_MATRIX)        :: a_mat
   type(type_RHS)              :: rhs_vec, deltas
   type(type_SP_SOLVER)        :: solver
+
+  character(len=13)        :: fname
  
   call init_expr()
   allocate(res(exprs_all_int%n_expr+1))
@@ -720,6 +725,15 @@ write(*,*) "n elements:", element_list%n_elements
   
     call clck_time_barrier(t1); call clck_ldiff(t0,t1,tsecond)
     if (my_id.eq.0) write(*,FMT_TIMING) my_id, '# Elapsed time in construct global matrix :',tsecond
+
+#ifdef SAVEMATRIX
+
+  write(fname,'(A5,I2.2,A1,I2.2, A3)') "matA_",my_id,"_",index_now,".h5"
+  call save_mat_h5(fname, a_mat%ng, a_mat%ng, a_mat%nnz, &
+                        a_mat%irn, a_mat%jcn, a_mat%val, rhs=rhs_vec%val, &
+                        ind_min=a_mat%index_min(my_id+1),ind_max=a_mat%index_max(my_id+1), &
+                        block_size=a_mat%block_size)
+#endif
       
     solver%tstep = tstep
     solver%istep = istep
