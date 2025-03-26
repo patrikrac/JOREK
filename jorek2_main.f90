@@ -185,7 +185,7 @@ program JOREK2
   type(type_RHS)              :: rhs_vec, deltas
   type(type_SP_SOLVER)        :: solver
 
-  character(len=13)        :: fname
+  character(len=15)        :: fname
  
   call init_expr()
   allocate(res(exprs_all_int%n_expr+1))
@@ -728,7 +728,7 @@ write(*,*) "n elements:", element_list%n_elements
 
 #ifdef SAVEMATRIX
 
-  write(fname,'(A5,I2.2,A1,I2.2, A3)') "matA_",my_id,"_",index_now,".h5"
+  write(fname,'(A5,I2.2,A1,I4.4, A3)') "matA_",my_id,"_",index_now,".h5"
   call save_mat_h5(fname, a_mat%ng, a_mat%ng, a_mat%nnz, &
                         a_mat%irn, a_mat%jcn, a_mat%val, rhs=rhs_vec%val, &
                         ind_min=a_mat%index_min(my_id+1),ind_max=a_mat%index_max(my_id+1), &
