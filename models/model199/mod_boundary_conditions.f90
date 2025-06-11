@@ -112,7 +112,7 @@ contains
                              index_node = node_list%node(inode)%index(index_tmp)
                              call boundary_conditions_add_one_entry(                 &
                                     index_node, k, in, index_node, k, in,            &
-                                    zbig, index_min, index_max, a_mat)
+                                    zbig, index_min, index_max, a_mat, my_id)
                            enddo
                          enddo
 
@@ -135,7 +135,7 @@ contains
                              index_node = node_list%node(inode)%index(index_tmp)
                              call boundary_conditions_add_one_entry(                 &
                                     index_node, k, in, index_node, k, in,            &
-                                    zbig, index_min, index_max, a_mat)
+                                    zbig, index_min, index_max, a_mat, my_id)
                            enddo
                          enddo
 
