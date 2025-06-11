@@ -23,7 +23,7 @@ contains
   subroutine boundary_conditions_add_one_entry( &
        &   index_node,  k,  in,                 &
        &   index_node2, k2, in2,                &
-       &   zbig, index_min, index_max, a_mat)
+       &   zbig, index_min, index_max, a_mat, my_id)
     use mod_parameters
     use mod_locate_irn_jcn
     use mod_integer_types
@@ -40,6 +40,7 @@ contains
     logical                                           :: is_local
     integer(kind=int_all)                             :: ija_position, ilarge_vp
     integer                                           :: n_tor_local
+        integer,                            intent(in)    :: my_id
 
     if ( (k==0) .or. (k2==0) ) return ! ignore calls for model family extensions not in use (variable number zero)
 
@@ -52,20 +53,24 @@ contains
        ilarge_vp  = ijA_position  - 1 + ((k-1)*n_tor_local + in-a_mat%i_tor_min ) * n_var*n_tor_local + (k2-1)*n_tor_local + in2&
                     -a_mat%i_tor_min + 1 
                                
-      
+      if (my_id == 0) then
          write(*,*) "Values before B.C. :", &
          & "irn=", a_mat%irn(ilarge_vp), &
          & "jcn=", a_mat%jcn(ilarge_vp), &
          & "val=", a_mat%val(ilarge_vp)    
+      endif
 
        a_mat%irn(ilarge_vp) =  n_tor_local * n_var * (index_node -1) + (k -1)*n_tor_local + in - a_mat%i_tor_min + 1
        a_mat%jcn(ilarge_vp) =  n_tor_local * n_var * (index_node2-1) + (k2-1)*n_tor_local + in2 - a_mat%i_tor_min + 1
 
-         write(*,*) "Adding boundary contition entry to matrix: ", &
-         & "irn=", a_mat%irn(ilarge_vp), &
-         & "jcn=", a_mat%jcn(ilarge_vp)
-
        a_mat%val(ilarge_vp) = ZBIG
+
+         if (my_id == 0) then
+            write(*,*) "Values after B.C. :", &
+            & "irn=", a_mat%irn(ilarge_vp), &
+            & "jcn=", a_mat%jcn(ilarge_vp), &
+            & "val=", a_mat%val(ilarge_vp)
+         endif
     endif
   end subroutine boundary_conditions_add_one_entry
 
