@@ -98,6 +98,8 @@ module phys_module
   logical :: Mach1_fix_B          !< Full-MHD: Use the initial magnetic field for Mach1 BCs on targets, ie. without AR and AZ variations
   logical :: export_polar_boundary !< Option to export boundary.txt even in the case of a polar boundary.
 
+  real*8  :: eps_noise         !< Tolerance for noise reduction
+
   ! --- RESISTIVITY SWITCHES FOR AR AND AZ EQUATIONS
   ! --- 1.
   ! --- Default set-up is eta_ARAZ_on = .true.

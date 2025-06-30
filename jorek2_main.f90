@@ -90,6 +90,10 @@ program JOREK2
   use matio_module, only: save_mat_h5
 #endif
 
+#ifdef NOISE_REDUCTION
+  use mod_reduce_noise, only: reduce_noise
+#endif
+
   use, intrinsic :: iso_c_binding
   use, intrinsic :: iso_fortran_env, only : stdin=>input_unit, &
                                             stdout=>output_unit, &
@@ -722,6 +726,10 @@ write(*,*) "n elements:", element_list%n_elements
     !--------- Constructing Global Matrix
     mhd_sim%es => es ! assign pointer to the equilibrium state
     call construct_matrix(mhd_sim, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat, rhs_vec, harmonic_matrix=.false.)
+
+#ifdef NOISE_REDUCTION
+    call reduce_noise(a_mat, eps_noise)
+#endif
   
     call clck_time_barrier(t1); call clck_ldiff(t0,t1,tsecond)
     if (my_id.eq.0) write(*,FMT_TIMING) my_id, '# Elapsed time in construct global matrix :',tsecond

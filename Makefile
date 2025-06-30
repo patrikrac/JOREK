@@ -94,7 +94,8 @@ DIRS := diagnostics				\
 	core					\
 	core/tests                      	\
 	.					\
-	vacuum
+	vacuum				\
+	numerics
 
 DIRS+=$(EXTRA_DIRS) # Specified in Makefile.inc or commandline
 

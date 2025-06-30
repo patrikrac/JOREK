@@ -872,5 +872,6 @@ Z_valve2      = 0.d0
 use_manual_random_seed = .false.
 manual_seed = 498932990          !< chosen arbitarily
 
+eps_noise = 0.0d0
 
 end subroutine preset_parameters
