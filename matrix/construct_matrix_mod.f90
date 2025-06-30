@@ -660,7 +660,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
           if ((index_node1 .ge. my_ind_min) .and. (index_node1 .le. my_ind_max)) then
 
-            if (interior) then
+            !if (interior) then
               do j = 1, n_var * n_tor_local
 
                 index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
@@ -669,7 +669,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
                 rhs_local(index_large_i+j) = rhs_local(index_large_i+j) + thread_struct(omp_tid)%RHS(index_ij) 
                 !$omp end atomic
               enddo
-            endif
+            !endif
 
             do k=1,n_vertex_max
 
@@ -705,16 +705,18 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
                 enddo ! n_var * n_tor_local
 
-                if (interior) then 
+                !if (interior) then 
                   !$omp critical
                   a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
                     a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
                     thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
                   !$omp end critical 
-                else if(inode1 == knode) then
-                  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) + 1.d0
-                endif
+                !else if(inode1 == knode) then
+                !  !$omp critical
+                !  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+                !    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) + 1.d0
+                !  !$omp end critical 
+                !endif
 
               enddo ! n_degrees
             enddo ! n_vertex_max
@@ -741,9 +743,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   call tr_vnorms("cm_A_bef_bc", a_mat%val, a_mat%nnz)
   
   ! --- Apply boundary conditions.
-  ! call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
-  !                          my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
-  !                          psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
+   call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
+                            my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
+                            psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
 
   if (fix_axis_nodes) then
     call fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, my_ind_min, my_ind_max, a_mat)
