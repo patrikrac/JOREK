@@ -342,6 +342,8 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   integer                           :: i_v(n_var)
   integer, allocatable              :: i_harm(:)
   integer                           :: comm, ierr, counts
+
+  logical :: interior
   
   ! --- Timing call
   call r3_info_begin (r3_info_index_0, 'construct_matrix')
@@ -452,7 +454,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   !$omp           i_father,element_father, inode_father, node_out, ivertex, iorder,          &
   !$omp           ivar, itor, jvertex, jorder, jvar, jtor, random_element, n_var_reduced, v1, v2, im,      &
   !$omp           index_ij_model400_e, index_kl_model400_e,  tmp_rhs, tmp_elm, tmp_elm_v2_8,    &
-  !$omp           i_v, i_harm                                                                              ) &
+  !$omp           i_v, i_harm, interior                                                                     ) &
   !$omp  firstprivate(nodes, aux_nodes, nodes_father)
 
 ! --- omp id
@@ -644,7 +646,11 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     
       do i=1,n_vertex_max
 
+        interior = .true.
+        
         inode1 = node_out(i)
+
+        if (node_list%node(inode1)%boundary .eq. 2) interior = .false.
 
         do i_order = 1, n_degrees
 
@@ -654,18 +660,22 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
           if ((index_node1 .ge. my_ind_min) .and. (index_node1 .le. my_ind_max)) then
 
-            do j = 1, n_var * n_tor_local
+            if (interior) then
+              do j = 1, n_var * n_tor_local
 
-              index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
-             
-              !$omp atomic
-              rhs_local(index_large_i+j) = rhs_local(index_large_i+j) + thread_struct(omp_tid)%RHS(index_ij) 
-              !$omp end atomic
-            enddo
+                index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
+              
+                !$omp atomic
+                rhs_local(index_large_i+j) = rhs_local(index_large_i+j) + thread_struct(omp_tid)%RHS(index_ij) 
+                !$omp end atomic
+              enddo
+            endif
 
             do k=1,n_vertex_max
 
               knode = node_out(k)
+
+              if (node_list%node(knode)%boundary .eq. 2) interior = .false.
 
               do k_order = 1, n_degrees
 
@@ -695,11 +705,16 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
                 enddo ! n_var * n_tor_local
 
-                !$omp critical
-                a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-                  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
-                  thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                !$omp end critical 
+                if (interior) then 
+                  !$omp critical
+                  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+                    thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+                  !$omp end critical 
+                else if(inode1 == knode) then
+                  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) + 1.d0
+                endif
 
               enddo ! n_degrees
             enddo ! n_vertex_max
@@ -726,9 +741,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   call tr_vnorms("cm_A_bef_bc", a_mat%val, a_mat%nnz)
   
   ! --- Apply boundary conditions.
-  call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
-                           my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
-                           psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
+  ! call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
+  !                          my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
+  !                          psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
 
   if (fix_axis_nodes) then
     call fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, my_ind_min, my_ind_max, a_mat)
