@@ -656,6 +656,8 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     enddo
     elm_diagonal_average = elm_diagonal_average / (n_vertex_max * n_degrees * n_var * n_tor_local)
 
+    write(*,*) "elm_diagonal_average = ", elm_diagonal_average
+
     ! --- We only look at non-refined elements
     if ((.not. refinement) .or. (refinement .and. (element%n_sons .eq. 0))) then
     
