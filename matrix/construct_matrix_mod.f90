@@ -764,6 +764,12 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
                     !$omp critical
                     a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = 0.d0
                     !$omp end critical
+                  else
+                    !$omp critical
+                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+                      a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+                      thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+                    !$omp end critical
                   endif
                 endif  
 
