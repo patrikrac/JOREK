@@ -655,6 +655,8 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
       enddo 
     enddo
     elm_diagonal_average = elm_diagonal_average / (n_vertex_max * n_degrees * n_var * n_tor_local)
+    elm_diagonal_average = max(elm_diagonal_average, 1.d-15)  ! Avoid division by zero
+    elm_diagonal_average = min(elm_diagonal_average, 1.d15)  ! Avoid too large values
 
     write(*,*) "elm_diagonal_average = ", elm_diagonal_average
 
