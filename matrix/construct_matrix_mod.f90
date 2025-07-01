@@ -650,7 +650,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
       do i_order = 1, n_degrees
           do j = 1, n_var * n_tor_local
             index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
-            elm_diagonal_average = elm_diagonal_average + thread_struct(omp_tid)%ELM(index_ij,index_ij)
+            elm_diagonal_average = elm_diagonal_average + abs(thread_struct(omp_tid)%ELM(index_ij,index_ij))  
           enddo
       enddo 
     enddo
