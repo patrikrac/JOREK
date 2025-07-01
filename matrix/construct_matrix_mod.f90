@@ -455,7 +455,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   !$omp           i_father,element_father, inode_father, node_out, ivertex, iorder,          &
   !$omp           ivar, itor, jvertex, jorder, jvar, jtor, random_element, n_var_reduced, v1, v2, im,      &
   !$omp           index_ij_model400_e, index_kl_model400_e,  tmp_rhs, tmp_elm, tmp_elm_v2_8,    &
-  !$omp           i_v, i_harm, interior                                                                     ) &
+  !$omp           i_v, i_harm, interior, elm_diagonal_average                                            ) &
   !$omp  firstprivate(nodes, aux_nodes, nodes_father)
 
 ! --- omp id
