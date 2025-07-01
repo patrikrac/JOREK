@@ -344,6 +344,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   integer                           :: comm, ierr, counts
 
   logical :: interior
+  real*8 :: elm_diagonal_average
   
   ! --- Timing call
   call r3_info_begin (r3_info_index_0, 'construct_matrix')
@@ -641,6 +642,20 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
       enddo 
     endif
 
+    ! -- Compute the average diagonal value of the element matrix
+    ! --- This should give an estimate of a reasonable value for the diagonal entries
+    ! TODO: Might be improved 
+    elm_diagonal_average = 0.d0
+    do i = 1, n_vertex_max
+      do i_order = 1, n_degrees
+          do j = 1, n_var * n_tor_local
+            index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
+            elm_diagonal_average = elm_diagonal_average + thread_struct(omp_tid)%ELM(index_ij,index_ij)
+          enddo
+      enddo 
+    enddo
+    elm_diagonal_average = elm_diagonal_average / (n_vertex_max * n_degrees * n_var * n_tor_local)
+
     ! --- We only look at non-refined elements
     if ((.not. refinement) .or. (refinement .and. (element%n_sons .eq. 0))) then
     
@@ -667,8 +682,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
               do j = 1, n_var * n_tor_local
 
                 index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
-
+                !$omp critical
                 rhs_local(index_large_i+j) = 0.d0
+                !$omp end critical
               enddo
             else
               do j = 1, n_var * n_tor_local
@@ -719,29 +735,33 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
                  ! a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
                  !   a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
                  !   thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                 ! !$omp end critical 
-
-
-                if ((.not. interior) .and. ((i_order .eq. 1 .and. k_order .eq. 1) .or. (i_order .eq. 3 .and. k_order .eq. 3)) .and. (i .eq. k)) then
-                  !$omp critical
-                  do j = 1, n_var * n_tor_local
-                    do l = 1, n_var * n_tor_local
-                      ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
-                      if (j .eq. l) then
-                        a_mat%val(ilarge2) = 1.d0
-                      else
-                         a_mat%val(ilarge2) = 0.d0
-                      endif
-                    enddo
-                  enddo
-                  !$omp end critical
-                else
+                 ! !$omp end critical
+                if (interior) then
                   !$omp critical
                   a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
                     a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
                     thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                  !$omp end critical 
-                endif   
+                  !$omp end critical
+                else 
+                  if (((i_order .eq. 1 .and. k_order .eq. 1) .or. (i_order .eq. 3 .and. k_order .eq. 3)) .and. (i .eq. k)) then
+                    !$omp critical
+                    do j = 1, n_var * n_tor_local
+                      do l = 1, n_var * n_tor_local
+                        ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
+                        if (j .eq. l) then
+                          a_mat%val(ilarge2) = elm_diagonal_average
+                        else
+                           a_mat%val(ilarge2) = 0.d0
+                        endif
+                      enddo
+                    enddo
+                    !$omp end critical
+                  else if (i_order .eq. 1 .or. k_order .eq. 1 .or. i_order .eq. 3 .or. k_order .eq. 3) then
+                    !$omp critical
+                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = 0.d0
+                    !$omp end critical
+                  endif
+                endif  
 
               enddo ! n_degrees
             enddo ! n_vertex_max
