@@ -131,7 +131,9 @@ contains
                            if ( (iv_dir .eq. 3) .and. (kk .gt. 1) ) cycle ! do only t-derivatives and node value
                            do ll = 1,(n_order+1)/2
                              if ( (iv_dir .eq. 2) .and. (ll .gt. 1) ) cycle ! do only s-derivatives and node value
+                             !write(*,*) "Setting B.C."
                              index_tmp = node_indices(kk,ll)
+                             !write(*,*) "index_tmp = ", index_tmp
                              index_node = node_list%node(inode)%index(index_tmp)
                              call boundary_conditions_add_one_entry(                 &
                                     index_node, k, in, index_node, k, in,            &

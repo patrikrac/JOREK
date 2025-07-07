@@ -345,6 +345,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
   logical :: interior
   real*8 :: elm_diagonal_average
+  real*8 :: elm_average
+  real*8 :: amat_diagonal_average
+  integer :: nnz_counter
   
   ! --- Timing call
   call r3_info_begin (r3_info_index_0, 'construct_matrix')
@@ -455,9 +458,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   !$omp           i_father,element_father, inode_father, node_out, ivertex, iorder,          &
   !$omp           ivar, itor, jvertex, jorder, jvar, jtor, random_element, n_var_reduced, v1, v2, im,      &
   !$omp           index_ij_model400_e, index_kl_model400_e,  tmp_rhs, tmp_elm, tmp_elm_v2_8,    &
-  !$omp           i_v, i_harm, interior, elm_diagonal_average                                            ) &
-  !$omp  firstprivate(nodes, aux_nodes, nodes_father)
-
+  !$omp           i_v, i_harm, interior, elm_diagonal_average, elm_average, nnz_counter                                           ) &
+  !$omp  firstprivate(nodes, aux_nodes, nodes_father) reduction(+:amat_diagonal_average)
+amat_diagonal_average = 0.d0
 ! --- omp id
 #ifdef _OPENMP
   omp_nthreads = omp_get_num_threads()
@@ -645,20 +648,42 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     ! -- Compute the average diagonal value of the element matrix
     ! --- This should give an estimate of a reasonable value for the diagonal entries
     ! TODO: Might be improved 
-    elm_diagonal_average = 0.d0
+    !elm_diagonal_average = 0.d0
+    nnz_counter = 0
     do i = 1, n_vertex_max
       do i_order = 1, n_degrees
           do j = 1, n_var * n_tor_local
             index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
-            elm_diagonal_average = elm_diagonal_average + abs(thread_struct(omp_tid)%ELM(index_ij,index_ij))  
+            if (abs(thread_struct(omp_tid)%ELM(index_ij,index_ij)) .ne. 0) nnz_counter = nnz_counter + 1
+            elm_diagonal_average = elm_diagonal_average + abs(thread_struct(omp_tid)%ELM(index_ij,index_ij)) 
           enddo
       enddo 
     enddo
-    elm_diagonal_average = elm_diagonal_average / (n_vertex_max * n_degrees * n_var * n_tor_local)
-    elm_diagonal_average = max(elm_diagonal_average, 1.d-15)  ! Avoid division by zero
-    elm_diagonal_average = min(elm_diagonal_average, 1.d15)  ! Avoid too large values
-  
-    write(*,*) "elm_diagonal_average = ", elm_diagonal_average
+    !elm_diagonal_average = elm_diagonal_average / (n_vertex_max * n_degrees * n_var * n_tor_local)
+    !elm_diagonal_average = max(elm_diagonal_average, 1.d0)  ! Avoid division by zero
+    !elm_diagonal_average = min(elm_diagonal_average, 1.d15)  ! Avoid too large values
+    elm_diagonal_average = elm_diagonal_average + elm_diagonal_average  / nnz_counter 
+    
+    !write(*,*) "elm_diagonal_average = ", elm_diagonal_average
+    nnz_counter = 0
+    do i = 1, n_vertex_max
+      do i_order = 1, n_degrees
+        do k=1,n_vertex_max
+          do k_order = 1, n_degrees
+            do j = 1, n_var * n_tor_local
+              index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
+              do l = 1, n_var * n_tor_local
+                index_kl = n_tor_local * n_var * n_degrees * (k-1) +  n_tor_local * n_var * (k_order-1) + l
+                if (abs(thread_struct(omp_tid)%ELM(index_ij,index_kl)) .ne. 0) nnz_counter = nnz_counter + 1
+                elm_average = elm_average + abs(thread_struct(omp_tid)%ELM(index_ij,index_kl))
+              enddo 
+            enddo
+          enddo
+        enddo
+      enddo
+    enddo
+    
+    elm_average = elm_average + elm_average  / nnz_counter    
 
     ! --- We only look at non-refined elements
     if ((.not. refinement) .or. (refinement .and. (element%n_sons .eq. 0))) then
@@ -671,7 +696,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
         if (node_list%node(inode1)%boundary .ne. 0) then
           interior = .false.
-          write(*,*) "Boundary element found, type=", node_list%node(inode1)%boundary
+          !write(*,*) "Boundary element found, type=", node_list%node(inode1)%boundary
         endif
 
         do i_order = 1, n_degrees
@@ -684,7 +709,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
             if ((.not. interior) .and. (i_order .eq. 1 .or. i_order .eq. 3)) then
               do j = 1, n_var * n_tor_local
-
+            
                 index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
                 !$omp critical
                 rhs_local(index_large_i+j) = 0.d0
@@ -716,6 +741,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
                 call locate_irn_jcn(index_node1,index_node2,my_ind_min,my_ind_max,ijA_position,a_mat)
 
                 thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local) = 0.d0
+                
                 do j = 1, n_var * n_tor_local
                   index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
 
@@ -727,19 +753,21 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
                     a_mat%irn(ilarge2) = index_large_i	+ j
                     a_mat%jcn(ilarge2) = index_large_k	+ l
+                    
+                    if(a_mat%irn(ilarge2) .eq. a_mat%jcn(ilarge2)) amat_diagonal_average = amat_diagonal_average + abs(thread_struct(omp_tid)%ELM(index_ij,index_kl))
 
                     thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) = &
                       thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) + thread_struct(omp_tid)%ELM(index_ij,index_kl)
-                     
                   enddo ! n_var * n_tor_local
 
                 enddo ! n_var * n_tor_local
- 
-                 ! !$omp critical
-                 ! a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-                 !   a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
-                 !   thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                 ! !$omp end critical
+                 
+   !               !$omp critical
+   !               a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+   !                 a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+   !                 thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+   !               !$omp end critical
+  
                 if (interior) then
                   !$omp critical
                   a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
@@ -748,12 +776,14 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
                   !$omp end critical
                 else 
                   if (((i_order .eq. 1 .and. k_order .eq. 1) .or. (i_order .eq. 3 .and. k_order .eq. 3)) .and. (i .eq. k)) then
+                    !write(*,*) "elm_diagonal_average = ", elm_diagonal_average
                     !$omp critical
                     do j = 1, n_var * n_tor_local
                       do l = 1, n_var * n_tor_local
                         ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
                         if (j .eq. l) then
-                          a_mat%val(ilarge2) = elm_diagonal_average
+                          !a_mat%val(ilarge2) = 1.d8
+                          a_mat%val(ilarge2) = a_mat%val(ilarge2) + 1.d12
                         else
                            a_mat%val(ilarge2) = 0.d0
                         endif
@@ -792,8 +822,18 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     call dealloc_node(nodes(iv))
     call dealloc_node(aux_nodes(iv))
   enddo
+
+  !write(*,*) "elm_diagonal_average = ", elm_diagonal_average
+  !write(*,*) "elm_average = ", elm_average
   !$omp end parallel
- 
+  n_tor_local = a_mat%i_tor_max - a_mat%i_tor_min + 1
+  write(*,*) "amat_diagonal_average = ", amat_diagonal_average
+  write(*,*) "Factor = ", real(n_local_elms*n_vertex_max*n_degrees*n_var * n_tor_local) 
+  amat_diagonal_average = amat_diagonal_average / real(n_local_elms*n_vertex_max*n_degrees*n_var * n_tor_local) 
+  write(*,*) "amat_diagonal_average = ", amat_diagonal_average
+  call MPI_AllReduce(MPI_IN_PLACE, amat_diagonal_average, 1, MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
+  
+  write(*,*) "amat_diagonal_average = ", amat_diagonal_average
   ! --- Memory tracking
   call tr_vnorms("cm_A_bef_bc", a_mat%val, a_mat%nnz)
   
