@@ -343,6 +343,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   integer, allocatable              :: i_harm(:)
   integer                           :: comm, ierr, counts
 
+  logical :: zbig_bc
   logical :: interior
   real*8 :: elm_diagonal_average
   real*8 :: elm_average
@@ -364,6 +365,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   R_xpoint(1:2)   = mhd_sim%es%R_xpoint(1:2)
   Z_xpoint(1:2)   = mhd_sim%es%Z_xpoint(1:2)
   psi_xpoint(1:2) = mhd_sim%es%psi_xpoint(1:2)
+
+  ! --- Set which bc method to use 
+  zbig_bc = .true.
 
   ! --- Printout
   if (my_id .eq. 0) then
@@ -451,7 +455,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   !$omp          my_ind_min, my_ind_max,xpoint2,xcase2,R_axis,Z_axis,psi_axis,psi_bnd,Z_xpoint,harmonic_matrix,  &
   !$omp          a_mat, rhs_local, rhs_vec,                                                               &
   !$omp          R_xpoint,my_id,bc_natural_open,bc_natural_flux,refinement,thread_struct,n_tor_fft_thresh,     &
-  !$omp          difference_found,rhs_problem,elm_problem, treat_axis) &
+  !$omp          difference_found,rhs_problem,elm_problem, treat_axis, zbig_bc) &
   !$omp   private(ife,ielm,iv,inode,element, i,inode1,i_order,index_node1, n_tor_local,   &
   !$omp           index_large_i,j,index_ij,k,knode,k_order,index_node2,index_large_k,ijA_position,         &
   !$omp           l,index_kl,ilarge2,iv2,vertex,direction,inode2,omp_nthreads,omp_tid,                     &
@@ -707,7 +711,7 @@ amat_diagonal_average = 0.d0
 
           if ((index_node1 .ge. my_ind_min) .and. (index_node1 .le. my_ind_max)) then
 
-            if ((.not. interior) .and. (i_order .eq. 1 .or. i_order .eq. 3)) then
+            if ((.not. zbig_bc) .and. (.not. interior) .and. (i_order .eq. 1 .or. i_order .eq. 3)) then
               do j = 1, n_var * n_tor_local
             
                 index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
@@ -761,47 +765,50 @@ amat_diagonal_average = 0.d0
                   enddo ! n_var * n_tor_local
 
                 enddo ! n_var * n_tor_local
-                 
-   !               !$omp critical
-   !               a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-   !                 a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
-   !                 thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-   !               !$omp end critical
+                 if (zbig_bc) then 
+                 !$omp critical
+                 a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+                   a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+                   thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+                 !$omp end critical
+                 else
   
-                if (interior) then
-                  !$omp critical
-                  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
-                    thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                  !$omp end critical
-                else 
-                  if (((i_order .eq. 1 .and. k_order .eq. 1) .or. (i_order .eq. 3 .and. k_order .eq. 3)) .and. (i .eq. k)) then
-                    !write(*,*) "elm_diagonal_average = ", elm_diagonal_average
-                    !$omp critical
-                    do j = 1, n_var * n_tor_local
-                      do l = 1, n_var * n_tor_local
-                        ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
-                        if (j .eq. l) then
-                          !a_mat%val(ilarge2) = 1.d8
-                          a_mat%val(ilarge2) = a_mat%val(ilarge2) + 1.d12
-                        else
-                           a_mat%val(ilarge2) = 0.d0
-                        endif
-                      enddo
-                    enddo
-                    !$omp end critical
-                  else if (i_order .eq. 1 .or. k_order .eq. 1 .or. i_order .eq. 3 .or. k_order .eq. 3) then
-                    !$omp critical
-                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = 0.d0
-                    !$omp end critical
-                  else
+                  if (.and. interior) then
                     !$omp critical
                     a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
                       a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
                       thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
                     !$omp end critical
-                  endif
-                endif  
+                  else 
+                    if (((i_order .eq. 1 .and. k_order .eq. 1) .or. (i_order .eq. 3 .and. k_order .eq. 3)) .and. (i .eq. k)) then
+                      !write(*,*) "elm_diagonal_average = ", elm_diagonal_average
+                      !$omp critical
+                      do j = 1, n_var * n_tor_local
+                        do l = 1, n_var * n_tor_local
+                          ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
+                          if (j .eq. l) then
+                            !a_mat%val(ilarge2) = 1.d8
+                            a_mat%val(ilarge2) = a_mat%val(ilarge2) + 1.d12
+                          else
+                            a_mat%val(ilarge2) = 0.d0
+                          endif
+                        enddo
+                      enddo
+                      !$omp end critical
+                    else if (i_order .eq. 1 .or. k_order .eq. 1 .or. i_order .eq. 3 .or. k_order .eq. 3) then
+                      !$omp critical
+                      a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = 0.d0
+                      !$omp end critical
+                    else
+                      !$omp critical
+                      a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+                        a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+                        thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+                      !$omp end critical
+                    endif
+                  endif  
+
+                endif ! zbig_bc
 
               enddo ! n_degrees
             enddo ! n_vertex_max
@@ -838,9 +845,10 @@ amat_diagonal_average = 0.d0
   call tr_vnorms("cm_A_bef_bc", a_mat%val, a_mat%nnz)
   
   ! --- Apply boundary conditions.
-  !call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
-  !                          my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
-  !                          psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
+
+  if (zbig_bc) call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
+                            my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
+                            psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
 
   if (fix_axis_nodes) then
     call fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, my_ind_min, my_ind_max, a_mat)
