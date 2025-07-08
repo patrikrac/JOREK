@@ -773,7 +773,7 @@ amat_diagonal_average = 0.d0
                  !$omp end critical
                  else
   
-                  if (.and. interior) then
+                  if (interior) then
                     !$omp critical
                     a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
                       a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
