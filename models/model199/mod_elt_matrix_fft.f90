@@ -517,7 +517,7 @@ do ms=1, n_gauss
             
              amat_25 = + 0.5d0 * vv2 * (v_x * rho_y_hat - v_y * rho_x_hat)   * xjac * theta * tstep &
                        + rho_hat * BigR**2 * w0 * (v_s * u0_t - v_t * u0_s)         * theta * tstep &
-                       - 2.d0 * BigR * v * (rho_t * T0 + T0_t * rho)      * theta * tstep  &
+                       - 2.d0 * BigR * v * (rho_t * T0 + T0_t * rho)      * theta * tstep  
 
             !  amat_26 = - BigR**2 * T * (v_s * r0_t - v_t * r0_s)      * theta * tstep  &
             !            - BigR**2 * r0 * (v_s *  T_t - v_t * T_s)    * theta * tstep  &
