@@ -510,13 +510,20 @@ do ms=1, n_gauss
                      + BigR * ( v_x * w_x + v_y * w_y) * visco_T  * xjac   * theta * tstep  &
                      + visco_num * (v_xx + v_x/BigR + v_yy)*(w_xx + w_x/BigR + w_yy) * xjac * theta * tstep
 
+            !  amat_25 = + 0.5d0 * vv2 * (v_x * rho_y_hat - v_y * rho_x_hat)   * xjac * theta * tstep &
+            !            + rho_hat * BigR**2 * w0 * (v_s * u0_t - v_t * u0_s)         * theta * tstep &
+            !            - BigR**2 * T0 * (v_s * rho_t    - v_t * rho_s   )        * theta * tstep &
+            !            - BigR**2 * rho * (v_s * T0_t - v_t *  T0_s)        * theta * tstep
+            
              amat_25 = + 0.5d0 * vv2 * (v_x * rho_y_hat - v_y * rho_x_hat)   * xjac * theta * tstep &
                        + rho_hat * BigR**2 * w0 * (v_s * u0_t - v_t * u0_s)         * theta * tstep &
-                       - BigR**2 * (v_s * rho_t * T0   - v_t * rho_s * T0  )        * theta * tstep &
-                       - BigR**2 * (v_s * rho   * T0_t - v_t * rho   * T0_s)        * theta * tstep
+                       - 2.d0 * BigR * v * (rho_t * T0 + T0_t * rho)      * theta * tstep  &
 
-             amat_26 = - BigR**2 * (v_s * r0_t * T   - v_t * r0_s * T)      * theta * tstep  &
-                       - BigR**2 * (v_s * r0   * T_t - v_t * r0   * T_s)    * theta * tstep  &
+            !  amat_26 = - BigR**2 * T * (v_s * r0_t - v_t * r0_s)      * theta * tstep  &
+            !            - BigR**2 * r0 * (v_s *  T_t - v_t * T_s)    * theta * tstep  &
+            !            + dvisco_dT * T * ( v_x * w0_x + v_y * w0_y ) * BigR * xjac * theta * tstep
+
+             amat_26 = - 2.d0 * BigR * v * (r0_t * T + T_t * r0)      * theta * tstep  &
                        + dvisco_dT * T * ( v_x * w0_x + v_y * w0_y ) * BigR * xjac * theta * tstep
 
 !------------------------------------------------------------ equation 3
