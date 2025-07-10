@@ -45,7 +45,7 @@ real*8     :: Bgrad_rho_star,     Bgrad_rho,     Bgrad_T_star,  Bgrad_T, BB2
 real*8     :: Bgrad_rho_star_psi, Bgrad_rho_psi, Bgrad_rho_rho, Bgrad_T_star_psi, Bgrad_T_psi, Bgrad_T_T, BB2_psi
 real*8     :: Bgrad_rho_rho_n, Bgrad_T_T_n, Bgrad_rho_k_star, Bgrad_T_k_star
 real*8     :: D_prof, ZK_prof, psi_norm
-real*8     :: rhs_ij_1,   rhs_ij_2,   rhs_ij_3,   rhs_ij_4,   rhs_ij_5,   rhs_ij_6
+real*8     :: rhs_ij_1,   rhs_ij_2, rhs_ij_2_k,   rhs_ij_3,   rhs_ij_4,   rhs_ij_5,   rhs_ij_6
 real*8     :: rhs_ij_5_k, rhs_ij_6_k
 real*8     :: rhs_stab_1, rhs_stab_2, rhs_stab_3, rhs_stab_4, rhs_stab_5, rhs_stab_6
 
@@ -60,7 +60,7 @@ real*8     :: rho, rho_x, rho_y, rho_s, rho_t, rho_p, rho_hat, rho_x_hat, rho_y_
 real*8     :: w0_xs, w0_xt, w0_ys, w0_yt, w0_xx, w0_yy, w0_xy, w0_ss, w0_tt, w0_st, P0, P0_s, P0_t, P0_x, P0_y
 real*8     :: BigR_x, vv2, eta_T, visco_T, deta_dT, d2eta_d2T, dvisco_dT
 real*8     :: eta_T_ohm, deta_dT_ohm
-real*8     :: amat_11, amat_12, amat_21, amat_22, amat_23, amat_24, amat_25, amat_26, amat_33, amat_31, amat_44, amat_42
+real*8     :: amat_11, amat_12, amat_21, amat_22, amat_23, amat_24, amat_24_kn, amat_25, amat_26, amat_33, amat_31, amat_44, amat_42
 real*8     :: amat_51, amat_52, amat_55, amat_61, amat_62, amat_63, amat_66, amat_16, amat_13
 real*8     :: amat_12_n, amat_23_n, amat_51_k, amat_55_kn, amat_55_k, amat_55_n, amat_61_k, amat_66_kn, amat_66_k, amat_66_n
 real*8     :: amat_stab_11, amat_stab_12, amat_stab_13, amat_stab_14 ,amat_stab_21,amat_stab_22, amat_stab_23, amat_stab_24
@@ -394,9 +394,11 @@ do ms=1, n_gauss
                       + v * (ps0_s * zj0_t - ps0_t * zj0_s )                     * tstep &
                       - visco_T * BigR * (v_x * w0_x + v_y * w0_y)        * xjac * tstep &
                       - v * eps_cyl * F0 / BigR * zj0_p                   * xjac * tstep &         ! F0 due to absence of normalisation
-                      - 2.d0 * BigR * v * p0_y               * xjac * tstep &         !+ BigR**2 * (v_s * p0_t - v_t * p0_s)                      * tstep &
+                      - 2.d0 * BigR * v * p0_y                            * xjac * tstep &         !+ BigR**2 * (v_s * p0_t - v_t * p0_s)                      * tstep &
                       - visco_num * (v_xx + v_x/Bigr + v_yy)*(w0_xx + w0_x/Bigr + w0_yy) * xjac * tstep &
                       - zeta * BigR * r0_hat * (v_x * delta_u_x + v_y * delta_u_y) * xjac  
+         
+         rhs_ij_2_k = - visco_T * 1.d0 / BigR * v_p * w0_p                * xjac * tstep
 
          rhs_ij_3 = - ( v_x * ps0_x  + v_y * ps0_y + v*zj0) / BigR * xjac
          rhs_ij_4 = - ( v_x * u0_x   + v_y * u0_y  + v*w0)  * BigR * xjac 
@@ -435,7 +437,9 @@ do ms=1, n_gauss
          RHS_p(mp,ij4) = RHS_p(mp,ij4) + rhs_ij_4 * wst
          RHS_p(mp,ij5) = RHS_p(mp,ij5) + rhs_ij_5 * wst
          RHS_p(mp,ij6) = RHS_p(mp,ij6) + rhs_ij_6 * wst
+         
 
+         RHS_k(mp,ij2) = RHS_k(mp,ij2) + rhs_ij_2_k * wst
          RHS_k(mp,ij5) = RHS_k(mp,ij5) + rhs_ij_5_k * wst
          RHS_k(mp,ij6) = RHS_k(mp,ij6) + rhs_ij_6_k * wst
 
@@ -510,6 +514,8 @@ do ms=1, n_gauss
                      + BigR * ( v_x * w_x + v_y * w_y) * visco_T  * xjac   * theta * tstep  &
                      + visco_num * (v_xx + v_x/BigR + v_yy)*(w_xx + w_x/BigR + w_yy) * xjac * theta * tstep
 
+             amat_24_kn = + visco_T * 1.d0 / BigR * v_p * w_p       * xjac * theta * tstep
+
             !  amat_25 = + 0.5d0 * vv2 * (v_x * rho_y_hat - v_y * rho_x_hat)   * xjac * theta * tstep &
             !            + rho_hat * BigR**2 * w0 * (v_s * u0_t - v_t * u0_s)         * theta * tstep &
             !            - BigR**2 * T0 * (v_s * rho_t    - v_t * rho_s   )        * theta * tstep &
@@ -517,7 +523,8 @@ do ms=1, n_gauss
             
              amat_25 = + 0.5d0 * vv2 * (v_x * rho_y_hat - v_y * rho_x_hat)   * xjac * theta * tstep &
                        + rho_hat * BigR**2 * w0 * (v_s * u0_t - v_t * u0_s)         * theta * tstep &
-                  
+                       + 2.d0 * BigR * v * (rho_y * T0 + T0_y * rho)    * xjac  * theta * tstep      
+            
             !  amat_26 = - BigR**2 * T * (v_s * r0_t - v_t * r0_s)      * theta * tstep  &
             !            - BigR**2 * r0 * (v_s *  T_t - v_t * T_s)    * theta * tstep  &
             !            + dvisco_dT * T * ( v_x * w0_x + v_y * w0_y ) * BigR * xjac * theta * tstep
@@ -617,6 +624,7 @@ do ms=1, n_gauss
              ELM_n(mp,ij2,kl3)  =  ELM_n(mp,ij2,kl3) + wst * amat_23_n
 
              ELM_p(mp,ij2,kl4)  =  ELM_p(mp,ij2,kl4) + wst * amat_24
+             ELM_kn(mp,ij2,kl4) =  ELM_kn(mp,ij2,kl4)+ wst * amat_24_kn
              ELM_p(mp,ij2,kl5)  =  ELM_p(mp,ij2,kl5) + wst * amat_25
              ELM_p(mp,ij2,kl6)  =  ELM_p(mp,ij2,kl6) + wst * amat_26
 
