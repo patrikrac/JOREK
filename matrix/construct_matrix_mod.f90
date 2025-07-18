@@ -345,6 +345,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
   logical :: zbig_bc
   logical :: interior
+  logical :: i_bnd, k_bnd
   real*8 :: elm_diagonal_average
   real*8 :: elm_average
   real*8 :: amat_diagonal_average
@@ -462,7 +463,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   !$omp           i_father,element_father, inode_father, node_out, ivertex, iorder,          &
   !$omp           ivar, itor, jvertex, jorder, jvar, jtor, random_element, n_var_reduced, v1, v2, im,      &
   !$omp           index_ij_model400_e, index_kl_model400_e,  tmp_rhs, tmp_elm, tmp_elm_v2_8,    &
-  !$omp           i_v, i_harm, interior, elm_diagonal_average, elm_average, nnz_counter                                           ) &
+  !$omp           i_v, i_harm, interior,i_bnd, k_bnd, elm_diagonal_average, elm_average, nnz_counter                                           ) &
   !$omp  firstprivate(nodes, aux_nodes, nodes_father) reduction(+:amat_diagonal_average)
 amat_diagonal_average = 0.d0
 ! --- omp id
@@ -695,10 +696,13 @@ amat_diagonal_average = 0.d0
       do i=1,n_vertex_max
 
         interior = .true.
+        i_bnd = .false.
+        k_bnd = .false.
         
         inode1 = node_out(i)
 
         if (node_list%node(inode1)%boundary .ne. 0) then
+          i_bnd = .true.
           interior = .false.
           !write(*,*) "Boundary element found, type=", node_list%node(inode1)%boundary
         endif
@@ -734,7 +738,10 @@ amat_diagonal_average = 0.d0
 
               knode = node_out(k)
 
-              if (node_list%node(knode)%boundary .ne. 0) interior = .false.
+              if (node_list%node(knode)%boundary .ne. 0) then
+                k_bnd = .true.
+                interior = .false.
+              endif
 
               do k_order = 1, n_degrees
 
@@ -766,11 +773,11 @@ amat_diagonal_average = 0.d0
 
                 enddo ! n_var * n_tor_local
                  if (zbig_bc) then 
-                 !$omp critical
-                 a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-                   a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
-                   thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                 !$omp end critical
+                  !$omp critical
+                  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+                    thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+                  !$omp end critical
                  else
   
                   if (interior) then
@@ -788,14 +795,14 @@ amat_diagonal_average = 0.d0
                           ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
                           if (j .eq. l) then
                             !a_mat%val(ilarge2) = 1.d8
-                            a_mat%val(ilarge2) = a_mat%val(ilarge2) + 1.d12
+                            a_mat%val(ilarge2) = a_mat%val(ilarge2) + 1.d3
                           else
                             a_mat%val(ilarge2) = 0.d0
                           endif
                         enddo
                       enddo
                       !$omp end critical
-                    else if (i_order .eq. 1 .or. k_order .eq. 1 .or. i_order .eq. 3 .or. k_order .eq. 3) then
+                    else if ((i_bnd .and. (i_order .eq. 1 .or. i_order .eq. 3)) .or. (k_bnd .and. (k_order .eq. 1 .or. k_order .eq. 3))) then
                       !$omp critical
                       a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = 0.d0
                       !$omp end critical
@@ -805,7 +812,7 @@ amat_diagonal_average = 0.d0
                         a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
                         thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
                       !$omp end critical
-                    endif
+                    endif                 
                   endif  
 
                 endif ! zbig_bc
