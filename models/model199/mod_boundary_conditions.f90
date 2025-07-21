@@ -85,6 +85,8 @@ contains
 
           if (node_list%node(inode)%boundary .ne. 0) then
 
+            write(*,*) "Setting boundary conditions for node ", inode, " with boundary type ", node_list%node(inode)%boundary
+
              do in=a_mat%i_tor_min, a_mat%i_tor_max 
                if (keep_n0_const  .and.  in .eq. 1 ) then
                  zbig = 1.d15

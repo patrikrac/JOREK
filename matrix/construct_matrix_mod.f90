@@ -368,7 +368,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   psi_xpoint(1:2) = mhd_sim%es%psi_xpoint(1:2)
 
   ! --- Set which bc method to use 
-  zbig_bc = .false.
+  zbig_bc = .true.
 
   ! --- Printout
   if (my_id .eq. 0) then
