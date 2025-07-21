@@ -346,6 +346,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   logical :: zbig_bc
   logical :: interior
   logical :: i_bnd, k_bnd
+  integer :: i_bnd_type, k_bnd_type
   real*8 :: elm_diagonal_average
   real*8 :: elm_average
   real*8 :: amat_diagonal_average
@@ -463,7 +464,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   !$omp           i_father,element_father, inode_father, node_out, ivertex, iorder,          &
   !$omp           ivar, itor, jvertex, jorder, jvar, jtor, random_element, n_var_reduced, v1, v2, im,      &
   !$omp           index_ij_model400_e, index_kl_model400_e,  tmp_rhs, tmp_elm, tmp_elm_v2_8,    &
-  !$omp           i_v, i_harm, interior,i_bnd, k_bnd, elm_diagonal_average, elm_average, nnz_counter                                           ) &
+  !$omp           i_v, i_harm, interior,i_bnd, k_bnd, i_bnd_type, k_bnd_type, elm_diagonal_average, elm_average, nnz_counter) &
   !$omp  firstprivate(nodes, aux_nodes, nodes_father) reduction(+:amat_diagonal_average)
 amat_diagonal_average = 0.d0
 ! --- omp id
@@ -700,10 +701,9 @@ amat_diagonal_average = 0.d0
         
         inode1 = node_out(i)
 
-        if (node_list%node(inode1)%boundary .ne. 0) then
-          i_bnd = .true.
-          !write(*,*) "Boundary element found, type=", node_list%node(inode1)%boundary
-        endif
+        ! --- Get the boundary type of the node
+        i_bnd_type = node_list%node(inode1)%boundary
+        if (i_bnd_type .ne. 0) i_bnd = .true.
 
         do i_order = 1, n_degrees
 
@@ -713,7 +713,11 @@ amat_diagonal_average = 0.d0
 
           if ((index_node1 .ge. my_ind_min) .and. (index_node1 .le. my_ind_max)) then
 
-            if ((.not. zbig_bc) .and. i_bnd .and. (i_order .eq. 1 .or. i_order .eq. 3)) then
+            if ((.not. zbig_bc) .and. i_bnd .and. & 
+                  (     (i_bnd_type .eq. 1 .and. (i_order .eq. 1 .or. i_order .eq. 2)) &
+                  .or.  (i_bnd_type .eq. 2 .and. (i_order .eq. 1 .or. i_order .eq. 3)) &
+                  .or.  (i_bnd_type .eq. 3 .and. (i_order .eq. 1 .or. i_order .eq. 2 .or. i_order .eq. 3))   )) then
+
               do j = 1, n_var * n_tor_local
             
                 index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
@@ -787,14 +791,15 @@ amat_diagonal_average = 0.d0
                       thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
                     !$omp end critical
                   else 
-                    if (((i_order .eq. 1 .and. k_order .eq. 1) .or. (i_order .eq. 3 .and. k_order .eq. 3)) .and. (i .eq. k)) then
-                      !write(*,*) "elm_diagonal_average = ", elm_diagonal_average
+                    if ((i .eq. k) .and. ((i_order .eq. 1 .and. k_order .eq. 1) &
+                                              .or. ((i_bnd_type .eq. 2 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 3 .and. k_order .eq. 3)) & 
+                                              .or. ((i_bnd_type .eq. 1 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 2 .and. k_order .eq. 2)))) then
+
                       !$omp critical
                       do j = 1, n_var * n_tor_local
                         do l = 1, n_var * n_tor_local
                           ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
                           if (j .eq. l) then
-                            !a_mat%val(ilarge2) = 1.d8
                             a_mat%val(ilarge2) = a_mat%val(ilarge2) + 1.d3
                           else
                             a_mat%val(ilarge2) = 0.d0
@@ -802,7 +807,12 @@ amat_diagonal_average = 0.d0
                         enddo
                       enddo
                       !$omp end critical
-                    else if ((i_bnd .and. (i_order .eq. 1 .or. i_order .eq. 3)) .or. (k_bnd .and. (k_order .eq. 1 .or. k_order .eq. 3))) then
+                    else if ((i_bnd .and. (i_order .eq. 1 .or. (i_bnd_type .eq. 2 .and. i_order .eq. 3) .or. &
+                                                              (i_bnd_type .eq. 1 .and. i_order .eq. 2) .or. &
+                                                              (i_bnd_type .eq. 3 .and. (i_order .eq. 2 .or. i_order .eq. 3)))) &
+                              .or. (k_bnd .and. (k_order .eq. 1 .or. (k_bnd_type .eq. 2 .and. k_order .eq. 3) .or. &
+                                                              (k_bnd_type .eq. 1 .and. k_order .eq. 2) .or. &
+                                                              (k_bnd_type .eq. 3 .and. (k_order .eq. 2 .or. k_order .eq. 3))))) then
                       !$omp critical
                       a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = 0.d0
                       !$omp end critical
