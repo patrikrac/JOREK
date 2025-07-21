@@ -18,6 +18,8 @@ module mod_reduce_noise
 
     do i=1, nnz
       ! Check if the value is below the threshold
+      if (a_mat%val(i) == 0.d0) cycle
+
       if (abs(a_mat%val(i)) < eps) then
         ! Set the value to zero
         a_mat%val(i) = 0.0
