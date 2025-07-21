@@ -368,7 +368,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   psi_xpoint(1:2) = mhd_sim%es%psi_xpoint(1:2)
 
   ! --- Set which bc method to use 
-  zbig_bc = .true.
+  zbig_bc = .false.
 
   ! --- Printout
   if (my_id .eq. 0) then
@@ -697,13 +697,11 @@ amat_diagonal_average = 0.d0
 
         interior = .true.
         i_bnd = .false.
-        k_bnd = .false.
         
         inode1 = node_out(i)
 
         if (node_list%node(inode1)%boundary .ne. 0) then
           i_bnd = .true.
-          interior = .false.
           !write(*,*) "Boundary element found, type=", node_list%node(inode1)%boundary
         endif
 
@@ -715,7 +713,7 @@ amat_diagonal_average = 0.d0
 
           if ((index_node1 .ge. my_ind_min) .and. (index_node1 .le. my_ind_max)) then
 
-            if ((.not. zbig_bc) .and. (.not. interior) .and. (i_order .eq. 1 .or. i_order .eq. 3)) then
+            if ((.not. zbig_bc) .and. i_bnd .and. (i_order .eq. 1 .or. i_order .eq. 3)) then
               do j = 1, n_var * n_tor_local
             
                 index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
@@ -737,11 +735,13 @@ amat_diagonal_average = 0.d0
             do k=1,n_vertex_max
 
               knode = node_out(k)
-
+              k_bnd = .false.
+              
               if (node_list%node(knode)%boundary .ne. 0) then
                 k_bnd = .true.
-                interior = .false.
               endif
+
+              interior = .not. (i_bnd .or. k_bnd)
 
               do k_order = 1, n_degrees
 
