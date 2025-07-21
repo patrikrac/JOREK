@@ -740,10 +740,10 @@ amat_diagonal_average = 0.d0
 
               knode = node_out(k)
               k_bnd = .false.
-              
-              if (node_list%node(knode)%boundary .ne. 0) then
-                k_bnd = .true.
-              endif
+
+              k_bnd_type = node_list%node(knode)%boundary
+              if (k_bnd_type .ne. 0) k_bnd = .true.
+
 
               interior = .not. (i_bnd .or. k_bnd)
 
