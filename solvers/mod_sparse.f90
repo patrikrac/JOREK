@@ -78,11 +78,13 @@ module mod_sparse
 
       if (verbose) tag = 0
 
+      if (verbose) write(*,*) '****************************************'
       if (solver%equilibrium) then
-        if (verbose) write(*,*) "Solving MHD equilibrium system"
+        if (verbose) write(*,*) '*    Solving MHD equilibrium system    *'
       else
-        if (verbose) write(*,*) "Solving MHD system using direct solver"
+        if (verbose) write(*,*) '*Solving MHD system using direct solver*'
       endif
+      if (verbose) write(*,*) '****************************************'
 
 #ifdef USE_GPU
       if (solver%gpu) write(*,*) "WARNING: Direct solution on the GPU not supported. Proceeding on CPU..."
@@ -131,7 +133,11 @@ module mod_sparse
 
     elseif (solver%iterative) then
 
-      if (verbose) write(*,*) "Solving MHD system using iterative solver"
+      if (verbose) then
+            write(*,*) '*******************************************'
+            write(*,*) '*Solving MHD system using iterative solver*'
+            write(*,*) '*******************************************'
+      endif
 
       if (solver%verbose) tag = my_id
 
