@@ -36,7 +36,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   
   real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0
   integer :: totit, maxit, restart, nrit, it, ldh, k
-  logical :: no_conv, GSC=.true., GSM=.false.
+  logical :: no_conv, GSC=.false., GSM=.true.
   real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, b_prec, b_
 
   integer :: my_id, my_id_n, n_cpu, ierr
