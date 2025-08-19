@@ -215,8 +215,7 @@ contains
     integer :: cc, cr
     real t0, t1
 
-    call system_clock(count=cc, count_rate=cr)
-    t0 = real(cc)/cr
+    call system_clock(count=cc, count_rate=cr); t0 = real(cc)/cr
 
     irn0 = minval(irn(1:nnz))
     nloc = maxval(irn(1:nnz)) - irn0 + 1
@@ -235,13 +234,13 @@ contains
     
     ! Fill in iptr, indmin, and indmax arrays
     do i = 1, nnz, block_size
-        iptr(irn(i) + 1) = iptr(irn(i) + 1) + block_size
-        indmin(irn(i)) = min(indmin(irn(i)), i)
-        indmax(irn(i)) = max(indmax(irn(i)), i + block_size - 1)
+      iptr(irn(i) + 1) = iptr(irn(i) + 1) + block_size
+      indmin(irn(i)) = min(indmin(irn(i)), i)
+      indmax(irn(i)) = max(indmax(irn(i)), i + block_size - 1)
     enddo
     
-    do i = 2, nloc + 1
-        iptr(i) = iptr(i) + iptr(i-1)
+    do i = 2, nloc+1
+      iptr(i) = iptr(i) + iptr(i-1)
     enddo
 
     if ((iptr(nloc+1)-1) /= nnz) write(*,*) "Warning: iptr(nloc+1)", iptr(nloc+1) - 1 
@@ -249,48 +248,47 @@ contains
     ! Determine the number of irn-blocks
     n_irn_block = 1
     do idum = 2, nloc
-        if (indmin(idum) > indmax(idum - 1)) n_irn_block = n_irn_block + 1
+      if (indmin(idum) .gt. indmax(idum - 1)) n_irn_block = n_irn_block + 1
     enddo
 
     allocate(iblock(n_irn_block + 1))
-    iblock(1) = 1
-    iblock(n_irn_block + 1) = nloc + 1
+    iblock(1) = 1; iblock(n_irn_block + 1) = nloc + 1
     ib = 2
 
     do idum = 2, nloc
-        if (indmin(idum) > indmax(idum - 1)) then
-            iblock(ib) = idum  ! min irn belonging to block
-            ib = ib + 1
-        endif
+      if (indmin(idum) .gt. indmax(idum - 1)) then
+          iblock(ib) = idum  ! min irn belonging to block
+          ib = ib + 1
+      endif
     enddo
 
     ! Find maximal block size for temporary buffer allocation
     ni = 0
     do ib = 1, n_irn_block
-        n1 = indmin(iblock(ib))
-        n2 = indmax(iblock(ib + 1) - 1)
-        ni = max(ni, n2 - n1 + 1)
+      n1 = indmin(iblock(ib))
+      n2 = indmax(iblock(ib + 1) - 1)
+      ni = max(ni, n2 - n1 + 1)
     enddo
 
     allocate(jcn_tmp(ni), val_tmp(ni))
 
 !$omp parallel do private(jcn_tmp, val_tmp, cnt, n1, n2, ni, idum, i, ib) shared(jcn, val, irn, iblock, indmin, indmax, block_size)
     do ib = 1, n_irn_block
-        cnt = 1
-        n1 = indmin(iblock(ib))
-        n2 = indmax(iblock(ib + 1) - 1)
-        ni = n2 - n1 + 1
-        do idum = iblock(ib), iblock(ib + 1) - 1
-            do i = indmin(idum), indmax(idum), block_size
-                if (irn(i) == idum) then
-                    jcn_tmp(cnt:cnt + block_size - 1) = jcn(i:i + block_size - 1)
-                    val_tmp(cnt:cnt + block_size - 1) = val(i:i + block_size - 1)
-                    cnt = cnt + block_size
-                endif
-            enddo
-        enddo
-        jcn(n1:n2) = jcn_tmp(1:ni)
-        val(n1:n2) = val_tmp(1:ni)
+      cnt = 1
+      n1 = indmin(iblock(ib))
+      n2 = indmax(iblock(ib + 1) - 1)
+      ni = n2 - n1 + 1
+      do idum = iblock(ib), iblock(ib + 1) - 1
+          do i = indmin(idum), indmax(idum), block_size
+              if (irn(i) == idum) then
+                  jcn_tmp(cnt:cnt + block_size - 1) = jcn(i:i + block_size - 1)
+                  val_tmp(cnt:cnt + block_size - 1) = val(i:i + block_size - 1)
+                  cnt = cnt + block_size
+              endif
+          enddo
+      enddo
+      jcn(n1:n2) = jcn_tmp(1:ni)
+      val(n1:n2) = val_tmp(1:ni)
     enddo
     deallocate(jcn_tmp, val_tmp)
     
