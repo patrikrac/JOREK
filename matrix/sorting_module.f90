@@ -346,8 +346,8 @@ subroutine set_csr_permutations(a_mat, irn)
     irn(1:nnz) = irn(1:nnz) - irn0 + 1  ! adjust irn to be one-based
     n_block = nnz/block_size
 
-    write(*,'(A,I10,X,A,I10,X,A,I10,X,A,I10,X,A,I10)')  "nloc", nloc, "nnz", nnz, "block_size", block_size, &
-                                                        "n_block", n_block, "residue", mod(nnz, block_size)
+    !write(*,'(A,I10,X,A,I10,X,A,I10,X,A,I10,X,A,I10)')  "nloc", nloc, "nnz", nnz, "block_size", block_size, &
+    !                                                    "n_block", n_block, "residue", mod(nnz, block_size)
         
     allocate(indmin(nloc), indmax(nloc))
     
