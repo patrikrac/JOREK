@@ -134,9 +134,9 @@ module mod_sparse
     elseif (solver%iterative) then
 
       if (verbose) then
-            write(*,*) '*******************************************'
-            write(*,*) '*Solving MHD system using iterative solver*'
-            write(*,*) '*******************************************'
+            write(*,*) '*********************************************'
+            write(*,*) '* Solving MHD system using iterative solver *'
+            write(*,*) '*********************************************'
       endif
 
       if (solver%verbose) tag = my_id
