@@ -6,7 +6,7 @@
 #ifdef USE_STRUMPACK
 #include <iostream>
 #include <string>
-#include "hdf5.h"
+//#include "hdf5.h"
 #include <math.h>
 
 #include "StrumpackSparseSolverMPIDist.hpp"
@@ -73,7 +73,7 @@ extern "C" void spk_init(StrumpackSparseSolverMPIDist<double,int_all>** spss_, i
   spss->options().set_abs_tol(eps);
   spss->options().set_maxit(200);
   spss->options().set_gmres_restart(50);
-  spss->options().set_verbose(true);
+  spss->options().set_verbose(false);
 
 //  spss->options().set_compression(CompressionType::HSS);
 //  spss->options().set_compression_min_sep_size(512);

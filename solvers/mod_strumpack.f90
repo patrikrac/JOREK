@@ -308,6 +308,11 @@ module mod_strumpack
 
       endif
       
+      if (eql) then
+        call remove_duplicates(a_mat%ng,a_mat%nnz,a_mat%irn,a_mat%jcn,a_mat%val)
+        n_d = a_mat%ng
+        nnz_d = a_mat%nnz
+      endif
       
       if (a_mat%indexing.eq.1) then
         a_mat%irn(1:nnz_d) = a_mat%irn(1:nnz_d) - a_mat%indexing;
@@ -317,7 +322,7 @@ module mod_strumpack
       endif
       
 #if (!defined(USEMKL))
-      call convert_sorting(nnz_d, a_mat%irn, a_mat%jcn, a_mat%val, a_mat%block_size, a_mat%indexing)
+      call convert_sorting(nnz=nnz_d, irn=a_mat%irn, jcn=a_mat%jcn, val=a_mat%val, block_size=a_mat%block_size)
 #endif
 
       irn_c = c_loc(a_mat%irn); jcn_c = c_loc(a_mat%jcn); val_c = c_loc(a_mat%val); dist_c = c_loc(distr)
@@ -332,7 +337,7 @@ module mod_strumpack
       deallocate(distr)
       dist_c = c_loc(spss%distr)
       
-      call spk_set_mat(n_d,dist_c,irn_c,jcn_c,val_c,spss%sscp,spss%comm,upd)
+      call spk_set_mat(n_d, dist_c, irn_c, jcn_c, val_c, spss%sscp, spss%comm,upd)
 
       call MPI_Barrier(spss%comm,ierr)
 

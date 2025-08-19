@@ -13,8 +13,10 @@ module mod_sparse_matrix
     integer(kind=int_all), dimension(:), pointer   :: ijA_size => Null()
     integer(kind=int_all), dimension(:,:), pointer :: ijA_index => Null()
     integer(kind=int_all), dimension(:,:), pointer :: irn_jcn => Null()
+    integer(kind=int_all), dimension(:), pointer   :: iptr => Null()
     
     real(kind=8), dimension(:), pointer          :: column_scaling => Null()    !< global column scaling, vector size of ng
+    integer(kind=int_all), dimension(:), pointer :: coo_to_csr_map => Null()    !< mapping of indices to convert from COO to CSR format
     integer                                      :: indexing = 1         !< matrix indexing (1 is standart FORTRAN)
     integer(kind=int_all)                        :: ng = 0               !< matrix total rank
     integer(kind=int_all)                        :: nr = 0               !< number of local rows
@@ -35,6 +37,8 @@ module mod_sparse_matrix
     logical                                      :: row_distributed = .false.
     logical                                      :: col_distributed = .false.
     logical                                      :: reduced = .false. !< matrix is available on all comm ranks (not distribued)
+    logical                                      :: csr_mapped = .false.     !< matrix mapping to CSR format is determined
+    logical                                      :: device_mapped = .false.  !<matrix in mapped to the device
 
   contains
     procedure :: copy_to
@@ -63,6 +67,7 @@ module mod_sparse_matrix
       mat_a%column_scaling => self%column_scaling
       mat_a%index_min      => self%index_min
       mat_a%index_max      => self%index_max
+      mat_a%iptr            => self%iptr; self%iptr => null()
     endif
 
     mat_a%indexing        = self%indexing
@@ -131,6 +136,14 @@ module mod_sparse_matrix
     if (associated(self%ijA_index)) then
       allocate(mat_a%ijA_index(mat_a%my_ind_size,mat_a%maxsize))
       mat_a%ijA_index(1:mat_a%my_ind_size,1:mat_a%maxsize) = self%ijA_index(1:self%my_ind_size,1:self%maxsize)
+    endif
+    if (associated(self%coo_to_csr_map)) then
+      allocate(mat_a%coo_to_csr_map(mat_a%nnz/mat_a%block_size))
+      mat_a%coo_to_csr_map(1:mat_a%nnz/mat_a%block_size) = self%coo_to_csr_map(1:mat_a%nnz/mat_a%block_size)
+    endif
+    if (associated(self%iptr)) then
+      allocate(mat_a%iptr(mat_a%nr+1))
+      mat_a%iptr(1:mat_a%nr+1) = self%iptr(1:self%nr+1)
     endif    
 
     return
@@ -166,6 +179,12 @@ module mod_sparse_matrix
     if (associated(self%index_max)) then
       deallocate(self%index_max); self%index_max => Null()
     endif
+    if (associated(self%coo_to_csr_map)) then
+      deallocate(self%coo_to_csr_map); self%coo_to_csr_map => Null()
+    endif
+    if (associated(self%iptr)) then
+      deallocate(self%iptr); self%iptr => Null()
+    endif    
 
     self%indexing = 1
     self%ng = 0
@@ -184,6 +203,9 @@ module mod_sparse_matrix
     self%row_distributed = .false.
     self%col_distributed = .false.
     self%reduced = .false.
+    self%csr_mapped = .false.
+    self%device_mapped = .false.
+    
   end subroutine reset
   
 end module mod_sparse_matrix
