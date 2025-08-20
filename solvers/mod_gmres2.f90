@@ -35,9 +35,10 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   type(type_SP_SOLVER)  :: solver
   
   real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0
-  integer :: totit, maxit, restart, nrit, it, ldh, k
-  logical :: no_conv, GSC=.true., GSM=.false.
-  real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, b_prec, b_
+  integer :: totit, maxit, restart, nrit, it, ldh, k, j
+  integer :: kappa 
+  logical :: no_conv, GSC=.false., GSM=.false., GSCI=.true., GSMI=.false.
+  real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, b_prec, b_, s_
 
   integer :: my_id, my_id_n, n_cpu, ierr
   integer :: MPI_GLOB, MPI_COMM_N
@@ -56,9 +57,12 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   atol = 1.d-36
   maxit = solver%iter_max
   restart = solver%gmres_m
+  kappa = 2 ! Number of iterations for the orthogonalization methos (in case of iterative methods) (Might be adjusted to be dynammic in the future)
   if (restart > maxit) restart = maxit
 
   allocate(givens_c(restart),givens_s(restart),b_(restart+1),hess((restart+1)*restart),V(n*(restart+1)),b_prec(n))
+  if (GSCI .or. GSMI) allocate(s_(restart)) 
+
   givens_c(1:restart) = 0.
   givens_s(1:restart) = 0.
 
@@ -96,6 +100,8 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       call cmatv(c_loc(V((it-1)*n+1)), c_loc(V(it*n+1)), c_loc(a_mat%val), c_loc(a_mat%iptr), c_loc(a_mat%jcn), &
                  c_loc(a_mat%coo_to_csr_map), a_mat%ng, a_mat%nr, a_mat%block_size, solver%gpu, a_mat%comm)
       call prec(solver, V(it*n+1:it*n+n), V(it*n+1:it*n+n), n, MPI_GLOB, MPI_COMM_N)
+
+      ! Orthogonalization
       if (GSC) then ! Gram-Schmidt Classical
         call dgemv('C', n, it, 1.d0, V(1), n, V(it*n+1), 1, 0.d0, hess((it-1)*ldh+1), 1)
         call dgemv('N', n, it, -1.d0, V(1), n, hess((it-1)*ldh+1), 1, 1.d0, V(it*n+1), 1)
@@ -104,7 +110,24 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
           hess(k+(it-1)*ldh) = ddot(n, V((k-1)*n+1), 1, V(it*n+1), 1)
           call daxpy(n, -hess(k+(it-1)*ldh), V((k-1)*n+1), 1, V(it*n+1), 1)
         enddo
+      elseif (GSCI) then ! Gram-Schmidt Classical Iterative 
+        hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
+        do j=1,kappa
+          call dgemv('C', n, it, 1.d0, V(1), n, V(it*n+1), 1, 0.d0, s_(1), 1)
+          call dgemv('N', n, it, -1.d0, V(1), n, s_(1), 1, 1.d0, V(it*n+1), 1)
+          call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
+        enddo
+      elseif (GSMI) then ! Gram-Schmidt Modified Iterative
+        hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
+        do j=1,kappa
+          do k=1,it
+            s_(k) = ddot(n, V((k-1)*n+1), 1, V(it*n+1), 1)
+            call daxpy(n, -s_(k), V((k-1)*n+1), 1, V(it*n+1), 1)
+          enddo
+          call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
+        enddo
       endif
+
       hess(it+(it-1)*ldh+1) = dnrm2(n, V(it*n+1), 1)
       call dscal(n, 1./hess(it+(it-1)*ldh+1), V(it*n+1), 1)
       do k = 1, it-1
@@ -134,6 +157,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   enddo
 
   deallocate(givens_c,givens_s,b_,hess,V,b_prec)
+  if (GSCI .or. GSMI) deallocate(s_) 
 
 end subroutine gmres2_driver
 
