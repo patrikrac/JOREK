@@ -63,21 +63,10 @@ integer, parameter :: newton_iter_max     = 8 !< Number of iterations to try
 
 !> Internal variables
 real*8  :: p              
-integer :: newton_iter_number, i_elm_tmp
+integer :: newton_iter_number, i_elm_tmp, checked_elms
 real*8  :: inv_st_jac_det, R_s, R_t, Z_s, Z_t
 real*8  :: st_step(2), x_step(2), x_tmp(2), st_new(2), x_new(2) ! x_step = (R,Z) of trial position
 real*8  :: err2, err2_old, dist(2), fact
-
-! Check if element is valid
-if (i_elm_old .lt. 1 .or. i_elm_old .gt. element_list%n_elements) then
-#if STELLARATOR_MODEL
-  write(*,*) "ERROR: find_RZ is not implemented for stellarators"
-  stop
-#else
-  call find_RZ(node_list,element_list,R_new,Z_new,x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail)
-  return
-#endif
-end if
 
 if (present(phi)) then
   p = phi
@@ -88,6 +77,17 @@ else
 #endif
   p = 0.0
 endif
+
+! Check if element is valid
+if (i_elm_old .lt. 1 .or. i_elm_old .gt. element_list%n_elements) then
+#if STELLARATOR_MODEL
+  call find_RZP(node_list,element_list,R_new,Z_new,p,x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail, checked_elms)
+  return
+#else
+  call find_RZ (node_list,element_list,R_new,Z_new,  x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail)
+  return
+#endif
+end if
 
 ! Setup initial values
 x_step = [R_old,Z_old] ! start at the current position
@@ -123,12 +123,11 @@ do newton_iter_number = 1, newton_iter_max
     call coord_in_neighbour(node_list,element_list,i_elm_tmp,i_elm_new,st_new)
     if (i_elm_new .lt. 0) then
 #if STELLARATOR_MODEL
-      write(*,*) "ERROR: find_RZ is not implemented for stellarators"
-      stop
+      call find_RZP(node_list,element_list,x_new(1),x_new(2),p,x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail, checked_elms)
 #else
-      call find_RZ(node_list,element_list,x_new(1),x_new(2),x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail)
-      if (ifail .ne. 0) i_elm_new = 0
+      call find_RZ (node_list,element_list,x_new(1),x_new(2),  x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail)
 #endif
+    if (ifail .ne. 0) i_elm_new = 0
     end if
     if (i_elm_new .eq. 0) then ! No element on that side, particle is lost
       i_elm_new = - i_elm_tmp ! Save position of particle
@@ -165,27 +164,25 @@ enddo
 
 if (ieee_is_nan(err2)) then
 #if STELLARATOR_MODEL
-  write(*,*) "ERROR: find_RZ is not implemented for stellarators"
-  stop
+  call find_RZP(node_list,element_list,x_new(1),x_new(2),p,x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail, checked_elms)
 #else
   !write(*,*) "WARNING: NaN encountered after newton iteration, using find_RZ"
-  call find_RZ(node_list,element_list,x_new(1),x_new(2),x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail)
-  if (ifail .eq. 0) ifail=2
-  return
+  call find_RZ (node_list,element_list,x_new(1),x_new(2),  x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail)
 #endif
+if (ifail .eq. 0) ifail=2
+return
 endif
 if (newton_iter_number .gt. newton_iter_max) then
 #if STELLARATOR_MODEL
-  write(*,*) "ERROR: find_RZ is not implemented for stellarators"
-  stop
+  call find_RZP(node_list,element_list,x_new(1),x_new(2),p,x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail, checked_elms)
 #else
   !write(*,"(A,i4,A,i5,A,2g14.6,A,3g14.6)") "WARNING: iteration for st did not converge after", newton_iter_max, " tries in element ", i_elm_new, &
   !" using find_RZ", x_new, "err2(old)/convergence: ", err2, err2_old, err2_old/err2
     !write(*,"(A,2g16.8)") "Find_RZ at ", x_new
-  call find_RZ(node_list,element_list,x_new(1),x_new(2),x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail)
-  if (ifail .eq. 0) ifail=3
-  return
+  call find_RZ (node_list,element_list,x_new(1),x_new(2),  x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail)
 #endif
+if (ifail .eq. 0) ifail=3
+return
 endif
 end subroutine find_RZ_nearby
 

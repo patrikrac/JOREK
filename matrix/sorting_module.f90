@@ -6,7 +6,7 @@ module sorting_module
   use mod_integer_types
   implicit none
   private
-  public remove_duplicates, convert2csr, convert_sorting
+  public remove_duplicates, convert2csr, convert_sorting, set_csr_permutations
 
 #define INTSIZE 8
 #define CINT c_int64_t
@@ -193,20 +193,21 @@ contains
   !> Convert to CSR while sorting column-wise
   !! based on matrix being structured in consecutive (non-uniform)
   !! blocks of irn values
-  subroutine convert_sorting(nnz,irn,jcn,val,block_size,indx)
+  subroutine convert_sorting(nnz, irn, jcn, val, block_size)
 
     use, intrinsic :: iso_c_binding
     use mod_integer_types
 
     integer(kind=int_all), intent(in) :: nnz
-    integer, intent(in) :: indx, block_size
-    integer(kind=int_all), dimension(:), pointer  :: irn, jcn
-    real(kind=c_double), dimension(:), pointer  :: val
+    integer, intent(in) :: block_size
+    integer(kind=int_all), dimension(:), pointer :: irn, jcn
+    real(kind=c_double), dimension(:), pointer   :: val
+    logical :: csr_mapped
 
     integer(kind=int_all), dimension(:), allocatable :: jcn_tmp, indmin, indmax, iblock, iptr
     real(kind=c_double),  dimension(:), allocatable :: val_tmp
 
-    integer(kind=int_all) :: i, nloc, n1, n2, ni, irn0, cnt, idum
+    integer(kind=int_all) :: i, j, nloc, n1, n2, ni, irn0, cnt, idum, n_block
     integer :: n_irn_block, ib
 
     logical :: check
@@ -214,106 +215,249 @@ contains
     integer :: cc, cr
     real t0, t1
 
-    call system_clock(count=cc, count_rate=cr); t0 =  real(cc)/cr
+    call system_clock(count=cc, count_rate=cr); t0 = real(cc)/cr
 
     irn0 = minval(irn(1:nnz))
     nloc = maxval(irn(1:nnz)) - irn0 + 1
-    !write(*,*) minval(irn(1:nnz)), maxval(irn(1:nnz)), "nloc", nloc
-    irn(1:nnz) = irn(1:nnz) - irn0 + 1 ! irn used as index
+    irn(1:nnz) = irn(1:nnz) - irn0 + 1  ! adjust irn to be one-based
+    n_block = nnz/block_size
 
-    write(*,*) "nloc", nloc, "nnz", nnz, "residue", mod(nnz,block_size)
-        
+    !write(*,'(A,I10,X,A,I10,X,A,I10,X,A,I10,X,A,I10)')  "nloc", nloc, "nnz", nnz, "block_size", block_size, &
+    !                                                    "n_block", n_block, "residue", mod(nnz, block_size)
+       
     allocate(indmin(nloc), indmax(nloc), iptr(nloc+1))
+   
     iptr = 0
-
     indmin = nnz
     indmax = 1
     iptr(1) = 1
+    
+    ! Fill in iptr, indmin, and indmax arrays
     do i = 1, nnz, block_size
       iptr(irn(i) + 1) = iptr(irn(i) + 1) + block_size
-      indmin(irn(i)) = min(indmin(irn(i)),i)
-      indmax(irn(i)) = max(indmax(irn(i)),i+block_size-1)
+      indmin(irn(i)) = min(indmin(irn(i)), i)
+      indmax(irn(i)) = max(indmax(irn(i)), i + block_size - 1)
     enddo
-
+    
     do i = 2, nloc+1
       iptr(i) = iptr(i) + iptr(i-1)
     enddo
-    if ((iptr(nloc+1)-1).ne.nnz) write(*,*) "Warning: iptr(nloc+1)", iptr(nloc+1)-1
 
-    !write(*,*) indmin(nloc), indmax(nloc)
+    if ((iptr(nloc+1)-1) /= nnz) write(*,*) "Warning: iptr(nloc+1)", iptr(nloc+1) - 1 
 
-    ! determine number of irn-blocks
+    ! Determine the number of irn-blocks
     n_irn_block = 1
     do idum = 2, nloc
-      if (indmin(idum).gt.indmax(idum-1)) n_irn_block = n_irn_block + 1
+      if (indmin(idum) .gt. indmax(idum - 1)) n_irn_block = n_irn_block + 1
     enddo
 
-    allocate(iblock(n_irn_block+1))
-    iblock(1) = 1; iblock(n_irn_block+1) = nloc + 1
+    allocate(iblock(n_irn_block + 1))
+    iblock(1) = 1; iblock(n_irn_block + 1) = nloc + 1
     ib = 2
+
     do idum = 2, nloc
-      if (indmin(idum).gt.indmax(idum-1)) then
-        iblock(ib) = idum ! min irn belonging to block
-        ib = ib + 1
+      if (indmin(idum) .gt. indmax(idum - 1)) then
+          iblock(ib) = idum  ! min irn belonging to block
+          ib = ib + 1
       endif
     enddo
-    
-    ! find maximal block size for temporary buffer allocation
+
+    ! Find maximal block size for temporary buffer allocation
     ni = 0
     do ib = 1, n_irn_block
-      cnt = 1
       n1 = indmin(iblock(ib))
-      n2 = indmax(iblock(ib+1)-1)
+      n2 = indmax(iblock(ib + 1) - 1)
       ni = max(ni, n2 - n1 + 1)
     enddo
-    allocate(jcn_tmp(ni),val_tmp(ni))
 
+    allocate(jcn_tmp(ni), val_tmp(ni))
+
+!$omp parallel do private(jcn_tmp, val_tmp, cnt, n1, n2, ni, idum, i, ib) shared(jcn, val, irn, iblock, indmin, indmax, block_size)
     do ib = 1, n_irn_block
       cnt = 1
       n1 = indmin(iblock(ib))
-      n2 = indmax(iblock(ib+1)-1)
+      n2 = indmax(iblock(ib + 1) - 1)
       ni = n2 - n1 + 1
-      do idum = iblock(ib),iblock(ib+1)-1
-        do i = indmin(idum), indmax(idum), block_size
-          if (irn(i).eq.idum) then
-            jcn_tmp(cnt:cnt + block_size - 1) = jcn(i:i + block_size - 1)
-            val_tmp(cnt:cnt + block_size - 1) = val(i:i + block_size - 1)
-            cnt = cnt + block_size
-          endif
-        enddo
+      do idum = iblock(ib), iblock(ib + 1) - 1
+          do i = indmin(idum), indmax(idum), block_size
+              if (irn(i) == idum) then
+                  jcn_tmp(cnt:cnt + block_size - 1) = jcn(i:i + block_size - 1)
+                  val_tmp(cnt:cnt + block_size - 1) = val(i:i + block_size - 1)
+                  cnt = cnt + block_size
+              endif
+          enddo
       enddo
       jcn(n1:n2) = jcn_tmp(1:ni)
       val(n1:n2) = val_tmp(1:ni)
     enddo
+    deallocate(jcn_tmp, val_tmp)
     
-    deallocate(jcn_tmp,val_tmp)
+    irn(1:nloc + 1) = iptr(1:nloc + 1)
 
-    irn(1:nloc+1) = iptr(1:nloc+1)
-    
     deallocate(indmin, indmax, iptr)
     deallocate(iblock)
+
+    call system_clock(count=cc, count_rate=cr)
+    t1 = real(cc) / cr
+    write(*,*) "Sorting/csr time (s) =", t1 - t0
+
+end subroutine convert_sorting
+
+subroutine set_csr_permutations(a_mat, irn)
+    use, intrinsic :: iso_c_binding
+    use mod_integer_types
+    use data_structure, only: type_SP_MATRIX
+
+    type(type_SP_MATRIX) :: a_mat
+    integer(kind=int_all) :: nnz
+    integer :: block_size
+    integer(kind=int_all), dimension(:), pointer :: irn
+
+    integer(kind=int_all), dimension(:), allocatable :: indmin, indmax, iblock
+    integer(kind=int_all), dimension(:), allocatable :: map_tmp
+
+    integer(kind=c_int), dimension(:), pointer   :: iptr => Null()
+    integer(kind=int_all), dimension(:), pointer :: csr_map => Null()
+
+    integer(kind=int_all) :: i, j, nloc, n1, n2, ni, irn0, cnt, idum, n_block
+    integer :: n_irn_block, ib
+
+    logical :: check
+
+    integer :: cc, cr
+    real t0, t1
+
+    call system_clock(count=cc, count_rate=cr)
+    t0 = real(cc)/cr
+
+#ifdef USE_GPU
+  !$omp target update from(irn) if(a_mat%device_mapped)
+#endif
+
+    block_size = a_mat%block_size
+    nnz = a_mat%nnz
     
-    ! check sorting consistency
-    if (.false.) then
-      do n1 = 1, nloc
-        check = .true.
-        ni = irn(n1+1) - irn(n1)
-        do i = irn(n1+1)-ni+1, irn(n1+1)-1
-          if (jcn(i).le.jcn(i-1)) check = .false.
-          idum = n1
-        enddo
-        if (.not.check) exit
-      enddo
-      write(*,*) "Consistency:", idum, check
-      if (.not.check) then
-        ni = irn(n1+1) - irn(n1)
-        write(*,*) "idum", n1, "iptr", ni, "jcn", jcn(irn(n1+1)-ni:irn(n1+1)-1)
-      endif
+    irn0 = minval(irn(1:nnz))
+    nloc = maxval(irn(1:nnz)) - irn0 + 1
+    if (a_mat%nr.ne.nloc) then
+      write(*,*) "ERROR in matrix strucutre"
+      call exit(1)
+    endif
+    irn(1:nnz) = irn(1:nnz) - irn0 + 1  ! adjust irn to be one-based
+    n_block = nnz/block_size
+
+    !write(*,'(A,I10,X,A,I10,X,A,I10,X,A,I10,X,A,I10)')  "nloc", nloc, "nnz", nnz, "block_size", block_size, &
+    !                                                    "n_block", n_block, "residue", mod(nnz, block_size)
+        
+    allocate(indmin(nloc), indmax(nloc))
+    
+    if (.not.associated(a_mat%iptr)) then 
+      allocate(a_mat%iptr(nloc+1))
+      iptr => a_mat%iptr(1:nloc+1)
+#ifdef USE_GPU
+      !$omp target enter data map(alloc: a_mat%iptr(1:nloc+1)) if(a_mat%device_mapped)
+#endif
+    else
+      iptr => a_mat%iptr(1:nloc+1)
+    endif
+    if (.not.associated(a_mat%coo_to_csr_map)) then
+      allocate(a_mat%coo_to_csr_map(n_block))
+      csr_map => a_mat%coo_to_csr_map(1:n_block)
+#ifdef USE_GPU
+      !$omp target enter data map(alloc: a_mat%coo_to_csr_map(1:n_block)) if(a_mat%device_mapped)
+#endif
+    else
+      csr_map => a_mat%coo_to_csr_map(1:n_block)
+    endif
+   
+    a_mat%iptr(1:a_mat%nr+1) = 0
+    indmin = nnz
+    indmax = 1
+    a_mat%iptr(1) = 1
+    
+    ! Fill in iptr, indmin, and indmax arrays
+    do i = 1, nnz, block_size
+        a_mat%iptr(irn(i) + 1) = a_mat%iptr(irn(i) + 1) + block_size
+        indmin(irn(i)) = min(indmin(irn(i)), i)
+        indmax(irn(i)) = max(indmax(irn(i)), i + block_size - 1)
+    enddo
+    
+    do i = 2, nloc + 1
+        a_mat%iptr(i) = a_mat%iptr(i) + a_mat%iptr(i-1)
+    enddo
+
+    if ((a_mat%iptr(nloc+1)-1) /= nnz) then
+      write(*,*) "ERROR in matrix strucutre: iptr(nloc+1) != nnz", a_mat%iptr(nloc+1)-1
+      call exit(1)
     endif
 
-    call system_clock(count=cc, count_rate=cr); t1 =  real(cc)/cr
-    write(*,*) "Sorting/csr time (s) =",t1-t0
+    ! Initialize coo_to_csr_map with original indices
+    do i = 1, n_block
+      a_mat%coo_to_csr_map(i) = i
+    enddo
 
-  end subroutine convert_sorting
+    ! Determine the number of irn-blocks
+    n_irn_block = 1
+    do idum = 2, nloc
+        if (indmin(idum) > indmax(idum - 1)) n_irn_block = n_irn_block + 1
+    enddo
+
+    allocate(iblock(n_irn_block + 1))
+    iblock(1) = 1
+    iblock(n_irn_block + 1) = nloc + 1
+    ib = 2
+
+    do idum = 2, nloc
+        if (indmin(idum) > indmax(idum - 1)) then
+            iblock(ib) = idum  ! min irn belonging to block
+            ib = ib + 1
+        endif
+    enddo
+
+    ! Find maximal block size for temporary buffer allocation
+    ni = 0
+    do ib = 1, n_irn_block
+        n1 = indmin(iblock(ib))
+        n2 = indmax(iblock(ib + 1) - 1)
+        ni = max(ni, n2 - n1 + 1)
+    enddo
+
+    allocate(map_tmp(max(1,ni/block_size)))
+
+!$omp parallel do private(map_tmp, cnt, n1, n2, ni, idum, i, ib) shared(irn, iblock, indmin, indmax, a_mat, block_size)
+    do ib = 1, n_irn_block
+        cnt = 1
+        n1 = indmin(iblock(ib))
+        n2 = indmax(iblock(ib + 1) - 1)
+        ni = n2 - n1 + 1
+        do idum = iblock(ib), iblock(ib + 1) - 1
+            do i = indmin(idum), indmax(idum), block_size
+                if (irn(i) == idum) then
+                    map_tmp((cnt-1)/block_size + 1) = a_mat%coo_to_csr_map((i-1)/block_size + 1)  ! Update the map
+                    cnt = cnt + block_size
+                endif
+            enddo
+        enddo
+        a_mat%coo_to_csr_map((n1-1)/block_size+1:(n2-1)/block_size+1) = map_tmp(1:ni/block_size)  ! Store the final mapping
+    enddo
+    deallocate(map_tmp)
+    
+    !do i=1,nloc+1
+    !  a_mat%irn(i) = a_mat%iptr(i)
+    !enddo
+#ifdef USE_GPU
+    !$omp target update to(a_mat%iptr(1:nloc+1), a_mat%coo_to_csr_map(1:n_block)) if(a_mat%device_mapped)
+#endif
+    
+    a_mat%csr_mapped = .true.
+
+    deallocate(indmin, indmax)
+    deallocate(iblock)
+
+    call system_clock(count=cc, count_rate=cr)
+    t1 = real(cc) / cr
+    write(*,*) "set_csr_permutation time (s) =", t1 - t0
+
+end subroutine set_csr_permutations
 
 end module sorting_module

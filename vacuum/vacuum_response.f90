@@ -1396,7 +1396,8 @@ module vacuum_response
     
     use phys_module, only: nout
     use constants
-    use mpi_mod    
+    use mpi_mod  
+    use mod_import_restart, only: rst_file_ind_fmt  
 
     implicit none
     
@@ -1414,7 +1415,7 @@ module vacuum_response
     real*8              :: Iw_net_tor 
     integer             :: filehandle = 60, i, maxcurr_pos
     logical             :: Iphi_max, Ipol_max, jphi_lin, jpol_lin
-    character(len=18)   :: filename
+    character(len=20)   :: filename, tmp_name
     real*8, allocatable :: tripot_w(:), dtripot_w(:)
     integer :: ierr
 
@@ -1430,7 +1431,8 @@ module vacuum_response
       jpol_lin = .false.    
       
       ! --- VTK file header
-      write(filename,'(A,I5.5,A)') 'wallcurr.',index,'.vtk'
+      write(tmp_name,rst_file_ind_fmt(1)) 'wallcurr.',index
+      write(filename,'(A,A)') trim(tmp_name),'.vtk'
       open(filehandle, file=filename, status='replace', action='write')
       140 format(a)
       141 format(a,i8,a)
@@ -2295,7 +2297,6 @@ module vacuum_response
   !> Initialize the currents in the resistive wall and the external coil currents.
   subroutine init_wall_currents(my_id, resistive_wall)
     
-    use nodes_elements, only: bnd_node_list, node_list
     use phys_module, only: index_now, index_start, nstep
     use mpi_mod
     
@@ -2306,13 +2307,9 @@ module vacuum_response
     logical, intent(in) :: resistive_wall
     
     ! --- Local variables
-    real*8, allocatable :: psibnd_vec(:)    ! Vector of Psi values at the boundary
-    real*8, allocatable :: dpsibnd_vec(:)   ! Vector of deltaPsi values at the boundary
     real*8, allocatable :: wall_and_coil_curr(:)
     real*8, allocatable :: tmp_coil_curr(:)
     integer             :: k, k2, ierr
-    
-    call det_psibnd_vec(bnd_node_list, node_list, psibnd_vec, dpsibnd_vec)
     
     if ( resistive_wall ) then
       
@@ -2323,17 +2320,13 @@ module vacuum_response
       
       if ( .not. allocated(wall_curr) ) then
         allocate( wall_curr(n_wall_curr) )
-        do k = 1, n_wall_curr
-          wall_curr(k) = 0.d0! - sum( sr%a_ye(k,:) * psibnd_vec(:) )
-        end do
+        wall_curr(:) = 0.d0
       end if
       
       if ( .not. allocated(dwall_curr) ) then
         allocate( dwall_curr(n_wall_curr) )
-        do k = 1, n_wall_curr
-          dwall_curr(:) = 0.d0!- sum( sr%a_ye(k,:) * dpsibnd_vec(:) )
-        end do
-      end if         
+        dwall_curr(:) = 0.d0
+      end if
       
     end if
     
@@ -2343,7 +2336,6 @@ module vacuum_response
     old_dpsibnd_vec(:) = 0.d0
 
     if (.not. CARIDDI_mode .and. .not. vacuum_min) call write_wall_vtk(0, resistive_wall, my_id)
-    deallocate( psibnd_vec, dpsibnd_vec )
 
     ! --- Initialize net toroidal wall current (for plot_live_data)
     if ( resistive_wall .and. (index_now>0) .and. (index_start+nstep>0)) then

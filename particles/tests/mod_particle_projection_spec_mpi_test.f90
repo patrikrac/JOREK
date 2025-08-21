@@ -77,7 +77,7 @@ end subroutine teardown
 subroutine test_particle_projection_square_10_10_pcg32
   use constants,                         only: TWOPI
   use mod_pcg32_rng,                     only: pcg32_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_square_grid
   implicit none
   real*8,parameter              :: expect_mean=1.d0
@@ -106,7 +106,7 @@ end subroutine test_particle_projection_square_10_10_pcg32
 subroutine test_particle_projection_square_10_10_sobseq
   use constants,                         only: TWOPI
   use mod_sobseq_rng,                    only: sobseq_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_square_grid
   implicit none
   real*8,parameter              :: expect_mean=1.d0
@@ -136,7 +136,7 @@ subroutine test_particle_projection_polar_30_22_sobseq
   use constants,                         only: TWOPI
   use phys_module,                       only: R_geo,amin
   use mod_sobseq_rng,                    only: sobseq_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_polar_grid
   implicit none
   real*8,parameter              :: expect_mean=1.d0
@@ -167,7 +167,7 @@ subroutine test_particle_projection_polar_30_21_sobseq
   use constants,                         only: TWOPI
   use phys_module,                       only: R_geo,amin
   use mod_sobseq_rng,                    only: sobseq_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_polar_grid
   implicit none
   real*8,parameter              :: expect_mean=1.d0
@@ -197,7 +197,7 @@ subroutine test_particle_projection_flux_40_31_pcg32
   use constants,                         only: TWOPI
   use phys_module,                       only: R_geo,amin
   use mod_pcg32_rng,                     only: pcg32_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_flux_grid
   implicit none
   real*8,parameter              :: expect_mean=1.d0
@@ -227,7 +227,7 @@ subroutine test_particle_projection_flux_40_32_pcg32
   use constants,                         only: TWOPI
   use phys_module,                       only: R_geo,amin
   use mod_pcg32_rng,                     only: pcg32_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_flux_grid
   implicit none
   real*8,parameter              :: expect_mean=1.d0
@@ -257,7 +257,7 @@ subroutine test_particle_projection_polar_30_22_10000_sob_smoothing
   use constants,                         only: TWOPI
   use phys_module,                       only: R_geo,amin
   use mod_sobseq_rng,                    only: sobseq_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_polar_grid
   implicit none
   integer,parameter              :: n_trials=7
@@ -291,7 +291,7 @@ end subroutine test_particle_projection_polar_30_22_10000_sob_smoothing
 subroutine test_rhs_square_10_10_pcg32
   use constants,                         only: TWOPI
   use mod_pcg32_rng,                     only: pcg32_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_square_grid 
   implicit none
   real*8,parameter            :: expect_mean=0.d0
@@ -314,7 +314,7 @@ end subroutine test_rhs_square_10_10_pcg32
 subroutine test_rhs_square_10_10_sobseq
   use constants,                         only: TWOPI
   use mod_sobseq_rng,                    only: sobseq_rng
-  use mod_project_particles,             only: proj_one
+  use mod_rhs_projections,               only: proj_one
   use mod_projection_helpers_test_tools, only: f_1,default_square_grid 
   implicit none
   real*8,parameter            :: expect_mean=0.d0
@@ -347,8 +347,8 @@ apply_dirichlet_in,write_particle_in,n_fields_write_in)
   use mod_rng,                           only: type_rng
   use mod_initialise_particles,          only: initialise_particles
   use mod_particle_sim,                  only: particle_sim
-  use mod_project_particles,             only: projection,new_projection,proj_f
-  use mod_project_particles,             only: write_particle_distribution_to_h5
+  use mod_project_particles,             only: projection,new_projection, write_particle_distribution_to_h5
+  use mod_rhs_projections,               only: proj_f
   use mod_particle_types,                only: particle_kinetic
   use mod_projection_helpers_test_tools, only: elements_mean_rms
   implicit none
@@ -425,7 +425,7 @@ apply_dirichlet_in,write_particle_in,n_fields_write_in)
       trim(adjustl(group_string))//trim(fname)//'.h5',n_fields=n_fields_write,time=test_time)
     endif
   enddo
-  deallocate(sim%groups); call project%close_mumps();
+  deallocate(sim%groups); call project%close_projection()
 end subroutine project_n
 
 !> Create RHS by integrating f and with monte carlo methods and
@@ -440,8 +440,8 @@ n_tor_local_in,i_tor_local_in,smoothing_in,apply_dirichlet_in)
   use mod_rng,                           only: type_rng
   use mod_initialise_particles,          only: initialise_particles
   use mod_particle_sim,                  only: particle_sim
-  use mod_project_particles,             only: projection,new_projection
-  use mod_project_particles,             only: proj_f,sample_rhs
+  use mod_project_particles,             only: projection, new_projection, sample_rhs
+  use mod_rhs_projections,               only: proj_f
   use mod_particle_types,                only: particle_fieldline
   use mod_projection_helpers_test_tools, only: calc_rhs_f
   implicit none
@@ -513,7 +513,7 @@ n_tor_local_in,i_tor_local_in,smoothing_in,apply_dirichlet_in)
   call assert_equals(mean_expect,maxval(abs(rhs_f-my_rhs)),tol,message//' |integrated-MC rhs|_inf n='//&
   trim(adjustl(n_particles_string)))
   call MPI_Barrier(MPI_COMM_WORLD,ifail)
-  deallocate(rhs_f); deallocate(my_rhs);! call project%close_mumps() !< cleanup
+  deallocate(rhs_f); deallocate(my_rhs);! call project%close_projection() !< cleanup
 end subroutine rhs_convergence
 
 !> ------------------------------------------------

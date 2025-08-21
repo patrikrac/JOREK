@@ -236,6 +236,7 @@ end subroutine default_flux_grid
 subroutine project_f(node_list, element_list, f, filter, filter_hyper, integral)
   use mpi_mod
   use mod_projection_helpers_test_tools, only: map_matrix_to_MUMPS_datastructure
+  use mod_uncoupled_projection, only: assemble_projection_matrix, assemble_projection_matrix_n0
 
   type(type_node_list), intent(inout)    :: node_list
   type(type_element_list), intent(inout) :: element_list
@@ -243,8 +244,8 @@ subroutine project_f(node_list, element_list, f, filter, filter_hyper, integral)
   real*8, optional, intent(in)           :: filter, filter_hyper !< smoothing and hyper-smoothing
   real*8, optional, intent(out)          :: integral !< The integral of the projected function, from the weights
   real*8, dimension(:), allocatable      :: this_integral_weights
-  type(DMUMPS_STRUC)                     :: p
-  type (type_SP_MATRIX)                  :: a_mat
+  type (type_SP_MATRIX)                  :: a_mat   !< Projection matrix using our datastructures
+  type(DMUMPS_STRUC)                     :: p       !< Object used by mumps for solving linear systems (the matrix wil be copied inside of this)
   integer :: i, k, index, i_tor_local, n_tor_local, mpi_comm_n, mpi_comm_master, ierr
   real*8  :: my_filter, my_filter_hyper, area, volume
 
@@ -262,10 +263,10 @@ subroutine project_f(node_list, element_list, f, filter, filter_hyper, integral)
   
 !  if (present(integral)) then  
   if (i_tor_local .eq. 1) then  
-    call prepare_mumps_par_n0(node_list, element_list, n_tor_local, i_tor_local, mpi_comm_world, mpi_comm_n, mpi_comm_master, &
+    call assemble_projection_matrix_n0(node_list, element_list, n_tor_local, i_tor_local, mpi_comm_world, mpi_comm_n, mpi_comm_master, &
                           a_mat,  area, volume, filter=my_filter, filter_hyper=my_filter_hyper, filter_parallel=0.d0, integral_weights=this_integral_weights)
   else
-    call prepare_mumps_par(node_list, element_list, n_tor_local, i_tor_local, mpi_comm_world, mpi_comm_n, mpi_comm_master, &
+    call assemble_projection_matrix(node_list, element_list, n_tor_local, i_tor_local, mpi_comm_world, mpi_comm_n, mpi_comm_master, &
                           a_mat, filter=my_filter, filter_hyper=my_filter_hyper, filter_parallel=0.d0)
   endif
 

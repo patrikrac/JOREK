@@ -430,7 +430,7 @@ subroutine read_next_file(this, f, i_found, prefer_plus_2)
   logical, optional, intent(in) :: prefer_plus_2 !< Set to true if we need to
   !< check for the presence of this%i+2 first
 
-  character(len=80) :: restart_file
+  character(len=80) :: restart_file, tmp_name
   integer :: i, j, k, di, ierr, my_id
   logical :: file_exists, next_file_found, flip_i12 = .false.
 
@@ -448,7 +448,8 @@ subroutine read_next_file(this, f, i_found, prefer_plus_2)
       else
         i = this%i + di
       end if
-      write(restart_file,'(A,i5.5,A)') trim(this%basename), i, '.h5'
+      write(tmp_name,rst_file_ind_fmt(1)) trim(this%basename), i
+      write(restart_file,'(A,A)') trim(tmp_name), '.h5'
       inquire(file=trim(restart_file), exist=file_exists)
       if (file_exists) then
         next_file_found=.true.

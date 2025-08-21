@@ -823,6 +823,9 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   write(*,LOGI_FMT) 'use_mumps_eq          ', use_mumps_eq
   write(*,LOGI_FMT) 'use_pastix_eq         ', use_pastix_eq
   write(*,LOGI_FMT) 'use_strumpack_eq      ', use_strumpack_eq  
+  write(*,LOGI_FMT) 'use_mumps_prj         ', use_mumps_prj
+  write(*,LOGI_FMT) 'use_pastix_prj        ', use_pastix_prj
+  write(*,LOGI_FMT) 'use_strumpack_prj     ', use_strumpack_prj
   write(*,REAL_FMT) 'pastix_pivot          ', pastix_pivot
   write(*,INTG_FMT) 'pastix_maxthrd        ', pastix_maxthrd
   write(*,LOGI_FMT) 'refinement            ', refinement
@@ -896,6 +899,7 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   endif
   write(*,LOGI_FMT) 'output_bnd_elements   ', output_bnd_elements
   write(*,LOGI_FMT) 'bootstrap             ', bootstrap
+  write(*,REAL_FMT) 'bootstrap_psin_cutoff ', bootstrap_psin_cutoff
   write(*,LOGI_FMT) 'NEO                   ', NEO
   if (NEO) then
     write(*,LOGI_FMT) 'num_neo_file          ', num_neo_file
@@ -1023,6 +1027,10 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   if (use_manual_random_seed) then
     write(*,INTG_FMT) 'manual_seed,             ',manual_seed
   endif     
+  write(*,LOGI_FMT) 'use_fixed_rng_value,    ',use_fixed_rng_value
+  if (use_fixed_rng_value) then
+    write(*,REAL_FMT) 'fixed_rng_value,        ',fixed_rng_value
+  endif
 
 #ifdef USE_CATALYST
   write(*,CHAR_FMT) 'catalyst_scripts,   ',trim(catalyst_scripts)

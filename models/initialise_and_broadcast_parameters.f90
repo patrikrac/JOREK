@@ -53,7 +53,15 @@ subroutine initialise_and_broadcast_parameters(my_id, filename)
 #endif
   endif
   ! -----------------------------------
-  
+  ! -- Set projection solver if not defined by user --
+  if ((.not.use_mumps_prj).and.(.not.use_pastix_prj).and.(.not.use_strumpack_prj)) then
+    write(*,*) 'WARNING: No projection solver defined. Using fluid solver by default.'
+    use_mumps_prj     = use_mumps
+    use_pastix_prj    = use_pastix
+    use_strumpack_prj = use_strumpack
+  endif
+  ! -----------------------------------
+
   prev_FB_fact = 1.d0 ! needed to make sure current_FB_fact is applied correctly in import_restart
   
 end subroutine initialise_and_broadcast_parameters

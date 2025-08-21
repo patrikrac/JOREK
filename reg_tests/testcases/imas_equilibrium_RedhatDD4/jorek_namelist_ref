@@ -1,12 +1,13 @@
 ***********************************************
 * namelist from imas2jorek.py                 *
-* pulse 111111        run 01          *
+* pulse 111111        run 34          *
 * database imas_regtest_db user schwarn*
 * time 0.000000                           
 ************************************************
  &in1
   tstep = 1.
   nstep = 0
+  nout = 20
 
   freeboundary          = .f.
   resistive_wall        = .f.
@@ -39,6 +40,7 @@
  
  
 ! --- Physical parameters -------------------
+  keep_current_prof     = .false. ! Fix current profile
   eta                   =    5.273375556e-08    !!! Spitzer value at Zeff=1 
   eta_ohmic             =    5.273375556e-08    !!! Spitzer value at Zeff=1 
   eta_T_dependent       = .t.  

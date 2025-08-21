@@ -47,8 +47,8 @@ real*8     :: T0_corr, r0_corr
 !real*8, intent(in)    :: Te0, ne0                        ! Electron temperature in JOREK units
 real*8  :: Sion_T , dSion_dT           ! Normalized ionization coefficient and its temperature derivative
 real*8  :: Srec_T , dSrec_dT           ! Normalized recombination coefficient and its temperature derivative
-real*8 :: LradDcont_T, dLradDcont_dT 
-real*8  :: ksi_ion_norm
+real*8  :: LradDcont_T, dLradDcont_dT 
+real*8  :: LradDcont_corr, dLradDcont_dT_corr
 
 !real*8     :: Sum_rec(n_gauss,n_gauss)
 integer    :: missing, loc_rec_elms
@@ -96,21 +96,20 @@ energy_neutrals(:,:)  = 0.d0
 energy_radiation(:,:) = 0.d0
 
 delta_phi     = 2.d0 * PI / real(n_plane,8) / real(n_period,8)
-ksi_ion_norm = central_density * 1.d20 * ksi_ion
 !HZ_p,n_plane,n_gauss,n_order,n_vertex_max,TWOPI
 !$omp parallel do default(none)                                              &
 !$omp schedule(static, 100)                                               &
 !$omp   shared(local_rec_elements,my_id,n_cpu, volume_check,energy_neutrals, energy_radiation ,              &
 !$omp          rec_rate_local,rec_v_R,rec_v_Z,rec_v_phi,                  &
 !$omp          element_list,node_list, H, H_s, H_t, HZ,                   & 
-!$omp          tstep,F0, delta_phi, ksi_ion_norm, gamma                                                      &
+!$omp          tstep,F0, delta_phi, gamma                                                      &
 !$omp          )                                                          &
 !$omp   private(ife,ielm,iv,i,j,k,ms,mt,mp,in,                            &
 !$omp           inode,nodes,element,                                      &
 !$omp           x_g, y_g, x_s, y_s, x_t, y_t, xjac, eq_g, eq_s, eq_t,     &
 !$omp           wst, BigR, r0, T0,  ps0_x,ps0_y ,u0_x,u0_y,vpar0,         &
 !$omp           r0_corr, T0_corr, Sion_T, dSion_dT, Srec_T, dSrec_dT,      &
-!$omp           LradDcont_T, dLradDcont_dT                                &
+!$omp           LradDcont_T, dLradDcont_dT, LradDcont_corr, dLradDCont_dT_corr  &
 !$omp           ) 
 !> loop over all local recombination elements
 do ife =1,  local_rec_elements(my_id+1) !element_list%n_elements !n_local_rec_elms
@@ -201,13 +200,12 @@ enddo
 		  
         vpar0    = eq_g(mp,7,ms,mt)
 		
-		!> Calculate 
-		call rec_rate_to_kinetic(r0, 0.5d0*T0, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradDcont_T, dLradDcont_dT)  
+		    !> Calculate 
+		    call rec_rate_to_kinetic(r0, 0.5d0*T0, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradDcont_T, dLradDcont_dT, LradDcont_corr, dLradDcont_dT_corr)  
         ! --- Transform derivatives on Te to derivatives in total T	
- !         	dSion_dT      = dSion_dT      / 2.d0	
-			dSrec_dT      = dSrec_dT      / 2.d0	
- !         	dLradDrays_dT = dLradDrays_dT / 2.d0	
-			dLradDcont_dT = dLradDcont_dT / 2.d0
+			  dSrec_dT           = dSrec_dT      / 2.d0	
+			  dLradDcont_dT      = dLradDcont_dT / 2.d0
+        dLradDcont_dT_corr = dLradDcont_dT_corr / 2.d0
 		
 		!>TO DO: add Te Ti possibility
 		 
@@ -230,8 +228,8 @@ enddo
 		rec_v_phi(ife,mp)        = rec_v_phi(ife,mp)     + (Srec_T * r0_corr * r0_corr) * (+ F0*vpar0/BigR)                  *BigR *xjac *tstep * delta_phi *wst !rho_rec*v_phi
 		!> volume check. 
 		volume_check(ife,mp)     = volume_check(ife,mp)  + (1.d0)                                                            *BigR *xjac        * delta_phi *wst
-        energy_neutrals(ife,mp)  = energy_neutrals(ife,mp)+ (gamma-1.d0) * 0.5d0 *T0 * r0_corr * r0_corr  * Srec_T           *BigR *xjac *tstep * delta_phi *wst 
-		energy_radiation(ife,mp) = energy_radiation(ife,mp)+ r0_corr * r0_corr  * (LradDcont_T -ksi_ion_norm*Srec_T)               *BigR *xjac *tstep * delta_phi *wst       
+    energy_neutrals(ife,mp)  = energy_neutrals(ife,mp)+ (gamma-1.d0) * 0.5d0 *T0 * r0_corr * r0_corr  * Srec_T           *BigR *xjac *tstep * delta_phi *wst 
+		energy_radiation(ife,mp) = energy_radiation(ife,mp)+ r0_corr * r0_corr  * LradDcont_corr                             *BigR *xjac *tstep * delta_phi *wst       
 
 	  enddo !mt
     enddo !ms

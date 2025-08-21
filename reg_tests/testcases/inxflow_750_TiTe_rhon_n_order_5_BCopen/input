@@ -139,5 +139,7 @@
  bc_natural_open = .t.
  neutral_reflection = 0.9
 
+use_pastix=.t.
+ use_strumpack = .f.
 
 /

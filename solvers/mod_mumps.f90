@@ -170,11 +170,9 @@ module mod_mumps
     use mod_integer_types
     use mpi_mod
     use data_structure, only: type_RHS
-    use, intrinsic :: ieee_exceptions
 
     type(type_MUMPS_SOLVER) :: mmss
     type(type_RHS)          :: rhs_vec
-    logical :: halt(size(IEEE_USUAL,1))
 
     mmss%mumps_par%rhs => rhs_vec%val
     mmss%mumps_par%nrhs = rhs_vec%nrhs
@@ -190,10 +188,7 @@ module mod_mumps
     ! calculations but then don't use the result for a speed increase.
     ! To allow running our code with -fpe0 we need to temporarily disable the
     ! checks, otherwise it'll crash here.
-    call ieee_get_halting_mode(IEEE_USUAL, halt)
-    call ieee_set_halting_mode(IEEE_USUAL, [.false., .false., .false.])
     call DMUMPS(mmss%mumps_par)
-    call ieee_set_halting_mode(IEEE_USUAL, halt)
 
   end subroutine mumps_solve_multiple
 

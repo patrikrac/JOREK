@@ -42,7 +42,7 @@ program jorek2_wall_forces
   implicit none
 
   character(len=60), parameter ::      FMT = "(1I5.5,'..', 1I5.5,'_' , 1f5.3 )" 
-  integer   :: my_id, my_id_n, my_id_master, ierr, ierr2
+  integer   :: my_id, my_id_n, my_id_master, ierr, ierr2, i_fmt
   integer   :: i_rank(n_tor), n_cpu, n_cpu_n, n_cpu_master, m_cpu, n_masters, n_cpu_trans, my_id_trans
   integer   :: MPI_COMM_N, MPI_GROUP_MASTER, MPI_GROUP_WORLD, MPI_COMM_MASTER, MPI_COMM_TRANS
   integer   :: required,provided,StatInfo
@@ -122,7 +122,8 @@ program jorek2_wall_forces
   ! --- Loop over restart files
   do istep = istart, iend, delta_step 
 
-    write(file_in,'(A5,i5.5)') 'jorek', istep
+    i_fmt = restart_file_exists(istep) ! -1 if it does not exist, otherwise index for restart file digit format
+    write(file_in, rst_file_ind_fmt(i_fmt)) 'jorek', istep
 
     if ( my_id == 0 ) then
       call import_restart(node_list, element_list, file_in, rst_format, ierr2)

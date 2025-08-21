@@ -353,7 +353,7 @@ module pellet_module
 #ifdef WITH_TiTe
           call interp_PRZ(node_list,element_list,i_elm,[var_rho,var_Te,var_psi,var_rhoimp],4,s_out,t_out,pellets(i_p)%spi_phi,&
                           P,P_s,P_t,P_phi,R,R_s,R_t,Z,Z_s,Z_t)        
-          if (drift_distance(i_inj) /= 0) then
+          if (drift_distance(i_inj) /= 0 .and. ifail_drift == 0) then
             call interp_PRZ(node_list,element_list,i_elm_drift,[var_rho,var_Te,var_psi,var_rhoimp],4,s_out_drift,t_out_drift,pellets(i_p)%spi_phi,&
                                    P_drift,P_s_drift,P_t_drift,P_phi_drift,R_drift,R_s_drift,R_t_drift,Z_drift,Z_s_drift,Z_t_drift)
           end if
@@ -361,7 +361,7 @@ module pellet_module
 #else /* WITH_TiTe */
           call interp_PRZ(node_list,element_list,i_elm,[var_rho,var_T,var_psi,var_rhoimp],4,s_out,t_out,pellets(i_p)%spi_phi,&
                           P,P_s,P_t,P_phi,R,R_s,R_t,Z,Z_s,Z_t)
-          if (drift_distance(i_inj) /= 0) then
+          if (drift_distance(i_inj) /= 0 .and. ifail_drift == 0) then
             call interp_PRZ(node_list,element_list,i_elm_drift,[var_rho,var_T,var_psi,var_rhoimp],4,s_out_drift,t_out_drift,pellets(i_p)%spi_phi,&
                                    P_drift,P_s_drift,P_t_drift,P_phi_drift,R_drift,R_s_drift,R_t_drift,Z_drift,Z_s_drift,Z_t_drift)
           end if
@@ -370,7 +370,7 @@ module pellet_module
 #ifdef WITH_TiTe
           call interp_PRZ(node_list,element_list,i_elm,[var_rho,var_Te,var_psi],3,s_out,t_out,pellets(i_p)%spi_phi,&
                           P,P_s,P_t,P_phi,R,R_s,R_t,Z,Z_s,Z_t)        
-          if (drift_distance(i_inj) /= 0) then
+          if (drift_distance(i_inj) /= 0 .and. ifail_drift == 0) then
             call interp_PRZ(node_list,element_list,i_elm_drift,[var_rho,var_Te,var_psi],3,s_out_drift,t_out_drift,pellets(i_p)%spi_phi,&
                                    P_drift,P_s_drift,P_t_drift,P_phi_drift,R_drift,R_s_drift,R_t_drift,Z_drift,Z_s_drift,Z_t_drift)
           end if
@@ -378,7 +378,7 @@ module pellet_module
 #else /* WITH_TiTe */
           call interp_PRZ(node_list,element_list,i_elm,[var_rho,var_T,var_psi],3,s_out,t_out,pellets(i_p)%spi_phi,&
                           P,P_s,P_t,P_phi,R,R_s,R_t,Z,Z_s,Z_t)
-          if (drift_distance(i_inj) /= 0) then
+          if (drift_distance(i_inj) /= 0 .and. ifail_drift == 0) then
             call interp_PRZ(node_list,element_list,i_elm_drift,[var_rho,var_T,var_psi],3,s_out_drift,t_out_drift,pellets(i_p)%spi_phi,&
                                    P_drift,P_s_drift,P_t_drift,P_phi_drift,R_drift,R_s_drift,R_t_drift,Z_drift,Z_s_drift,Z_t_drift)
           end if

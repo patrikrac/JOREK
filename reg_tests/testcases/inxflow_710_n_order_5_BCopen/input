@@ -115,4 +115,7 @@
  heatsource     = 0.d-7
  particlesource = 0.d-6
 
+ use_pastix = .t.
+ use_strumpack=.f.
+
 /

@@ -440,6 +440,7 @@ module vacuum
     FB_Zaxis_integral    = 0.d0
     n_feedback_vertical  = 1
     start_VFB            = 10
+    n_pf_coils = 0
     
     n_iter_freeb         = 900
     

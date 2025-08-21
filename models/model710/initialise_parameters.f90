@@ -74,6 +74,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 bc_natural_open, bc_natural_flux, gamma_sheath,     &
                 freeboundary, resistive_wall, freeb_change_indices, &
                 use_mumps_eq, use_pastix_eq, use_strumpack_eq,      &
+                use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering, use_strumpack,           &
                 use_BLR_compression, epsilon_BLR, just_in_time_BLR, &
                 use_pastix, use_murge, use_murge_element,           &
@@ -127,6 +128,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 alpha_Newton, vacuum_min, strumpack_matching,       &
                 forceSDN, SDN_threshold, xpoint_search_tries,       &
                 use_manual_random_seed, manual_seed,                &
+                use_fixed_rng_value, fixed_rng_value,               &            
                 export_aux_node_list, bgf_rpolar, bgf_tht
 
 if (my_id .eq. 0) then
@@ -151,6 +153,12 @@ if (my_id .eq. 0) then
     read(5,in1)
   end if
 
+  if ( ( n_tor .eq. 1 ) .and. freeboundary .and. (.not. freeboundary_equil) ) then
+    write(*,*) 'WARNING: The parameter freeboundary is automatically changed to .false. since n_tor==1 and freeboundary_equil is .false.'
+    freeboundary= .false.
+  end if
+
+  
   !==============================R_Z_psi_bnd==========================
   if ( (n_boundary.ne.0) .and. (R_Z_psi_bnd_file /= 'none') ) then
     ! --- Open the file.

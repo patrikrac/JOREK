@@ -6,7 +6,7 @@
 #ifdef USE_STRUMPACK
 #include <iostream>
 #include <string>
-#include "hdf5.h"
+//#include "hdf5.h"
 #include <math.h>
 
 #include "StrumpackSparseSolverMPIDist.hpp"
@@ -73,7 +73,7 @@ extern "C" void spk_init(StrumpackSparseSolverMPIDist<double,int_all>** spss_, i
   spss->options().set_abs_tol(eps);
   spss->options().set_maxit(200);
   spss->options().set_gmres_restart(50);
-  spss->options().set_verbose(true);
+  spss->options().set_verbose(false);
 
 //  spss->options().set_compression(CompressionType::HSS);
 //  spss->options().set_compression_min_sep_size(512);
@@ -166,9 +166,71 @@ extern "C" void spk_fact(StrumpackSparseSolverMPIDist<double,int_all>** spss_,MP
   return;
 }
 
+extern "C" void spk_solve_multiple(int_all* n_, int_all* nrhs_, int_all ** dist_, double** rhs_,
+  StrumpackSparseSolverMPIDist<double,int_all>** spss_,MPI_Fint* comm_) {
+
+  int_all n=*n_;
+  double* rhs=*rhs_;
+  int_all nrhs=*nrhs_;
+  int_all *dist = *dist_;
+
+  StrumpackSparseSolverMPIDist<double,int_all>* spss= *spss_;
+
+  MPI_Comm comm=MPI_Comm_f2c(*comm_);
+  int thread_level,rank,P;
+  MPI_Comm_rank(comm, &rank);
+  MPI_Comm_size(comm, &P);
+  std::chrono::steady_clock::time_point t0, t1;
+
+  int_all n_local = dist[rank+1]-dist[rank];
+
+  // set local RHS
+  // std::vector<double> b(n_local*nrhs), x(n_local*nrhs);
+  DenseMatrix<double> b(n_local, nrhs), x(n_local, nrhs);
+
+
+  for (int_all j=0; j<nrhs; j++)
+    #pragma omp for
+    for (int_all i=dist[rank]; i<dist[rank+1]; i++)
+      b(i-dist[rank],j)=rhs[i+n*j];
+
+  t0 = std::chrono::steady_clock::now();
+  // spss->solve(nrhs, b.data(), nrhs, x.data(), nrhs, false);
+  spss->solve(b, x, false);
+
+  // Gather the solution
+  std::vector<double> x_glob(n*nrhs), x_buf(n*nrhs);
+  x_glob.assign(n*nrhs,0);
+  x_buf.assign(n*nrhs,0);
+
+for (int_all j=0; j<nrhs; j++)
+  #pragma omp for
+  for (int_all i=dist[rank]; i<dist[rank+1]; i++)
+    x_buf[i+n*j]=x(i-dist[rank], j);
+
+  MPI_Allreduce(x_buf.data(), x_glob.data(), n*nrhs, MPI_DOUBLE_PRECISION, MPI_SUM, comm);
+
+  t1 = std::chrono::steady_clock::now();
+  if (!rank){
+    std::cout<<"Time to solve (s) = "<< std::chrono::duration_cast<
+    std::chrono::microseconds>(t1 - t0).count()*1e-6 << std::endl;
+  }
+
+#pragma omp for
+  for (int_all i=0;i<n*nrhs;i++){
+    (*rhs_)[i] = x_glob[i];
+  }
+
+  x.clear();
+  b.clear();
+  x_glob.clear();
+  x_buf.clear();
+
+  return;
+}
 
 extern "C" void spk_solve(int_all* n_, int_all ** dist_, double** rhs_,
-        StrumpackSparseSolverMPIDist<double,int_all>** spss_,MPI_Fint* comm_,int* phase) {
+        StrumpackSparseSolverMPIDist<double,int_all>** spss_,MPI_Fint* comm_) {
 
   int_all n=*n_;
   double* rhs=*rhs_;

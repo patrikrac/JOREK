@@ -23,7 +23,7 @@ program jorek2_IDS
   
   character(len=200):: user, database, passive_coil_geo_file, active_coil_geo_file, URI
   character(len=64) :: file_name, name_proj, dd_version_maj, backend, str_shot, str_run
-  integer :: shot_number, run_number, i_begin, i_end, i_step, i_jump_steps
+  integer :: shot_number, run_number, i_begin, i_end, i_step, i_jump_steps, i_fmt
   integer :: ierr, idx, stat_mhd, stat_core, stat_rad, stat_eq, n_grid, stat, stat_wall
   integer :: stat_pass, stat_act, stat_sum, stat_dis, stat_vac, stat_spi
   logical :: first_step, file_exists, rad_only_projections_h5, overwrite_entry
@@ -213,9 +213,10 @@ program jorek2_IDS
       file_name = 'jorek_restart' 
       fact_time = 1.d0  ! Projection times are already in SI units...
     else
-      if (.not. restart_file_exists(i_step)) cycle
-      write(file_name,'(a,i5.5)')   'jorek', i_step
-      write(name_proj,'(a,i5.5,a)') 'projections', i_step, '.h5'
+      i_fmt = restart_file_exists(i_step)  ! -1 if it does not exist, otherwise index for restart file digit format
+      if (i_fmt < 0) cycle
+      write(file_name,rst_file_ind_fmt(i_fmt)) 'jorek', i_step
+      write(name_proj,rst_file_ind_fmt(i_fmt)) 'projections', i_step
     endif
 
     ! --- Import restart file
@@ -284,12 +285,12 @@ program jorek2_IDS
 
     ! --- Fill and export a radiation IDS
     if (export_radiation) then
-      call import_hdf5_restart_aux(aux_node_list, name_proj, rst_format, ierr)
+      call import_hdf5_restart_aux(aux_node_list, trim(name_proj) // '.h5', rst_format, ierr)
       if (ierr /= 0) then
         write(*,*) ' Could not open projections file where radiation is stored'
         stop
       endif
-      call fill_radiation_IDS(first_step, t_start*fact_time, radiation_ids)  
+      call fill_radiation_IDS(first_step, time_SI, radiation_ids)  
     endif
 
     ! --- Fill and export an SPI IDS

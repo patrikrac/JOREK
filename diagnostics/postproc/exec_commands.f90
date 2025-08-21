@@ -305,24 +305,22 @@ module exec_commands
     integer,            intent(out) :: ierr !< Error flag
     
     character(len=64) :: file_name
-    logical           :: file_exists
     real*8            :: minRad
+    integer           :: i_fmt
     
     ierr = 0
-    
-    write(file_name,'(a,i5.5)') 'jorek', istep
-    if ( rst_hdf5 .ne. 0 ) then
-      inquire (file=trim(file_name)//'.h5', exist=file_exists)
-    else
-      inquire (file=trim(file_name)//'.rst', exist=file_exists)
-    end if
-    if ( .not. file_exists ) then
+
+    i_fmt = restart_file_exists(istep) ! -1 if it does not exist, otherwise index for restart file digit format
+
+    if ( i_fmt < 0 ) then ! file does not exist
       ierr = 42
       return
     end if
+
+    write(file_name, rst_file_ind_fmt(i_fmt)) 'jorek', istep
     
     write(*,*)
-    write(*,'(a,i5.5,a)') '#################### TIME STEP ', istep, ' ####################'
+    write(*,rst_file_ind_fmt(i_fmt)) '#################### TIME STEP ', istep, ' ####################'
     write(*,*)
     
     ! --- Load the restart file
@@ -528,7 +526,7 @@ module exec_commands
     
     ! --- Local variables
     integer              :: jcmd, istep, load_error, n_avail, itime, n_time, iavail, n_select, & 
-                            temp_select, loop_unit, input_err
+                            temp_select, loop_unit, input_err, i_fmt
     logical              :: first_step, file_exists   ! Is true for the first timestep loaded in the for-loop
     real*8               :: time_loop, rho_norm, loop_fact_time
     character(len=64)    :: file_name
@@ -573,24 +571,18 @@ module exec_commands
 
       ! --- Get list of available restart files
       n_avail=0
-      allocate(available_steps(100000))
-      do istep = 0, 99999
-        if ( rst_hdf5 .ne. 0 ) then
-          write (file_name,'(a, i5.5, a)') 'jorek', istep, '.h5'
-          inquire (file=file_name, exist=file_exists)
-        else
-          write (file_name,'(a, i5.5, a)') 'jorek', istep, '.rst'
-          inquire (file=file_name, exist=file_exists)
-        end if
-
-        if ( file_exists ) then
+      allocate(available_steps(1000000))
+      do istep = 0, 999999
+        if ( restart_file_exists(istep) > 0 ) then ! -1 if it does not exist
           n_avail=n_avail+1					
           available_steps(n_avail) = istep
         end if
       end do
 
       ! --- Get xtime from the restart file with the highest step number
-      write (file_name,'(a, i5.5)') 'jorek', available_steps(n_avail)
+      i_fmt = restart_file_exists(available_steps(n_avail)) ! -1 if it does not exist, otherwise index for restart file digit format
+      write(file_name, rst_file_ind_fmt(i_fmt)) 'jorek',  available_steps(n_avail)
+
       call import_restart(node_list, element_list, file_name, rst_format, ierr, .true., aux_node_list)
       if ( ierr /= 0 ) return
 
@@ -635,7 +627,7 @@ module exec_commands
           n_select                 = n_select+1
           selected_steps(n_select) = temp_select
 
-          write(*,'(a, i5.5, a,f13.6)') 'Selected Step: ', selected_steps(n_select),&
+          write(*,'(a, i6.6, a,f13.6)') 'Selected Step: ', selected_steps(n_select),&
           ' at t=',xtime(selected_steps(n_select))
           write(*,'(a,f13.6,a)') '                        (=',xtime(selected_steps(n_select))*loop_fact_Time*1000,' ms)'
         end if
@@ -673,7 +665,7 @@ module exec_commands
     end do
     
     if ( first_step ) then
-      write(*,'(a,i5.5,a,i5.5,a)') 'WARNING: There were no restart files for steps ',              &
+      write(*,'(a,i6.6,a,i6.6,a)') 'WARNING: There were no restart files for steps ',              &
         loop_min_step, ' to ', loop_max_step, '.'
     end if
     
@@ -782,16 +774,12 @@ module exec_commands
     
     character(len=256)  :: filename
     logical             :: file_exists
-    integer             :: i
+    integer             :: i, i_fmt
     
     write(*,'(a)') 'Available restart files:'
-    do i = 0, 99999
-      write (filename,'(a, i5.5, a)') 'jorek', i, '.rst'
-      inquire (file=filename, exist=file_exists)
-      if (file_exists) write(*,'(i6)',advance='no') i
-      write (filename,'(a, i5.5, a)') 'jorek', i, '.h5'
-      inquire (file=filename, exist=file_exists)
-      if (file_exists) write(*,'(i6)',advance='no') i
+    do i = 0, 999999
+      i_fmt = restart_file_exists(i)
+      if (i_fmt>0) write(*,'(i7)',advance='no') i
     end do
     write(*,*)
     
@@ -1062,6 +1050,7 @@ module exec_commands
 
     integer, intent(in) :: min_step, max_step
     character(len=2)    :: prefix
+    character(len=20)   :: init_string, end_string
 
     if ( loop_mode .eq. LOOP_S_MODE )  then 
       prefix='_s'
@@ -1070,9 +1059,11 @@ module exec_commands
     end if
 
     if ( min_step /= max_step ) then
-      write(step_range_string,'(a,i5.5,a,i5.5)') prefix, min_step, '..', max_step
+      write(init_string, rst_file_ind_fmt(1)) prefix, min_step
+      write(end_string,  rst_file_ind_fmt(1)) '..', max_step
+      write(step_range_string,'(a,a)') trim(init_string), trim(end_string)
     else
-      write(step_range_string,'(a,i5.5)') prefix, min_step
+      write(step_range_string,rst_file_ind_fmt(1)) trim(prefix), min_step
     end if
 
   end function step_range_string
@@ -1154,7 +1145,7 @@ module exec_commands
     do i = 1, node_list%n_nodes
       node_list%node(i)%values(:,:,:) = values(:,:,:,i) / total_weight
     end do
-    call export_restart(node_list, element_list, 'jorek99999', aux_node_list)
+    call export_restart(node_list, element_list, 'jorek_average', aux_node_list)
     deallocate(values)
     
   end subroutine average_h5_finalize
@@ -2936,7 +2927,7 @@ module exec_commands
     real*8, dimension(n_gauss,n_gauss) :: x_g,   x_s,   x_t,   x_ss,   x_tt,   x_st
     real*8, dimension(n_gauss,n_gauss) :: y_g,   y_s,   y_t,   y_ss,   y_tt,   y_st
     integer :: dim0, dim1, dim2, only_itor
-    character(len=64)       :: file_name, label 
+    character(len=64)       :: file_name, label, tmp_name1, tmp_name2 
     integer   :: required,provided,StatInfo
 #ifdef USE_FFTW
     real*8     :: in_fft(1:n_plane)
@@ -3506,7 +3497,9 @@ module exec_commands
     write(*,*) ''
     write(*,*) '  Writing non-zero terms to vtk...'
   
-    write (file_name,'(2a, i5.5, a)') trim(DIR),'RHS.', index_start, '.vtk'
+    write (tmp_name1,'(a,a)') trim(DIR), 'RHS.'
+    write (tmp_name2,rst_file_ind_fmt(1)) trim(tmp_name1), index_start
+    write (file_name,'(a,a)') trim(tmp_name2), '.vtk'
     call write_vtk(file_name,xyz,ien,9,scalar_names,scalars)
   
     write(*,*) '  Finished writing vtk'

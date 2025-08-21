@@ -73,7 +73,7 @@ integer, parameter :: var_up   = 0
 logical, parameter :: unified_element_matrix = .true.
 
 !> parameters for naming equation terms in the RHS diagnostic 
-integer,  parameter :: max_terms    = 20
+integer,  parameter :: max_terms    = 21
 integer,  parameter :: n_terms_psi  = 5
 integer,  parameter :: n_terms_u    = 11
 integer,  parameter :: n_terms_zj   = 1

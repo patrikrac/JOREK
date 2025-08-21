@@ -7,6 +7,7 @@
 
  bc_natural_open = .t.
  bootstrap       = .t.
+ bootstrap_psin_cutoff = 10.d0
 ! tauIC           = 1.d-3
 ! NEO             = .t.
 ! aki_neo_const   = -1.e+0

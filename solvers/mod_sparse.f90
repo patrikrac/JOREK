@@ -28,9 +28,15 @@ module mod_sparse
 #ifdef USE_BICGSTAB
     use mod_bicgstab, only: bicgstab_driver
 #else
-    use mod_gmres, only: gmres_driver
+    !use mod_gmres, only: gmres_driver !< Legacy gmres_driver
+    use mod_gmres2, only: gmres2_driver
 #endif
     use matio_module, only: save_mat_h5
+    use sorting_module, only : convert_sorting, set_csr_permutations
+    use mpi_mod
+#ifdef USE_GPU
+    use omp_lib, only: omp_target_memcpy, omp_get_initial_device, omp_get_default_device, omp_target_is_present
+#endif
 
     implicit none
 
@@ -41,11 +47,15 @@ module mod_sparse
 
     integer                  :: my_id, n_cpu, ierr
     type(clcktype)           :: t_itstart, t0, t1, t2, t3
+
     real*8                   :: tsecond
     integer(kind=int_all)    :: i
     logical                  :: verbose = .false.
     integer                  :: tag = -1   !< tag for log file output
     character(len=10)        :: fname
+
+    integer                  :: cc, cr
+    real                     :: tt1,tt0
 
 
     external :: solve_mumps_all, solve_pastix_all, solve_strumpack_all
@@ -68,11 +78,23 @@ module mod_sparse
 
       if (verbose) tag = 0
 
+      if (verbose) write(*,*) '****************************************'
       if (solver%equilibrium) then
-        if (verbose) write(*,*) "Solving MHD equilibrium system"
+        if (verbose) write(*,*) '*    Solving MHD equilibrium system    *'
       else
-        if (verbose) write(*,*) "Solving MHD system using direct solver"
+        if (verbose) write(*,*) '*Solving MHD system using direct solver*'
       endif
+      if (verbose) write(*,*) '****************************************'
+
+#ifdef USE_GPU
+      if (solver%gpu) write(*,*) "WARNING: Direct solution on the GPU not supported. Proceeding on CPU..."
+      if (a_mat%device_mapped) then
+            write(*,*) "WARNING: Solving the system directly leads to large memory transfers."
+            ! If we choose to solve directly, we need to make sure that the matrix is on the CPU
+            !$omp target update from(a_mat%val(1:a_mat%nnz), a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz))
+            !$omp target update from(rhs_vec%val(1:rhs_vec%n))
+      endif
+#endif
 
       if (solver%library.eq.mumps) then
 #ifdef USE_MUMPS
@@ -83,12 +105,20 @@ module mod_sparse
       elseif (solver%library.eq.strumpack) then
 #ifdef USE_STRUMPACK
         if (verbose) write(*,*) "Using STRUMPACK solver"
+# ifdef USE_GPU
+      ! In the case of STRUMPACK/pastix the matrix is deallocated, but since it is renamed this only works here
+      !$omp target exit data map(delete: a_mat%val(1:a_mat%nnz), a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz))
+# endif
         solver%spss%equilibrium = solver%equilibrium
         call solve_strumpack_all(solver%spss, a_mat, rhs_vec, solver%solve_only, tag)
 #endif
       elseif (solver%library.eq.pastix) then
 #if (defined USE_PASTIX) || (defined USE_PASTIX6)
         if (verbose) write(*,*) "Using PaStiX solver"
+# ifdef USE_GPU
+      ! In the case of STRUMPACK/pastix the matrix is deallocated, but since it is renamed this only works here
+      !$omp target exit data map(delete: a_mat%val(1:a_mat%nnz), a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz))
+# endif
         solver%ptss%equilibrium = solver%equilibrium
         solver%ptss%refine = .true.
         call solve_pastix_all(solver%ptss, a_mat, rhs_vec, solver%solve_only, tag)
@@ -103,7 +133,11 @@ module mod_sparse
 
     elseif (solver%iterative) then
 
-      if (verbose) write(*,*) "Solving MHD system using iterative solver"
+      if (verbose) then
+            write(*,*) '*********************************************'
+            write(*,*) '* Solving MHD system using iterative solver *'
+            write(*,*) '*********************************************'
+      endif
 
       if (solver%verbose) tag = my_id
 
@@ -170,9 +204,33 @@ module mod_sparse
 #ifdef USE_BICGSTAB
       call bicgstab_driver(a_mat, rhs_vec, sol_vec, solver)
 #else
-      call gmres_driver(a_mat, rhs_vec, sol_vec, solver)
-#endif
+      if (.not.a_mat%csr_mapped) then
+        call set_csr_permutations(a_mat=a_mat, irn=a_mat%irn)
+      endif
 
+# ifdef USE_GPU
+      !$omp target update from(rhs_vec%val)
+# endif
+
+# ifdef USE_GPU
+      if (solver%gpu .and. .not. a_mat%device_mapped) then
+            !$omp target enter data map(alloc: a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz), a_mat%val(1:a_mat%nnz), a_mat%iptr, a_mat%coo_to_csr_map)
+      endif
+
+      !$omp target data use_device_ptr(a_mat%jcn, a_mat%val, a_mat%iptr, a_mat%coo_to_csr_map) if(solver%gpu)
+# endif
+      !call gmres_driver(a_mat, rhs_vec, sol_vec, solver) !< Legacy GMRES Driver (Requires use gmres_driver)
+      call gmres2_driver(a_mat=a_mat,b=rhs_vec%val,x=sol_vec%val,n=sol_vec%n, solver=solver)
+# ifdef USE_GPU
+      !$omp end target data
+
+      if (solver%gpu .and. .not. a_mat%device_mapped) then
+            !$omp target exit data map(delete: a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz), a_mat%val(1:a_mat%nnz), a_mat%iptr, a_mat%coo_to_csr_map)
+      endif
+# endif
+
+#endif 
+ 
       if (verbose) write(*,'(A32,I5)') 'Number of iterations: ', solver%iter_gmres
 
       solver%step_success = (solver%iter_gmres .lt. solver%iter_max)

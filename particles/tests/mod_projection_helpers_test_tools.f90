@@ -327,6 +327,7 @@ end subroutine default_flux_grid
 !> Project a function onto the JOREK elements
 subroutine project_f(rank,master,node_list,element_list,f,ifail,filter,filter_hyper,integral,&
   apply_dirichlet_bnd_in)
+  use mod_uncoupled_projection, only: assemble_projection_matrix, assemble_projection_matrix_n0
   use mpi_mod
   type(type_node_list), intent(inout)    :: node_list
   type(type_element_list), intent(inout) :: element_list
@@ -359,12 +360,12 @@ subroutine project_f(rank,master,node_list,element_list,f,ifail,filter,filter_hy
   if (present(apply_dirichlet_bnd_in)) apply_dirichlet_bnd = apply_dirichlet_bnd_in
   
   if (i_tor_local .eq. 1) then  
-    call prepare_mumps_par_n0(node_list,element_list,n_tor_local,i_tor_local,mpi_comm_world,mpi_comm_n,&
+    call assemble_projection_matrix_n0(node_list,element_list,n_tor_local,i_tor_local,mpi_comm_world,mpi_comm_n,&
          mpi_comm_master,a_mat,area,volume,filter=my_filter,filter_hyper=my_filter_hyper,&
          filter_parallel=0.d0,apply_dirichlet_condition_in=apply_dirichlet_bnd,&
          integral_weights=this_integral_weights)
   else
-    call prepare_mumps_par(node_list,element_list,n_tor_local,i_tor_local,mpi_comm_world,mpi_comm_n,&
+    call assemble_projection_matrix(node_list,element_list,n_tor_local,i_tor_local,mpi_comm_world,mpi_comm_n,&
          mpi_comm_master,a_mat,filter=my_filter,filter_hyper=my_filter_hyper,filter_parallel=0.d0,&
          apply_dirichlet_condition_in=apply_dirichlet_bnd)
   endif
@@ -622,8 +623,8 @@ end subroutine broadcast_dmumps_project_struct
 subroutine map_matrix_to_MUMPS_datastructure(a_mat, mumps_par)
   use, intrinsic :: ieee_exceptions
   implicit none
-  type (type_SP_MATRIX), intent(in)      :: a_mat
-  type (DMUMPS_STRUC)  , intent(inout)   :: mumps_par
+  type (type_SP_MATRIX), intent(in)      :: a_mat       !< Projection matrix using our datastructures
+  type (DMUMPS_STRUC)  , intent(inout)   :: mumps_par   !< Object used by mumps for solving linear systems (the matrix wil be copied inside of this)
   logical :: halt(size(IEEE_USUAL,1)), found_nan
   integer :: my_id_n, ierr
 

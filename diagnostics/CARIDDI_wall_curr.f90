@@ -226,7 +226,7 @@ do i = 1, ncomponents
   if (( comp_start(i) .eq. -1) .and. (comp_end(i) .eq. -1)) then
     do j = 1, maxval(elem_component)
       write(ic,'(I0.3)') j
-      call write_header('CARIDDI_comp'//trim(ic)//'.vtk',ifile, n_nodes, xyznode)
+      call write_header(trim(comp_name(i))//'.'//trim(ic)//'.vtk',ifile, n_nodes, xyznode)
       call det_comp(elem_component, j, j,&
           n_elems, istart, iend, nelems_comp)
       call write_cell(ifile, n_elems, elemnode, istart, iend, nelems_comp)

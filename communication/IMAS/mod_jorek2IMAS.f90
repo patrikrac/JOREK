@@ -133,6 +133,7 @@ module mod_jorek2IMAS
       ! --- Put the grid in GGD
       allocate( plasma_profiles_ids%grid_ggd(n_grid) )
       grid => plasma_profiles_ids%grid_ggd(grid_ind)
+      grid%time = time_SI
       call grid2ggd( grid, node_list, element_list, bnd_node_list, bnd_elm_list )
     else 
       if ( associated(plasma_profiles_ids%grid_ggd) ) then
@@ -159,7 +160,7 @@ module mod_jorek2IMAS
     allocate(  plasma_profiles_ids%time(n_slice) )
     allocate(  plasma_profiles_ids%ggd(n_slice ) )
 
-    plasma_profiles_ids%ids_properties%homogeneous_time = 1
+    plasma_profiles_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HETEROGENEOUS
   
     plasma_profiles_ids%time(i_slice)     = time_SI 
     plasma_profiles_ids%ggd(i_slice)%time = time_SI
@@ -326,7 +327,7 @@ module mod_jorek2IMAS
     i_vv         = 1
     i_fw         = 2
 
-    wall_ids%ids_properties%homogeneous_time = 1
+    wall_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HETEROGENEOUS
 
     ! --- Set times
     n_slice = 1  
@@ -350,6 +351,7 @@ module mod_jorek2IMAS
       wall_ids%description_ggd(i_vv)%type%index  = 2  ! For thin wall description
       
       grid => wall_ids%description_ggd(i_vv)%grid_ggd(grid_ind)
+      grid%time = time_SI
       
       grid%identifier%index = 0   ! Unspecified
       allocate( grid%identifier%description(1))
@@ -413,11 +415,13 @@ module mod_jorek2IMAS
       wall_ids%description_ggd(i_vv)%thickness(1)%grid_subset(1)%grid_subset_index = grid_sub_ind
 
       wall_ids%description_ggd(i_vv)%thickness(1)%grid_subset(1)%values(:) = wall_thickness
+      wall_ids%description_ggd(i_vv)%thickness(1)%time = time_SI
 
       !--- Information about the wall component
       allocate(wall_ids%description_ggd(i_vv)%component(n_grid))
       allocate(wall_ids%description_ggd(i_vv)%component(1)%type(1))
       allocate(wall_ids%description_ggd(i_vv)%component(1)%identifiers(1))
+      wall_ids%description_ggd(i_vv)%component(1)%identifiers = ''
       wall_ids%description_ggd(i_vv)%component(1)%type(1)%grid_index        = grid_ind
       wall_ids%description_ggd(i_vv)%component(1)%type(1)%grid_subset_index = grid_sub_ind
       wall_ids%description_ggd(i_vv)%component(1)%type(1)%identifier%index  = 0  ! --- 0 means not specified yet
@@ -425,10 +429,13 @@ module mod_jorek2IMAS
       wall_ids%description_ggd(i_vv)%component(1)%type(1)%identifier%name = "Vacuum Vessel"
       allocate(wall_ids%description_ggd(i_vv)%component(1)%type(1)%identifier%description(1))
       wall_ids%description_ggd(i_vv)%component(1)%type(1)%identifier%description = "A single layer of the &
-                                                                    vacuum vessel discretized with linear thin triangles"
+          vacuum vessel discretized with linear thin triangles"
+      wall_ids%description_ggd(i_vv)%component(1)%time = time_SI
     else
       if ( associated(wall_ids%description_ggd(i_vv)%grid_ggd)) then
         call ids_deallocate_struct(wall_ids%description_ggd(i_vv)%grid_ggd(grid_ind), .false.)
+        deallocate( wall_ids%description_ggd(i_vv)%thickness)
+        deallocate( wall_ids%description_ggd(i_vv)%component)
         deallocate(wall_ids%description_ggd(i_vv)%grid_ggd)
       end if
     endif
@@ -527,6 +534,7 @@ module mod_jorek2IMAS
       wall_ids%description_ggd(i_fw)%type%index  = 2  ! For thin wall description
       
       grid => wall_ids%description_ggd(i_fw)%grid_ggd(grid_ind)
+      grid%time = time_SI
       
       grid%identifier%index = 0   ! Unspecified
       allocate( grid%identifier%description(1))
@@ -608,6 +616,7 @@ module mod_jorek2IMAS
       allocate(wall_ids%description_ggd(i_fw)%component(n_grid))
       allocate(wall_ids%description_ggd(i_fw)%component(1)%type(1))
       allocate(wall_ids%description_ggd(i_fw)%component(1)%identifiers(1))
+      wall_ids%description_ggd(i_fw)%component(1)%identifiers= ''
       wall_ids%description_ggd(i_fw)%component(1)%type(1)%grid_index        = grid_ind
       wall_ids%description_ggd(i_fw)%component(1)%type(1)%grid_subset_index = grid_sub_ind
       wall_ids%description_ggd(i_fw)%component(1)%type(1)%identifier%index  = 0  ! --- 0 means not specified yet
@@ -615,10 +624,12 @@ module mod_jorek2IMAS
       wall_ids%description_ggd(i_fw)%component(1)%type(1)%identifier%name = "FW + divertor"
       allocate(wall_ids%description_ggd(i_fw)%component(1)%type(1)%identifier%description(1))
       wall_ids%description_ggd(i_fw)%component(1)%type(1)%identifier%description = "A single layer representing the first wall &
-                                                                    + divertor surfaces discretized with linear thin triangles"
+          + divertor surfaces discretized with linear thin triangles"
+      wall_ids%description_ggd(i_fw)%component(1)%time = time_SI
     else   
       if ( associated(wall_ids%description_ggd(i_fw)%grid_ggd)) then
         call ids_deallocate_struct(wall_ids%description_ggd(i_fw)%grid_ggd(grid_ind), .false.)
+        deallocate( wall_ids%description_ggd(i_fw)%component)
         deallocate(wall_ids%description_ggd(i_fw)%grid_ggd)    
       end if                                                     
     endif
@@ -737,7 +748,7 @@ module mod_jorek2IMAS
     real*8, allocatable :: pot_c(:) 
     type(t_coil_set_starwall) :: coil_set
    
-    pf_passive%ids_properties%homogeneous_time = 1
+    pf_passive%ids_properties%homogeneous_time = IDS_TIME_MODE_HETEROGENEOUS
 
     if (sr%n_diag_coils == 0) then
       write(*,*) '  No diagnostic coils in the STARWALL response file'
@@ -795,9 +806,10 @@ module mod_jorek2IMAS
       endif
 
       allocate( pf_passive%loop(i_coil)%current(n_slice) )
+      allocate( pf_passive%loop(i_coil)%time(n_slice) )
 
       pf_passive%loop(i_coil)%current(i_slice) = pot_c(i) / MU_ZERO * fact_Ip
-
+      pf_passive%loop(i_coil)%time(i_slice)    = time_SI
     enddo
 
   end subroutine fill_pf_passive_IDS
@@ -831,7 +843,7 @@ module mod_jorek2IMAS
       return
     endif
 
-    spi%ids_properties%homogeneous_time = 1
+    spi%ids_properties%homogeneous_time = IDS_TIME_MODE_HOMOGENEOUS
 
     ! --- Set times
     allocate( spi%time(n_slice) )
@@ -841,6 +853,7 @@ module mod_jorek2IMAS
 
     ! --- Loop over injectors
     allocate( spi%injector(n_inj) )
+    n_spi_begin = 1
     do i_inj = 1, n_inj 
 
       ! --- Pellet properties
@@ -872,7 +885,6 @@ module mod_jorek2IMAS
       spi%injector(i_inj)%velocity_mass_centre_fragments_tor = spi_vel_RxZref(i_inj) * fact_phi_dir
 
       ! --- Fragment properties
-      n_spi_begin = 1
       allocate( spi%injector(i_inj)%fragment( n_spi(i_inj) ) )
       
       do i_frag=1, n_spi(i_inj)
@@ -895,10 +907,10 @@ module mod_jorek2IMAS
         spi%injector(i_inj)%fragment(i_frag)%velocity_tor(i_slice) = pellets(i_frag_glob)%spi_vel_rxz * fact_phi_dir
 
         spi%injector(i_inj)%fragment(i_frag)%volume(i_slice) = 4.d0/3.d0*PI*pellets(i_frag_glob)%spi_radius**3.d0 
-      enddo
+      enddo ! --- fragments
 
       n_spi_begin = n_spi_begin + n_spi(i_inj)
-    end do
+    end do  ! --- injectors
 
   end subroutine fill_spi_IDS
 
@@ -929,7 +941,7 @@ module mod_jorek2IMAS
     real*8, allocatable :: pot_c(:) 
     type(t_coil_set_starwall) :: coil_set
    
-    pf_active%ids_properties%homogeneous_time = 1
+    pf_active%ids_properties%homogeneous_time = IDS_TIME_MODE_HETEROGENEOUS
 
     if (sr%n_pol_coils == 0) then
       write(*,*) '  No poloidal active coils in the STARWALL response file'
@@ -987,8 +999,10 @@ module mod_jorek2IMAS
       endif
 
       allocate( pf_active%coil(i_coil)%current%data(n_slice) )
+      allocate( pf_active%coil(i_coil)%current%time(n_slice) )
 
       pf_active%coil(i_coil)%current%data(i_slice) = pot_c(i) / MU_ZERO * fact_Ip
+      pf_active%coil(i_coil)%current%time(i_slice) = time_SI
 
     enddo
 
@@ -1036,6 +1050,7 @@ module mod_jorek2IMAS
       ! --- Put the grid in GGD
       allocate( radiation_ids%grid_ggd(n_grid) )
       grid => radiation_ids%grid_ggd(grid_ind)
+      grid%time = time_SI
       call grid2ggd( grid, node_list, element_list, bnd_node_list, bnd_elm_list )
     else
       if ( associated(radiation_ids%grid_ggd)) then
@@ -1056,7 +1071,7 @@ module mod_jorek2IMAS
     i_slice = 1
     allocate(  radiation_ids%time(n_slice) )
 
-    radiation_ids%ids_properties%homogeneous_time = 1
+    radiation_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HETEROGENEOUS
     allocate( radiation_ids%process(1))   ! --- 1 type of radiation
     allocate( radiation_ids%process(1)%ggd(n_slice) )
   
@@ -1125,7 +1140,7 @@ module mod_jorek2IMAS
     rho0               = central_density * 1.d20 * central_mass * mass_proton
     sqrt_mu0_rho0      = sqrt( mu_zero * rho0 )
     
-    plasma_profiles_ids%ids_properties%homogeneous_time = 1    
+    plasma_profiles_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HOMOGENEOUS     
     plasma_profiles_ids%time(i_slice) = time_SI 
 
     ! --- Call expressions and do a flux average
@@ -1406,7 +1421,7 @@ module mod_jorek2IMAS
     rho0               = central_density * 1.d20 * central_mass * mass_proton
     sqrt_mu0_rho0      = sqrt( mu_zero * rho0 )
     
-    equilibrium_ids%ids_properties%homogeneous_time = 1    
+    equilibrium_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HOMOGENEOUS    
     equilibrium_ids%time(i_slice) = time_SI 
 
     ! --- Call expressions and do a flux average
@@ -1722,7 +1737,7 @@ module mod_jorek2IMAS
     ! --- Set times
     n_slice = 1;   i_slice = 1
     allocate( summary_ids%time(n_slice) )
-    summary_ids%ids_properties%homogeneous_time = 1   
+    summary_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HOMOGENEOUS   
     if (first_step) then 
       allocate(summary_ids%ids_properties%comment(1))
       summary_ids%ids_properties%comment = simulation_description
@@ -1878,7 +1893,7 @@ module mod_jorek2IMAS
     ! --- Set times
     n_slice = 1;   i_slice = 1
     allocate( disruption_ids%time(n_slice) )
-    disruption_ids%ids_properties%homogeneous_time = 1    
+    disruption_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HOMOGENEOUS    
     disruption_ids%time(i_slice) = time_SI 
 
     do i_exp=1, exprs_all_int%n_expr
@@ -2014,6 +2029,7 @@ module mod_jorek2IMAS
       ! --- Put the grid in GGD
       allocate( plasma_profiles_ids%grid_ggd(n_grid) )
       grid => plasma_profiles_ids%grid_ggd(grid_ind)
+      grid%time = time_SI
       call rect_grid2ggd( grid, rect_elms_vertices, RZ )
     else
       if ( associated(plasma_profiles_ids%grid_ggd)) then
@@ -2028,7 +2044,7 @@ module mod_jorek2IMAS
     allocate(  plasma_profiles_ids%time(n_slice) )
     allocate(  plasma_profiles_ids%ggd(n_slice ) )
 
-    plasma_profiles_ids%ids_properties%homogeneous_time = 1
+    plasma_profiles_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HETEROGENEOUS 
 
     allocate(plasma_profiles_ids%ids_properties%comment(1))
   
@@ -2540,29 +2556,6 @@ module mod_jorek2IMAS
 
   end subroutine rect_grid2ggd
 
-
-
-
-
-
-  ! --- Checks if a restart file exists in the current directory
-  logical function restart_file_exists(i_step)
-
-    use phys_module, only : rst_hdf5
-
-    implicit none
-
-    integer,  intent(in) :: i_step
-    character(len=64)    :: file_name
-
-    write(file_name,'(a,i5.5)') 'jorek', i_step
-    if ( rst_hdf5 .ne. 0 ) then
-      inquire (file=trim(file_name)//'.h5', exist=restart_file_exists)
-    else
-      inquire (file=trim(file_name)//'.rst', exist=restart_file_exists)
-    end if
-
-  end function restart_file_exists
 
 
 

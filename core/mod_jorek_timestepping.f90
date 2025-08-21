@@ -258,6 +258,7 @@ subroutine do_jorek_timestep(this, sim, ev)
   use mod_live_data_core,      only: write_live_data_all
   use tr_module,               only: tr_print_memsize, tr_resetfile
   use mod_export_restart
+  use mod_import_restart,      only: rst_file_ind_fmt
   use construct_matrix_mod
   use pellet_module
   use vacuum
@@ -450,7 +451,7 @@ subroutine do_jorek_timestep(this, sim, ev)
     mindelta = minval(this%deltas%val(1:this%deltas%n)); maxdelta = maxval(this%deltas%val(1:this%deltas%n));
     
     ! --- Output some information about the current timestep
-    130 format(1x,a,i5.5,a,es10.3,a)
+    130 format(1x,a,i6.6,a,es10.3,a)
     131 format(1x,a,2(2(es10.2,' ...',es10.2,',')))
     132 format(1x,'-------------------------------------------------------------------')
     133 format(1x,a,2(es10.2,' at ',i10,','))
@@ -510,7 +511,7 @@ subroutine do_jorek_timestep(this, sim, ev)
   
   ! --- Write a restart file every nout timesteps
   if ( (sim%my_id == 0) .and. (mod(index_now,nout) == 0) ) then
-    write(fileout,'(A5,i5.5)') 'jorek',index_now
+    write(fileout,rst_file_ind_fmt(1)) 'jorek',index_now
     call export_restart(sim%fields%node_list, sim%fields%element_list, fileout, aux_node_list)
   endif
   

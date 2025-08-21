@@ -408,8 +408,7 @@ Rbegin_loc,Rend_loc,Zbegin_loc,Zend_loc,i_tor_local,n_tor_local,local_filter,&
 hyper_filter,parallel_filter,apply_dirichlet,node_list,element_list,mumps_data,ifail)
   use mpi_mod
   use data_structure
-  use mod_project_particles,             only: prepare_mumps_par_n0
-  use mod_project_particles,             only: prepare_mumps_par
+  use mod_uncoupled_projection, only: assemble_projection_matrix, assemble_projection_matrix_n0
   use mod_projection_helpers_test_tools, only: default_square_grid
   use mod_projection_helpers_test_tools, only: broadcast_dmumps_struct_A_irn_jcn
   use mod_projection_helpers_test_tools, only: map_matrix_to_MUMPS_datastructure
@@ -422,8 +421,8 @@ hyper_filter,parallel_filter,apply_dirichlet,node_list,element_list,mumps_data,i
   real*8,intent(in)    :: Rbegin_loc,Rend_loc,Zbegin_loc,Zend_loc
   real*8,intent(in)    :: local_filter,hyper_filter,parallel_filter
   logical,intent(in)   :: apply_dirichlet
-  type(DMUMPS_STRUC),intent(inout) :: mumps_data
-  type (type_SP_MATRIX) :: a_mat
+  type(DMUMPS_STRUC),intent(inout) :: mumps_data    !< Object used by mumps for solving linear systems (the matrix wil be copied inside of this)
+  type (type_SP_MATRIX)            :: a_mat         !< Projection matrix using our datastructures
   integer :: mpi_comm_n,mpi_comm_master
   real*8  :: area,volume
   real*8,dimension(:),allocatable :: integral_weights
@@ -434,12 +433,12 @@ hyper_filter,parallel_filter,apply_dirichlet,node_list,element_list,mumps_data,i
   call default_square_grid(rank,n_tasks,nx_loc,ny_loc,node_list,element_list,ifail)
   !> compute the matrix 
   if(i_tor_local.eq.1) then
-    call prepare_mumps_par_n0(node_list,element_list,n_tor_local,i_tor_local,&
+    call assemble_projection_matrix_n0(node_list,element_list,n_tor_local,i_tor_local,&
     MPI_COMM_WORLD,mpi_comm_n,mpi_comm_master,a_mat,area,volume,&
     filter=local_filter,filter_hyper=hyper_filter,filter_parallel=parallel_filter,&
     apply_dirichlet_condition_in=apply_dirichlet,integral_weights=integral_weights)
   else
-    call prepare_mumps_par(node_list,element_list,n_tor_local,i_tor_local,&
+    call assemble_projection_matrix(node_list,element_list,n_tor_local,i_tor_local,&
     MPI_COMM_WORLD,mpi_comm_n,mpi_comm_master,a_mat,filter=local_filter,&
     filter_hyper=hyper_filter,filter_parallel=parallel_filter,&
     apply_dirichlet_condition_in=apply_dirichlet)

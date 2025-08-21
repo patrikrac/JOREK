@@ -360,7 +360,7 @@ subroutine do_read(this, sim, ev)
   class(read_jorek_fields_interp_linear), intent(inout) :: this
   type(particle_sim), intent(inout) :: sim
   type(event), intent(inout), optional :: ev
-  character(len=80) :: restart_file
+  character(len=80) :: restart_file, tmp_name
   integer :: i, ierr, my_id,i_nodes,n_nodes
   logical :: file_exists, next_file_found
 
@@ -396,7 +396,8 @@ subroutine do_read(this, sim, ev)
         if (this%i .eq. -1) then
           write(restart_file,'(A,A)') trim(this%basename), '_restart.h5'
         else
-          write(restart_file,'(A,i5.5,A)') trim(this%basename), this%i, '.h5'
+          write(tmp_name,rst_file_ind_fmt(1)) trim(this%basename), this%i
+          write(restart_file,'(A,A)') trim(tmp_name), '.h5'
         end if
         inquire(file=trim(restart_file), exist=file_exists)
         if (file_exists) then
@@ -428,7 +429,8 @@ subroutine do_read(this, sim, ev)
       else ! Linearly interpolating case
         ! If nothing has been loaded (i.e. fields%time_prev = 0.d0) load the initial file
         if (abs(f%time_prev) .lt. 1.d-50) then
-          write(restart_file,'(A,i5.5,A)') trim(this%basename), this%i, '.h5'
+          write(tmp_name,rst_file_ind_fmt(1)) trim(this%basename), this%i
+          write(restart_file,'(A,A)') trim(tmp_name), '.h5'
           inquire(file=trim(restart_file), exist=file_exists)
           if (file_exists) then
             call import_hdf5_restart(f%node_list,f%element_list,trim(restart_file),this%rst_format,ierr)
@@ -456,7 +458,8 @@ subroutine do_read(this, sim, ev)
         ! Find the following file (next timestep number)
         next_file_found=.false.
         do i=this%i+1,this%i+20 ! check 20 files ahead
-          write(restart_file,'(A,i5.5,A)') trim(this%basename), i, '.h5'
+          write(tmp_name,rst_file_ind_fmt(1)) trim(this%basename), i
+          write(restart_file,'(A,A)') tmp_name, '.h5'
           inquire(file=trim(restart_file), exist=file_exists)
           if (file_exists) then
             next_file_found=.true.

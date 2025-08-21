@@ -15,6 +15,7 @@ module mod_strumpack
     logical                          :: analyzed = .false.
     logical                          :: equilibrium = .false.
     integer                          :: comm = 0
+    logical                          :: projection  = .false.
   end type type_STRUMPACK_SOLVER
 
   private
@@ -79,6 +80,19 @@ module mod_strumpack
       integer, intent(in) :: comm
     end subroutine spk_solve
 
+    subroutine spk_solve_multiple(n,nrhs,dist,rhs,sscp,comm) bind(C)
+      use iso_c_binding
+      use mod_integer_types
+      implicit none
+
+      integer(kind=C_INT_ALL), intent(in) :: n, nrhs
+      type(c_ptr), intent(inout) :: sscp, rhs
+      type(c_ptr) :: dist
+      !integer(kind=C_INT_ALL), dimension(:), pointer, intent(in) :: dist
+      integer, intent(in) :: comm
+    end subroutine spk_solve_multiple
+
+
     subroutine spk_delete_factors(sscp) bind(C)
       use iso_c_binding
       implicit none
@@ -140,6 +154,15 @@ module mod_strumpack
       use data_structure, only: type_SP_MATRIX
 
       implicit none
+
+      type int_buff
+        integer(kind=C_INT_ALL), allocatable :: buff(:)
+      end type 
+    
+      type double_buff
+        real(kind=C_DOUBLE), allocatable :: buff(:)
+      end type 
+
       
       type(type_STRUMPACK_SOLVER)       :: spss
       type(type_SP_MATRIX)              :: a_mat
@@ -148,23 +171,34 @@ module mod_strumpack
       integer(kind=C_INT_ALL), dimension(:), pointer :: irn_d, jcn_d
       real(kind=C_DOUBLE),  dimension(:), pointer :: val_d
 
+      type(int_buff),     dimension(:), allocatable :: buff_irn_d, buff_jcn_d
+      type(double_buff),  dimension(:), allocatable :: buff_val_d
+
+
       integer(kind=C_INT_ALL), allocatable, target :: distr(:)
       
       integer :: rank, n_cpu
-      integer(kind=int_all) :: nnz_d, n_d, i, j, imin, imax
+      integer(kind=C_INT_ALL) :: nnz_d, tmp_nnz_d, n_d, i, j, imin, imax, ranks_i, request
+
 
       integer(kind=int_all), dimension(:), pointer :: myelm
       logical :: upd, dflag, eql
       type(c_ptr) :: irn_c, jcn_c, val_c, dist_c
-      
+
       upd = spss%analyzed
       dflag = a_mat%row_distributed
       eql = spss%equilibrium
 
       call MPI_COMM_RANK(spss%comm, rank, ierr)
       call MPI_COMM_SIZE(spss%comm, n_cpu, ierr)
-      
-      !write(*,*) "n_cpu, a_mat%ng, a_mat%nnz", n_cpu, a_mat%ng, a_mat%nnz
+      if (eql .or. spss%projection) then
+        if (rank.eq.0) call remove_duplicates(a_mat%ng,a_mat%nnz,a_mat%irn,a_mat%jcn,a_mat%val)
+        call MPI_Bcast(a_mat%ng,       1, MPI_INTEGER, 0, spss%comm, ierr)
+        call MPI_Bcast(a_mat%nnz,      1, MPI_INTEGER, 0, spss%comm, ierr)
+        call MPI_Bcast(a_mat%indexing, 1, MPI_INTEGER, 0, spss%comm, ierr)
+        call MPI_Bcast(a_mat%block_size, 1, MPI_INTEGER, 0, spss%comm, ierr)
+        call MPI_Bcast(a_mat%row_distributed, 1, MPI_INTEGER, 0, spss%comm, ierr)
+      endif
       
       allocate(distr(n_cpu+1))
 
@@ -173,31 +207,65 @@ module mod_strumpack
         call distribute_rows(a_mat,n_cpu,distr)
         if (rank.eq.0) write(*,*) "Matrix is not row-distributed. Distributing now."
 
-        allocate(myelm(a_mat%nnz))
-        j = 1
-        do i=1, a_mat%nnz
-          if ((a_mat%irn(i) >= distr(rank+1)).and.(a_mat%irn(i) <= (distr(rank+2)-1))) then
-            myelm(j) = i
-            j = j + 1
-          endif
-        enddo
+        allocate(buff_irn_d(n_cpu), buff_jcn_d(n_cpu), buff_val_d(n_cpu))
 
-        nnz_d = j - 1
         n_d = distr(rank+2) - distr(rank+1) ! number of local rows
 
-        allocate(irn_d(nnz_d), jcn_d(nnz_d), val_d(nnz_d))
+        allocate(myelm(a_mat%nnz))
+        if (rank.eq.0) then
+          do ranks_i=0, n_cpu-1
+            myelm = 0
+            j = 1
+            do i=1, a_mat%nnz
+              if ((a_mat%irn(i) >= distr(ranks_i+1)).and.(a_mat%irn(i) <= (distr(ranks_i+2)-1))) then
+                myelm(j) = i
+                j = j + 1
+              endif
+            enddo
+            tmp_nnz_d = j - 1
+            if (ranks_i.ne.0) then  
+              allocate(buff_irn_d(ranks_i+1)%buff(tmp_nnz_d), buff_jcn_d(ranks_i+1)%buff(tmp_nnz_d), buff_val_d(ranks_i+1)%buff(tmp_nnz_d))
+              do i = 1, tmp_nnz_d
+                buff_irn_d(ranks_i+1)%buff(i) = a_mat%irn(myelm(i)) - distr(ranks_i+1) + a_mat%indexing    ! irn starts from index
+                buff_jcn_d(ranks_i+1)%buff(i) = a_mat%jcn(myelm(i))                                        ! jcn remains the same
+                buff_val_d(ranks_i+1)%buff(i) = a_mat%val(myelm(i))
+              enddo
 
-        do i = 1, nnz_d
-          irn_d(i) = a_mat%irn(myelm(i)) - distr(rank+1) + a_mat%indexing    ! irn starts from index
-          jcn_d(i) = a_mat%jcn(myelm(i))                          ! jcn remains the same
-          val_d(i) = a_mat%val(myelm(i))
-        enddo
+              call MPI_Send(tmp_nnz_d, 1, MPI_INTEGER, ranks_i, 0, spss%comm, ierr)
 
-        deallocate(a_mat%irn,a_mat%jcn,a_mat%val)
-        
+              call MPI_Send(buff_irn_d(ranks_i+1)%buff, tmp_nnz_d, MPI_INTEGER,          ranks_i, 1, spss%comm, ierr)
+              call MPI_Send(buff_jcn_d(ranks_i+1)%buff, tmp_nnz_d, MPI_INTEGER,          ranks_i, 2, spss%comm, ierr)
+              call MPI_Send(buff_val_d(ranks_i+1)%buff, tmp_nnz_d, MPI_DOUBLE_PRECISION, ranks_i, 3, spss%comm, ierr)
+            else 
+              nnz_d = tmp_nnz_d
+
+              allocate(irn_d(nnz_d), jcn_d(nnz_d), val_d(nnz_d))
+  
+              do i = 1, nnz_d
+                irn_d(i) = a_mat%irn(myelm(i)) - distr(ranks_i+1) + a_mat%indexing    ! irn starts from index
+                jcn_d(i) = a_mat%jcn(myelm(i))                                        ! jcn remains the same
+                val_d(i) = a_mat%val(myelm(i))
+              enddo
+    
+            endif
+          enddo
+        else 
+          call MPI_Recv(nnz_d, 1, MPI_INTEGER, 0, 0, spss%comm, MPI_STATUS_IGNORE, ierr)
+          allocate(irn_d(nnz_d), jcn_d(nnz_d), val_d(nnz_d))
+
+          call MPI_Recv(irn_d, nnz_d, MPI_INTEGER,          0, 1, spss%comm, MPI_STATUS_IGNORE, ierr)
+          call MPI_Recv(jcn_d, nnz_d, MPI_INTEGER,          0, 2, spss%comm, MPI_STATUS_IGNORE, ierr)
+          call MPI_Recv(val_d, nnz_d, MPI_DOUBLE_PRECISION, 0, 3, spss%comm, MPI_STATUS_IGNORE, ierr)
+
+        end if
+
+        if (rank .eq. 0) deallocate(a_mat%irn, a_mat%jcn, a_mat%val)
+
         a_mat%irn => irn_d
         a_mat%jcn => jcn_d
         a_mat%val => val_d
+        a_mat%nnz =  nnz_d
+        a_mat%ng  =  n_d
         a_mat%row_distributed = .true.
 
         deallocate(myelm)
@@ -254,7 +322,7 @@ module mod_strumpack
       endif
       
 #if (!defined(USEMKL))
-      call convert_sorting(nnz_d, a_mat%irn, a_mat%jcn, a_mat%val, a_mat%block_size, a_mat%indexing)
+      call convert_sorting(nnz=nnz_d, irn=a_mat%irn, jcn=a_mat%jcn, val=a_mat%val, block_size=a_mat%block_size)
 #endif
 
       irn_c = c_loc(a_mat%irn); jcn_c = c_loc(a_mat%jcn); val_c = c_loc(a_mat%val); dist_c = c_loc(distr)
@@ -269,7 +337,7 @@ module mod_strumpack
       deallocate(distr)
       dist_c = c_loc(spss%distr)
       
-      call spk_set_mat(n_d,dist_c,irn_c,jcn_c,val_c,spss%sscp,spss%comm,upd)
+      call spk_set_mat(n_d, dist_c, irn_c, jcn_c, val_c, spss%sscp, spss%comm,upd)
 
       call MPI_Barrier(spss%comm,ierr)
 
@@ -286,6 +354,7 @@ module mod_strumpack
       integer ierr
 
       call spk_reord(spss%sscp,spss%comm)
+
       call MPI_Barrier(spss%comm,ierr)
       spss%analyzed = .true.
 
@@ -318,14 +387,25 @@ module mod_strumpack
       type(c_ptr)                   :: dist_c
       integer :: ierr
       integer(kind=C_INT_ALL), allocatable, target :: dist(:)
-      integer :: i, n_cpu
+      integer :: i, n_cpu, rank
       
-      call MPI_COMM_SIZE(spss%comm, n_cpu, ierr) 
+      call MPI_COMM_SIZE(spss%comm, n_cpu, ierr)
+      call MPI_COMM_RANK(spss%comm, rank, ierr)
+
+      if (spss%projection) then
+        if (rank.ne.0) allocate (rhs_vec%val(rhs_vec%n*rhs_vec%nrhs))
+        call MPI_Bcast(rhs_vec%val, rhs_vec%n*rhs_vec%nrhs, MPI_DOUBLE_PRECISION, 0, spss%comm, ierr)
+      endif
 
       rhs_c = c_loc(rhs_vec%val);
       dist_c = c_loc(spss%distr)
 
-      call spk_solve(rhs_vec%n, dist_c, rhs_c, spss%sscp, spss%comm)
+      if (spss%projection) then
+        call spk_solve_multiple(rhs_vec%n, rhs_vec%nrhs, dist_c, rhs_c, spss%sscp, spss%comm)
+      else
+        call spk_solve         (rhs_vec%n, dist_c, rhs_c, spss%sscp, spss%comm)
+      endif
+
       call MPI_Barrier(spss%comm,ierr)
 
       return

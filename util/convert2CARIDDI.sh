@@ -1,12 +1,11 @@
 #!/bin/bash
 
 #
-# Purpose: Produces poincare files that can be plotted, e.g., by gnuplot from JOREK restart files.
-#          Adapted from convert2vtk.sh.
-#
-# Date: 2019-10-25
-# Author: Fabian Wieschollek, IPP Garching
-#
+# Purpose: Produces .vtk files of the CARIDDI wall structures
+# Requires some additional files, more info on https://www.jorek.eu/wiki/doku.php?id=cariddi-plotting
+# Date: 2024-04-16
+# Author: Nina Schwarz
+# Heavily copying from convert2vtk.sh
 
 # --- Cleanup things when the user presses Ctrl-C or the script finishes.
 trap cleanup 1 2 3 6
@@ -28,7 +27,7 @@ function cleanup () {
 
 function usage () {
   echo ""
-  echo "Convert JOREK restart files to Poincare for visualization."
+  echo "Convert JOREK restart files into 2D/3D VTK files for visualization."
   echo ""
   echo "Usage: `basename $0` [options] binary infile [extra-files]"
   echo ""
@@ -39,20 +38,19 @@ function usage () {
   echo "  -only <step>-<step>         Convert only time steps in the given range"
   echo "  -only <step>-<dstep>-<step> Convert only time steps in the given range with given interval"
   echo "  -donly <dstep>              Equivalent to -only 0-<dstep>-99999"
-  echo "  -time <time>,<time>         Selects time step roughly at <time> (JOREK-units)"
+  echo "  -time <time>,<time>         Selects time step roughly at <time> (default in JOREK-units)"
   echo "  -time <time>-<dtime>-<time> Selects time step within given time range with given interval"
   echo "  -dtime <dtime>              Equivalent to -time 0-<dtime>-infinity"
   echo "  -ms                         -time is given in milliseconds instead of in JOREK-units"
   echo "  -l                          Creates a file containing all selected timesteps and times,"
   echo "                              if parameter -(d)time is used (default:off)"
-  echo "  -zip                        Compress the .dat files using gzip"
-  echo "  -tool                       Using jorek2_poincare or poincare? [default:jorek2_poincare]"
-  echo "  -input_poinc                Input file for jorek2_poincare / poincare [default:stpts / pncr]"
-  echo "  -5digits                    Use old 5-digit restart file index (instead of 6)"
+  echo "  -zip                        Compress the .vtk files using gzip"
   echo ""
-  echo "  binary                      executable (jorek2poincare)"
-  echo "  infile                      Input file of the corresponding JOREK run"
-  echo "  extra-files                 Additional files that are required for running"
+  echo ""
+  echo "  binary                      executable (CARIDDI_wall_curr)"
+  echo ""
+  echo "Remarks:"
+  echo "  options are provided in CARIDDI_plot.nml as described here https://www.jorek.eu/wiki/doku.php?id=cariddi-plotting"
   echo ""
 }
 
@@ -106,49 +104,58 @@ function is_selected () {
 function do_convert () {
   file="$1"
   ithread="$2"
-
+  
   cd ${tmpdir[$ithread]}
-
+  
   stepnum=${file##*/} # Remove directory from filename
   if [ "$use_5digits" == "yes" ]; then
     stepnum=${stepnum:5:5}
   else
     stepnum=${stepnum:5:6}
   fi
-
-  if [ "$poinc_tool" == "poincare" ]; then
-    targetFile0="$targetDir/poincare.$stepnum.h5" # Target filename with same number as source
-  else
-    targetFile0="$targetDir/poinc_R-Z.$stepnum.dat" # Target filename with same number as source
-    targetFile1="$targetDir/poinc_rho-theta.$stepnum.dat" # Target filename with same number as source
+  targetFile="$stepnum.vtk" # Target filename with same number as source
+  targetFile="$targetDir/$targetFile" # Target filename with full path
+  targetFile1="$stepnum.vtk"
+  exist='true'
+  pattern='false'
+  for copyfile in $copyfiles; do
+      cp $startDir/$copyfile .
+  done
+  filenames=$(grep "comp_name" CARIDDI_plot.nml | sed 's/!.*//' | awk -F "'" '{ for(i=2; i<NF; i+=2) print $i }')
+  if [ -z "$filenames" ]; then
+      filenames='CARIDDI_all'
   fi
+  for f in $filenames
+  do
+      pattern='false'
+      f=${f//,/}         # remove commas
+      a=${f//\'/}        # remove single quotes
+      for fi in ${targetDir}/"$f"*"$targetFile1" 
+      do
+          [[ ! -e "$fi" ]] && continue  # skip if glob doesn't match anything
+
+          if [[ ${fi##*/} =~ ^${a}\.[0-9]+\.vtk$ || ${fi##*/} =~ ^${a}\.[0-9]+\.[0-9]+\.vtk$ ]]; then
+              pattern='true'
+              if  [ "$file" -nt "$fi" ]  \
+	              &&  ( [ ! -z "$select_arguments" ] || [ `is_selected $stepnum` == "yes" ] ) ; then
+                  exist='false'
+              fi
+          fi
+      done
+  done
 
   # Convert only new, selected restart files
   #   If -only flag is used, $select_arguments is empty and selection of steps is carried out below via 'is_selected'.
   #   If -time flag is used, selection of steps has happened before by python and every incoming step is accepted here.
-  if ( [ ! -e $targetFile0 ] || [ "$file" -nt "$targetFile0" ] ) \
-    &&  ( [ ! -z "$select_arguments" ] || [ `is_selected $stepnum` == "yes" ] ) ; then
+  if ( [ "$exist" == 'false' ]  || [ "$pattern" == 'false' ] ); then
     rm -f jorek_restart.${RST_TYPE}
     ln -s $file jorek_restart.${RST_TYPE}
-    for copyfile in $copyfiles; do
-      cp $startDir/$copyfile .
-    done
-    if [ "$poinc_tool" == "jorek2_poincare" ]; then
-      if [ "$input_poinc" != "stpts" ]; then
-        mv "$input_poinc" "stpts"
-      fi
-    else
-      if [ "$input_poinc" != "pncr" ]; then
-        mv "$input_poinc" "pncr"
-      fi
-    fi
 
-    if [ "$poinc_tool" == "poincare" ]; then
-      mpirun -n 1 $binary < $infile > ./log 2>&1
-    else 
-      $binary < $infile > ./log 2>&1
+    if [ -f CARIDDI_plot.nml ]; then
+	struct_path="${struct_path}/"
+	sed -i "s@dir_struct\s*=\s*'[^']*'@dir_struct = '$struct_path'@" CARIDDI_plot.nml
     fi
-
+    $binary  > ./log 2>&1
     if [ $? -ne 0 ]; then
       if [ ! -f $ERROR_STOP_FILE ]; then
         touch $ERROR_STOP_FILE
@@ -164,23 +171,17 @@ function do_convert () {
     else
       egrep -i "warning|restart time" ./log
     fi
-    if [ "$poinc_tool" == "jorek2_poincare" ]; then
-      mv poinc_R-Z.dat $targetFile0
-      mv poinc_rho-theta.dat $targetFile1
-    else
-      mv poincare.h5 $targetFile0
-    fi
 
+    for fi in *vtk; do
+        name="${fi%.vtk}"
+        mv $fi "$targetDir/$name.$targetFile1"
+    done
     if [ "$zipfiles" == "yes" ]; then
-      rm -f ${targetFile0}.gz
-      gzip $targetFile0
-      if [ "$poinc_tool" == "jorek2_poincare" ]; then 
-        rm -f ${targetFile1}.gz
-        gzip $targetFile1
-      fi
-    fi 
+      rm -f ${targetFile}.gz
+      gzip $targetFile
+    fi
+    echo "$stepnum finished"
   fi
-  
   unmark_running $ithread
 }
 
@@ -192,11 +193,7 @@ SCRIPTDIR=`dirname $0`; SCRIPTDIR=`readlink -f $SCRIPTDIR`
 
 # --- Process command line parameters
 nthreads="1"
-customdir=""
-input_poinc="stpts"
-poinc_tool="jorek2_poincare"
 use_5digits="no"          # use old restart file index format with 5 digits
-select_arguments=""
 
 # First pass: detect -5digits early
 for arg in "$@"; do
@@ -210,7 +207,8 @@ if [ "$use_5digits" == "yes" ]; then
 else
   selected_steps="0-999999"
 fi
-
+select_arguments=""
+customdir=""
 while [ $# -gt 1 ]; do
   if [ "$1" == "-j" ]; then
     nthreads="$2"
@@ -240,12 +238,6 @@ while [ $# -gt 1 ]; do
   elif [ "$1" == "-zip" ]; then
     zipfiles="yes"
     shift 1
-  elif [ "$1" == "-input_poinc" ]; then
-    input_poinc="$2"
-    shift 2
-  elif [ "$1" == "-tool" ]; then
-    poinc_tool="$2"
-    shift 2
   elif [ "$1" == "-5digits" ]; then
     use_5digits="yes"
     shift
@@ -262,9 +254,8 @@ while [ $# -gt 1 ]; do
 done
 
 
-
 # --- Some parameter checks
-if [ $# -lt 2 ]; then
+if [ $# -lt 1 ]; then
   echo "ERROR: Not enough parameters."
   usage
   exit 1
@@ -284,25 +275,11 @@ if [[ ! "$selected_steps" =~ $regexp_steps   ]]; then
   exit 1
 fi
 
-if [ $poinc_tool != "jorek2_poincare" ] && [ $poinc_tool != "poincare" ]; then
-  echo "ERROR: Wrong poincare tool. Use either jorek2_poincare or poincare"
-  usage
-  exit 1
-fi
-
-if [ "$poinc_tool" == "poincare" ]; then
-  if [ "$input_poinc" == "stpts" ]; then
-    input_poinc="pncr"  
-  fi
-fi
 
 binary=`readlink -f $1`
 shift
-infile=`readlink -f $1`
-shift
 sourceDir=`readlink -f .`
-copyfiles=`grep _file $infile | grep -v '^ *!' | sed -e "s/^.*= *[\"']\(.*\)[\"'].*$/\1/" | grep -v 'none'`
-copyfiles="$copyfiles $input_poinc $@"
+copyfiles="$copyfiles $@"
 for copyfile in $copyfiles; do
   if [ ! -f "$copyfile" ]; then
     echo "ERROR: Extra-file '$copyfile' does not exist."
@@ -310,6 +287,8 @@ for copyfile in $copyfiles; do
     exit 1
   fi
 done
+echo "extra files" $copyfiles
+
 
 
 
@@ -317,7 +296,9 @@ done
 if [ ! -z "$customdir" ]; then
   dir="$customdir"
 else
-  dir="./poincare_dir"
+    dir="./CARIDDI_plot"
+    threeD="no"
+    target="no"
 fi
 
 
@@ -325,10 +306,6 @@ fi
 # --- Some basic checks
 if [ ! -f $binary ]; then
   echo "ERROR: $binary does not exist."
-  usage
-  exit 1
-elif [ ! -f $infile ]; then
-  echo "ERROR: $infile does not exist."
   usage
   exit 1
 elif [ ! -d $sourceDir ]; then
@@ -344,7 +321,7 @@ fi
 
 
 # ---- Detect restart file type
-. ${SCRIPTDIR}/detect_rst_type.sh -d5 "$use_5digits"
+. ${SCRIPTDIR}/detect_rst_type.sh -d5 $use_5digits
 if [ "$RST_TYPE" != "h5" ] && [ "$RST_TYPE" != "rst" ]; then
   echo "ERROR: RST_TYPE not detected properly: $RST_TYPE"
   usage
@@ -371,8 +348,7 @@ else
 fi
 
 
-
-# --- Create directory for poincare files
+# --- Create directory for vtk files
 echo "Writing files to dir='$dir'."
 startDir=`pwd`
 mkdir -p $dir || exit 1
@@ -381,10 +357,29 @@ targetDir=`readlink -f $dir`
 
 
 # --- Create local temporary directory
-local_tmp_dir0="tmp_poinc_$$"
+local_tmp_dir0="tmp_CAR_$$"
 mkdir -p $local_tmp_dir0
 local_tmp_dir=`readlink -f $local_tmp_dir0` # absolute path
 ERROR_STOP_FILE="$local_tmp_dir/ERROR_STOP"
+
+
+
+if [ -f "CARIDDI_plot.nml" ]; then
+  # If parameters -nsub, -i_tor, -i_plane were not provided, but
+  # a vtk.nml file exists, include it automatically
+  struct_path=$(grep -oP "^\s*dir_struct\s*=\s*'\K[^']+" CARIDDI_plot.nml )
+  if [ -z $struct_path ]; then
+      struct_path="./"
+  fi
+  struct_path=$(readlink -f $struct_path)
+  copyfiles="$copyfiles CARIDDI_plot.nml"
+else
+    vtk_nml="$local_tmp_dir0/CARIDDI_plot.nml"
+    echo "&CARIDDI_plot"               > $vtk_nml
+    echo "/"                        >> $vtk_nml
+    struct_path='./'
+    copyfiles="$copyfiles $vtk_nml"
+fi
 
 
 
@@ -398,7 +393,6 @@ done
 if [[ "$selected_steps" == "0-99999" || "$selected_steps" == "0-999999" ]]; then
   selected_available_files=$file_available_restarts
 else
-  file_available_restarts="available_restart_files.txt"
   file_selected_restarts="selected_restart_files.txt"
   rm -f $file_selected_restarts
   step_ranges=`echo $selected_steps | tr ',' ' '`
@@ -413,7 +407,6 @@ else
     fi
 
     for i in `seq $istart $istep $iend`; do
-      padnumber=`printf "%05d" $i`
       if [ "$use_5digits" == "yes" ]; then
         padnumber=`printf "%05d" $i`
       else
@@ -422,7 +415,7 @@ else
       echo $padnumber >> $file_selected_restarts
     done
   done
- 
+
   selected_available_files='selected_available_files.txt'
 
   grep -f $file_selected_restarts $file_available_restarts > $selected_available_files
@@ -438,7 +431,7 @@ while IFS= read -r file; do
   ithread=`get_available_thread`
   if [ ! -f "$ERROR_STOP_FILE" ]; then
     mark_running $ithread
-    do_convert $file $ithread &
+    do_convert $file $ithread  &
   fi
 done < $selected_available_files
 rm -f $file_available_restarts $selected_available_files

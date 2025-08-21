@@ -1,7 +1,7 @@
 &in1
- use_pastix    = .f.
+ use_pastix    = .t.
  use_mumps     = .f.
- use_strumpack = .t.
+ use_strumpack = .f.
 
  n_tor_fft_thresh = 2
 

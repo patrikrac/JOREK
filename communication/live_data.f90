@@ -735,9 +735,9 @@ module live_data
       thmwork_tot_t, viscopar_dissip_tot_t, viscopar_flux_t, li3_t, friction_dissip_tot_t,     &
       li3_tot_t, part_src_tot_t, heat_src_tot_t, volume_t, area_t, mag_ener_src_tot, eta_ohmic, eta, &
       dpart_tot_dt, part_flux_Dpar_t, part_flux_Dperp_t, part_flux_vpar_t, part_flux_vperp_t, &
-      dnpart_tot_dt, npart_tot_t, npart_flux_t, density_tot_t, flux_poynting_t, xtime_rad_power,Px_t, Py_t, dPx_dt, dPy_dt, &
-      xtime_E_ion_power, thermal_e_tot_t, thermal_i_tot_t, xtime_P_ei, visco_par, visco_par_heating, &
-      visco_dissip_tot_t, visco, visco_heating
+      dnpart_tot_dt, npart_tot_t, npart_flux_t, density_tot_t, flux_poynting_t, xtime_rad_power, xtime_rad_cooling_power, &
+      Px_t, Py_t, dPx_dt, dPy_dt, xtime_E_ion_power, thermal_e_tot_t, thermal_i_tot_t, xtime_P_ei, &
+      visco_par, visco_par_heating, visco_dissip_tot_t, visco, visco_heating
       
 
 
@@ -836,6 +836,8 @@ module live_data
 
 #if (defined WITH_Neutrals) || (defined WITH_Impurities)
     if (index>1) then
+
+      !> note the dissipative_terms diagnostics uses the radiation power (xtime_rad_power) rather than the radiative cooling power (xtime_rad_cooling_power)
       write(LIVE_DATA_HANDLE,'(A,7ES17.9)') '@dissipative_terms: ', xtime(index-1), ohmic_tot_t(index-1), friction_dissip_tot_t(index-1), &
                                                                     visco_dissip_tot_t(index-1),  viscopar_dissip_tot_t(index-1),         &
                                                                     xtime_rad_power(index-1), xtime_E_ion_power(index-1)
@@ -864,7 +866,8 @@ module live_data
                        + viscopar_dissip_tot_t(index-1)*(1.d0 - visco_par_heating/max(visco_par,1d-20))
 
 #if (defined WITH_Neutrals) || (defined WITH_Impurities)
-     sum_fluxes_dissip = sum_fluxes_dissip + xtime_rad_power(index-1) + xtime_E_ion_power(index-1)
+      !> note the radiative cooling power is used below for energy conservation, rather than the radiative power
+     sum_fluxes_dissip = sum_fluxes_dissip + xtime_rad_cooling_power(index-1) + xtime_E_ion_power(index-1)
 #endif
 
      sum_mag_energy_terms = -ohmic_tot_t(index-1) + flux_poynting_t(index-1) + Magwork_tot_t(index-1) + mag_ener_src_tot(index-1) 

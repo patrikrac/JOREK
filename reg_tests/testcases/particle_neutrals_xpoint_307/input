@@ -14,6 +14,8 @@
   use_manual_random_seed = .true.
   manual_seed = 498932990
 
+  use_fixed_rng_value = .true.
+
   use_ncs = .true.
   use_pcs = .f.
   use_ccs = .f.
@@ -34,6 +36,8 @@
   time_evol_scheme= 'Gears'
   use_mumps_eq  = .true.
   use_pastix_eq = .false.
+  use_pastix_prj = .false.
+  use_mumps_prj = .true.
   T_min_neg     = 4.d-4
   rho_min_neg   =  1.d-3
 

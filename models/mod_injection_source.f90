@@ -328,6 +328,12 @@ module mod_injection_source
 
       do i_inj = 1,n_inj
 
+        if (present(source_background_drift_arr) .or. present(source_impurity_drift_arr)) then
+          if (drift_distance(i_inj) /= 0.d0 .and. i_main_imp/=0) then ! For non-pure D SPI
+            write(*,*) 'WARNING: Do you really want to put <plasmoid teleportation> to non-pure D SPI?'
+          end if
+        end if
+
         do i = 1,n_spi(i_inj)
           spi_i = n_spi_begin + i - 1
 
@@ -363,11 +369,7 @@ module mod_injection_source
                               pellets(spi_i)%spi_psi_drift,pellets(spi_i)%spi_grad_psi_drift, &
                               ns_radius_loc,ns_deltaphi,ns_delta_minor_rad,ns_tor_norm, &
                               A_Dmv,K_Dmv,V_Dmv,P_Dmv,t_ns(i_inj),0., R, Z, phi, psi, &
-                              source_tmp_drift,t_now,JET_MGI,ASDEX_MGI,central_density,central_mass,spi_vol_tmp_drift,i_main_imp)
-
-                  if (pellets(spi_i)%spi_species > 0.) then
-                    write(*,*) 'WARNING: Do you really want to put <plasmoid teleportation> to non-pure D SPI?'
-                  end if 
+                              source_tmp_drift,t_now,JET_MGI,ASDEX_MGI,central_density,central_mass,spi_vol_tmp_drift,i_main_imp) 
 
                 else
                   source_tmp_drift = 0.d0

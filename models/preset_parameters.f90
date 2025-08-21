@@ -192,6 +192,7 @@ subroutine preset_parameters
   T_jropes       = 0.d0
 
   bootstrap = .false.
+  bootstrap_psin_cutoff = 0.9995
 
   ellip  = 1.d0
   tria_u = 0.d0
@@ -640,14 +641,18 @@ subroutine preset_parameters
   current_prof_initialized = .false.
   
   use_mumps          = .false.              ! Use MUMPS solver
-  use_pastix         = .true.               ! Use PASTIX solver
-  use_strumpack      = .false.              ! Use STRUMPACK solver  
+  use_pastix         = .false.              ! Use PASTIX solver
+  use_strumpack      = .true.               ! Use STRUMPACK solver  
   use_wsmp           = .false.              ! Use WSMP solver (use with care, still in development!)
   
   use_mumps_eq       = .false.              ! Use MUMPS equilibrium solver
   use_pastix_eq      = .false.              ! Use PASTIX equilibrium solver
   use_strumpack_eq   = .false.              ! Use STRUMPACK equilibrium olver  
   
+  use_mumps_prj      = .true.               ! Use MUMPS equilibrium solver
+  use_pastix_prj     = .false.              ! Use PASTIX equilibrium solver
+  use_strumpack_prj  = .false.              ! Use STRUMPACK equilibrium olver  
+
   refinement         = .false.              ! enable mesh refinement
   force_central_node = .true.               ! force all nodes in the grid center to have the same values in flux surface aligned grids
   fix_axis_nodes     = .false.              ! Fix t-derivative and cross st-derivative on axis to avoid noise
@@ -873,7 +878,8 @@ Z_valve2      = 0.d0
 
 use_manual_random_seed = .false.
 manual_seed = 498932990          !< chosen arbitarily
-
+use_fixed_rng_value = .false.
+fixed_rng_value = 0.5
 eps_noise = 0.0d0
 
 end subroutine preset_parameters

@@ -1,6 +1,6 @@
 &imas_params
   shot_number = 111111
-  run_number  = 1
+  run_number  = run_number_replace
   database    = 'imas_regtest_db'
 !!  user        = 'artolaj'
   export_1d_profiles = .true.

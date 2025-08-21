@@ -54,6 +54,7 @@ module mod_sparse_data
     integer                     :: iter_prev = 0                       !< number of iterations in the previous step
     integer                     :: iter_gmres                          !< number of iterations in the current step
     real(kind=8)                :: iter_tol                            !< iterative convergence criteria
+    integer                     :: gmres_m=40                          !< number of iterations before GMRES restart
     logical                     :: solve_only = .false.                !< flag for updating PC matrix (.true. - no update/factorization needed)
     logical                     :: step_success = .false.              !< flag indicating successfull time step completion
     logical                     :: iterative = .false.                 !< flag indicating use of iterative solver
@@ -62,6 +63,7 @@ module mod_sparse_data
 
     integer                     :: library = pastix                    !< solver library (default=pastix)
 
+    logical                     :: gpu     = .false.                   !< Perform the solution of the linear system on the device
     logical                     :: verbose = .true.                    !< flag for logfile printout
 
     logical                     :: projection = .false.                !< flag to set ONLY if using with the project particles module, it assumes matrix assembled only on rank zero and multiple rhs, use with care
@@ -77,7 +79,7 @@ module mod_sparse_data
 !> Set solver parameters
   subroutine setup(self)
     use phys_module, only: gmres, iter_precon, gmres_max_iter, max_steps_noUpdate, gmres_tol, &
-                           use_pastix, use_mumps, use_strumpack, use_newton
+                           use_pastix, use_mumps, use_strumpack, use_newton, gmres_m
     class(type_SP_SOLVER)     :: self
 
     self%iterative          = gmres
@@ -86,6 +88,7 @@ module mod_sparse_data
     self%iter_max           = gmres_max_iter
     self%max_steps_noUpdate = max_steps_noUpdate
     self%iter_tol           = gmres_tol
+    self%gmres_m            = gmres_m
     self%iter_prev          = 0
     self%n_since_update     = 0
     self%use_newton         = use_newton

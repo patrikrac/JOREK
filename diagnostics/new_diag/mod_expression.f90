@@ -637,8 +637,8 @@ module mod_expression
 
 #if (defined WITH_Neutrals) || (defined WITH_Impurities)
     real*8  :: Te_corr_eV, Te_eV
-    real*8  :: LradDrays_T, LradDcont_T, Sion_T, Srec_T
-    real*8  :: dLradDrays_dT, dLradDcont_dT, dSion_dT, dSrec_dT
+    real*8  :: LradDrays_T, LradDcont_T, LradDcont_corr, Sion_T, Srec_T
+    real*8  :: dLradDrays_dT, dLradDcont_dT, dLradDcont_dT_corr, dSion_dT, dSrec_dT
     real*8  :: ne_SI, ne_JOREK                              ! Electron density used in radiation rate
     real*8  :: Lrad_imp, r_imp_bg, frad_bg
     integer :: i_imp
@@ -1524,8 +1524,8 @@ module mod_expression
    Te_eV = Te0/(EL_CHG*MU_ZERO*central_density * 1.d20)
 
    if (use_imp_adas) then
-     call atomic_coeff_deuterium(Te0_corr, Sion_T, dSion_dT, Srec_T, dSrec_dT,        &
-                                LradDcont_T, dLradDcont_dT, LradDrays_T, dLradDrays_dT, r0, rn0, .true. ) 
+     call atomic_coeff_deuterium(Te0_corr, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradDcont_T, dLradDcont_dT, &
+                                 LradDcont_corr, dLradDcont_dT_corr, LradDrays_T, dLradDrays_dT, r0, rn0, .true. ) 
      ! Note the inputs and outputs of atomic_coeff_deuterium are all in JOREK units!!!
 
     !--------------------------------------------------------
@@ -2087,7 +2087,7 @@ module mod_expression
                 res = J_boot / R / fact_mu_zero
 
 #if (defined WITH_Neutrals) && (!defined WITH_Impurities)
-              case ( 'radiation' )
+              case ( 'radiation' ) !< outputs radiation power (i.e. what a bolometer would measure), rather than the radiative cooling
 
                 if (rn0 .lt. 0.d0) then
                   res = r0 * r0 * LradDcont_T * fact_rad &
@@ -2098,7 +2098,7 @@ module mod_expression
                        + r0 * fact_ne * frad_bg
                 endif
 
-              case ( 'brem' )
+              case ( 'brem' ) !< outputs radiation power (i.e. what a bolometer would measure), rather than the radiative cooling
                 res = r0 * r0 * LradDcont_T * fact_rad
 
               case ('line_rad')

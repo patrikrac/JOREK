@@ -36,9 +36,10 @@ subroutine solve_strumpack_all(spss, ad_mat, rhs_vec, solve_only, tag)
 
   if ((tag.ge.0).and.(my_id.eq.0)) verbose = .true.
 
-  if (.not.solve_only) then
+  if (.not. solve_only) then
 
-    centralize = (n_cpu.gt.1).and.(.not.ad_mat%row_distributed)
+    ! in projection the matrix is already centralized
+    centralize = (n_cpu.gt.1).and.(.not.ad_mat%row_distributed).and. .not. spss%projection
 
     if (centralize) then
 

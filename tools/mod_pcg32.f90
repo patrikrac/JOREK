@@ -1,5 +1,6 @@
 module mod_pcg32
 use iso_c_binding, only: c_int32_t, c_int64_t
+use phys_module, only: use_fixed_rng_value, fixed_rng_value
 implicit none
 private
 public pcg_state_setseq_64, pcg32_random_doubles_r, pcg32_random_double_r, pcg32_srandom_r, pcg32_jumpahead
@@ -42,6 +43,7 @@ contains
     integer :: i
     do i=1,size(out,1)
       out(i) = pcg32_random_double_r(rng)
+      if (use_fixed_rng_value) out(i) = fixed_rng_value
     end do
   end subroutine pcg32_random_doubles_r
 

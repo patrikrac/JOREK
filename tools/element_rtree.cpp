@@ -6,49 +6,38 @@
 
 #include "RTree.h"
 
-extern "C" { // prevent name mangling
-using namespace std;
+#if STELLARATOR_MODEL
+constexpr unsigned int ND = 3;
+#else
+constexpr unsigned int ND = 2;
+#endif
 
-typedef int ValueType;
-typedef RTree<ValueType, double, 2, double> MyTree;
-// Persistent tree
-static MyTree ElementTree;
+extern "C"
+{ // prevent name mangling
+    using namespace std;
 
-void PopulateTree(int n, double minx[], double miny[], double maxx[], double maxy[])
-{
-  int i;
-  double min[2], max[2];
-  ElementTree.RemoveAll();
-  for(i=0; i<n; i++)
-  {
-    min[0] = minx[i];
-    min[1] = miny[i];
-    max[0] = maxx[i];
-    max[1] = maxy[i];
-    ElementTree.Insert(min, max, i+1); // store element number (1-based)
-  }
-}
+    typedef int ValueType;
+    typedef RTree<ValueType, double, ND, double> MyTree;
+    // Persistent tree
+    static MyTree ElementTree;
 
-// Return the number of elements in a rectangle
-int NumElementsInRect(double minx, double miny, double maxx, double maxy)
-{
-  double min[2], max[2];
-  min[0] = minx;
-  min[1] = miny;
-  max[0] = maxx;
-  max[1] = maxy;
-  return ElementTree.Search(min, max, NULL, NULL);
-}
+    void PopulateTree(int n, int n_plane, double *min, double *max)
+    {
+        ElementTree.RemoveAll();
+        for (unsigned int i = 0; i < n * n_plane; i++)
+            ElementTree.Insert(min + i * ND, max + i * ND, (i / n_plane) + 1); // store element number (1-based)
+    }
 
-// Return element indices of elements contained within the rectangle in element_tree
-// i_elm must be allocated by the caller to size at least nelm.
-int ElementsInRect(double minx, double miny, double maxx, double maxy, int *ielm)
-{
-  double min[2], max[2];
-  min[0] = minx;
-  min[1] = miny;
-  max[0] = maxx;
-  max[1] = maxy;
-  return ElementTree.Search(min, max, NULL, ielm);
-}
+    // Return the number of elements in a rectangle
+    int NumElementsInRect(double *min, double *max)
+    {
+        return ElementTree.Search(min, max, NULL, NULL);
+    }
+
+    // Return element indices of elements contained within the rectangle in element_tree
+    // i_elm must be allocated by the caller to size at least nelm.
+    int ElementsInRect(double *min, double *max, int *ielm)
+    {
+        return ElementTree.Search(min, max, NULL, ielm);
+    }
 }

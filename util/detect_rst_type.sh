@@ -8,6 +8,7 @@ function print_help() {
   echo " -h        Print this help text"
   echo " -n NNNNN  Detect restart type based on a certain time step"
   echo " -v        Print additional information"
+  echo " -d5       Detect 5 digit restart file"
 }
 
 if [ "$1" == "-h" ]; then
@@ -19,12 +20,19 @@ function set_rst_type() {
   export RST_TYPE="$1"
 }
 
-timestep="[0-9][0-9][0-9][0-9][0-9]"
 verbose="0"
+timestep="[0-9][0-9][0-9][0-9][0-9][0-9]"
 while [ $# -gt 0 ]; do
   if [ "$1" == "-n" ]; then
     timestep="$2"
     shift 2
+  elif [ "$1" == "-d5" ]; then
+      if [ "$2" == "yes" ]; then
+          timestep="[0-9][0-9][0-9][0-9][0-9]"
+      else
+          timestep="[0-9][0-9][0-9][0-9][0-9][0-9]"
+      fi
+      shift 2
   elif [ "$1" == "v" ]; then
     verbose="1"
     shift

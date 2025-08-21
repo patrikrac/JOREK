@@ -1,4 +1,49 @@
 subroutine find_RZ(node_list,element_list,R_find,Z_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
+  use data_structure, only: type_node_list, type_element_list
+  use phys_module, only: i_plane_rtree
+  use constants, only: PI
+  use mod_parameters, only: n_period, n_plane
+
+  implicit none 
+
+  type (type_node_list),    intent(in)    :: node_list
+  type (type_element_list), intent(in)    :: element_list
+  real*8,                   intent(in)    :: R_find, Z_find
+  real*8,                   intent(out)   :: R_out,Z_out,s_out,t_out
+  integer,                  intent(inout) :: ielm_out
+  integer,                  intent(out)   :: ifail
+
+  real*8 :: phi
+  integer :: checked_elms
+
+  phi = 2.d0*pi*float(i_plane_rtree - 1)/float(n_period*n_plane)
+
+  call find_RZ_general(node_list,element_list,R_find,Z_find,phi,R_out,Z_out,ielm_out,s_out,t_out,ifail,checked_elms)
+end subroutine find_RZ
+
+
+subroutine find_RZP(node_list,element_list,R_find,Z_find,phi_find,R_out,Z_out,ielm_out,s_out,t_out,ifail,checked_elms)
+  use data_structure, only: type_node_list, type_element_list
+  use constants, only: PI
+  use mod_parameters, only: n_coord_period
+  
+  implicit none
+
+  type (type_node_list),    intent(in)    :: node_list
+  type (type_element_list), intent(in)    :: element_list
+  real*8,                   intent(in)    :: R_find, Z_find, phi_find
+  real*8,                   intent(out)   :: R_out,Z_out,s_out,t_out
+  integer,                  intent(inout) :: ielm_out
+  integer,                  intent(out)   :: ifail, checked_elms
+
+  real*8 :: phi 
+
+  phi = phi_find - (PI * 2.d0 / n_coord_period) * floor(phi_find / (PI * 2.d0 / n_coord_period))
+
+  call find_RZ_general(node_list,element_list,R_find,Z_find,phi,R_out,Z_out,ielm_out,s_out,t_out,ifail,checked_elms)
+end subroutine
+
+subroutine find_RZ_general(node_list,element_list,R_find,Z_find,phi_find,R_out,Z_out,ielm_out,s_out,t_out,ifail,checked_elms)
 !-------------------------------------------------------------------------
 !< Find all elements for which minmax is correct and run find_RZ_single on those.
 !< Return the first result.
@@ -11,17 +56,22 @@ use mod_quadtree
 #else
 use mod_element_rtree, only: elements_containing_point  
 #endif
+
 implicit none
 
 type (type_node_list), intent(in)    :: node_list
 type (type_element_list), intent(in) :: element_list
-real*8, intent(in)     :: R_find, Z_find
+real*8, intent(in)     :: R_find, Z_find, phi_find
 real*8, intent(out)    :: R_out,Z_out,s_out,t_out
 integer, intent(inout) :: ielm_out
-integer, intent(out)   :: ifail
+integer, intent(out)   :: ifail, checked_elms
 
-integer :: k
-integer, dimension(:), allocatable :: i_elms
+integer :: k, nb, i_neighbour
+integer, dimension(:), allocatable :: i_elms, neighbours
+
+integer, dimension(:), allocatable :: queue
+logical, dimension(:), allocatable :: visited
+integer :: queue_head, queue_tail
 
 ielm_out = 0
 #ifdef USE_NO_TREE
@@ -29,21 +79,82 @@ call elements_containing_point_no_tree(R_find, Z_find, i_elms)
 #elif USE_QUADTREE
 call elements_containing_point_quadtree(R_find, Z_find, i_elms)
 #else
-call elements_containing_point(R_find, Z_find, i_elms)
+call elements_containing_point(R_find, Z_find, phi_find, i_elms)
 #endif
 
 ! then loop through all
 do k=1,size(i_elms)
-  call find_RZ_single(node_list,element_list,i_elms(k),R_find,Z_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
-  if (ifail .eq. 0) exit
+  call find_RZ_single(node_list,element_list,i_elms(k),R_find,Z_find,phi_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
+  if (ifail == 0) then 
+    checked_elms = k
+    return
+  endif
 enddo
+
+checked_elms = size(i_elms)
+
+allocate(neighbours(element_list%n_elements))
+
+allocate(queue(element_list%n_elements), visited(element_list%n_elements))
+
+! Initialize visited array and queue
+visited = .false.
+queue = 0
+queue_head = 1
+queue_tail = 1
+
+! Add initial elements to the queue and mark as visited
+do k = 1, size(i_elms)
+    if (.not. visited(i_elms(k))) then
+        visited(i_elms(k)) = .true.
+        queue(queue_tail) = i_elms(k)
+        queue_tail = queue_tail + 1
+    endif
+enddo
+
+! Start the Breadth-First Search
+search_loop: do while (queue_head < queue_tail)
+  ! Get the current element from the front of the queue
+  k = queue(queue_head)
+  queue_head = queue_head + 1
+
+  ! Check all neighbors of the current element
+  do nb = 1, size(element_list%element(k)%neighbours)
+    i_neighbour = element_list%element(k)%neighbours(nb)
+
+    ! If neighbor is valid and not visited yet
+    if (i_neighbour > 0) then
+      if (.not. visited(i_neighbour)) then
+        
+        ! Mark as visited and add to the back of the queue
+        visited(i_neighbour) = .true.
+        queue(queue_tail) = i_neighbour
+        queue_tail = queue_tail + 1
+
+        checked_elms = checked_elms + 1
+        
+        ! Now, try to find the point in this new neighbor element
+        call find_RZ_single(node_list,element_list,i_neighbour,R_find,Z_find,phi_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
+        
+        ! If found, exit everything
+        if (ifail == 0) then
+          deallocate(queue, visited)
+          exit search_loop
+        end if
+      end if
+    end if
+  end do
+end do search_loop
+
+if (allocated(queue)) deallocate(queue, visited)
 
 if (ielm_out .eq. 0) ifail = 99
 if (ifail .eq. 999) ielm_out = 0 ! Otherwise testing ielm=0 on output does not
 ! work anymore (and we don't always check ifail)
-end subroutine find_RZ
 
-subroutine find_RZ_single(node_list,element_list,i_elm,R_find,Z_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
+end subroutine find_RZ_general
+
+subroutine find_RZ_single(node_list,element_list,i_elm,R_find,Z_find,phi_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
 !-------------------------------------------------------------------------
 !< solves two non-linear equations using Newtons method (from numerical recipes)
 !< LU decomposition replaced by explicit solution of 2x2 matrix.
@@ -54,14 +165,13 @@ subroutine find_RZ_single(node_list,element_list,i_elm,R_find,Z_find,R_out,Z_out
 use data_structure
 use mod_interp, only: interp_RZP
 use constants, only: pi
-use mod_parameters, only: n_period, n_plane
-use phys_module, only: i_plane_rtree
 implicit none
 
 type (type_node_list), intent(in)    :: node_list
 type (type_element_list), intent(in) :: element_list
 integer, intent(in)    :: i_elm
-real*8, intent(in)     :: R_find, Z_find
+real*8, intent(in)     :: R_find, Z_find, phi_find
+
 real*8, intent(out)    :: R_out,Z_out,s_out,t_out
 integer, intent(out)   :: ielm_out
 integer, intent(out)   :: ifail
@@ -70,12 +180,11 @@ integer :: i, ntrial, istart
 real*8  :: RRg1,dRRg1_dr,dRRg1_ds
 real*8  :: ZZg1,dZZg1_dr,dZZg1_ds
 real*8  :: tolx, tolf, errx, errf, temp, dis, dummy
-real*8  :: x(2), FVEC(2), FJAC(2,2), p(2), phi
+real*8  :: x(2), FVEC(2), FJAC(2,2), p(2)
 
 ntrial = 20
 tolx = 1.d-8
 tolf = 1.d-15
-phi = 2.d0*pi*float(i_plane_rtree - 1)/float(n_period*n_plane)
 
 ielm_out = i_elm ! Since we only test a single element
 
@@ -101,7 +210,7 @@ do istart = 1,5
   ifail = 999
 
   do i=1,ntrial
-    call interp_RZP(node_list,element_list,i_elm,x(1),x(2),phi,RRg1,dRRg1_dr,dRRg1_ds,dummy,dummy,dummy,dummy,dummy,dummy,dummy, &
+    call interp_RZP(node_list,element_list,i_elm,x(1),x(2),phi_find,RRg1,dRRg1_dr,dRRg1_ds,dummy,dummy,dummy,dummy,dummy,dummy,dummy, &
                                                                ZZg1,dZZg1_dr,dZZg1_ds,dummy,dummy,dummy,dummy,dummy,dummy,dummy)
 
     FVEC(1)   = RRg1 - R_find

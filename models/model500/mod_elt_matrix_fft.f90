@@ -116,6 +116,9 @@ real*8     :: coef_rec_1                                      ! Recombination ra
 !   -Radiation from injected gas/impurities
 real*8     :: LradDrays_T, dLradDrays_dT                      ! Line (/rays) radiation rate and its derivative wrt. temperature
 real*8     :: LradDcont_T, dLradDcont_dT                      ! Continuum (Brem.) radiation rate and its derivative wrt. T
+real*8     :: LradDcont_corr, dLradDcont_dT_corr              ! LradDcont_T corrected for potential extra counting of dielectronic cascade energy loss
+                                                              ! (see mod_atomic_coeff_deuterium for more details)
+                                                              ! remains in the electron fluid
 real*8     :: Te_corr_eV, Te_eV                               ! Temperature used in radiation rate
 real*8     :: ne_SI                                           ! Electron density used in radiation rate
 
@@ -747,14 +750,15 @@ do i=1,n_vertex_max
                                 source_pellet, source_volume)
           endif
 
-          call atomic_coeff_deuterium(0.5d0*T0, Sion_T, dSion_dT, Srec_T, dSrec_dT,        &
-                                      LradDcont_T, dLradDcont_dT, LradDrays_T, dLradDrays_dT, r0 )
+          call atomic_coeff_deuterium(0.5d0*T0, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradDcont_T, dLradDcont_dT, &
+                                      LradDcont_corr, dLradDcont_dT_corr, LradDrays_T, dLradDrays_dT, r0 )
 
           ! --- Transform derivatives on Te to derivatives in total T
-          dSion_dT      = dSion_dT      / 2.d0
-          dSrec_dT      = dSrec_dT      / 2.d0
-          dLradDrays_dT = dLradDrays_dT / 2.d0
-          dLradDcont_dT = dLradDcont_dT / 2.d0
+          dSion_dT           = dSion_dT      / 2.d0
+          dSrec_dT           = dSrec_dT      / 2.d0
+          dLradDrays_dT      = dLradDrays_dT / 2.d0
+          dLradDcont_dT      = dLradDcont_dT / 2.d0
+          dLradDcont_dT_corr = dLradDcont_dT_corr / 2.d0
 
           !-------------------------------------------
           ! --- Normalisation of the ionization energy cost for Deuterium
@@ -1054,7 +1058,7 @@ do i=1,n_vertex_max
 
                        + v * (gamma-1.d0) * eta_T_ohm * (zj0 / BigR)**2.d0         * BigR  * xjac * tstep * factor(6,12) & ! Source from Ohmic heating
                        - v * BigR * r0_corr * rn0_corr * LradDrays_T                       * xjac * tstep * factor(6,13) & ! Sink by line radiation
-                       - v * BigR * r0_corr * r0_corr  * LradDcont_T                       * xjac * tstep * factor(6,14) & ! Sink by Brem. radiation
+                       - v * BigR * r0_corr * r0_corr  * LradDcont_corr                    * xjac * tstep * factor(6,14) & ! Sink by Brem. radiation
                        - v * BigR * r0_corr * frad_bg                                      * xjac * tstep * factor(6,15) & ! Sink by background impurity rad.
 
                        - TG_num6 * 0.25d0 * BigR**3 * T0 * (r0_x * u0_y - r0_y * u0_x)                                 &
@@ -1705,7 +1709,7 @@ do i=1,n_vertex_max
 
                            + v * BigR * rho * rn0_corr * ksi_ion_norm * Sion_T                      * xjac * theta * tstep &
                            + v * BigR * rho * rn0_corr * LradDrays_T                          * xjac * theta * tstep &
-                           + v * BigR * rho * 2d0 * r0_corr * LradDcont_T                * xjac * theta * tstep &
+                           + v * BigR * rho * 2d0 * r0_corr * LradDcont_corr                  * xjac * theta * tstep &
                            + v * BigR * rho * frad_bg                                    * xjac * theta * tstep &
 !===================== Additional terms from friction terms============
                             - v * BigR * ((GAMMA - 1.)/2.) * vpar0**2 * BB2 * (rho*rn0*Sion_T) * xjac * theta * tstep &
@@ -1767,7 +1771,7 @@ do i=1,n_vertex_max
                             + v * BigR * r0_corr * rn0_corr * ksi_ion_norm * dSion_dT * T         * xjac * theta * tstep &
 
                             + v * BigR * T * r0_corr * rn0_corr * dLradDrays_dT             * xjac * theta * tstep &
-                            + v * BigR * T * r0_corr * r0_corr  * dLradDcont_dT             * xjac * theta * tstep &
+                            + v * BigR * T * r0_corr * r0_corr  * dLradDcont_dT_corr        * xjac * theta * tstep &
                             + v * BigR * T * r0_corr * dfrad_bg_dT                          * xjac * theta * tstep &
 !===================== Additional terms from friction terms============
                             - v * BigR * ((GAMMA - 1.)/2.) * vpar0**2 * BB2 &

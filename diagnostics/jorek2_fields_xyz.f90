@@ -66,7 +66,7 @@ program jorek2_fields_xyz
   integer   :: i_rank(n_tor), n_cpu, n_cpu_n, n_cpu_master, m_cpu, n_masters, n_cpu_trans, my_id_trans
   integer   :: MPI_COMM_N, MPI_GROUP_MASTER, MPI_GROUP_WORLD, MPI_COMM_MASTER, MPI_COMM_TRANS
   integer   :: required,provided,StatInfo
-  integer   :: istep, delta_step, istart, iend, np, i
+  integer   :: istep, delta_step, istart, iend, np, i, i_fmt
   integer*4 :: rank, comm_size 
   logical   :: first_step
 
@@ -176,7 +176,8 @@ program jorek2_fields_xyz
   ! --- Loop over restart files
   do istep = istart, iend, delta_step 
 
-    write(file_in,'(A5,i5.5)') 'jorek', istep
+    i_fmt = restart_file_exists(istep) ! -1 if it does not exist, otherwise index for restart file digit format
+    write(file_in, rst_file_ind_fmt(i_fmt)) 'jorek', istep
 
     if ( my_id == 0 ) then
       call import_restart(node_list, element_list, file_in, rst_format, ierr)

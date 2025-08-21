@@ -30,6 +30,7 @@ use mod_sobseq_rng
 ! Diagnostics
 use mod_diag_print_kinetic_energy
 use mod_project_particles
+use mod_rhs_projections
 
 ! JOREK
 use data_structure

@@ -31,6 +31,7 @@ implicit none
 ! The particle remains between +- 3 in Z and 8 and 13 in R for these parameters. set this in an input file
 
 ! Local variables
+logical :: verbose = .false.
 integer :: i,ielm_out,ifail,j,i_elm_old
 real*8  :: R,Z
 real*8  :: s,t
@@ -62,9 +63,14 @@ type is (jorek_fields_interp_linear)
   p%static = .true.
 end select
 allocate(sim%fields%node_list, sim%fields%element_list)
+call init_node_list(sim%fields%node_list, n_nodes_max, sim%fields%node_list%n_dof, n_var)
 
 ! Only 1 toroidal mode (n=0)
 mode(1) = 0
+if (n_tor /= 1) then
+  write(0,*) 'ERROR: Penning test only works with n_tor=1'
+  stop
+endif
 
 ! Create a grid according to the variables present in the input file
 if ((n_R > 0) .and. (n_Z > 0) .and. (n_radial > 0)) then
@@ -82,7 +88,7 @@ else
 end if
 call update_neighbours(sim%fields%node_list, sim%fields%element_list)
 
-call jorek_penning_fields(sim%fields%node_list, sim%fields%element_list)
+call jorek_penning_fields(sim%fields%node_list, sim%fields%element_list, apply_dirichlet_in=.false.)
 
 
 ! Write a restart file containing the grid
@@ -90,23 +96,22 @@ write(*,*) "INFO: Exporting grid to jorek_restart.h5"
 rst_hdf5 = 1
 call export_restart(sim%fields%node_list,sim%fields%element_list,'jorek_restart')
 
-! interpret tstep_n as [s] instead of jorek units
 do i=1,size(tstep_n)
   if (tstep_n(i) .le. 0 .or. tstep_n(i) .ne. tstep_n(i) .or. tstep_n(i) .eq. 1) cycle
-  nstep_n(i) = floor(time_end / tstep_n(i)) ! Override nstep_n
+  nstep_n(i) = floor(time_end  / (t_norm*tstep_n(i)) ) ! Override nstep_n
   call reset_particle
   ! Calculate the correct velocity for a half-step backwards to obtain second-order convergence
   E = [-2.d0*Phi0*x0(1),0.d0,0.d0]/t_norm
   B = [0.d0, B0, 0.d0]
-  call boris_initial_half_step_backwards_RZPhi(particle, real(mass,8), E, B, tstep_n(i))
-
+  call boris_initial_half_step_backwards_RZPhi(particle, real(mass,8), E, B, tstep_n(i)*t_norm)
   do j=1,nstep_n(i)
     if (mod(j,max(nstep_n(i)/100,10)) .eq. 0) write(*,'(A)',advance='no') '.'
     call sim%fields%calc_EBpsiU(0.d0, particle%i_elm, particle%st, particle%x(3), E, B, psi, U)
     rz_old    = particle%x(1:2)
     st_old    = particle%st
     i_elm_old = particle%i_elm
-    call boris_push_cylindrical(particle, real(mass,8), E, B, tstep_n(i))
+    if (verbose) write(*,"(A,g16.8,g16.8,g16.8)") 'PARTICLE ', cylindrical_to_cartesian(particle%x)
+    call boris_push_cylindrical(particle, real(mass,8), E, B, tstep_n(i)*t_norm)
     call find_RZ_nearby(sim%fields%node_list, sim%fields%element_list, rz_old(1), rz_old(2), st_old(1), st_old(2), i_elm_old, &
         particle%x(1), particle%x(2), particle%st(1), particle%st(2), particle%i_elm, ifail)
     if (particle%i_elm .le. 0) then
@@ -118,12 +123,12 @@ do i=1,size(tstep_n)
 
   ! Check position against analytical result
   x_e = cylindrical_to_cartesian(particle%x)
-  x_a = penning_trajectory(tstep_n(i)*real(nstep_n(i)))
+  x_a = penning_trajectory(tstep_n(i)*real(nstep_n(i))*t_norm)
   err_norm = norm2(x_e - x_a)
 
   ! Exit the test if the error is too large
   ! Norm error scales as dt^2
-  err_ref = 3.14084d-8*tstep_n(i)**2*t_norm**(-2)
+  err_ref = 3.14084d-8*tstep_n(i)**2
   !if (n_pol .gt. 0) err_ref = max(err_ref, 2.d0*3.675d3*real(n_pol)**(-4)) ! only use this condition for polar grids, with huge margin (2x)
   write(*,"(A,i3,A,g12.4,A,g16.8,a,g16.8)") "RESULT: n_radial= ", n_radial, " dt= ", tstep_n(i), " error= ", err_norm, " reference= ", err_ref
   if (isnan(err_norm) .or. err_norm .gt. err_ref*1.2d0) then

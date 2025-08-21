@@ -45,8 +45,8 @@ real*8     :: T0_corr, r0_corr
 !real*8, intent(in)    :: Te0, ne0                        ! Electron temperature in JOREK units
 real*8  :: Sion_T , dSion_dT           ! Normalized ionization coefficient and its temperature derivative
 real*8  :: Srec_T , dSrec_dT           ! Normalized recombination coefficient and its temperature derivative
-real*8 :: LradDcont_T, dLradDcont_dT 
-real*8  :: ksi_ion_norm
+real*8  :: LradDcont_T, dLradDcont_dT 
+real*8  :: LradDcont_corr, dLradDcont_dT_corr 
 
 !real*8     :: Sum_rec(n_gauss,n_gauss)
 integer    :: missing, loc_rec_elms
@@ -94,21 +94,20 @@ energy_neutrals(:)  = 0.d0
 energy_radiation(:) = 0.d0
 
 delta_phi     = 2.d0 * PI / float(n_plane) / float(n_period)
-ksi_ion_norm = central_density * 1.d20 * ksi_ion
 !HZ_p,n_plane,n_gauss,n_order,n_vertex_max,TWOPI
 !$omp parallel do default(none)                                              &
 !$omp schedule(static, 100)                                               &
 !$omp   shared(local_rec_elements,my_id,n_cpu, volume_check,energy_neutrals, energy_radiation ,              &
 !$omp          rec_rate_local,rec_v_R,rec_v_Z,rec_v_phi,                  &
 !$omp          element_list,node_list, H, H_s, H_t, HZ,                   & 
-!$omp          tstep,F0, delta_phi,ksi_ion_norm, gamma                                                 &
+!$omp          tstep,F0, delta_phi, gamma                                                 &
 !$omp          )                                                          &
 !$omp   private(ife,ielm,iv,i,j,k,ms,mt,mp,in,                            &
 !$omp           inode,element,                                            &
 !$omp           x_g, y_g, x_s, y_s, x_t, y_t, xjac, eq_g, eq_s, eq_t,     &
 !$omp           wst, BigR, r0, T0,  ps0_x,ps0_y ,u0_x,u0_y,vpar0,         &
 !$omp           r0_corr, T0_corr, Sion_T, dSion_dT, Srec_T, dSrec_dT,      &
-!$omp           LradDcont_T, dLradDcont_dT                               &
+!$omp           LradDcont_T, dLradDcont_dT, LradDcont_corr, dLradDcont_dT_corr  &
 !$omp           )                                                         &
 !$omp   firstprivate(nodes)
 !> loop over all local recombination elements
@@ -200,13 +199,12 @@ enddo
 		  
         vpar0    = eq_g(mp,7,ms,mt)
 		
-		!> Calculate 
-		call rec_rate_to_kinetic(r0, 0.5d0*T0, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradDcont_T, dLradDcont_dT)  
+        !> Calculate 
+        call rec_rate_to_kinetic(r0, 0.5d0*T0, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradDcont_T, dLradDcont_dT, LradDcont_corr, dLradDcont_dT_corr)  
         ! --- Transform derivatives on Te to derivatives in total T	
- !         	dSion_dT      = dSion_dT      / 2.d0	
-			dSrec_dT      = dSrec_dT      / 2.d0	
- !         	dLradDrays_dT = dLradDrays_dT / 2.d0	
-			dLradDcont_dT = dLradDcont_dT / 2.d0
+        dSrec_dT           = dSrec_dT      / 2.d0	
+        dLradDcont_dT      = dLradDcont_dT / 2.d0
+        dLradDcont_dT_corr = dLradDcont_dT_corr / 2.d0
 		
 		 
 		!> neutral density gain in element due to recombination
@@ -218,7 +216,7 @@ enddo
 		!> volume check. 
 		volume_check(ife)     = volume_check(ife)  + (1.d0)                                                            *TWOPI *BigR *xjac        /n_plane *wst
 		energy_neutrals(ife)  =energy_neutrals(ife)+ (gamma-1.d0) * 0.5d0 *T0 * r0_corr * r0_corr  * Srec_T            *TWOPI *BigR *xjac *tstep /n_plane *wst
-		energy_radiation(ife)=energy_radiation(ife)+ r0_corr * r0_corr  * (LradDcont_T -ksi_ion_norm*Srec_T)                 *TWOPI *BigR *xjac *tstep /n_plane *wst       
+		energy_radiation(ife)=energy_radiation(ife)+ r0_corr * r0_corr  * (LradDcont_corr)                             *TWOPI *BigR *xjac *tstep /n_plane *wst       
 						              
 
       enddo !mt

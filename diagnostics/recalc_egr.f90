@@ -18,7 +18,7 @@ program recalc_egr
   integer, parameter :: nts = 20
   
   character*14 :: filein
-  integer      :: ts, ierr, imf
+  integer      :: ts, ierr, imf, i_fmt
   
   real*8, dimension(:), allocatable              :: res
   real*8, dimension(nts)                         :: time
@@ -36,7 +36,8 @@ program recalc_egr
   index_now = ts1
   
   do ts=1,nts
-    write(filein,'(A,i5.5)') 'jorek', index_now
+    i_fmt = restart_file_exists(index_now) ! -1 if it does not exist, otherwise index for restart file digit format
+    write(filein,rst_file_ind_fmt(i_fmt)) 'jorek', index_now
     call import_restart(node_list,element_list, filein, rst_format, ierr, .true.)
     call energy3d_new(node_list,element_list,Wmag(:,ts),Wkin(:,ts))
     time(ts) = xtime(index_now)

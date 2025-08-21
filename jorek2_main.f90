@@ -629,7 +629,7 @@ write(*,*) "n elements:", element_list%n_elements
   ! --- Export a restart file before the first timestep
   if ( (my_id == 0) .and. (.not. restart) ) then
     if ( freeboundary .and. freeb_change_indices ) call exchange_indices(node_list, my_id, n_cpu, .true.)
-    fileout = 'jorek00000'
+    write(fileout,rst_file_ind_fmt(1)) 'jorek',0
     call export_restart(node_list, element_list, fileout)
     if ( freeboundary .and. freeb_change_indices ) call exchange_indices(node_list, my_id, n_cpu, .false.)
   end if
@@ -865,7 +865,7 @@ write(*,*) "n elements:", element_list%n_elements
 #endif
 
        ! --- Output some information about the current timestep
-       130 format(1x,a,i5.5,a,es10.3,a)
+       130 format(1x,a,i6.6,a,es10.3,a)
        131 format(1x,a,2(2(es10.2,' ...',es10.2,',')))
        132 format(1x,'-------------------------------------------------------------------')
        133 format(1x,a,2(es10.2,' at ',i10,','))
@@ -934,7 +934,7 @@ write(*,*) "n elements:", element_list%n_elements
     ! --- Write a restart file every nout timesteps
     if ( (my_id == 0) .and. (mod(index_now,nout) == 0) ) then
       if ( freeboundary .and. freeb_change_indices ) call exchange_indices(mhd_sim%node_list, my_id, n_cpu, .true.)
-      write(fileout,'(A5,i5.5)') 'jorek',index_now
+      write(fileout,rst_file_ind_fmt(1)) 'jorek',index_now
       call export_restart(mhd_sim%node_list, mhd_sim%element_list, fileout)
       if ( freeboundary .and. freeb_change_indices ) call exchange_indices(mhd_sim%node_list, my_id, n_cpu, .false.)
     endif

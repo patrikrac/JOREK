@@ -22,21 +22,23 @@ function initial_run () {
 
 # --- Carry out the test case
 function restart_run () {
-  database="imas_regtest_db"
-  if [ -d ~/public/imasdb/${database}/4/111111/1/ ]; then
-      echo "Directory exists."
-  else
-      pwd
-      echo "directory does not exist"
-  fi
- 
-  cp jorek_restart.h5 jorek00000.h5
+   database="imas_regtest_db"
+   run_number=$(shuf -i 0-100   -n 1)
+   if [ -d ~/public/imasdb/${database}/4/111111/${run_number}/ ]; then
+       echo "Directory exists. Delete IDS"
+       rm -rf ~/public/imasdb/${database}/4/111111/${run_number}
+   fi
+
+   echo $run_number > "IMAS_RUN_OUT"
+   echo $database > "IMAS_DB_OUT"
+   cp jorek_restart.h5 jorek00000.h5
+   sed -i "s/run_number_replace/$run_number/" imas.nml
   ./jorek2_IDS < input0                                                              || exit 1
-  python imas2jorek.py -d ${database} -p 111111 -r 1 -dd 4 -tk inxflow               || exit 1
-  if [ -d ~/public/imasdb/${database}/4/111111/1/ ]; then
-      rm -rf ~/public/imasdb/${database}/4/111111/1/
+  python imas2jorek.py -d ${database} -p 111111 -r $run_number -dd 4 -tk inxflow     || exit 1
+  if [ -d ~/public/imasdb/${database}/4/111111/${run_number}/ ]; then
+      rm -rf ~/public/imasdb/${database}/4/111111/${run_number}                      || exit 1
+      rm "IMAS_RUN_OUT" "IMAS_DB_OUT"
   fi
-      
 }
 
 # --- Compare the results of the test case to the reference solution

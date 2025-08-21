@@ -169,16 +169,16 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
   endif
 
 #if (!defined(USE_PASTIX))&&(!defined(USE_PASTIX6))
-  if (use_pastix.or.use_pastix_eq) then
-    write(*,*) ' FATAL : use_pastix requires defined USE_PASTIX or USE_PASTIX6'
+  if (use_pastix.or.use_pastix_eq.or.use_pastix_prj) then
+    write(*,*) ' FATAL : use_pastix/use_pastix_eq/use_pastix_prj requires defined USE_PASTIX or USE_PASTIX6'
     call MPI_Abort(MPI_COMM_WORLD, 3, ierr)
     stop
   endif
 #endif
 
 #ifndef USE_MUMPS
-  if (use_mumps.or.use_mumps_eq) then
-    write(*,*) ' FATAL : use_mumps requires defined USE_MUMPS'
+  if (use_mumps.or.use_mumps_eq.or.use_mumps_prj) then
+    write(*,*) ' FATAL : use_mumps/use_mumps_eq/use_mumps_prj requires defined USE_MUMPS'
     call MPI_Abort(MPI_COMM_WORLD, 3, ierr)
     stop
   endif
@@ -193,8 +193,8 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
 #endif
 
 #ifndef USE_STRUMPACK
-  if (use_strumpack.or.use_strumpack_eq) then
-    write(*,*) ' FATAL : use_strumpack requires defined USE_STRUMPACK'
+  if (use_strumpack.or.use_strumpack_eq.or.use_strumpack_prj) then
+    write(*,*) ' FATAL : use_strumpack/use_strumpack_eq/use_strumpack_prj requires defined USE_STRUMPACK'
     call MPI_Abort(MPI_COMM_WORLD, 3, ierr)
     stop
   endif
