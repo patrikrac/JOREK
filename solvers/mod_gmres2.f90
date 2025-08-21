@@ -139,14 +139,14 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
         enddo
       endif
       ! --- h_j+1,j = ||v_j+1||_2 ---
-      hess(it+(it-1)*ldh+1) = dnrm2(n, V(it*n+1), 1)#
+      hess(it+(it-1)*ldh+1) = dnrm2(n, V(it*n+1), 1)
       ! --- v_j+1 = v_j+1 / h_j+1,j --- 
       call dscal(n, 1./hess(it+(it-1)*ldh+1), V(it*n+1), 1)
       ! --- Givens Rotation ---
       do k = 1, it-1
         gamma = givens_c(k)*hess(k+(it-1)*ldh) + givens_s(k)*hess(k+(it-1)*ldh+1)
         hess(k+(it-1)*ldh+1) = -givens_s(k)*hess(k+(it-1)*ldh) + givens_c(k)*hess(k+(it-1)*ldh+1)
-        hess(k+(it-1)*ldh) = gamma;
+        hess(k+(it-1)*ldh) = gamma
       enddo
       delta = sqrt(abs(hess(it+(it-1)*ldh))**2 + hess(it+(it-1)*ldh+1)**2);
       givens_c(it) = hess(it+(it-1)*ldh) / delta
