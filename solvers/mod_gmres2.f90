@@ -37,7 +37,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0
   real(kind=8) :: norm_p
   integer :: totit, maxit, restart, nrit, it, ldh, k, j
-  integer :: nOrto 
+  integer :: n_ortho 
   logical :: no_conv, GSC=.false., GSM=.false., GSCI=.true., GSMI=.false.
   real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, b_prec, b_, s_
 
@@ -58,7 +58,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   atol = 1.d-36
   maxit = solver%iter_max
   restart = solver%gmres_m
-  nOrto = 3 ! Number of iterations for the orthogonalization methos (in case of iterative methods)
+  n_ortho = 3 ! Number of iterations for the orthogonalization methos (in case of iterative methods)
   if (restart > maxit) restart = maxit
 
   allocate(givens_c(restart),givens_s(restart),b_(restart+1),hess((restart+1)*restart),V(n*(restart+1)),b_prec(n))
@@ -120,7 +120,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       elseif (GSCI) then ! Gram-Schmidt Classical Iterative 
         norm_p = dnrm2(n, V(it*n+1), 1)
         hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
-        do j=1,nOrtho
+        do j=1,n_ortho
           call dgemv('C', n, it, 1.d0, V(1), n, V(it*n+1), 1, 0.d0, s_(1), 1)
           call dgemv('N', n, it, -1.d0, V(1), n, s_(1), 1, 1.d0, V(it*n+1), 1)
           call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
@@ -129,7 +129,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       elseif (GSMI) then ! Gram-Schmidt Modified Iterative
         norm_p = dnrm2(n, V(it*n+1), 1)
         hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
-        do j=1,nOrtho
+        do j=1,n_ortho
           do k=1,it
             s_(k) = ddot(n, V((k-1)*n+1), 1, V(it*n+1), 1)
             call daxpy(n, -s_(k), V((k-1)*n+1), 1, V(it*n+1), 1)
