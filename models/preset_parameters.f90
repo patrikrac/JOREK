@@ -223,6 +223,7 @@ subroutine preset_parameters
 
   rect_grid_vac_psi = 0.d0
   
+  maintain_profiles = .false.
   ZK_perp(1:5)   = (/ 1.d-5, 0.d0, 0.d0, 99.d0, 99.d0 /)
   ZK_i_perp(1:5) = (/ 1.d-5, 0.d0, 0.d0, 99.d0, 99.d0 /)
   ZK_e_perp(1:5) = (/ 1.d-5, 0.d0, 0.d0, 99.d0, 99.d0 /)
@@ -794,6 +795,7 @@ subroutine preset_parameters
   spi_shard_file(:) = 'none'
   spi_plume_file(:) = 'none'
   spi_plume_hdf5  = .false.
+  spi_abl_mag_reduction  = .false.
   spi_tor_rot     = .false.
   spi_num_vol     = .true.
   using_spi       = .false.

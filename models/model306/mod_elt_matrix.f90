@@ -43,7 +43,7 @@ real*8     :: R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint(2), Z_xpoint(2), dj_dp
 real*8     :: Bgrad_rho_star,     Bgrad_rho,     Bgrad_T_star,  Bgrad_T, BB2
 real*8     :: Bgrad_rho_star_psi, Bgrad_rho_psi, Bgrad_rho_rho, Bgrad_T_star_psi, Bgrad_T_psi, Bgrad_T_T, BB2_psi
 real*8     :: rhs_ij_1,   rhs_ij_2,   rhs_ij_3,   rhs_ij_4,   rhs_ij_5,   rhs_ij_6, rhs_ij_7
-real*8     :: ZK_prof, D_prof, psi_norm, theta, zeta, delta_u_x, delta_u_y, delta_ps_x, delta_ps_y, ZKpar_T, dZKpar_dT
+real*8     :: ZK_prof, D_prof, D_par_local, psi_norm, theta, zeta, delta_u_x, delta_u_y, delta_ps_x, delta_ps_y, ZKpar_T, dZKpar_dT
 
 #ifdef altcs
 real*8     :: psieq_R, psieq_Z  ! more accurate current
@@ -600,8 +600,9 @@ do ms=1, n_gauss
 
      psi_norm = get_psi_n(ps0, y_g(ms,mt))
 
-     D_prof  = get_dperp (psi_norm)
-     ZK_prof = get_zkperp(psi_norm)
+     D_prof      = get_dperp (psi_norm)
+     D_par_local = D_par
+     ZK_prof     = get_zkperp(psi_norm)
 
      if (xpoint2) then
        if (r0 .lt. 0.d0)  then
@@ -760,7 +761,7 @@ do ms=1, n_gauss
            rhs_ij_5 = v * BigR * (particle_source(ms,mt) + source_pellet)                      * xjac * tstep &
                     + v * BigR**2 * ( r0_s * u0_t - r0_t * u0_s)                                      * tstep &
                     + v * 2.d0 * BigR * r0 * u0_y                                              * xjac * tstep &
-                    - (D_par-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho                 * xjac * tstep &
+                    - (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho                 * xjac * tstep &
                     - D_prof * BigR  * (v_x*r0_x + v_y*r0_y + v_p*r0_p * eps_cyl**2 /BigR**2 ) * xjac * tstep &
                     - v * F0 / BigR * Vpar0 * r0_p                                             * xjac * tstep &
                     - v * Vpar0 * (r0_s * ps0_t - r0_t * ps0_s)                                       * tstep &
@@ -1197,9 +1198,9 @@ jec2_t = psi_t
                  Bgrad_rho_rho      = ( F0 / BigR * rho_p +  rho_x * ps0_y - rho_y * ps0_x ) / BigR
                  BB2_psi            = 2.d0 * (psi_x * ps0_x + psi_y * ps0_y ) /BigR**2
 
-                 amat_51 = - (D_par-D_prof) * BigR * BB2_psi / BB2**2 * Bgrad_rho_star     * Bgrad_rho     * xjac * theta * tstep &
-                           + (D_par-D_prof) * BigR / BB2              * Bgrad_rho_star_psi * Bgrad_rho     * xjac * theta * tstep &
-                           + (D_par-D_prof) * BigR / BB2              * Bgrad_rho_star     * Bgrad_rho_psi * xjac * theta * tstep &
+                 amat_51 = - (D_par_local-D_prof) * BigR * BB2_psi / BB2**2 * Bgrad_rho_star     * Bgrad_rho     * xjac * theta * tstep &
+                           + (D_par_local-D_prof) * BigR / BB2              * Bgrad_rho_star_psi * Bgrad_rho     * xjac * theta * tstep &
+                           + (D_par_local-D_prof) * BigR / BB2              * Bgrad_rho_star     * Bgrad_rho_psi * xjac * theta * tstep &
                            + v * Vpar0 * (r0_s * psi_t - r0_t * psi_s)                                            * theta * tstep &
                            + v * r0 * (vpar0_s * psi_t - vpar0_t * psi_s)                                         * theta * tstep &
 
@@ -1224,7 +1225,7 @@ jec2_t = psi_t
                  amat_55 = v * rho * BigR * xjac * (1.d0 + zeta)  &
                          - v * BigR**2 * ( rho_s * u0_t - rho_t * u0_s)                                       * theta * tstep &
                          - v * 2.d0 * BigR * rho * u0_y                                                * xjac * theta * tstep &
-                         + (D_par-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho_rho                * xjac * theta * tstep &
+                         + (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho_rho                * xjac * theta * tstep &
                          + D_prof * BigR  * (v_x*rho_x + v_y*rho_y + v_p*rho_p * eps_cyl**2 /BigR**2 ) * xjac * theta * tstep &
                          + v * F0 / BigR * Vpar0 * rho_p                                               * xjac * theta * tstep &
                          + v * Vpar0 * (rho_s * ps0_t - rho_t * ps0_s)                                        * theta * tstep &

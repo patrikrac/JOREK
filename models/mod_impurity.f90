@@ -54,7 +54,7 @@ module mod_impurity
           case('N')
             adas_suffix = '96_n'	  
           case default
-            write(*,*) "Unrecognized species, terminating."
+            write(*,*) "Unrecognized species", trim(imp_type(i)), ", terminating."
             adas_suffix = 'none'
             deallocate(imp_cor)
             deallocate(imp_adas)

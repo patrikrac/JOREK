@@ -25,6 +25,7 @@
  keep_current_prof = .f.
 
  using_spi = .t.
+ spi_abl_mag_reduction = .t.
  imp_type = 'Ne'
  t_ns  = 510.0
  n_inj = 1

@@ -308,6 +308,9 @@ module phys_module
              ZK_i_perp_num_tanh, ZK_i_perp_num_tanh_psin, ZK_i_perp_num_tanh_sig,    &
              ZK_e_perp_num_tanh, ZK_e_perp_num_tanh_psin, ZK_e_perp_num_tanh_sig
   real*8  :: Dn_perp_num
+  logical :: maintain_profiles             !< Add artificial sources to maintain initial rho and T profiles
+                                           !! (diffusion acts on deviation from initial profiles)
+					   !! at present only implemented for stellarator model 183
 
   !> @name Shock-capturing terms
   logical :: use_sc  !< Use shock-capturing stabilization
@@ -505,6 +508,7 @@ module phys_module
   character(len=256) :: spi_shard_file(n_inj_max)!< The name of the shard size file
   character(len=256) :: spi_plume_file(n_inj_max)!< The name of the shard information datafile (array)
   logical            :: spi_plume_hdf5           !< if 'spi_plume_file' is in HDF5format?
+  logical            :: spi_abl_mag_reduction    !< Whether to use the magnetic reduction effect described in Eq.(27) of Nucl. Fusion 60 066027
 
   integer :: n_adas             !< Number of species to be traced by ADAS
 

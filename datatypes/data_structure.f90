@@ -164,6 +164,7 @@ end type type_node
   type type_RHS
     real(kind=8), dimension(:), pointer :: val => Null()
     integer(kind=int_all)               :: n                    !< vector length
+    integer                             :: nrhs                 !< number of right hand sides, used only when %.projection. is set to .true. in the associated SP_SOLVER object
   end type type_RHS  
   
   !> Preconditioner type  

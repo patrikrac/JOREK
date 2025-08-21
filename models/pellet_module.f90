@@ -559,14 +559,14 @@ module pellet_module
   
           B0 = abs(F0 / R_geo)
           nu = 0.843
-          if (B0 > 2.) pellets(i_p)%spi_abl = pellets(i_p)%spi_abl * (2./B0)**nu
+          if (B0 > 2. .and. spi_abl_mag_reduction) pellets(i_p)%spi_abl = pellets(i_p)%spi_abl * (2./B0)**nu
   
         else if (spi_abl_model(i_inj) == 3) then ! .not. with_impurities
           pellets(i_p)%spi_abl = 39.0023 * 2. * MOLE_NUMBER * ((pellets(i_p)%spi_radius*1.d2 / 0.2)**(4./3.)) &
                                  * ((n_SI*1.d-20)**(1./3.)) * ((T_eV/2.d3)**(5./3.)) / 4.0282
           B0 = abs(F0 / R_geo)
           nu = 0.843
-          if (B0 > 2.) pellets(i_p)%spi_abl = pellets(i_p)%spi_abl * (2./B0)**nu
+          if (B0 > 2. .and. spi_abl_mag_reduction) pellets(i_p)%spi_abl = pellets(i_p)%spi_abl * (2./B0)**nu
         else 
           write(*,*) "Unknown ablation model, terminating now!"
           stop

@@ -640,7 +640,8 @@ module mod_expression
     real*8  :: LradDrays_T, LradDcont_T, Sion_T, Srec_T
     real*8  :: dLradDrays_dT, dLradDcont_dT, dSion_dT, dSrec_dT
     real*8  :: ne_SI, ne_JOREK                              ! Electron density used in radiation rate
-    real*8  :: Lrad_imp, r_imp_bg, i_imp, frad_bg
+    real*8  :: Lrad_imp, r_imp_bg, frad_bg
+    integer :: i_imp
 #endif
 #if (defined WITH_Neutrals) && (!defined WITH_Impurities)
     real*8  :: Arad_bg, Brad_bg, Crad_bg
@@ -769,7 +770,7 @@ module mod_expression
         element  = pol_pos%element
         nodes(:) = pol_pos%nodes(:)
 
-        if(export_aux_node_list .and. (size(aux_node_list%node) > 0)) then
+        if(export_aux_node_list .and. allocated(aux_node_list%node)) then
            aux_nodes(:) = aux_node_list%node(pol_pos%element%vertex(:))
         endif
         
@@ -853,7 +854,7 @@ module mod_expression
                 vv(:)  = 0.d0
                 vv(1:n_var)  = nodes(i)%values(i_tor,j,:)
 		            va(:)  = 0.d0
-                if(export_aux_node_list .and. (size(aux_node_list%node) > 0)) then
+              if(export_aux_node_list .and. allocated(aux_node_list%node)) then
                    va(1:n_var)  = aux_nodes(i)%values(i_tor,j,:)
                 endif
                 

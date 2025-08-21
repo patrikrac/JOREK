@@ -385,7 +385,18 @@ subroutine do_jorek_timestep(this, sim, ev)
   call clck_time(t0)
   if (this%solver%step_success) then  
 
-    ! TODO add if use_pellet
+    if (use_pellet) then
+      pellet_volume = total_pellet_volume
+      call update_pellet(sim%my_id, sim%fields%node_list, sim%fields%element_list)
+
+      if (sim%my_id == 0) then
+        xtime_pellet_R(index_now)         = pellet_R
+        xtime_pellet_Z(index_now)         = pellet_Z
+        xtime_pellet_psi(index_now)       = pellet_psi
+        xtime_pellet_particles(index_now) = pellet_particles
+        xtime_phys_ablation(index_now)    = phys_ablation
+      endif
+    endif
 
 #if (defined WITH_Neutrals) || (defined WITH_Impurities)
     if (using_spi) then

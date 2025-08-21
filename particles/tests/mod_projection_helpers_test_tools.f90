@@ -9,11 +9,13 @@ use data_structure
 use mod_particle_types
 implicit none
 private
+include 'dmumps_struc.h'        ! MUMPS include files defining its datastructure  implicit none
 public :: default_flux_grid,default_square_grid,default_polar_grid
 public :: project_f,broadcast_dmumps_struct_A_irn_jcn
 public :: broadcast_dmumps_project_struct,calc_rhs_f
 public :: elements_mean_rms,close_dmumps
 public :: f_0,f_1,f_R,f_RZ,f_R4,f_a2
+public :: map_matrix_to_MUMPS_datastructure
 
 !> Variables ------------------------------------------------------
 logical,parameter :: nice_q=.true.
@@ -336,6 +338,7 @@ subroutine project_f(rank,master,node_list,element_list,f,ifail,filter,filter_hy
   real*8, optional, intent(out)          :: integral !< The integral of the projected function, from the weights
   real*8, dimension(:), allocatable      :: this_integral_weights
   type(DMUMPS_STRUC)                     :: p
+  type(type_SP_MATRIX)                   :: a_mat
   integer :: i, k, index, i_tor_local, n_tor_local, mpi_comm_n, mpi_comm_master, ierr
   real*8  :: my_filter, my_filter_hyper, area, volume
   logical :: apply_dirichlet_bnd
@@ -357,14 +360,16 @@ subroutine project_f(rank,master,node_list,element_list,f,ifail,filter,filter_hy
   
   if (i_tor_local .eq. 1) then  
     call prepare_mumps_par_n0(node_list,element_list,n_tor_local,i_tor_local,mpi_comm_world,mpi_comm_n,&
-         mpi_comm_master,p,area,volume,filter=my_filter,filter_hyper=my_filter_hyper,&
+         mpi_comm_master,a_mat,area,volume,filter=my_filter,filter_hyper=my_filter_hyper,&
          filter_parallel=0.d0,apply_dirichlet_condition_in=apply_dirichlet_bnd,&
          integral_weights=this_integral_weights)
   else
     call prepare_mumps_par(node_list,element_list,n_tor_local,i_tor_local,mpi_comm_world,mpi_comm_n,&
-         mpi_comm_master,p,filter=my_filter,filter_hyper=my_filter_hyper,filter_parallel=0.d0,&
+         mpi_comm_master,a_mat,filter=my_filter,filter_hyper=my_filter_hyper,filter_parallel=0.d0,&
          apply_dirichlet_condition_in=apply_dirichlet_bnd)
   endif
+
+  call map_matrix_to_MUMPS_datastructure(a_mat, p)
 
   ! Project manually
   p%JOB = 3
@@ -535,8 +540,6 @@ end subroutine elements_mean_rms
 
 !> construct the projected matrix from mumps data
 subroutine construct_matrix_from_mumps(mumps_data,matrix)
-  use mod_project_particles, only: DMUMPS_STRUC
-  implicit none
   type(DMUMPS_STRUC),intent(inout)              :: mumps_data
   real*8,dimension(:,:),allocatable,intent(out) :: matrix
   integer :: ii
@@ -560,7 +563,6 @@ end subroutine construct_matrix_from_mumps
 !>   ifail:      (integer) MPI failure/error code
 subroutine broadcast_dmumps_struct_A_irn_jcn(rank,master,mumps_data,ifail)
  use mpi_mod
- use mod_project_particles, only: DMUMPS_STRUC
  implicit none
  type(DMUMPS_STRUC),intent(inout) :: mumps_data
  integer,intent(inout) :: ifail
@@ -590,8 +592,6 @@ end subroutine broadcast_dmumps_struct_A_irn_jcn
 !>   ifail:      (integer) MPI failure/error code
 subroutine broadcast_dmumps_project_struct(rank,master,mumps_data,ifail)
   use mpi_mod
-  use mod_project_particles, only: DMUMPS_STRUC
-  implicit none
   type(DMUMPS_STRUC),intent(inout) :: mumps_data
   integer,intent(inout) :: ifail
   integer,intent(in)    :: rank,master
@@ -617,6 +617,56 @@ subroutine broadcast_dmumps_project_struct(rank,master,mumps_data,ifail)
   call MPI_Bcast(mumps_data%A,struct_integers(11),MPI_REAL8,master,MPI_COMM_WORLD,ifail)
   call MPI_Bcast(mumps_data%rhs,struct_integers(12),MPI_REAL8,master,MPI_COMM_WORLD,ifail)
 end subroutine broadcast_dmumps_project_struct
+
+
+subroutine map_matrix_to_MUMPS_datastructure(a_mat, mumps_par)
+  use, intrinsic :: ieee_exceptions
+  implicit none
+  type (type_SP_MATRIX), intent(in)      :: a_mat
+  type (DMUMPS_STRUC)  , intent(inout)   :: mumps_par
+  logical :: halt(size(IEEE_USUAL,1)), found_nan
+  integer :: my_id_n, ierr
+
+  ! initialise MUMPS
+  mumps_par%COMM = a_mat%comm
+  mumps_par%JOB  = -1
+  mumps_par%SYM  = 0
+  mumps_par%PAR  = 1
+
+  call MPI_COMM_RANK(mumps_par%COMM, my_id_n, ierr)
+
+  call DMUMPS(mumps_par)
+ 
+  if (my_id_n .eq. 0) then
+
+    ! allocate(mumps_par%irn(a_mat%nnz),mumps_par%jcn(a_mat%nnz),mumps_par%A(a_mat%nnz))
+
+    ! map already constructed matrix to mumps datastructure
+    mumps_par%irn => a_mat%irn
+    mumps_par%jcn => a_mat%jcn
+    mumps_par%A   => a_mat%val
+
+  endif
+
+  mumps_par%n   = a_mat%ng
+  mumps_par%nz  = a_mat%nnz
+
+  ! parameters for factorization
+  mumps_par%JOB       = 4
+  mumps_par%icntl(2)  = 6 ! print diagnostics, statistics and warnings to stderr
+  mumps_par%icntl(4)  = 1 ! print errors(1), debug(2), much(3)
+  mumps_par%icntl(5)  = 0 ! assembled form
+  mumps_par%icntl(18) = 0 ! centralized input matrix (i.e. only on cpu 0)
+  mumps_par%icntl(7)  = 7 ! compute symmetric permutation (PORD or SCOTCH autoselect)
+  mumps_par%icntl(8)  = 8 ! scaling
+  mumps_par%icntl(14) = 80 ! memory relaxation parameter  
+
+  call ieee_get_halting_mode(IEEE_USUAL, halt)
+  call ieee_set_halting_mode(IEEE_USUAL, [.false., .false., .false.])
+  call DMUMPS(mumps_par)
+  call ieee_set_halting_mode(IEEE_USUAL, halt)
+
+end subroutine map_matrix_to_MUMPS_datastructure
 
 !> close dmumps
 subroutine close_dmumps(mumps_data)

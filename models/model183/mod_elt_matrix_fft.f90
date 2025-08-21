@@ -50,12 +50,15 @@ real*8     :: x_p_x, x_p_y, y_p_x, y_p_y, v_px, v_py, u_px, u_py
 real*8     :: v, v_x, v_y, v_s, v_t, v_p, v_ss, v_st, v_tt, v_xx, v_yy, v_xs, v_ys, v_xt, v_yt, v_xy
 real*8     :: ps0, ps0_x, ps0_y, ps0_p,ps0_s,ps0_t,  zj0, zj0_x, zj0_y, zj0_p, zj0_s, zj0_t
 real*8     :: u0, u0_x, u0_y, u0_p, u0_s, u0_t,  w0, w0_x, w0_y, w0_p, w0_s, w0_t
-real*8     :: r0, r0_x, r0_y, r0_p, r0_s, r0_t,  r0_hat, r0_x_hat, r0_y_hat, T0, T0_x, T0_y, T0_p, T0_s, T0_t
+real*8     :: r0, r0_x, r0_y, r0_p, r0_s, r0_t, r0_ss, r0_hat, r0_x_hat, r0_y_hat, T0, T0_x, T0_y, T0_p, T0_s, T0_t, T0_ss
 real*8     :: psi, psi_x, psi_y, psi_p, psi_s, psi_t, psi_ss, psi_st, psi_tt, psi_xs, psi_ys, psi_xt, psi_yt, psi_xx, psi_yy
 real*8     :: zj, zj_x, zj_y, zj_p, zj_s, zj_t
 real*8     :: u, u_x, u_y, u_p, u_s, u_t, w, w_x, w_y, w_p, w_s, w_t, w_xx, w_yy
 real*8     :: rho, rho_x, rho_y, rho_s, rho_t, rho_p, rho_hat, rho_x_hat, rho_y_hat, T, T_x, T_y, T_s, T_t, T_p
 real*8     :: w0_xs, w0_xt, w0_ys, w0_yt, w0_xx, w0_yy, w0_xy, w0_ss, w0_tt, w0_st, P0, P0_s, P0_t, P0_x, P0_y
+real*8     :: rho0, rho0_s, rho0_ss
+real*8     :: T0_i, T0_i_s, T0_i_ss
+real*8     :: T0_e, T0_e_s, T0_e_ss
 real*8     :: BigR_x, vv2, eta_T, visco_T, deta_dT, d2eta_d2T, dvisco_dT
 real*8     :: theta, zeta, reta
 logical    :: xpoint2, use_fft
@@ -218,17 +221,19 @@ do i=1,n_vertex_max
   enddo
 enddo
 
-do ms=1, n_gauss
-  do mt=1, n_gauss
-    do mp=1,n_plane
-      if (with_TiTe) then
-        call sources(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, s_norm(ms,mt),psi_axis,psi_bnd,particle_source(mp,ms,mt),heat_source_i(mp,ms,mt),heat_source_e(mp,ms,mt))
-      else
-        call sources(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, s_norm(ms,mt),0.0,1.0,particle_source(mp,ms,mt),heat_source(mp,ms,mt))
-      end if
+if (.not. maintain_profiles) then
+  do ms=1, n_gauss
+    do mt=1, n_gauss
+      do mp=1,n_plane
+        if (with_TiTe) then
+          call sources(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, s_norm(ms,mt),psi_axis,psi_bnd,particle_source(mp,ms,mt),heat_source_i(mp,ms,mt),heat_source_e(mp,ms,mt))
+        else
+          call sources(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, s_norm(ms,mt),0.0,1.0,particle_source(mp,ms,mt),heat_source(mp,ms,mt))
+        end if
+      enddo
     enddo
   enddo
-enddo
+endif
 
 if (eta .ne. 0.d0) then
   reta = eta_ohmic/eta
@@ -327,7 +332,7 @@ do ms=1, n_gauss
 
       ! Poloidal momentum source based on artificial ExB flow - note only first order derivatives are implemented
       call potential_source(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, psi_norm, 0.0, 1.0, phi_source, dPhi_source_dpsi,dummy1,dPhi_source_dpsi2,dummy2,dummy3,dummy4,dummy5,dummy6)
-      dphi_source_dpsi = dphi_source_dpsi*s_factor
+      dphi_source_dpsi = dphi_source_dpsi*s_factor ! convert to local derivative within element
       eq(var_S_phi_pol,0,0,0,:) = phi_source
       eq(var_S_phi_pol,1,0,0,:) = (y_t(mp,ms,mt)*dphi_source_dpsi)/xjac
       eq(var_S_phi_pol,0,1,0,:) = (-x_t(mp,ms,mt)*dphi_source_dpsi)/xjac
@@ -337,6 +342,83 @@ do ms=1, n_gauss
       eq(var_Phi_pol,1,0,0,1) = (y_t(mp,ms,mt)*eq_s(mp,var_Phi,ms,mt))/xjac
       eq(var_Phi_pol,0,1,0,1) = (-x_t(mp,ms,mt)*eq_s(mp,var_Phi,ms,mt))/xjac
       eq(var_Phi_pol,0,0,1,1) = eq_p(mp,var_Phi,ms,mt) - eq(var_Phi_pol,1,0,0,1)*x_p(mp,ms,mt) - eq(var_Phi_pol,0,1,0,1)*y_p(mp,ms,mt)
+      
+      ! Equilibrium temperature and density
+      if (maintain_profiles) then
+        call density(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, psi_norm, 0.0, 1.0, rho0, rho0_s,dummy1,rho0_ss,dummy2,dummy3,dummy4,dummy5,dummy6)
+        rho0_s = rho0_s*s_factor; rho0_ss = rho0_ss*s_factor**2    ! convert to local derivative within element
+        eq(var_rho_equil,0,0,0,:) = rho0
+        eq(var_rho_equil,1,0,0,:) = (y_t(mp,ms,mt)*rho0_s)/xjac
+        eq(var_rho_equil,0,1,0,:) = (-x_t(mp,ms,mt)*rho0_s)/xjac
+        eq(var_rho_equil,0,0,1,:) = -eq(var_rho_equil,1,0,0,:)*x_p(mp,ms,mt) - eq(var_rho_equil,0,1,0,:)*y_p(mp,ms,mt)
+        eq(var_rho_equil,2,0,0,1) = (rho0_ss*y_t(mp,ms,mt)**2 + rho0_s*(y_st(mp,ms,mt)*y_t(mp,ms,mt) - y_tt(mp,ms,mt)*y_s(mp,ms,mt)))/xjac**2  &
+                                  - xjac_x*(rho0_s*y_t(mp,ms,mt))/xjac**2
+        eq(var_rho_equil,0,2,0,1) = (rho0_ss*x_t(mp,ms,mt)**2 + rho0_s*(x_st(mp,ms,mt)*x_t(mp,ms,mt) - x_tt(mp,ms,mt)*x_s(mp,ms,mt)))/xjac**2  &
+                                  - xjac_y*(-rho0_s*x_t(mp,ms,mt))/xjac**2
+        eq(var_rho_equil,1,1,0,1) = (-rho0_ss*y_t(mp,ms,mt)*x_t(mp,ms,mt) - rho0_s*(x_st(mp,ms,mt)*y_t(mp,ms,mt) - x_tt(mp,ms,mt)*y_s(mp,ms,mt)))/xjac**2         &
+                                  - xjac_x*(-rho0_s*x_t(mp,ms,mt))/xjac**2
+        ! Second derivatives wrt phi not implemented in FFT, and not necessary for stabilization (2nd derivatives only appear in hyperdissipation terms)
+        eq(var_rho_equil,1,0,1,1) = -x_p_x*eq(var_rho_equil,1,0,0,1) - x_p(mp,ms,mt)*eq(var_rho_equil,2,0,0,1) - y_p_x*eq(var_rho_equil,0,1,0,1) &
+                                  - y_p(mp,ms,mt)*eq(var_rho_equil,1,1,0,1)
+        eq(var_rho_equil,0,1,1,1) = -x_p_y*eq(var_rho_equil,1,0,0,1) - x_p(mp,ms,mt)*eq(var_rho_equil,1,1,0,1) - y_p_y*eq(var_rho_equil,0,1,0,1) &
+                                  - y_p(mp,ms,mt)*eq(var_rho_equil,0,2,0,1)
+
+        if (with_TiTe) then
+          call temperature_i(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, psi_norm, 0.0, 1.0, T0_i, T0_i_s,dummy1,T0_i_ss,dummy2,dummy3,dummy4,dummy5,dummy6)
+          T0_i_s = T0_i_s*s_factor; T0_i_ss = T0_i_ss*s_factor**2   ! convert to local derivative within element
+          eq(var_Ti_equil,0,0,0,:) = T0_i
+          eq(var_Ti_equil,1,0,0,:) = (y_t(mp,ms,mt)*T0_i_s)/xjac
+          eq(var_Ti_equil,0,1,0,:) = (-x_t(mp,ms,mt)*T0_i_s)/xjac
+          eq(var_Ti_equil,0,0,1,:) = -eq(var_Ti_equil,1,0,0,:)*x_p(mp,ms,mt) - eq(var_Ti_equil,0,1,0,:)*y_p(mp,ms,mt)
+          eq(var_Ti_equil,2,0,0,1) = (T0_i_ss*y_t(mp,ms,mt)**2 + T0_i_s*(y_st(mp,ms,mt)*y_t(mp,ms,mt) - y_tt(mp,ms,mt)*y_s(mp,ms,mt)))/xjac**2  &
+                                    - xjac_x*(T0_i_s*y_t(mp,ms,mt))/xjac**2
+          eq(var_Ti_equil,0,2,0,1) = (T0_i_ss*x_t(mp,ms,mt)**2 + T0_i_s*(x_st(mp,ms,mt)*x_t(mp,ms,mt) - x_tt(mp,ms,mt)*x_s(mp,ms,mt)))/xjac**2  &
+                                    - xjac_y*(-T0_i_s*x_t(mp,ms,mt))/xjac**2
+          eq(var_Ti_equil,1,1,0,1) = (-T0_i_ss*y_t(mp,ms,mt)*x_t(mp,ms,mt) - T0_i_s*(x_st(mp,ms,mt)*y_t(mp,ms,mt) - x_tt(mp,ms,mt)*y_s(mp,ms,mt)))/xjac**2         &
+                                    - xjac_x*(-T0_i_s*x_t(mp,ms,mt))/xjac**2
+          ! Second derivatives wrt phi not implemented in FFT, and not necessary for stabilization (2nd derivatives only appear in hyperdissipation terms)
+          eq(var_Ti_equil,1,0,1,1) = -x_p_x*eq(var_Ti_equil,1,0,0,1) - x_p(mp,ms,mt)*eq(var_Ti_equil,2,0,0,1) - y_p_x*eq(var_Ti_equil,0,1,0,1) &
+                                    - y_p(mp,ms,mt)*eq(var_Ti_equil,1,1,0,1)
+          eq(var_Ti_equil,0,1,1,1) = -x_p_y*eq(var_Ti_equil,1,0,0,1) - x_p(mp,ms,mt)*eq(var_Ti_equil,1,1,0,1) - y_p_y*eq(var_Ti_equil,0,1,0,1) &
+                                    - y_p(mp,ms,mt)*eq(var_Ti_equil,0,2,0,1)
+
+          call temperature_e(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, psi_norm, 0.0, 1.0, T0_e, T0_e_s,dummy1,T0_e_ss,dummy2,dummy3,dummy4,dummy5,dummy6)
+          T0_e_s = T0_e_s*s_factor; T0_e_ss = T0_e_ss*s_factor**2   ! convert to local derivative within element
+          eq(var_Te_equil,0,0,0,:) = T0_e
+          eq(var_Te_equil,1,0,0,:) = (y_t(mp,ms,mt)*T0_e_s)/xjac
+          eq(var_Te_equil,0,1,0,:) = (-x_t(mp,ms,mt)*T0_e_s)/xjac
+          eq(var_Te_equil,0,0,1,:) = -eq(var_Te_equil,1,0,0,:)*x_p(mp,ms,mt) - eq(var_Te_equil,0,1,0,:)*y_p(mp,ms,mt)
+          eq(var_Te_equil,2,0,0,1) = (T0_e_ss*y_t(mp,ms,mt)**2 + T0_e_s*(y_st(mp,ms,mt)*y_t(mp,ms,mt) - y_tt(mp,ms,mt)*y_s(mp,ms,mt)))/xjac**2  &
+                                    - xjac_x*(T0_e_s*y_t(mp,ms,mt))/xjac**2
+          eq(var_Te_equil,0,2,0,1) = (T0_e_ss*x_t(mp,ms,mt)**2 + T0_e_s*(x_st(mp,ms,mt)*x_t(mp,ms,mt) - x_tt(mp,ms,mt)*x_s(mp,ms,mt)))/xjac**2  &
+                                    - xjac_y*(-T0_e_s*x_t(mp,ms,mt))/xjac**2
+          eq(var_Te_equil,1,1,0,1) = (-T0_e_ss*y_t(mp,ms,mt)*x_t(mp,ms,mt) - T0_e_s*(x_st(mp,ms,mt)*y_t(mp,ms,mt) - x_tt(mp,ms,mt)*y_s(mp,ms,mt)))/xjac**2         &
+                                    - xjac_x*(-T0_e_s*x_t(mp,ms,mt))/xjac**2
+          ! Second derivatives wrt phi not implemented in FFT, and not necessary for stabilization (2nd derivatives only appear in hyperdissipation terms)
+          eq(var_Te_equil,1,0,1,1) = -x_p_x*eq(var_Te_equil,1,0,0,1) - x_p(mp,ms,mt)*eq(var_Te_equil,2,0,0,1) - y_p_x*eq(var_Te_equil,0,1,0,1) &
+                                    - y_p(mp,ms,mt)*eq(var_Te_equil,1,1,0,1)
+          eq(var_Te_equil,0,1,1,1) = -x_p_y*eq(var_Te_equil,1,0,0,1) - x_p(mp,ms,mt)*eq(var_Te_equil,1,1,0,1) - y_p_y*eq(var_Te_equil,0,1,0,1) &
+                                    - y_p(mp,ms,mt)*eq(var_Te_equil,0,2,0,1)
+        else
+          call temperature(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, psi_norm, 0.0, 1.0, T0, T0_s,dummy1,T0_ss,dummy2,dummy3,dummy4,dummy5,dummy6)
+          T0_s = T0_s*s_factor; T0_ss = T0_ss*s_factor**2   ! convert to local derivative within element
+          eq(var_T_equil,0,0,0,:) = T0
+          eq(var_T_equil,1,0,0,:) = (y_t(mp,ms,mt)*T0_s)/xjac
+          eq(var_T_equil,0,1,0,:) = (-x_t(mp,ms,mt)*T0_s)/xjac
+          eq(var_T_equil,0,0,1,:) = -eq(var_T_equil,1,0,0,:)*x_p(mp,ms,mt) - eq(var_T_equil,0,1,0,:)*y_p(mp,ms,mt)
+          eq(var_T_equil,2,0,0,1) = (T0_ss*y_t(mp,ms,mt)**2 + T0_s*(y_st(mp,ms,mt)*y_t(mp,ms,mt) - y_tt(mp,ms,mt)*y_s(mp,ms,mt)))/xjac**2  &
+                                    - xjac_x*(T0_s*y_t(mp,ms,mt))/xjac**2
+          eq(var_T_equil,0,2,0,1) = (T0_ss*x_t(mp,ms,mt)**2 + T0_s*(x_st(mp,ms,mt)*x_t(mp,ms,mt) - x_tt(mp,ms,mt)*x_s(mp,ms,mt)))/xjac**2  &
+                                    - xjac_y*(-T0_s*x_t(mp,ms,mt))/xjac**2
+          eq(var_T_equil,1,1,0,1) = (-T0_ss*y_t(mp,ms,mt)*x_t(mp,ms,mt) - T0_s*(x_st(mp,ms,mt)*y_t(mp,ms,mt) - x_tt(mp,ms,mt)*y_s(mp,ms,mt)))/xjac**2         &
+                                    - xjac_x*(-T0_s*x_t(mp,ms,mt))/xjac**2
+          ! Second derivatives wrt phi not implemented in FFT, and not necessary for stabilization (2nd derivatives only appear in hyperdissipation terms)
+          eq(var_T_equil,1,0,1,1) = -x_p_x*eq(var_T_equil,1,0,0,1) - x_p(mp,ms,mt)*eq(var_T_equil,2,0,0,1) - y_p_x*eq(var_T_equil,0,1,0,1) &
+                                    - y_p(mp,ms,mt)*eq(var_T_equil,1,1,0,1)
+          eq(var_T_equil,0,1,1,1) = -x_p_y*eq(var_T_equil,1,0,0,1) - x_p(mp,ms,mt)*eq(var_T_equil,1,1,0,1) - y_p_y*eq(var_T_equil,0,1,0,1) &
+                                    - y_p(mp,ms,mt)*eq(var_T_equil,0,2,0,1)
+        end if
+      endif
 
       if (with_TiTe) then
         

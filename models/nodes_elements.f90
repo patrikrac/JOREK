@@ -9,7 +9,7 @@ module nodes_elements
   type (type_bnd_element_list),target :: bnd_elm_list   !< List of boundary elements.
   type (type_bnd_node_list),   target :: bnd_node_list  !< List of boundary nodes.
 
-  type (type_node_list),       pointer :: aux_node_list  !< List of grid nodes (used for particle moments)
+  type (type_node_list),       pointer :: aux_node_list=>null()  !< List of grid nodes (used for particle moments)
 
 #ifdef IMPORT_PERTURBATIONS
   type (type_node_list)        :: node_list2      !< List of grid nodes.

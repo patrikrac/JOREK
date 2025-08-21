@@ -55,7 +55,11 @@ contains
     if (p_time2%bip < p_time1%bip) then
        nb_periods = nb_periods + nb_periods_max
     endif
-    p_difftime = p_difftime+real(nb_periods)/real(nb_periods_sec)
+    if (nb_periods_sec == 0) then
+       p_difftime = p_difftime+0.0
+    else
+        p_difftime = p_difftime+real(nb_periods)/real(nb_periods_sec)
+    endif
   end subroutine clck_diff
 
   !--------------------------------- 
@@ -71,7 +75,12 @@ contains
     if (p_time2%bip < p_time1%bip) then
        nb_periods = nb_periods + nb_periods_max
     endif
-    p_difftime = real(nb_periods)/real(nb_periods_sec)
+    ! if the number of periods is null, the time difference is null
+    if (nb_periods_sec == 0) then
+       p_difftime = 0.0
+    else
+        p_difftime = real(nb_periods)/real(nb_periods_sec)
+    endif
   end subroutine clck_ldiff
 
 

@@ -10,6 +10,7 @@ use data_structure, only: type_node_list,type_element_list, init_node_list, deal
 use mod_parameters, only: n_nodes_max
 use mod_model_settings, only: n_var
 implicit none
+include 'dmumps_struc.h'        ! MUMPS include files defining its datastructure
 private
 public :: run_fruit_projection_spec_mpi
 !> Variables --------------------------------------
@@ -271,7 +272,6 @@ end subroutine test_project_peak_gaussian_square_20_20
 !> Reference integrals calculated with Mathematica
 subroutine test_projection_matrix_square
   use constants,                         only: TWOPI
-  use mod_project_particles,             only: DMUMPS_STRUC
   use mod_projection_helpers_test_tools, only: close_dmumps
   implicit none
   integer,parameter          :: nstep_test=2
@@ -294,7 +294,6 @@ end subroutine test_projection_matrix_square
 !> Test the construction of the projection matrix with and without openmp
 !> for a simple grid.
 subroutine test_omp_projection_matrix_square
-  use mod_project_particles,             only: DMUMPS_STRUC
   use mod_projection_helpers_test_tools, only: close_dmumps
   !$use omp_lib
   implicit none
@@ -409,11 +408,11 @@ Rbegin_loc,Rend_loc,Zbegin_loc,Zend_loc,i_tor_local,n_tor_local,local_filter,&
 hyper_filter,parallel_filter,apply_dirichlet,node_list,element_list,mumps_data,ifail)
   use mpi_mod
   use data_structure
-  use mod_project_particles,             only: DMUMPS_STRUC
   use mod_project_particles,             only: prepare_mumps_par_n0
   use mod_project_particles,             only: prepare_mumps_par
   use mod_projection_helpers_test_tools, only: default_square_grid
   use mod_projection_helpers_test_tools, only: broadcast_dmumps_struct_A_irn_jcn
+  use mod_projection_helpers_test_tools, only: map_matrix_to_MUMPS_datastructure
   implicit none
   type(type_node_list),intent(inout)    :: node_list
   type(type_element_list),intent(inout) :: element_list
@@ -424,6 +423,7 @@ hyper_filter,parallel_filter,apply_dirichlet,node_list,element_list,mumps_data,i
   real*8,intent(in)    :: local_filter,hyper_filter,parallel_filter
   logical,intent(in)   :: apply_dirichlet
   type(DMUMPS_STRUC),intent(inout) :: mumps_data
+  type (type_SP_MATRIX) :: a_mat
   integer :: mpi_comm_n,mpi_comm_master
   real*8  :: area,volume
   real*8,dimension(:),allocatable :: integral_weights
@@ -435,22 +435,23 @@ hyper_filter,parallel_filter,apply_dirichlet,node_list,element_list,mumps_data,i
   !> compute the matrix 
   if(i_tor_local.eq.1) then
     call prepare_mumps_par_n0(node_list,element_list,n_tor_local,i_tor_local,&
-    MPI_COMM_WORLD,mpi_comm_n,mpi_comm_master,mumps_data,area,volume,&
+    MPI_COMM_WORLD,mpi_comm_n,mpi_comm_master,a_mat,area,volume,&
     filter=local_filter,filter_hyper=hyper_filter,filter_parallel=parallel_filter,&
     apply_dirichlet_condition_in=apply_dirichlet,integral_weights=integral_weights)
   else
     call prepare_mumps_par(node_list,element_list,n_tor_local,i_tor_local,&
-    MPI_COMM_WORLD,mpi_comm_n,mpi_comm_master,mumps_data,filter=local_filter,&
+    MPI_COMM_WORLD,mpi_comm_n,mpi_comm_master,a_mat,filter=local_filter,&
     filter_hyper=hyper_filter,filter_parallel=parallel_filter,&
     apply_dirichlet_condition_in=apply_dirichlet)
   endif
+  !> map the matrix to the MUMPS datastructure
+  call map_matrix_to_MUMPS_datastructure(a_mat,mumps_data)
   !> broadcast matrix
   call broadcast_dmumps_struct_A_irn_jcn(rank,master_rank,mumps_data,ifail)
 end subroutine compute_projection_matrix_square_grid
 
 !> construct the projected matrix from mumps data
 subroutine construct_matrix_from_mumps(mumps_data,matrix)
-  use mod_project_particles, only: DMUMPS_STRUC
   implicit none
   type(DMUMPS_STRUC),intent(inout)              :: mumps_data
   real*8,dimension(:,:),allocatable,intent(out) :: matrix

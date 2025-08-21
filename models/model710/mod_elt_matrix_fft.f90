@@ -230,7 +230,7 @@ real*8     :: PneoZ_rho__p, PneoZ_rho__n
 real*8     :: PneoZ_T__p,   PneoZ_T__n
 real*8     :: PneoZ_UR,     PneoZ_UZ
 
-real*8     :: ZK_prof, D_prof, psi_norm
+real*8     :: ZK_prof, D_prof, D_par_local, psi_norm
 
 real*8     :: eta_T, visco_T, deta_dT, d2eta_d2T, dvisco_dT, visco_num_T, visco_divV, dvisco_divV_dT
 real*8     :: eta_num_T, eta_R, eta_Z, eta_p, Zkpar_T, dZKpar_dt
@@ -948,8 +948,9 @@ do i=1,n_vertex_max
           psi_norm = get_psi_n(psi_axisym(ms,mt), y_g(ms,mt))
 
           ! --- Diffusions
-          D_prof  = get_dperp (psi_norm)
-          ZK_prof = get_zkperp(psi_norm)
+          D_prof      = get_dperp (psi_norm)
+          D_par_local = D_par
+          ZK_prof     = get_zkperp(psi_norm)
 
           ! --- Resistivity
           if ( eta_T_dependent .and. T0_corr <= T_max_eta) then
@@ -1506,12 +1507,12 @@ do i=1,n_vertex_max
             Qvec_p(var_rho) = - v * ( rho0 * divU + UgradRho )                  &
                               + rho0 * VdiaGradVstar__p                         &
                               - D_prof * gradRho_gradVstar__p                   &
-                              - (D_par-D_prof) * BgradVstar__p * BgradRho / BB2 &
+                              - (D_par_local-D_prof) * BgradVstar__p * BgradRho / BB2 &
                               + v * particle_source(ms,mt)                      &
                               - D_perp_num * lap_Vstar * lap_Rho
             Qvec_k(var_rho) = + rho0 * VdiaGradVstar__k                         &
                               - D_prof * gradRho_gradVstar__k                   &
-                              - (D_par-D_prof) * BgradVstar__k * BgradRho / BB2 
+                              - (D_par_local-D_prof) * BgradVstar__k * BgradRho / BB2 
             !###################################################################################################
             !#  equation 8 (Pressure equation)                                                                 #
             !###################################################################################################
@@ -2799,46 +2800,46 @@ do i=1,n_vertex_max
                   Pjac   (var_rho,var_rho) =   v * rho
 
                   Qjac_p (var_rho,var_AR)  = + rho0 * VdiaGradVstar_AR__p &
-                                             - (D_par-D_prof) * BgradVstar_AR__p * BgradRho       / BB2 &
-                                             - (D_par-D_prof) * BgradVstar__p    * BgradRho_AR__p / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__p    * BgradRho       / BB2**2 * BB2_AR__p
+                                             - (D_par_local-D_prof) * BgradVstar_AR__p * BgradRho       / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__p    * BgradRho_AR__p / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__p    * BgradRho       / BB2**2 * BB2_AR__p
                   Qjac_n (var_rho,var_AR)  = + rho0 * VdiaGradVstar_AR__n &
-                                             - (D_par-D_prof) * BgradVstar_AR__n * BgradRho       / BB2 &
-                                             - (D_par-D_prof) * BgradVstar__p    * BgradRho_AR__n / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__p    * BgradRho       / BB2**2 * BB2_AR__n
+                                             - (D_par_local-D_prof) * BgradVstar_AR__n * BgradRho       / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__p    * BgradRho_AR__n / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__p    * BgradRho       / BB2**2 * BB2_AR__n
                   Qjac_k (var_rho,var_AR)  = + rho0 * VdiaGradVstar_AR__k &
-                                             - (D_par-D_prof) * BgradVstar_AR__k * BgradRho       / BB2 &
-                                             - (D_par-D_prof) * BgradVstar__k    * BgradRho_AR__p / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__k    * BgradRho       / BB2**2 * BB2_AR__p
+                                             - (D_par_local-D_prof) * BgradVstar_AR__k * BgradRho       / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__k    * BgradRho_AR__p / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__k    * BgradRho       / BB2**2 * BB2_AR__p
                   Qjac_kn(var_rho,var_AR)  = + rho0 * VdiaGradVstar_AR__kn &
-                                             - (D_par-D_prof) * BgradVstar__k    * BgradRho_AR__n / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__k    * BgradRho       / BB2**2 * BB2_AR__n
+                                             - (D_par_local-D_prof) * BgradVstar__k    * BgradRho_AR__n / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__k    * BgradRho       / BB2**2 * BB2_AR__n
 
                   Qjac_p (var_rho,var_AZ)  = + rho0 * VdiaGradVstar_AZ__p &
-                                             - (D_par-D_prof) * BgradVstar_AZ__p * BgradRho       / BB2 &
-                                             - (D_par-D_prof) * BgradVstar__p    * BgradRho_AZ__p / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__p    * BgradRho       / BB2**2 * BB2_AZ__p
+                                             - (D_par_local-D_prof) * BgradVstar_AZ__p * BgradRho       / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__p    * BgradRho_AZ__p / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__p    * BgradRho       / BB2**2 * BB2_AZ__p
                   Qjac_n (var_rho,var_AZ)  = + rho0 * VdiaGradVstar_AZ__n &
-                                             - (D_par-D_prof) * BgradVstar_AZ__n * BgradRho       / BB2 &
-                                             - (D_par-D_prof) * BgradVstar__p    * BgradRho_AZ__n / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__p    * BgradRho       / BB2**2 * BB2_AZ__n
+                                             - (D_par_local-D_prof) * BgradVstar_AZ__n * BgradRho       / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__p    * BgradRho_AZ__n / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__p    * BgradRho       / BB2**2 * BB2_AZ__n
                   Qjac_k (var_rho,var_AZ)  = + rho0 * VdiaGradVstar_AZ__k &
-                                             - (D_par-D_prof) * BgradVstar_AZ__k * BgradRho       / BB2 &
-                                             - (D_par-D_prof) * BgradVstar__k    * BgradRho_AZ__p / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__k    * BgradRho       / BB2**2 * BB2_AZ__p
+                                             - (D_par_local-D_prof) * BgradVstar_AZ__k * BgradRho       / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__k    * BgradRho_AZ__p / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__k    * BgradRho       / BB2**2 * BB2_AZ__p
                   Qjac_kn(var_rho,var_AZ)  = + rho0 * VdiaGradVstar_AZ__kn &
-                                             - (D_par-D_prof) * BgradVstar__k    * BgradRho_AZ__n / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__k    * BgradRho       / BB2**2 * BB2_AZ__n
+                                             - (D_par_local-D_prof) * BgradVstar__k    * BgradRho_AZ__n / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__k    * BgradRho       / BB2**2 * BB2_AZ__n
 
                   Qjac_p (var_rho,var_A3)  = + rho0 * VdiaGradVstar_A3__p &
-                                             - (D_par-D_prof) * BgradVstar_A3__p * BgradRho    / BB2 &
-                                             - (D_par-D_prof) * BgradVstar__p    * BgradRho_A3 / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__p    * BgradRho    / BB2**2 * BB2_A3
+                                             - (D_par_local-D_prof) * BgradVstar_A3__p * BgradRho    / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__p    * BgradRho_A3 / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__p    * BgradRho    / BB2**2 * BB2_A3
                   Qjac_n (var_rho,var_A3)  = + rho0 * VdiaGradVstar_A3__n
                   Qjac_k (var_rho,var_A3)  = + rho0 * VdiaGradVstar_A3__k &
-                                             - (D_par-D_prof) * BgradVstar_A3__k * BgradRho    / BB2 &
-                                             - (D_par-D_prof) * BgradVstar__k    * BgradRho_A3 / BB2 &
-                                             + (D_par-D_prof) * BgradVstar__k    * BgradRho    / BB2**2 * BB2_A3
+                                             - (D_par_local-D_prof) * BgradVstar_A3__k * BgradRho    / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__k    * BgradRho_A3 / BB2 &
+                                             + (D_par_local-D_prof) * BgradVstar__k    * BgradRho    / BB2**2 * BB2_A3
                   Qjac_kn(var_rho,var_A3)  = + rho0 * VdiaGradVstar_A3__kn
 
                   Qjac_p (var_rho,var_UR)  = - v * ( rho0 * divU_UR + UgradRho_UR )
@@ -2852,16 +2853,16 @@ do i=1,n_vertex_max
                                              + rho  * VdiaGradVstar__p &
                                              + rho0 * VdiaGradVstar_rho__p &
                                              - D_prof * gradRho_gradVstar_rho__p                      &
-                                             - (D_par-D_prof) * BgradVstar__p * BgradRho_rho__p / BB2 &
+                                             - (D_par_local-D_prof) * BgradVstar__p * BgradRho_rho__p / BB2 &
                                              - D_perp_num * lap_Vstar * lap_bf
                   Qjac_n (var_rho,var_rho) = - v * (UgradRho_rho__n )                                 &
                                              + rho0 * VdiaGradVstar_rho__n &
-                                             - (D_par-D_prof) * BgradVstar__p * BgradRho_rho__n / BB2
+                                             - (D_par_local-D_prof) * BgradVstar__p * BgradRho_rho__n / BB2
                   Qjac_k (var_rho,var_rho) = + rho0 * VdiaGradVstar_rho__k &
-                                             - (D_par-D_prof) * BgradVstar__k * BgradRho_rho__p / BB2
+                                             - (D_par_local-D_prof) * BgradVstar__k * BgradRho_rho__p / BB2
                   Qjac_kn(var_rho,var_rho) = + rho0 * VdiaGradVstar_rho__kn &
                                              - D_prof * gradRho_gradVstar_rho__kn                     &
-                                             - (D_par-D_prof) * BgradVstar__k * BgradRho_rho__n / BB2
+                                             - (D_par_local-D_prof) * BgradVstar__k * BgradRho_rho__n / BB2
 
                   Qjac_p (var_rho,var_T  ) = + rho0 * VdiaGradVstar_T__p
                   Qjac_n (var_rho,var_T  ) = + rho0 * VdiaGradVstar_T__n

@@ -44,7 +44,7 @@ real*8     :: R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint(2), Z_xpoint(2), dj_dp
 real*8     :: Bgrad_rho_star,     Bgrad_rho,     Bgrad_T_star,  Bgrad_T, BB2
 real*8     :: Bgrad_rho_star_psi, Bgrad_rho_psi, Bgrad_rho_rho, Bgrad_T_star_psi, Bgrad_T_psi, Bgrad_T_T, BB2_psi
 real*8     :: Bgrad_rho_rho_n, Bgrad_T_T_n, Bgrad_rho_k_star, Bgrad_T_k_star
-real*8     :: D_prof, ZK_prof, psi_norm
+real*8     :: D_prof, D_par_local, ZK_prof, psi_norm
 real*8     :: rhs_ij_1,   rhs_ij_2, rhs_ij_2_k,   rhs_ij_3,   rhs_ij_4,   rhs_ij_5,   rhs_ij_6
 real*8     :: rhs_ij_5_k, rhs_ij_6_k
 real*8     :: rhs_stab_1, rhs_stab_2, rhs_stab_3, rhs_stab_4, rhs_stab_5, rhs_stab_6
@@ -327,8 +327,9 @@ do ms=1, n_gauss
      
      psi_norm = get_psi_n(ps0, y_g(ms,mt))
      
-     D_prof  = get_dperp (psi_norm)
-     ZK_prof = get_zkperp(psi_norm)
+     D_prof      = get_dperp (psi_norm)
+     D_par_local = D_par
+     ZK_prof     = get_zkperp(psi_norm)
      
      ! --- Increase diffusivity if very small density/temperature
      if (xpoint2) then
@@ -406,7 +407,7 @@ do ms=1, n_gauss
          rhs_ij_5   = v * BigR * particle_source(ms,mt)                                        * xjac * tstep &
                     + v * BigR**2 * ( r0_s * u0_t - r0_t * u0_s)                                      * tstep &
                     + v * 2.d0 * BigR * r0 * u0_y                                              * xjac * tstep &
-                    - (D_par-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho                 * xjac * tstep &
+                    - (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho                 * xjac * tstep &
                     - D_prof * BigR  * (v_x*r0_x + v_y*r0_y                                  ) * xjac * tstep &
                     + zeta * v * delta_g(mp,5,ms,mt) * BigR                                    * xjac 
 

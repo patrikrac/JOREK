@@ -52,7 +52,7 @@ real*8     :: Bgrad_rho_star,     Bgrad_rho,     Bgrad_T_star,  Bgrad_Ti, Bgrad_
 real*8     :: Bgrad_rho_star_psi, Bgrad_rho_psi, Bgrad_rho_rho, Bgrad_T_star_psi, Bgrad_Ti_psi, Bgrad_Ti_Ti, Bgrad_Te_psi, Bgrad_Te_Te, BB2_psi
 real*8     :: Bgrad_rho_k_star, Bgrad_T_k_star, Bgrad_Ti_Ti_n, Bgrad_Te_Te_n, Bgrad_rho_rho_n
 real*8     :: ZKi_par_T, dZKi_par_dT, ZKe_par_T, dZKe_par_dT
-real*8     :: D_prof, ZKi_prof, ZKe_prof, psi_norm, theta, zeta, delta_u_x, delta_u_y, delta_ps_x, delta_ps_y
+real*8     :: D_prof, D_par_local, ZKi_prof, ZKe_prof, psi_norm, theta, zeta, delta_u_x, delta_u_y, delta_ps_x, delta_ps_y
 real*8     :: rhs_ij(n_var), rhs_ij_k(n_var)
 real*8     :: amat(n_var,n_var), amat_k(n_var,n_var), amat_n(n_var,n_var), amat_kn(n_var,n_var)
 
@@ -797,9 +797,10 @@ do i=1,n_vertex_max
             Jb = 0.d0
           endif
 
-          D_prof   = get_dperp (psi_norm)
-          ZKi_prof = get_zk_iperp(psi_norm)
-          ZKe_prof = get_zk_eperp(psi_norm)
+          D_prof      = get_dperp (psi_norm)
+          D_par_local = D_par
+          ZKi_prof    = get_zk_iperp(psi_norm)
+          ZKe_prof    = get_zk_eperp(psi_norm)
 
           ! --- Increase diffusivity if very small density/temperature
           if (xpoint2) then
@@ -965,7 +966,7 @@ do i=1,n_vertex_max
                        + v * BigR**2 * ( r0_s * u0_t - r0_t * u0_s)                                      * tstep &
                        + v * 2.d0 * BigR * r0 * u0_y                                              * xjac * tstep &
 
-                       - (D_par-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho                 * xjac * tstep &
+                       - (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho                 * xjac * tstep &
                        - D_prof * BigR  * (v_x*r0_x + v_y*r0_y                                  ) * xjac * tstep &
 
                        - v * F0 / BigR * Vpar0 * r0_p                                             * xjac * tstep &
@@ -986,7 +987,7 @@ do i=1,n_vertex_max
                                  * ( v_x * ps0_y -  v_y * ps0_x                   ) * xjac * tstep * tstep
 
 
-            rhs_ij_k(5) = - (D_par-D_prof) * BigR / BB2 * Bgrad_rho_k_star * Bgrad_rho            * xjac * tstep &
+            rhs_ij_k(5) = - (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_k_star * Bgrad_rho            * xjac * tstep &
                           - D_prof * BigR  * (                  v_p*r0_p /BigR**2 )               * xjac * tstep &
 
                        - TG_num5 * 0.25d0 / BigR * vpar0**2 &
@@ -1440,9 +1441,9 @@ do i=1,n_vertex_max
                   !###################################################################################################
 
 
-                  amat(5,1) =-(D_par-D_prof) * BigR * BB2_psi/ BB2**2 * Bgrad_rho_star     * Bgrad_rho     * xjac * theta * tstep &
-                            + (D_par-D_prof) * BigR / BB2             * Bgrad_rho_star_psi * Bgrad_rho     * xjac * theta * tstep &
-                            + (D_par-D_prof) * BigR / BB2             * Bgrad_rho_star     * Bgrad_rho_psi * xjac * theta * tstep &
+                  amat(5,1) =-(D_par_local-D_prof) * BigR * BB2_psi/ BB2**2 * Bgrad_rho_star     * Bgrad_rho     * xjac * theta * tstep &
+                            + (D_par_local-D_prof) * BigR / BB2             * Bgrad_rho_star_psi * Bgrad_rho     * xjac * theta * tstep &
+                            + (D_par_local-D_prof) * BigR / BB2             * Bgrad_rho_star     * Bgrad_rho_psi * xjac * theta * tstep &
                             + v * Vpar0 * (r0_s * psi_t - r0_t * psi_s)                                           * theta * tstep &
                             + v * r0 * (vpar0_s * psi_t - vpar0_t * psi_s)                                        * theta * tstep &
  
@@ -1454,8 +1455,8 @@ do i=1,n_vertex_max
                                       * ( v_x * psi_y -  v_y * psi_x                   ) * xjac * theta * tstep * tstep
 
 
-                  amat_k(5,1) = - (D_par-D_prof) * BigR * BB2_psi/ BB2**2 * Bgrad_rho_k_star * Bgrad_rho     * xjac * theta * tstep &
-                                + (D_par-D_prof) * BigR / BB2             * Bgrad_rho_k_star * Bgrad_rho_psi * xjac * theta * tstep &
+                  amat_k(5,1) = - (D_par_local-D_prof) * BigR * BB2_psi/ BB2**2 * Bgrad_rho_k_star * Bgrad_rho     * xjac * theta * tstep &
+                                + (D_par_local-D_prof) * BigR / BB2             * Bgrad_rho_k_star * Bgrad_rho_psi * xjac * theta * tstep &
 
                               + TG_num5 * 0.25d0 / BigR * vpar0**2                                                            &
                                       * (r0_x * psi_y - r0_y * psi_x)                                                         &
@@ -1472,7 +1473,7 @@ do i=1,n_vertex_max
                   amat(5,5) = v * rho * BigR * (1.d0 + zeta)                                            * xjac   &
                           - v * BigR**2 * ( rho_s * u0_t - rho_t * u0_s)                                       * theta * tstep &
                           - v * 2.d0 * BigR * rho * u0_y                                                * xjac * theta * tstep &
-                          + (D_par-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho_rho                * xjac * theta * tstep &
+                          + (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_star * Bgrad_rho_rho                * xjac * theta * tstep &
                           + D_prof * BigR  * (v_x*rho_x + v_y*rho_y )                                   * xjac * theta * tstep &
                           + v * Vpar0 * (rho_s * ps0_t - rho_t * ps0_s)                                        * theta * tstep &
                           + v * rho * (vpar0_s * ps0_t - vpar0_t * ps0_s)                                      * theta * tstep &
@@ -1489,20 +1490,20 @@ do i=1,n_vertex_max
                                     * (rho_x * ps0_y - rho_y * ps0_x )                             &
                                     * ( v_x * ps0_y -  v_y * ps0_x   ) * xjac * theta * tstep * tstep
 
-                  amat_k(5,5) = + (D_par-D_prof) * BigR / BB2 * Bgrad_rho_k_star * Bgrad_rho_rho          * xjac * theta * tstep &
+                  amat_k(5,5) = + (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_k_star * Bgrad_rho_rho          * xjac * theta * tstep &
  
                          + TG_num5 * 0.25d0 / BigR * vpar0**2                                                        &
                                     * (rho_x * ps0_y - rho_y * ps0_x                  )                              &
                                     * (                              + F0 / BigR * v_p) * xjac * theta * tstep * tstep
 
-                  amat_n(5,5) = + (D_par-D_prof) * BigR / BB2 * Bgrad_rho_star   * Bgrad_rho_rho_n        * xjac * theta * tstep &
+                  amat_n(5,5) = + (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_star   * Bgrad_rho_rho_n        * xjac * theta * tstep &
                               + v * F0 / BigR * Vpar0 * rho_p                                             * xjac * theta * tstep &
 
                           + TG_num5 * 0.25d0 / BigR * vpar0**2                                                        &
                                     * (                              + F0 / BigR * rho_p)                             &
                                     * ( v_x * ps0_y -  v_y * ps0_x                      ) * xjac * theta * tstep * tstep
 
-                  amat_kn(5,5) = + (D_par-D_prof) * BigR / BB2 * Bgrad_rho_k_star * Bgrad_rho_rho_n       * xjac * theta * tstep &
+                  amat_kn(5,5) = + (D_par_local-D_prof) * BigR / BB2 * Bgrad_rho_k_star * Bgrad_rho_rho_n       * xjac * theta * tstep &
                                  + D_prof * BigR  * ( v_p*rho_p /BigR**2 )                                * xjac * theta * tstep &
 
                           + TG_num5 * 0.25d0 / BigR * vpar0**2                                                        &

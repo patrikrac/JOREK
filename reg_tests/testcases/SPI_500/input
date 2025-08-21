@@ -230,6 +230,7 @@
 
  ! --- SPI parameters
  using_spi = .t.
+ spi_abl_mag_reduction = .t.
  t_ns      = 2000.
 
  spi_quantity   = 5.d26 !3.6d22
