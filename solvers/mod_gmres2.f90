@@ -35,8 +35,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   type(type_SP_SOLVER)  :: solver
   
   real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0
+  real(kind=8) :: norm_p
   integer :: totit, maxit, restart, nrit, it, ldh, k, j
-  integer :: kappa 
+  integer :: nOrto 
   logical :: no_conv, GSC=.false., GSM=.false., GSCI=.true., GSMI=.false.
   real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, b_prec, b_, s_
 
@@ -57,7 +58,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   atol = 1.d-36
   maxit = solver%iter_max
   restart = solver%gmres_m
-  kappa = 2 ! Number of iterations for the orthogonalization methos (in case of iterative methods) (Might be adjusted to be dynammic in the future)
+  nOrto = 3 ! Number of iterations for the orthogonalization methos (in case of iterative methods)
   if (restart > maxit) restart = maxit
 
   allocate(givens_c(restart),givens_s(restart),b_(restart+1),hess((restart+1)*restart),V(n*(restart+1)),b_prec(n))
@@ -68,27 +69,31 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
   ldh = restart+1
   call dcopy(n, b, 1, b_prec, 1)
+  ! --- b = M^-1 b --- 
   call prec(solver, b_prec, b_prec, n, MPI_GLOB, MPI_COMM_N)
 
   no_conv = .true.
   totit = 0;
 
   do while (no_conv)
-
+    ! --- v_1 = A * x ---
     call cmatv(c_loc(x), c_loc(V(1)), c_loc(a_mat%val), c_loc(a_mat%iptr), c_loc(a_mat%jcn), &
                c_loc(a_mat%coo_to_csr_map), a_mat%ng, a_mat%nr, a_mat%block_size, solver%gpu, a_mat%comm)
-    !write(*,"(A5,X,E18.10)") "after", dnrm2(n, V(1:n), 1);
+    
+    ! --- v_1 = M^-1 v_1 ---
     call prec(solver, V(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
-    !write(*,"(A5,X,E18.10)") "after", dnrm2(n, V(1:n), 1);
 
-    call daxpby(n, 1.d0, b_prec(1:n), 1, -1.d0, V(1:n), 1);
+    ! --- v_1 = b - v_1 (Preconditioned residual) ---
+    call daxpby(n, 1.d0, b_prec(1:n), 1, -1.d0, V(1:n), 1)
 
-    rho = dnrm2(n, V(1:n), 1);
-    if (totit .eq. 0) rho0 = rho;
+    ! --- rho = ||v_1||_2 ---
+    rho = dnrm2(n, V(1:n), 1)
+    if (totit .eq. 0) rho0 = rho
     if ((rho/rho0 < rtol) .or. (rho < atol)) then
       no_conv = .false.
       exit
     endif
+    !--- v_1 = v_1 / rho
     call dscal(n, 1./rho, V(1:n), 1)
     b_(1) = rho
     b_(2:restart+1) = 0.d0
@@ -97,11 +102,13 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
     do it = 1, restart
       totit = totit +1
+      ! --- v_j+1 = A * v_j --- 
       call cmatv(c_loc(V((it-1)*n+1)), c_loc(V(it*n+1)), c_loc(a_mat%val), c_loc(a_mat%iptr), c_loc(a_mat%jcn), &
                  c_loc(a_mat%coo_to_csr_map), a_mat%ng, a_mat%nr, a_mat%block_size, solver%gpu, a_mat%comm)
+      ! --- v_j+1 = M^-1 v_j+1 --- 
       call prec(solver, V(it*n+1:it*n+n), V(it*n+1:it*n+n), n, MPI_GLOB, MPI_COMM_N)
 
-      ! Orthogonalization
+      ! --- Orthogonalization ---
       if (GSC) then ! Gram-Schmidt Classical
         call dgemv('C', n, it, 1.d0, V(1), n, V(it*n+1), 1, 0.d0, hess((it-1)*ldh+1), 1)
         call dgemv('N', n, it, -1.d0, V(1), n, hess((it-1)*ldh+1), 1, 1.d0, V(it*n+1), 1)
@@ -111,25 +118,31 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
           call daxpy(n, -hess(k+(it-1)*ldh), V((k-1)*n+1), 1, V(it*n+1), 1)
         enddo
       elseif (GSCI) then ! Gram-Schmidt Classical Iterative 
+        norm_p = dnrm2(n, V(it*n+1), 1)
         hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
-        do j=1,kappa
+        do j=1,nOrtho
           call dgemv('C', n, it, 1.d0, V(1), n, V(it*n+1), 1, 0.d0, s_(1), 1)
           call dgemv('N', n, it, -1.d0, V(1), n, s_(1), 1, 1.d0, V(it*n+1), 1)
           call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
+          if (2.d0 * dnrm2(n, V(it*n+1), 1) .gt. norm_p) exit ! Stopping criterion for iterative GS methods
         enddo
       elseif (GSMI) then ! Gram-Schmidt Modified Iterative
+        norm_p = dnrm2(n, V(it*n+1), 1)
         hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
-        do j=1,kappa
+        do j=1,nOrtho
           do k=1,it
             s_(k) = ddot(n, V((k-1)*n+1), 1, V(it*n+1), 1)
             call daxpy(n, -s_(k), V((k-1)*n+1), 1, V(it*n+1), 1)
           enddo
           call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
+          if (2.d0 * dnrm2(n, V(it*n+1), 1) .gt. norm_p) exit ! Stopping criterion for iterative GS methods
         enddo
       endif
-
-      hess(it+(it-1)*ldh+1) = dnrm2(n, V(it*n+1), 1)
+      ! --- h_j+1,j = ||v_j+1||_2 ---
+      hess(it+(it-1)*ldh+1) = dnrm2(n, V(it*n+1), 1)#
+      ! --- v_j+1 = v_j+1 / h_j+1,j --- 
       call dscal(n, 1./hess(it+(it-1)*ldh+1), V(it*n+1), 1)
+      ! --- Givens Rotation ---
       do k = 1, it-1
         gamma = givens_c(k)*hess(k+(it-1)*ldh) + givens_s(k)*hess(k+(it-1)*ldh+1)
         hess(k+(it-1)*ldh+1) = -givens_s(k)*hess(k+(it-1)*ldh) + givens_c(k)*hess(k+(it-1)*ldh+1)
@@ -151,7 +164,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       endif
 
     enddo
+    ! --- Solve upper triangular system b_ = H \ b_ ---
     call dtrsv('U', 'N', 'N', nrit+1, hess, ldh, b_, 1)
+    ! --- Update the solution x = x + V * b_ --- 
     call dgemv('N', n, nrit+1, 1.d0, V(1), n, b_(1), 1, 1.d0, x, 1)
 
   enddo
