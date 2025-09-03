@@ -129,12 +129,19 @@ find_package(LAPACK REQUIRED)
 if(USE_HDF5)
   find_package(HDF5 COMPONENTS Fortran C REQUIRED)
 endif()
+
 if(USE_FFTW)
-  find_package(FFTW REQUIRED
-    HINTS
-        ENV FFTW_HOME  
-        ENV FFTW_DIR
-  )
+  find_package(FFTW3 QUIET)
+
+  # 2. If the modern package was NOT found, fall back to the legacy "Module" mode.
+  #    This uses the FindFFTW.cmake script and can be guided by FFTW_HOME.
+  if(NOT FFTW3_FOUND)
+    find_package(FFTW MODULE QUIET
+        HINTS
+            ENV FFTW_HOME
+            ENV FFTW_DIR
+    )
+  endif()
 endif()
 
 # --- Advanced Library Finding for Solvers ---
