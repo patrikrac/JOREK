@@ -131,12 +131,12 @@ if(USE_HDF5)
 endif()
 
 if(USE_FFTW)
-  find_package(FFTW3 QUIET)
+  find_package(FFTW3)
 
   # 2. If the modern package was NOT found, fall back to the legacy "Module" mode.
   #    This uses the FindFFTW.cmake script and can be guided by FFTW_HOME.
   if(NOT FFTW3_FOUND)
-    find_package(FFTW MODULE QUIET
+    find_package(FFTW
         HINTS
             ENV FFTW_HOME
             ENV FFTW_DIR
@@ -178,7 +178,14 @@ if(USE_MUMPS)
   set(MUMPS_INCLUDE_DIRS ${MUMPS_INCLUDE_DIR} ${MKL_INCLUDE_DIRS})
   message(STATUS "Configured MUMPS support.")
 endif()
-# Add similar blocks for PASTIX, STRUMPACK, HIPS, WSMP...
+
+if(USE_STRUMPACK)
+  find_package(STRUMPACK REQUIRED)
+  if(NOT STRUMPACK_FOUND)
+      message(FATAL_ERROR "STRUMPACK not found. Set STRUMPACK_HOME or add to CMAKE_PREFIX_PATH.")
+  endif()
+  message(STATUS "Configured STRUMPACK support.")
+endif()
 
 
 # --- 6. Define Source Files ---
@@ -247,9 +254,10 @@ target_link_libraries(jorek_objects PUBLIC
     $<$<BOOL:${USE_MPI}>:MPI::MPI_Fortran>
     LAPACK::LAPACK BLAS::BLAS
     # Optional libraries
-    $<$<BOOL:${USE_HDF5}>:HDF5::HDF5_Fortran>
+    $<$<BOOL:${USE_HDF5}>:HDF5::hdf5_fortran>
     $<$<BOOL:${USE_FFTW}>:FFTW::FFTW>
     $<$<BOOL:${USE_MUMPS}>:${MUMPS_LIBRARIES}>
+    $<$<BOOL:${USE_STRUMPACK}>:STRUMPACK::strumpack>
     # Link to C++ std library if needed by Boost, etc.
     $<$<OR:$<BOOL:${USE_BOOST}>,$<BOOL:${USE_STD_BESSELK}>>:${CMAKE_CXX_STANDARD_LIBRARIES}>
 )
@@ -293,7 +301,6 @@ endfunction()
 # --- 9. Final Configuration Summary ---
 message(STATUS "--- JOREK Build Configuration Summary ---")
 message(STATUS "Build Type:       ${CMAKE_BUILD_TYPE}")
-message(STATUS "Install Prefix:   ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "Fortran Compiler: ${CMAKE_Fortran_COMPILER_ID} (${CMAKE_Fortran_COMPILER})")
 message(STATUS "Model:            ${MODEL} (Executable: jorek_model${MODEL_NUMBER})")
 message(STATUS "--- Enabled Features & Libraries ---")
