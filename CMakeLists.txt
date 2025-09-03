@@ -80,7 +80,7 @@ add_compile_definitions(${JOREK_EXTRA_DEFINITIONS})
 find_package(Git QUIET)
 if(GIT_FOUND)
   execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev OUTPUT_VARIABLE GIT_RCS_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
-  execute_process(COMMAND ${GIT_EXECUTABLE} log -1 "--format=%s (%D)" OUTPUT_VARIABLE GIT_RCS_LABEL ...)
+  execute_process(COMMAND ${GIT_EXECUTABLE} log -1 "--format=%s (%D)" OUTPUT_VARIABLE GIT_RCS_LABEL OUTPUT_STRIP_TRAILING_WHITESPACE)
   # ... add other git commands as needed ...
 else()
   set(GIT_RCS_VERSION "unknown")
