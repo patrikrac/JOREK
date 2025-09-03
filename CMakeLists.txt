@@ -130,7 +130,11 @@ if(USE_HDF5)
   find_package(HDF5 COMPONENTS Fortran C REQUIRED)
 endif()
 if(USE_FFTW)
-  find_package(FFTW REQUIRED)
+  find_package(FFTW REQUIRED
+    HINTS
+        ENV FFTW_HOME  
+        ENV FFTW_DIR
+  )
 endif()
 
 # --- Advanced Library Finding for Solvers ---
