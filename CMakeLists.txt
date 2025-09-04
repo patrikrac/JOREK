@@ -95,21 +95,19 @@ include_directories(${CMAKE_BINARY_DIR}) # So the compiler can find version.h
 
 
 # --- 4. Code Generation ---
-# Replicates the 'generate_code' target which runs 'algexpr2fort'
-# Assuming 'algexpr2fort' is an executable available in the source tree root
-add_executable(algexpr2fort_tool IMPORTED GLOBAL)
-set_property(TARGET algexpr2fort_tool PROPERTY IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/algexpr2fort)
+# Build algexpr2fort from source
+add_executable(algexpr2fort models/algexpr2fort.f90)
 
 set(GENERATED_RHS_FILE ${CMAKE_CURRENT_SOURCE_DIR}/models/${MODEL}/rhs_automatic.h)
 set(GENERATED_AMAT_FILE ${CMAKE_CURRENT_SOURCE_DIR}/models/${MODEL}/amat_automatic.h)
 
 add_custom_command(
-    OUTPUT ${GENERATED_RHS_FILE} ${GENERATED_AMAT_FILE}
-    COMMAND ${CMAKE_COMMAND} -E touch ${GENERATED_RHS_FILE} ${GENERATED_AMAT_FILE} # Placeholder, as algexpr2fort seems to modify files in place
-    COMMAND $<TARGET_FILE:algexpr2fort_tool>
-    COMMENT "Generating symbolic expressions for model ${MODEL}"
-    DEPENDS algexpr2fort_tool
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT ${GENERATED_RHS_FILE} ${GENERATED_AMAT_FILE}
+  COMMAND ${CMAKE_COMMAND} -E touch ${GENERATED_RHS_FILE} ${GENERATED_AMAT_FILE} # Placeholder, as algexpr2fort seems to modify files in place
+  COMMAND $<TARGET_FILE:algexpr2fort>
+  COMMENT "Generating symbolic expressions for model ${MODEL}"
+  DEPENDS algexpr2fort
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 add_custom_target(generate_code ALL DEPENDS ${GENERATED_RHS_FILE} ${GENERATED_AMAT_FILE})
@@ -127,20 +125,23 @@ find_package(BLAS REQUIRED)
 find_package(LAPACK REQUIRED)
 
 if(USE_HDF5)
-  find_package(HDF5 COMPONENTS Fortran C REQUIRED)
+	find_package(HDF5 REQUIRED COMPONENTS Fortran C)
+  # Check if HDF5 was found successfully
+  if(HDF5_FOUND)
+      message(STATUS "HDF5 found. Libraries: ${HDF5_LIBRARIES}")
+      message(STATUS "HDF5 Include Dirs: ${HDF5_INCLUDE_DIRS}")
+  else()
+      message(FATAL_ERROR "HDF5 not found, but USE_HDF5 is ON.")
+  endif()
 endif()
 
 if(USE_FFTW)
-  find_package(FFTW3)
-
-  # 2. If the modern package was NOT found, fall back to the legacy "Module" mode.
-  #    This uses the FindFFTW.cmake script and can be guided by FFTW_HOME.
-  if(NOT FFTW3_FOUND)
-    find_package(FFTW
-        HINTS
-            ENV FFTW_HOME
-            ENV FFTW_DIR
-    )
+  find_package(FFTW3 REQUIRED COMPONENTS)
+  if (FFTW3_FOUND)
+    message(STATUS "FFTW found. Libraries: ${FFTW3_LIBRARIES}")
+    message(STATUS "FFTW Include Dirs: ${FFTW3_INCLUDE_DIRS}")
+  else()
+      message(FATAL_ERROR "FFTW not found, but USE_FFTW is ON.")
   endif()
 endif()
 
@@ -246,6 +247,7 @@ target_include_directories(jorek_objects PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/tools
     ${CMAKE_CURRENT_SOURCE_DIR}/models
     # Add include directories from dependencies
+    $<$<BOOL:${USE_HDF5}>:${HDF5_INCLUDE_DIRS}>
     $<$<BOOL:${USE_MUMPS}>:${MUMPS_INCLUDE_DIRS}>
 )
 
@@ -254,16 +256,14 @@ target_link_libraries(jorek_objects PUBLIC
     $<$<BOOL:${USE_MPI}>:MPI::MPI_Fortran>
     LAPACK::LAPACK BLAS::BLAS
     # Optional libraries
-    $<$<BOOL:${USE_HDF5}>:HDF5::hdf5_fortran>
-    $<$<BOOL:${USE_FFTW}>:FFTW::FFTW>
+    $<$<BOOL:${USE_HDF5}>:${HDF5_LIBRARIES}>
+    $<$<BOOL:${USE_FFTW}>:${FFTW_TARGET_TO_LINK}>
     $<$<BOOL:${USE_MUMPS}>:${MUMPS_LIBRARIES}>
     $<$<BOOL:${USE_STRUMPACK}>:STRUMPACK::strumpack>
     # Link to C++ std library if needed by Boost, etc.
     $<$<OR:$<BOOL:${USE_BOOST}>,$<BOOL:${USE_STD_BESSELK}>>:${CMAKE_CXX_STANDARD_LIBRARIES}>
 )
 
-
-# --- Define Executable Targets ---
 
 # --- Main Model Executable ---
 add_executable(jorek_model${MODEL_NUMBER} jorek2_main.f90)
