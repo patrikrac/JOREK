@@ -29,7 +29,8 @@ module mod_sparse
     use mod_bicgstab, only: bicgstab_driver
 #else
     !use mod_gmres, only: gmres_driver !< Legacy gmres_driver
-    use mod_gmres2, only: gmres2_driver
+    !use mod_gmres2, only: gmres2_driver
+     use mod_aar, only: aar_driver
 #endif
     use matio_module, only: save_mat_h5
     use sorting_module, only : convert_sorting, set_csr_permutations
@@ -219,8 +220,17 @@ module mod_sparse
 
       !$omp target data use_device_ptr(a_mat%jcn, a_mat%val, a_mat%iptr, a_mat%coo_to_csr_map) if(solver%gpu)
 # endif
+      call clck_time_barrier(t0)
       !call gmres_driver(a_mat, rhs_vec, sol_vec, solver) !< Legacy GMRES Driver (Requires use gmres_driver)
-      call gmres2_driver(a_mat=a_mat,b=rhs_vec%val,x=sol_vec%val,n=sol_vec%n, solver=solver)
+      !call gmres2_driver(a_mat=a_mat,b=rhs_vec%val,x=sol_vec%val,n=sol_vec%n, solver=solver)
+      sol_vec%val = 0.d0
+      call aar_driver(a_mat=a_mat,b=rhs_vec%val,x=sol_vec%val,n=sol_vec%n, solver=solver)
+
+      call clck_time_barrier(t1)
+      call clck_ldiff(t0,t1,tsecond)
+      if (my_id .eq. 0) then
+        write(*,FMT_TIMING)  my_id, '#  Elapsed time Solve :',tsecond
+      end if
 # ifdef USE_GPU
       !$omp end target data
 
