@@ -1405,13 +1405,13 @@ do i=1,n_vertex_max
             !#  Current Definition Equation                                                                    #
             !###################################################################################################
 
-            rhs_ij(var_zj) = - ( v_x * ps0_x  + v_y * ps0_y + v*zj0) / BigR * xjac * factor(var_zj,1)
+            rhs_ij(var_zj) = 0.d0!- ( v_x * ps0_x  + v_y * ps0_y + v*zj0) / BigR * xjac * factor(var_zj,1)
 
             !###################################################################################################
             !#  Vorticity Definition Equation                                                                  #
             !###################################################################################################
 
-            rhs_ij(var_w) = - ( v_x * u0_x   + v_y * u0_y  + v*w0)  * BigR * xjac * factor(var_w,1)
+            rhs_ij(var_w) = 0.d0!- ( v_x * u0_x   + v_y * u0_y  + v*w0)  * BigR * xjac * factor(var_w,1)
 
             !###################################################################################################
             !#  Density Equation                                                                               #
@@ -2443,8 +2443,8 @@ do i=1,n_vertex_max
                   !#  Current Definition Equation                                                                    #
                   !###################################################################################################
 
-                  amat(var_zj,var_zj) = v * zj / BigR * xjac
-                  amat(var_zj,var_psi) = (v_x * psi_x + v_y * psi_y ) / BigR * xjac
+                  amat(var_zj,var_zj) = v * zj * BigR * xjac
+                  amat(var_zj,var_psi) = (v_x * psi_x + v_y * psi_y ) * BigR * xjac + 2.d0 * v * psi_x * BigR * xjac
 
                   !###################################################################################################
                   !#  Vorticity Definition Equation                                                                  #

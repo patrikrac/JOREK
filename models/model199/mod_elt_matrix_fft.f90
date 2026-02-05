@@ -401,8 +401,8 @@ do ms=1, n_gauss
          
          rhs_ij_2_k = - visco_T * 1.d0 / BigR * v_p * w0_p                * xjac * tstep
 
-         rhs_ij_3 = - ( v_x * ps0_x  + v_y * ps0_y + v*zj0) / BigR * xjac
-         rhs_ij_4 = - ( v_x * u0_x   + v_y * u0_y  + v*w0)  * BigR * xjac 
+         rhs_ij_3 = 0.d0 !- ( v_x * ps0_x  + v_y * ps0_y + v*zj0) / BigR * xjac
+         rhs_ij_4 = 0.d0 !- ( v_x * u0_x   + v_y * u0_y  + v*w0)  * BigR * xjac 
 
          rhs_ij_5   = v * BigR * particle_source(ms,mt)                                        * xjac * tstep &
                     + v * BigR**2 * ( r0_s * u0_t - r0_t * u0_s)                                      * tstep &
@@ -534,8 +534,8 @@ do ms=1, n_gauss
                        + dvisco_dT * T * ( v_x * w0_x + v_y * w0_y ) * BigR * xjac * theta * tstep
 
 !------------------------------------------------------------ equation 3
-             amat_33 = v * zj / BigR * xjac                                
-             amat_31 = (v_x * psi_x + v_y * psi_y ) / BigR * xjac          
+             amat_33 = v * zj * BigR * xjac                                
+             amat_31 = (v_x * psi_x + v_y * psi_y ) * BigR * xjac + 2.d0 * v * psi_x * BigR * xjac          
 
 !------------------------------------------------------------ equation 4
              amat_44 =  v * w * BigR * xjac                                
