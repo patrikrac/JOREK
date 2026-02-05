@@ -17,7 +17,7 @@ use phys_module, only: F0, tstep, nstep, nout, restart
 use phys_module, only: CENTRAL_MASS, CENTRAL_DENSITY, xcase, xpoint
 use phys_module, only: n_particles, nstep_particles, nsubstep_particles, tstep_particles
 use phys_module, only: xtime, mode
-use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
+use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 use mod_export_restart
 
 use mod_edge_domain
@@ -93,7 +93,7 @@ if (.not. restart) then
 endif
 
 n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
 t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
 
 if (sim%my_id .eq. 0) call boundary_from_grid(sim%fields%node_list, sim%fields%element_list, bnd_node_list, bnd_elm_list, .false.)
@@ -358,7 +358,7 @@ integer   :: ifail
 !$ w0 = omp_get_wtime()
 
 n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
 t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
 v_norm   = 1.d0 / t_norm                                        ! V_SI   = v_norm * v_jorek
 E_norm   = 1.5d0 / MU_ZERO                                      ! E_SI   = E_norm * E_jorek

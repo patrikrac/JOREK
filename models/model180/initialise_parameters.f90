@@ -19,7 +19,7 @@ integer :: ierr,err,i
 ! --- Namelist with input parameters.
 namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 rst_hdf5, rst_hdf5_version, keep_current_prof,      &
-                eta, visco, visco_par,                              &
+                init_current_prof, eta, visco, visco_par,           &
                 restart, rst_format, regrid, bootstrap, write_ps,   &
                 bootstrap_psin_cutoff,                              &
                 force_horizontal_Xline,                             &
@@ -40,7 +40,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 R_boundary, Z_boundary, psi_boundary, n_boundary,   &
                 n_pfc, n_tor_fft_thresh, manipulate_psi_map,        &
                 Rmin_pfc, Rmax_pfc, Zmin_pfc, Zmax_pfc, current_pfc,&
-                tokamak_device, gvec_grid_import,                   &
+                tokamak_device, gvec_grid_import, extended_boundary,&
+                j_cutoff_rcoord, j_cutoff_sig,                      &
                 F0, gamma_sheath, density_reflection,               &
                 zjz_0, zjz_1, zj_coef,                              &
                 rho_0, rho_1, rho_coef,                             &
@@ -77,7 +78,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 use_BLR_compression, epsilon_BLR, just_in_time_BLR, &
                 use_pastix, use_murge, use_murge_element, use_wsmp, &
                 refinement, force_central_node,    &
-                fix_axis_nodes,                                     &
+                fix_axis_nodes, treat_axis,                         &
                 grid_to_wall, use_strumpack,                        &
                 adaptive_time, equil, bench_without_plot,           &
                 eta_T_dependent, visco_T_dependent,                 &

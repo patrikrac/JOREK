@@ -20,7 +20,7 @@ program test_import_realistic
   use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, filter_hyper_n0, filter_par_n0
   use phys_module, only: n_mode_families
 
-  use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
+  use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 
   use mod_edge_domain
   use mod_edge_elements
@@ -109,7 +109,7 @@ program test_import_realistic
       do j=1,size(particles)
         call copy_particle_kinetic_leapfrog(particles(j),particle_tmp)
         call sim%fields%calc_EBpsiU(t, particle_tmp%i_elm, particle_tmp%st, particle_tmp%x(3), E, B, psi, U)
-        Energy =0.5d0*sim%groups(1)%mass*MASS_PROTON*dot_product(particle_tmp%v,particle_tmp%v)/EL_CHG/1000d0
+        Energy =0.5d0*sim%groups(1)%mass*atomic_mass_unit*dot_product(particle_tmp%v,particle_tmp%v)/EL_CHG/1000d0
         !call calc_index_shaped_part_x(test_phase,index_phase_tmp, val_tmp,[Energy,dot_product(particle_tmp%v,B)/norm2(B)/norm2(particle_tmp%v),sqrt((psi+0.16192)/(0.16192))])
         !do i_phase=1, test_phase%totsupport
         !  if(index_phase_tmp(i_phase) > 0)then
@@ -135,7 +135,7 @@ program test_import_realistic
               do i_tor=1,n_tor
                 feedback_rhs(m,l,i_elm,i_tor,1) = feedback_rhs(m,l,i_elm,i_tor,1) &
 
-                                                  + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                  + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
 
                                                   * (1.d0/3.d0) * (particle_tmp%v(1)**2 + particle_tmp%v(2)**2 + particle_tmp%v(3)**2) * mu_zero
               enddo !< n_tor

@@ -152,13 +152,13 @@ module pellet_module
           call Integrals_3D(my_id, node_list,element_list,density,density_in,density_out,pressure,pressure_in,pressure_out, &
                             kin_par_tot, kin_par_in, kin_par_out, mom_par_tot, mom_par_in, mom_par_out, varminout, varmaxout)
                                                           
-    V_normalisation = 1.d0 / sqrt(central_density * 1d20 * mass_proton * central_mass * MU_ZERO)
+    V_normalisation = 1.d0 / sqrt(central_density * 1d20 * ATOMIC_MASS_UNIT * central_mass * MU_ZERO)
     
     pellet_R = pellet_R + pellet_velocity_R * tstep / V_normalisation
     pellet_Z = pellet_Z + pellet_velocity_Z * tstep / V_normalisation
     
     
-    phys_ablation = total_pellet_particles * central_density / sqrt(central_density * 1d20 * mass_proton * central_mass * MU_ZERO)
+    phys_ablation = total_pellet_particles * central_density / sqrt(central_density * 1d20 * ATOMIC_MASS_UNIT * central_mass * MU_ZERO)
     
     total_pellet_particles = total_pellet_particles * central_density * tstep 
     total_plasma_particles = total_plasma_particles * central_density          ! undo normalisation
@@ -242,8 +242,8 @@ module pellet_module
     spi_Vel_R_tmp   = 0.
     spi_Vel_phi_tmp = 0.
 
-    V_normalisation = 1.d0 / sqrt(central_density * 1d20 * mass_proton * central_mass * MU_ZERO)
-    t_norm          = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20)
+    V_normalisation = 1.d0 / sqrt(central_density * 1d20 * ATOMIC_MASS_UNIT * central_mass * MU_ZERO)
+    t_norm          = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20)
   
     loop_over_shards: do i=1, n_spi(i_inj)
 

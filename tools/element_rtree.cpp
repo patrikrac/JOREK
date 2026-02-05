@@ -21,12 +21,26 @@ extern "C"
     // Persistent tree
     static MyTree ElementTree;
 
-    void PopulateTree(int n, int n_plane, double *min, double *max)
+    void PopulateTree(int n_elms, int *sizes, double **min, double **max)
     {
         ElementTree.RemoveAll();
-        for (unsigned int i = 0; i < n * n_plane; i++)
-            ElementTree.Insert(min + i * ND, max + i * ND, (i / n_plane) + 1); // store element number (1-based)
+
+        for (int i = 0; i < n_elms; i++) {
+            for (int j = 0; j < sizes[i]; j++) {
+                double split_min[ND], split_max[ND];
+                
+                // Copy coords to local variables
+                for(unsigned int d=0; d<ND; ++d) {
+                    split_min[d] = min[i][j*ND+d];
+                    split_max[d] = max[i][j*ND+d];
+                }
+
+                // Insert first box
+                ElementTree.Insert(split_min, split_max, i + 1);
+            }
+        }
     }
+
 
     // Return the number of elements in a rectangle
     int NumElementsInRect(double *min, double *max)

@@ -844,7 +844,7 @@ do ms=1, n_gauss
          m_i_over_m_imp = central_mass/2.
          m_imp          = 2.
        case('Ar')
-         m_i_over_m_imp = central_mass/40. ! Argon mass = 40 u and main ion (D) mass = 2 u
+         m_i_over_m_imp = central_mass/40. * (2.d0/2.01455279245d0) !backwards compatibility ! Argon mass = 40 u and main ion (D) mass = 2 u
          m_imp          = 40.
        case('Ne')
          m_i_over_m_imp = central_mass/20. ! Neon mass = 20 u and main ion (D) mass = 2 u
@@ -1142,20 +1142,20 @@ do ms=1, n_gauss
     else
       lambda_e_bg  = 24. - log((ne_SI*1.d-6)**0.5*Te_corr_eV**(-1.0))
     endif
-    nu_e_imp     = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*m_imp) ** 0.5&
+    nu_e_imp     = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*m_imp) ** 0.5&
                    * Z_eff_imp * (1.d14*central_density*rn0_corr*m_i_over_m_imp) * lambda_e_imp &
-                   / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*m_imp)&
+                   / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*m_imp)&
                    / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5
-    nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5&
+    nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5&
                    * (1.d14*central_density*(r0_corr-rn0_corr)) * lambda_e_bg &
-                   / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass)&
+                   / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass)&
                    / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
 
     if (nu_e_imp < 0.) nu_e_imp = 0.
     if (nu_e_bg < 0.)  nu_e_bg  = 0.
 
     !Converting the energy transfer rate from s^-1 to JOREK unit
-    t_norm   = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20)
+    t_norm   = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20)
     nu_e_imp = nu_e_imp * t_norm
     nu_e_bg  = nu_e_bg * t_norm
 
@@ -1163,32 +1163,32 @@ do ms=1, n_gauss
 
     !Calculating the density and temperature derivative for amats
     !We negelect the coulomb log's dericatives due to their smallness
-    dnu_e_imp_dTi   = -1.5*MASS_ELECTRON*nu_e_imp*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + MASS_PROTON*m_imp*Te0_corr)
-    dnu_e_imp_dTe   = -1.5*MASS_PROTON*m_imp*nu_e_imp*dTe0_corr_dT / (MASS_ELECTRON*Ti0_corr + MASS_PROTON*m_imp*Te0_corr) &
+    dnu_e_imp_dTi   = -1.5*MASS_ELECTRON*nu_e_imp*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*m_imp*Te0_corr)
+    dnu_e_imp_dTe   = -1.5*ATOMIC_MASS_UNIT*m_imp*nu_e_imp*dTe0_corr_dT / (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*m_imp*Te0_corr) &
                       + nu_e_imp * dZ_eff_imp_dT / Z_eff_imp
 
-    dnu_e_imp_drhon = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*m_imp) ** 0.5&
+    dnu_e_imp_drhon = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*m_imp) ** 0.5&
                         * Z_eff_imp * (1.d14*central_density*drn0_corr_dn*m_i_over_m_imp) * lambda_e_imp &
-                        / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*m_imp)&
+                        / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*m_imp)&
                         / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5
     dnu_e_imp_drho  = 0.
     dnu_e_imp_drhon = dnu_e_imp_drhon * t_norm
     dnu_e_imp_drho  = dnu_e_imp_drho * t_norm
 
-    dnu_e_bg_dTi    = -1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + MASS_PROTON*central_mass*Te0_corr)
-    dnu_e_bg_dTe    = -1.5*MASS_PROTON*central_mass*nu_e_bg*dTe0_corr_dT &
-                      / (MASS_ELECTRON*Ti0_corr + MASS_PROTON*central_mass*Te0_corr)
+    dnu_e_bg_dTi    = -1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*central_mass*Te0_corr)
+    dnu_e_bg_dTe    = -1.5*ATOMIC_MASS_UNIT*central_mass*nu_e_bg*dTe0_corr_dT &
+                      / (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*central_mass*Te0_corr)
     if (r0_corr-rn0_corr <= 0.) then
       dnu_e_bg_drhon = 0.
       dnu_e_bg_drho  = 0.
     else
-      dnu_e_bg_drhon = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5&
+      dnu_e_bg_drhon = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5&
                          * (1.d14*central_density*(-drn0_corr_dn)) * lambda_e_bg &
-                         / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass)&
+                         / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass)&
                          / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
-      dnu_e_bg_drho  = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5&
+      dnu_e_bg_drho  = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5&
                          * (1.d14*central_density*(dr0_corr_dn)) * lambda_e_bg &
-                         / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass)&
+                         / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass)&
                          / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
       dnu_e_bg_drhon = dnu_e_bg_drhon * t_norm
       dnu_e_bg_drho  = dnu_e_bg_drho * t_norm

@@ -79,8 +79,24 @@ if (my_id .eq. 0) then
 
 endif
 
-!---------------------------- initialise perturbations
+! Set T_0, or Ti_0 and Te_0 based on density, pressure and t_rat on axis
+call density(    xpoint2, xcase2, Z, Z_xpoint, 0.0, 0.0, 1.0, zn, dn_dpsi, dn_dz, dn_dpsi2, dn_dz2, dn_dpsi_dz, dn_dpsi3, dn_dpsi_dz2, dn_dpsi2_dz)
+do i=1,node_list%n_nodes
+  if (node_list%node(i)%axis_node) then
+    if (with_TiTe) then
+      Ti_0 = TiTe_ratio*mu_zero*node_list%node(i)%pressure(1) / zn
+      Te_0 = (1.d0-TiTe_ratio)*mu_zero*node_list%node(i)%pressure(1) / zn
+      write(*,*) "Calculated values of Ti_0, Te_0 (to be set in input files!): ", Ti_0, Te_0
+    else
+      write(*,*) "Calculated value of T_0 (to be set in input files!): ", T_0
+      T_0 = mu_zero*node_list%node(i)%pressure(1) / zn
+    endif
+    exit
+  endif
+enddo
 
+
+! initialise perturbations
 amplitude = 1.d-10
 mm = 2
 

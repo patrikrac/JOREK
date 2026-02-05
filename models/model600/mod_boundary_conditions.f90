@@ -28,7 +28,7 @@ subroutine boundary_conditions( my_id, node_list, element_list, bnd_node_list, l
                                 xcase2, R_axis, Z_axis, psi_axis, psi_bnd,                &
                                 R_xpoint, Z_xpoint, psi_xpoint, a_mat)
 
-use constants, only : PI, MU_ZERO, MASS_PROTON
+use constants, only : PI, MU_ZERO, ATOMIC_MASS_UNIT
 use mod_assembly, only : boundary_conditions_add_one_entry, boundary_conditions_add_RHS
 use data_structure
 use vacuum, ONLY: is_freebound
@@ -359,7 +359,7 @@ do i=1, n_local_elms !=== do elements
                 call boundary_conditions_add_RHS(       &
                           index_node, k, in,     &
                           index_min, index_max,  &
-                          RHS_loc, ZBIG*(loop_voltage*sqrt(MU_ZERO*central_density*central_mass*MASS_PROTON*1.d20))* tstep, &
+                          RHS_loc, ZBIG*(loop_voltage*sqrt(MU_ZERO*central_density*central_mass*ATOMIC_MASS_UNIT*1.d20))* tstep, &
                           a_mat%i_tor_min, a_mat%i_tor_max)
               endif
             endif

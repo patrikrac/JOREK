@@ -237,7 +237,7 @@ end subroutine do_interp_PRZ_2
 
 pure subroutine do_interp_PRZP_1(this, time, i_elm, i_v, n_v, s, t, phi, P, P_s, P_t, P_phi, P_time, R, R_s, R_t, R_phi, Z, Z_s, Z_t, Z_phi)
   use mod_interp
-  use constants, only: mu_zero, mass_proton
+  use constants, only: mu_zero, atomic_mass_unit
   use phys_module, only: tstep, central_mass, central_density
   use mod_linear, only: linear_interp_differentials
   use mod_linear, only: linear_interp_differentials_dt
@@ -296,7 +296,7 @@ end function new_read_jorek_fields_interp_hermite_birkhoff
 !> t(jend-1).
 subroutine do_read(this, sim, ev)
   use phys_module, only: central_mass, central_density, t_start, tstep
-  use constants, only: mu_zero, mass_proton
+  use constants, only: mu_zero, atomic_mass_unit
   use mpi
   use mod_neighbours
   class(read_jorek_fields_interp_hermite_birkhoff), intent(inout) :: this
@@ -307,7 +307,7 @@ subroutine do_read(this, sim, ev)
   logical :: file_exists, next_file_found
 
   real*8 :: t_norm, invdet
-  t_norm = sqrt(mu_zero * mass_proton * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds
+  t_norm = sqrt(mu_zero * ATOMIC_MASS_UNIT * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds
 
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)
 

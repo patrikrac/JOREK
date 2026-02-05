@@ -77,7 +77,7 @@ real*8   :: amix_used
 real*8   :: psi_lim, R_lim, Z_lim, R_out, Z_out, s_bnd, t_bnd, P_s,P_t,P_st,P_ss,P_tt
 integer  :: i_elm_bnd, i_elm_axis, i_elm_xpoint(2), ifail
 integer  :: n_AA, nz_AA, nz_AA_old, n_border, ilarge, ife, iv, iv2, iv3, iv4, i,j,k,l
-integer  :: inode, inode1, inode2, inode3, inode4, bnd1, bnd2, vertex(2), direction(2)
+integer  :: inode, inode1, inode2, inode3, inode4, bnd1, bnd2, vertex(2), direction(2), i_n(n_coord_tor)
 integer  :: i_tor, k_tor, index_large_i, knode, index_large_k, index_ij, index_kl, index, index_i
 logical   :: newton_method_GS
 
@@ -100,7 +100,7 @@ type(type_RHS) :: rhs_vec, sol_vec
 type(type_SP_SOLVER) :: solver
 real*8 :: tmp
 
-real*8 :: new_dofs(1:4), old_dofs(1:4)
+real*8 :: new_dofs(1:4,n_coord_tor), old_dofs(1:4)
 
 if (my_id == 0) then
   write(*,*) '**************************************'
@@ -134,13 +134,17 @@ if (my_id == 0) then
   n_border = 0
   if (itype .ne. 0) then
     do i=1,node_list%n_nodes
-      if(treat_axis)then
+      if (treat_axis) then
         ! --- Only one fixed for fixed-axis (only valid for G1-cases at the moment!!!)
-        if (node_list%node(i)%axis_node    ) n_border = n_border+1
+#if STELLARATOR_MODEL
+        if (node_list%node(i)%axis_node) n_border = n_border+n_coord_tor
+#else
+        if (node_list%node(i)%axis_node) n_border = n_border+1
+#endif
       else
         ! --- t-derivatives and cross derivatives are switched off on axis, so (n_order+1)/2 are not fixed
         if (node_list%node(i)%axis_node    ) n_border = n_border + n_degrees - (n_order+1)/2
-      endif    
+      end if    
       ! --- on non-corner boundaries, only tangent derivatives are fixed, ie. (n_order+1)/2
       n_degrees_per_boundary_node = (n_order+1)/2
 #if STELLARATOR_MODEL
@@ -255,7 +259,7 @@ if (my_id == 0) then
   !$omp shared(node_list, element_list, refinement, itype, ivar_in, ivar_out, i_harm, psi_axis, psi_bnd, xpoint, xcase, Z_xpoint, psi_axis_kl, &
   !$omp        psi_bnd_kl, newton_method_GS, treat_axis, ES, a_mat, rhs_vec, ilarge) &
   !$omp private(element, inode, ife, i_father, element_father, iv, inode_father, ELM, RHS, ELM_axis, ELM_bnd, node_out, i, j, &
-  !$omp         i_tor, index_ij, index_large_i, k, l, knode, k_tor, index_kl, index_large_k)                                                       &
+  !$omp         i_tor, index_ij, index_large_i, k, l, knode, k_tor, index_kl, index_large_k, i_n)                                                  &
   !$omp firstprivate(nodes, nodes_father) !< so that these nodes are unallocated at the start of the omp region and can be explicitly allocated/deallocated 
   
   do iv = 1, n_vertex_max
@@ -320,9 +324,16 @@ if (my_id == 0) then
     endif  
 
     ! Transform basis functions for the axis nodes. This will solve for new degrees of freedom at the axis.    
-    if( (treat_axis) .and. (nodes(1)%axis_node .or. nodes(2)%axis_node .or. nodes(3)%axis_node .or. nodes(4)%axis_node) ) then
-      call transform_basis_for_axis_element_poisson(nodes, ELM, RHS, ivar_in, ivar_out, i_harm)
-    endif
+    if(treat_axis .and. (nodes(1)%axis_node .or. nodes(2)%axis_node .or. nodes(3)%axis_node .or. nodes(4)%axis_node)) then
+      if (itype .eq. 4) then
+        do i_tor=1,n_coord_tor
+          i_n(i_tor) = i_tor
+        end do
+        call transform_basis_for_axis_element(nodes, ife, ELM, RHS, (/ 1 /), 1, i_n, n_coord_tor)
+      else
+        call transform_basis_for_axis_element_poisson(nodes, ELM, RHS, ivar_in, ivar_out, i_harm)
+      end if
+    end if
     
     if (refinement) then ! Processing  "constrained nodes"
       call Chgmt_node(ife,element,nodes,element_father,nodes_father,ELM,RHS,node_out) 
@@ -545,6 +556,21 @@ elseif (itype .eq. 4) then
         exit
       endif
     enddo
+
+    if (treat_axis) then
+      ! penalize 4th DoF to enforce C0 continuity at the grid center
+      do i=1,node_list%n_nodes
+        if (node_list%node(i)%axis_node) then
+          do i_tor=1,n_coord_tor
+            index_i = (node_list%node(i)%index(4)-1)*n_coord_tor + i_tor ! base index in the main matrix
+            a_mat%irn(ilarge+1) = index_i
+            a_mat%jcn(ilarge+1) = index_i
+            a_mat%val(ilarge+1) = zbig
+            ilarge = ilarge + 1
+          end do
+        end if
+      end do
+    end if
   end if ! my_id == 0
 
   nz_AA_old = nz_AA
@@ -723,17 +749,33 @@ if (my_id == 0) then
       ! The respective RHS entries on the axis (which are shared)
       ! are updated during the transformation. At the end of the loop,
       ! we recover RHS entries so that they same can be used for all the axis nodes.            
-      if(treat_axis .and. node_list%node(i)%axis_node)then
-        do k=1,n_degrees
-          index = node_list%node(i)%index(k)
-          new_dofs(k) = rhs_vec%val(index)
-        enddo
-        call new_to_old_dofs_on_the_axis(node_list, i, new_dofs, old_dofs)
-        do k=1,n_degrees
-          index = node_list%node(i)%index(k)
-          rhs_vec%val(index) = old_dofs(k)
-        enddo
-      endif
+      if (treat_axis .and. node_list%node(i)%axis_node) then
+#if STELLARATOR_MODEL
+        do i_tor=1,n_coord_tor
+#else
+        i_tor = 1
+#endif
+          do k=1,n_degrees
+#if STELLARATOR_MODEL
+            index = (node_list%node(i)%index(k)-1)*n_coord_tor + i_tor
+#else
+            index = node_list%node(i)%index(k)
+#endif
+            new_dofs(k,i_tor) = rhs_vec%val(index)
+          end do
+          call new_to_old_dofs_on_the_axis(node_list, i, new_dofs(:,i_tor), old_dofs)
+          do k=1,n_degrees
+#if STELLARATOR_MODEL
+            index = (node_list%node(i)%index(k)-1)*n_coord_tor + i_tor
+#else
+            index = node_list%node(i)%index(k)
+#endif
+            rhs_vec%val(index) = old_dofs(k)
+          end do
+#if STELLARATOR_MODEL
+        end do
+#endif
+      end if
             
       do k=1,n_degrees
   
@@ -755,7 +797,7 @@ if (my_id == 0) then
           endif
         !--------------- for equation on total flux
         else if (itype .eq. 4) then
-#ifndef USE_DOMM
+#if (!defined(USE_DOMM) && STELLARATOR_MODEL)
           do i_tor=1,n_coord_tor
             index = n_coord_tor*(node_list%node(i)%index(k)-1) + i_tor
             
@@ -774,12 +816,24 @@ if (my_id == 0) then
       enddo    ! order
 
       ! recover RHS entries.
-      if(treat_axis .and. node_list%node(i)%axis_node)then
-        do k=1,n_degrees
-          index = node_list%node(i)%index(k)
-          rhs_vec%val(index) = new_dofs(k)
-        enddo
-      endif
+      if (treat_axis .and. node_list%node(i)%axis_node) then
+#if STELLARATOR_MODEL
+        do i_tor=1,n_coord_tor
+#else
+        i_tor = 1
+#endif
+          do k=1,n_degrees
+#if STELLARATOR_MODEL
+            index = (node_list%node(i)%index(k)-1)*n_coord_tor + i_tor
+#else
+            index = node_list%node(i)%index(k)
+#endif
+            rhs_vec%val(index) = new_dofs(k,i_tor)
+          end do
+#if STELLARATOR_MODEL
+        end do
+#endif
+      end if
       
     endif      ! refinement, constrained
   enddo        ! nodes

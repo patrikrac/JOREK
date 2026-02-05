@@ -383,12 +383,29 @@ subroutine read_gvec_import(node_list, element_list, file_name, is_test, ierr)
       ! Determine if node is on the boundary
       node_list%node(i_node)%boundary = 0
       if (i_rad .eq. n_rad) node_list%node(i_node)%boundary = 2
-     
+      
+      ! Share 4 degrees of freedom for all nodes on the grid axis and flag the axis nodes.
+      if (treat_axis) then
+        if (i_rad .eq. 1) then
+          node_list%node(i_node)%index(1) = 1
+          node_list%node(i_node)%index(2) = 2
+          node_list%node(i_node)%index(3) = 3
+          node_list%node(i_node)%index(4) = 4
+          n_index_start = 4
+          node_list%node(i_node)%axis_node = .true.
+          node_list%node(i_node)%axis_dof = 3
+        else
+          do i_order=1,n_order+1
+            node_list%node(i_node)%index(i_order) = n_index_start + i_order
+          end do
+          n_index_start = n_index_start + n_order + 1
+          node_list%node(i_node)%axis_node = .false.
+        end if
       ! Fix all axis nodes to have the same indices in global matrix structure is force_central_node = .t.
-      if ((force_central_node) .and. (i_rad.eq.1)) then
+      else if (force_central_node .and. (i_rad .eq. 1)) then
         node_list%node(i_node)%index(1) = 1
 
-        if (i_theta.eq.1) n_index_start = n_index_start + 1
+        if (i_theta .eq. 1) n_index_start = n_index_start + 1
         node_list%node(i_node)%index(2) = n_index_start + 1
         node_list%node(i_node)%index(3) = n_index_start + 2
         node_list%node(i_node)%index(4) = n_index_start + 3
@@ -396,9 +413,9 @@ subroutine read_gvec_import(node_list, element_list, file_name, is_test, ierr)
       else
         do i_order=1,n_order+1
           node_list%node(i_node)%index(i_order) = n_index_start + i_order
-        enddo
+        end do
         n_index_start = n_index_start + n_order+1
-      endif
+      end if
       
       if (fix_axis_nodes .and. (i_rad .eq. 1)) node_list%node(i_node)%axis_node = .true.
 
@@ -473,10 +490,10 @@ subroutine read_gvec_import(node_list, element_list, file_name, is_test, ierr)
     do i_node=1, n_tht
       node_list%node(i_node)%x(idx, 1, 1) = R_average   / n_tht
       node_list%node(i_node)%x(idx, 3, 1) = 0.0
-      node_list%node(i_node)%x(idx, 4, 1) = 0.0
+      !node_list%node(i_node)%x(idx, 4, 1) = 0.0
       node_list%node(i_node)%x(idx, 1, 2) = Z_average   / n_tht
       node_list%node(i_node)%x(idx, 3, 2) = 0.0
-      node_list%node(i_node)%x(idx, 4, 2) = 0.0
+      !node_list%node(i_node)%x(idx, 4, 2) = 0.0
       !node_list%node(i_node)%b_field(idx, 1, 1) = BR_average  / n_tht
       node_list%node(i_node)%b_field(idx, 3, 1) = 0.0
       node_list%node(i_node)%b_field(idx, 4, 1) = 0.0

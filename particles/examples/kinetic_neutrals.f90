@@ -28,7 +28,7 @@ use mod_jorek_timestepping
 use mod_random_seed
 use mod_basisfunctions
 use nodes_elements
-use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
+use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 use mod_particle_sputtering, only: particle_sputter, sample_fluid_particle_energy
 use mod_projection_functions, only: proj_f_combined_density, proj_f_combined_energy, proj_f_combined_par_momentum
 use mod_particle_puffing
@@ -157,7 +157,7 @@ end if
 
 ! --- Calculating normalisation constants
 n_norm    = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-rho_norm  = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+rho_norm  = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
 t_norm    = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek 
 
 ! --- Setting up sputtering
@@ -383,7 +383,7 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, tstep_part_adj)
   !$ w0 = omp_get_wtime()
 
   n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-  rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+  rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
   t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
   v_norm   = 1.d0 / t_norm                                        ! V_SI   = v_norm * v_jorek
   E_norm   = 1.5d0 / MU_ZERO                                      ! E_SI   = E_norm * E_jorek

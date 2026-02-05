@@ -11,7 +11,7 @@ use data_structure
 use tr_module 
 use gauss
 use basis_at_gaussian
-use phys_module, only:   n_limiter, R_limiter, Z_limiter, write_ps, fix_axis_nodes, force_central_node, treat_axis
+use phys_module, only:   n_limiter, R_limiter, Z_limiter, write_ps, fix_axis_nodes, force_central_node, treat_axis, wall_file
 use mod_neighbours, only: update_neighbours
 use mod_interp
 use mod_grid_conversions
@@ -88,7 +88,7 @@ write(*,*) '*************************************'
 write(*,*) '*    X-point(wall) grid             *'
 write(*,*) '*************************************'
 
-open(23,file='wall.txt')
+open(23,file=wall_file)
 read(23,*)
 read(23,*) n_wall
 write(*,*) ' reading outer wall : ',n_wall

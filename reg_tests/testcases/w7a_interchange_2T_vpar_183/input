@@ -91,6 +91,9 @@
  heatsource_e     = 5.d-8
  particlesource = 1.d-7
 
+ Ti_0 = 2.500000000127308d-3
+ Te_0 = 2.500000000127308d-3
+
  rho_0 = 1.
  rho_1 = 1.
  rho_coef(1)  =  0.0

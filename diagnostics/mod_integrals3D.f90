@@ -32,6 +32,7 @@ module mod_integrals3D
   use equil_info, only : get_psi_n, ES
   use mod_atomic_coeff_deuterium, only: rec_rate_to_kinetic, atomic_coeff_deuterium
   use mod_sources
+  use mod_edge_elements, only : elm_coords
 
   implicit none
   
@@ -147,7 +148,7 @@ real*8  :: kinpar_flux, qn_par, qn_perp, mag_work_tot, mag_src_tot, mag_source_t
 real*8  :: vpar_part_flux, vperp_part_flux, Dperp_part_flux, Dpar_part_flux, neut_part_flux
 real*8  :: vpar_part_flow, vperp_part_flow, Dperp_part_flow, Dpar_part_flow, neut_part_flow
 real*8  :: poynting_flux, poynting_tmp, dpsi_dt
-real*8  :: s_or_t,sg,tg
+real*8  :: s_or_t,sg,tg, st(2)
 real*8  :: R,R_s,R_t,R_phi,R_st,R_ss,R_tt,R_sp,R_tp,R_pp
 real*8  :: Z,Z_s,Z_t,Z_phi,Z_st,Z_ss,Z_tt,Z_sp,Z_tp,Z_pp
 real*8  :: RH,RH_s,RH_t,RH_st,RH_ss,RH_tt
@@ -894,7 +895,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 #endif
      
         ! Get coefficient:  Prad,SI = coef_prad_si * Prad,jorek
-        coef_prad_si = 1./((GAMMA-1)*MU_ZERO*(MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)**0.5) 
+        coef_prad_si = 1./((GAMMA-1)*MU_ZERO*(MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**0.5) 
       
         ksi_ion_norm = central_density * 1.d20 * ksi_ion   ! Normalisation of the ionization energy cost for Deuterium
       
@@ -944,7 +945,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
             Arad_bg = 2.4d-31 
             Brad_bg = 20.
             Crad_bg = 0.8
-            frad_bg = (2./3.)*(1./(central_mass*MASS_PROTON))*((MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)**(1.5d0))                &
+            frad_bg = (2./3.)*(1./(central_mass*ATOMIC_MASS_UNIT))*((MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**(1.5d0))                &
                             *nimp_bg(1)*Arad_bg*exp(-((log(Te_corr_eV)-log(Brad_bg))**2.)/Crad_bg**2.)
                     
             local_radiation_phi(mp)         = local_radiation_phi(mp) + (r0_corr * rn0_corr  * LradDrays_T         &
@@ -1117,13 +1118,13 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         else
           lambda_e_bg  = 24. - log((ne_SI*1.d-6)**0.5*Te_corr_eV**(-1.0))
         endif
-        nu_e_imp     = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*m_imp) ** 0.5&
+        nu_e_imp     = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*m_imp) ** 0.5&
                        * Z_eff_imp * (1.d14*central_density*rimp0_corr*m_i_over_m_imp) * lambda_e_imp &
-                       / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*m_imp)&
+                       / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*m_imp)&
                        / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5
-        nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5&
+        nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5&
                        * (1.d14*central_density*(r0_corr-rimp0_corr)) * lambda_e_bg &
-                       / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass)&
+                       / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass)&
                        / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
     
         if (nu_e_imp < 0.) nu_e_imp = 0.
@@ -1375,7 +1376,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 
         ! Neutral injection rate in particles/s
         local_n_particles_inj = local_n_particles_inj + 0.5d0 * central_density * 1.d20 * source_neutral * bigR *&
-                                 xjac * wst * delta_phi / sqrt(MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)
+                                 xjac * wst * delta_phi / sqrt(MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)
         ! Total neutrals in particles
         local_n_particles     = local_n_particles     +  rn0 * central_density * 1.d20 * bigR * xjac * wst * delta_phi
         ! Frictional heat source
@@ -1425,7 +1426,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 
         ! Neutral injection rate in particles/s
         local_n_particles_inj = local_n_particles_inj + 0.5d0 * central_density * 1.d20 * source_imp * m_i_over_m_imp * bigR &
-	                         * xjac * wst * delta_phi / sqrt(MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)
+	                         * xjac * wst * delta_phi / sqrt(MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)
         ! Total neutrals in particles
         local_n_particles     = local_n_particles + central_density * 1.d20 * rimp0 * m_i_over_m_imp * bigR * xjac * wst * delta_phi
 #endif
@@ -1660,21 +1661,17 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
 
     ! --- Which s and t values correspond to the current point and is the
     !     boundary element an s=const or t=const side of the 2D element?
-    select case (mv1)
-    case (1)
-      sg = s_or_t;  tg = 0.d0;   
-    case (2)
-      sg = 1.d0;    tg = s_or_t; 
-    case (3)
-      sg = s_or_t;  tg = 1.d0;  
-    case (4)
-      sg = 0.d0;    tg = s_or_t; 
-    end select
+    st = elm_coords(mv1, s_or_t)
+    sg = st(1); tg = st(2)
 
     do mp=1, n_plane
       phi       = 2.d0*PI*float(mp-1)/float(n_plane) / float(n_period)
       call interp_RZP(node_list,element_list,m_elm,sg,tg,phi,R,R_s,R_t,R_phi,R_st,R_ss,R_tt,R_sp,R_tp,R_pp,Z,Z_s,Z_t,Z_phi,Z_st,Z_ss,Z_tt,Z_sp,Z_tp,Z_pp)
       
+      if ((abs(x_g_1d(mp,ms) - R) .gt. 1d-6) .or. (abs(y_g_1d(mp,ms) - Z) .gt. 1d-6)) then
+        write(*,'(A,2i3,4e16.8)') 'INTEGRALS3D : SOMETHING IS VERY WRONG ALONG THE BOUNDARY : ', m_elm, mv1, x_g_1d(mp,ms), R, y_g_1d(mp,ms), Z
+      endif
+
       BigR   = R
       xjac   = R_s * Z_t - R_t * Z_s
       
@@ -2223,7 +2220,7 @@ if (allocated(local_source_volume_drift)) deallocate(local_source_volume_drift)
 #endif
 
 ! --- Normalization factors
-rho_norm = central_density*1.d20 * central_mass * MASS_PROTON 
+rho_norm = central_density*1.d20 * central_mass * ATOMIC_MASS_UNIT 
 t_norm   = sqrt(MU_zero*rho_norm)
 
 if (units == SI_UNITS) then

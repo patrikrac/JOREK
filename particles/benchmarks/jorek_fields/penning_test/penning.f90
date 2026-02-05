@@ -64,7 +64,7 @@ write(*,*) '***************************************'
 call initialise_parameters(my_id, "__NO_FILENAME__")
 
 ! Initialize fields in JOREK units
-t_norm  = sqrt(mu_zero * mass_proton * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds
+t_norm  = sqrt(mu_zero * ATOMIC_MASS_UNIT * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds
 qom     = real(charge) * el_chg / (mass * atomic_mass_unit)
 B0      = omega_b/qom ! In T
 Phi0    = epsilon*omega_e**2/qom/2.d0*t_norm ! In JOREK units: E_SI*t_norm

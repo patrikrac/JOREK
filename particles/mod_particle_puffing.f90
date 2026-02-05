@@ -109,7 +109,7 @@ end function new_particle_puffing
 subroutine do_particle_puffing(this,sim, ev)
   use mpi_mod
   use phys_module, only: tstep, central_mass, central_density
-  use constants, only: MASS_PROTON, MU_ZERO
+  use constants, only: ATOMIC_MASS_UNIT, MU_ZERO
   ! !$ use omp_lib
 
   class(particle_puffing) , intent(inout) :: this
@@ -127,7 +127,7 @@ subroutine do_particle_puffing(this,sim, ev)
   integer ::    puffed_this_step_local, all_puffed_this_step
   real*8  ::    puff_weight_local, all_puff_weight
 
-  tstep_fluid_si = tstep*sqrt((MU_ZERO * CENTRAL_MASS * MASS_PROTON * CENTRAL_DENSITY * 1.d20))
+  tstep_fluid_si = tstep*sqrt((MU_ZERO * central_mass * ATOMIC_MASS_UNIT * CENTRAL_DENSITY * 1.d20))
 
   if (sim%my_id .eq. 0) write(*,*) "Started puffing!"
   

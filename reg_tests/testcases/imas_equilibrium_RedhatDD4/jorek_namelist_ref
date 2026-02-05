@@ -1,7 +1,7 @@
 ***********************************************
 * namelist from imas2jorek.py                 *
-* pulse 111111        run 34          *
-* database imas_regtest_db user schwarn*
+* pulse 111111        run 09          *
+* database imas_regtest_db user marisd1*
 * time 0.000000                           
 ************************************************
  &in1
@@ -41,8 +41,8 @@
  
 ! --- Physical parameters -------------------
   keep_current_prof     = .false. ! Fix current profile
-  eta                   =    5.273375556e-08    !!! Spitzer value at Zeff=1 
-  eta_ohmic             =    5.273375556e-08    !!! Spitzer value at Zeff=1 
+  eta                   =    5.272785006e-08    !!! Spitzer value at Zeff=1 
+  eta_ohmic             =    5.272785006e-08    !!! Spitzer value at Zeff=1 
   eta_T_dependent       = .t.  
   eta_coul_log_dep      = .t.  
   T_max_eta             =    1.490298633e-02  !!! You may want to modify this, taken at T_tot_axis 
@@ -60,34 +60,34 @@
   gamma_stangeby  = 8.d0
   bc_natural_open = .t.
 
-  D_par     =    6.483638939e-07    !!! 1m2/s - Double check! 
-  D_perp(1) =    6.483638939e-07    !!! 1m2/s - Double check! 
+  D_par     =    6.482912854e-07    !!! 1m2/s - Double check! 
+  D_perp(1) =    6.482912854e-07    !!! 1m2/s - Double check! 
   D_perp(2) = 0.85d0
   D_perp(3) = 0.d0
   D_perp(4) = 0.01d0
   D_perp(5) = 1.d4
 
   ZKpar_T_dependent = .t. 
-  ZK_par            =    1.296694625e+02    !!! Spitzer value in the core 
-  ZK_par_max        =    1.296694625e+02    !!! double check!! you may want to lower if Te_axis > 1keV 
+  ZK_par            =    1.296549412e+02    !!! Spitzer value in the core 
+  ZK_par_max        =    1.296549412e+02    !!! double check!! you may want to lower if Te_axis > 1keV 
   T_min_ZKpar       =    2.013354494e-05    !!! set to 1 eV, you may want to rise it to resolve sharp gradients 
 
-  ZK_perp(1) =    4.322425959e-07    !!! 1m2/s - Double check! 
+  ZK_perp(1) =    4.321941903e-07    !!! 1m2/s - Double check! 
   ZK_perp(2) = 0.85d0
   ZK_perp(3) = 0.d0
   ZK_perp(4) = 0.01d0
   ZK_perp(5) = 1.d4
 
   visco_T_dependent = .f. 
-  visco             =    6.483638939e-07    !!! 1 m2/s - Double check! 
-  visco_heating     =    6.483638939e-07    !!! 1 m2/s - Double check! 
-  visco_par         =    6.483638939e-06    !!! 10m2/s - Double check! 
-  visco_par_heating =    6.483638939e-06    !!! 10m2/s - Double check! 
+  visco             =    6.482912854e-07    !!! 1 m2/s - Double check! 
+  visco_heating     =    6.482912854e-07    !!! 1 m2/s - Double check! 
+  visco_par         =    6.482912854e-06    !!! 10m2/s - Double check! 
+  visco_par_heating =    6.482912854e-06    !!! 10m2/s - Double check! 
 
   heatsource     = 0.d0
   particlesource = 0.d0
 
-  central_mass    =    2.000000000e+00 
+  central_mass    =    2.014101778e+00 
   central_density =    9.999999999e-01 
 
   R_geo =    3.000000000e+00 

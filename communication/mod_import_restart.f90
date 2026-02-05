@@ -951,6 +951,7 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   real(RKIND), allocatable :: t_deltas(:,:,:,:)
   real(RKIND), allocatable :: t_aux_values(:,:,:,:)
 
+  ! Stellarator node members
   real(RKIND), allocatable :: t_pressure(:,:)
   real(RKIND), allocatable :: t_r_tor_eq(:,:)
   real(RKIND), allocatable :: t_j_field(:,:,:,:)
@@ -958,6 +959,7 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   real(RKIND), allocatable :: t_chi_correction(:,:,:)
   real(RKIND), allocatable :: t_j_source(:,:,:)
 
+  ! Full MHD node members
   real(RKIND), allocatable :: t_psi_eq(:,:)
   real(RKIND), allocatable :: t_Fprof_eq(:,:)
 
@@ -981,8 +983,12 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   integer,     allocatable :: t_contain_node(:,:)
   integer,     allocatable :: t_nref(:)
 
-! local variables
+  ! stellarator fixed temperature parameters
+  real*8                   :: T_0_hdf5, Ti_0_hdf5, Te_0_hdf5
+  real*8                   :: F_0
+  integer                  :: n_flux_hdf5, n_tht_hdf5
 
+  ! local variables
   real*8, allocatable :: spi_R_arr (:)
   real*8, allocatable :: spi_Z_arr (:)
   real*8, allocatable :: spi_phi_arr (:)
@@ -1011,6 +1017,8 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   real*8, allocatable :: t_energies4(:,:,:)  !< Magnetic and kinetic mode energies at previous timesteps.
   logical                               :: no_pert
   
+  logical, parameter  :: use_defensive_checks = .true.
+
   no_pert = .false.
   if ( present(no_perturbations) ) no_pert = no_perturbations
 
@@ -1202,6 +1210,7 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   if(aux_values_read) then
      call HDF5_array4D_reading(file_id,t_aux_values,   'aux_values')
   endif
+
 #if STELLARATOR_MODEL
   call HDF5_array2D_reading(file_id,t_r_tor_eq, 'r_tor_eq')
 #if JOREK_MODEL == 180
@@ -1209,11 +1218,49 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   call HDF5_array4D_reading(file_id,t_j_field,  'j_field')
   call HDF5_array4D_reading(file_id,t_b_field,   'b_field')
 #endif
+
+#ifdef WITH_TiTe
+  call HDF5_real_reading(file_id,Ti_0_hdf5,'Ti_0')
+  call HDF5_real_reading(file_id,Te_0_hdf5,'Te_0')
+  if (use_defensive_checks) then
+    if ((abs(Ti_0_hdf5 - Ti_0) .gt. 1.d-16) .or. (abs(Te_0_hdf5 - Te_0) .gt. 1.d-16)) then
+      write(*,*) "Error: Value of Ti_0 or Te_0 in restart file and namelist are inconsistent: ", Ti_0_hdf5, Ti_0, Te_0_hdf5, Te_0
+      stop
+    endif
+  else
+    Ti_0 = Ti_0_hdf5; Te_0 = Te_0_hdf5
+  endif
+#else
+  call HDF5_real_reading(file_id,T_0_hdf5,'T_0')
+  if (use_defensive_checks) then
+    if (abs(T_0_hdf5 - T_0) .gt. 1.d-16) then
+      write(*,*) "Error: Value of T_0 in restart file and namelist are inconsistent: ", T_0_hdf5, T_0
+      stop
+    endif
+  else
+    T_0 = T_0_hdf5
+  endif
+#endif
+  
+  call HDF5_real_reading(file_id,F_0,'F0')
+  if (abs(F_0 - F0) .gt. 1.d-16) then
+    write(*,*) "Error: F0 in restart file and namelist are inconsistent: ", F_0, F0
+    stop
+  endif
+
+  call HDF5_integer_reading(file_id,n_flux_hdf5,'n_flux')
+  call HDF5_integer_reading(file_id,n_tht_hdf5,'n_tht')
+  if ((n_tht_hdf5 .ne. n_tht) .or. (n_flux_hdf5 .ne. n_flux)) then
+    write(*, *) "Error: Number of radial and poloidal in restart file and namelist are inconsistent: ", n_flux_hdf5, n_flux, n_tht_hdf5, n_tht
+    stop
+  endif
+
 #ifndef USE_DOMM
   call HDF5_array3D_reading(file_id,t_chi_correction, 'chi_correction')
 #endif
+
   call HDF5_array3D_reading(file_id,t_j_source, 'j_source')
-#endif
+#endif /* STELLARATOR_MODEL */
 
 #ifdef fullmhd
   call HDF5_array2D_reading(file_id,t_psi_eq,   'psi_eq')

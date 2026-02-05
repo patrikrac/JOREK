@@ -236,7 +236,7 @@ else
   dat = ccoll_read_L0L1table('ccolldata')
   allocate(sim%groups(1))
   allocate( ni(1), dat%mi(1), dat%Z0(1), dat%Zi(1), dat%ai(1), dat%Ii(1))
-  dat%mi(1) = MASS_PROTON
+  dat%mi(1) = atomic_mass_unit
   dat%Z0(1) = 1
   dat%Zi(1) = 1
   dat%ai(1) = 1

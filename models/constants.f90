@@ -13,7 +13,7 @@ module constants
   real*8,  parameter :: EL_CHG        = 1.602176565d-19          !< Elementary charge  [C]
   real*8,  parameter :: K_BOLTZ       = 1.3806488d-23            !< Boltzmann constant [J/K]
   real*8,  parameter :: C_LIGHT       = 299792458.               !< Speed of light [m/s]
-  real*8,  parameter :: MASS_PROTON   = 1.67262178d-27           !< proton mass [kg]
+  ! real*8,  parameter :: MASS_PROTON   = 1.67262178d-27           !< proton mass [kg] ! commented out because we should always use AMU
   real*8,  parameter :: ATOMIC_MASS_UNIT = 1.660539040d-27       !< standardized mass unit [kg]
   real*8,  parameter :: MASS_ELECTRON = 9.10938291d-31           !< electron mass [kg]
   real*8,  parameter :: SPEED_OF_LIGHT = 2.997924580105029d+8    !< speed of light in (m/s)

@@ -337,7 +337,7 @@ module mod_chi
   !>  This function returns a correction to the vacuum scalar magnetic potential (chi) and its derivatives such 
   !!  that n.grad(chi) on the simulation boundary is equal to 0
   pure function get_chi_corr(node_list, element_list, i_elm, s, t, phi)
-    use phys_module,        only: mode_coord
+    use phys_module,        only: mode_coord, n_tht
     use data_structure,     only: type_node_list, type_element_list
     use mod_interp,         only: interp_RZP, interp_gvec
     implicit none
@@ -353,7 +353,7 @@ module mod_chi
     real*8  :: chi_corr_harm, chi_corr_harm_s, chi_corr_harm_t, chi_corr_harm_ss, chi_corr_harm_tt, chi_corr_harm_st
     real*8  :: chi_corr_px, chi_corr_py
     real*8  :: chi_x, chi_y, chi_p, chi_xx, chi_xy, chi_yy, chi_yp, chi_xp, chi_pp
-    real*8  :: xjac, xjac_x, xjac_y, x_p_x, x_p_y, y_p_x, y_p_y
+    real*8  :: xjac, xjac_s, xjac_x, xjac_y, x_p_x, x_p_y, y_p_x, y_p_y
     
     ! Get R, Z, phi geometry of point
     call interp_RZP(node_list,element_list,i_elm,s,t,phi,R,R_s,R_t,R_p,R_st,R_ss,R_tt,R_sp,R_tp,R_pp, &
@@ -393,9 +393,16 @@ module mod_chi
     end do
 
     ! Compute chi and R, Z, phi derivatives
-    xjac =  R_s*Z_t - R_t*Z_s 
-    chi_x = (   Z_t * chi_corr_s - Z_s * chi_corr_t ) / xjac
-    chi_y = ( - R_t * chi_corr_s + R_s * chi_corr_t ) / xjac
+    xjac =  R_s*Z_t - R_t*Z_s
+    ! Use L'Hopital's rule (differentiate numerator and denominator wrt s) if the derivatives are being evaluated on the axis
+    if (i_elm .le. n_tht .and. s .eq. 0.d0) then
+      xjac_s = R_s*Z_st - R_st*Z_s
+      chi_x = ( Z_st*chi_corr_s - Z_s*chi_corr_st)/xjac_s
+      chi_y = (-R_st*chi_corr_s + R_s*chi_corr_st)/xjac_s
+    else ! If not, then we use the standard expressions for chi_x and chi_y
+      chi_x = (   Z_t * chi_corr_s - Z_s * chi_corr_t ) / xjac
+      chi_y = ( - R_t * chi_corr_s + R_s * chi_corr_t ) / xjac
+    end if
     chi_p = chi_corr_p - chi_x * R_p - chi_y * Z_p
 
     xjac_x  = (R_ss*Z_t**2 - Z_ss*R_t*Z_t - 2.d0*R_st*Z_s*Z_t &

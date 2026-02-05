@@ -21,6 +21,7 @@ module mod_equations
   integer, parameter :: var_B0y_gvec  = n_var+7
   integer, parameter :: var_B0p_gvec  = n_var+8
   integer, parameter :: var_Bv2       = n_var+9
+  integer, parameter :: var_heaviside = n_var+10
 
   ! Values
   type(algexpr), parameter, private :: Psi0       = algexpr(basic=.true.,var=var_Psi)
@@ -44,6 +45,8 @@ module mod_equations
   type(algexpr), parameter, private :: vpar       = algexpr(basic=.true.,var=var_varStar)
   type(algexpr), parameter, private :: T_i        = algexpr(basic=.true.,var=var_varStar)
   type(algexpr), parameter, private :: T_e        = algexpr(basic=.true.,var=var_varStar)
+
+  type(algexpr), parameter, private :: heaviside  = algexpr(basic=.true.,var=var_heaviside)
   ! Other quantities
   type(algexpr), parameter, private :: chi        = algexpr(basic=.true.,var=var_chi)
   type(algexpr), parameter, private :: R          = algexpr(basic=.true.,var=var_R)
@@ -68,9 +71,8 @@ module mod_equations
   contains
 
   subroutine init_equations()
-
     implicit none
-
+ 
     !###################################################################################################
     !#  Auxiliary vacuum magnetic field                                                                #
     !###################################################################################################
@@ -86,10 +88,11 @@ module mod_equations
  
     !###################################################################################################
     !#  Current Definition Equation for zj                                                             #
-    !###################################################################################################
-    rhs_semianalytic(var_zj)  = -dx(v)*(dy(chi)*B0p_gvec - dp(chi)*B0y_gvec/R)   &
-                              +  dy(v)*(dx(chi)*B0p_gvec - dp(chi)*B0x_gvec/R)   &
-                              -  dp(v)*(dx(chi)*B0y_gvec - dy(chi)*B0x_gvec)/R
+    ! Integration by parts to avoid first order derivatives in curl of B
+    rhs_semianalytic(var_zj)  = (-dx(v*heaviside)*(dy(chi)*B0p_gvec - dp(chi)*B0y_gvec/R)   &
+                              +   dy(v*heaviside)*(dx(chi)*B0p_gvec - dp(chi)*B0x_gvec/R)   &
+                              -   dp(v*heaviside)*(dx(chi)*B0y_gvec - dy(chi)*B0x_gvec)/R)
+    rhs_semianalytic(var_zj) = Dexpand(deepcopy(rhs_semianalytic(var_zj)))
 
     amat_semianalytic( var_zj,  var_zj) = v*Bv2*zj
     
@@ -125,7 +128,7 @@ module mod_equations
     if (.not. allocated(thread_eq)) then
       allocate(thread_eq(nbthreads))
       do i=1,nbthreads
-        allocate(thread_eq(i)%eq(n_var+9,0:n_order-1,0:n_order-1,0:n_order-1,4))
+        allocate(thread_eq(i)%eq(n_var+10,0:n_order-1,0:n_order-1,0:n_order-1,4))
       end do
     end if
   end subroutine init_eq_struct

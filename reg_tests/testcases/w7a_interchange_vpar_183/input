@@ -85,6 +85,8 @@
  heatsource     = 0.d0
  particlesource = 0.d0
 
+ T_0 = 5.000000000254616d-3
+
  rho_0 = 1.
  rho_1 = 1.
  rho_coef(1)  =  0.0

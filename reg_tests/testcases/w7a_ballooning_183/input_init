@@ -36,8 +36,8 @@
 
  !gmres = .f.
  iter_precon = 22
- gmres_m = 20
- gmres_4 = 1.d0
+! gmres_m = 20
+! gmres_4 = 1.d0
  gmres_max_iter = 200
  gmres_tol = 1.d-8
 /

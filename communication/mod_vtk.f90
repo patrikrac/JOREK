@@ -6,8 +6,8 @@ module mod_vtk
   !> To get a useful file you typically still need to add scalars
   type :: vtk_grid
     integer :: nsub !< Number of times to split each element in each dimension (i.e. 2**nsub per element)
-    real*4,allocatable  :: xyz (:,:) !< positions of points in vtk file (3,n_points)
-    integer,allocatable :: ien (:,:) !< connectivity in vtk file (n_corners,n_elements) (for arbitrary shapes)
+    real*4,allocatable  :: xyz (:,:,:) !< positions of points in vtk file (3,n_points)
+    integer,allocatable :: ien (:,:,:) !< connectivity in vtk file (n_corners,n_elements) (for arbitrary shapes)
   end type
 
   interface vtk_grid
@@ -33,25 +33,31 @@ contains
   !> This creates a grid with quadrilateral elements, uniformly spaced inside the finite elements
   subroutine prepare_vtk_grid(node_list,element_list,nsub,xyz,ien)
     use data_structure
-    use mod_interp, only: interp_RZ
+    use mod_parameters,    only: n_plane
+    use constants,         only: PI
+    use mod_interp,        only: interp_RZP
     implicit none
 
     !> Input parameters
     type(type_node_list), intent(in)    :: node_list
     type(type_element_list), intent(in) :: element_list
     integer, intent(in)                 :: nsub !< Number of subdivisions of each element
-    real*4, allocatable, intent(out)    :: xyz (:,:)
-    integer, allocatable, intent(out)   :: ien (:,:)
+    real*4, allocatable, intent(out)    :: xyz (:,:,:)
+    integer, allocatable, intent(out)   :: ien (:,:,:)
 
-    integer :: nnos, nnoel, nel, i, j, ielm, inode, k
-    real*8 :: s, t, R, R_s, R_t, Z, Z_s, Z_t
+    integer, allocatable  :: inode (:), ielm(:)
+
+    integer :: nnos, nnoel, nel, i, l, m, mp
+    real*8 :: toroidal_angle, s, t, R, Z
 
     nnos = nsub*nsub*element_list%n_elements
-    allocate(xyz(3,nnos))
+    allocate(xyz(n_plane,3,nnos))
 
     nnoel = 4
     nel   = (nsub-1)*(nsub-1)*element_list%n_elements
-    allocate(ien(nnoel,nel))
+    allocate(ien(n_plane,nnoel,nel))
+
+    allocate(inode(n_plane), ielm(n_plane))
 
     inode   = 0
     ielm    = 0
@@ -59,31 +65,37 @@ contains
     ien     = 0
 
     ! Create points for each element
-    do i=1,element_list%n_elements
-      do j=1,nsub
-        s = float(j-1)/float(nsub-1)
-        ! Create nsub^2 points per element at regularly spaced intervals
-        do k=1,nsub
-          t = float(k-1)/float(nsub-1)
-          call interp_RZ(node_list,element_list,i,s,t,R,R_s,R_t,Z,Z_s,Z_t)
-          inode = inode+1
-          xyz(1:3,inode) = real([R, Z, 0.d0], 4)
+    do mp=1,n_plane
+      toroidal_angle = real((mp - 1),8) * 2.d0 * PI / n_plane / n_period ! 2*PI / 6
+      do i=1,element_list%n_elements
+        do l=1,nsub
+          s = real(l-1,8)/real(nsub-1,8)
+          do m=1,nsub
+            t = real(m-1,8)/real(nsub-1,8)
+            call interp_RZP(node_list,element_list,i,s,t,toroidal_angle,R,Z)
+            inode(mp) = inode(mp)+1
+            ! xyz(mp,1:3,inode) = real([R, Z, 0.d0], 4)
+            xyz(mp,1,inode(mp)) = real(R,    4)
+            xyz(mp,2,inode(mp)) = real(Z,    4)
+            xyz(mp,3,inode(mp)) = real(0.d0, 4)
+          enddo
         enddo
-      enddo
 
-      ! Calculate the connectivity of each subelement
-      do j=1,nsub-1
-        do k=1,nsub-1
-          ielm        = ielm+1
-          ! the quadrilateral has 4 corners, for which we need to write out the node numbers
-          ! in a specific (clockwise) order (see the VTK spec)
-          ien(1,ielm) = inode - nsub*nsub + nsub*(j-1) + k-1       ! 0 based indices for VTK
-          ien(2,ielm) = inode - nsub*nsub + nsub*(j  ) + k-1
-          ien(3,ielm) = inode - nsub*nsub + nsub*(j  ) + k
-          ien(4,ielm) = inode - nsub*nsub + nsub*(j-1) + k
+        ! Calculate the connectivity of each subelement
+        do l=1,nsub-1
+          do m=1,nsub-1
+            ielm(mp)        = ielm(mp)+1
+            ! the quadrilateral has 4 corners, for which we need to write out the node numbers
+            ! in a specific (clockwise) order (see the VTK spec)
+            ien(mp,1,ielm(mp)) = inode(mp) - nsub*nsub + nsub*(l-1) + m-1       ! 0 based indices for VTK
+            ien(mp,2,ielm(mp)) = inode(mp) - nsub*nsub + nsub*(l  ) + m-1
+            ien(mp,3,ielm(mp)) = inode(mp) - nsub*nsub + nsub*(l  ) + m
+            ien(mp,4,ielm(mp)) = inode(mp) - nsub*nsub + nsub*(l-1) + m
+          enddo
         enddo
       enddo
     enddo
+
   end subroutine prepare_vtk_grid
 
 

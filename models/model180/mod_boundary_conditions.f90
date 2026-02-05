@@ -156,8 +156,9 @@ contains
 
     return
   end subroutine boundary_conditions
+
   
-  subroutine solve_Psi_boundary_eqn(node_list, boundary_list)
+  subroutine solve_Psi_boundary_eqn(node_list, boundary_list, ierr)
   !---------------------------------------------------------------------------------------------------------------------------------
   ! The Psi boundary equation is solved using the Fourier-Galerkin method here
   !
@@ -172,7 +173,7 @@ contains
   !---------------------------------------------------------------------------------------------------------------------------------
     use constants, only: pi
     use mod_parameters, only: n_period, n_plane, n_order, n_tor, n_coord_tor
-    use phys_module, only: F0, m_pol_bc
+    use phys_module, only: F0, m_pol_bc, extended_boundary
     use gauss
     use basis_at_gaussian
     use data_structure
@@ -183,8 +184,12 @@ contains
     type(type_node_list),        intent(in) :: node_list
     type(type_bnd_element_list), intent(in) :: boundary_list
 
-    real*8  :: phi, theta, element_size_ij, element_size_perp, BigR, grad_chi(3), Jgrad_ps(3)
+    real*8  :: Bp_n, Bp_cyl_n, grad_chi_n, phi, theta, element_size_ij, element_size_perp, BigR, grad_chi(3), Jgrad_ps(3)
+    real*8  :: Jgrad_ps_cart(3), B_field(3), B_r, B_phi, B_z, B_field_cyl(3)
+    real*8  :: theta_points, phi_points, x_points, y_points, z_points, s_points
     integer :: N_tht, mp, ms, ielm, i, j, j2, n, m, nn, mm, in, ind1, ind2, info
+    integer :: number_of_points, i_tht, j_gauss, k_plane, np
+    integer :: ierr
 
     type(type_bnd_element) :: bnd_element
     type(type_node)        :: node
@@ -194,6 +199,11 @@ contains
     real*8, dimension(:),     allocatable :: RHS
 
     real*8, dimension(0:n_order-1,0:n_order-1,0:n_order-1) :: chi
+
+    real*8, dimension(:,:,:), allocatable :: bx_p, by_p, bz_p
+    real*8, dimension(:,:,:), allocatable :: step_xyz, time1_xyz, time2_xyz, x_xyz, y_xyz, z_xyz
+    logical :: file_exists
+
 
     write(*,*) "***************************************"
     write(*,*) "*    Solving boundary Psi equation    *"
@@ -210,7 +220,7 @@ contains
 
     x_g  = 0.d0; x_s = 0.d0; x_p = 0.d0
     y_g  = 0.d0; y_s = 0.d0; y_p = 0.d0
-
+    
     do ielm=1,N_tht
       bnd_element = boundary_list%bnd_element(ielm)
 
@@ -231,42 +241,141 @@ contains
                 y_g(mp,ms,ielm)  = y_g(mp,ms,ielm)  + node%x(in,j2,2)*element_size_ij*H1(i,j,ms)   *HZ_coord(in,mp)
                 y_s(mp,ms,ielm)  = y_s(mp,ms,ielm)  + node%x(in,j2,2)*element_size_ij*H1_s(i,j,ms) *HZ_coord(in,mp)
                 y_p(mp,ms,ielm)  = y_p(mp,ms,ielm)  + node%x(in,j2,2)*element_size_ij*H1(i,j,ms)   *HZ_coord_p(in,mp)
+
+              end do
+            end do
+          end do
+        end do
+      end do 
+    end do
+    
+    ! Integration of the RHS: it is much easier to integrate over one period than over the manifold [0,2*pi]x[chi_0,chi_0+2*pi*F_0/N_p]
+    ! Due to periodicity, integration over the manifold above is equivalent to integration over one period
+    ! The Jacobian for dtheta*dchi -> dtheta*dphi is dchi/dphi
+    Amat = 0.d0; RHS = 0.d0
+    if (extended_boundary) then
+      ! write out points in .dat file for xyz points
+      open(66,file='xyz.dat',action='write')
+      number_of_points = n_gauss*n_plane*N_tht
+ 
+      write(66,*), number_of_points
+     
+      do i_tht=1,N_tht
+        do j_gauss=1,n_gauss
+          do k_plane=1, n_plane
+            phi_points = 2.d0*pi*float(k_plane-1)/float(n_plane*n_period)
+         
+            x_points =  x_g(k_plane,j_gauss,i_tht)*Cos(phi_points)       ! x=R, y=Z see jorek Wiki: coordinates
+            y_points = -x_g(k_plane,j_gauss,i_tht)*Sin(phi_points)      
+            z_points =  y_g(k_plane,j_gauss,i_tht)              
+            write(66,*), x_g(k_plane,j_gauss,i_tht)*Cos(phi_points), -x_g(k_plane,j_gauss,i_tht)*Sin(phi_points), y_g(k_plane,j_gauss,i_tht)
+          end do
+        end do
+      end do
+ 
+      write(*,*) "xyz.dat file is created"
+      write(*,*) "if the integration points changed, please re-run jorek2_fields_xyz_stel with this new xyz.dat file"
+      write(*,*) "run model 180 again afterwards"
+      close(66)
+
+      inquire(file="fields_xyz.dat", exist = file_exists)
+      
+      if (file_exists) then
+        write(*,*) "fields_xyz.dat file exists"
+        open(26,file='fields_xyz.dat',action='read')
+        read(26,*)  ! first row of fields_xyz is just a header
+        allocate(bx_p(n_plane,n_gauss,N_tht), by_p(n_plane,n_gauss,N_tht), bz_p(n_plane,n_gauss,N_tht))
+        allocate(step_xyz(n_plane,n_gauss,N_tht), time1_xyz(n_plane,n_gauss,N_tht), time2_xyz(n_plane,n_gauss,N_tht), x_xyz(n_plane,n_gauss,N_tht), y_xyz(n_plane,n_gauss,N_tht), z_xyz(n_plane,n_gauss,N_tht))
+        do ielm=1,N_tht
+          do ms=1,n_gauss
+            do mp=1,n_plane
+              read(26,*) step_xyz(mp,ms,ielm), time1_xyz(mp,ms,ielm), time2_xyz(mp,ms,ielm), x_xyz(mp,ms,ielm), y_xyz(mp,ms,ielm), z_xyz(mp,ms,ielm), bx_p(mp,ms,ielm), by_p(mp,ms,ielm), bz_p(mp,ms,ielm)
+            enddo
+          enddo
+        enddo
+        close(26)
+      else
+         write(*,*) "Could not find fields_xyz.dat file"
+         write(*,*) "please run jorek2_fields_xyz_stel.f90 with genereated xyz.dat file to create fields_xyz.dat file"
+         write(*,*) "run model 180 again afterwards"
+         ierr = 3
+         return
+      endif
+
+      open(69, file="Bpn_theta_phi.dat", action="write")
+      write(69, '(a)') "J_ps_cart, Bx, By, Bz, Bp_n, grad_chi_n, theta, phi"
+      
+      do ielm=1,N_tht
+        do ms=1,n_gauss
+          theta = 2.d0*pi*(float(ielm-1) + xgauss(ms))/float(N_tht)
+          do mp=1,n_plane
+            BigR = x_g(mp,ms,ielm)
+            phi = 2.d0*pi*float(mp-1)/float(n_plane*n_period)
+            B_field = (/ bx_p(mp,ms,ielm), by_p(mp,ms,ielm), bz_p(mp,ms,ielm) /) ! creating B-field arrray to replace grad(chi)
+            ! converting B-field to cylindrical coordiantes to be able to use J_grad_ps
+            ! B_r   = bx_p(mp,ms,ielm)*Cos(phi) + by_p(mp,ms,ielm)*(-Sin(phi))
+            ! B_phi = bx_p(mp,ms,ielm)*(-Sin(phi)) + by_p(mp,ms,ielm)*(-Cos(phi))
+            ! B_z   = bz_p(mp,ms,ielm)
+            ! B_field_cyl = (/ B_r, B_z, B_phi /)  ! because in JOREK it's (R,Z,Phi)
+            chi = get_chi_domm(x_g(mp,ms,ielm),y_g(mp,ms,ielm),phi)
+            grad_chi = (/ chi(1,0,0), chi(0,1,0), chi(0,0,1)/BigR /)
+            ! -e_theta x e_phi = -J*grad(psi)
+            Jgrad_ps = (/ -BigR*y_s(mp,ms,ielm), BigR*x_s(mp,ms,ielm), x_p(mp,ms,ielm)*y_s(mp,ms,ielm) - x_s(mp,ms,ielm)*y_p(mp,ms,ielm) /)
+            Jgrad_ps = Jgrad_ps*N_tht/(2.d0*pi) ! Multiply by dt/dtheta since J = 1/(grad(psi).(grad(theta)xgrad(phi))) and (s,t,phi) CS used above
+            ! Note that J'*dchi/dphi = J, where J' = 1/(grad(psi).(grad(theta)xgrad(chi))) and dchi/dphi is from the switch dtheta*dchi -> dtheta*dphi
+            
+            ! Jgrad_ps is needed in cartesian coordinates, since the B field is in cartesian coordinates
+            ! e_theta x e_phi, e_theta=dr(x,y,z)/dtheta, e_phi=dr(x,y,z)/dphi
+            Jgrad_ps_cart = (/ -x_s(mp,ms,ielm)*Sin(phi)*y_p(mp,ms,ielm) - y_s(mp,ms,ielm)*(-x_p(mp,ms,ielm)*Sin(phi)-BigR*Cos(phi)), &
+                               y_s(mp,ms,ielm)*(x_p(mp,ms,ielm)*Cos(phi)-BigR*Sin(phi)) - x_s(mp,ms,ielm)*Cos(phi)*y_p(mp,ms,ielm), &
+                               x_s(mp,ms,ielm)*Cos(phi)*(-x_p(mp,ms,ielm)*Sin(phi)-BigR*Cos(phi)) + x_s(mp,ms,ielm)*Sin(phi)*(x_p(mp,ms,ielm)*Cos(phi)-BigR*Sin(phi)) /)
+            Jgrad_ps_cart = Jgrad_ps_cart*N_tht/(2.d0*pi)
+            grad_chi_n = dot_product(Jgrad_ps,grad_chi)
+            Bp_n = dot_product(Jgrad_ps_cart,B_field)
+            ! Bp_cyl_n = dot_product(-Jgrad_ps,B_field_cyl)
+            
+            write(69,'(10ES18.10)') Jgrad_ps_cart, B_field, Bp_n, grad_chi_n, 2.d0*pi*(float(ielm-1) + xgauss(ms))/float(N_tht), 2.d0*pi*float(mp-1)/float(n_plane*n_period)
+
+            ind1 = 1
+            do n=1,n_tor
+              do m=1,m_pol_bc
+                RHS(ind1) = RHS(ind1) + dot_product(Jgrad_ps_cart,B_field)*Zn(n,chi(0,0,0))*Zm(m,theta)*wgauss(ms) ! B-field version
+                ! RHS(ind1) = RHS(ind1) + dot_product(-Jgrad_ps,B_field_cyl)*Zn(n,chi(0,0,0))*Zm(m,theta)*wgauss(ms) ! B_cyl-field version
+                ind1 = ind1 + 1
               end do
             end do
           end do
         end do
       end do
-    end do
+      close(69)
+    else   ! if case started in line 255
+      ! original script for gradchi B.C.
+      do ielm=1,N_tht
+        do ms=1,n_gauss
+          theta = 2.d0*pi*(float(ielm-1) + xgauss(ms))/float(N_tht)
+          do mp=1,n_plane
+            BigR = x_g(mp,ms,ielm)
+            phi = 2.d0*pi*float(mp-1)/float(n_plane*n_period)
+            chi = get_chi_domm(x_g(mp,ms,ielm),y_g(mp,ms,ielm),phi)
+            grad_chi = (/ chi(1,0,0), chi(0,1,0), chi(0,0,1)/BigR /)
+            ! -e_theta x e_phi = -J*grad(psi)
+            Jgrad_ps = (/ -BigR*y_s(mp,ms,ielm), BigR*x_s(mp,ms,ielm), x_p(mp,ms,ielm)*y_s(mp,ms,ielm) - x_s(mp,ms,ielm)*y_p(mp,ms,ielm) /)
+            Jgrad_ps = Jgrad_ps*N_tht/(2.d0*pi) ! Multiply by dt/dtheta since J = 1/(grad(psi).(grad(theta)xgrad(phi))) and (s,t,phi) CS used above
+            ! Note that J'*dchi/dphi = J, where J' = 1/(grad(psi).(grad(theta)xgrad(chi))) and dchi/dphi is from the switch dtheta*dchi -> dtheta*dphi
+            grad_chi_n = dot_product(Jgrad_ps,grad_chi)
 
-    Amat = 0.d0; RHS = 0.d0
-
-    ! Integration of the RHS: it is much easier to integrate over one period than over the manifold [0,2*pi]x[chi_0,chi_0+2*pi*F_0/N_p]
-    ! Due to periodicity, integration over the manifold above is equivalent to integration over one period
-    ! The Jacobian for dtheta*dchi -> dtheta*dphi is dchi/dphi
-    do ielm=1,N_tht
-      do ms=1,n_gauss
-        theta = 2.d0*pi*(float(ielm-1) + xgauss(ms))/float(N_tht)
-
-        do mp=1,n_plane
-          BigR = x_g(mp,ms,ielm)
-          phi = 2.d0*pi*float(mp-1)/float(n_plane*n_period)
-          chi = get_chi_domm(x_g(mp,ms,ielm),y_g(mp,ms,ielm),phi)
-          grad_chi = (/ chi(1,0,0), chi(0,1,0), chi(0,0,1)/BigR /)
-          ! -e_theta x e_phi = -J*grad(psi)
-          Jgrad_ps = (/ -BigR*y_s(mp,ms,ielm), BigR*x_s(mp,ms,ielm), x_p(mp,ms,ielm)*y_s(mp,ms,ielm) - x_s(mp,ms,ielm)*y_p(mp,ms,ielm) /)
-          Jgrad_ps = Jgrad_ps*N_tht/(2.d0*pi) ! Multiply by dt/dtheta since J = 1/(grad(psi).(grad(theta)xgrad(phi))) and (s,t,phi) CS used above
-          ! Note that J'*dchi/dphi = J, where J' = 1/(grad(psi).(grad(theta)xgrad(chi))) and dchi/dphi is from the switch dtheta*dchi -> dtheta*dphi
-
-          ind1 = 1
-          do n=1,n_tor
-            do m=1,m_pol_bc
-              RHS(ind1) = RHS(ind1) + dot_product(Jgrad_ps,grad_chi)*Zn(n,chi(0,0,0))*Zm(m,theta)*wgauss(ms)
-              ind1 = ind1 + 1
+            ind1 = 1
+            do n=1,n_tor
+              do m=1,m_pol_bc
+                RHS(ind1) = RHS(ind1) + dot_product(Jgrad_ps,grad_chi)*Zn(n,chi(0,0,0))*Zm(m,theta)*wgauss(ms) ! grad(chi) version
+                ind1 = ind1 + 1
+              end do
             end do
           end do
         end do
       end do
-    end do
+    endif  ! else case started in line 348
+
     RHS = RHS*(2.d0*pi)**2/float(n_period*n_plane*N_tht)
 
     ! The integrals in the matrix are done analytically since they only contain sines and cosines

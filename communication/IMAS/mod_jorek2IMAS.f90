@@ -143,7 +143,7 @@ module mod_jorek2IMAS
     endif
 
     ! --- Normalization factors for IMAS
-    rho0               = central_density * 1.d20 * central_mass * mass_proton
+    rho0               = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
     sqrt_mu0_rho0      = sqrt( mu_zero * rho0 )
     sqrt_mu0_over_rho0 = sqrt( mu_zero / rho0 )
   
@@ -262,7 +262,7 @@ module mod_jorek2IMAS
         allocate(plasma_profiles_ids%ggd(i_slice)%neutral(i_neut))
         allocate(plasma_profiles_ids%ggd(i_slice)%neutral(i_neut)%element(1))
 
-        plasma_profiles_ids%ggd(i_slice)%neutral(i_neut)%element(1)%a   = int(central_mass)
+        plasma_profiles_ids%ggd(i_slice)%neutral(i_neut)%element(1)%a   = nint(central_mass)
         plasma_profiles_ids%ggd(i_slice)%neutral(i_neut)%element(1)%z_n = 1
 
         ! --- Density in GGD
@@ -504,8 +504,6 @@ module mod_jorek2IMAS
     ! --- Call expressions to compute boundary quantities
     step_imported = .true.
 
-    call initialise_postproc_settings(first_step, 100)
-  
     ! --- Arguments for boundary quantities
     command_tmp%n_args = 3
     command_tmp%args(1) = '0'              ! phimin
@@ -848,7 +846,7 @@ module mod_jorek2IMAS
     ! --- Set times
     allocate( spi%time(n_slice) )
     spi%time(i_slice) = time_SI 
-    rho0              = central_density * 1.d20 * central_mass * mass_proton
+    rho0              = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
     sqrt_mu0_rho0     = sqrt( mu_zero * rho0 )
 
     ! --- Loop over injectors
@@ -875,7 +873,7 @@ module mod_jorek2IMAS
       spi%injector(i_inj)%pellet%core%species(1)%density = spi_quantity(i_inj) / pellet_vol
 
       ! --- Background species
-      spi%injector(i_inj)%pellet%core%species(2)%a       = int(central_mass)
+      spi%injector(i_inj)%pellet%core%species(2)%a       = nint(central_mass)
       spi%injector(i_inj)%pellet%core%species(2)%z_n     = 1
       spi%injector(i_inj)%pellet%core%species(2)%density = spi_quantity_bg(i_inj) / pellet_vol
 
@@ -1013,7 +1011,7 @@ module mod_jorek2IMAS
 
 
 
-  subroutine fill_radiation_IDS(first_step, time_SI, radiation_ids)  
+  subroutine fill_radiation_IDS(first_step, time_SI, expr_avg_list, avg, n_grid_1d, radiation_ids)  
 
     use phys_module, only : F0, central_density, sqrt_mu0_rho0, &
                            sqrt_mu0_over_rho0, central_mass, imp_type, &
@@ -1023,12 +1021,15 @@ module mod_jorek2IMAS
     ! --- External parameters
     logical,                 intent(in) :: first_step   ! is this the first step?
     real*8,                  intent(in) :: time_SI
+    type(t_expr_list),       intent(in) :: expr_avg_list ! list of expressions for average
+    real*8,                  intent(in) :: avg(:,:)
+    integer,                 intent(in) :: n_grid_1d ! (Number of points for 1D profile)
     type(ids_radiation),  intent(inout) :: radiation_ids
    
     ! --- Local parameters 
-    integer    :: i, j, k, m, var_rad, i_var, i_tor, index, index_node, my_id, ierr
+    integer    :: i, j, k, m, i_exp, var_rad, my_id
     real*8     :: rho0, fact_rad
-    
+
     ! **********************************************************************************
     ! ******************************* IMAS **********************************************
     ! **********************************************************************************
@@ -1037,7 +1038,7 @@ module mod_jorek2IMAS
     
     integer:: num_nodes
     
-    integer :: n_slice, i_slice, grid_ind, grid_sub_ind, n_grid_sub, n_grid
+    integer :: n_slice, i_slice, grid_ind, grid_sub_ind, n_grid_sub, n_grid, i_psi
     ! **********************************************************************************
   
     ! --- Number of grids and grid subsets
@@ -1045,22 +1046,24 @@ module mod_jorek2IMAS
     n_grid_sub   = 1
     grid_ind     = 1  ! Index
     grid_sub_ind = 1  ! Index
-  
-    if (first_step) then
-      ! --- Put the grid in GGD
-      allocate( radiation_ids%grid_ggd(n_grid) )
-      grid => radiation_ids%grid_ggd(grid_ind)
-      grid%time = time_SI
-      call grid2ggd( grid, node_list, element_list, bnd_node_list, bnd_elm_list )
-    else
-      if ( associated(radiation_ids%grid_ggd)) then
-        call ids_deallocate_struct(radiation_ids%grid_ggd(grid_ind), .false.)     
-        deallocate(radiation_ids%grid_ggd)
+
+    if (use_marker) then
+      if (first_step) then
+        ! --- Put the grid in GGD
+        allocate( radiation_ids%grid_ggd(n_grid) )
+        grid => radiation_ids%grid_ggd(grid_ind)
+        grid%time = time_SI
+        call grid2ggd( grid, node_list, element_list, bnd_node_list, bnd_elm_list )
+      else
+        if ( associated(radiation_ids%grid_ggd)) then
+          call ids_deallocate_struct(radiation_ids%grid_ggd(grid_ind), .false.)     
+          deallocate(radiation_ids%grid_ggd)
+        endif
       endif
-    endif
- 
+    end if
+    
     ! --- Normalization factors for IMAS
-    rho0               = central_density * 1.d20 * central_mass * mass_proton
+    rho0               = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
     sqrt_mu0_rho0      = sqrt( mu_zero * rho0 )
     sqrt_mu0_over_rho0 = sqrt( mu_zero / rho0 )
 
@@ -1070,20 +1073,10 @@ module mod_jorek2IMAS
     n_slice = 1  
     i_slice = 1
     allocate(  radiation_ids%time(n_slice) )
+    radiation_ids%time(i_slice)                = time_SI 
 
     radiation_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HETEROGENEOUS
     allocate( radiation_ids%process(1))   ! --- 1 type of radiation
-    allocate( radiation_ids%process(1)%ggd(n_slice) )
-  
-    radiation_ids%time(i_slice)                = time_SI 
-    radiation_ids%process(1)%ggd(i_slice)%time = time_SI
- 
-    ! --- Fill radiation data 
-    var_rad = 2
-  
-    allocate( radiation_ids%process(1)%ggd(i_slice)%ion(1))
-    allocate( radiation_ids%process(1)%ggd(i_slice)%ion(1)%emissivity(n_grid_sub))
-    allocate( radiation_ids%process(1)%ggd(i_slice)%ion(1)%name(1) )  
     allocate( radiation_ids%process(1)%identifier%name(1) )
     allocate( radiation_ids%process(1)%identifier%description(1) )
 
@@ -1091,11 +1084,58 @@ module mod_jorek2IMAS
     radiation_ids%process(1)%identifier%description  = "Total line radiation"
     radiation_ids%process(1)%identifier%index        = 10
 
-    radiation_ids%process(1)%ggd(i_slice)%ion(1)%name = imp_type(index_main_imp) 
-  
-    ggd_scalar => radiation_ids%process(1)%ggd(i_slice)%ion(1)%emissivity(grid_sub_ind)
-    call fill_Bezier_coefficients( ggd_scalar, aux_node_list, var_rad, grid_ind, grid_sub_ind, fact_rad )
+    
+    if (use_marker) then
+      allocate( radiation_ids%process(1)%ggd(n_slice) )
+      radiation_ids%process(1)%ggd(i_slice)%time = time_SI
 
+      ! --- Fill radiation data 
+      var_rad = 2
+
+      allocate( radiation_ids%process(1)%ggd(i_slice)%ion(1))
+      allocate( radiation_ids%process(1)%ggd(i_slice)%ion(1)%emissivity(n_grid_sub))
+      allocate( radiation_ids%process(1)%ggd(i_slice)%ion(1)%name(1) )  
+
+      radiation_ids%process(1)%ggd(i_slice)%ion(1)%name = imp_type(index_main_imp) 
+
+      ggd_scalar => radiation_ids%process(1)%ggd(i_slice)%ion(1)%emissivity(grid_sub_ind)
+      call fill_Bezier_coefficients( ggd_scalar, aux_node_list, var_rad, grid_ind, grid_sub_ind, fact_rad )
+    else
+      allocate( radiation_ids%process(1)%profiles_1d(1))
+      radiation_ids%process(1)%profiles_1d(1)%time = time_SI
+
+      ! --- Fill expressions in IDSs
+      do i_exp=1, expr_avg_list%n_expr
+        
+        ! --- psi
+        if (expr_avg_list%expr(i_exp)%name=='Psi_N') then
+          ! --- Psi_N
+          allocate( radiation_ids%process(1)%profiles_1d(i_slice)%grid%rho_pol_norm(n_grid_1d) )
+          radiation_ids%process(1)%profiles_1d(i_slice)%grid%psi_magnetic_axis = ES%Psi_axis * fact_psi
+          radiation_ids%process(1)%profiles_1d(i_slice)%grid%psi_boundary      = ES%Psi_bnd  * fact_psi
+          radiation_ids%process(1)%profiles_1d(i_slice)%grid%rho_pol_norm(:)   = sqrt(avg(:,i_exp))
+        end if
+
+        if (expr_avg_list%expr(i_exp)%name=='Psi_N') then
+          ! --- Psi
+          allocate( radiation_ids%process(1)%profiles_1d(i_slice)%grid%psi(n_grid_1d) )
+          radiation_ids%process(1)%profiles_1d(i_slice)%grid%psi(:)   = avg(:,i_exp) * fact_psi
+        end if
+        
+        if (expr_avg_list%expr(i_exp)%name=='radiation') then
+          ! --- radiation
+          allocate( radiation_ids%process(1)%profiles_1d(1)%emissivity_ion_total(n_grid_1d))
+          radiation_ids%process(1)%profiles_1d(1)%emissivity_ion_total(:) = avg(:,i_exp) 
+        end if
+        
+      end do
+      
+      allocate( radiation_ids%process(1)%profiles_1d(i_slice)%grid%rho_tor_norm(n_grid_1d) )
+      i = expr_avg_list%n_expr + 2
+      radiation_ids%process(1)%profiles_1d(i_slice)%grid%rho_tor_norm(:) = sqrt( avg(:,i)/avg(n_grid_1d,i) )
+
+    end if
+    
   end subroutine fill_radiation_IDS
 
 
@@ -1103,7 +1143,7 @@ module mod_jorek2IMAS
 
 
 
-  subroutine fill_plasma_profiles_IDS(first_step, time_SI, plasma_profiles_ids, n_grid)  
+  subroutine fill_plasma_profiles_IDS(first_step, time_SI, expr_avg_list, avg, plasma_profiles_ids, n_grid)  
 
     use phys_module, only : F0, central_density, sqrt_mu0_rho0, &
                            sqrt_mu0_over_rho0, central_mass, imp_type, &
@@ -1113,16 +1153,15 @@ module mod_jorek2IMAS
     ! --- External parameters
     logical,      intent(in) :: first_step   ! is this the first step?
     real*8,       intent(in) :: time_SI
-    integer,      intent(in) :: n_grid       ! Number of flux surfaces to compute average
+    type(t_expr_list) , intent(inout) :: expr_avg_list ! list of expressions for average
+    real*8,             intent(in)    :: avg(:,:)
+    integer,            intent(in)    :: n_grid       ! Number of flux surfaces to compute average
     type(ids_plasma_profiles),   intent(inout) :: plasma_profiles_ids
    
     ! --- Local parameters 
     integer    :: i, j, k, m, var_rad, i_var, i_tor, index, index_node, my_id, ierr
     integer    :: a_imp, z_imp, i_ion_main, i_ion_imp
     real*8     :: rho0
-    real*8, allocatable :: result(:,:), q_prof(:), rho_tor(:)
-    character(10)       :: str
-    type(type_command)  :: command_tmp
     
     ! **********************************************************************************
     ! ******************************* IMAS **********************************************
@@ -1137,40 +1176,11 @@ module mod_jorek2IMAS
     allocate( plasma_profiles_ids%time(n_slice) )
 
     ! --- Normalization factors for IMAS
-    rho0               = central_density * 1.d20 * central_mass * mass_proton
+    rho0               = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
     sqrt_mu0_rho0      = sqrt( mu_zero * rho0 )
     
     plasma_profiles_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HOMOGENEOUS     
     plasma_profiles_ids%time(i_slice) = time_SI 
-
-    ! --- Call expressions and do a flux average
-    step_imported = .true.
-
-    call initialise_postproc_settings(first_step, n_grid)
-  
-    ! --- Get average and q-profile
-    command_tmp%n_args = 0
-    call clean_up()
-    expr_list = exprs((/'Psi_N', 'T_i', 'T_e', 'ne', 'pres', 'Phi', 'eta_T', &
-                        'Jpar', 'E_||', 'Er', 'vpar', 'Vtheta_i', 'Vstar_i', 'rho', 'Psi', &
-                        'Z_eff', 'nimp', 'ni_main', 'nn_main'/), 19)
-    
-    ! --- If loss of LCFS, abort plasma_profiles
-    if ( .not. ES%LCFS_is_lost ) then
-      call average(command_tmp, first_step==.true., ierr, result, .true.)
-      call clean_up()
-      call qprofile(command_tmp, first_step==.true., ierr, q_prof)
-    else 
-      if(allocated(result)) deallocate(result)
-      if(allocated(q_prof)) deallocate(q_prof)
-      allocate(result(n_grid, expr_list%n_expr))
-      allocate(q_prof(n_grid))
-      result = -1.d99;   q_prof = -1.d99;
-      write(*,*) '  plasma_profiles cannot be produced without closed flux surfaces'
-    endif
-    ! --- Correct first and last points
-    q_prof(1)      = q_prof(2)        + (q_prof(2)-q_prof(3))
-    q_prof(n_grid) = q_prof(n_grid-1) + (q_prof(n_grid-1)-q_prof(n_grid-2))
 
     ! --- Some allocations
     allocate( plasma_profiles_ids%profiles_1d(i_slice)%ion(1+n_adas) ) ! First index is for main ions
@@ -1178,104 +1188,104 @@ module mod_jorek2IMAS
     i_ion_main = 1;  i_ion_imp = 2;
 
     ! --- Fill expressions in IDSs
-    do i_exp=1, expr_list%n_expr
+    do i_exp=1, expr_avg_list%n_expr
 
       ! --- Psi_N
       if (expr_list%expr(i_exp)%name=='Psi_N') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%grid%rho_pol_norm(n_grid) )
         plasma_profiles_ids%profiles_1d(i_slice)%grid%psi_magnetic_axis = ES%Psi_axis * fact_psi
         plasma_profiles_ids%profiles_1d(i_slice)%grid%psi_boundary      = ES%Psi_bnd  * fact_psi
-        plasma_profiles_ids%profiles_1d(i_slice)%grid%rho_pol_norm(:)   = sqrt(result(:,i_exp))
+        plasma_profiles_ids%profiles_1d(i_slice)%grid%rho_pol_norm(:)   = sqrt(avg(:,i_exp))
       endif
 
       ! --- Psi
       if (expr_list%expr(i_exp)%name=='Psi') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%grid%psi(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%grid%psi(:)   = result(:,i_exp) * fact_psi
+        plasma_profiles_ids%profiles_1d(i_slice)%grid%psi(:)   = avg(:,i_exp) * fact_psi
       endif
 
       ! --- Ion temperature
       if (expr_list%expr(i_exp)%name=='T_i') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%t_i_average(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%t_i_average(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%t_i_average(:) = avg(:,i_exp)
       endif
 
       ! --- Electron temperature
       if (expr_list%expr(i_exp)%name=='T_e') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%electrons%temperature(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%electrons%temperature(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%electrons%temperature(:) = avg(:,i_exp)
       endif
 
       ! --- Electron density
       if (expr_list%expr(i_exp)%name=='ne') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%electrons%density(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%electrons%density(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%electrons%density(:) = avg(:,i_exp)
       endif
 
       ! --- Total pressure
       if (expr_list%expr(i_exp)%name=='pres') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%pressure_thermal(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%pressure_thermal(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%pressure_thermal(:) = avg(:,i_exp)
       endif
 
       ! --- Electrostatic potential
       if (expr_list%expr(i_exp)%name=='Phi') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%phi_potential(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%phi_potential(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%phi_potential(:) = avg(:,i_exp)
       endif
 
       ! --- Parallel conductivity
       if (expr_list%expr(i_exp)%name=='eta_T') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%conductivity_parallel(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%conductivity_parallel(:) = 1.d0 / result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%conductivity_parallel(:) = 1.d0 / avg(:,i_exp)
       endif
 
       ! --- Parallel current density
       if (expr_list%expr(i_exp)%name=='Jpar') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%j_total(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%j_total(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%j_total(:) = avg(:,i_exp)
       endif
 
       ! --- Parallel electric field
       if (expr_list%expr(i_exp)%name=='E_||') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%e_field%parallel(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%e_field%parallel(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%e_field%parallel(:) = avg(:,i_exp)
       endif
 
       ! --- Radial electric field
       if (expr_list%expr(i_exp)%name=='Er') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%e_field%radial(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%e_field%radial(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%e_field%radial(:) = avg(:,i_exp)
       endif
 
       ! --- Parallel velocity
       if (expr_list%expr(i_exp)%name=='vpar') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%parallel(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%parallel(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%parallel(:) = avg(:,i_exp)
       endif
 
       ! --- Poloidal velocity
       if (expr_list%expr(i_exp)%name=='Vtheta_i') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%poloidal(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%poloidal(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%poloidal(:) = avg(:,i_exp)
       endif
 
       ! --- Diamagnetic velocity
       if (expr_list%expr(i_exp)%name=='Vstar_i') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%diamagnetic(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%diamagnetic(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%velocity%diamagnetic(:) = avg(:,i_exp)
       endif
 
       ! --- Z_eff
       if (expr_list%expr(i_exp)%name=='Z_eff') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%zeff(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%zeff(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%zeff(:) = avg(:,i_exp)
       endif
 
       ! --- Ion density
       if (expr_list%expr(i_exp)%name=='ni_main') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%density(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%density(:) = result(:,i_exp) 
+        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%density(:) = avg(:,i_exp) 
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%element(1) )
         plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%element(1)%a   = central_mass
         plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_main)%element(1)%z_n = 1   ! Main ions have Z=1
@@ -1284,7 +1294,7 @@ module mod_jorek2IMAS
       ! --- Neutral density (of main ions)
       if (expr_list%expr(i_exp)%name=='nn_main') then
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%neutral(i_ion_main)%density(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%neutral(i_ion_main)%density(:) = result(:,i_exp) 
+        plasma_profiles_ids%profiles_1d(i_slice)%neutral(i_ion_main)%density(:) = avg(:,i_exp) 
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%neutral(i_ion_main)%element(1) )
         plasma_profiles_ids%profiles_1d(i_slice)%neutral(i_ion_main)%element(1)%a   = central_mass
         plasma_profiles_ids%profiles_1d(i_slice)%neutral(i_ion_main)%element(1)%z_n = 1   ! Main ions have Z=1
@@ -1293,7 +1303,7 @@ module mod_jorek2IMAS
       ! --- Main impurity density
       if (expr_list%expr(i_exp)%name=='nimp') then   ! ion index 2 is for the main impurity species
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_imp)%density(n_grid) )
-        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_imp)%density(:) = result(:,i_exp)
+        plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_imp)%density(:) = avg(:,i_exp)
         allocate( plasma_profiles_ids%profiles_1d(i_slice)%ion(i_ion_imp)%element(1) )
         call get_element_atomic_numbers(imp_type(index_main_imp), a_imp, z_imp )
 
@@ -1318,19 +1328,15 @@ module mod_jorek2IMAS
      end if
    end do
 
-   
     ! --- q-profile
-    allocate( plasma_profiles_ids%profiles_1d(i_slice)%q(n_grid) )
-    plasma_profiles_ids%profiles_1d(i_slice)%q(:) = q_prof(:)
-
-    ! --- Get rho_norm_tor from psi_N and q_profile
-    allocate( plasma_profiles_ids%profiles_1d(i_slice)%grid%rho_tor_norm(n_grid) )
-    allocate(rho_tor(n_grid))
-    rho_tor(:) = 0.d0
-    do i_psi=2, n_grid
-      rho_tor(i_psi) = sum(q_prof(1:i_psi)) ! Assuming equidistant psi grid!!
-    end do
-    plasma_profiles_ids%profiles_1d(i_slice)%grid%rho_tor_norm(:) = sqrt( rho_tor(:)/rho_tor(n_grid) )
+   allocate( plasma_profiles_ids%profiles_1d(i_slice)%q(n_grid) )
+   index = expr_avg_list%n_expr + 1
+   plasma_profiles_ids%profiles_1d(i_slice)%q(:) = avg(:,index)
+    
+   ! --- Get rho_norm_tor from psi_N and q_profile
+   allocate( plasma_profiles_ids%profiles_1d(i_slice)%grid%rho_tor_norm(n_grid) )
+   index = expr_avg_list%n_expr + 2
+   plasma_profiles_ids%profiles_1d(i_slice)%grid%rho_tor_norm(:) = sqrt( avg(:,index)/avg(n_grid,index) )
 
   end subroutine fill_plasma_profiles_IDS
 
@@ -1339,49 +1345,89 @@ module mod_jorek2IMAS
 
 
 
-  ! --- This subroutine fills different IDSs, they are filled together here to calculate 0D
-  ! --- quantities by calling mod_integrals3D only once and avoid duplications
-  subroutine fill_IDSs_w_common_quantities(first_step, time_SI, n_grid, export_equil, export_summary, export_disruption, &
-                                           equilibrium_ids, summary_ids, disruption_ids, simulation_description, rect_grid_params)
+  ! --- This subroutine calls the 0D data subroutine
+  ! --- by calling mod_integrals3D only once and avoid duplications
+  subroutine get_0D_data(first_step, res0D)
 
     implicit none
 
     ! --- External parameters
-    logical,      intent(in) :: first_step   ! is this the first step?
-    real*8,       intent(in) :: time_SI
-    logical,      intent(in) :: export_equil, export_summary, export_disruption
-    integer,      intent(in) :: n_grid       ! Number of flux surfaces to compute average
-    type(ids_equilibrium),  intent(inout)  :: equilibrium_ids
-    type(ids_summary),      intent(inout)  :: summary_ids
-    type(ids_disruption),   intent(inout)  :: disruption_ids
-    character(len=1000)                    :: simulation_description
-    type(t_rect_grid_params), intent(in)   :: rect_grid_params
-
+    logical, intent(in)                :: first_step
+    real*8, allocatable, intent(inout) :: res0D(:)  ! result of 0D data
     ! --- Local parameters
-    real*8, allocatable :: res0D(:)
     integer             :: ierr
     type(type_command)  :: command_tmp
 
     step_imported = .true.
-    call initialise_postproc_settings(first_step, n_grid)
 
     command_tmp%n_args = 0
+    if (allocated(res0D)) deallocate(res0D)
     call clean_up()
-    call zeroD_quantities(command_tmp, first_step==.true., ierr, res0D)
+    call zeroD_quantities(command_tmp, first_step, ierr, res0D)
+    call clean_up()
+    
+  end subroutine get_0D_data
 
-    if (export_equil)       call fill_equilibrium_IDS(first_step, time_SI, n_grid, res0D, equilibrium_ids, rect_grid_params)  
-    if (export_summary)     call fill_summary_IDS(first_step, time_SI, res0D, summary_ids, simulation_description)  
-    if (export_disruption)  call fill_disruption_IDS(first_step, time_SI, res0D, disruption_ids) 
+
+  subroutine get_average_data(first_step, n_grid, expr_avg_list, avg)
+    
+    implicit none
+    
+    ! --- Input Variables
+    logical, intent(in)                :: first_step
+    integer, intent(in)                :: n_grid        ! Number of surfaces
+    type(t_expr_list) , intent(inout)  :: expr_avg_list ! list of expressions for average
+    real*8, allocatable, intent(inout) :: avg(:,:)  ! array: average + qprof + rho_tor
+    ! --- Local Variables
+    type(type_command)  :: command_tmp
+    real*8, allocatable :: res(:,:)
+    real*8, allocatable :: q_prof(:), rho_tor(:)
+    integer :: i_psi, ierr
+
+    expr_list = exprs((/'Psi_N', 'Psi', 'pres', 'FFprime_loc', 'p_prime_loc', &
+        'Jpar', 'T_i', 'T_e', 'ne', 'pres', 'Phi', 'eta_T', 'Jpar', &
+        'E_||', 'Er', 'vpar', 'Vtheta_i', 'Vstar_i', 'rho', 'Psi', 'Z_eff', 'nimp', &
+        'ni_main', 'nn_main', 'radiation' /), 25)
+    
+    command_tmp%n_args = 0
+    step_imported = .true.
+    
+    call clean_up()
+    if ( .not. ES%LCFS_is_lost ) then
+      if (allocated(res)) deallocate(res)
+      call average(command_tmp, first_step, ierr, res, .true.)
+      call clean_up()
+      call qprofile(command_tmp, first_step, ierr, q_prof)
+    else 
+      if(allocated(res)) deallocate(res)
+      if(allocated(q_prof)) deallocate(q_prof)
+      allocate(res(n_grid, expr_list%n_expr))
+      allocate(q_prof(n_grid))
+      res = -1.d99;   q_prof = -1.d99;
+      write(*,*) '  profiles cannot be produced without closed flux surfaces'
+    endif
+    ! --- Correct first and last points
+    q_prof(1)      = q_prof(2)        + (q_prof(2)-q_prof(3))
+    q_prof(n_grid) = q_prof(n_grid-1) + (q_prof(n_grid-1)-q_prof(n_grid-2))
+    allocate(rho_tor(n_grid))
+    rho_tor(:) = 0.d0
+    do i_psi=2, n_grid
+      rho_tor(i_psi) = sum(q_prof(1:i_psi)) ! Assuming equidistant psi grid!!
+    end do
+
+    expr_avg_list = expr_list
+    if (allocated(avg)) deallocate(avg)
+    allocate(avg(n_grid, expr_list%n_expr+2))
+    avg(:,1:expr_list%n_expr) = res(:,:)
+    avg(:,expr_list%n_expr + 1) = q_prof(:)
+    avg(:,expr_list%n_expr + 2) = rho_tor(:)
+
+    deallocate(res, q_prof, rho_tor)
+    
+  end subroutine get_average_data
+
   
-  
-  end subroutine fill_IDSs_w_common_quantities
-
-
-
-
-
-
-  subroutine fill_equilibrium_IDS(first_step, time_SI, n_grid, res0D, equilibrium_ids, rect_grid_params)  
+  subroutine fill_equilibrium_IDS(first_step, time_SI, n_grid, res0D, expr_avg_list, avg, equilibrium_ids, rect_grid_params)  
 
     use phys_module, only : F0, central_density, sqrt_mu0_rho0, &
                            sqrt_mu0_over_rho0, central_mass, imp_type, &
@@ -1393,14 +1439,16 @@ module mod_jorek2IMAS
     real*8,              intent(in) :: time_SI
     integer,             intent(in) :: n_grid       ! Number of flux surfaces to compute average
     real*8, allocatable, intent(in) :: res0D(:)     ! List of 0D quantities defined in exprs_all_int (mod_expressions.f90)
+    type(t_expr_list) , intent(inout) :: expr_avg_list ! list of expressions for average
+    real*8,             intent(in)    :: avg(:,:)
     type(t_rect_grid_params), intent(in) :: rect_grid_params ! Parameters that define grid for profiles_2d
     
     type(ids_equilibrium),  intent(inout)  :: equilibrium_ids
    
     ! --- Local parameters 
-    integer    :: i, j, k, m, var_rad, i_var, i_tor, index, index_node, my_id, ierr, ixp1, ixp2, nR, nZ
+    integer    :: i, j, k, m, my_id, ierr, ixp1, ixp2, nR, nZ
     real*8     :: rho0, fact_rad, R_min, Z_min, R_max, Z_max, R_node, Z_node
-    real*8, allocatable :: result(:,:), q_prof(:), rho_tor(:), R_sep(:), Z_sep(:)
+    real*8, allocatable :: R_sep(:), Z_sep(:)
     real*8, allocatable :: result2D(:,:,:), R_vec(:), Z_vec(:)
     character(30)       :: str
     type(type_command)  :: command_tmp
@@ -1418,82 +1466,56 @@ module mod_jorek2IMAS
     allocate( equilibrium_ids%time(n_slice) )
 
     ! --- Normalization factors for IMAS
-    rho0               = central_density * 1.d20 * central_mass * mass_proton
+    rho0               = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
     sqrt_mu0_rho0      = sqrt( mu_zero * rho0 )
     
     equilibrium_ids%ids_properties%homogeneous_time = IDS_TIME_MODE_HOMOGENEOUS    
     equilibrium_ids%time(i_slice) = time_SI 
 
-    ! --- Call expressions and do a flux average
-    
-    ! --- Get average and q-profile
-    command_tmp%n_args = 0
-    call clean_up()
-    expr_list = exprs((/'Psi', 'pres', 'FFprime_loc', 'p_prime_loc', 'Jpar'/), 5)
-    ! --- If loss of LCFS, abort profiles
-    if ( .not. ES%LCFS_is_lost ) then
-      call average(command_tmp, first_step==.true., ierr, result, .true.)
-      call clean_up()
-      call qprofile(command_tmp, first_step==.true., ierr, q_prof)
-    else 
-      if(allocated(result)) deallocate(result)
-      if(allocated(q_prof)) deallocate(q_prof)
-      allocate(result(n_grid, expr_list%n_expr))
-      allocate(q_prof(n_grid))
-      result = -1.d99;   q_prof = -1.d99;
-      write(*,*) '  profiles cannot be produced without closed flux surfaces'
-    endif
-    ! --- Correct first and last points
-    q_prof(1)      = q_prof(2)        + (q_prof(2)-q_prof(3))
-    q_prof(n_grid) = q_prof(n_grid-1) + (q_prof(n_grid-1)-q_prof(n_grid-2))
-
     ! --- Fill profiles
-    do i_exp=1, expr_list%n_expr
+    do i_exp=1, expr_avg_list%n_expr
 
       ! --- psi
-      if (expr_list%expr(i_exp)%name=='Psi') then
+      if (expr_avg_list%expr(i_exp)%name=='Psi') then
         allocate( equilibrium_ids%time_slice(i_slice)%profiles_1d%psi(n_grid) )
-        equilibrium_ids%time_slice(i_slice)%profiles_1d%psi(:)   = result(:,i_exp) * fact_psi
+        equilibrium_ids%time_slice(i_slice)%profiles_1d%psi(:)   = avg(:,i_exp) * fact_psi
       endif
 
       ! --- pressure
-      if (expr_list%expr(i_exp)%name=='pres') then
+      if (expr_avg_list%expr(i_exp)%name=='pres') then
         allocate( equilibrium_ids%time_slice(i_slice)%profiles_1d%pressure(n_grid) )
-        equilibrium_ids%time_slice(i_slice)%profiles_1d%pressure(:)   = result(:,i_exp) 
+        equilibrium_ids%time_slice(i_slice)%profiles_1d%pressure(:)   = avg(:,i_exp) 
       endif
 
       ! --- p'
-      if (expr_list%expr(i_exp)%name=='p_prime_loc') then
+      if (expr_avg_list%expr(i_exp)%name=='p_prime_loc') then
         allocate( equilibrium_ids%time_slice(i_slice)%profiles_1d%dpressure_dpsi(n_grid) )
-        equilibrium_ids%time_slice(i_slice)%profiles_1d%dpressure_dpsi(:)   = result(:,i_exp) / fact_psi
+        equilibrium_ids%time_slice(i_slice)%profiles_1d%dpressure_dpsi(:)   = avg(:,i_exp) / fact_psi
       endif
 
       ! --- FF'
-      if (expr_list%expr(i_exp)%name=='FFprime_loc') then
+      if (expr_avg_list%expr(i_exp)%name=='FFprime_loc') then
         allocate( equilibrium_ids%time_slice(i_slice)%profiles_1d%f_df_dpsi(n_grid) )
-        equilibrium_ids%time_slice(i_slice)%profiles_1d%f_df_dpsi(:) = result(:,i_exp) / fact_psi
+        equilibrium_ids%time_slice(i_slice)%profiles_1d%f_df_dpsi(:) = avg(:,i_exp) / fact_psi
       endif
 
       ! --- Parallel current
-      if (expr_list%expr(i_exp)%name=='Jpar') then
+      if (expr_avg_list%expr(i_exp)%name=='Jpar') then
         allocate( equilibrium_ids%time_slice(i_slice)%profiles_1d%j_parallel(n_grid) )
-        equilibrium_ids%time_slice(i_slice)%profiles_1d%j_parallel(:) = result(:,i_exp) 
+        equilibrium_ids%time_slice(i_slice)%profiles_1d%j_parallel(:) = avg(:,i_exp) 
       endif
 
     end do
     
     ! --- q-profile
     allocate( equilibrium_ids%time_slice(i_slice)%profiles_1d%q(n_grid) )
-    equilibrium_ids%time_slice(i_slice)%profiles_1d%q(:) = q_prof(:)
+    k = expr_avg_list%n_expr + 1
+    equilibrium_ids%time_slice(i_slice)%profiles_1d%q(:) = avg(:,k)
 
     ! --- Get rho_norm_tor from psi_N and q_profile
     allocate( equilibrium_ids%time_slice(i_slice)%profiles_1d%rho_tor_norm(n_grid) )
-    allocate(rho_tor(n_grid))
-    rho_tor(:) = 0.d0
-    do i_psi=2, n_grid
-      rho_tor(i_psi) = sum(q_prof(1:i_psi)) ! Assuming equidistant psi grid!!
-    end do
-    equilibrium_ids%time_slice(i_slice)%profiles_1d%rho_tor_norm(:) = sqrt( rho_tor(:)/rho_tor(n_grid) )
+    k = expr_avg_list%n_expr + 2
+    equilibrium_ids%time_slice(i_slice)%profiles_1d%rho_tor_norm(:) = sqrt( avg(:,k)/avg(n_grid,k) )
 
     ! --- Information about the toroidal field
     equilibrium_ids%vacuum_toroidal_field%r0 = R_geo
@@ -1615,6 +1637,7 @@ module mod_jorek2IMAS
     equilibrium_ids%time_slice(i_slice)%contour_tree%node(3)%psi = ES%Psi_xpoint(ixp2)
 
     ! --- Export separatrix
+    command_tmp%n_args = 0
     call separatrix(command_tmp, ierr, R_sep, Z_sep)
     allocate(equilibrium_ids%time_slice(i_slice)%boundary%outline%r(size(R_sep)))
     allocate(equilibrium_ids%time_slice(i_slice)%boundary%outline%z(size(R_sep)))

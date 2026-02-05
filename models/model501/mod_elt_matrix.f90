@@ -728,7 +728,7 @@ do ms=1, n_gauss
        case('Ar')
          m_i_over_m_imp = central_mass/40. ! Argon mass = 40 u
        case('Ne')
-         m_i_over_m_imp = central_mass/20. ! Neon mass = 20 u
+         m_i_over_m_imp = central_mass/20. * (2.d0/2.01455279245d0) !backwards compatibility ! Neon mass = 20 u
        case default
          write(*,*) '!! Gas type "', trim(imp_type(index_main_imp)), '" unknown (in mod_injection_source.f90) !!'
          write(*,*) '=> We assume the gas is D2.'

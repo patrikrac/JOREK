@@ -279,7 +279,7 @@ contains
        allocate( dat%Z0(nions), dat%Zi(nions), dat%mi(nions) )
        dat%Zi(2:nions) = atomnum_imp
        dat%Z0(2:nions) = (/ (i, i=0,atomnum_imp, 1) /)
-       dat%mi(2:nions) = MASS_PROTON * central_mass / dat%m_i_over_m_imp
+       dat%mi(2:nions) = ATOMIC_MASS_UNIT * central_mass / dat%m_i_over_m_imp
 
     else
        allocate( dat%Z0(1), dat%Zi(1), dat%mi(1) )
@@ -289,7 +289,7 @@ contains
 
 
     allocate( dat%Ii(1), dat%ai(1) )
-    dat%mi(1) = central_mass * MASS_PROTON
+    dat%mi(1) = central_mass * ATOMIC_MASS_UNIT
     dat%Zi(1) = 1
     dat%Z0(1) = 1
     dat%Ii(1) = 1.0

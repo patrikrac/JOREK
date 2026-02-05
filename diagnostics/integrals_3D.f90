@@ -405,7 +405,7 @@ do ife = ife_min, ife_max
 
         source_neutral       = max(0.,source_neutral)
 
-        local_n_particles_inj = local_n_particles_inj + 0.5d0 * central_density * 1.d20 * source_neutral * bigR * xjac * wst * delta_phi / sqrt(MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)
+        local_n_particles_inj = local_n_particles_inj + 0.5d0 * central_density * 1.d20 * source_neutral * bigR * xjac * wst * delta_phi / sqrt(MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)
         local_n_particles     = local_n_particles     + central_density * 1.d20 * rn0 * bigR * xjac * wst * delta_phi
 
 #endif
@@ -494,7 +494,7 @@ endif
 call MPI_AllReduce(varmin,varminout,n_var,MPI_DOUBLE_PRECISION,MPI_MIN,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(varmax,varmaxout,n_var,MPI_DOUBLE_PRECISION,MPI_MAX,MPI_COMM_WORLD,ierr)
 
-rho_norm = central_density*1.d20 * central_mass * 1.67d-27
+rho_norm = central_density*1.d20 * central_mass * ATOMIC_MASS_UNIT
 t_norm   = sqrt(MU_zero*rho_norm)
 
 current_in  = n_period * current_in  / MU_zero / (2.d0 * PI)

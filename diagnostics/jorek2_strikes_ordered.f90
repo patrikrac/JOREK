@@ -129,7 +129,7 @@ endif
 
 call initialise_basis                                       ! define the basis functions at the Gaussian points
 
-rho_norm = central_density*1.d20 * central_mass * 1.67d-27
+rho_norm = central_density*1.d20 * central_mass * ATOMIC_MASS_UNIT
 t_norm   = sqrt(MU_zero*rho_norm)
 
 if (my_id .eq. 0 ) then

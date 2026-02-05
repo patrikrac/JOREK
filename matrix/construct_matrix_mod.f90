@@ -11,7 +11,7 @@ contains
   !> subroutine that will construct elementary matrices
   subroutine elementary_matrix_build(element, nodes, xpoint2, xcase2, R_axis,         &
        &                             Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint,   &
-       &                             omp_tid, ife, n_local_elms, node_list, i_tor_min, i_tor_max, &
+       &                             omp_tid, ife, ielm, n_local_elms, node_list, i_tor_min, i_tor_max, &
                                      aux_nodes)
 
     ! --- Modules
@@ -36,6 +36,7 @@ contains
     real*8,                           intent(in)     :: Z_xpoint(2)
     integer,                          intent(in)     :: omp_tid
     integer,                          intent(in)     :: ife
+    integer,                          intent(in)     :: ielm
     integer,                          intent(in)     :: n_local_elms
     integer,                          intent(in)     :: i_tor_min   
     integer,                          intent(in)     :: i_tor_max   
@@ -161,9 +162,15 @@ contains
           
 
         ! --- Build matrix elements for boundary
+#if JOREK_MODEL == 183
         call boundary_matrix_open(vertex, direction, element, nodes, & 
                                   xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint, &
+                                  thread_struct(omp_tid)%ELM, thread_struct(omp_tid)%RHS, i_tor_min, i_tor_max, ielm)
+#else
+        call boundary_matrix_open(vertex, direction, element, nodes, &
+                                  xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint, &
                                   thread_struct(omp_tid)%ELM, thread_struct(omp_tid)%RHS, i_tor_min, i_tor_max)
+#endif
        
       enddo
     endif
@@ -518,11 +525,11 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     endif
 
     call elementary_matrix_build(element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis,        &
-      psi_bnd, R_xpoint, Z_xpoint, omp_tid, ife, n_local_elms, node_list, a_mat%i_tor_min, a_mat%i_tor_max, aux_nodes)
+      psi_bnd, R_xpoint, Z_xpoint, omp_tid, ife, ielm, n_local_elms, node_list, a_mat%i_tor_min, a_mat%i_tor_max, aux_nodes)
 
     ! Transform basis functions for the axis nodes. mhd_sim% will solve for new degrees of freedom at the axis.
     if(treat_axis .and. (nodes(1)%axis_node .or. nodes(2)%axis_node .or. nodes(3)%axis_node .or. nodes(4)%axis_node) ) then
-      call transform_basis_for_axis_element(nodes, thread_struct(omp_tid)%ELM, thread_struct(omp_tid)%RHS, i_v, n_var, i_harm, n_tor_local)
+      call transform_basis_for_axis_element(nodes, ielm, thread_struct(omp_tid)%ELM, thread_struct(omp_tid)%RHS, i_v, n_var, i_harm, n_tor_local)
     endif
 
 #ifdef PRINT_ELM_RHS

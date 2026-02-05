@@ -1,6 +1,6 @@
 module mod_particle_loop
 use phys_module
-use constants,   only: MU_ZERO, MASS_PROTON
+use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT
 use mpi
 use particle_tracer
 !$ use omp_lib
@@ -61,7 +61,7 @@ integer   :: n_particles,n_reflect,ifail
 if (use_ccs .and. use_pcs) write(*,*) 'ERROR: pcs and ccs should not be used simultaneously'
 
 n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
 t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
 v_norm   = 1.d0 / t_norm                                        ! V_SI   = v_norm * v_jorek
 E_norm   = 1.5d0 / MU_ZERO                                      ! E_SI   = E_norm * E_jorek
@@ -298,7 +298,7 @@ end if
              if (use_pcs) then
                 do i_tor=1,n_tor
                    feedback_rhs(m,l,i_elm,i_tor,4) = feedback_rhs(m,l,i_elm,i_tor,4) &
-                          + HZ(i_tor) * v * dot_product(particle_tmp%v,particle_tmp%v) * sim%groups(1)%mass * mass_proton * particle_tmp%weight * mu_zero / 3.d0
+                          + HZ(i_tor) * v * dot_product(particle_tmp%v,particle_tmp%v) * sim%groups(1)%mass * atomic_mass_unit * particle_tmp%weight * mu_zero / 3.d0
 
                    feedback_rhs(m,l,i_elm,i_tor,5) = feedback_rhs(m,l,i_elm,i_tor,5) &
                           + HZ(i_tor) * v * el_chg * particle_tmp%q * particle_tmp%weight * particle_tmp%v(3) * mu_zero

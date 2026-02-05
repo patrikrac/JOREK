@@ -55,7 +55,7 @@ subroutine initialise_and_broadcast_parameters(my_id, filename)
   ! -----------------------------------
   ! -- Set projection solver if not defined by user --
   if ((.not.use_mumps_prj).and.(.not.use_pastix_prj).and.(.not.use_strumpack_prj)) then
-    write(*,*) 'WARNING: No projection solver defined. Using fluid solver by default.'
+    if (my_id .eq. 0) write(*,*) 'WARNING: No projection solver defined. Using fluid solver by default.'
     use_mumps_prj     = use_mumps
     use_pastix_prj    = use_pastix
     use_strumpack_prj = use_strumpack

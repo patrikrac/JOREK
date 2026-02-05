@@ -93,65 +93,9 @@ enddo
 
 checked_elms = size(i_elms)
 
-allocate(neighbours(element_list%n_elements))
-
-allocate(queue(element_list%n_elements), visited(element_list%n_elements))
-
-! Initialize visited array and queue
-visited = .false.
-queue = 0
-queue_head = 1
-queue_tail = 1
-
-! Add initial elements to the queue and mark as visited
-do k = 1, size(i_elms)
-    if (.not. visited(i_elms(k))) then
-        visited(i_elms(k)) = .true.
-        queue(queue_tail) = i_elms(k)
-        queue_tail = queue_tail + 1
-    endif
-enddo
-
-! Start the Breadth-First Search
-search_loop: do while (queue_head < queue_tail)
-  ! Get the current element from the front of the queue
-  k = queue(queue_head)
-  queue_head = queue_head + 1
-
-  ! Check all neighbors of the current element
-  do nb = 1, size(element_list%element(k)%neighbours)
-    i_neighbour = element_list%element(k)%neighbours(nb)
-
-    ! If neighbor is valid and not visited yet
-    if (i_neighbour > 0) then
-      if (.not. visited(i_neighbour)) then
-        
-        ! Mark as visited and add to the back of the queue
-        visited(i_neighbour) = .true.
-        queue(queue_tail) = i_neighbour
-        queue_tail = queue_tail + 1
-
-        checked_elms = checked_elms + 1
-        
-        ! Now, try to find the point in this new neighbor element
-        call find_RZ_single(node_list,element_list,i_neighbour,R_find,Z_find,phi_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
-        
-        ! If found, exit everything
-        if (ifail == 0) then
-          deallocate(queue, visited)
-          exit search_loop
-        end if
-      end if
-    end if
-  end do
-end do search_loop
-
-if (allocated(queue)) deallocate(queue, visited)
-
 if (ielm_out .eq. 0) ifail = 99
-if (ifail .eq. 999) ielm_out = 0 ! Otherwise testing ielm=0 on output does not
-! work anymore (and we don't always check ifail)
-
+if (ifail .eq. 999) ielm_out = 0 ! Otherwise testing ielm=0 on output does not work anymore (and we don't always check ifail)
+return
 end subroutine find_RZ_general
 
 subroutine find_RZ_single(node_list,element_list,i_elm,R_find,Z_find,phi_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
@@ -164,7 +108,6 @@ subroutine find_RZ_single(node_list,element_list,i_elm,R_find,Z_find,phi_find,R_
 !-------------------------------------------------------------------------
 use data_structure
 use mod_interp, only: interp_RZP
-use constants, only: pi
 implicit none
 
 type (type_node_list), intent(in)    :: node_list
@@ -179,7 +122,7 @@ integer, intent(out)   :: ifail
 integer :: i, ntrial, istart
 real*8  :: RRg1,dRRg1_dr,dRRg1_ds
 real*8  :: ZZg1,dZZg1_dr,dZZg1_ds
-real*8  :: tolx, tolf, errx, errf, temp, dis, dummy
+real*8  :: tolx, tolf, errx, errf, temp, dis, dummy, dummy2
 real*8  :: x(2), FVEC(2), FJAC(2,2), p(2)
 
 ntrial = 20
@@ -210,8 +153,7 @@ do istart = 1,5
   ifail = 999
 
   do i=1,ntrial
-    call interp_RZP(node_list,element_list,i_elm,x(1),x(2),phi_find,RRg1,dRRg1_dr,dRRg1_ds,dummy,dummy,dummy,dummy,dummy,dummy,dummy, &
-                                                               ZZg1,dZZg1_dr,dZZg1_ds,dummy,dummy,dummy,dummy,dummy,dummy,dummy)
+    call interp_RZP (node_list,element_list,i_elm,x(1),x(2),phi_find,RRg1,dRRg1_dr,dRRg1_ds,dummy,ZZg1,dZZg1_dr,dZZg1_ds,dummy2)
 
     FVEC(1)   = RRg1 - R_find
     FVEC(2)   = ZZg1 - Z_find

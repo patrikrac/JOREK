@@ -134,6 +134,9 @@ subroutine setup_solvers(this, sim)
     endif
   endif
 
+  ! --- flag that this is a particle simulation
+  use_particles = .true.
+  
   ! --- Initialize the vacuum part.
   call vacuum_init(sim%my_id, freeboundary_equil, freeboundary, resistive_wall)
 

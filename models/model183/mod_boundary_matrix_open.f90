@@ -2,7 +2,7 @@ module mod_boundary_matrix_open
   implicit none
 contains
 subroutine boundary_matrix_open(vertex, direction, element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis, &
-                                psi_bnd, R_xpoint, Z_xpoint, ELM, RHS, i_tor_min, i_tor_max)
+                                psi_bnd, R_xpoint, Z_xpoint, ELM, RHS, i_tor_min, i_tor_max, ielm)
 !--------------------------------------------------------------------------------------------------------------------
 ! implements a boundary condition for zj, which allows the values of zj on the boundary to change during a simulation
 !--------------------------------------------------------------------------------------------------------------------
@@ -20,8 +20,7 @@ type(type_node)      :: nodes(2)        ! the two nodes containing the boundary 
 
 real*8, dimension(:,:), allocatable :: ELM
 real*8, dimension(:),   allocatable :: RHS
-integer,                intent(in)  :: i_tor_min
-integer,                intent(in)  :: i_tor_max
+integer,                intent(in)  :: i_tor_min, i_tor_max, ielm
 
 integer :: vertex(2), direction(2), xcase2
 real*8  :: psi_axis, R_axis, Z_axis, psi_bnd, R_xpoint(2), Z_xpoint(2)
@@ -43,11 +42,6 @@ real*8, dimension(n_vertex_max,n_order+1,n_gauss) :: H1_full, H1_s_full, H1_t_fu
 real*8, dimension(0:n_order-1,0:n_order-1,0:n_order-1) :: chi
 
 type(type_node) :: nodes2(2), tmp_node
-
-#ifndef USE_DOMM
-  write(*,*) 'boundary_matrix_open requires USE_DOMM=1 for model 183'
-  stop
-#endif
 
 theta = time_evol_theta
 !zeta  = time_evol_zeta
@@ -190,7 +184,7 @@ do ms=1,n_gauss
   do mp=1,n_plane
     BigR = x_g(mp,ms)
     phi = 2.d0*pi*float(mp-1)/float(n_plane*n_period)
-    chi = get_chi_domm(x_g(mp,ms),y_g(mp,ms),phi)
+    chi = get_chi(x_g(mp,ms),y_g(mp,ms),phi,node_list,element_list,ielm,1.d0,xgauss(ms))
     grad_chi = (/ chi(1,0,0), chi(0,1,0), chi(0,0,1)/BigR /)
     Bv2 = dot_product(grad_chi,grad_chi)
     grad_Bv2 = 2.d0*(/ chi(1,0,0)*chi(2,0,0) + chi(0,1,0)*chi(1,1,0) + chi(0,0,1)*chi(1,0,1)/BigR**2 - chi(0,0,1)**2/BigR**3, &

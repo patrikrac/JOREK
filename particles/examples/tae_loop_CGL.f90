@@ -21,7 +21,7 @@ program tae_loop_CGL
   use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, filter_hyper_n0, filter_par_n0
   use phys_module, only: n_mode_families
 
-  use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
+  use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 
   use mod_particle_sputtering, only: particle_sputter, sample_fluid_particle_energy
   use mod_projection_functions, only: proj_f_combined_density, &
@@ -84,7 +84,7 @@ program tae_loop_CGL
   call update_equil_state(sim%my_id,sim%fields%node_list, sim%fields%element_list, bnd_elm_list, xpoint, xcase)
 
   n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-  rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+  rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
   t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
 
   tstep_si  = tstep * t_norm
@@ -266,7 +266,7 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, timesteps, n_st
 !$ w0 = omp_get_wtime()
 
   n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-  rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+  rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
   t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
   v_norm   = 1.d0 / t_norm                                        ! V_SI   = v_norm * v_jorek
   E_norm   = 1.5d0 / MU_ZERO                                      ! E_SI   = E_norm * E_jorek
@@ -352,32 +352,32 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, timesteps, n_st
 
                     feedback_rhs(m,l,i_elm,i_tor,1) = feedback_rhs(m,l,i_elm,i_tor,1) &
 
-                                                      + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                      + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
 
                                                        * (p_perp+b_norm_r**2*p_atrop) * mu_zero !Pi_RR
                     feedback_rhs(m,l,i_elm,i_tor,2) = feedback_rhs(m,l,i_elm,i_tor,2) &
 
-                                                       + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                       + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
 
                                                        * ( p_perp+b_norm_z**2*p_atrop ) * mu_zero                       !Pi_ZZ
                     feedback_rhs(m,l,i_elm,i_tor,3) = feedback_rhs(m,l,i_elm,i_tor,3) &
 
-                                                     + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                     + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
 
                                                        * (p_perp+b_norm_phi**2*p_atrop) * mu_zero !Pi_phiphi
                     feedback_rhs(m,l,i_elm,i_tor,4) = feedback_rhs(m,l,i_elm,i_tor,4) &
 
-                                                      + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                      + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
 
                                                       * ( b_norm_r*b_norm_z*p_atrop ) * mu_zero                            !Pi_RZ
                     feedback_rhs(m,l,i_elm,i_tor,5) = feedback_rhs(m,l,i_elm,i_tor,5) &
 
-                                                      + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                      + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
 
                                                        * (b_norm_r*b_norm_phi*p_atrop ) * mu_zero !Pi_Rphi
                     feedback_rhs(m,l,i_elm,i_tor,6) = feedback_rhs(m,l,i_elm,i_tor,6) &
 
-                                                       + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                       + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
 
                                                        *(b_norm_z*b_norm_phi*p_atrop ) * mu_zero   !Pi_Zphi
 

@@ -227,7 +227,7 @@ Z_geo = boundary_line[3]
 
 # Constants
 mu0      = 12.566370614359e-7
-m_proton = 1.67262192e-27
+AMU      = 1.660539040e-27
 e_ch     = 1.6021766e-19
 
 # Read 0D parameters
@@ -289,7 +289,7 @@ for ion in ions:
     if (len(ion.density)<1):
        continue
     n_tot   += ion.density
-    rho_tot += ion.density*ion.element[0].a * m_proton
+    rho_tot += ion.density*ion.element[0].a * AMU
 
 psi_norm    = (psi_1d      - psi_axis) / (psi_boundary - psi_axis)
 psi_norm2   = (psi_1d_core - psi_axis) / (psi_boundary - psi_axis)
@@ -316,8 +316,8 @@ psi_bnd = griddata((Ra, Za), pa, (R_bnd, Z_bnd))
 
 n0              = n_tot[0]
 central_density = n0*1e-20
-central_mass    = rho_tot[0] / (n0 * m_proton)
-rho0            = central_mass * m_proton * central_density * 1e20 
+central_mass    = rho_tot[0] / (n0 * AMU)
+rho0            = central_mass * AMU * central_density * 1e20 
 rho_unit        = rho_tot / rho_tot[0]
 
 # Extend profiles into the SOL
@@ -445,7 +445,7 @@ namelist.write("  D_perp(3) = 0.d0"+"\n")
 namelist.write("  D_perp(4) = 0.01d0"+"\n")
 namelist.write("  D_perp(5) = 1.d4"+"\n")
 namelist.write("\n")
-fact_norm_kappa = np.sqrt(mu0/rho0) * (5.0/3.0-1.0) * central_mass * m_proton 
+fact_norm_kappa = np.sqrt(mu0/rho0) * (5.0/3.0-1.0) * central_mass * AMU 
 Kappa_par_JU    = kappa_par_Spitzer(Te_ids[0]) * fact_norm_kappa
 namelist.write("  ZKpar_T_dependent = .t. "+"\n")
 namelist.write("  ZK_par            = %18.9e    !!! Spitzer value in the core \n"%(Kappa_par_JU))

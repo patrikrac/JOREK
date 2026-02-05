@@ -1552,7 +1552,7 @@ subroutine set_particle_weights_canonical_maxwellian(particles, node_list, eleme
   real*8               :: R, R_s, R_t, Z, Z_s, Z_t
   real*8               :: my_alpha
 
-  t_norm = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20)
+  t_norm = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20)
 
   if (present(alpha)) then
     my_alpha = alpha
@@ -1870,7 +1870,7 @@ subroutine set_velocity_from_T(particles, mass, node_list, element_list, cor, v_
   real*8 :: DUMMY_REAL, t_norm
   real*8, allocatable :: Z_coronal(:)
 
-  t_norm = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20)
+  t_norm = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20)
 
 ! Calculate a single random seed and communicate it over MPI
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ifail)

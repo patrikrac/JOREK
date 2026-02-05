@@ -25,7 +25,7 @@ use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, fi
 use phys_module, only: xtime, mode
 ! use phys_module, only: use_kn_sputtering , use_kn_cx, use_kn_ionisation, use_kn_sputtering
 
-use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
+use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 
 use mod_particle_sputtering, only: particle_sputter, sample_fluid_particle_energy
 use mod_projection_functions, only: proj_f_combined_density, &
@@ -202,7 +202,7 @@ use_coll          = .false.
  ! if (deuterium_adas .and. use_kn_recombination) ad_deuterium =  read_adf11('96_h') !< move to core (jorek2_main for particles)
  
 n_norm    = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-rho_norm  = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+rho_norm  = CENTRAL_MASS * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
 t_norm    = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek 
  
 ! Setting up edge_elements and amount of sputtered super particles per event
@@ -522,7 +522,7 @@ real*8,allocatable :: feedback_rhs(:,:,:,:,:)
 !$ w0 = omp_get_wtime()
 
 n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+rho_norm = CENTRAL_MASS * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
 t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
 v_norm   = 1.d0 / t_norm                                        ! V_SI   = v_norm * v_jorek
 E_norm   = 1.5d0 / MU_ZERO                                      ! E_SI   = E_norm * E_jorek

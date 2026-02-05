@@ -53,8 +53,10 @@ module mod_gmres
     call r3_info_begin (r3_info_index_0, 'gmres_driver')  ! timing
     call clck_time(t0)
     call init_dgmres(icntl,cntl)
-    
-
+ 
+    if (my_id .ne. 0) then 
+      icntl(2) = 0            ! disable warning
+    endif
     icntl(3) = 0            ! output unit
     if (my_id.eq.0) icntl(3) = 6
     icntl(7) = iter_gmres   ! Maximum number of iterations

@@ -5010,10 +5010,10 @@ subroutine construct_imp_charge_states()
      m_i_over_m_imp = central_mass/2.
      m_imp          = 2.
   case('Ar')
-     m_i_over_m_imp = central_mass/40.  
+     m_i_over_m_imp = central_mass/40. * (2.d0/2.01455279245d0) !backwards compatibility  
      m_imp          = 40.
   case('Ne')
-     m_i_over_m_imp = central_mass/20. 
+     m_i_over_m_imp = central_mass/20. * (2.d0/2.01455279245d0) !backwards compatibility
      m_imp          = 20.
   case default
      write(*,*) '!! Gas type "', trim(imp_type(index_main_imp)), '" unknown (in inj_source.f90) !!'
@@ -5189,21 +5189,21 @@ subroutine construct_thermalization_terms()
        lambda_e_bg  = 24. - log((ne_SI*1.d-6)**0.5*Te_corr_eV**(-1.0))
     endif
 
-    nu_e_imp = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*m_imp) ** 0.5                    &
+    nu_e_imp = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*m_imp) ** 0.5                    &
          * Z_eff_imp * (1.d14*central_density*rimp0_corr*m_i_over_m_imp) * lambda_e_imp &
-         / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*m_imp)                    &
+         / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*m_imp)                    &
          / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5
 
-    nu_e_bg  = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5             &
+    nu_e_bg  = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5             &
          * (1.d14*central_density*(r0_corr-rimp0_corr)) * lambda_e_bg                   &
-         / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass)             &
+         / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass)             &
          / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
 
     if (nu_e_imp < 0.) nu_e_imp = 0.
     if (nu_e_bg < 0.)  nu_e_bg  = 0.
 
     ! Converting the energy transfer rate from s^-1 to JOREK unit
-    t_norm   = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20)
+    t_norm   = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20)
     nu_e_imp = nu_e_imp * t_norm
     nu_e_bg  = nu_e_bg * t_norm
 
@@ -5211,32 +5211,32 @@ subroutine construct_thermalization_terms()
 
     ! Calculating the density and temperature derivative for amats
     ! We negelect the Coulomb log's derivatives due to their smallness
-    dnu_e_imp_dTi   = -1.5*MASS_ELECTRON*nu_e_imp*dTi0_corr_dT/(MASS_ELECTRON*Ti0_corr+MASS_PROTON*m_imp*Te0_corr)
-    dnu_e_imp_dTe   = -1.5*MASS_PROTON*m_imp*nu_e_imp*dTe0_corr_dT/(MASS_ELECTRON*Ti0_corr+MASS_PROTON*m_imp*Te0_corr) &
+    dnu_e_imp_dTi   = -1.5*MASS_ELECTRON*nu_e_imp*dTi0_corr_dT/(MASS_ELECTRON*Ti0_corr+ATOMIC_MASS_UNIT*m_imp*Te0_corr)
+    dnu_e_imp_dTe   = -1.5*ATOMIC_MASS_UNIT*m_imp*nu_e_imp*dTe0_corr_dT/(MASS_ELECTRON*Ti0_corr+ATOMIC_MASS_UNIT*m_imp*Te0_corr) &
                       + nu_e_imp*dZ_eff_imp_dT/max(Z_eff_imp,1d-8)
 
-    dnu_e_imp_drhoimp = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*m_imp)**0.5                          &
+    dnu_e_imp_drhoimp = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*m_imp)**0.5                          &
                         * Z_eff_imp*1.d14*central_density*drimp0_corr_dn*m_i_over_m_imp*lambda_e_imp &
-                        / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*m_imp)                  &
+                        / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*m_imp)                  &
                         / (EL_CHG*MU_ZERO*central_density*1.d20))**1.5
     dnu_e_imp_drho    = 0.
     dnu_e_imp_drhoimp = dnu_e_imp_drhoimp * t_norm
     dnu_e_imp_drho    = dnu_e_imp_drho * t_norm
 
-    dnu_e_bg_dTi = -1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT/(MASS_ELECTRON*Ti0_corr+MASS_PROTON*central_mass*Te0_corr)
-    dnu_e_bg_dTe = -1.5*MASS_PROTON*central_mass*nu_e_bg*dTe0_corr_dT/(MASS_ELECTRON*Ti0_corr+MASS_PROTON*central_mass*Te0_corr)
+    dnu_e_bg_dTi = -1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT/(MASS_ELECTRON*Ti0_corr+ATOMIC_MASS_UNIT*central_mass*Te0_corr)
+    dnu_e_bg_dTe = -1.5*ATOMIC_MASS_UNIT*central_mass*nu_e_bg*dTe0_corr_dT/(MASS_ELECTRON*Ti0_corr+ATOMIC_MASS_UNIT*central_mass*Te0_corr)
 
     if (r0_corr-rimp0_corr <= 0.) then
        dnu_e_bg_drhoimp = 0.
        dnu_e_bg_drho    = 0.
     else
-       dnu_e_bg_drhoimp = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5       &
+       dnu_e_bg_drhoimp = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5       &
                           * (1.d14*central_density*(-drimp0_corr_dn)) * lambda_e_bg          &
-                          / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass) &
+                          / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass) &
                           / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
-       dnu_e_bg_drho    = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5       &
+       dnu_e_bg_drho    = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5       &
                           * (1.d14*central_density*(dr0_corr_dn)) * lambda_e_bg              &
-                          / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass) &
+                          / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass) &
                           / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
        dnu_e_bg_drhoimp = dnu_e_bg_drhoimp * t_norm
        dnu_e_bg_drho    = dnu_e_bg_drho * t_norm
@@ -5272,15 +5272,15 @@ subroutine construct_thermalization_terms()
      dTe_corr_eV_dT = dTe0_corr_dT/(EL_CHG*MU_ZERO*central_density*1.d20)
 
      lambda_e_bg  = 23. - log((ne_SI*1.d-6)**0.5*Te_corr_eV**(-1.5)) ! Assuming bg_charge is 1! 
-     nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5       &
+     nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5       &
                     * (1.d14*central_density*r0_corr) * lambda_e_bg                    &
-                    / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass) &
+                    / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass) &
                     / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5
 
      if (nu_e_bg < 0.)  nu_e_bg  = 0.
 
      ! Converting the energy transfer rate from s^-1 to JOREK unit
-     t_norm   = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20)
+     t_norm   = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20)
      nu_e_bg  = nu_e_bg * t_norm    
 
      dTe_i    = nu_e_bg * (Ti0_corr - Te0_corr)
@@ -5289,9 +5289,9 @@ subroutine construct_thermalization_terms()
      ! Calculating the density and temperature derivative for amats
      ! We negelect the Coulomb log's derivatives due to their smallness
 
-     dnu_e_bg_dTi    = -1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + MASS_PROTON*central_mass*Te0_corr)
-     dnu_e_bg_dTe    = -1.5*MASS_PROTON*central_mass*nu_e_bg*dTe0_corr_dT &
-                       / (MASS_ELECTRON*Ti0_corr + MASS_PROTON*central_mass*Te0_corr)
+     dnu_e_bg_dTi    = -1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*central_mass*Te0_corr)
+     dnu_e_bg_dTe    = -1.5*ATOMIC_MASS_UNIT*central_mass*nu_e_bg*dTe0_corr_dT &
+                       / (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*central_mass*Te0_corr)
 
      dnu_e_bg_drho   = nu_e_bg * dr0_corr_dn / r0_corr
 
@@ -5452,10 +5452,10 @@ subroutine construct_radiation_parameters()
       Brad_bg = 20.
       Crad_bg = 0.8
     
-      frad_bg     = (2./3.)*(1./(central_mass*MASS_PROTON))*((MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)**(1.5d0))            &
+      frad_bg     = (2./3.)*(1./(central_mass*ATOMIC_MASS_UNIT))*((MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**(1.5d0))            &
                     *nimp_bg(1)*Arad_bg*exp(-((log(Te_corr_eV)-log(Brad_bg))**2.)/Crad_bg**2.)
     
-      dfrad_bg_dT = -(1./3.)*((MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)**(0.5d0))*(1./EL_CHG)                               &
+      dfrad_bg_dT = -(1./3.)*((MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**(0.5d0))*(1./EL_CHG)                               &
                     *2.*(nimp_bg(1)*Arad_bg/Crad_bg**2.)*(log(Te_corr_eV)-log(Brad_bg))*(1./Te_corr_eV)*exp(-((log(Te_corr_eV)-log(Brad_bg))**2.)/Crad_bg**2.)
     else
       write(*,*) "WARNING: hard-coded fitting doesn't exist for  ", trim(imp_type(1)), ", use open adas instead!"

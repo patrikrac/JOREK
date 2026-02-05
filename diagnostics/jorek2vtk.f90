@@ -118,8 +118,8 @@ real*8                :: r0_real8, rn0_real8, lnA
 real*8                :: T0_corr, r0_corr, rn0_corr, ne_JOREK, T_or_Te, T_or_Te_corr, T_or_Te_0 
 integer               :: i_imp, offset_bgimp, i_bg     ! Loop for more than one background impurity
 integer               :: i_proj
-integer               :: i_psin, i_test, iimp(6), i_ne, ineu(7), ibg_tot, i_pellet(2), i_flux(8), i_neo(10), i_boot(2), i_gvec, i_vac(3), i_saw
-integer               :: i_full(11), i_vec_B, i_vec_V, i_vec_E, i_vec_Jpol, i_vec_gvec(2), i_vec_vac(2)
+integer               :: i_psin, i_test, iimp(6), i_ne, ineu(7), ibg_tot, i_pellet(2), i_flux(8), i_neo(10), i_boot(2), i_gvec(3), i_vac(3), i_saw
+integer               :: i_full(11), i_vec_B, i_vec_V, i_vec_E, i_vec_Jpol, i_vec_gvec(3), i_vec_vac(2)
 integer, allocatable  :: iibg(:), iproj(:)
 character*36          :: imp_label, proj_label
 
@@ -361,7 +361,9 @@ if (include_psi_norm) then
 endif
 
 if (include_gvec_field) then
-  call add_vtk_entry('pressure    ', 'pressure    ',   i_gvec, n_scalars, si_units, scalar_names)
+  call add_vtk_entry('pressure    ', 'pressure    ',   i_gvec(1), n_scalars, si_units, scalar_names)
+  call add_vtk_entry('Div_B_gvec  ', 'Div_B_gvec  ',   i_gvec(2), n_scalars, si_units, scalar_names)
+  call add_vtk_entry('zj_gvec     ', 'zj_gvec     ',   i_gvec(3), n_scalars, si_units, scalar_names)
 endif
 
 if (include_vacuum_field) then
@@ -459,6 +461,7 @@ endif
 if (include_gvec_field) then
   call add_vtk_entry('B_gvec      ', 'B_gvec      ', i_vec_gvec(1), n_vectors, si_units, vector_names)
   call add_vtk_entry('J_gvec      ', 'J_gvec      ', i_vec_gvec(2), n_vectors, si_units, vector_names)
+  call add_vtk_entry('J_gvec_JOR  ', 'J_gvec_JOR  ', i_vec_gvec(3), n_vectors, si_units, vector_names)
 endif
 
 if (include_vacuum_field) then
@@ -1186,17 +1189,33 @@ do i=1,element_list%n_elements
 
         if (include_gvec_field) then
           call interp_gvec(node_list,element_list,i,3,1,i_tor,s,t,BRg,BRg_s,BRg_t,BRg_st,BRg_ss,BRg_tt)
-          scalars(inode,i_gvec) = BRg
-          do i_tor=1, n_coord_tor
-            call interp_gvec(node_list,element_list,i,1,1,i_tor,s,t,BRg,BRg_s,BRg_t,BRg_st,BRg_ss,BRg_tt)
-            call interp_gvec(node_list,element_list,i,1,2,i_tor,s,t,BZg,BZg_s,BZg_t,BZg_st,BZg_ss,BZg_tt)
-            call interp_gvec(node_list,element_list,i,1,3,i_tor,s,t,Bpg,Bpg_s,Bpg_t,Bpg_st,Bpg_ss,Bpg_tt)
-            vectors(inode,:,i_vec_gvec(1)) =  vectors(inode,:,i_vec_gvec(1)) + (/ BRg, BZg, BPg /) * HZ_coord(i_tor, i_plane)          
+          scalars(inode,i_gvec(1)) = BRg
+          do i_tor_coord=1, n_coord_tor
+            call interp_gvec(node_list,element_list,i,1,1,i_tor_coord,s,t,BRg,BRg_s,BRg_t,BRg_st,BRg_ss,BRg_tt)
+            call interp_gvec(node_list,element_list,i,1,2,i_tor_coord,s,t,BZg,BZg_s,BZg_t,BZg_st,BZg_ss,BZg_tt)
+            call interp_gvec(node_list,element_list,i,1,3,i_tor_coord,s,t,Bpg,Bpg_s,Bpg_t,Bpg_st,Bpg_ss,Bpg_tt)
+            vectors(inode,:,i_vec_gvec(1)) =  vectors(inode,:,i_vec_gvec(1)) + (/ BRg, BZg, BPg /) * HZ_coord(i_tor_coord, i_plane)          
+            BR_R  = (   Z_t * BRg_s - Z_s * BRg_t )     / xjac * HZ_coord(i_tor_coord,i_plane)
+            BR_Z  = ( - R_t * BRg_s + R_s * BRg_t )     / xjac * HZ_coord(i_tor_coord,i_plane)
+            BR_p  = BRg * HZ_coord_p(i_tor_coord, i_plane) - BR_R * R_phi - Z_p * BR_Z
+            BZ_R  = (   Z_t * BZg_s - Z_s * BZg_t )     / xjac * HZ_coord(i_tor_coord,i_plane)
+            BZ_Z  = ( - R_t * BZg_s + R_s * BZg_t )     / xjac * HZ_coord(i_tor_coord,i_plane)
+            BZ_p  = BZg * HZ_coord_p(i_tor_coord, i_plane) - BZ_R * R_phi - Z_p * BZ_Z
+            BP_R  = (   Z_t * BPg_s - Z_s * BPg_t )     / xjac * HZ_coord(i_tor_coord,i_plane)
+            BP_Z  = ( - R_t * BPg_s + R_s * BPg_t )     / xjac * HZ_coord(i_tor_coord,i_plane)
+            BP_p  = BPg * HZ_coord_p(i_tor_coord, i_plane) - BP_R * R_phi - Z_p * BP_Z
+            scalars(inode,i_gvec(2)) = scalars(inode, i_gvec(2)) + BRg * HZ_coord(i_tor_coord, i_plane) / BigR + BR_R + BZ_Z + BP_p / BigR  
             
-            call interp_gvec(node_list,element_list,i,2,1,i_tor,s,t,JRg,JRg_s,JRg_t,JRg_st,JRg_ss,JRg_tt)
-            call interp_gvec(node_list,element_list,i,2,2,i_tor,s,t,JZg,JZg_s,JZg_t,JZg_st,JZg_ss,JZg_tt)
-            call interp_gvec(node_list,element_list,i,2,3,i_tor,s,t,Jpg,Jpg_s,Jpg_t,Jpg_st,Jpg_ss,Jpg_tt)
-            vectors(inode,:,i_vec_gvec(2)) =  vectors(inode,:,i_vec_gvec(2)) + (/ JRg, JZg, JPg /) * HZ_coord(i_tor, i_plane)         
+            JRg = 1 / BigR * BZ_p - BP_Z
+            JZg = 1 / BigR * (BPg + BigR * BP_R - BR_p)
+            JPg = BR_Z - BZ_R
+            scalars(inode, i_gvec(3)) = scalars(inode, i_gvec(3)) + F0 / (chi(1,0,0)**2 + chi(0,1,0)**2 + chi(0,0,1)**2/BigR**2) * (chi(1,0,0) * JRg + chi(0,1,0) * JZg + chi(0,0,1)/BigR * JPg)
+            vectors(inode,:,i_vec_gvec(3)) =  vectors(inode,:,i_vec_gvec(3)) + (/ JRg, JZg, JPg /)         
+
+            call interp_gvec(node_list,element_list,i,2,1,i_tor_coord,s,t,JRg,JRg_s,JRg_t,JRg_st,JRg_ss,JRg_tt)
+            call interp_gvec(node_list,element_list,i,2,2,i_tor_coord,s,t,JZg,JZg_s,JZg_t,JZg_st,JZg_ss,JZg_tt)
+            call interp_gvec(node_list,element_list,i,2,3,i_tor_coord,s,t,Jpg,Jpg_s,Jpg_t,Jpg_st,Jpg_ss,Jpg_tt)
+            vectors(inode,:,i_vec_gvec(2)) =  vectors(inode,:,i_vec_gvec(2)) + (/ JRg, JZg, JPg /) * HZ_coord(i_tor_coord, i_plane)         
           enddo
         end if
 
@@ -1392,7 +1411,7 @@ enddo  ! n_elements
 #if (defined WITH_Neutrals) 
       coef_ion_3 = 27.2d0*EL_CHG*MU_ZERO*central_density*1.d20
       coef_ion_2 = 0.232d0
-      coef_ion_1 = (MU_ZERO*central_mass*MASS_PROTON)**(0.5d0)*0.2917d-13*(central_density*1.d20)**(1.5d0)
+      coef_ion_1 = (MU_ZERO*central_mass*ATOMIC_MASS_UNIT)**(0.5d0)*0.2917d-13*(central_density*1.d20)**(1.5d0)
       S_ion_puiss = 3.9d-1
 
       ksi_ion_norm = ksi_ion * central_density * 1.d20
@@ -1446,8 +1465,8 @@ enddo  ! n_elements
           Arad_bg = 2.4d-31
           Brad_bg = 20.
           Crad_bg = 0.8
-          frad_bg = (2./3.)*(1./(central_mass*MASS_PROTON))                               &
-                     *((MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)**(1.5d0)) &
+          frad_bg = (2./3.)*(1./(central_mass*ATOMIC_MASS_UNIT))                               &
+                     *((MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**(1.5d0)) &
                      *nimp_bg(1)* Arad_bg*exp(-((log(Te_corr_eV)-log(Brad_bg))**2.)/Crad_bg**2.)
         else
           write(*,*) "WARNING: hard-coded fitting doesn't exist for  ", trim(imp_type(1)), ", use open adas instead!"
@@ -1648,7 +1667,7 @@ enddo  ! n_elements
 if (SI_units) then
 
   !===========================================================real values=============
-  rho_norm = central_density*1.d20 * central_mass * mass_proton
+  rho_norm = central_density*1.d20 * central_mass * ATOMIC_MASS_UNIT
   t_norm   = sqrt(MU_zero*rho_norm)
 
   !=================================================real values============
@@ -1786,8 +1805,8 @@ if (SI_units) then
       endif
 
 #if (defined WITH_Neutrals) 
-      coef_ion_1 = (MU_ZERO*central_mass*MASS_PROTON)**(0.5d0)*(central_density*1.d20)**(1.5d0)
-      coef_rad_1 = (gamma-1.d0)*MU_ZERO**1.5d0*(central_mass*MASS_PROTON)**0.5d0*(central_density*1.d20)**2.5d0
+      coef_ion_1 = (MU_ZERO*central_mass*ATOMIC_MASS_UNIT)**(0.5d0)*(central_density*1.d20)**(1.5d0)
+      coef_rad_1 = (gamma-1.d0)*MU_ZERO**1.5d0*(central_mass*ATOMIC_MASS_UNIT)**0.5d0*(central_density*1.d20)**2.5d0
 
       ksi_ion_norm = ksi_ion * central_density * 1.d20
       rn0_real8 = scalars(i,8)/central_density
@@ -1849,15 +1868,15 @@ if (SI_units) then
 #ifdef WITH_Impurities
   if (include_radiation) then
    scalars(i,iimp(1)) = scalars(i,iimp(1))/(K_BOLTZ*MU_ZERO)
-   scalars(i,iimp(2)) = scalars(i,iimp(2))/(2.d0/3.d0*MU_ZERO**1.5d0*(central_mass*MASS_PROTON*central_density*1.d20)**0.5d0)
-   scalars(i,iimp(3)) = scalars(i,iimp(3))/(2.d0/3.d0*((central_mass*MASS_PROTON*central_density*1.d20)**0.5)*(MU_ZERO**1.5)) 
+   scalars(i,iimp(2)) = scalars(i,iimp(2))/(2.d0/3.d0*MU_ZERO**1.5d0*(central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**0.5d0)
+   scalars(i,iimp(3)) = scalars(i,iimp(3))/(2.d0/3.d0*((central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**0.5)*(MU_ZERO**1.5)) 
    scalars(i,iimp(4)) = scalars(i,iimp(4)) ! Z_imp
    scalars(i,iimp(5)) = scalars(i,iimp(5)) ! Z_eff
    scalars(i,iimp(6)) = scalars(i,iimp(6)) ! beta_imp
    scalars(i,ibg_tot) = scalars(i,ibg_tot) &
-       /((GAMMA-1.d0)*MU_ZERO**1.5d0*(central_mass*MASS_PROTON*central_density*1.d20)**0.5d0)
+       /((GAMMA-1.d0)*MU_ZERO**1.5d0*(central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**0.5d0)
    do i_imp=1,n_adas
-     scalars(i,iibg(i_imp)) = scalars(i,iibg(i_imp)) / ((GAMMA-1.d0)*MU_ZERO**1.5d0*(central_mass*MASS_PROTON*central_density*1.d20)**0.5d0)
+     scalars(i,iibg(i_imp)) = scalars(i,iibg(i_imp)) / ((GAMMA-1.d0)*MU_ZERO**1.5d0*(central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**0.5d0)
    end do
   end if
 #endif /* WITH_Impurities */

@@ -51,8 +51,8 @@ subroutine preset_parameters
   visco_par_heating = 0.d0
   visco_old_setup   = .false.
   
-  central_density = 1.d0        ! the central density in units 10^20 m^-3
-  central_mass    = 2.d0        ! the central average ion mass (D)
+  central_density = 1.d0            ! the central density in units 10^20 m^-3
+  central_mass    = 2.01410177811d0 ! the central average mass (atomic mass of deuterium, including electron)
 
   n_tor_restart= 0
   restart      = .false.
@@ -62,6 +62,9 @@ subroutine preset_parameters
   rst_format   = 0             ! use 'old' format for restart import
   write_ps     = .true.           ! write postscript file at the end of the run 
   gvec_grid_import = .false.
+  extended_boundary = .false.
+  j_cutoff_rcoord = 99.0
+  j_cutoff_sig = 0.025
 
   freeboundary_equil = .false. ! use free or fixed boundary equilibrium
   freeboundary       = .false. ! use free or fixed boundary?
@@ -582,7 +585,7 @@ subroutine preset_parameters
   zk_e_perp_file     = 'none'
   zk_i_perp_file     = 'none'
   R_Z_psi_bnd_file   = 'none'
-  wall_file          = 'none'
+  wall_file          = 'wall.txt'
   rot_file           = 'none'
   domm_file          = 'none'
   normalized_velocity_profile = .true.
@@ -649,9 +652,9 @@ subroutine preset_parameters
   use_pastix_eq      = .false.              ! Use PASTIX equilibrium solver
   use_strumpack_eq   = .false.              ! Use STRUMPACK equilibrium olver  
   
-  use_mumps_prj      = .true.               ! Use MUMPS equilibrium solver
-  use_pastix_prj     = .false.              ! Use PASTIX equilibrium solver
-  use_strumpack_prj  = .false.              ! Use STRUMPACK equilibrium olver  
+  use_mumps_prj      = .true.               ! Use MUMPS projection solver
+  use_pastix_prj     = .false.              ! Use PASTIX projection solver
+  use_strumpack_prj  = .false.              ! Use STRUMPACK projection olver  
 
   refinement         = .false.              ! enable mesh refinement
   force_central_node = .true.               ! force all nodes in the grid center to have the same values in flux surface aligned grids
@@ -845,6 +848,7 @@ subroutine preset_parameters
   Sigma = 0.d0
 
 !===================== particle input values
+use_particles      = .false.
 n_particles        = 0
 nstep_particles    = 0
 nsubstep_particles = 1

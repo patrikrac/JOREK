@@ -998,15 +998,15 @@ do i=1,n_vertex_max
             if (ne_SI < 1.d16) ne_SI = 1.d16 ! To prevent absurd number in the coulomb lambda
 
             lambda_e_bg  = 23. - log((ne_SI*1.d-6)**0.5*Te_corr_eV**(-1.5)) ! Assuming bg_charge is 1! 
-            nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5&
+            nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5&
                            * (1.d14*central_density*rho0_corr) * lambda_e_bg &
-                           / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass)&
+                           / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass)&
                            / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
 
             if (nu_e_bg < 0.)  nu_e_bg  = 0.
 
             !Converting the energy transfer rate from s^-1 to JOREK unit
-            t_norm   = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20)
+            t_norm   = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20)
             nu_e_bg  = nu_e_bg * t_norm    
 
             dTe_i    = nu_e_bg * (Ti0_corr - Te0_corr) * rho0_corr
@@ -1018,9 +1018,9 @@ do i=1,n_vertex_max
             !                 this may be for the same reason that correction functions cannot be used for
             !                 the density and temperatures. Will need to be investigated in the future
 
-            dnu_e_bg_dTi    = 0.d0!-1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + MASS_PROTON*central_mass*Te0_corr)
-            dnu_e_bg_dTe    = 0.d0!-1.5*MASS_PROTON*central_mass*nu_e_bg*dTe0_corr_dT &
-                                  !/ (MASS_ELECTRON*Ti0_corr + MASS_PROTON*central_mass*Te0_corr)
+            dnu_e_bg_dTi    = 0.d0!-1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*central_mass*Te0_corr)
+            dnu_e_bg_dTe    = 0.d0!-1.5*ATOMIC_MASS_UNIT*central_mass*nu_e_bg*dTe0_corr_dT &
+                                  !/ (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*central_mass*Te0_corr)
 
             dnu_e_bg_drho   = 0.d0!nu_e_bg * drho0_corr_dn / rho0_corr
 

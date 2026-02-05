@@ -17,7 +17,7 @@ use phys_module, only: n_particles, nstep_particles, nsubstep_particles, tstep_p
 use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, filter_hyper_n0, filter_par_n0
 use phys_module, only: tstep
 use phys_module, only: CENTRAL_MASS, CENTRAL_DENSITY
-use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
+use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 
 use mod_particle_sputtering, only: particle_sputter, sample_fluid_particle_energy
 use mod_projection_functions, only: proj_f_combined_density, &
@@ -76,7 +76,7 @@ if (use_kn_sputtering) then
 endif
 
 n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
 t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
 
 tstep_si  = tstep * t_norm
@@ -196,7 +196,7 @@ use mod_jorek_timestepping
 use mod_basisfunctions
 use phys_module, only: tstep, use_ncs, use_pcs, use_ccs
 use phys_module, only: CENTRAL_MASS, CENTRAL_DENSITY
-use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
+use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 
 implicit none
 real*8, parameter  :: binding_energy = 2.18d-18 ! ionization energy of a hydrogen atom [J] (= 13.6 eV)
@@ -225,7 +225,7 @@ real*8    :: particles_remaining, momentum_remaining, energy_remaining, all_part
 real,dimension(n_var) :: varmin,varmax
 
 n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
 t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
 v_norm   = 1.d0 / t_norm                                        ! V_SI   = v_norm * v_jorek
 E_norm   = 1.5d0 / MU_ZERO                                      ! E_SI   = E_norm * E_jorek

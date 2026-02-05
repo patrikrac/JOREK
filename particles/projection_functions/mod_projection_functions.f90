@@ -5,7 +5,7 @@ use data_structure
 use mod_particle_sim
 use mod_particle_types
 use phys_module, only: CENTRAL_MASS, CENTRAL_DENSITY
-use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ
+use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ
 
 implicit none
 
@@ -40,7 +40,7 @@ function proj_f_combined_density(sim, i_group,  particle) result(combined_densit
   select type (pa => particle)
   type is (particle_kinetic_leapfrog)
     combined_density =  proj_f_combined_density_SI(sim, i_group, particle) & 
-                      * 1.d0  *sqrt((MU_ZERO * CENTRAL_MASS * MASS_PROTON) / (CENTRAL_DENSITY * 1.d20))
+                      * 1.d0  *sqrt((MU_ZERO * central_mass * ATOMIC_MASS_UNIT) / (CENTRAL_DENSITY * 1.d20))
   class default
     combined_density = 0.d0
   end select
@@ -75,7 +75,7 @@ function proj_f_combined_energy(sim, i_group,  particle) result(combined_energy)
     
     call sim%fields%interp_PRZ(sim%time, particle%i_elm, [5], 1, particle%st(1), particle%st(2), particle%x(3), &
         rho, rho_s, rho_t, rho_phi, rho_time, R, R_s, R_t, Z, Z_s, Z_t)
-    combined_energy = rho(1) * MU_ZERO**(3.d0/2.d0) * sqrt(CENTRAL_MASS * CENTRAL_DENSITY * 1.d20 * MASS_PROTON) &
+    combined_energy = rho(1) * MU_ZERO**(3.d0/2.d0) * sqrt(CENTRAL_MASS * CENTRAL_DENSITY * 1.d20 * ATOMIC_MASS_UNIT) &
                   * proj_f_combined_energy_SI(sim, i_group, particle) 
   class default
     combined_energy = 0.d0
@@ -114,7 +114,7 @@ function proj_f_combined_par_momentum(sim, i_group,  particle) result(combined_p
     call sim%fields%calc_EBpsiU(sim%time, particle%i_elm, &
             particle%st, particle%x(3), E, B, psi, U)
     B_norm = norm2(B)
-    combined_par_momentum = MU_ZERO / (B_norm * CENTRAL_MASS * MASS_PROTON * rho(1)) &
+    combined_par_momentum = MU_ZERO / (B_norm * central_mass * ATOMIC_MASS_UNIT * rho(1)) &
                          * proj_f_combined_par_momentum_SI(sim, i_group, particle) 
   class default
     combined_par_momentum = 0.d0

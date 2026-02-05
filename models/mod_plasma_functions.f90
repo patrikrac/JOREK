@@ -24,7 +24,7 @@ module mod_plasma_functions
     real*8 :: rho0, Te0_keV, Ti0_keV
 
     ! --- Calculate normalization factors.
-    rho0               = central_density * 1.d20 * central_mass * mass_proton
+    rho0               = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
     sqrt_mu0_rho0      = sqrt( mu_zero * rho0 )
     sqrt_mu0_over_rho0 = sqrt( mu_zero / rho0 )
 
@@ -34,15 +34,15 @@ module mod_plasma_functions
       Ti0_keV               = Ti_0 / ( EL_CHG * mu_zero * central_density * 1.d+20 ) / 1.d+3
       call coulomb_log_ei(Te_0, Te_0, 1.d0, 1.d0, 0.d0, 0.d0, 0.d0, lnA_center)
 
-      ZK_e_par_SpitzerHaerm = 5.5789d+0 * central_mass*mass_proton/(mass_electron*lnA_center) * Te0_keV**(2.5d+0) * (gamma-1.d0) * sqrt_mu0_over_rho0
+      ZK_e_par_SpitzerHaerm = 5.5789d+0 * central_mass*ATOMIC_MASS_UNIT/(mass_electron*lnA_center) * Te0_keV**(2.5d+0) * (gamma-1.d0) * sqrt_mu0_over_rho0
       ZK_i_par_SpitzerHaerm = 5.8410d+2 * sqrt(central_mass/2.d+0)/(lnA_center)               * Ti0_keV**(2.5d+0) * (gamma-1.d0) * sqrt_mu0_over_rho0
     else
       Te0_keV               = T_0 / 2.d+0 / ( EL_CHG * mu_zero * central_density * 1.d+20 ) / 1.d+3
       call coulomb_log_ei(T_0, T_0, 1.d0, 1.d0, 0.d0, 0.d0, 0.d0, lnA_center)
 
-      ZK_par_SpitzerHaerm   = 5.5789d+0 * central_mass*mass_proton/(mass_electron*lnA_center) * Te0_keV**(2.5d+0) * (gamma-1.d0) * sqrt_mu0_over_rho0
+      ZK_par_SpitzerHaerm   = 5.5789d+0 * central_mass*ATOMIC_MASS_UNIT/(mass_electron*lnA_center) * Te0_keV**(2.5d+0) * (gamma-1.d0) * sqrt_mu0_over_rho0
     end if
-    tauIC_nominal      = central_mass * mass_proton / ( EL_CHG * F0 * sqrt_mu0_rho0 * 2.d0 )
+    tauIC_nominal      = central_mass * ATOMIC_MASS_UNIT / ( EL_CHG * F0 * sqrt_mu0_rho0 * 2.d0 )
     eta_Spitzer        = ( 1.65d-9 * lnA_center * Te0_keV**(-1.5d+0) ) / sqrt_mu0_over_rho0
 
     ! --- Assign minimum values for parallel conduction if not given

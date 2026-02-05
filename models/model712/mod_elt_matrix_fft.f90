@@ -1054,15 +1054,15 @@ do i=1,n_vertex_max
             if (ne_SI < 1.d16) ne_SI = 1.d16 ! To prevent absurd number in the coulomb lambda
 
             lambda_e_bg  = 23. - log((ne_SI*1.d-6)**0.5*Te_corr_eV**(-1.5)) ! Assuming bg_charge is 1! 
-            nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5&
+            nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5&
                            * (1.d14*central_density*rho0_corr) * lambda_e_bg &
-                           / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*MASS_PROTON*central_mass)&
+                           / (1.d3*(MASS_ELECTRON*Ti0_corr+Te0_corr*ATOMIC_MASS_UNIT*central_mass)&
                            / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1!
 
             if (nu_e_bg < 0.)  nu_e_bg  = 0.
 
             !Converting the energy transfer rate from s^-1 to JOREK unit
-            t_norm   = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20)
+            t_norm   = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20)
             nu_e_bg  = nu_e_bg * t_norm    
 
             dTe_i    = nu_e_bg * (Ti0_corr - Te0_corr) * rho0_corr
@@ -1074,9 +1074,9 @@ do i=1,n_vertex_max
             !                 this may be for the same reason that correction functions cannot be used for
             !                 the density and temperatures. Will need to be investigated in the future
 
-            dnu_e_bg_dTi    = 0.d0!-1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + MASS_PROTON*central_mass*Te0_corr)
-            dnu_e_bg_dTe    = 0.d0!-1.5*MASS_PROTON*central_mass*nu_e_bg*dTe0_corr_dT &
-                                  !/ (MASS_ELECTRON*Ti0_corr + MASS_PROTON*central_mass*Te0_corr)
+            dnu_e_bg_dTi    = 0.d0!-1.5*MASS_ELECTRON*nu_e_bg*dTi0_corr_dT / (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*central_mass*Te0_corr)
+            dnu_e_bg_dTe    = 0.d0!-1.5*ATOMIC_MASS_UNIT*central_mass*nu_e_bg*dTe0_corr_dT &
+                                  !/ (MASS_ELECTRON*Ti0_corr + ATOMIC_MASS_UNIT*central_mass*Te0_corr)
 
             dnu_e_bg_drho   = 0.d0!nu_e_bg * drho0_corr_dn / rho0_corr
 
@@ -1200,7 +1200,7 @@ do i=1,n_vertex_max
 
           ! --- Ionization rate for Deuterium
           ! --- (see Wiki for more info: http://jorek.eu/wiki/doku.php?id=model500_501_555#ionization_rate_for_deuterium)
-          coef_ion_1  = sqrt(MU_ZERO*central_mass*MASS_PROTON) * (central_density*1.d20)**(1.5d0) * 0.2917d-13
+          coef_ion_1  = sqrt(MU_ZERO*central_mass*ATOMIC_MASS_UNIT) * (central_density*1.d20)**(1.5d0) * 0.2917d-13
           coef_ion_2  = 0.232d0
           coef_ion_3  = EL_CHG*MU_ZERO*central_density*1.d20 * 27.2d0
           S_ion_puiss = 3.9d-1
@@ -1217,7 +1217,7 @@ do i=1,n_vertex_max
 
           ! --- Formulae for radiative power is in SI units and for T = Te + Ti
           if (Te_eV .gt. 0.1) then
-            coef_rad_1 = 2.d0/(3.d0)*MU_ZERO**1.5d0*(central_mass*MASS_PROTON)**0.5d0*(central_density*1.d20)**2.5d0
+            coef_rad_1 = 2.d0/(3.d0)*MU_ZERO**1.5d0*(central_mass*ATOMIC_MASS_UNIT)**0.5d0*(central_density*1.d20)**2.5d0
             LradDcont_T = coef_rad_1*5.37d-37*(1.d1)**(-1.5d0)*(1.d0)**2*sqrt(T_rad) ! Only Bremsstrahlung contribution
             dLradDcont_dT = coef_rad_1*5.37d-37*(1.d1)**(-1.5d0)*(1.d0)**2*(8*EL_CHG*MU_ZERO*central_density*1.d20*sqrt(T_rad))**(-1.d0) * dTe0_corr_dT
             LradDrays_T = coef_rad_1*(1.d1)**(-29.44d0*exp(-(log10(T_rad)-4.4283d0)**2.d0/(2.d0*(2.8428d0)**2.d0)) &
@@ -1239,7 +1239,7 @@ do i=1,n_vertex_max
           ! --- Recombination rate for ionized Deuterium
           ! (see Wiki for more info: http://jorek.eu/wiki/doku.php?id=model500_501_555#recombination_rate_for_deuterium)
           if (Te_ev .gt. 0.1) then      
-            coef_rec_1 = (MU_ZERO*central_mass*MASS_PROTON)**(0.5d0)*(central_density*1.d20)**(1.5d0)
+            coef_rec_1 = (MU_ZERO*central_mass*ATOMIC_MASS_UNIT)**(0.5d0)*(central_density*1.d20)**(1.5d0)
             Srec_T    =            coef_rec_1 * 0.7d-19 * (13.6d0*(2.d0*EL_CHG*MU_ZERO*central_density*1.d20))**(0.5d0) * (Te0_corr)**(-0.5d0)      
             dSrec_dT  = - 0.25d0 * coef_rec_1 * 0.7d-19 * (13.6d0*(2.d0*EL_CHG*MU_ZERO*central_density*1.d20))**(0.5d0) * (Te0_corr)**(-1.5d0) * dTe0_corr_dT
           else
@@ -1251,9 +1251,9 @@ do i=1,n_vertex_max
           Arad_bg = 2.4d-31
           Brad_bg = 20.
           Crad_bg = 0.8
-          frad_bg     = (2./3.)*(1./(central_mass*MASS_PROTON))*((MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)**(1.5d0))                &
+          frad_bg     = (2./3.)*(1./(central_mass*ATOMIC_MASS_UNIT))*((MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**(1.5d0))                &
                         *nimp_bg(1)*Arad_bg*exp(-((log(T_rad)-log(Brad_bg))**2.)/Crad_bg**2.)
-          dfrad_bg_dT = -(1./3.)*((MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)**(0.5d0))*(1./EL_CHG)                                   &
+          dfrad_bg_dT = -(1./3.)*((MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**(0.5d0))*(1./EL_CHG)                                   &
                         *2.*(nimp_bg(1)*Arad_bg/Crad_bg**2.)*(log(T_rad)-log(Brad_bg))*(1./T_rad)*exp(-((log(T_rad)-log(Brad_bg))**2.)/Crad_bg**2.)
 
           ! --- Pellet source

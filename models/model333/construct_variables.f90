@@ -610,9 +610,9 @@ subroutine ELM_build_diffusivities_and_sources(element, nodes, xpoint2, xcase2, 
   ! --- (ie. if input values are given in physical units) Not done for sources yet...
   if (renormalise) then
     if (central_density .gt. 1.d10) then
-      rho_norm    = central_density         * central_mass * mass_proton
+      rho_norm    = central_density         * central_mass * ATOMIC_MASS_UNIT
     else
-      rho_norm    = central_density * 1.d20 * central_mass * mass_proton
+      rho_norm    = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
     endif
     eta_T       = eta_T       * sqrt(rho_norm / mu_zero )
     deta_dT     = deta_dT     * sqrt(rho_norm / mu_zero )

@@ -25,7 +25,7 @@ contains
 subroutine do_save_E(this, sim, ev)
   use mod_particle_sim, only: particle_sim
   use phys_module, only: central_mass, central_density, F0, eta, xpoint, xcase
-  use constants, only: mu_zero, mass_proton
+  use constants, only: mu_zero, atomic_mass_unit
   class(save_E), intent(inout) :: this
   type(particle_sim), intent(inout) :: sim
   type(event), intent(inout), optional :: ev
@@ -54,7 +54,7 @@ subroutine do_save_E(this, sim, ev)
     open(newunit=unit(i), file=trim(adjustl(time_s))//'_'//trim(variables(i))//this%suffix, status='replace', access='stream', action='write')
   end do
 
-  t_norm  = sqrt(mu_zero * mass_proton * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds
+  t_norm  = sqrt(mu_zero * ATOMIC_MASS_UNIT * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds
 
   ! calculate current J0 to compare jphi - jphi0, since that is what we solve for
   call find_axis(0, sim%fields%node_list, sim%fields%element_list, psi_axis, R_axis, Z_axis, i_elm, s, t, ifail)

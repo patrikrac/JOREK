@@ -62,7 +62,7 @@ subroutine atomic_coeff_deuterium(Te0, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradD
   real*8 :: ksi_ion_norm
 
   ! --- Normalization constants
-  rho_norm     = central_density*1.d20 * central_mass * MASS_PROTON
+  rho_norm     = central_density*1.d20 * central_mass * ATOMIC_MASS_UNIT
   t_norm       = sqrt(MU_zero*rho_norm)
   gamma_factor = gamma-1.d0  ! Normalization factor to include terms in the pressure equation
                              ! internal_energy = pressure / (gamma - 1)
@@ -151,13 +151,13 @@ subroutine atomic_coeff_deuterium(Te0, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradD
     ! --- Te_max=10 keV, beyond that value the fits blow up
     T0 = min( T0, 2.d0 * 1.d4 * EL_CHG*MU_ZERO*central_density*1.d20 )
 
-    coef_ion_1  = sqrt(MU_ZERO*central_mass*MASS_PROTON) * (central_density*1.d20)**(1.5d0) * 0.2917d-13
+    coef_ion_1  = sqrt(MU_ZERO*central_mass*ATOMIC_MASS_UNIT) * (central_density*1.d20)**(1.5d0) * 0.2917d-13
     coef_ion_2  = 0.232d0
     coef_ion_3  = EL_CHG*MU_ZERO*central_density*1.d20 * 27.2d0
 
     
-    coef_rad_1  = gamma_factor*MU_ZERO**1.5d0*(central_mass*MASS_PROTON)**0.5d0*(central_density*1.d20)**2.5d0
-    coef_rec_1  = (MU_ZERO*central_mass*MASS_PROTON)**(0.5d0)*(central_density*1.d20)**(1.5d0)   
+    coef_rad_1  = gamma_factor*MU_ZERO**1.5d0*(central_mass*ATOMIC_MASS_UNIT)**0.5d0*(central_density*1.d20)**2.5d0
+    coef_rec_1  = (MU_ZERO*central_mass*ATOMIC_MASS_UNIT)**(0.5d0)*(central_density*1.d20)**(1.5d0)   
 
     ! -------------------------------------------
     ! --- Ionization rate for Deuterium
@@ -349,7 +349,7 @@ subroutine rec_rate_to_kinetic(ne0, Te0, Sion_T, dSion_dT, Srec_T, dSrec_dT, Lra
   real*8 :: ksi_ion_norm 
 
   ! --- Normalization constants
-  rho_norm     = central_density*1.d20 * central_mass * MASS_PROTON
+  rho_norm     = central_density*1.d20 * central_mass * ATOMIC_MASS_UNIT
   t_norm       = sqrt(MU_zero*rho_norm)
   gamma_factor = gamma-1.d0  ! Normalization factor to include terms in the pressure equation
                              ! internal_energy = pressure / (gamma - 1)

@@ -31,6 +31,10 @@ program jorek2_IDS
   logical :: export_wall, export_pf_passive, export_pf_active, export_summary, export_disruption
   logical :: export_field_extension, new_entry, export_spi
   real*8  :: rho0, fact_time, time_SI, wall_thickness
+  real*8, allocatable :: res0D(:)
+  real*8, allocatable :: avg(:,:)    ! average like expr_avg_list + q_prof + rho_tor
+  real*8, allocatable :: q_prof(:), rho_tor(:)
+
 
   integer   :: my_id, my_id_n, my_id_master, ierr2
   integer   :: i_rank(n_tor), n_cpu, n_cpu_n, n_cpu_master, m_cpu, n_masters, n_cpu_trans, my_id_trans
@@ -51,6 +55,7 @@ program jorek2_IDS
   type(ids_disruption)    :: disruption_ids
   type(ids_spi)           :: spi_ids
   type(t_rect_grid_params):: rect_grid_params
+  type(t_expr_list) :: expr_avg_list
 
   namelist /imas_params/ shot_number, run_number, user, database, i_begin, i_end,    &
                          export_JOREK_variables, export_radiation, export_1d_profiles, n_grid, &
@@ -184,21 +189,18 @@ program jorek2_IDS
     endif
   endif
 
-  if (export_radiation)  then
-    if (.not. use_marker) then
-      write(*,*) 'radiation IDS currently only supported with marker model'
-      export_radiation=.false.
-    else
-      allocate( aux_node_list )
-    end if
+  if (export_radiation .and. use_marker)  then
+    allocate( aux_node_list )
   end if
 
   ! --- Time normalization
-  rho0       = central_density * 1.d20 * central_mass * mass_proton
+  rho0       = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
   fact_time  = sqrt( mu_zero * rho0 )
 
   first_step = .true.
 
+  call initialise_postproc_settings(first_step, n_grid)
+  
   ! --- Loop over
   do i_step = i_begin, i_end, i_jump_steps
  
@@ -248,17 +250,26 @@ program jorek2_IDS
       if ( .not. wall_curr_initialized ) call init_wall_currents(my_id, resistive_wall)
    endif
 
+       ! --- Fill IDSs that share common quantities
+    if (export_equilibrium .or. export_summary .or. export_disruption)  then
+      call get_0D_data(first_step, res0D)
+    endif
+
+    if (export_equilibrium .or. export_1d_profiles .or. export_radiation)  then
+      call get_average_data(first_step, n_grid, expr_avg_list, avg)
+    end if
+
     ! --- Fill and export a plasma profiles IDS with the JOREK variables
     if (export_JOREK_variables)  call fill_profiles_w_JOREK_var(first_step, time_SI, plasma_profiles_ids1)  
 
     ! --- Fill and export a plasma_profiles IDS
-    if (export_1d_profiles)  call fill_plasma_profiles_IDS(first_step, time_SI, plasma_profiles_ids, n_grid)  
+    if (export_1d_profiles)  call fill_plasma_profiles_IDS(first_step, time_SI, expr_avg_list, avg, plasma_profiles_ids, n_grid)  
 
-    ! --- Fill IDSs that share common quantities
-    if (export_equilibrium .or. export_summary .or. export_disruption)  then
-      call fill_IDSs_w_common_quantities(first_step, time_SI, n_grid, export_equilibrium, export_summary, export_disruption, &
-                                        equilibrium_ids, summary_ids, disruption_ids, simulation_description, rect_grid_params)
-    endif
+
+    if (export_equilibrium) call fill_equilibrium_IDS(first_step, time_SI, n_grid, res0D, expr_avg_list, avg, equilibrium_ids, rect_grid_params)  
+    if (export_summary)     call fill_summary_IDS(first_step, time_SI, res0D, summary_ids, simulation_description)  
+    if (export_disruption)  call fill_disruption_IDS(first_step, time_SI, res0D, disruption_ids) 
+
 
     ! --- Extend the fields to vacuum is possible
     if (export_field_extension) then
@@ -285,14 +296,15 @@ program jorek2_IDS
 
     ! --- Fill and export a radiation IDS
     if (export_radiation) then
-      call import_hdf5_restart_aux(aux_node_list, trim(name_proj) // '.h5', rst_format, ierr)
-      if (ierr /= 0) then
-        write(*,*) ' Could not open projections file where radiation is stored'
-        stop
+      if (use_marker) then
+        call import_hdf5_restart_aux(aux_node_list, trim(name_proj) // '.h5', rst_format, ierr)
+        if (ierr /= 0) then
+          write(*,*) ' Could not open projections file where radiation is stored'
+          stop
+        endif
       endif
-      call fill_radiation_IDS(first_step, time_SI, radiation_ids)  
-    endif
-
+      call fill_radiation_IDS(first_step, time_SI, expr_avg_list, avg, n_grid, radiation_ids)  
+    end if
     ! --- Fill and export an SPI IDS
     if (export_spi)   call fill_spi_IDS(first_step, time_SI, spi_ids) 
 

@@ -444,7 +444,7 @@ contains
     use constants    
     use data_structure
     use phys_module, only: F0, FF_0, xpoint, xcase, tokamak_device,    &
-                           central_mass, mass_proton, central_density, &
+                           central_mass, atomic_mass_unit, central_density, &
                            mu_zero, tauIC, renormalise, grid_to_wall, n_wall_blocks
     use corr_neg
     
@@ -536,9 +536,9 @@ contains
     
     ! --- Renormalise MHD parameters?
     if (central_density .gt. 1.d10) then
-      rho_norm = central_density	 * central_mass * mass_proton
+      rho_norm = central_density	 * central_mass * ATOMIC_MASS_UNIT
     else
-      rho_norm = central_density * 1.d20 * central_mass * mass_proton
+      rho_norm = central_density * 1.d20 * central_mass * ATOMIC_MASS_UNIT
     endif
     if (renormalise) tau_IC = tau_IC / sqrt(mu_zero * rho_norm)
 

@@ -20,7 +20,7 @@ program tae_phase_space_project
   use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, filter_hyper_n0, filter_par_n0
   use phys_module, only: n_mode_families, nout
 
-  use constants,   only: MU_ZERO, MASS_PROTON, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
+  use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
   use mod_math_operators, only: cross_product
   use mod_particle_sputtering, only: particle_sputter, sample_fluid_particle_energy
   use mod_projection_functions, only: proj_f_combined_density, &
@@ -84,7 +84,7 @@ program tae_phase_space_project
   call update_equil_state(sim%my_id,sim%fields%node_list, sim%fields%element_list, bnd_elm_list, xpoint, xcase)
 
   n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-  rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+  rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
   t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
   write(*,*) 'Alfven =', F0/10.d0/t_norm
   tstep_si  = tstep * t_norm
@@ -295,7 +295,7 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, timesteps, n_st
 !$ w0 = omp_get_wtime()
 
   n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
-  rho_norm = CENTRAL_MASS * MASS_PROTON * n_norm                  ! rho_SI = rho_norm * rho
+  rho_norm = central_mass * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
   t_norm   = sqrt((MU_ZERO * rho_norm))                           ! t_SI   = t_norm * t_jorek
   v_norm   = 1.d0 / t_norm                                        ! V_SI   = v_norm * v_jorek
   E_norm   = 1.5d0 / MU_ZERO                                      ! E_SI   = E_norm * E_jorek
@@ -317,7 +317,7 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, timesteps, n_st
   select type (particles => sim%groups(1)%particles)
     type is (particle_kinetic_leapfrog)
       do j=1,size(particles,1)
-        E_tot = E_tot + 0.5d0*particles(j)%weight*sim%groups(1)%mass*mass_proton*dot_product(particles(j)%v, particles(j)%v)
+        E_tot = E_tot + 0.5d0*particles(j)%weight*sim%groups(1)%mass*atomic_mass_unit*dot_product(particles(j)%v, particles(j)%v)
       enddo
   end select
   call MPI_REDUCE(E_tot,E_tot_red,1,MPI_REAL8, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
@@ -354,7 +354,7 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, timesteps, n_st
 
         !      i_rng = 1
 !$      i_rng = omp_get_thread_num()+1
-        E_diff = particle_tmp%weight*0.5d0*sim%groups(1)%mass*MASS_PROTON*dot_product(particle_tmp%v,particle_tmp%v)
+        E_diff = particle_tmp%weight*0.5d0*sim%groups(1)%mass*atomic_mass_unit*dot_product(particle_tmp%v,particle_tmp%v)
         do k=1,n_steps
 
           if (particle_tmp%i_elm .le. 0) exit
@@ -423,32 +423,32 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, timesteps, n_st
   
                   feedback_rhs(m,l,i_elm,i_tor,1) = feedback_rhs(m,l,i_elm,i_tor,1) &
   
-                                                             + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                             + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
   
                                                               * (p_perp+b_norm_r**2*p_atrop) * mu_zero !PI_RR
                   feedback_rhs(m,l,i_elm,i_tor,2) = feedback_rhs(m,l,i_elm,i_tor,2) &
   
-                                                              + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                              + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
   
                                                               * ( p_perp+b_norm_z**2*p_atrop ) * mu_zero                       !PI_ZZ
                   feedback_rhs(m,l,i_elm,i_tor,3) = feedback_rhs(m,l,i_elm,i_tor,3) &
   
-                                                              + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                              + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
   
                                                               * (p_perp+b_norm_phi**2*p_atrop) * mu_zero !PI_PHIPHI
                   feedback_rhs(m,l,i_elm,i_tor,4) = feedback_rhs(m,l,i_elm,i_tor,4) &
   
-                                                              + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                              + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
   
                                                               * ( b_norm_r*b_norm_z*p_atrop ) * mu_zero                            !PI_RZ
                   feedback_rhs(m,l,i_elm,i_tor,5) = feedback_rhs(m,l,i_elm,i_tor,5) &
   
-                                                             + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                             + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
   
                                                               * (b_norm_r*b_norm_phi*p_atrop ) * mu_zero !PI_RPHI
                   feedback_rhs(m,l,i_elm,i_tor,6) = feedback_rhs(m,l,i_elm,i_tor,6) &
   
-                                                             + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * mass_proton &
+                                                             + HZ(i_tor) * v * particle_tmp%weight * sim%groups(1)%mass * atomic_mass_unit &
   
                                                               *(b_norm_z*b_norm_phi*p_atrop ) * mu_zero !PI_ZPHI
                   feedback_rhs(m,l,i_elm,i_tor,7) = feedback_rhs(m,l,i_elm,i_tor,7) &
@@ -464,7 +464,7 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, timesteps, n_st
           end if !<particle_temp%i_elm gt 0 after pushing and projection needed 
         end do ! steps
         
-        E_diff =-E_diff+ particle_tmp%weight*0.5d0*sim%groups(1)%mass*mass_proton*dot_product(particle_tmp%v,particle_tmp%v)
+        E_diff =-E_diff+ particle_tmp%weight*0.5d0*sim%groups(1)%mass*atomic_mass_unit*dot_product(particle_tmp%v,particle_tmp%v)
 
         ! For the fitting, it is important to take a gyrofrequency that makes sense.
         ! Although the average B is not expected to give the exact gyrofrequency, it is often good enough.
@@ -492,7 +492,7 @@ subroutine loop_particle_kinetic_local(sim, jorek_feedback, rng, timesteps, n_st
   select type(particles => sim%groups(1)%particles)
     type is (particle_kinetic_leapfrog)
       do j=1,size(particles,1)
-        E_after = E_after + 0.5d0*particles(j)%weight*sim%groups(1)%mass*mass_proton*dot_product(particles(j)%v, particles(j)%v)
+        E_after = E_after + 0.5d0*particles(j)%weight*sim%groups(1)%mass*atomic_mass_unit*dot_product(particles(j)%v, particles(j)%v)
       enddo
   end select
   call MPI_REDUCE(E_after,E_after_red,1,MPI_REAL8, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
@@ -543,7 +543,7 @@ pure function proj_RZPE(ndim, sim,group, particle)
   B_tmp= calculate_B(sim%fields, particle%i_elm,particle%st(1),particle%st(2),particle%x(3))
   select type( p => particle)
     type is (particle_kinetic_leapfrog)
-      proj_RZPE = [particle%x(1),particle%x(2),dot_product(p%v,B_tmp)/norm2(B_tmp)/norm2(p%v),0.5d0*sim%groups(1)%mass*mass_proton*dot_product(p%v, p%v)/1000.d0/el_CHG]
+      proj_RZPE = [particle%x(1),particle%x(2),dot_product(p%v,B_tmp)/norm2(B_tmp)/norm2(p%v),0.5d0*sim%groups(1)%mass*atomic_mass_unit*dot_product(p%v, p%v)/1000.d0/el_CHG]
   end select  
 end function proj_RZPE
 

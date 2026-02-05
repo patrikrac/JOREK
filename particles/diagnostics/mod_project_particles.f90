@@ -602,75 +602,149 @@ end subroutine write_particle_distribution_to_h5
 !> to `filename`. `nsub` is the number of subdivisions to make per element.
 !> Should be called only by process 1
 subroutine write_particle_distribution_to_vtk(node_list,element_list,filename,nsub,n_fields,xyz,ien)
-use data_structure
-use phys_module, only: mode
-use mod_vtk
-use mod_interp
-use mod_basisfunctions
-!$ use omp_lib
-implicit none
+  use data_structure
+  use phys_module, only: mode, n_tor, n_plane, n_period
+  use mod_vtk
+  use mod_interp
+  use basis_at_gaussian, only: HZ
+  use constants, only: PI
 
-!> Input parameters
-type(type_node_list), intent(in)    :: node_list
-type(type_element_list), intent(in) :: element_list
-character*(*), intent(in)           :: filename
-integer, intent(in) :: nsub !< Number of subdivisions of each element
-integer, intent(in) :: n_fields !< number of different particle groups to output
-real*4, intent(in)  :: xyz(:,:)
-integer, intent(in) :: ien(:,:)
+  !> Input parameters
+  type(type_node_list), intent(in)    :: node_list
+  type(type_element_list), intent(in) :: element_list
+  character*(*), intent(in)           :: filename
+  integer, intent(in) :: nsub         !< Number of subdivisions of each element for visualization
+  integer, intent(in) :: n_fields     !< number of different particle groups to output
+  real*4, intent(in)  :: xyz(:,:,:)
+  integer, intent(in) :: ien(:,:,:)
 
-integer :: nnos, i, j, k, l, m, inode, ivar
-real*4, allocatable :: scalars(:,:), vectors(:,:,:)
-integer :: n_scalars, n_vectors = 0
-character*36, allocatable :: vector_names(:), scalar_names(:)
-real*8 :: s, t
-real*8 :: P, P_s, P_t, P_st, P_ss, P_tt
+  integer :: n_nodes, i, j, k, l, m, mp, inode, ivar
+  real*4, allocatable :: scalars(:,:,:), vectors(:,:,:)
+  ! No vectors in this example, but could be added:
+  ! real*4, allocatable :: vectors(:,:,:)
+  integer :: n_scalars, n_vectors = 0
+  character*36, allocatable :: scalar_names(:), vector_names(:)
 
-integer, parameter :: etype = 9 ! for vtk_quad
+  character*100 :: i_filename
+  
+  real*8 :: s, t, toroidal_angle
+  real*8 :: P, R, Z
 
-n_scalars = n_tor * n_fields
-nnos = nsub*nsub*element_list%n_elements
+  integer, parameter :: vtk_quad_type = 9 ! VTK_QUAD
 
-allocate(scalars(nnos,n_scalars),vectors(nnos,3,n_vectors))
-allocate(scalar_names(n_scalars),vector_names(n_vectors))
+  n_scalars = (n_tor+1) * n_fields
 
-do i=1,n_fields
-  write(scalar_names(n_tor*(i-1)+1),'(A,i0.2)') "rho_", i
-  do j=1,(n_tor-1)/2
-    write(scalar_names(n_tor*(i-1)+2*j),"(A4,i0.2,A4,i0.2)") "rho_", i, "_cos", mode(2*j)
-    write(scalar_names(n_tor*(i-1)+2*j+1),"(A4,i0.2,A4,i0.2)") "rho_", i, "_sin", mode(2*j+1)
+  n_nodes =  nsub*nsub*element_list%n_elements
+
+  allocate(scalar_names(n_scalars),vector_names(n_vectors))
+
+#ifdef STELLARATOR_MODEL
+  allocate(scalars(n_plane, n_nodes, n_scalars), vectors(n_nodes,3,n_vectors))
+#else
+  allocate(scalars(1, n_nodes, n_scalars), vectors(n_nodes,3,n_vectors))
+#endif
+
+  ivar = 0
+  do i = 1, n_fields  ! Particle group
+    do k = 1, n_tor+1 ! Toroidal mode component
+      ivar = ivar + 1
+      if (k == 1) then
+        write(scalar_names(ivar), '(A,I0.2,A)') "rho_", i, "_0"
+      else if (k == n_tor+1) then
+        write(scalar_names(ivar), '(A,I0.2,A,I0.2,A,I0.2,A,I0.3)') "allsum_rho_", i
+      else if (mod(k, 2) == 0) then ! cosine_mode
+        write(scalar_names(ivar), '(A,I0.2,A,I0.2,A,I0.2,A,I0.3)') "rho_", i, "_cos", mode(k)
+      else ! sine_mode
+        write(scalar_names(ivar), '(A,I0.2,A,I0.2,A,I0.2,A,I0.3)') "rho_", i, "_sin", mode(k)
+      endif
+    end do
   end do
-end do
+  
+  if (ivar /= n_scalars) then
+      print *, "Error: Mismatch in number of scalars and generated names."
+      stop
+  endif
 
-scalars = 0.e0
-vectors = 0.e0
+  scalars(:,:,:) = 0.e0
+  vectors        = 0.e0
 
-! Create points for each element
-!$omp parallel do default(none) &
-!$omp shared(element_list,nsub,node_list,n_fields,scalars) &
-!$omp private(i,j,k,l,m,inode,ivar,s,t,P, P_s, P_t, P_st, P_ss, P_tt) schedule(static)
-do i=1,element_list%n_elements
-  do j=1,n_fields
-    do k=1,n_tor
-      ivar = (j-1)*n_tor + k
-      do l=1,nsub
-        s = real(l-1,8)/real(nsub-1,8)
-        do m=1,nsub
-          t = real(m-1,8)/real(nsub-1,8)
-          inode = (i-1)*nsub*nsub+(l-1)*nsub+m
-          call interp(node_list, element_list, i, j, k, s, t, P, P_s, P_t, P_st, P_ss, P_tt)
-          scalars(inode,ivar) = real(P,4)
+#ifndef STELLARATOR_MODEL
+
+  ! Create points for each element
+  !$omp parallel do default(none) &
+  !$omp shared(element_list,nsub,node_list,n_fields,scalars) &
+  !$omp private(i,j,k,l,m,inode,ivar,s,t,P,R,Z) schedule(static)
+  do i=1,element_list%n_elements
+    do j=1,n_fields
+      do k=1,n_tor+1
+        ivar = (j-1)*(n_tor+1) + k
+        do l=1,nsub
+          s = real(l-1,8)/real(nsub-1,8)
+          do m=1,nsub
+            t = real(m-1,8)/real(nsub-1,8)
+            inode = (i-1)*nsub*nsub+(l-1)*nsub+m
+            if (k == n_tor+1) then  ! add only the cosine terms (i.e. sum at phi=0)
+              scalars(1,inode, ivar) = scalars(1, inode, (j-1)*(n_tor+1) + 1)  & 
+                                     + sum(scalars(1, inode, (j-1)*(n_tor+1)+2 : (j-1)*(n_tor+1)+n_tor:2))
+            else
+              call interp(node_list, element_list, i, j, k, s, t, P)
+              scalars(1,inode,ivar) = real(P,4)
+            end if
+          end do
         end do
       end do
     end do
   end do
-end do ! n_elements
-!$omp end parallel do
+  !$omp end parallel do
 
-! ------------- Write to VTK
-call write_vtk(filename,xyz, ien, etype, scalar_names, scalars, vector_names, vectors)
+#else
+
+  do mp=1, n_plane
+
+    toroidal_angle = real((mp - 1), 8) * 2.d0 * PI / n_plane / n_period 
+
+    ! Create points for each element
+    !$omp parallel do default(none) &
+    !$omp shared(element_list,nsub,node_list,n_fields,scalars,HZ, mp, toroidal_angle) &
+    !$omp private(i,j,k,l,m,inode,ivar,s,t,P,R,Z) schedule(static)
+    do i=1,element_list%n_elements
+      do j=1,n_fields
+        do k=1,n_tor+1
+          ivar = (j-1)*(n_tor+1) + k
+          do l=1,nsub
+            s = real(l-1,8)/real(nsub-1,8)
+            do m=1,nsub
+              t = real(m-1,8)/real(nsub-1,8)
+              inode = (i-1)*nsub*nsub+(l-1)*nsub+m
+              if (k == n_tor+1) then 
+                scalars(mp,inode, ivar) = sum(scalars(mp, inode, (j-1)*(n_tor+1)+1 : (j-1)*(n_tor+1)+n_tor))
+              else
+                call interp(node_list, element_list, i, j, k, s, t, P)
+                scalars(mp,inode,ivar) = real(P * HZ(k,mp), 4)
+              end if
+            end do
+          end do
+        end do
+      end do
+    end do
+    !$omp end parallel do
+
+  end do
+#endif
+
+#ifdef STELLARATOR_MODEL
+  do mp=1,n_plane
+    write(i_filename, '(A,A,I0.3,A)') filename(:len_trim(filename) - 4), "_proj_plane", mp, ".vtk"
+    call write_vtk(i_filename, xyz(mp,:,:), ien(mp,:,:), vtk_quad_type, scalar_names, scalars(mp,:,:))
+  enddo
+#else 
+  call write_vtk(filename, xyz(1,:,:), ien(1,:,:), vtk_quad_type, scalar_names, scalars(1,:,:))
+#endif
+
+  deallocate(scalars, scalar_names, vectors, vector_names)
 
 end subroutine write_particle_distribution_to_vtk
+
 
 subroutine close_projection(this)
   class(projection), intent(inout) :: this

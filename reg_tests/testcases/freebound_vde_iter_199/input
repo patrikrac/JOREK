@@ -1,5 +1,8 @@
 &in1
- restart        = .t.
+
+  central_mass = 2.01455279245
+
+  restart        = .t.
   nstep_n        = 0
   tstep_n        = 1.e-3
 

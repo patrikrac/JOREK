@@ -490,21 +490,21 @@ do ms=1, n_gauss
 
         ! the equations for collision frequency nu_e_bg and Coulomb lambda were taken from NRL plasmaformulary 2013 p.34
         ! equations were written down in cgs in the source and were modfied to match SI units below
-        if ((T0_i_corr*MASS_ELECTRON/(central_mass*MASS_PROTON)<T0_e_corr) .and. (T0_e_corr_eV<10)) then 
+        if ((T0_i_corr*MASS_ELECTRON/(central_mass*ATOMIC_MASS_UNIT)<T0_e_corr) .and. (T0_e_corr_eV<10)) then 
           lambda_e_bg  = 23.d0 - log((ne_SI*1.d-6)**0.5*T0_e_corr_eV**(-1.5)) ! Assuming bg_charge is 1! --> Coulomb lambda
-        else if ((T0_i_corr_eV*MASS_ELECTRON/(central_mass*MASS_PROTON) < 10) .and. (10<T0_e_corr_eV)) then
+        else if ((T0_i_corr_eV*MASS_ELECTRON/(central_mass*ATOMIC_MASS_UNIT) < 10) .and. (10<T0_e_corr_eV)) then
           lambda_e_bg  = 24.d0 - log((ne_SI*1.d-6)**0.5*T0_e_corr_eV**(-1.0))
         else
           lambda_e_bg  = 30.d0 - log((ne_SI*1.d-6)**0.5*T0_i_corr_eV**(-1.5)/MU_ZERO)
         end if
-        nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*MASS_PROTON*central_mass) ** 0.5&
+        nu_e_bg      = 1.8d-19*(1.d6*MASS_ELECTRON*ATOMIC_MASS_UNIT*central_mass) ** 0.5&
                      * (1.d14*central_density*rho0_corr) * lambda_e_bg &
-                     / (1.d3*(MASS_ELECTRON*T0_i_corr+T0_e_corr*MASS_PROTON*central_mass)&
+                     / (1.d3*(MASS_ELECTRON*T0_i_corr+T0_e_corr*ATOMIC_MASS_UNIT*central_mass)&
                      / (EL_CHG * MU_ZERO * central_density * 1.d20)) ** 1.5 ! Assuming bg_charge is 1! --> collision frequency
         if (nu_e_bg < 0.) nu_e_bg = 0.
       
         !Converting the energy transfer rate from s^-1 to JOREK unit
-        t_norm   = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20) ! normalization coefficient
+        t_norm   = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20) ! normalization coefficient
         nu_e_bg  = nu_e_bg * t_norm                                                     ! normalised collision frequency
 
         eq(var_dTe_i,0,0,0,:) = nu_e_bg * (T0_e_corr - T0_i_corr) * rho0_corr          ! dTe_i - temperature exchange term
@@ -512,9 +512,9 @@ do ms=1, n_gauss
         ! --- derivatives of dTe_i for amats (of temperatures and density)
         ! --- We negelect the coulomb log's derivatives due to their smallness
 
-        dnu_e_bg_dTi    = -1.5*MASS_ELECTRON*nu_e_bg*dT0_i_corr_dT / (MASS_ELECTRON*T0_i_corr + MASS_PROTON*central_mass*T0_e_corr)
-        dnu_e_bg_dTe    = -1.5*MASS_PROTON*central_mass*nu_e_bg*dT0_e_corr_dT &
-                        / (MASS_ELECTRON*T0_i_corr + MASS_PROTON*central_mass*T0_e_corr)
+        dnu_e_bg_dTi    = -1.5*MASS_ELECTRON*nu_e_bg*dT0_i_corr_dT / (MASS_ELECTRON*T0_i_corr + ATOMIC_MASS_UNIT*central_mass*T0_e_corr)
+        dnu_e_bg_dTe    = -1.5*ATOMIC_MASS_UNIT*central_mass*nu_e_bg*dT0_e_corr_dT &
+                        / (MASS_ELECTRON*T0_i_corr + ATOMIC_MASS_UNIT*central_mass*T0_e_corr)
 
         dnu_e_bg_drho   = nu_e_bg * drho0_corr_dn / rho0_corr
 

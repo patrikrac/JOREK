@@ -103,10 +103,10 @@ end subroutine teardown
 !> test set_t_norm
 subroutine test_set_t_norm()
   use phys_module, only: central_mass,central_density
-  use constants,   only: MU_ZERO,MASS_PROTON
+  use constants,   only: MU_ZERO,ATOMIC_MASS_UNIT
   implicit none
   real*8 :: t_norm_sol
-  t_norm_sol = sqrt(MU_ZERO*MASS_PROTON*central_mass*central_density*1.d20)
+  t_norm_sol = sqrt(MU_ZERO*ATOMIC_MASS_UNIT*central_mass*central_density*1.d20)
   call sim_sol%set_t_norm()
   call assert_equals(t_norm_sol,sim_sol%t_norm,tol_real8,&
   "Error particle_sim set t_norm: t_norm mismatch!")

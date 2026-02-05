@@ -338,7 +338,7 @@ subroutine do_particle_sputter(this, sim, ev)
   !> for deuterium and neutrals reflection instead of sputtering
   logical :: reflection, fast_reflection
   
-  delta_t = (tstep*sqrt((MU_ZERO * CENTRAL_MASS * MASS_PROTON * CENTRAL_DENSITY * 1.d20)))
+  delta_t = (tstep*sqrt((MU_ZERO * central_mass * ATOMIC_MASS_UNIT * CENTRAL_DENSITY * 1.d20)))
   
   if (this%last_diag_time .eq. 0.d0) then
     this%last_diag_time = sim%time - delta_t

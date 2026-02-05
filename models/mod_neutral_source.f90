@@ -70,7 +70,7 @@ module mod_neutral_source
     endif
     ! ===================================================================
 
-    t_norm = sqrt(MU_ZERO * central_mass * MASS_PROTON * central_density * 1.d20) ! Time normalization factor
+    t_norm = sqrt(MU_ZERO * central_mass * ATOMIC_MASS_UNIT * central_density * 1.d20) ! Time normalization factor
 
     t_loc = (t_now-t_ns) * t_norm
 
@@ -114,11 +114,11 @@ module mod_neutral_source
 
         ns_dNinj_dt = A_Dmv * K_Dmv * L_tube / V_Dmv * (5.d0)**(5.d0) * (6.d0)**(-6.d0) * f_dNbar_dt   ! Normalised number of injected particles per unit time
 
-        ns_drhon_dt = ns_dNinj_dt * (P_Dmv * 1.d5/(K_BOLTZ * 293)) * V_Dmv * 2.d0 * central_mass * MASS_PROTON ! Mass density per unit time (SI units)
+        ns_drhon_dt = ns_dNinj_dt * (P_Dmv * 1.d5/(K_BOLTZ * 293)) * V_Dmv * 2.d0 * central_mass * ATOMIC_MASS_UNIT ! Mass density per unit time (SI units)
     
         ! Apply gaussian shape (toroidally and poloidally) factor (normalized so that the number of particles injected does not depend on the shape)
         ! as well as JOREK normalization
-        rhon_source = (MU_ZERO)**(0.5d0)*(central_mass*MASS_PROTON*central_density*1.d20)**(-0.5d0) * ns_drhon_dt * ns_shape / V_ns
+        rhon_source = (MU_ZERO)**(0.5d0)*(central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**(-0.5d0) * ns_drhon_dt * ns_shape / V_ns
 
       elseif (ASDEX_MGI) then
 
@@ -141,10 +141,10 @@ module mod_neutral_source
           ns_dNinj_dt = - prof_temp*gam*V_Dmv*1.d3*P_Dmv*N_barlitre               ! Number of particles injected per unit time
         endif
 
-        ns_drhon_dt =  ns_dNinj_dt * central_mass * MASS_PROTON ! Mass density injected per unit time
+        ns_drhon_dt =  ns_dNinj_dt * central_mass * ATOMIC_MASS_UNIT ! Mass density injected per unit time
 
         ! Apply JOREK normalization
-        rhon_source = (MU_ZERO)**(0.5d0)*(central_mass*MASS_PROTON*central_density*1.d20)**(-0.5d0) * ns_drhon_dt * ns_shape / V_ns
+        rhon_source = (MU_ZERO)**(0.5d0)*(central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)**(-0.5d0) * ns_drhon_dt * ns_shape / V_ns
 
       else 
 
@@ -326,7 +326,7 @@ module mod_neutral_source
     call Integrals_3D(my_id,node_list,element_list,density,density_in,density_out,pressure,pressure_in,pressure_out, &
                       kin_par_tot, kin_par_in, kin_par_out, mom_par_tot, mom_par_in, mom_par_out,varmin,varmax)
 
-    total_n_particles_inj_all = total_n_particles_inj_all + total_n_particles_inj*tstep*sqrt(MU_ZERO*central_mass*MASS_PROTON*central_density*1.d20)
+    total_n_particles_inj_all = total_n_particles_inj_all + total_n_particles_inj*tstep*sqrt(MU_ZERO*central_mass*ATOMIC_MASS_UNIT*central_density*1.d20)
 
     if (my_id .eq. 0) then
       write(*,'(A,e14.6)') 'total neutrals particles injected per second = '                       , total_n_particles_inj

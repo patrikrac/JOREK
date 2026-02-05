@@ -34,8 +34,9 @@ integer    :: i, j, ms, mt, mp, k, l, index_ij, index_kl, index, xcase2
 integer    :: in, im, ij, kl, i_var, j_var
 real*8     :: wst, prefactor, xjac, xjac_x, xjac_y, x_p_x, x_p_y, y_p_x, y_p_y, BigR, phi
 real*8     :: R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint(2), Z_xpoint(2)
-real*8     :: psi_norm, reta, zeta, theta
+real*8     :: s_norm_s, psi_norm, psi_norm_R, psi_norm_Z, psi_norm_p, reta, zeta, theta
 real*8     :: v_px, v_py, u_px, u_py
+real*8     :: BR_R, BR_z, BR_p, Bz_R, Bz_z, Bz_p, Bp_R, Bp_z, Bp_p
 
 real*8, dimension(n_var)        :: rhs_ij
 real*8, dimension(n_var, n_var) :: amat_ij
@@ -55,7 +56,8 @@ real*8, dimension(:,:,:,:,:), pointer :: eq
 real*8, dimension(n_var)            :: eq_px, eq_py
 
 real*8, dimension(n_gauss,n_gauss) :: press_gvec
-real*8, dimension(n_dim+1,n_plane,n_gauss,n_gauss) :: B_gvec
+real*8, dimension(n_dim+1,n_plane,n_gauss,n_gauss) :: B_gvec, B_gvec_s, B_gvec_t, B_gvec_p
+           
 
 eq_g    => thread_struct(tid)%eq_g
 eq_s    => thread_struct(tid)%eq_s
@@ -80,6 +82,8 @@ theta = time_evol_theta
 ! change zeta for variable dt
 zeta  = time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
 
+s_norm_s = 1.d0/float(n_flux-1)
+
 !---------------------------------------------------- value of (x,y) and derivatives on Gaussian points
 x_g  = 0.d0; x_s   = 0.d0; x_t   = 0.d0; x_p = 0.d0; x_st  = 0.d0; x_ss  = 0.d0; x_tt  = 0.d0; x_sp = 0.d0; x_tp = 0.d0; x_pp = 0.d0;
 y_g  = 0.d0; y_s   = 0.d0; y_t   = 0.d0; y_p = 0.d0; y_st  = 0.d0; y_ss  = 0.d0; y_tt  = 0.d0; y_sp = 0.d0; y_tp = 0.d0; y_pp = 0.d0;
@@ -87,7 +91,7 @@ eq_g = 0.d0; eq_s  = 0.d0; eq_t  = 0.d0; eq_st = 0.d0; eq_ss = 0.d0; eq_tt = 0.d
 eq_p = 0.d0; eq_pp = 0.d0; eq_sp = 0.d0; eq_tp = 0.d0
 
 eq = 0.d0
-press_gvec = 0.d0; B_gvec = 0.d0
+press_gvec = 0.d0; B_gvec = 0.d0; B_gvec_s(:,:,:,:) = 0.d0; B_gvec_t(:,:,:,:) = 0.d0; B_gvec_p(:,:,:,:) = 0.d0
 s_norm = 0.d0
 
 do i=1,n_vertex_max
@@ -97,7 +101,7 @@ do i=1,n_vertex_max
      do mt=1, n_gauss
 
        press_gvec(ms,mt) = press_gvec(ms,mt) + nodes(i)%pressure(j)*element%size(i,j)*H(i,j,ms,mt)
-       s_norm(ms, mt) = s_norm(ms, mt) + nodes(i)%r_tor_eq(j)*element%size(i,j)*H(i,j,ms,mt)
+       s_norm(ms,mt)     = s_norm(ms,mt)     + nodes(i)%r_tor_eq(j)*element%size(i,j)*H(i,j,ms,mt)
 
        do mp=1,n_plane
          do in=1,n_coord_tor
@@ -126,6 +130,20 @@ do i=1,n_vertex_max
            B_gvec(1,mp,ms,mt) = B_gvec(1,mp,ms,mt) + nodes(i)%b_field(in,j,1)*element%size(i,j)*H(i,j,ms,mt)*HZ_coord(in,mp)
            B_gvec(2,mp,ms,mt) = B_gvec(2,mp,ms,mt) + nodes(i)%b_field(in,j,2)*element%size(i,j)*H(i,j,ms,mt)*HZ_coord(in,mp)
            B_gvec(3,mp,ms,mt) = B_gvec(3,mp,ms,mt) + nodes(i)%b_field(in,j,3)*element%size(i,j)*H(i,j,ms,mt)*HZ_coord(in,mp)
+
+           ! Interpolate s, t, and zeta derivatives
+           
+           B_gvec_s(1,mp,ms,mt) = B_gvec_s(1,mp,ms,mt) + nodes(i)%b_field(in,j,1)*element%size(i,j)*H_s(i,j,ms,mt)*HZ_coord(in,mp)
+           B_gvec_t(1,mp,ms,mt) = B_gvec_t(1,mp,ms,mt) + nodes(i)%b_field(in,j,1)*element%size(i,j)*H_t(i,j,ms,mt)*HZ_coord(in,mp)
+           B_gvec_p(1,mp,ms,mt) = B_gvec_p(1,mp,ms,mt) + nodes(i)%b_field(in,j,1)*element%size(i,j)*H(i,j,ms,mt)*HZ_coord_p(in,mp)
+           
+           B_gvec_s(2,mp,ms,mt) = B_gvec_s(2,mp,ms,mt) + nodes(i)%b_field(in,j,2)*element%size(i,j)*H_s(i,j,ms,mt)*HZ_coord(in,mp)
+           B_gvec_t(2,mp,ms,mt) = B_gvec_t(2,mp,ms,mt) + nodes(i)%b_field(in,j,2)*element%size(i,j)*H_t(i,j,ms,mt)*HZ_coord(in,mp)
+           B_gvec_p(2,mp,ms,mt) = B_gvec_p(2,mp,ms,mt) + nodes(i)%b_field(in,j,2)*element%size(i,j)*H(i,j,ms,mt)*HZ_coord_p(in,mp)
+          
+           B_gvec_s(3,mp,ms,mt) = B_gvec_s(3,mp,ms,mt) + nodes(i)%b_field(in,j,3)*element%size(i,j)*H_s(i,j,ms,mt)*HZ_coord(in,mp)
+           B_gvec_t(3,mp,ms,mt) = B_gvec_t(3,mp,ms,mt) + nodes(i)%b_field(in,j,3)*element%size(i,j)*H_t(i,j,ms,mt)*HZ_coord(in,mp)
+           B_gvec_p(3,mp,ms,mt) = B_gvec_p(3,mp,ms,mt) + nodes(i)%b_field(in,j,3)*element%size(i,j)*H(i,j,ms,mt)*HZ_coord_p(in,mp)
          end do
 
          do k=1,n_var
@@ -215,8 +233,38 @@ do ms=1, n_gauss
      eq(var_p0_gvec,0,0,0,1) = mu_zero*press_gvec(ms,mt)  ! Pressure, as imported from GVEC
      eq(var_B0x_gvec:var_B0p_gvec,0,0,0,1) = B_gvec(:,mp,ms,mt) ! Magnetic field, as imported from GVEC
      
+     ! Compute R, Z, phi derivatives
+     BR_R = ( y_t(mp,ms,mt)*B_gvec_s(1,mp,ms,mt) - y_s(mp,ms,mt)*B_gvec_t(1,mp,ms,mt))/xjac
+     BR_z = (-x_t(mp,ms,mt)*B_gvec_s(1,mp,ms,mt) + x_s(mp,ms,mt)*B_gvec_t(1,mp,ms,mt))/xjac
+     BR_p = B_gvec_p(1,mp,ms,mt) - x_p(mp,ms,mt)*BR_R - y_p(mp,ms,mt)*BR_z
+     eq(var_B0x_gvec,1,0,0,1) = BR_R   
+     eq(var_B0x_gvec,0,1,0,1) = BR_z  
+     eq(var_B0x_gvec,0,0,1,1) = BR_p
+
+     Bz_R = ( y_t(mp,ms,mt)*B_gvec_s(2,mp,ms,mt) - y_s(mp,ms,mt)*B_gvec_t(2,mp,ms,mt))/xjac
+     Bz_z = (-x_t(mp,ms,mt)*B_gvec_s(2,mp,ms,mt) + x_s(mp,ms,mt)*B_gvec_t(2,mp,ms,mt))/xjac
+     Bz_p = B_gvec_p(2,mp,ms,mt) - x_p(mp,ms,mt)*Bz_R - y_p(mp,ms,mt)*Bz_z
+     eq(var_B0y_gvec,1,0,0,1) = Bz_R     
+     eq(var_B0y_gvec,0,1,0,1) = Bz_z
+     eq(var_B0y_gvec,0,0,1,1) = Bz_p
+
+     Bp_R = ( y_t(mp,ms,mt)*B_gvec_s(3,mp,ms,mt) - y_s(mp,ms,mt)*B_gvec_t(3,mp,ms,mt))/xjac
+     Bp_z = (-x_t(mp,ms,mt)*B_gvec_s(3,mp,ms,mt) + x_s(mp,ms,mt)*B_gvec_t(3,mp,ms,mt))/xjac
+     Bp_p = B_gvec_p(3,mp,ms,mt) - x_p(mp,ms,mt)*Bp_R - y_p(mp,ms,mt)*Bp_z
+     eq(var_B0p_gvec,1,0,0,1) = Bp_R     
+     eq(var_B0p_gvec,0,1,0,1) = Bp_z
+     eq(var_B0p_gvec,0,0,1,1) = Bp_p
+
      psi_norm = s_norm(ms,mt)
-     
+     psi_norm_R = y_t(mp,ms,mt)*s_norm_s/xjac
+     psi_norm_Z = -x_t(mp,ms,mt)*s_norm_s/xjac
+     psi_norm_p = -x_p(mp,ms,mt)*psi_norm_R       - y_p(mp,ms,mt)*psi_norm_Z
+     eq(var_heaviside,0,0,0,1) = 0.5-0.5*tanh((psi_norm-j_cutoff_rcoord)/j_cutoff_sig)
+     eq(var_heaviside,1,0,0,1) = -psi_norm_R/(2*j_cutoff_sig * (cosh((psi_norm-j_cutoff_rcoord)/j_cutoff_sig)**2))
+     eq(var_heaviside,0,1,0,1) = -psi_norm_Z/(2*j_cutoff_sig * (cosh((psi_norm-j_cutoff_rcoord)/j_cutoff_sig)**2))
+     eq(var_heaviside,0,0,1,1) = -psi_norm_p/(2*j_cutoff_sig * (cosh((psi_norm-j_cutoff_rcoord)/j_cutoff_sig)**2))
+
+
      ! The Psi in the equations differs by a factor of F0 from the normal JOREK Psi
      eq(var_Psi,:,:,:,1) = eq(var_Psi,:,:,:,1)/F0
      eq( var_zj,:,:,:,1) = eq( var_zj,:,:,:,1)/F0
