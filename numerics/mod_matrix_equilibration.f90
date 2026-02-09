@@ -23,6 +23,9 @@ module mod_matrix_equilibration
     integer :: cc, cr
     real :: t1,t0
 
+    call system_clock(count=cc, count_rate=cr)
+    t0 =  real(cc)/cr
+
     call MPI_COMM_RANK(a_mat%comm, my_id, ierr)
 
     !< Routine parameter setup
@@ -66,10 +69,10 @@ module mod_matrix_equilibration
       col_conv = maxval(abs(1.d0 - (1.d0 / d2)**2)) < tol
       conv = row_conv .and. col_conv
 
-      if (my_id == 0) print *, "Iteration ", iter, ": max row scaling factor = ", maxval(abs(1.d0 - (1.d0 / d1)**2)), " max column scaling factor = ", maxval(abs(1.d0 - (1.d0 / d2)**2))
+      if (my_id .eq. 0) print *, "Iteration ", iter, ": max row scaling factor = ", maxval(abs(1.d0 - (1.d0 / d1)**2)), " max column scaling factor = ", maxval(abs(1.d0 - (1.d0 / d2)**2))
 
       if (conv) then
-        if (my_id == 0) print *, "Matrix equilibration converged in ", iter, " iterations."
+        if (my_id .eq. 0) print *, "Matrix equilibration converged in ", iter, " iterations."
         exit
       end if
 
@@ -78,6 +81,9 @@ module mod_matrix_equilibration
       a_mat%row_scaling = a_mat%row_scaling * d1
       a_mat%column_scaling = a_mat%column_scaling * d2
     enddo
+    call system_clock(count=cc, count_rate=cr)
+    t1 =  real(cc)/cr
+    if (my_id.eq.0) write(*,*) "Elapsed time matrix_equilibration (s) = ", t1 - t0
     a_mat%equilibrated = .true.
   end subroutine matrix_equilibration
 
