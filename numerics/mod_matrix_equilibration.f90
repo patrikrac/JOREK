@@ -69,7 +69,7 @@ module mod_matrix_equilibration
       col_conv = maxval(abs(1.d0 - (1.d0 / d2)**2)) < tol
       conv = row_conv .and. col_conv
 
-      if (my_id .eq. 0) print *, "Iteration ", iter, ": max row scaling factor = ", maxval(abs(1.d0 - (1.d0 / d1)**2)), " max column scaling factor = ", maxval(abs(1.d0 - (1.d0 / d2)**2))
+      if (verbose .and. (my_id .eq. 0)) print *, "Iteration ", iter, ": row residual = ", maxval(abs(1.d0 - (1.d0 / d1)**2)), " column residual = ", maxval(abs(1.d0 - (1.d0 / d2)**2))
 
       if (conv) then
         if (my_id .eq. 0) print *, "Matrix equilibration converged in ", iter, " iterations."
@@ -150,6 +150,7 @@ module mod_matrix_equilibration
 
     n_local_block = a_mat%my_ind_max - a_mat%my_ind_min + 1
 
+    !$omp parallel do private(i,j,ib,jb,row_idx,row_idx_start,col_idx,col_idx_start,val_idx,val_idx_start) schedule(static)
     do i = 1, n_local_block
       row_idx_start = (i-1)*a_mat%block_size + 1
       do j = a_mat%iblockptr(i), a_mat%iblockptr(i+1)-1
@@ -179,7 +180,7 @@ module mod_matrix_equilibration
     if (.not. a_mat%equilibrated) then
       return
     end if
-
+    !$omp parallel do private(i) schedule(static)
     do i = 1, a_mat%ng
       vec(i) = vec(i) * a_mat%row_scaling(i)
     end do
@@ -195,7 +196,7 @@ module mod_matrix_equilibration
     if (.not. a_mat%equilibrated) then
       return
     end if
-
+    !$omp parallel do private(i) schedule(static)
     do i = 1, a_mat%ng
       vec(i) = vec(i) * a_mat%column_scaling(i)
     end do
