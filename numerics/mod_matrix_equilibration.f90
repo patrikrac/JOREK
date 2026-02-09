@@ -49,19 +49,22 @@ module mod_matrix_equilibration
     a_mat%column_scaling = 1.d0
 
     do while (iter < maxit)
+      iter = iter + 1
       d1 = 0.d0; d2 = 0.d0
 
       call get_scaling_factors(a_mat, d1, d2)
 
       do i = 1, n
-        d1(i) = 1.0d0 / sqrt(d1(i))
-        d2(i) = 1.0d0 / sqrt(d2(i))
+        d1(i) = 1.d0 / sqrt(d1(i))
+        d2(i) = 1.d0 / sqrt(d2(i))
       end do
 
       ! Check convergence 
-      row_conv = maxval(abs(1.0d0 - (1.0d0 / d1)**2)) < tol
-      col_conv = maxval(abs(1.0d0 - (1.0d0 / d2)**2)) < tol
+      row_conv = maxval(abs(1.d0 - (1.d0 / d1)**2)) < tol
+      col_conv = maxval(abs(1.d0 - (1.d0 / d2)**2)) < tol
       conv = row_conv .and. col_conv
+
+      print *, "Iteration ", iter, ": max row scaling factor = ", maxval(abs(1.d0 - (1.d0 / d1)**2)), " max column scaling factor = ", maxval(abs(1.d0 - (1.d0 / d2)**2))
 
       if (conv) then
         if (my_id == 0) print *, "Matrix equilibration converged in ", iter, " iterations."
@@ -86,7 +89,7 @@ module mod_matrix_equilibration
     integer :: n_local, n_local_block
     real*8,   allocatable  :: R_local(:)
     integer,  allocatable  :: rc(:), rd(:)
-    integer :: ierr, my_id, n_cpu
+    integer :: ierr, n_cpu
 
     call MPI_COMM_SIZE(a_mat%comm, n_cpu, ierr)
     n_local_block = a_mat%my_ind_max - a_mat%my_ind_min + 1
