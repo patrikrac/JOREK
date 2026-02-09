@@ -73,7 +73,7 @@ module mod_matrix_equilibration
 
       call scale_matrix(a_mat, d1, d2)
 
-      a_mat%row_scaling =  a_mat%row_scaling * d1
+      a_mat%row_scaling = a_mat%row_scaling * d1
       a_mat%column_scaling = a_mat%column_scaling * d2
     enddo
 
@@ -149,7 +149,7 @@ module mod_matrix_equilibration
         col_idx_start = a_mat%jcn(val_idx_start)
         do ib = 1, a_mat%block_size
           do jb = 1, a_mat%block_size
-            row_idx = row_idx_start + ib - 1
+            row_idx = row_idx_start + ib - 1 + (a_mat%my_ind_min - 1)*a_mat%block_size
             col_idx = col_idx_start + jb - 1
             val_idx = val_idx_start + (ib-1)*a_mat%block_size + (jb-1)
 
