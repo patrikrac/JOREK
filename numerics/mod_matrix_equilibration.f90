@@ -3,12 +3,12 @@ module mod_matrix_equilibration
   use data_structure, only: type_SP_MATRIX
   implicit none
 
-  public :: martix_equilibration, scale_matrix, scale_vector_row, scale_vector_column
+  public :: matrix_equilibration, scale_matrix, scale_vector_row, scale_vector_column
   private
 
   contains 
 
-  subroutine martix_equilibration(a_mat)
+  subroutine matrix_equilibration(a_mat)
     type(type_SP_MATRIX), intent(inout) :: a_mat
 
     ! Internal variables 
@@ -74,7 +74,7 @@ module mod_matrix_equilibration
       a_mat%column_scaling = a_mat%column_scaling * d2
     enddo
 
-  end subroutine martix_equilibration
+  end subroutine matrix_equilibration
 
   subroutine get_scaling_factors(a_mat, R, C)
     type(type_SP_MATRIX), intent(in) :: a_mat
