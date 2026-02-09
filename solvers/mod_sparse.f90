@@ -33,7 +33,7 @@ module mod_sparse
     use mod_aar, only: aar_driver
 #endif
     use matio_module, only: save_mat_h5
-    use sorting_module, only : convert_sorting, set_csr_permutations
+    use sorting_module, only : convert_sorting, set_block_csr_permutations
     use mpi_mod
 #ifdef USE_GPU
     use omp_lib, only: omp_target_memcpy, omp_get_initial_device, omp_get_default_device, omp_target_is_present
@@ -205,8 +205,8 @@ module mod_sparse
 #ifdef USE_BICGSTAB
       call bicgstab_driver(a_mat, rhs_vec, sol_vec, solver)
 #else
-      if (.not.a_mat%csr_mapped) then
-        call set_csr_permutations(a_mat=a_mat, irn=a_mat%irn)
+      if (.not. a_mat%bcsr_mapped) then
+        call set_block_csr_permutations(a_mat)
       endif
 
 # ifdef USE_GPU

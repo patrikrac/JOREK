@@ -4,20 +4,10 @@ module mod_aar
   use mpi_mod
   use mod_sparse_data, only: pastix, mumps, strumpack
   use mod_integer_types
+  use mod_matv
 
   private
   public :: aar_driver
-  
-  interface
-    subroutine cmatv(x, y, a, iptr, jcn, csr, n, nl, block_size, gpu, commg) bind(C)
-      use iso_c_binding
-      implicit none
-      integer :: commg
-      integer :: n, nl, block_size
-      type(c_ptr) :: x, y, a, iptr, jcn, csr
-      logical :: gpu
-    end subroutine cmatv
-  end interface
 
 contains
 
@@ -61,8 +51,7 @@ subroutine aar_driver(a_mat,b,x,n,solver)
   allocate(X_(n*m), F_(n*m), r(n), r_prev(n), x_prev(n), z(m), FtF(m*m), ipiv(m))
 
   ! --- r = A * x ---
-  call cmatv(c_loc(x), c_loc(r), c_loc(a_mat%val), c_loc(a_mat%iptr), c_loc(a_mat%jcn), &
-              c_loc(a_mat%coo_to_csr_map), a_mat%ng, a_mat%nr, a_mat%block_size, solver%gpu, a_mat%comm)
+  call bcsr_matv(a_mat, x, r)
 
   ! --- r = b - r (residual) ---
   call daxpby(n, 1.d0, b(1:n), 1, -1.d0, r(1:n), 1)
@@ -127,8 +116,7 @@ subroutine aar_driver(a_mat,b,x,n,solver)
 
     nrit = nrit + 1
     totit = totit + 1
-    call cmatv(c_loc(x), c_loc(r), c_loc(a_mat%val), c_loc(a_mat%iptr), c_loc(a_mat%jcn), &
-              c_loc(a_mat%coo_to_csr_map), a_mat%ng, a_mat%nr, a_mat%block_size, solver%gpu, a_mat%comm)
+    call bcsr_matv(a_mat, x, r)
 
     ! --- r = b - r (residual) ---
     call daxpby(n, 1.d0, b(1:n), 1, -1.d0, r(1:n), 1)

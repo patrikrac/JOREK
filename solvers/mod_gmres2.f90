@@ -4,21 +4,10 @@ module mod_gmres2
   use mpi_mod
   use mod_sparse_data, only: pastix, mumps, strumpack
   use mod_integer_types
+  use mod_matv
 
   private
   public :: gmres2_driver
-  
-  interface
-    subroutine cmatv(x, y, a, iptr, jcn, csr, n, nl, block_size, gpu, commg) bind(C)
-      use iso_c_binding
-      implicit none
-      integer :: commg
-      integer :: n, nl, block_size
-      type(c_ptr) :: x, y, a, iptr, jcn, csr
-      logical :: gpu
-    end subroutine cmatv
-  end interface
-
 contains
 
 !> solve a_mat x=b using iterative GMRES method with left preconditioning
@@ -77,8 +66,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
   do while (no_conv)
     ! --- v_1 = A * x ---
-    call cmatv(c_loc(x), c_loc(V(1)), c_loc(a_mat%val), c_loc(a_mat%iptr), c_loc(a_mat%jcn), &
-               c_loc(a_mat%coo_to_csr_map), a_mat%ng, a_mat%nr, a_mat%block_size, solver%gpu, a_mat%comm)
+    call bcsr_matv(a_mat, x, V(1:n))
     
     ! --- v_1 = M^-1 v_1 ---
     call prec(solver, V(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
@@ -103,8 +91,8 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     do it = 1, restart
       totit = totit +1
       ! --- v_j+1 = A * v_j --- 
-      call cmatv(c_loc(V((it-1)*n+1)), c_loc(V(it*n+1)), c_loc(a_mat%val), c_loc(a_mat%iptr), c_loc(a_mat%jcn), &
-                 c_loc(a_mat%coo_to_csr_map), a_mat%ng, a_mat%nr, a_mat%block_size, solver%gpu, a_mat%comm)
+      call bcsr_matv(a_mat, V((it-1)*n+1:it*n), V(it*n+1: (it+1)*n))
+      
       ! --- v_j+1 = M^-1 v_j+1 --- 
       call prec(solver, V(it*n+1:it*n+n), V(it*n+1:it*n+n), n, MPI_GLOB, MPI_COMM_N)
 

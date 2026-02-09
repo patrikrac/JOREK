@@ -6,7 +6,7 @@ module sorting_module
   use mod_integer_types
   implicit none
   private
-  public remove_duplicates, convert2csr, convert_sorting, set_csr_permutations
+  public remove_duplicates, convert2csr, convert_sorting, set_block_csr_permutations
 
 #define INTSIZE 8
 #define CINT c_int64_t
@@ -202,7 +202,6 @@ contains
     integer, intent(in) :: block_size
     integer(kind=int_all), dimension(:), pointer :: irn, jcn
     real(kind=c_double), dimension(:), pointer   :: val
-    logical :: csr_mapped
 
     integer(kind=int_all), dimension(:), allocatable :: jcn_tmp, indmin, indmax, iblock, iptr
     real(kind=c_double),  dimension(:), allocatable :: val_tmp
@@ -303,26 +302,19 @@ contains
 
 end subroutine convert_sorting
 
-subroutine set_csr_permutations(a_mat, irn)
+
+subroutine set_block_csr_permutations(a_mat)
     use, intrinsic :: iso_c_binding
     use mod_integer_types
     use data_structure, only: type_SP_MATRIX
 
-    type(type_SP_MATRIX) :: a_mat
-    integer(kind=int_all) :: nnz
-    integer :: block_size
-    integer(kind=int_all), dimension(:), pointer :: irn
+    type(type_SP_MATRIX), intent(inout) :: a_mat
+    integer(kind=int_all) :: nnz, nnz_blocks
+    integer :: block_size, block_size_2
 
-    integer(kind=int_all), dimension(:), allocatable :: indmin, indmax, iblock
-    integer(kind=int_all), dimension(:), allocatable :: map_tmp
-
-    integer(kind=c_int), dimension(:), pointer   :: iptr => Null()
-    integer(kind=int_all), dimension(:), pointer :: csr_map => Null()
-
-    integer(kind=int_all) :: i, j, nloc, n1, n2, ni, irn0, cnt, idum, n_block
+    integer(kind=int_all) :: irn0
+    integer(kind=int_all) :: i, i_glob, j, nloc, nblockloc, index_offset
     integer :: n_irn_block, ib
-
-    logical :: check
 
     integer :: cc, cr
     real t0, t1
@@ -330,134 +322,80 @@ subroutine set_csr_permutations(a_mat, irn)
     call system_clock(count=cc, count_rate=cr)
     t0 = real(cc)/cr
 
-#ifdef USE_GPU
-  !$omp target update from(irn) if(a_mat%device_mapped)
-#endif
-
-    block_size = a_mat%block_size
     nnz = a_mat%nnz
-    
-    irn0 = minval(irn(1:nnz))
-    nloc = maxval(irn(1:nnz)) - irn0 + 1
+    block_size = a_mat%block_size
+    block_size_2 = block_size * block_size
+
+    irn0 = minval(a_mat%irn(1:nnz))
+    !write(*,*) "Row number base :", irn0
+    nloc = maxval(a_mat%irn(1:nnz)) - irn0 + 1
     if (a_mat%nr.ne.nloc) then
       write(*,*) "ERROR in matrix strucutre"
       call exit(1)
     endif
-    irn(1:nnz) = irn(1:nnz) - irn0 + 1  ! adjust irn to be one-based
-    n_block = nnz/block_size
-
-    !write(*,'(A,I10,X,A,I10,X,A,I10,X,A,I10,X,A,I10)')  "nloc", nloc, "nnz", nnz, "block_size", block_size, &
-    !                                                    "n_block", n_block, "residue", mod(nnz, block_size)
-        
-    allocate(indmin(nloc), indmax(nloc))
-    
-    if (.not.associated(a_mat%iptr)) then 
-      allocate(a_mat%iptr(nloc+1))
-      iptr => a_mat%iptr(1:nloc+1)
-#ifdef USE_GPU
-      !$omp target enter data map(alloc: a_mat%iptr(1:nloc+1)) if(a_mat%device_mapped)
-#endif
-    else
-      iptr => a_mat%iptr(1:nloc+1)
-    endif
-    if (.not.associated(a_mat%coo_to_csr_map)) then
-      allocate(a_mat%coo_to_csr_map(n_block))
-      csr_map => a_mat%coo_to_csr_map(1:n_block)
-#ifdef USE_GPU
-      !$omp target enter data map(alloc: a_mat%coo_to_csr_map(1:n_block)) if(a_mat%device_mapped)
-#endif
-    else
-      csr_map => a_mat%coo_to_csr_map(1:n_block)
-    endif
-   
-    a_mat%iptr(1:a_mat%nr+1) = 0
-    indmin = nnz
-    indmax = 1
-    a_mat%iptr(1) = 1
-    
-    ! Fill in iptr, indmin, and indmax arrays
-    do i = 1, nnz, block_size
-        a_mat%iptr(irn(i) + 1) = a_mat%iptr(irn(i) + 1) + block_size
-        indmin(irn(i)) = min(indmin(irn(i)), i)
-        indmax(irn(i)) = max(indmax(irn(i)), i + block_size - 1)
-    enddo
-    
-    do i = 2, nloc + 1
-        a_mat%iptr(i) = a_mat%iptr(i) + a_mat%iptr(i-1)
-    enddo
-
-    if ((a_mat%iptr(nloc+1)-1) /= nnz) then
-      write(*,*) "ERROR in matrix strucutre: iptr(nloc+1) != nnz", a_mat%iptr(nloc+1)-1
+    !a_mat%irn(1:nnz) = a_mat%irn(1:nnz) - irn0 + 1  ! adjust irn to be one-based
+    nblockloc = nloc / block_size
+    if (nblockloc * block_size .ne. nloc) then
+      write(*,*) "ERROR in matrix structure: nloc not multiple of block_size"
       call exit(1)
     endif
 
-    ! Initialize coo_to_csr_map with original indices
-    do i = 1, n_block
-      a_mat%coo_to_csr_map(i) = i
-    enddo
+    nnz_blocks = nnz / block_size_2
 
-    ! Determine the number of irn-blocks
-    n_irn_block = 1
-    do idum = 2, nloc
-        if (indmin(idum) > indmax(idum - 1)) n_irn_block = n_irn_block + 1
-    enddo
-
-    allocate(iblock(n_irn_block + 1))
-    iblock(1) = 1
-    iblock(n_irn_block + 1) = nloc + 1
-    ib = 2
-
-    do idum = 2, nloc
-        if (indmin(idum) > indmax(idum - 1)) then
-            iblock(ib) = idum  ! min irn belonging to block
-            ib = ib + 1
-        endif
-    enddo
-
-    ! Find maximal block size for temporary buffer allocation
-    ni = 0
-    do ib = 1, n_irn_block
-        n1 = indmin(iblock(ib))
-        n2 = indmax(iblock(ib + 1) - 1)
-        ni = max(ni, n2 - n1 + 1)
-    enddo
-
-    allocate(map_tmp(max(1,ni/block_size)))
-
-!$omp parallel do private(map_tmp, cnt, n1, n2, ni, idum, i, ib) shared(irn, iblock, indmin, indmax, a_mat, block_size)
-    do ib = 1, n_irn_block
-        cnt = 1
-        n1 = indmin(iblock(ib))
-        n2 = indmax(iblock(ib + 1) - 1)
-        ni = n2 - n1 + 1
-        do idum = iblock(ib), iblock(ib + 1) - 1
-            do i = indmin(idum), indmax(idum), block_size
-                if (irn(i) == idum) then
-                    map_tmp((cnt-1)/block_size + 1) = a_mat%coo_to_csr_map((i-1)/block_size + 1)  ! Update the map
-                    cnt = cnt + block_size
-                endif
-            enddo
-        enddo
-        a_mat%coo_to_csr_map((n1-1)/block_size+1:(n2-1)/block_size+1) = map_tmp(1:ni/block_size)  ! Store the final mapping
-    enddo
-    deallocate(map_tmp)
+    index_offset = (a_mat%my_ind_min - 1)*block_size
     
-    !do i=1,nloc+1
-    !  a_mat%irn(i) = a_mat%iptr(i)
-    !enddo
+    if (nnz_blocks * block_size_2 .ne. nnz) then
+      write(*,*) "ERROR in matrix structure: nnz not multiple of block_size^2"
+      call exit(1)
+    endif
+
+     !write(*,*) "Setting block CSR permutations, nnz =", nnz, " nloc =", nloc, " nblockloc =", nblockloc, &
+     !           " block_size =", block_size, " nnz_blocks =", nnz_blocks
+
+    if (.not.associated(a_mat%iblockptr)) then 
+      allocate(a_mat%iblockptr(nblockloc+1))
 #ifdef USE_GPU
-    !$omp target update to(a_mat%iptr(1:nloc+1), a_mat%coo_to_csr_map(1:n_block)) if(a_mat%device_mapped)
+      !$omp target enter data map(alloc: a_mat%iblockptr(1:nblockloc+1))
 #endif
-    
-    a_mat%csr_mapped = .true.
+    endif
 
-    deallocate(indmin, indmax)
-    deallocate(iblock)
+    if (.not. associated(a_mat%jcn_block)) then
+      allocate(a_mat%jcn_block(nnz_blocks))
+#ifdef USE_GPU
+      !$omp target enter data map(alloc: a_mat%jcn_block(1:nnz_blocks))
+#endif
+    endif
+
+    a_mat%iblockptr(1:nblockloc+1) = 0
+    a_mat%iblockptr(1) = 1
+    do i = 1, nnz_blocks
+        i_glob = (i - 1) * block_size_2 + 1
+        j = ((a_mat%irn(i_glob)-index_offset) / block_size) + 1
+        a_mat%jcn_block(i) = (a_mat%jcn(i_glob) / block_size) + 1
+        a_mat%iblockptr(j+1) = a_mat%iblockptr(j+1) + 1
+    enddo
+
+    
+    
+    do i = 2, nblockloc + 1
+        a_mat%iblockptr(i) = a_mat%iblockptr(i) + a_mat%iblockptr(i-1)
+    enddo
+
+    if ((a_mat%iblockptr(nblockloc+1)-1) /= nnz_blocks) then
+      write(*,*) "ERROR in matrix strucutre: iblockptr(nblockloc+1) != nnz_blocks", a_mat%iblockptr(nblockloc+1) - 1
+      call exit(1)
+    endif
 
     call system_clock(count=cc, count_rate=cr)
     t1 = real(cc) / cr
-    write(*,*) "set_csr_permutation time (s) =", t1 - t0
+    write(*,*) "set_block_csr_permutation time (s) =", t1 - t0
 
-end subroutine set_csr_permutations
+#ifdef USE_GPU
+    !$omp target update to(a_mat%iblockptr(1:nblockloc+1), a_mat%jcn_block(1:nnz_blocks))
+#endif
+
+    a_mat%bcsr_mapped = .true.
+
+end subroutine set_block_csr_permutations
 
 end module sorting_module
