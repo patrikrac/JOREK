@@ -20,6 +20,8 @@ module mod_matrix_equilibration
     logical :: verbose
     logical :: conv, row_conv, col_conv
     integer :: ierr, my_id
+    integer :: cc, cr
+    real :: t1,t0
 
     call MPI_COMM_RANK(a_mat%comm, my_id, ierr)
 
@@ -64,7 +66,7 @@ module mod_matrix_equilibration
       col_conv = maxval(abs(1.d0 - (1.d0 / d2)**2)) < tol
       conv = row_conv .and. col_conv
 
-      print *, "Iteration ", iter, ": max row scaling factor = ", maxval(abs(1.d0 - (1.d0 / d1)**2)), " max column scaling factor = ", maxval(abs(1.d0 - (1.d0 / d2)**2))
+      if (my_id == 0) print *, "Iteration ", iter, ": max row scaling factor = ", maxval(abs(1.d0 - (1.d0 / d1)**2)), " max column scaling factor = ", maxval(abs(1.d0 - (1.d0 / d2)**2))
 
       if (conv) then
         if (my_id == 0) print *, "Matrix equilibration converged in ", iter, " iterations."
@@ -76,7 +78,7 @@ module mod_matrix_equilibration
       a_mat%row_scaling = a_mat%row_scaling * d1
       a_mat%column_scaling = a_mat%column_scaling * d2
     enddo
-
+    a_mat%equilibrated = .true.
   end subroutine matrix_equilibration
 
   subroutine get_scaling_factors(a_mat, R, C)
@@ -161,6 +163,7 @@ module mod_matrix_equilibration
 
   end subroutine scale_matrix
 
+
   subroutine scale_vector_row(a_mat, vec)
     type(type_SP_MATRIX), intent(in) :: a_mat
     real*8, dimension(:), intent(inout) :: vec
@@ -175,6 +178,7 @@ module mod_matrix_equilibration
       vec(i) = vec(i) * a_mat%row_scaling(i)
     end do
   end subroutine scale_vector_row
+
 
   subroutine scale_vector_column(a_mat, vec)
     type(type_SP_MATRIX), intent(in) :: a_mat
