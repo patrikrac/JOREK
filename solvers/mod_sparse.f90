@@ -17,7 +17,7 @@ module mod_sparse
     use mod_simulation_data, only: type_MHD_SIM
     use mod_sparse_data, only: type_SP_SOLVER, mumps, pastix, strumpack
     use mod_preconditioner, only: initialize_preconditioner, reset_preconditioner, update_pc_rhs, gather_solution
-    use mod_matrix_equilibration, only: matrix_equilibration, scale_by_rows, scale_by_cols
+    use mod_matrix_equilibration, only: matrix_equilibration, scale_vector_row, scale_vector_column
 #ifdef DIRECT_CONSTRUCTION
     use mod_direct_construction, only: update_pc_mat
 #else
@@ -160,7 +160,7 @@ module mod_sparse
       endif
 
       call matrix_equilibration(a_mat)
-      call scale_by_rows(a_mat, rhs_vec%val)
+      call scale_vector_row(a_mat, rhs_vec%val)
 
       if (.not.solver%pc%initialized) then
         call initialize_preconditioner(solver%pc,a_mat%comm)
@@ -245,7 +245,7 @@ module mod_sparse
 
 #endif 
 
-      call scale_by_cols(a_mat, sol_vec%val)
+      call scale_vector_column(a_mat, sol_vec%val)
  
       if (verbose) write(*,'(A32,I5)') 'Number of iterations: ', solver%iter_gmres
 
