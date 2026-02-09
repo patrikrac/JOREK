@@ -114,7 +114,7 @@ module mod_matrix_equilibration
     enddo  
 
     ! Communicate to get global max values for rows and columns
-    call MPI_AllReduce(C, C, a_mat%ng, MPI_DOUBLE_PRECISION, MPI_MAX, a_mat%comm, ierr)
+    call MPI_AllReduce(MPI_IN_PLACE, C, a_mat%ng, MPI_DOUBLE_PRECISION, MPI_MAX, a_mat%comm, ierr)
 
     allocate(rc(n_cpu),rd(n_cpu))
     call MPI_Allgather(n_local, 1, MPI_INT, rc, 1, MPI_INT, a_mat%comm, ierr)
