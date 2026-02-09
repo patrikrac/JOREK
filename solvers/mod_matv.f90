@@ -151,13 +151,11 @@ contains
 
     allocate(rc(n_cpu),rd(n_cpu))
     call MPI_Allgather(n_local, 1, MPI_INT, rc, 1, MPI_INT, a_mat%comm, ierr)
-    if (my_id.eq.0) write(*,*) "rc", rc(1:n_cpu)
 
     rd(1) = 0
     do i = 2, n_cpu
       rd(i) = rd(i-1) + rc(i-1)
     enddo
-    if (my_id.eq.0) write(*,*) "rc", rc(1:n_cpu)
 
     call MPI_Allgatherv(b_tmp,n_local,MPI_DOUBLE_PRECISION,b,rc,rd,MPI_DOUBLE_PRECISION,a_mat%comm,ierr)
     deallocate(b_tmp, b_tmp_block)

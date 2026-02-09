@@ -17,6 +17,7 @@ module mod_sparse
     use mod_simulation_data, only: type_MHD_SIM
     use mod_sparse_data, only: type_SP_SOLVER, mumps, pastix, strumpack
     use mod_preconditioner, only: initialize_preconditioner, reset_preconditioner, update_pc_rhs, gather_solution
+    use mod_matrix_equilibration, only: martix_equilibration
 #ifdef DIRECT_CONSTRUCTION
     use mod_direct_construction, only: update_pc_mat
 #else
@@ -154,6 +155,13 @@ module mod_sparse
       endif
       solver%solve_only = (solver%solve_only).or.(solver%newton%it.gt.1) ! no PC update within Newton loop
 
+      if (.not. a_mat%bcsr_mapped) then
+        call set_block_csr_permutations(a_mat)
+      endif
+
+      call martix_equilibration(a_mat)
+      call scale_by_rows(a_mat, rhs_vec%val)
+
       if (.not.solver%pc%initialized) then
         call initialize_preconditioner(solver%pc,a_mat%comm)
         ! set whether to distribute pc matrix when constructing by communication
@@ -205,9 +213,6 @@ module mod_sparse
 #ifdef USE_BICGSTAB
       call bicgstab_driver(a_mat, rhs_vec, sol_vec, solver)
 #else
-      if (.not. a_mat%bcsr_mapped) then
-        call set_block_csr_permutations(a_mat)
-      endif
 
 # ifdef USE_GPU
       !$omp target update from(rhs_vec%val)
@@ -239,6 +244,8 @@ module mod_sparse
 # endif
 
 #endif 
+
+      call scale_by_cols(a_mat, sol_vec%val)
  
       if (verbose) write(*,'(A32,I5)') 'Number of iterations: ', solver%iter_gmres
 
