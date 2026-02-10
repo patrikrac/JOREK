@@ -131,7 +131,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 export_aux_node_list, xpoint_search_tries,          &
                 use_manual_random_seed, manual_seed,                &
                 use_fixed_rng_value, fixed_rng_value,               &            
-                bgf_rpolar, bgf_tht, eps_noise  
+                bgf_rpolar, bgf_tht, eps_noise, use_matrix_equilibration 
 
 
 if (my_id .eq. 0) then

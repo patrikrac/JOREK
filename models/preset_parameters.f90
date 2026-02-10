@@ -885,5 +885,6 @@ manual_seed = 498932990          !< chosen arbitarily
 use_fixed_rng_value = .false.
 fixed_rng_value = 0.5
 eps_noise = 0.0d0
+use_matrix_equilibration = .false.
 
 end subroutine preset_parameters

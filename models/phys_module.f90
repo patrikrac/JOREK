@@ -100,6 +100,7 @@ module phys_module
   logical :: export_polar_boundary !< Option to export boundary.txt even in the case of a polar boundary.
 
   real*8  :: eps_noise         !< Tolerance for noise reduction
+  logical :: use_matrix_equilibration !< Use matrix equilibration for the iterative solver (Improves condition number of the matrix)
 
   ! --- RESISTIVITY SWITCHES FOR AR AND AZ EQUATIONS
   ! --- 1.

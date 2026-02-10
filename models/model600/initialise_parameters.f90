@@ -219,7 +219,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 use_manual_random_seed, manual_seed,                &
                 use_fixed_rng_value, fixed_rng_value,               &            
                 loop_voltage, export_aux_node_list,                 &
-                eps_noise                        
+                eps_noise, use_matrix_equilibration                       
 
 
 if (my_id .eq. 0) then

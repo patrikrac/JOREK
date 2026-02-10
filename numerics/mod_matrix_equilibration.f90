@@ -3,7 +3,7 @@ module mod_matrix_equilibration
   use data_structure, only: type_SP_MATRIX
   implicit none
 
-  public :: matrix_equilibration, scale_matrix, scale_vector_row, scale_vector_column
+  public :: matrix_equilibration, scale_matrix, scale_vector_row, scale_vector_column, scale_vector_row_inverse, scale_vector_column_inverse
   private
 
   contains 
@@ -201,5 +201,37 @@ module mod_matrix_equilibration
       vec(i) = vec(i) * a_mat%column_scaling(i)
     end do
   end subroutine scale_vector_column
+
+
+  subroutine scale_vector_row_inverse(a_mat, vec)
+    type(type_SP_MATRIX), intent(in) :: a_mat
+    real*8, dimension(:), intent(inout) :: vec
+
+    integer :: i
+
+    if (.not. a_mat%equilibrated) then
+      return
+    end if
+    !$omp parallel do private(i) schedule(static)
+    do i = 1, a_mat%ng
+      vec(i) = vec(i) / a_mat%row_scaling(i)
+    end do
+  end subroutine scale_vector_row_inverse
+
+
+  subroutine scale_vector_column_inverse(a_mat, vec)
+    type(type_SP_MATRIX), intent(in) :: a_mat
+    real*8, dimension(:), intent(inout) :: vec
+
+    integer :: i
+
+    if (.not. a_mat%equilibrated) then
+      return
+    end if
+    !$omp parallel do private(i) schedule(static)
+    do i = 1, a_mat%ng
+      vec(i) = vec(i) / a_mat%column_scaling(i)
+    end do
+  end subroutine scale_vector_column_inverse
 
 end module mod_matrix_equilibration
