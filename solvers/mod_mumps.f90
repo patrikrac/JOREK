@@ -21,7 +21,7 @@ module mod_mumps
   end type type_MUMPS_SOLVER
   
   private
-  public :: type_MUMPS_SOLVER, mumps_initialize, mumps_analyze, mumps_factorize, mumps_solve, mumps_solve_multiple, mumps_finalize
+  public :: type_MUMPS_SOLVER, mumps_initialize, mumps_analyze, mumps_factorize, mumps_solve, mumps_solve_multiple, mumps_finalize, mumps_set_solve_transpose
   
   contains
   
@@ -191,6 +191,18 @@ module mod_mumps
     call DMUMPS(mmss%mumps_par)
 
   end subroutine mumps_solve_multiple
+
+  subroutine mumps_set_solve_transpose(mmss, transpose)
+    type(type_MUMPS_SOLVER) :: mmss
+    logical :: transpose
+
+    if (transpose) then
+      mmss%mumps_par%icntl(9) = 0 ! Solve the transposed system A^T x = b icntl(9) /= 1
+    else
+      mmss%mumps_par%icntl(9) = 1 ! Solve the regular system A x = b icntl(9) = 1
+    endif
+  end subroutine mumps_set_solve_transpose
+
 
   subroutine mumps_finalize(mmss)
     implicit none
