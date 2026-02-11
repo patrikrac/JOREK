@@ -30,7 +30,7 @@ contains
         call MPI_COMM_RANK(a_mat%comm, my_id, info)
 
         ! Parameters
-        k_max = 500
+        k_max = 300
         n = a_mat%ng
         n_rows_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
 
@@ -148,231 +148,139 @@ contains
         enddo
     end subroutine reorthogonalize
 
-! Experimental implementation of LSMR-based condition number estimator (Not working well yet, needs debugging)
+! Second implementation using LU factorization
     subroutine estimate_condition_number_2(a_mat, cond_est)
         type(type_SP_MATRIX), intent(in) :: a_mat
         real*8, intent(out) :: cond_est
+        
+        real*8              :: min_sv, max_sv
+        real*8,allocatable  :: dummy_vec(:)
+        integer             :: my_id, ierr
 
-        ! -- External BLAS functions --
-        real*8, external :: dnrm2, ddot
-        
-        ! -- Local Constants --
-        integer, parameter :: MAX_ITER = 500  ! Increase if convergence is poor
-        real*8, parameter :: ONE = 1.0d0
-        real*8, parameter :: ZERO = 0.0d0
-        
-        ! -- Local Arrays (Allocatable for safety) --
-        real*8, allocatable :: U(:,:), V(:,:)
-        real*8, allocatable :: u_tmp(:), v_tmp(:)
-        
-        ! -- GKL/LSMR Scalars --
-        real*8 :: alpha, beta
-        real*8 :: alphabar, zetabar
-        real*8 :: rho, c, s, chat, shat, alphahat
-        real*8 :: normA2, min_rbar
-        real*8 :: sigma_max, sigma_min
-        
-        ! -- Loop Indices and dims --
-        integer :: m, n, j, k, pass
-        real*8 :: d
+        call MPI_COMM_RANK(a_mat%comm, my_id, ierr)
 
-        integer :: my_id, ierr, info
-        logical :: verbose = .false.
+        allocate(dummy_vec(a_mat%ng))
+        dummy_vec = 0.d0
 
-        call MPI_COMM_RANK(a_mat%comm, my_id, info)
-        
-        ! 1. Get dimensions (Adjust %m / %n to match your struct)
-        n = a_mat%ng
-        m = n
-        
-        ! 2. Allocate Basis Vectors
-        !    U is (m, MAX_ITER+1), V is (n, MAX_ITER+1)
-        allocate(U(m, MAX_ITER + 1))
-        allocate(V(n, MAX_ITER + 1))
-        allocate(u_tmp(m))
-        allocate(v_tmp(n))
-        
-        ! 3. Initialize GKL Process
-        !    Start with random V_1 (Recommended to find min eigenvalue)
-        if (my_id .eq. 0) then
-            call random_number(v_tmp)
-        endif
-        ! Send the random initial vector to all processes
-        call MPI_BCAST(v_tmp, n, MPI_DOUBLE_PRECISION, 0, a_mat%comm, ierr) 
-        
-        ! Normalize v_1
-        alpha = dnrm2(n, v_tmp, 1)
-        if (alpha > epsilon(ZERO)) then
-            call dscal(n, ONE/alpha, v_tmp, 1)
-        endif
-        V(:, 1) = v_tmp
-        
-        ! u_1 = A * v_1
-        call bcsr_matv(a_mat, V(:, 1), u_tmp)
-        
-        ! beta_1 = ||u_1||
-        beta = dnrm2(m, u_tmp, 1)
-        if (beta > epsilon(ZERO)) then
-            call dscal(m, ONE/beta, u_tmp, 1)
-        endif
-        U(:, 1) = u_tmp
-        
-        ! 4. Initialize LSMR Scalars
-        !    (Fong & Saunders, 2011)
-        alphabar = alpha 
-        zetabar  = alpha * beta
-        
-        ! Implicit Frobenius norm accumulator
-        normA2 = beta**2 
-        
-        ! Condition number trackers
-        min_rbar = huge(ONE)
-        
-        ! Initial estimate
-        cond_est = ONE
-        
-        if (my_id .eq. 0) print *, "Iter | Sigma_Max (Est) | Sigma_Min (Est) | Condition (Est)"
-        ! ---------------------------------------------------------
-        ! 5. Main Iteration Loop
-        ! ---------------------------------------------------------
-        do j = 1, MAX_ITER
-            
-            ! --- Step A: Compute V_{j+1} ---
-            ! v_tmp = A^T * u_j
-            call bcsr_matvT(a_mat, U(:, j), v_tmp)
-            
-            ! v_tmp = v_tmp - beta * v_j (GKL standard subtraction)
-            call daxpy(n, -beta, V(:, j), 1, v_tmp, 1)
-            
-            ! -- Reorthogonalization of V --
-            call reorthogonalize(v_tmp, V, j, n)
-            
-            ! alpha_{j+1} = ||v_tmp||
-            alpha = dnrm2(n, v_tmp, 1)
-            if (alpha > epsilon(ZERO)) then
-                call dscal(n, ONE/alpha, v_tmp, 1)
-            endif
-            V(:, j+1) = v_tmp
-            
-            ! --- Step B: LSMR Scalar Rotation (Part 1) ---
-            ! Rotate to eliminate previous beta
-            call sym_ortho(alphabar, beta, chat, shat, alphahat)
-            
-            ! Construct rotation for current alpha
-            call sym_ortho(alphahat, alpha, c, s, rho)
-            
-            ! Update alphabar for next step
-            alphabar = c * alpha ! Wait, check indices. 
-            ! In LSMR code: alphabar = alpha * c_next. 
-            ! Here alpha is the *new* alpha just computed.
-            
-            ! Update Frobenius Norm (Sigma Max Estimate)
-            normA2 = normA2 + alpha**2
-            
-            ! Update Sigma Min Estimate (via Diagonal of R)
-            if (rho /= ZERO) then
-               min_rbar = min(min_rbar, abs(rho))
-            endif
-            
-            ! --- Step C: Compute U_{j+1} ---
-            if (j < MAX_ITER) then
-                ! u_tmp = A * v_{j+1}
-                call bcsr_matv(a_mat, V(:, j+1), u_tmp)
-                
-                ! u_tmp = u_tmp - alpha * u_j
-                call daxpy(m, -alpha, U(:, j), 1, u_tmp, 1)
-                
-                ! -- Reorthogonalization of U --
-                call reorthogonalize(u_tmp, U, j, m)
-                
-                ! beta_{j+1} = ||u_tmp||
-                beta = dnrm2(m, u_tmp, 1)
-                
-                ! LSMR Norm Update for next beta
-                normA2 = normA2 + beta**2
-                
-                if (beta > epsilon(ZERO)) then
-                    call dscal(m, ONE/beta, u_tmp, 1)
-                endif
-                U(:, j+1) = u_tmp
-                
-                ! Prepare for next rotation
-                alphabar = c * alpha
-            end if
-            
-            ! --- Step D: Calculate Estimates ---
-            sigma_max = sqrt(normA2)
-            sigma_min = min_rbar
-            
-            if (sigma_min > epsilon(ZERO)) then
-                cond_est = sigma_max / sigma_min
-            endif
+        ! Compute the max singular value q using power iteration
+        call power_iteration(a_mat, max_sv, dummy_vec, 20)
 
-            if (my_id .eq. 0 .and. mod(j, 10) == 0) then
-                print '(I5, 3ES14.6)', j, sigma_max, sigma_min, cond_est
-            end if
-            
-        end do
-        
-        ! Cleanup
-        deallocate(U, V, u_tmp, v_tmp)
-        
+        ! Compute the inverse of the min singular value using the power iteration on A^{-1}
+        call inverse_power_iteration(a_mat, min_sv, dummy_vec, 20)
+
+        cond_est = max_sv / min_sv
     end subroutine estimate_condition_number_2  
 
 
-! Simple power iteration implementation (unused)
-    subroutine power_iteration(a_mat, dominant_sval, dominant_svec, max_iters)
+! power iteration implementation 
+    subroutine power_iteration(a_mat, max_sval, max_svec, max_iters)
         type(type_SP_MATRIX), intent(in) :: a_mat
-        real*8, intent(out) :: dominant_sval
-        real*8, intent(out) :: dominant_svec(:)
+        real*8, intent(out) :: max_sval
+        real*8, intent(out) :: max_svec(:)
         integer, intent(in) :: max_iters
         real*8, external :: dnrm2
 
-        integer :: k
-        logical :: verbose = .false.
+        real*8  :: old_sval, norm_svec
+        real*8, allocatable :: tmp_vec(:)
+        integer :: k, n
+        logical :: verbose = .true.
         integer :: my_id, ierr
 
         call MPI_COMM_RANK(a_mat%comm, my_id, ierr)
 
-        call random_number(dominant_svec)
-        call dscal(size(dominant_svec), 1.0d0/dnrm2(size(dominant_svec), dominant_svec, 1), dominant_svec, 1)
+        n = size(max_svec)
+
+        allocate(tmp_vec(n))
+
+        if (my_id .eq. 0) call random_number(max_svec)
+        call MPI_BCAST(max_svec, n, MPI_DOUBLE_PRECISION, 0, a_mat%comm, ierr)
+
+        call dscal(n, 1.0d0/dnrm2(n, max_svec, 1), max_svec, 1)
+       
+        max_sval = 0.d0
 
         do k = 1, max_iters
-            call bcsr_matv(a_mat, dominant_svec, dominant_svec)  ! y = A * x
-            dominant_sval = dnrm2(size(dominant_svec), dominant_svec, 1)  ! sigma = ||y||
-            if (verbose .and. my_id .eq. 0) print *, "Power iteration ", k, ": dominant singular value = ", dominant_sval
-            call dscal(size(dominant_svec), 1.0d0/dominant_sval, dominant_svec, 1)  ! x = y / sigma
+            old_sval = max_sval
+            call bcsr_matv(a_mat, max_svec, tmp_vec)  ! y = A * x
+            call bcsr_matvT(a_mat, tmp_vec, max_svec)  ! x = A^T * y
+
+            norm_svec = dnrm2(n, max_svec, 1)
+            max_sval = dnrm2(n, tmp_vec, 1)
+
+            if (verbose .and. my_id .eq. 0) print *, "Power iteration ", k, ": max singular value = ", max_sval
+            call dscal(n, 1.0d0/max_sval, max_svec, 1)  ! x = y / sigma
+
+            if (k > 1 .and. abs(max_sval - old_sval) < 1.d-4 * max_sval) exit ! Convergence Check
         enddo
+
+        deallocate(tmp_vec)
         
     end subroutine power_iteration
- 
 
-! Helper routines –--
-    subroutine sym_ortho(a, b, c, s, r)
-            real*8, intent(in) :: a, b
-            real*8, intent(out) :: c, s, r
-            real*8 :: tau
-            real*8, parameter :: ONE = 1.0d0
-            real*8, parameter :: ZERO = 0.0d0
-            
-            if (b == ZERO) then
-                c = sign(ONE, a)
-                s = ZERO
-                r = abs(a)
-            elseif (a == ZERO) then
-                c = ZERO
-                s = sign(ONE, b)
-                r = abs(b)
-            elseif (abs(b) > abs(a)) then
-                tau = a / b
-                s = sign(ONE, b) / sqrt(ONE + tau**2)
-                c = s * tau
-                r = b / s
-            else
-                tau = b / a
-                c = sign(ONE, a) / sqrt(ONE + tau**2)
-                s = c * tau
-                r = a / c
-            end if
-        end subroutine sym_ortho
+
+    subroutine inverse_power_iteration(a_mat, min_sval, min_svec, max_iters)
+#ifdef USE_MUMPS
+        use mod_mumps
+#endif
+        use data_structure, only: type_RHS
+
+        type(type_SP_MATRIX), intent(in) :: a_mat
+        real*8, intent(out) :: min_sval
+        real*8, intent(out) :: min_svec(:)
+        integer, intent(in) :: max_iters
+
+        real*8, external :: dnrm2
+
+        type(type_MUMPS_SOLVER) :: mmss
+        type(type_RHS) :: svec_rhs
+        real*8  :: old_sval, norm_svec
+        integer :: k, n
+        logical :: verbose = .true.
+        integer :: my_id, ierr
+#ifdef USE_MUMPS
+        call MPI_COMM_RANK(a_mat%comm, my_id, ierr)
+
+        call mumps_initialize(mmss,a_mat%comm)
+
+        call mumps_analyze(mmss,a_mat)
+
+        call mumps_factorize(mmss,a_mat)
+
+        n = size(min_svec)
+
+        allocate(svec_rhs%val(n))
+
+        if (my_id .eq. 0) call random_number(min_svec)
+        call MPI_BCAST(min_svec, n, MPI_DOUBLE_PRECISION, 0, a_mat%comm, ierr)
+
+        call dscal(n, 1.0d0/dnrm2(n, min_svec, 1), min_svec, 1)
+       
+        min_sval = 0.d0
+        svec_rhs%val = min_svec
+
+        do k = 1, max_iters
+            old_sval = min_sval
+            call mumps_set_solve_transpose(mmss, .true.)
+            call mumps_solve(mmss, svec_rhs)
+            min_sval = dnrm2(n, svec_rhs%val, 1)
+            call mumps_set_solve_transpose(mmss, .false.)
+            call mumps_solve(mmss, svec_rhs)
+            norm_svec = dnrm2(n, svec_rhs%val, 1)
+
+
+            if (verbose .and. my_id .eq. 0) print *, "Inverse Power iteration ", k, ": min singular value = ", 1.d0/min_sval
+            call dscal(n, 1.0d0/min_sval, svec_rhs%val, 1)  ! x = y / sigma
+
+            if (k > 1 .and. abs(min_sval - old_sval) < 1.d-2 * min_sval) exit ! Convergence Check
+        enddo
+
+        min_svec = svec_rhs%val
+        min_sval = 1.d0 / min_sval
+
+        deallocate(svec_rhs%val)
+#else
+        print *, "MUMPS is required for inverse power iteration. Please recompile..."
+#endif
+    end subroutine inverse_power_iteration
+ 
 end module mod_cond_estimator

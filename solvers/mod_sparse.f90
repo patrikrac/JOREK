@@ -167,11 +167,11 @@ module mod_sparse
       if (use_matrix_equilibration) call scale_vector_row(a_mat, rhs_vec%val)
       if (use_matrix_equilibration) call scale_vector_column_inverse(a_mat, sol_vec%val)
 
-      call estimate_condition_number(a_mat, cond_est)
-      if (verbose) write(*,'(A,F12.4)') 'Estimated cond nr: ', cond_est
+      !call estimate_condition_number(a_mat, cond_est)
+      !if (verbose) write(*,'(A,F12.4)') 'Estimated cond nr: ', cond_est
 
-      !call estimate_condition_number_2(a_mat, cond_est)
-      !if (verbose) write(*,'(A,F12.4)') 'Estimated cond2 nr: ', cond_est
+      call estimate_condition_number_2(a_mat, cond_est)
+      if (verbose) print *, 'Estimated cond nr: ', cond_est
 
       if (.not.solver%pc%initialized) then
         call initialize_preconditioner(solver%pc,a_mat%comm)
