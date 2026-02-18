@@ -63,6 +63,8 @@ module mod_sparse
     integer                  :: cc, cr
     real                     :: tt1,tt0
 
+    logical :: use_condition_number_estimate = .false.
+
 
     external :: solve_mumps_all, solve_pastix_all, solve_strumpack_all
 
@@ -170,8 +172,8 @@ module mod_sparse
       !call estimate_condition_number(a_mat, cond_est)
       !if (verbose) write(*,'(A,F12.4)') 'Estimated cond nr: ', cond_est
 
-      call estimate_condition_number_2(a_mat, cond_est)
-      if (verbose) print *, 'Estimated cond nr: ', cond_est
+      if(use_condition_number_estimate)call estimate_condition_number_2(a_mat, cond_est)
+      if (use_condition_number_estimate .and. verbose) print *, 'Estimated cond nr: ', cond_est
 
       if (.not.solver%pc%initialized) then
         call initialize_preconditioner(solver%pc,a_mat%comm)

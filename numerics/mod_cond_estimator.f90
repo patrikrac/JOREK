@@ -271,7 +271,7 @@ contains
             if (verbose .and. my_id .eq. 0) print *, "Inverse Power iteration ", k, ": min singular value = ", 1.d0/min_sval
             call dscal(n, 1.0d0/min_sval, svec_rhs%val, 1)  ! x = y / sigma
 
-            if (k > 1 .and. abs(min_sval - old_sval) < 1.d-2 * min_sval) exit ! Convergence Check
+            if (k > 1 .and. abs(min_sval - old_sval) < 1.d-4 * min_sval) exit ! Convergence Check
         enddo
 
         min_svec = svec_rhs%val
