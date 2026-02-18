@@ -41,6 +41,9 @@ module mod_sparse
 #ifdef USE_GPU
     use omp_lib, only: omp_target_memcpy, omp_get_initial_device, omp_get_default_device, omp_target_is_present
 #endif
+#ifdef USE_PETSC
+    use mod_petsc
+#endif
 
     implicit none
 
@@ -164,6 +167,10 @@ module mod_sparse
       if (.not. a_mat%bcsr_mapped) then
         call set_block_csr_permutations(a_mat)
       endif
+
+      call petsc_initialize()
+      call petsc_print_version()
+      call petsc_finalize()
 
       if (use_matrix_equilibration) call matrix_equilibration(a_mat)
       if (use_matrix_equilibration) call scale_vector_row(a_mat, rhs_vec%val)

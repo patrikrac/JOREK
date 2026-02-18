@@ -341,6 +341,13 @@ ifeq (1, $(USE_TASKLOOP))
   DEFINES  := $(DEFINES) -DUSE_TASKLOOP
 endif
 
+ifeq (1, $(USE_PETSC))
+  DEFINES  := $(DEFINES) -DUSE_PETSC
+  include ${PETSC_DIR}/lib/petsc/conf/variables
+  LIBS     := $(LIBS) $(PETSC_LIB)
+  INCLUDES := $(INCLUDES) $(PETSC_FC_INCLUDES)
+endif
+
 # Do not check to make these files to speed up and clean -d output
 Makefile: ;
 Makefile.inc: ;
