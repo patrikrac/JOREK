@@ -67,7 +67,11 @@ module mod_sparse
     real                     :: tt1,tt0
 
     logical :: use_condition_number_estimate = .false.
-
+#ifdef USE_PETSC
+    type(type_PETSC_SYSTEM) :: petsc_sys
+    real*8 :: b_norm
+    real*8 :: jorek_sum_sq, jorek_norm
+#endif
 
     external :: solve_mumps_all, solve_pastix_all, solve_strumpack_all
 
@@ -168,9 +172,26 @@ module mod_sparse
         call set_block_csr_permutations(a_mat)
       endif
 
+#ifdef USE_PETSC
+! Petsc testing (to be put in better places when implementation is finished)
       call petsc_initialize()
       call petsc_print_version()
+      call petsc_convert_jorek_system(a_mat, rhs_vec, petsc_sys)
+      call petsc_calc_vec_norm(petsc_sys, b_norm)
+      if (my_id.eq.0) print *,"RHS Norm (L2): ", b_norm
+      if (my_id .eq.0) then
+            jorek_sum_sq = 0.0d0
+            do i = 1,rhs_vec%n
+              jorek_sum_sq = jorek_sum_sq + (rhs_vec%val(i))**2
+            enddo
+            jorek_norm = sqrt(jorek_sum_sq)
+            print *, "JOREK Manual Norm: ", jorek_norm
+      endif
+      call petsc_print_matrix_info(petsc_sys)
+      call petsc_test_matv(petsc_sys, a_mat)
+      call petsc_cleanup(petsc_sys)
       call petsc_finalize()
+#endif
 
       if (use_matrix_equilibration) call matrix_equilibration(a_mat)
       if (use_matrix_equilibration) call scale_vector_row(a_mat, rhs_vec%val)
