@@ -189,6 +189,7 @@ module mod_sparse
       endif
       call petsc_print_matrix_info(petsc_sys)
       call petsc_test_matv(petsc_sys, a_mat)
+      !call petsc_solve_and_retrieve(petsc_sys)
       call petsc_cleanup(petsc_sys)
       call petsc_finalize()
 #endif
