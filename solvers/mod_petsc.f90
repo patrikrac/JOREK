@@ -73,15 +73,14 @@ contains
     row_start_idx = (a_mat%my_ind_min - 1)*block_size + 1
     row_end_idx = a_mat%my_ind_max*block_size
 
-    if ((row_end_idx - row_start_idx + 1) /= n_local) print *, "[RANK ", my_id, "] WARNING: Somthing is wrong!"
+    if ((row_end_idx - row_start_idx + 1) /= n_local) &
+      write(*,*) "[RANK ", my_id, "] WARNING: Something is wrong in petsc_convert_jorek_system!"
 
     ! --- 1. Create matrix
     call MatCreate(comm, petsc_sys%A, ierr)
     call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
     call MatSetType(petsc_sys%A, MATMPIBAIJ, ierr)
     call MatSetBlockSize(petsc_sys%A, block_size, ierr)
-
-    print *, "[RANK ", my_id, "] Matrix created (MATMPIBAIJ, block_size=", block_size, ")"
 
     allocate(d_nnz(n_block_local), o_nnz(n_block_local))
     d_nnz = 0
@@ -100,10 +99,8 @@ contains
         enddo
     enddo
 
-    print *, "[RANK ", my_id, "] d_nnz sum: ", sum(d_nnz), " o_nnz sum: ", sum(o_nnz)
-
     call MatMPIBAIJSetPreallocation(petsc_sys%A, block_size, 0, d_nnz, 0, o_nnz, ierr)
-    if (ierr /= 0) print *, "[RANK ", my_id, "] WARNING: MatMPIBAIJSetPreallocation ierr=", ierr
+    if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: MatMPIBAIJSetPreallocation ierr=", ierr
     deallocate(d_nnz, o_nnz)
 
     !call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
@@ -130,8 +127,6 @@ contains
     call MatAssemblyEnd(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
     deallocate(vals_petsc)
 
-    print *, "[RANK ", my_id, "] PETSc Matrix created!"
-    
     call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
     allocate(indices_petsc(n_local))
     do i = 1, n_local
@@ -141,9 +136,8 @@ contains
     call VecAssemblyBegin(petsc_sys%b, ierr)
     call VecAssemblyEnd(petsc_sys%b, ierr)
     deallocate(indices_petsc)
-    print *, "[RANK ", my_id, "] PETSc Vectors created!"
 
-    if (my_id .eq. 0) print *, " --- System conversion successfull"
+    if (my_id .eq. 0) write(*,*) " --- PETSc system conversion successful"
   end subroutine petsc_convert_jorek_system
 
 

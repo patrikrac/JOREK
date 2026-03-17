@@ -80,6 +80,9 @@ module mod_sparse_data
   subroutine setup(self)
     use phys_module, only: gmres, iter_precon, gmres_max_iter, max_steps_noUpdate, gmres_tol, &
                            use_pastix, use_mumps, use_strumpack, use_newton, gmres_m
+#ifdef USE_PETSC
+    use mod_petsc, only: petsc_initialize
+#endif
     class(type_SP_SOLVER)     :: self
 
     self%iterative          = gmres
@@ -99,6 +102,9 @@ module mod_sparse_data
     elseif (use_pastix) then
       self%library = pastix
     endif
+#ifdef USE_PETSC
+    call petsc_initialize()
+#endif
     return
   end subroutine setup
 
@@ -113,7 +119,10 @@ module mod_sparse_data
 #ifdef USE_STRUMPACK
     use mod_strumpack, only: strumpack_finalize
 #endif
-    use mpi 
+#ifdef USE_PETSC
+    use mod_petsc, only: petsc_finalize
+#endif
+    use mpi
     implicit none
 
     class(type_SP_SOLVER)     :: self
@@ -131,6 +140,9 @@ module mod_sparse_data
 #endif
 #ifdef USE_STRUMPACK
     if (self%spss%initialized) call strumpack_finalize(self%spss)
+#endif
+#ifdef USE_PETSC
+    call petsc_finalize()
 #endif
 
     self%solve_only   = .false.
