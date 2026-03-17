@@ -228,7 +228,7 @@ contains
         real*8, intent(out) :: min_sval
         real*8, intent(out) :: min_svec(:)
         integer, intent(in) :: max_iters
-
+#ifdef USE_MUMPS
         real*8, external :: dnrm2
 
         type(type_MUMPS_SOLVER) :: mmss
@@ -237,7 +237,7 @@ contains
         integer :: k, n
         logical :: verbose = .true.
         integer :: my_id, ierr
-#ifdef USE_MUMPS
+
         call MPI_COMM_RANK(a_mat%comm, my_id, ierr)
 
         call mumps_initialize(mmss,a_mat%comm)
