@@ -172,128 +172,145 @@ module mod_sparse
         call set_block_csr_permutations(a_mat)
       endif
 
-#ifdef USE_PETSC
-! Petsc testing (to be put in better places when implementation is finished)
-      call petsc_initialize()
-      call petsc_print_version()
-      call petsc_convert_jorek_system(a_mat, rhs_vec, petsc_sys)
-      call petsc_calc_vec_norm(petsc_sys, b_norm)
-      if (my_id.eq.0) print *,"RHS Norm (L2): ", b_norm
-      if (my_id .eq.0) then
-            jorek_sum_sq = 0.0d0
-            do i = 1,rhs_vec%n
-              jorek_sum_sq = jorek_sum_sq + (rhs_vec%val(i))**2
-            enddo
-            jorek_norm = sqrt(jorek_sum_sq)
-            print *, "JOREK Manual Norm: ", jorek_norm
-      endif
-      call petsc_print_matrix_info(petsc_sys)
-      call petsc_test_matv(petsc_sys, a_mat)
-      !call petsc_solve_and_retrieve(petsc_sys)
-      call petsc_cleanup(petsc_sys)
-      call petsc_finalize()
-#endif
-
       if (use_matrix_equilibration) call matrix_equilibration(a_mat)
       if (use_matrix_equilibration) call scale_vector_row(a_mat, rhs_vec%val)
       if (use_matrix_equilibration) call scale_vector_column_inverse(a_mat, sol_vec%val)
 
-      !call estimate_condition_number(a_mat, cond_est)
-      !if (verbose) write(*,'(A,F12.4)') 'Estimated cond nr: ', cond_est
+#ifdef USE_PETSC
+! Petsc testing (to be put in better places when implementation is finished)
+      call petsc_initialize()
+      !call petsc_print_version()
+      call petsc_convert_jorek_system(a_mat, rhs_vec, petsc_sys)
+      !call petsc_calc_vec_norm(petsc_sys, b_norm)
+      !if (my_id.eq.0) print *,"RHS Norm (L2): ", b_norm
+      !if (my_id .eq.0) then
+      !      jorek_sum_sq = 0.0d0
+      !      do i = 1,rhs_vec%n
+      !        jorek_sum_sq = jorek_sum_sq + (rhs_vec%val(i))**2
+      !      enddo
+      !      jorek_norm = sqrt(jorek_sum_sq)
+      !      print *, "JOREK Manual Norm: ", jorek_norm
+      !endif
+      !call petsc_print_matrix_info(petsc_sys)
+      !call petsc_test_matv(petsc_sys, a_mat)
 
-      if(use_condition_number_estimate)call estimate_condition_number_2(a_mat, cond_est)
-      if (use_condition_number_estimate .and. verbose) print *, 'Estimated cond nr: ', cond_est
-
-      if (.not.solver%pc%initialized) then
-        call initialize_preconditioner(solver%pc,a_mat%comm)
-        ! set whether to distribute pc matrix when constructing by communication
-        if (solver%library.eq.strumpack) solver%pc%mat%row_distributed = .true.
-#if (defined USE_PASTIX6)
-        if (solver%library.eq.pastix) solver%pc%mat%col_distributed = .true.
+      !call petsc_solve_and_retrieve(petsc_sys)
+      call petsc_solve_iterative_and_retrieve(petsc_sys)
+      
+      call petsc_recover_solution(petsc_sys, sol_vec)
+      call petsc_cleanup(petsc_sys)
+      call petsc_finalize()
 #endif
-      endif
-
-! Finding PC solution
-      if (.not.solver%solve_only) then
-#ifdef USE_STRUMPACK
-        if ((solver%library.eq.strumpack).and.(solver%spss%analyzed)) call spk_delete_factors(solver%spss%sscp)
-#endif
-        call update_pc_mat(solver%pc,a_mat,mhd_sim)
-      endif
-
-      call update_pc_rhs(solver%pc,rhs_vec)
-! #ifdef SAVEMATRIX
-!       if (.not.solver%solve_only) then
-!         write(fname,'(A3,I2.2,A3)') "pc_",my_id,".h5"
-!         call save_mat_h5_ext(fname, a_mat%ng, solver%pc%mat%ng,solver%pc%mat%nnz, &
-!                                        solver%pc%mat%irn, solver%pc%mat%jcn,solver%pc%mat%val, &
-!                                        l2g=solver%pc%row_index,rhs=solver%pc%rhs%val, block_size=solver%pc%mat%block_size)
-!       endif
-! #endif
-      if (solver%library.eq.mumps) then
-#ifdef USE_MUMPS
-        call solve_mumps_all(solver%mmss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
-#endif
-      elseif (solver%library.eq.strumpack) then
-#ifdef USE_STRUMPACK
-        call solve_strumpack_all(solver%spss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
-#endif
-      elseif (solver%library.eq.pastix) then
-#if (defined USE_PASTIX) || (defined USE_PASTIX6)
-        call solve_pastix_all(solver%ptss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
-#endif
-      endif
-
-      call MPI_Barrier(a_mat%comm, ierr)
-
-      call gather_solution(solver%pc,sol_vec)
-
-! iterative part
-      solver%iter_prev  = solver%iter_gmres
-      solver%iter_gmres = solver%iter_max
-
-#ifdef USE_BICGSTAB
-      call bicgstab_driver(a_mat, rhs_vec, sol_vec, solver)
-#else
-
-# ifdef USE_GPU
-      !$omp target update from(rhs_vec%val)
-# endif
-
-# ifdef USE_GPU
-      if (solver%gpu .and. .not. a_mat%device_mapped) then
-            !$omp target enter data map(alloc: a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz), a_mat%val(1:a_mat%nnz), a_mat%iptr, a_mat%coo_to_csr_map)
-      endif
-
-      !$omp target data use_device_ptr(a_mat%jcn, a_mat%val, a_mat%iptr, a_mat%coo_to_csr_map) if(solver%gpu)
-# endif
-      call clck_time_barrier(t0)
-      !call gmres_driver(a_mat, rhs_vec, sol_vec, solver) !< Legacy GMRES Driver (Requires use gmres_driver)
-      call gmres2_driver(a_mat=a_mat,b=rhs_vec%val,x=sol_vec%val,n=sol_vec%n, solver=solver)
-      !sol_vec%val = 0.d0
-      !call aar_driver(a_mat=a_mat,b=rhs_vec%val,x=sol_vec%val,n=sol_vec%n, solver=solver) !< Experimental AAR Driver
-      call clck_time_barrier(t1)
-      call clck_ldiff(t0,t1,tsecond)
-      if (my_id .eq. 0) then
-        write(*,FMT_TIMING)  my_id, '#  Elapsed time Solve :',tsecond
-      end if
-# ifdef USE_GPU
-      !$omp end target data
-
-      if (solver%gpu .and. .not. a_mat%device_mapped) then
-            !$omp target exit data map(delete: a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz), a_mat%val(1:a_mat%nnz), a_mat%iptr, a_mat%coo_to_csr_map)
-      endif
-# endif
-
-#endif 
-
       if (use_matrix_equilibration) call scale_vector_column(a_mat, sol_vec%val)
+      solver%step_success = .true.
+      endif 
+
+!       !call estimate_condition_number(a_mat, cond_est)
+!       !if (verbose) write(*,'(A,F12.4)') 'Estimated cond nr: ', cond_est
+
+!       if(use_condition_number_estimate)call estimate_condition_number_2(a_mat, cond_est)
+!       if (use_condition_number_estimate .and. verbose) print *, 'Estimated cond nr: ', cond_est
+
+!       if (.not.solver%pc%initialized) then
+!         call initialize_preconditioner(solver%pc,a_mat%comm)
+!         ! set whether to distribute pc matrix when constructing by communication
+!         if (solver%library.eq.strumpack) solver%pc%mat%row_distributed = .true.
+! #if (defined USE_PASTIX6)
+!         if (solver%library.eq.pastix) solver%pc%mat%col_distributed = .true.
+! #endif
+!       endif
+
+! ! Finding PC solution
+!       if (.not.solver%solve_only) then
+! #ifdef USE_STRUMPACK
+!         if ((solver%library.eq.strumpack).and.(solver%spss%analyzed)) call spk_delete_factors(solver%spss%sscp)
+! #endif
+!         call update_pc_mat(solver%pc,a_mat,mhd_sim)
+!       endif
+
+!       call update_pc_rhs(solver%pc,rhs_vec)
+! ! #ifdef SAVEMATRIX
+! !       if (.not.solver%solve_only) then
+! !         write(fname,'(A3,I2.2,A3)') "pc_",my_id,".h5"
+! !         call save_mat_h5_ext(fname, a_mat%ng, solver%pc%mat%ng,solver%pc%mat%nnz, &
+! !                                        solver%pc%mat%irn, solver%pc%mat%jcn,solver%pc%mat%val, &
+! !                                        l2g=solver%pc%row_index,rhs=solver%pc%rhs%val, block_size=solver%pc%mat%block_size)
+! !       endif
+! ! #endif
+!       if (solver%library.eq.mumps) then
+! #ifdef USE_MUMPS
+!         call solve_mumps_all(solver%mmss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
+! #endif
+!       elseif (solver%library.eq.strumpack) then
+! #ifdef USE_STRUMPACK
+!         call solve_strumpack_all(solver%spss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
+! #endif
+!       elseif (solver%library.eq.pastix) then
+! #if (defined USE_PASTIX) || (defined USE_PASTIX6)
+!         call solve_pastix_all(solver%ptss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
+! #endif
+!       endif
+
+!       call MPI_Barrier(a_mat%comm, ierr)
+
+!       call gather_solution(solver%pc,sol_vec)
+
+! ! iterative part
+!       solver%iter_prev  = solver%iter_gmres
+!       solver%iter_gmres = solver%iter_max
+
+! #ifdef USE_BICGSTAB
+!       call bicgstab_driver(a_mat, rhs_vec, sol_vec, solver)
+! #else
+
+! # ifdef USE_GPU
+!       !$omp target update from(rhs_vec%val)
+! # endif
+
+! # ifdef USE_GPU
+!       if (solver%gpu .and. .not. a_mat%device_mapped) then
+!             !$omp target enter data map(alloc: a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz), a_mat%val(1:a_mat%nnz), a_mat%iptr, a_mat%coo_to_csr_map)
+!       endif
+
+!       !$omp target data use_device_ptr(a_mat%jcn, a_mat%val, a_mat%iptr, a_mat%coo_to_csr_map) if(solver%gpu)
+! # endif
+!       call clck_time_barrier(t0)
+!       !call gmres_driver(a_mat, rhs_vec, sol_vec, solver) !< Legacy GMRES Driver (Requires use gmres_driver)
+!       call gmres2_driver(a_mat=a_mat,b=rhs_vec%val,x=sol_vec%val,n=sol_vec%n, solver=solver)
+!       !sol_vec%val = 0.d0
+!       !call aar_driver(a_mat=a_mat,b=rhs_vec%val,x=sol_vec%val,n=sol_vec%n, solver=solver) !< Experimental AAR Driver
+!       call clck_time_barrier(t1)
+!       call clck_ldiff(t0,t1,tsecond)
+!       if (my_id .eq. 0) then
+!         write(*,FMT_TIMING)  my_id, '#  Elapsed time Solve :',tsecond
+!       end if
+! # ifdef USE_GPU
+!       !$omp end target data
+
+!       if (solver%gpu .and. .not. a_mat%device_mapped) then
+!             !$omp target exit data map(delete: a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz), a_mat%val(1:a_mat%nnz), a_mat%iptr, a_mat%coo_to_csr_map)
+!       endif
+! # endif
+
+! #endif 
+!       if (my_id .eq.0) then
+!             jorek_sum_sq = 0.0d0
+!             do i = 1,sol_vec%n
+!               jorek_sum_sq = jorek_sum_sq + (sol_vec%val(i))**2
+!             enddo
+!             jorek_norm = sqrt(jorek_sum_sq)
+!             print *, "JOREK Manual Norm (solution): ", jorek_norm
+!       endif
+
+!       if (use_matrix_equilibration) call scale_vector_column(a_mat, sol_vec%val)
  
-      if (verbose) write(*,'(A32,I5)') 'Number of iterations: ', solver%iter_gmres
+!       if (verbose) write(*,'(A32,I5)') 'Number of iterations: ', solver%iter_gmres
 
-      solver%step_success = (solver%iter_gmres .lt. solver%iter_max)
+!       solver%step_success = (solver%iter_gmres .lt. solver%iter_max)
 
-    endif
+
+
+!     endif
 
   end subroutine solve_sparse_system
 
