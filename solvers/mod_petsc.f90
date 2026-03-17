@@ -18,6 +18,7 @@ contains
 
   subroutine petsc_initialize()
     PetscErrorCode :: ierr
+    ! PetscCallA(PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-log_view", PETSC_NULL_CHARACTER, ierr))
     call PetscInitialize(PETSC_NULL_CHARACTER, ierr)
     if (ierr /= 0) print *, "Error initializing PETSc"
   end subroutine
@@ -74,26 +75,6 @@ contains
 
     if ((row_end_idx - row_start_idx + 1) /= n_local) print *, "[RANK ", my_id, "] WARNING: Somthing is wrong!"
 
-    ! --- 1. Create vectors
-    call VecCreateMPI(comm, n_local, n_global, petsc_sys%x, ierr)
-    call VecDuplicate(petsc_sys%x, petsc_sys%b, ierr)
-
-    allocate(indices_petsc(n_local))
-    do i = 1, n_local
-        indices_petsc(i) = (row_start_idx-1 + i) - 1
-    end do
-
-    call VecSetValues(petsc_sys%b, n_local, indices_petsc, rhs_vec%val(row_start_idx:row_end_idx), INSERT_VALUES, ierr)
-    call VecSetValues(petsc_sys%x, n_local, indices_petsc, rhs_vec%val(row_start_idx:row_end_idx), INSERT_VALUES, ierr)
-    deallocate(indices_petsc)
-
-    call VecAssemblyBegin(petsc_sys%b, ierr)
-    call VecAssemblyEnd(petsc_sys%b, ierr)
-    call VecAssemblyBegin(petsc_sys%x, ierr)
-    call VecAssemblyEnd(petsc_sys%x, ierr)
-
-    print *, "[RANK ", my_id, "] PETSc Vectors created!"
-    
     ! --- 1. Create matrix
     call MatCreate(comm, petsc_sys%A, ierr)
     call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
@@ -150,6 +131,18 @@ contains
     deallocate(vals_petsc)
 
     print *, "[RANK ", my_id, "] PETSc Matrix created!"
+    
+    call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
+    allocate(indices_petsc(n_local))
+    do i = 1, n_local
+      indices_petsc(i) = (row_start_idx-1 + i) - 1
+    end do
+    call VecSetValues(petsc_sys%b, n_local, indices_petsc, rhs_vec%val(row_start_idx:row_end_idx), INSERT_VALUES, ierr)
+    call VecAssemblyBegin(petsc_sys%b, ierr)
+    call VecAssemblyEnd(petsc_sys%b, ierr)
+    deallocate(indices_petsc)
+    print *, "[RANK ", my_id, "] PETSc Vectors created!"
+
     if (my_id .eq. 0) print *, " --- System conversion successfull"
   end subroutine petsc_convert_jorek_system
 
@@ -264,7 +257,6 @@ contains
         jorek_sum_sq = jorek_sum_sq + (y_jorek(i))**2
       enddo
       jorek_norm = sqrt(jorek_sum_sq)
-      print *, "JOREK Manual Norm (x): ", jorek_norm
     endif
 
     call VecNorm(y_petsc, NORM_2, petsc_norm, ierr)
@@ -288,59 +280,251 @@ contains
 
   subroutine petsc_solve_and_retrieve(petsc_sys)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
     PetscLogDouble :: t1, t2
+    PetscReal :: petsc_norm
     PC :: pc ! Maybe should be part of petsc_sys in the future
+    PetscViewerAndFormat :: vf
     KSPConvergedReason :: reason
+    Mat :: A_aij, F
+    Vec :: b_aij, x_aij
+    KSPType :: ksp_type
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
-    ! Create solver Object
-    call KSPCreate(comm, petsc_sys%ksp, ierr)
-    print *, "DEBUG: Setting Operators"
-    ! Link the operator A  
-    call KSPSetOperators(petsc_sys%ksp, petsc_sys%A, petsc_sys%A, ierr)
+    !PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    !PetscCallA(MatCreateVecs(A_aij, x_aij, b_aij, ierr))
+    !PetscCallA(VecCopy(petsc_sys%b, b_aij, ierr))
 
-    ! Configure the solver
-    call KSPGetPC(petsc_sys%ksp, pc, ierr)
-    call KSPSetType(petsc_sys%ksp, KSPPREONLY, ierr)
-    call PCSetType(pc, PCLU, ierr)
+    PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
+    PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A, petsc_sys%A, ierr))
 
-    print *, "DEBUG: Setting MUMPS"
+    PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
+    PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
 
-    call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
-    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
-                            "-mat_mumps_icntl_14", "50", ierr)
-    call KSPSetFromOptions(petsc_sys%ksp, ierr)
+    ! PetscCallA(KSPSetType(petsc_sys%ksp, KSPDGMRES, ierr))
+    PetscCallA(KSPSetType(petsc_sys%ksp, KSPPREONLY, ierr))
+    !PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
-    print *, "DEBUG: Calling Solve"
+    ! Set the preconditioner
+    PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
+    ! --- Additive Schwarz
+    !PetscCallA(PCSetType(pc, PCASM, ierr)) ! Set additive Schwarz method
+    !PetscCallA(PCASMSetTotalSubdomains(pc, 5, PETSC_NULL_IS, PETSC_NULL_IS, ierr))
+    !PetscCallA(PCASMSetOverlap(pc, 2, ierr))
+    !PetscCallA(PCASMSetType(pc, PC_ASM_BASIC, ierr)) ! Set type of restriction/interpolation
+    ! --- AMG
+    !PetscCallA(PCSetType(pc, PCGAMG, ierr))
+    !PetscCallA(PCGAMGSetThreshold(pc, [0.1], 1, ierr))
+    !PetscCallA(PCGAMGSetAggressiveLevels(pc, 1, ierr))
+    ! --- LU
+    PetscCallA(PCSetType(pc, PCLU, ierr))
+    PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
 
-    print *, "DEBUG: 4a. Setup (Symbolic Factorization)"
-    call KSPSetUp(petsc_sys%ksp, ierr)  ! Does symbolic analysis
-    print *, "DEBUG: 4b. Setup Done"
+    !PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
 
-    print *, "DEBUG: 4c. Solve (Numeric Factorization)"
-    call KSPSolve(petsc_sys%ksp, petsc_sys%b, petsc_sys%x, ierr)
-    print *, "DEBUG: 4d. Solve Done"
-    ! Perform the solve 
-    !call KSPSolve(petsc_sys%ksp, petsc_sys%b, petsc_sys%x, ierr)
+    PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
+        
+    PetscCallA(PCFactorSetMatOrderingType(pc,MATORDERINGND,ierr))
+    PetscCallA(PCFactorGetMatrix(pc, F, ierr))
+    PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))  ! fill-reducing ordering
+    PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))  ! workspace expansion %
+    PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))  ! numerical scaling (auto)
+    PetscCallA(MatMumpsSetIcntl(F, 21, 1, ierr))
 
-    print *, "DEBUG: Solve Done"
+    PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
 
-    ! Check result
-    call KSPGetConvergedReason(petsc_sys%ksp, reason, ierr)
-    if (reason < 0) then
-        print *, "CRITICAL: Direct Solver Failed! Reason:", reason
-        ! KSP_DIVERGED_NANORINF (-9) is common if matrix is singular
-    end if
+    PetscCallA(KSPGetType(petsc_sys%ksp, ksp_type, ierr))
+    if (my_id == 0) print *, "KSP type:", ksp_type
 
-    ! Destroy the solver Object
-    call KSPDestroy(petsc_sys%ksp, ierr)
+    ! Set the maximum iterations of the linear system
+    PetscCallA(KSPSetTolerances(petsc_sys%ksp, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, 400, ierr))
+    PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
 
+    if (my_id .eq. 0) print *, "Solving the system using PETSc"
+    PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b, petsc_sys%x, ierr))
+    PetscCallA(KSPDestroy(petsc_sys%ksp, ierr))
+    !PetscCallA(MatDestroy(A_aij, ierr))
+    !PetscCallA(VecCopy(x_aij, petsc_sys%x, ierr))
+    !PetscCallA(VecDestroy(b_aij, ierr))
+    !PetscCallA(VecDestroy(x_aij, ierr))
+
+    ! Calculate the norm of the solution 
+    PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
+    if (my_id .eq.0) print *, "PETSc Norm (solution): ", petsc_norm
   end subroutine petsc_solve_and_retrieve
 
+
+  subroutine petsc_solve_iterative_and_retrieve(petsc_sys)
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+
+    PetscErrorCode :: ierr
+    integer :: comm, my_id, mpierr
+    PetscViewerAndFormat :: vf
+    KSPConvergedReason :: reason
+    Mat :: A_aij
+    Vec :: b_aij, x_aij
+    PetscLogStage :: stage_setup, stage_solve
+    PetscLogDouble :: t1, t2
+    KSPType :: ksp_type
+    PetscInt :: its
+    PetscReal :: petsc_norm
+
+    call PetscObjectGetComm(petsc_sys%A, comm, ierr)
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatCreateVecs(A_aij, x_aij, b_aij, ierr))
+    PetscCallA(VecCopy(petsc_sys%b, b_aij, ierr))
+
+    PetscCallA(PetscLogStageRegister("KSP Setup", stage_setup, ierr))
+    PetscCallA(PetscLogStageRegister("KSP Solve", stage_solve, ierr))
+
+    PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
+    PetscCallA(KSPSetOperators(petsc_sys%ksp, A_aij, A_aij, ierr))
+
+    PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
+    PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
+
+    PetscCallA(KSPSetType(petsc_sys%ksp, KSPDGMRES, ierr))
+    !PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
+    !PetscCallA(KSPSetType(petsc_sys%ksp, KSPFGMRES, ierr))
+    PetscCallA(PetscTime(t1, ierr))
+    PetscCallA(PetscLogStagePush(stage_setup, ierr))
+    call petsc_set_toroidal_harmonic_pc(petsc_sys)
+
+    ! Set the maximum iterations of the linear system
+    PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
+    PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
+
+    if (my_id .eq. 0) print *, "Setting up the solver using PETSc"
+
+    PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+
+    PetscCallA(PetscLogStagePop(ierr))
+    PetscCallA(PetscTime(t2, ierr))
+    if (my_id == 0) print *, "Setup time:", t2 - t1, "s"
+
+    PetscCallA(KSPGetType(petsc_sys%ksp, ksp_type, ierr))
+    if (my_id == 0) print *, "KSP type:", ksp_type
+
+    if (my_id .eq. 0) print *, "Solving the system using PETSc"
+    PetscCallA(PetscTime(t1, ierr))
+    PetscCallA(PetscLogStagePush(stage_solve, ierr))
+    PetscCallA(KSPSolve(petsc_sys%ksp, b_aij, x_aij, ierr))
+    PetscCallA(PetscLogStagePop(ierr))
+    PetscCallA(PetscTime(t2, ierr))
+    if (my_id == 0) print *, "Solve time:", t2 - t1, "s"
+
+    
+    PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
+    PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
+
+    if (my_id == 0) then
+        print *, "Total Iterations:", its
+        if (reason > 0) then
+            print *, "Converged, reason:", reason
+        else
+            print *, "Diverged, reason:", reason
+        end if
+    end if
+
+    PetscCallA(KSPDestroy(petsc_sys%ksp, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+    PetscCallA(VecCopy(x_aij, petsc_sys%x, ierr))
+    PetscCallA(VecDestroy(b_aij, ierr))
+    PetscCallA(VecDestroy(x_aij, ierr))
+
+    ! Calculate the norm of the solution 
+    PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
+    if (my_id .eq.0) print *, "PETSc Norm (solution): ", petsc_norm
+  end subroutine petsc_solve_iterative_and_retrieve
+
+
+  subroutine petsc_recover_solution(petsc_sys, sol_vec)
+    use data_structure, only: type_RHS
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_RHS), intent(inout) :: sol_vec
+
+    Vec             :: x_seq      ! sequential copy, replicated on all ranks
+    VecScatter      :: scatter
+    PetscScalar, pointer :: x_arr(:)
+    PetscErrorCode :: ierr
+
+    PetscCallA(VecScatterCreateToAll(petsc_sys%x, scatter, x_seq, ierr))
+
+    PetscCallA(VecScatterBegin(scatter, petsc_sys%x, x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
+    PetscCallA(VecScatterEnd(scatter, petsc_sys%x, x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
+
+    PetscCallA(VecGetArrayF90(x_seq, x_arr, ierr))
+
+    sol_vec%val(:) = x_arr(:)
+
+    PetscCallA(VecRestoreArrayF90(x_seq, x_arr, ierr))
+
+    PetscCallA(VecScatterDestroy(scatter, ierr))
+    PetscCallA(VecDestroy(x_seq, ierr))
+  end subroutine petsc_recover_solution
+
+
+  subroutine petsc_set_toroidal_harmonic_pc(petsc_sys)
+    use mod_parameters, only: n_tor
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+
+    integer :: i, j, n_split, split_size, field_size
+    PetscInt :: block_size
+    PetscInt, allocatable :: fields(:)
+    PC :: pc, subpc
+    KSP, pointer, dimension(:) :: subksp_array
+    PetscErrorCode :: ierr
+
+    PetscCallA(MatGetBlockSize(petsc_sys%A, block_size, ierr))
+    PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
+    PetscCallA(PCSetType(pc, PCFIELDSPLIT, ierr))
+    PetscCallA(PCFieldSplitSetBlockSize(pc, block_size, ierr))
+    n_split = (n_tor + 1)/2
+    split_size = block_size/n_tor
+    do i = 1,n_split
+      if (i .eq. 1) then
+        field_size = split_size
+      else 
+        field_size = 2 * split_size
+      endif
+      allocate(fields(field_size))
+      fields = 0
+      do j = 1, split_size
+        if (i .eq. 1) then
+          fields(j) = (j-1)*n_tor
+        else  
+          fields(2*j - 1) = (j-1)*n_tor + 1
+          fields(2*j)     = (j-1)*n_tor + 2
+        endif
+      enddo
+      PetscCallA(PetscSortInt(field_size, fields, ierr))
+      PetscCallA(PCFieldSplitSetFields(pc, PETSC_NULL_CHARACTER, field_size, fields, fields, ierr))
+      deallocate(fields)
+    enddo
+
+    PetscCallA(PCSetUp(pc, ierr))
+    PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+    allocate(subksp_array(n_split))
+    PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
+    do i = 1, n_split
+        PetscCallA(KSPSetType(subksp_array(i), KSPPREONLY, ierr))
+        PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
+
+        PetscCallA(PCSetType(subpc, PCLU, ierr))
+        PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
+
+        PetscCallA(KSPSetUp(subksp_array(i), ierr))
+    enddo
+    deallocate(subksp_array)
+  end subroutine petsc_set_toroidal_harmonic_pc
 
   subroutine petsc_cleanup(petsc_sys)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
@@ -351,12 +535,6 @@ contains
     call MatDestroy(petsc_sys%A, ierr)
 
   end subroutine petsc_cleanup
-
-
-  
-
-
-  
 
 #endif
 end module mod_petsc
