@@ -176,9 +176,7 @@ module mod_sparse
       if (.not. solver%petsc_sys%initialized) then
         call petsc_init_system(solver%petsc_sys, a_mat)
       endif
-      if (.not. solver%solve_only) then
-        call petsc_update_matrix(solver%petsc_sys, a_mat)
-      endif
+      call petsc_update_matrix(solver%petsc_sys, a_mat)   ! always — GMRES needs current A
       call petsc_update_rhs(solver%petsc_sys, rhs_vec)
       call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only)
       call petsc_recover_solution(solver%petsc_sys, sol_vec)
