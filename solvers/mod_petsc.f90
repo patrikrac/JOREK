@@ -533,12 +533,16 @@ contains
 
   subroutine petsc_set_toroidal_harmonic_pc(petsc_sys)
     use mod_parameters, only: n_tor
+    use phys_module,    only: autodistribute_modes, n_mode_families, &
+                              modes_per_family, mode_families_modes
 
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
 
-    integer :: i, j, n_split, split_size, field_size
+    integer :: i, j, k, n_split, split_size, field_size, n_modes_in_fam, idx
     PetscInt :: block_size
     PetscInt, allocatable :: fields(:)
+    integer, allocatable :: fam_modes(:)
+    Mat :: F
     PC :: pc, subpc
     KSP, pointer, dimension(:) :: subksp_array
     PetscErrorCode :: ierr
@@ -547,27 +551,42 @@ contains
     PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
     PetscCallA(PCSetType(pc, PCFIELDSPLIT, ierr))
     PetscCallA(PCFieldSplitSetBlockSize(pc, block_size, ierr))
-    n_split = (n_tor + 1)/2
+    if (autodistribute_modes) then
+      n_split = (n_tor + 1)/2
+    else
+      n_split = n_mode_families
+    endif
     split_size = block_size/n_tor
-    do i = 1,n_split
-      if (i .eq. 1) then
-        field_size = split_size
-      else
-        field_size = 2 * split_size
-      endif
-      allocate(fields(field_size))
-      fields = 0
-      do j = 1, split_size
-        if (i .eq. 1) then
-          fields(j) = (j-1)*n_tor
+    do i = 1, n_split
+      if (autodistribute_modes) then
+        if (i == 1) then
+          n_modes_in_fam = 1
+          allocate(fam_modes(1))
+          fam_modes(1) = 1
         else
-          fields(2*j - 1) = (j-1)*n_tor + 1
-          fields(2*j)     = (j-1)*n_tor + 2
+          n_modes_in_fam = 2
+          allocate(fam_modes(2))
+          fam_modes(1) = 2*(i-1)
+          fam_modes(2) = 2*(i-1) + 1
         endif
+      else
+        n_modes_in_fam = modes_per_family(i)
+        allocate(fam_modes(n_modes_in_fam))
+        fam_modes(1:n_modes_in_fam) = mode_families_modes(i, 1:n_modes_in_fam)
+      endif
+
+      field_size = split_size * n_modes_in_fam
+      allocate(fields(field_size))
+      idx = 0
+      do j = 1, split_size
+        do k = 1, n_modes_in_fam
+          idx = idx + 1
+          fields(idx) = (j-1)*n_tor + (fam_modes(k) - 1)
+        enddo
       enddo
       PetscCallA(PetscSortInt(field_size, fields, ierr))
       PetscCallA(PCFieldSplitSetFields(pc, PETSC_NULL_CHARACTER, field_size, fields, fields, ierr))
-      deallocate(fields)
+      deallocate(fields, fam_modes)
     enddo
 
     PetscCallA(PCSetUp(pc, ierr))
@@ -575,13 +594,16 @@ contains
     allocate(subksp_array(n_split))
     PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
     do i = 1, n_split
-        PetscCallA(KSPSetType(subksp_array(i), KSPPREONLY, ierr))
-        PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
-
-        PetscCallA(PCSetType(subpc, PCLU, ierr))
-        PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
-
-        PetscCallA(KSPSetUp(subksp_array(i), ierr))
+      PetscCallA(KSPSetType(subksp_array(i), KSPPREONLY, ierr))
+      PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
+      PetscCallA(PCSetType(subpc, PCLU, ierr))
+      PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
+      PetscCallA(KSPSetUp(subksp_array(i), ierr))
+      PetscCallA(PCFactorGetMatrix(subpc, F, ierr))
+      PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (METIS)
+      PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
+      PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
+      PetscCallA(MatMumpsSetIcntl(F, 21, 1,  ierr))   ! out-of-core processing
     enddo
     deallocate(subksp_array)
   end subroutine petsc_set_toroidal_harmonic_pc
