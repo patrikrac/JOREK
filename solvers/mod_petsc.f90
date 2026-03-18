@@ -402,10 +402,11 @@ contains
   !! On first call (!ksp_ready): creates AIJ matrix, KSP, sets up PCFIELDSPLIT+MUMPS.
   !! When !solve_only: converts A to AIJ (reuse sparsity), calls KSPSetUp to refactorize.
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
-  subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter)
+  subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
+    logical, intent(out) :: converged
 
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
@@ -486,7 +487,8 @@ contains
 
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
-    n_iter = its
+    n_iter    = its
+    converged = (reason > 0)
 
     if (my_id == 0) then
       if (reason > 0) then
