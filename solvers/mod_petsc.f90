@@ -13,8 +13,10 @@ module mod_petsc
     Vec  :: x, b           ! BAIJ solution/RHS vectors
     Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (persistent)
     KSP  :: ksp            ! Krylov solver context (persistent)
-    logical :: initialized  = .false.  ! A, x, b created
-    logical :: ksp_ready    = .false.  ! KSP, A_aij, PC setup + factored
+    logical :: initialized   = .false.  ! A, x, b created
+    logical :: ksp_ready     = .false.  ! KSP, A_aij, PC setup + factored
+    PetscLogStage :: stage_setup = -1
+    PetscLogStage :: stage_solve = -1
   end type type_PETSC_SYSTEM
 
 
@@ -407,7 +409,6 @@ contains
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
     KSPConvergedReason :: reason
-    PetscLogStage :: stage_setup, stage_solve
     PetscLogDouble :: t1, t2
     KSPType :: ksp_type
     PetscInt :: its
@@ -417,13 +418,12 @@ contains
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
-    PetscCallA(PetscLogStageRegister("KSP Setup", stage_setup, ierr))
-    PetscCallA(PetscLogStageRegister("KSP Solve", stage_solve, ierr))
-
     if (.not. petsc_sys%ksp_ready) then
       ! First solve: create AIJ matrix, vecs, KSP, and set up PCFIELDSPLIT+MUMPS
+      PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
+      PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
       PetscCallA(PetscTime(t1, ierr))
-      PetscCallA(PetscLogStagePush(stage_setup, ierr))
+      PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
@@ -452,7 +452,7 @@ contains
       ! Matrix changed: convert to AIJ (reuse sparsity pattern), rebuild PC
       if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: matrix changed, refactorizing"
       PetscCallA(PetscTime(t1, ierr))
-      PetscCallA(PetscLogStagePush(stage_setup, ierr))
+      PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
@@ -476,7 +476,7 @@ contains
 
     if (my_id .eq. 0) write(*,*) "[PETSc] KSP solve..."
     PetscCallA(PetscTime(t1, ierr))
-    PetscCallA(PetscLogStagePush(stage_solve, ierr))
+    PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
     PetscCallA(PetscLogStagePop(ierr))
     PetscCallA(PetscTime(t2, ierr))
