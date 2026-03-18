@@ -9,6 +9,9 @@ module mod_sparse_data
 #ifdef USE_STRUMPACK
   use mod_strumpack, only:  type_STRUMPACK_SOLVER
 #endif
+#ifdef USE_PETSC
+  use mod_petsc, only: type_PETSC_SYSTEM, petsc_initialize, petsc_finalize, petsc_cleanup
+#endif
   use data_structure, only: type_PRECOND
 
   private
@@ -37,6 +40,9 @@ module mod_sparse_data
 #endif
 #ifdef USE_STRUMPACK
     type(type_STRUMPACK_SOLVER) :: spss
+#endif
+#ifdef USE_PETSC
+    type(type_PETSC_SYSTEM)     :: petsc_sys
 #endif
     type(type_PRECOND)          :: pc
     type(type_newton_solver)    :: newton
@@ -80,9 +86,6 @@ module mod_sparse_data
   subroutine setup(self)
     use phys_module, only: gmres, iter_precon, gmres_max_iter, max_steps_noUpdate, gmres_tol, &
                            use_pastix, use_mumps, use_strumpack, use_newton, gmres_m
-#ifdef USE_PETSC
-    use mod_petsc, only: petsc_initialize
-#endif
     class(type_SP_SOLVER)     :: self
 
     self%iterative          = gmres
@@ -119,9 +122,6 @@ module mod_sparse_data
 #ifdef USE_STRUMPACK
     use mod_strumpack, only: strumpack_finalize
 #endif
-#ifdef USE_PETSC
-    use mod_petsc, only: petsc_finalize
-#endif
     use mpi
     implicit none
 
@@ -142,6 +142,7 @@ module mod_sparse_data
     if (self%spss%initialized) call strumpack_finalize(self%spss)
 #endif
 #ifdef USE_PETSC
+    call petsc_cleanup(self%petsc_sys)
     call petsc_finalize()
 #endif
 

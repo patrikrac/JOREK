@@ -8,9 +8,13 @@ module mod_petsc
 
 
   type type_PETSC_SYSTEM
-    Mat :: A
-    Vec :: x, b
-    KSP :: ksp
+    Mat  :: A              ! BAIJ system matrix (from JOREK block-CSR)
+    Mat  :: A_aij          ! AIJ version used by KSP (persistent)
+    Vec  :: x, b           ! BAIJ solution/RHS vectors
+    Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (persistent)
+    KSP  :: ksp            ! Krylov solver context (persistent)
+    logical :: initialized  = .false.  ! A, x, b created
+    logical :: ksp_ready    = .false.  ! KSP, A_aij, PC setup + factored
   end type type_PETSC_SYSTEM
 
 
@@ -43,40 +47,35 @@ contains
   end subroutine petsc_print_version
 
 
-  subroutine petsc_convert_jorek_system(a_mat, rhs_vec, petsc_sys)
-    use data_structure, only: type_SP_MATRIX, type_RHS 
+  !> Initialize BAIJ matrix structure and BAIJ vecs — called once when !initialized
+  subroutine petsc_init_system(petsc_sys, a_mat)
+    use data_structure, only: type_SP_MATRIX
 
-    type(type_SP_MATRIX), intent(in) :: a_mat
-    type(type_RHS), intent(in) :: rhs_vec
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_SP_MATRIX), intent(in) :: a_mat
 
     integer :: i, k
     integer :: comm, my_id, mpierr
-    integer :: n_local, n_global, n_block_local, n_block_global, block_size, block_size2, row_start_idx, row_end_idx
-    integer :: r_start , r_end, c_global, block_col, val_ptr_start, val_ptr_end
-    PetscInt, allocatable :: indices_petsc(:)
+    integer :: n_local, n_global, n_block_local, block_size, block_size2, row_start_idx, row_end_idx
+    integer :: r_start, r_end, c_global, block_col
     PetscInt, allocatable :: d_nnz(:), o_nnz(:)
-    PetscInt :: idxm(1), idxn(1)
-    PetscScalar, allocatable :: vals_petsc(:)
     PetscErrorCode :: ierr
 
     comm = a_mat%comm
-
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
     block_size = a_mat%block_size
     block_size2 = block_size * block_size
     n_global = a_mat%ng
-    n_block_global = n_global / block_size
     n_local = (a_mat%my_ind_max - a_mat%my_ind_min + 1) * block_size
     n_block_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
     row_start_idx = (a_mat%my_ind_min - 1)*block_size + 1
     row_end_idx = a_mat%my_ind_max*block_size
 
     if ((row_end_idx - row_start_idx + 1) /= n_local) &
-      write(*,*) "[RANK ", my_id, "] WARNING: Something is wrong in petsc_convert_jorek_system!"
+      write(*,*) "[RANK ", my_id, "] WARNING: Something is wrong in petsc_init_system!"
 
-    ! --- 1. Create matrix
+    ! Create matrix
     call MatCreate(comm, petsc_sys%A, ierr)
     call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
     call MatSetType(petsc_sys%A, MATMPIBAIJ, ierr)
@@ -88,57 +87,102 @@ contains
     do i = 1, n_block_local
       r_start = a_mat%iblockptr(i)
       r_end = a_mat%iblockptr(i+1) - 1
-        do k = r_start, r_end
-          c_global = a_mat%jcn((k-1)*block_size2 + 1)
-          block_col = (c_global / block_size) + 1 ! Fortran 1-based indexing
-          if (block_col >= a_mat%my_ind_min .and. block_col <= a_mat%my_ind_max) then
-            d_nnz(i) = d_nnz(i) + 1
-          else
-            o_nnz(i) = o_nnz(i) + 1
-          endif
-        enddo
+      do k = r_start, r_end
+        c_global = a_mat%jcn((k-1)*block_size2 + 1)
+        block_col = (c_global / block_size) + 1
+        if (block_col >= a_mat%my_ind_min .and. block_col <= a_mat%my_ind_max) then
+          d_nnz(i) = d_nnz(i) + 1
+        else
+          o_nnz(i) = o_nnz(i) + 1
+        endif
+      enddo
     enddo
 
     call MatMPIBAIJSetPreallocation(petsc_sys%A, block_size, 0, d_nnz, 0, o_nnz, ierr)
     if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: MatMPIBAIJSetPreallocation ierr=", ierr
     deallocate(d_nnz, o_nnz)
 
-    !call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
+
+    petsc_sys%initialized = .true.
+    if (my_id .eq. 0) write(*,*) " --- PETSc: init_system called"
+  end subroutine petsc_init_system
+
+
+  !> Fill matrix values from JOREK block-CSR — called when !solve_only
+  subroutine petsc_update_matrix(petsc_sys, a_mat)
+    use data_structure, only: type_SP_MATRIX
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_SP_MATRIX), intent(in) :: a_mat
+
+    integer :: i, k
+    integer :: my_id, mpierr
+    integer :: n_block_local, block_size, block_size2
+    integer :: r_start, r_end, c_global, val_ptr_start, val_ptr_end
+    PetscInt :: idxm(1), idxn(1)
+    PetscScalar, allocatable :: vals_petsc(:)
+    PetscErrorCode :: ierr
+
+    call MPI_COMM_RANK(a_mat%comm, my_id, mpierr)
+
+    block_size = a_mat%block_size
+    block_size2 = block_size * block_size
+    n_block_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
+
+    call MatZeroEntries(petsc_sys%A, ierr)
 
     allocate(vals_petsc(block_size2))
     do i = 1, n_block_local
-      idxm(1) = (a_mat%my_ind_min - 1) + (i - 1) ! 0-based PETSc indexing
+      idxm(1) = (a_mat%my_ind_min - 1) + (i - 1)
       r_start = a_mat%iblockptr(i)
       r_end = a_mat%iblockptr(i+1) - 1
-
       do k = r_start, r_end
         c_global = a_mat%jcn((k-1)*block_size2 + 1)
-        idxn(1) = c_global / block_size  ! 0-based PETSc indexing
-        
+        idxn(1) = c_global / block_size
         val_ptr_start = (k - 1) * block_size2 + 1
         val_ptr_end   = val_ptr_start + block_size2
         vals_petsc(1:block_size2) = a_mat%val(val_ptr_start : val_ptr_end)
-        
-        PetscCallA(MatSetValuesBlocked(petsc_sys%A, 1, idxm, 1, idxn, vals_petsc, INSERT_VALUES, ierr)) ! Secure PETSc call
+        PetscCallA(MatSetValuesBlocked(petsc_sys%A, 1, idxm, 1, idxn, vals_petsc, INSERT_VALUES, ierr))
       enddo
     enddo
 
     call MatAssemblyBegin(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
     call MatAssemblyEnd(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
     deallocate(vals_petsc)
+  end subroutine petsc_update_matrix
 
-    call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
+
+  !> Fill RHS vector from JOREK rhs — called every time
+  subroutine petsc_update_rhs(petsc_sys, rhs_vec)
+    use data_structure, only: type_RHS
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_RHS), intent(in) :: rhs_vec
+
+    integer :: i, my_id, mpierr, comm
+    PetscInt :: i_start, i_end, n_local
+    PetscInt, allocatable :: indices_petsc(:)
+    PetscErrorCode :: ierr
+
+    call PetscObjectGetComm(petsc_sys%b, comm, ierr)
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    call VecGetOwnershipRange(petsc_sys%b, i_start, i_end, ierr)
+    n_local = i_end - i_start
+
     allocate(indices_petsc(n_local))
     do i = 1, n_local
-      indices_petsc(i) = (row_start_idx-1 + i) - 1
+      indices_petsc(i) = i_start + (i - 1)
     end do
-    call VecSetValues(petsc_sys%b, n_local, indices_petsc, rhs_vec%val(row_start_idx:row_end_idx), INSERT_VALUES, ierr)
+
+    call VecSetValues(petsc_sys%b, n_local, indices_petsc, rhs_vec%val(i_start+1:i_end), INSERT_VALUES, ierr)
     call VecAssemblyBegin(petsc_sys%b, ierr)
     call VecAssemblyEnd(petsc_sys%b, ierr)
     deallocate(indices_petsc)
 
     if (my_id .eq. 0) write(*,*) " --- PETSc system conversion successful"
-  end subroutine petsc_convert_jorek_system
+  end subroutine petsc_update_rhs
 
 
   subroutine petsc_calc_vec_norm(petsc_sys, b_norm)
@@ -169,7 +213,7 @@ contains
     if (speaker) print *, "Start PETSC Matrix info ---"
     call MatGetSize(petsc_sys%A, M, N, ierr)
     if (speaker) print *, "Matrix size M = ", M, " ; N = ", N
-    call MatGetInfo(petsc_sys%A, MAT_GLOBAL_SUM, info, ierr) 
+    call MatGetInfo(petsc_sys%A, MAT_GLOBAL_SUM, info, ierr)
     if (speaker) then
        print "(A, I0)", " NNZ used = ", int(info(MAT_INFO_NZ_USED))
        print "(A, I0)", " NNZ stored = ", int(info(MAT_INFO_NZ_ALLOCATED))
@@ -181,7 +225,7 @@ contains
 
 
   subroutine petsc_test_matv(petsc_sys, a_mat)
-    use data_structure, only: type_SP_MATRIX 
+    use data_structure, only: type_SP_MATRIX
     use mod_matv, only: bcsr_matv
 
     type(type_PETSC_SYSTEM), intent(in) :: petsc_sys
@@ -189,8 +233,8 @@ contains
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpi_err
     integer :: i
-    real*8, allocatable :: x_global(:) 
-    real*8, allocatable :: y_jorek(:) 
+    real*8, allocatable :: x_global(:)
+    real*8, allocatable :: y_jorek(:)
     real*8 :: jorek_sum_sq, jorek_norm, petsc_norm
     Vec :: x, y_petsc
     PetscInt :: i_start, i_end, n_local
@@ -228,7 +272,7 @@ contains
     call VecGetArrayF90(x, x_arr, ierr)
     do i = 1, n_local
       x_arr(i) = x_global(i_start + i)  ! i_start+1 to i_end maps to x_global indices
-    enddo 
+    enddo
     call VecRestoreArrayF90(x, x_arr, ierr)
     call VecAssemblyBegin(x, ierr)
     call VecAssemblyEnd(x, ierr)
@@ -261,7 +305,7 @@ contains
       print *, "PETSc MatMult time: ", t2-t1
       print *, "JOREK MatVec time:  ", t4-t3
       print *, ""
-      
+
       print *, "JOREK Norm: ", jorek_norm
       print *, "PETSc norm: ", petsc_norm
     endif
@@ -321,7 +365,7 @@ contains
     !PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
 
     PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
-        
+
     PetscCallA(PCFactorSetMatOrderingType(pc,MATORDERINGND,ierr))
     PetscCallA(PCFactorGetMatrix(pc, F, ierr))
     PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))  ! fill-reducing ordering
@@ -346,21 +390,23 @@ contains
     !PetscCallA(VecDestroy(b_aij, ierr))
     !PetscCallA(VecDestroy(x_aij, ierr))
 
-    ! Calculate the norm of the solution 
+    ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
     if (my_id .eq.0) print *, "PETSc Norm (solution): ", petsc_norm
   end subroutine petsc_solve_and_retrieve
 
 
-  subroutine petsc_solve_iterative_and_retrieve(petsc_sys)
+  !> Iterative solve with persistent KSP/PC across time steps.
+  !! On first call (!ksp_ready): creates AIJ matrix, KSP, sets up PCFIELDSPLIT+MUMPS.
+  !! When !solve_only: converts A to AIJ (reuse sparsity), calls KSPSetUp to refactorize.
+  !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
+  subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    logical, intent(in) :: solve_only
 
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
-    PetscViewerAndFormat :: vf
     KSPConvergedReason :: reason
-    Mat :: A_aij
-    Vec :: b_aij, x_aij
     PetscLogStage :: stage_setup, stage_solve
     PetscLogDouble :: t1, t2
     KSPType :: ksp_type
@@ -370,71 +416,85 @@ contains
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
-    PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
-    PetscCallA(MatCreateVecs(A_aij, x_aij, b_aij, ierr))
-    PetscCallA(VecCopy(petsc_sys%b, b_aij, ierr))
-
     PetscCallA(PetscLogStageRegister("KSP Setup", stage_setup, ierr))
     PetscCallA(PetscLogStageRegister("KSP Solve", stage_solve, ierr))
 
-    PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
-    PetscCallA(KSPSetOperators(petsc_sys%ksp, A_aij, A_aij, ierr))
+    if (.not. petsc_sys%ksp_ready) then
+      ! First solve: create AIJ matrix, vecs, KSP, and set up PCFIELDSPLIT+MUMPS
+      PetscCallA(PetscTime(t1, ierr))
+      PetscCallA(PetscLogStagePush(stage_setup, ierr))
 
-    PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
-    PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
+      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
+      PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
 
-    PetscCallA(KSPSetType(petsc_sys%ksp, KSPDGMRES, ierr))
-    !PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
-    !PetscCallA(KSPSetType(petsc_sys%ksp, KSPFGMRES, ierr))
-    PetscCallA(PetscTime(t1, ierr))
-    PetscCallA(PetscLogStagePush(stage_setup, ierr))
-    call petsc_set_toroidal_harmonic_pc(petsc_sys)
+      PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      PetscCallA(KSPSetType(petsc_sys%ksp, KSPDGMRES, ierr))
 
-    ! Set the maximum iterations of the linear system
-    PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
-    PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
+      ! Set the maximum iterations and restart
+      PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
+      PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
 
-    if (my_id .eq. 0) print *, "Setting up the solver using PETSc"
+      if (my_id .eq. 0) write(*,*) "PETSc: setting up KSP with PCFIELDSPLIT+MUMPS"
+      call petsc_set_toroidal_harmonic_pc(petsc_sys)
 
-    PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+      PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+      petsc_sys%ksp_ready = .true.
 
-    PetscCallA(PetscLogStagePop(ierr))
-    PetscCallA(PetscTime(t2, ierr))
-    if (my_id == 0) print *, "Setup time:", t2 - t1, "s"
+      PetscCallA(PetscLogStagePop(ierr))
+      PetscCallA(PetscTime(t2, ierr))
+      if (my_id == 0) write(*,*) "PETSc: setup time:", t2 - t1, "s"
 
-    PetscCallA(KSPGetType(petsc_sys%ksp, ksp_type, ierr))
-    if (my_id == 0) print *, "KSP type:", ksp_type
+    else if (.not. solve_only) then
+      ! Matrix changed: convert to AIJ (reuse sparsity pattern), rebuild PC
+      if (my_id .eq. 0) write(*,*) "PETSc: rebuilding PC"
+      PetscCallA(PetscTime(t1, ierr))
+      PetscCallA(PetscLogStagePush(stage_setup, ierr))
 
-    if (my_id .eq. 0) print *, "Solving the system using PETSc"
+      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
+      PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+
+      PetscCallA(PetscLogStagePop(ierr))
+      PetscCallA(PetscTime(t2, ierr))
+      if (my_id == 0) write(*,*) "PETSc: PC rebuild time:", t2 - t1, "s"
+
+    else
+      ! solve_only: update A for mat-vec products but reuse PC factorization
+      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
+    end if
+
+    ! Copy RHS, solve, copy solution back
+    PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
+
+    if (my_id .eq. 0) write(*,*) "PETSc: solving the system"
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(stage_solve, ierr))
-    PetscCallA(KSPSolve(petsc_sys%ksp, b_aij, x_aij, ierr))
+    PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
     PetscCallA(PetscLogStagePop(ierr))
     PetscCallA(PetscTime(t2, ierr))
-    if (my_id == 0) print *, "Solve time:", t2 - t1, "s"
+    if (my_id == 0) write(*,*) "PETSc: solve time:", t2 - t1, "s"
 
-    
+    PetscCallA(VecCopy(petsc_sys%x_aij, petsc_sys%x, ierr))
+
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
 
     if (my_id == 0) then
-        print *, "Total Iterations:", its
-        if (reason > 0) then
-            print *, "Converged, reason:", reason
-        else
-            print *, "Diverged, reason:", reason
-        end if
+      write(*,*) "PETSc: total iterations:", its
+      if (reason > 0) then
+        write(*,*) "PETSc: converged, reason:", reason
+      else
+        write(*,*) "PETSc: diverged, reason:", reason
+      end if
     end if
 
-    PetscCallA(KSPDestroy(petsc_sys%ksp, ierr))
-    PetscCallA(MatDestroy(A_aij, ierr))
-    PetscCallA(VecCopy(x_aij, petsc_sys%x, ierr))
-    PetscCallA(VecDestroy(b_aij, ierr))
-    PetscCallA(VecDestroy(x_aij, ierr))
-
-    ! Calculate the norm of the solution 
+    ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
-    if (my_id .eq.0) print *, "PETSc Norm (solution): ", petsc_norm
+    if (my_id .eq.0) write(*,*) "PETSc Norm (solution): ", petsc_norm
   end subroutine petsc_solve_iterative_and_retrieve
 
 
@@ -486,7 +546,7 @@ contains
     do i = 1,n_split
       if (i .eq. 1) then
         field_size = split_size
-      else 
+      else
         field_size = 2 * split_size
       endif
       allocate(fields(field_size))
@@ -494,7 +554,7 @@ contains
       do j = 1, split_size
         if (i .eq. 1) then
           fields(j) = (j-1)*n_tor
-        else  
+        else
           fields(2*j - 1) = (j-1)*n_tor + 1
           fields(2*j)     = (j-1)*n_tor + 2
         endif
@@ -520,14 +580,25 @@ contains
     deallocate(subksp_array)
   end subroutine petsc_set_toroidal_harmonic_pc
 
+
+  !> Destroy all persistent PETSc objects; safe to call even if never initialized.
   subroutine petsc_cleanup(petsc_sys)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     PetscErrorCode :: ierr
 
-    call VecDestroy(petsc_sys%b, ierr)
-    call VecDestroy(petsc_sys%x, ierr)
-    call MatDestroy(petsc_sys%A, ierr)
-
+    if (petsc_sys%ksp_ready) then
+      call KSPDestroy(petsc_sys%ksp, ierr)
+      call MatDestroy(petsc_sys%A_aij, ierr)
+      call VecDestroy(petsc_sys%b_aij, ierr)
+      call VecDestroy(petsc_sys%x_aij, ierr)
+      petsc_sys%ksp_ready = .false.
+    endif
+    if (petsc_sys%initialized) then
+      call VecDestroy(petsc_sys%b, ierr)
+      call VecDestroy(petsc_sys%x, ierr)
+      call MatDestroy(petsc_sys%A, ierr)
+      petsc_sys%initialized = .false.
+    endif
   end subroutine petsc_cleanup
 
 #endif

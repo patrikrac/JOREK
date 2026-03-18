@@ -42,7 +42,8 @@ module mod_sparse
     use omp_lib, only: omp_target_memcpy, omp_get_initial_device, omp_get_default_device, omp_target_is_present
 #endif
 #ifdef USE_PETSC
-    use mod_petsc
+    use mod_petsc, only: petsc_init_system, petsc_update_matrix, petsc_update_rhs, &
+                         petsc_solve_iterative_and_retrieve, petsc_recover_solution
 #endif
 
     implicit none
@@ -67,9 +68,6 @@ module mod_sparse
     real                     :: tt1,tt0
 
     logical :: use_condition_number_estimate = .false.
-#ifdef USE_PETSC
-    type(type_PETSC_SYSTEM) :: petsc_sys
-#endif
 
     external :: solve_mumps_all, solve_pastix_all, solve_strumpack_all
 
@@ -175,10 +173,15 @@ module mod_sparse
       if (use_matrix_equilibration) call scale_vector_column_inverse(a_mat, sol_vec%val)
 
 #ifdef USE_PETSC
-      call petsc_convert_jorek_system(a_mat, rhs_vec, petsc_sys)
-      call petsc_solve_iterative_and_retrieve(petsc_sys)
-      call petsc_recover_solution(petsc_sys, sol_vec)
-      call petsc_cleanup(petsc_sys)
+      if (.not. solver%petsc_sys%initialized) then
+        call petsc_init_system(solver%petsc_sys, a_mat)
+      endif
+      if (.not. solver%solve_only) then
+        call petsc_update_matrix(solver%petsc_sys, a_mat)
+      endif
+      call petsc_update_rhs(solver%petsc_sys, rhs_vec)
+      call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only)
+      call petsc_recover_solution(solver%petsc_sys, sol_vec)
       solver%step_success = .true.
 #else
       if (.not.solver%pc%initialized) then
