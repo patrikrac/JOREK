@@ -484,7 +484,7 @@ contains
     n_iter    = its
     converged = (reason > 0)
 
-    if (my_id == 0) write(*,FMT_TIMING) my_id, '#  Elapsed time PETSc solve :', t2-t1
+    if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
