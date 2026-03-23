@@ -403,6 +403,7 @@ contains
   !! When !solve_only: converts A to AIJ (reuse sparsity), calls KSPSetUp to refactorize.
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
+    use mod_clock, only: FMT_TIMING
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -424,7 +425,6 @@ contains
       ! First solve: create AIJ matrix, vecs, KSP, and set up PCFIELDSPLIT+MUMPS
       PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
       PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
-      PetscCallA(PetscTime(t1, ierr))
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
@@ -447,13 +447,10 @@ contains
       petsc_sys%ksp_ready = .true.
 
       PetscCallA(PetscLogStagePop(ierr))
-      PetscCallA(PetscTime(t2, ierr))
-      if (my_id == 0) write(*,'(A,F8.3,A)') "[PETSc] setup complete  (", t2-t1, "s)"
 
     else if (.not. solve_only) then
       ! Matrix changed: convert to AIJ (reuse sparsity pattern), rebuild PC
       if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: matrix changed, refactorizing"
-      PetscCallA(PetscTime(t1, ierr))
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
@@ -462,8 +459,6 @@ contains
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
 
       PetscCallA(PetscLogStagePop(ierr))
-      PetscCallA(PetscTime(t2, ierr))
-      if (my_id == 0) write(*,'(A,F8.3,A)') "[PETSc] PC rebuild complete  (", t2-t1, "s)"
 
     else
       ! solve_only: update A for mat-vec products but reuse PC factorization
@@ -476,7 +471,6 @@ contains
     ! Copy RHS, solve, copy solution back
     PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
 
-    if (my_id .eq. 0) write(*,*) "[PETSc] KSP solve..."
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
@@ -490,13 +484,7 @@ contains
     n_iter    = its
     converged = (reason > 0)
 
-    if (my_id == 0) then
-      if (reason > 0) then
-        write(*,'(A,I4,A,I3,A,F8.3,A)') "[PETSc] converged: ", its, " iters (reason=", reason, ") in ", t2-t1, "s"
-      else
-        write(*,'(A,I4,A,I3,A,F8.3,A)') "[PETSc] DIVERGED:  ", its, " iters (reason=", reason, ") in ", t2-t1, "s"
-      end if
-    end if
+    if (my_id == 0) write(*,FMT_TIMING) my_id, '#  Elapsed time PETSc solve :', t2-t1
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
