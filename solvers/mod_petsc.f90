@@ -416,9 +416,6 @@ contains
     PetscInt :: its
     PetscReal :: petsc_norm
     PetscViewerAndFormat :: vf
-    PC :: outer_pc
-    PetscInt :: n_sub, i_sub
-    KSP, pointer :: subksp_arr(:)
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
@@ -461,14 +458,8 @@ contains
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
-      ! Force MUMPS factorization now instead of deferring to first KSPSolve iteration
-      PetscCallA(KSPGetPC(petsc_sys%ksp, outer_pc, ierr))
-      PetscCallA(PCFieldSplitGetSubKSP(outer_pc, n_sub, subksp_arr, ierr))
-      do i_sub = 1, n_sub
-        PetscCallA(KSPSetUp(subksp_arr(i_sub), ierr))
-      enddo
-      deallocate(subksp_arr)
 
       PetscCallA(PetscLogStagePop(ierr))
       PetscCallA(PetscTime(t2, ierr))
