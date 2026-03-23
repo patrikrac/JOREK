@@ -17,6 +17,7 @@ module mod_petsc
     logical :: ksp_ready     = .false.  ! KSP, A_aij, PC setup + factored
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
+    integer :: n_split = 0             ! number of FIELDSPLIT sub-KSPs (set on first call)
   end type type_PETSC_SYSTEM
 
 
@@ -417,8 +418,8 @@ contains
     PetscReal :: petsc_norm
     PetscViewerAndFormat :: vf
     PC :: outer_pc
-    PetscInt :: n_sub, i_sub
-    KSP, pointer :: subksp_arr(:)
+    PetscInt :: i_sub
+    KSP, allocatable :: subksp_arr(:)
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
@@ -464,8 +465,9 @@ contains
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       ! Force MUMPS factorization now instead of deferring to first KSPSolve iteration
       PetscCallA(KSPGetPC(petsc_sys%ksp, outer_pc, ierr))
-      PetscCallA(PCFieldSplitGetSubKSP(outer_pc, n_sub, subksp_arr, ierr))
-      do i_sub = 1, n_sub
+      allocate(subksp_arr(petsc_sys%n_split))
+      PetscCallA(PCFieldSplitGetSubKSP(outer_pc, petsc_sys%n_split, subksp_arr, ierr))
+      do i_sub = 1, petsc_sys%n_split
         PetscCallA(KSPSetUp(subksp_arr(i_sub), ierr))
       enddo
       deallocate(subksp_arr)
@@ -565,6 +567,7 @@ contains
     else
       n_split = n_mode_families
     endif
+    petsc_sys%n_split = n_split
     split_size = block_size/n_tor
     do i = 1, n_split
       if (autodistribute_modes) then
