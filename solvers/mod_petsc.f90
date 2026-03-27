@@ -428,7 +428,7 @@ contains
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
 
-      if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + PCFIELDSPLIT + MUMPS (first solve)"
+      if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + PCFIELDSPLIT + MUMPS"
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
       call petsc_set_toroidal_harmonic_pc(petsc_sys)
@@ -439,7 +439,7 @@ contains
       PetscCallA(PetscLogStagePop(ierr))
 
     else if (.not. solve_only) then
-      if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: matrix changed, refactorizing"
+      if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: refactorizing"
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
