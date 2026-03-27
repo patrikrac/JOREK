@@ -211,6 +211,12 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
 #endif
   
   ! --- Check solver consistency
+#ifdef USE_PETSC
+  if (.not. gmres) then
+    write(*,*) 'FATAL : Direct solution not implemented in PETSc'
+    call MPI_Abort(MPI_COMM_WORLD, 3, ierr) 
+  endif
+#else
   solvers = (/use_mumps,use_pastix,use_wsmp,use_strumpack/)
   nsolvers = 0
   do i=1,size(solvers)
@@ -225,7 +231,9 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
     call MPI_Abort(MPI_COMM_WORLD, 3, ierr)
     stop
   endif
-  
+#endif
+ 
+#ifndef USE_PETSC
   solvers_eq = (/use_mumps_eq,use_pastix_eq,use_strumpack_eq/)
   nsolvers = 0
   do i=1,size(solvers_eq)
@@ -240,6 +248,7 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
     call MPI_Abort(MPI_COMM_WORLD, 3, ierr)
     stop
   endif
+#endif
 
   ! --- Some checks not to waste any cpu time
   if ( (n_tor < 1) .or. (mod(n_tor,2) == 0) ) then
