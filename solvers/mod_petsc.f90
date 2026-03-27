@@ -422,7 +422,7 @@ contains
 
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
-      PetscCallA(KSPSetType(petsc_sys%ksp, KSPDGMRES, ierr))
+      PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
       ! Set the maximum iterations and restart
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
@@ -450,7 +450,7 @@ contains
       PetscCallA(PetscLogStagePop(ierr))
 
     else
-      ! solve_only: update A for mat-vec products but reuse PC factorization
+      ! solve_only: update A but reuse PC factorization
       if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
