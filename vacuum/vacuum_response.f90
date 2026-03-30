@@ -1943,6 +1943,9 @@ module vacuum_response
     integer  :: ierr,i
     real*8, allocatable :: rhs_contrib_arr(:)
     real*8, allocatable :: diag_1(:)
+#ifdef USE_PETSC
+    PetscErrorCode :: petsc_ierr
+#endif
 
     if ( sr%n_tor == 0 ) then
       write(*,*) 'Skipping vacuum_boundary_integral since sr%n_tor==0.'
@@ -1951,7 +1954,11 @@ module vacuum_response
     
     if ( vacuum_debug ) t_elaps_start = MPI_WTIME()  ! for timing
 
+#ifdef USE_PETSC
+    if ( vacuum_debug .and. .not. a_mat%petsc_assembled) write(*,*) my_id, 'Before:', sum(abs(rhs_loc)),sum(abs(a_mat%val))
+#else
     if ( vacuum_debug ) write(*,*) my_id, 'Before:', sum(abs(rhs_loc)),sum(abs(a_mat%val))
+#endif
 
     ! --- Determine vectors of the psi and deltapsi boundary values.
     call det_psibnd_vec(bnd_node_list, node_list, psibnd_vec, dpsibnd_vec, psibnd_coils)
@@ -2013,7 +2020,11 @@ module vacuum_response
     !$omp   testfunc_l, i_vertex, i_dof, i_node, i_dir, i_node_bnd, i_index, i_size, i_starwall,              &
     !$omp   i_tor, i_resp, i_resp_old, i_resp_0, basfunc_i, j_node_bnd, j_dof, j_node, j_dir,                 &
     !$omp   j_index, j_starwall, j_tor, j_resp, j_col_psi, sparsepos_jp, sparsepos_pp,                        &
-    !$omp   amat_contrib, rhs_contrib, blockpos_jp, blockpos_pp, ierr     )                                   &
+    !$omp   amat_contrib, rhs_contrib, blockpos_jp, blockpos_pp, ierr     &
+#ifdef USE_PETSC
+    !$omp   , petsc_ierr                                                                                       &
+#endif
+    !$omp   )                                                                                                   &
     !$omp schedule(dynamic,1) collapse(4)
     L_MB: do m_bndelem = 1, bnd_elm_list%n_bnd_elements
 
@@ -2125,15 +2136,26 @@ module vacuum_response
                         ! --- Determine the column in the main matrix
                         j_col_psi = det_row_col(j_index, var_psi, j_tor, a_mat%i_tor_min, a_mat%i_tor_max)
 
+                        ! --- Vacuum response contribution to the lhs of the current equation
+                        amat_contrib = - common_prefactor * response_m_e(i_resp, j_resp)
+#ifdef USE_PETSC
+                        if (a_mat%petsc_assembled) then
+                          !$omp critical
+                          call MatSetValue(a_mat%petsc_A, l_row_j - 1, j_col_psi - 1, &
+                                           amat_contrib, ADD_VALUES, petsc_ierr)
+                          !$omp end critical
+                        else
+#endif
                         ! --- Determine the position in the sparse matrix data structure
                         !     which corresponds to the matrix entry at  l_row_j, j_col_psi.
                         sparsepos_jp = det_sparse_pos(l_row_j,   j_col_psi, index_min, a_mat)
                         sparsepos_pp = det_sparse_pos(l_row_psi, j_col_psi, index_min, a_mat)
 
-                        ! --- Vacuum response contribution to the lhs of the current equation
-                        amat_contrib = - common_prefactor * response_m_e(i_resp, j_resp)
                         !$omp atomic
                         a_mat%val(sparsepos_jp) = a_mat%val(sparsepos_jp) + amat_contrib
+#ifdef USE_PETSC
+                        endif
+#endif
 
                       end do L_JS
                     end do L_JD
@@ -2171,7 +2193,11 @@ module vacuum_response
       write(*,'(I4,A,F10.7,A)') my_id, '  Elapsed time vacuum_boundary_integral', t_elaps_end - t_elaps_start, ' s'
     end if
     
+#ifdef USE_PETSC
+    if ( vacuum_debug .and. .not. a_mat%petsc_assembled) write(*,*) my_id, 'After:', sum(abs(rhs_loc)),sum(abs(a_mat%val))
+#else
     if ( vacuum_debug ) write(*,*) my_id, 'After:', sum(abs(rhs_loc)),sum(abs(a_mat%val))
+#endif
 
     if ( allocated(psibnd_vec ) ) deallocate( psibnd_vec  )
     if ( allocated(dpsibnd_vec) ) deallocate( dpsibnd_vec )

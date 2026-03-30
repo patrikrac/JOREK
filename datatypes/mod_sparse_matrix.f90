@@ -1,5 +1,9 @@
 module mod_sparse_matrix
   use mod_integer_types
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+  use petsc
+#endif
   implicit none
   
   private
@@ -42,6 +46,10 @@ module mod_sparse_matrix
     logical                                      :: reduced = .false. !< matrix is available on all comm ranks (not distribued)
     logical                                      :: bcsr_mapped = .false.    !< matrix mapping to block CSR format is determined
     logical                                      :: device_mapped = .false.  !<matrix in mapped to the device
+#ifdef USE_PETSC
+    Mat                                          :: petsc_A                  !< PETSc MPIBAIJ matrix for direct assembly
+    logical                                      :: petsc_assembled = .false. !< true once PETSc matrix has been created
+#endif
 
   contains
     procedure :: copy_to
@@ -94,6 +102,16 @@ module mod_sparse_matrix
     mat_a%row_distributed = self%row_distributed
     mat_a%col_distributed = self%col_distributed
     mat_a%reduced         = self%reduced
+
+#ifdef USE_PETSC
+    if (with_data .and. self%petsc_assembled) then
+      mat_a%petsc_A         = self%petsc_A
+      mat_a%petsc_assembled = .true.
+      self%petsc_assembled  = .false.
+    else
+      mat_a%petsc_assembled = .false.
+    endif
+#endif
 
     return
   end subroutine move_to
@@ -161,6 +179,9 @@ module mod_sparse_matrix
 
   subroutine reset(self)
     class(type_SP_MATRIX), intent(inout)    :: self
+#ifdef USE_PETSC
+    PetscErrorCode :: petsc_ierr
+#endif
 
     if (associated(self%irn)) then
       deallocate(self%irn); self%irn => Null()
@@ -199,6 +220,13 @@ module mod_sparse_matrix
       deallocate(self%iptr); self%iptr => Null()
     endif    
 
+#ifdef USE_PETSC
+    if (self%petsc_assembled) then
+      call MatDestroy(self%petsc_A, petsc_ierr)
+      self%petsc_assembled = .false.
+    endif
+#endif
+
     self%indexing = 1
     self%ng = 0
     self%nr = 0
@@ -218,7 +246,7 @@ module mod_sparse_matrix
     self%col_distributed = .false.
     self%reduced = .false.
     self%device_mapped = .false.
-    
+
   end subroutine reset
   
 end module mod_sparse_matrix

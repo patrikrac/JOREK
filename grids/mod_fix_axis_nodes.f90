@@ -1,6 +1,10 @@
 !> Add condition for the axis directly in the matrix.
 !> This is aimed at stabilising numerical noise on the axis.
 module mod_fix_axis_nodes
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+  use petsc
+#endif
 contains
 
 subroutine fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, index_min, index_max, a_mat)
@@ -25,6 +29,10 @@ subroutine fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, 
   integer               :: index_node, index_node2
   integer(kind=int_all) :: index_large_i
   integer(kind=int_all) :: ijA_position,ijA_position2
+#ifdef USE_PETSC
+  PetscInt              :: petsc_row
+  PetscErrorCode        :: petsc_ierr
+#endif
 
   n_tor_local = (a_mat%i_tor_max - a_mat%i_tor_min + 1)
 
@@ -45,6 +53,12 @@ subroutine fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, 
             ! --- For t-derivative
             index_node = node_list%node(inode)%index(3)
             if ((index_node .ge. index_min) .and. (index_node .le. index_max)) then
+#ifdef USE_PETSC
+              if (a_mat%petsc_assembled) then
+                petsc_row = n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min
+                call MatSetValue(a_mat%petsc_A, petsc_row, petsc_row, zbig, INSERT_VALUES, petsc_ierr)
+              else
+#endif
               call locate_irn_jcn(index_node,index_node,index_min,index_max,ijA_position,a_mat)
               index_large_i = n_tor_local * n_var * (index_node - 1)
               ilarge2 = ijA_position - 1 + ((k-1)*n_tor_local + in-a_mat%i_tor_min) * n_var*n_tor_local &
@@ -52,11 +66,20 @@ subroutine fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, 
               a_mat%irn(ilarge2) =  n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min + 1
               a_mat%jcn(ilarge2) =  n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min + 1
               a_mat%val(ilarge2)   = zbig
+#ifdef USE_PETSC
+              endif
+#endif
             end if
 
             ! --- For cross st-derivative
             index_node = node_list%node(inode)%index(4)
             if ((index_node .ge. index_min) .and. (index_node .le. index_max)) then
+#ifdef USE_PETSC
+              if (a_mat%petsc_assembled) then
+                petsc_row = n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min
+                call MatSetValue(a_mat%petsc_A, petsc_row, petsc_row, zbig, INSERT_VALUES, petsc_ierr)
+              else
+#endif
               call locate_irn_jcn(index_node,index_node,index_min,index_max,ijA_position,a_mat)
               index_large_i = n_tor_local * n_var * (index_node - 1)
               ilarge2 = ijA_position - 1 + ((k-1)*n_tor_local + in-a_mat%i_tor_min) * n_var*n_tor_local &
@@ -64,6 +87,9 @@ subroutine fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, 
               a_mat%irn(ilarge2) =  n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min + 1
               a_mat%jcn(ilarge2) =  n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min + 1
               a_mat%val(ilarge2)   = zbig
+#ifdef USE_PETSC
+              endif
+#endif
             end if
 
           enddo

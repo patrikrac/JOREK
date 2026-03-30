@@ -14,6 +14,7 @@ module mod_petsc
     Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (persistent)
     KSP  :: ksp            ! Krylov solver context (persistent)
     logical :: initialized   = .false.  ! A, x, b created
+    logical :: owns_A        = .false.  ! .true. when A was created by petsc_init_system (old path)
     logical :: ksp_ready     = .false.  ! KSP, A_aij, PC setup + factored
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
@@ -107,6 +108,7 @@ contains
     call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
 
     petsc_sys%initialized = .true.
+    petsc_sys%owns_A = .true.
     if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0)') "[PETSc] init: BAIJ matrix ", n_global, "x", n_global, &
                                                     ", block_size=", block_size
   end subroutine petsc_init_system
@@ -586,7 +588,60 @@ contains
   end subroutine petsc_set_toroidal_harmonic_pc
 
 
+  !> Create and preallocate a PETSc MPIBAIJ matrix from the JOREK block structure
+  !! (ijA_size, irn_jcn). Does not require iblockptr (block-CSR).
+  subroutine petsc_create_matrix(petsc_A, a_mat)
+    use data_structure, only: type_SP_MATRIX
+
+    Mat, intent(out)                    :: petsc_A
+    type(type_SP_MATRIX), intent(in)    :: a_mat
+
+    integer :: i, j
+    integer :: comm, my_id, mpierr
+    integer :: n_local, n_global, n_block_local, block_size, col_block
+    PetscInt, allocatable :: d_nnz(:), o_nnz(:)
+    PetscErrorCode :: ierr
+
+    comm = a_mat%comm
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    block_size    = a_mat%block_size
+    n_global      = a_mat%ng
+    n_block_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
+    n_local       = n_block_local * block_size
+
+    ! Compute diagonal/off-diagonal block counts per block row
+    allocate(d_nnz(n_block_local), o_nnz(n_block_local))
+    d_nnz = 0
+    o_nnz = 0
+    do i = 1, n_block_local
+      do j = 1, a_mat%ijA_size(i)
+        col_block = a_mat%irn_jcn(i, j)
+        if (col_block >= a_mat%my_ind_min .and. col_block <= a_mat%my_ind_max) then
+          d_nnz(i) = d_nnz(i) + 1
+        else
+          o_nnz(i) = o_nnz(i) + 1
+        endif
+      enddo
+    enddo
+
+    ! Create and preallocate
+    call MatCreate(comm, petsc_A, ierr)
+    call MatSetSizes(petsc_A, n_local, n_local, n_global, n_global, ierr)
+    call MatSetType(petsc_A, MATMPIBAIJ, ierr)
+    call MatSetBlockSize(petsc_A, block_size, ierr)
+    call MatMPIBAIJSetPreallocation(petsc_A, block_size, 0, d_nnz, 0, o_nnz, ierr)
+    if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: petsc_create_matrix preallocation ierr=", ierr
+    deallocate(d_nnz, o_nnz)
+
+    if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0)') &
+      "[PETSc] create_matrix: BAIJ ", n_global, "x", n_global, ", block_size=", block_size
+  end subroutine petsc_create_matrix
+
+
   !> Destroy all persistent PETSc objects; safe to call even if never initialized.
+  !! petsc_sys%A is only destroyed if owns_A=.true. (old path via petsc_init_system).
+  !! In the direct assembly path, A is owned by a_mat%petsc_A.
   subroutine petsc_cleanup(petsc_sys)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     PetscErrorCode :: ierr
@@ -601,7 +656,10 @@ contains
     if (petsc_sys%initialized) then
       call VecDestroy(petsc_sys%b, ierr)
       call VecDestroy(petsc_sys%x, ierr)
-      call MatDestroy(petsc_sys%A, ierr)
+      if (petsc_sys%owns_A) then
+        call MatDestroy(petsc_sys%A, ierr)
+        petsc_sys%owns_A = .false.
+      endif
       petsc_sys%initialized = .false.
     endif
   end subroutine petsc_cleanup

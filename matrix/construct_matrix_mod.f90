@@ -26,6 +26,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   use mod_fix_axis_nodes, only: fix_nodes_on_axis
   use vacuum_response, only: vacuum_boundary_integral
   use global_distributed_matrix, only: global_matrix_structure_vacuum
+#ifdef USE_PETSC
+  use mod_petsc, only: petsc_create_matrix
+#endif
   implicit none
 
 #include "r3_info.h"
@@ -53,6 +56,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   integer                           :: my_ind_min, my_ind_max
   integer                           :: node_out(n_vertex_max)
   integer                           :: my_id
+#ifdef USE_PETSC
+  PetscErrorCode                    :: petsc_ierr
+#endif
   integer                           :: xcase2
   real*8                            :: R_axis
   real*8                            :: Z_axis
@@ -96,6 +102,17 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   call new_thread_buffers() 
 
   ! --- Allocation/Reallocation of the sparse matrix and right-hand side vector
+#ifdef USE_PETSC
+  if (.not. harmonic_matrix) then !TODO: Might be unnessecary ... constant protection by harmonic_matrix...
+    ! Direct PETSc assembly: skip irn/jcn/val, use PETSc MPIBAIJ matrix
+    if (.not. a_mat%petsc_assembled) then
+      call petsc_create_matrix(a_mat%petsc_A, a_mat)
+      a_mat%petsc_assembled = .true.
+    else
+      call MatZeroEntries(a_mat%petsc_A, petsc_ierr)
+    endif
+  else
+#endif
   if (associated(a_mat%irn)) call tr_deallocatep(a_mat%irn, "irn", CAT_DMATRIX)
   if (associated(a_mat%jcn)) call tr_deallocatep(a_mat%jcn, "jcn", CAT_DMATRIX)
   if (associated(a_mat%val)) call tr_deallocatep(a_mat%val, "val", CAT_DMATRIX)
@@ -107,6 +124,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   a_mat%irn(1:a_mat%nnz) = 0
   a_mat%jcn(1:a_mat%nnz) = 0
   a_mat%val(1:a_mat%nnz) = 0.0d0
+#ifdef USE_PETSC
+  endif
+#endif
 
   if (associated(rhs_vec%val)) call tr_deallocatep(rhs_vec%val,"rhs",CAT_DMATRIX)
   call tr_allocatep(rhs_vec%val, Int1, a_mat%ng, "rhs", CAT_DMATRIX)
@@ -173,8 +193,18 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     !$omp end do
     !$omp end parallel
 
+#ifdef USE_PETSC
+    if (.not. harmonic_matrix) then
+      ! Flush element contributions (ADD_VALUES) before BCs (INSERT_VALUES)
+      call MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+      call MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+    else
+#endif
     ! --- Memory tracking
     call tr_vnorms("cm_A_bef_bc", a_mat%val, a_mat%nnz)
+#ifdef USE_PETSC
+    endif
+#endif
 
     ! --- Apply boundary conditions.
     call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
@@ -187,8 +217,18 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
       call penalize_dof_on_axis(node_list, 4, element_list, local_elms, n_local_elms, my_ind_min, my_ind_max, a_mat)
     endif
 
+#ifdef USE_PETSC
+    if (.not. harmonic_matrix) then
+      ! Flush BC contributions (INSERT_VALUES) before vacuum (ADD_VALUES)
+      call MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+      call MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+    else
+#endif
     ! --- Memory tracking
     call tr_vnorms("cm_A_aft_bc", a_mat%val, a_mat%nnz)
+#ifdef USE_PETSC
+    endif
+#endif
 
     ! --- Add vacuum response (boundary integral) for free boundary computations
     if ( freeboundary .and. ( sr%n_tor /= 0 ) ) then
@@ -196,7 +236,15 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
                                     resistive_wall, my_ind_min, my_ind_max, rhs_local, tstep, index_now, a_mat)
     endif
 
-    if ( .not. harmonic_matrix ) then 
+#ifdef USE_PETSC
+    if (.not. harmonic_matrix) then
+      ! Final assembly of PETSc matrix
+      call MatAssemblyBegin(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, petsc_ierr)
+      call MatAssemblyEnd(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, petsc_ierr)
+    endif
+#endif
+
+    if ( .not. harmonic_matrix ) then
 #ifdef COMPARE_ELEMENT_MATRIX
       ! TODO: Create a subroutine to compare the element matrix with the right-hand side vector
       !call summarise_element_matrix_comparison(a_mat, rhs_vec, my_id, index_now)
@@ -212,7 +260,11 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   rhs_vec%n  = a_mat%ng
 
   ! --- Check if the matrix is distributed correctly
+#ifdef USE_PETSC
+  if (harmonic_matrix) call check_if_distributed(a_mat)
+#else
   call check_if_distributed(a_mat)
+#endif
 
   ! --- Handle all nessecarry cleanup operations
   call tr_locvnorms("cm_BCRhs",rhs_vec%val,a_mat%ng)
@@ -385,6 +437,10 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
   use data_structure, only: type_element, type_node, type_node_list, type_SP_MATRIX, thread_struct
   use nodes_elements
   use mod_locate_irn_jcn
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+  use petsc
+#endif
   implicit none
 
   ! Arguments
@@ -412,6 +468,10 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
   integer :: nnz_counter
 
   integer :: n_tor_local
+#ifdef USE_PETSC
+  PetscInt :: idxm_petsc(1), idxn_petsc(1)
+  PetscErrorCode :: petsc_ierr
+#endif
 
   n_tor_local = a_mat%i_tor_max - a_mat%i_tor_min + 1
 
@@ -476,6 +536,33 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
             enddo
           endif
 
+#ifdef USE_PETSC
+          if (a_mat%petsc_assembled) then
+          ! --- PETSc direct assembly: compute block and insert via MatSetValuesBlocked
+          do k=1,n_vertex_max
+            knode = node_out(k)
+            do k_order = 1, n_degrees
+              index_node2 = node_list%node(knode)%index(k_order)
+              thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local) = 0.d0
+              do j = 1, n_var * n_tor_local
+                index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j
+                do l = 1, n_var * n_tor_local
+                  index_kl = n_tor_local * n_var * n_degrees * (k-1) + n_tor_local * n_var * (k_order-1) + l
+                  thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) = &
+                    thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) + thread_struct(omp_tid)%ELM(index_ij,index_kl)
+                enddo
+              enddo
+
+              idxm_petsc(1) = index_node1 - 1  ! 0-based block row
+              idxn_petsc(1) = index_node2 - 1  ! 0-based block col
+              !$omp critical
+              call MatSetValuesBlocked(a_mat%petsc_A, 1, idxm_petsc, 1, idxn_petsc, &
+                                      thread_struct(omp_tid)%synch_buff, ADD_VALUES, petsc_ierr)
+              !$omp end critical
+            enddo ! n_degrees
+          enddo ! n_vertex_max
+          else
+#endif
           do k=1,n_vertex_max
 
             knode = node_out(k)
@@ -496,7 +583,7 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
               call locate_irn_jcn(index_node1,index_node2,my_ind_min,my_ind_max,ijA_position,a_mat)
 
               thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local) = 0.d0
-              
+
               do j = 1, n_var * n_tor_local
                 index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
 
@@ -508,14 +595,13 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
 
                   a_mat%irn(ilarge2) = index_large_i	+ j
                   a_mat%jcn(ilarge2) = index_large_k	+ l
-                  
 
                   thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) = &
                     thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) + thread_struct(omp_tid)%ELM(index_ij,index_kl)
                 enddo ! n_var * n_tor_local
 
               enddo ! n_var * n_tor_local
-                if (.not. eliminate_boundary_dofs) then 
+                if (.not. eliminate_boundary_dofs) then
                   !$omp critical
                   a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
                     a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
@@ -529,9 +615,9 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
                     a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
                     thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
                   !$omp end critical
-                else 
+                else
                   if ((i .eq. k) .and. ((i_order .eq. 1 .and. k_order .eq. 1) &
-                                            .or. ((i_bnd_type .eq. 2 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 3 .and. k_order .eq. 3)) & 
+                                            .or. ((i_bnd_type .eq. 2 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 3 .and. k_order .eq. 3)) &
                                             .or. ((i_bnd_type .eq. 1 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 2 .and. k_order .eq. 2)))) then
 
                     !$omp critical
@@ -561,13 +647,16 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
                       a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
                       thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
                     !$omp end critical
-                  endif                 
-                endif  
+                  endif
+                endif
 
               endif ! zbig_bc
 
             enddo ! n_degrees
           enddo ! n_vertex_max
+#ifdef USE_PETSC
+          endif
+#endif
 
         endif ! my_ind_min < index < my_ind_max
 
