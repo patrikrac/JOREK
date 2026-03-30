@@ -1,6 +1,10 @@
 module construct_matrix_mod
 
 use mod_parameters, only : n_var, n_order, n_degrees_1d
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+use petsc
+#endif
 implicit none
 
 public :: construct_matrix

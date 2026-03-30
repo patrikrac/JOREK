@@ -1890,6 +1890,10 @@ module vacuum_response
     use phys_module, only: t_now, t_start
     use mpi_mod
     use mod_integer_types
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+    use petsc
+#endif
 
     implicit none
 
@@ -1901,7 +1905,7 @@ module vacuum_response
     logical,                            intent(in)    :: freeboundary_equil   !< Use free boundary equilibrium?
     logical,                            intent(in)    :: resistive_wall       !< Resistive or ideal wall?
     integer,                            intent(in)    :: index_min, index_max !< Responsibility of MPI proc
-    real*8,                             intent(inout) :: rhs_loc(:)           !< Part of RHS of MPI proc 
+    real*8,                             intent(inout) :: rhs_loc(:)           !< Part of RHS of MPI proc
     real*8,                             intent(in)    :: tstep                !< delta t, timestep
     integer,                            intent(in)    :: index_now            !< Current timestep index
     type(type_SP_MATRIX)                              :: a_mat

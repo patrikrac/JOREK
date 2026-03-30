@@ -42,6 +42,8 @@ module mod_sparse
     use omp_lib, only: omp_target_memcpy, omp_get_initial_device, omp_get_default_device, omp_target_is_present
 #endif
 #ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+    use petsc
     use mod_petsc, only: petsc_init_system, petsc_update_matrix, petsc_update_rhs, &
                          petsc_solve_iterative_and_retrieve, petsc_recover_solution
 #endif
