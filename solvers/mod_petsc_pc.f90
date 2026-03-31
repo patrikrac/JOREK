@@ -1,6 +1,8 @@
 module mod_petsc_pc
   use mod_petsc_pc_toroidal
   use mod_petsc_pc_physics
+#include "petsc/finclude/petsc.h"
+  use petsc
   implicit none
   public
 
