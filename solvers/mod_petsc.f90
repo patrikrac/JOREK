@@ -51,6 +51,7 @@ contains
 
 
   !> Initialize BAIJ matrix structure and BAIJ vecs — called once when !initialized
+  !TODO: Redundant with petsc_create_matrix. One must go...
   subroutine petsc_init_system(petsc_sys, a_mat)
     use data_structure, only: type_SP_MATRIX
 
@@ -114,7 +115,58 @@ contains
   end subroutine petsc_init_system
 
 
-  !> Fill matrix values from JOREK block-CSR — called when !solve_only
+  !> Create and preallocate a PETSc MPIBAIJ matrix from the JOREK block structure
+  !! (ijA_size, irn_jcn). Does not require iblockptr (block-CSR).
+  subroutine petsc_create_matrix(petsc_A, a_mat)
+    use data_structure, only: type_SP_MATRIX
+
+    Mat, intent(out)                    :: petsc_A
+    type(type_SP_MATRIX), intent(in)    :: a_mat
+
+    integer :: i, j
+    integer :: comm, my_id, mpierr
+    integer :: n_local, n_global, n_block_local, block_size, col_block
+    PetscInt, allocatable :: d_nnz(:), o_nnz(:)
+    PetscErrorCode :: ierr
+
+    comm = a_mat%comm
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    block_size    = a_mat%block_size
+    n_global      = a_mat%ng
+    n_block_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
+    n_local       = n_block_local * block_size
+
+    ! Compute diagonal/off-diagonal block counts per block row
+    allocate(d_nnz(n_block_local), o_nnz(n_block_local))
+    d_nnz = 0
+    o_nnz = 0
+    do i = 1, n_block_local
+      do j = 1, a_mat%ijA_size(i)
+        col_block = a_mat%irn_jcn(i, j)
+        if (col_block >= a_mat%my_ind_min .and. col_block <= a_mat%my_ind_max) then
+          d_nnz(i) = d_nnz(i) + 1
+        else
+          o_nnz(i) = o_nnz(i) + 1
+        endif
+      enddo
+    enddo
+
+    ! Create and preallocate
+    call MatCreate(comm, petsc_A, ierr)
+    call MatSetSizes(petsc_A, n_local, n_local, n_global, n_global, ierr)
+    call MatSetType(petsc_A, MATMPIBAIJ, ierr)
+    call MatSetBlockSize(petsc_A, block_size, ierr)
+    call MatMPIBAIJSetPreallocation(petsc_A, block_size, 0, d_nnz, 0, o_nnz, ierr)
+    if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: petsc_create_matrix preallocation ierr=", ierr
+    deallocate(d_nnz, o_nnz)
+
+    if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0)') &
+      "[PETSc] create_matrix: BAIJ ", n_global, "x", n_global, ", block_size=", block_size
+  end subroutine petsc_create_matrix
+
+
+  !> Fill matrix values from JOREK block-CSR
   subroutine petsc_update_matrix(petsc_sys, a_mat)
     use data_structure, only: type_SP_MATRIX
 
@@ -489,7 +541,7 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_RHS), intent(inout) :: sol_vec
 
-    Vec             :: x_seq      ! sequential copy, replicated on all ranks
+    Vec             :: x_seq
     VecScatter      :: scatter
     PetscScalar, pointer :: x_arr(:)
     PetscErrorCode :: ierr
@@ -586,57 +638,6 @@ contains
     enddo
     deallocate(subksp_array)
   end subroutine petsc_set_toroidal_harmonic_pc
-
-
-  !> Create and preallocate a PETSc MPIBAIJ matrix from the JOREK block structure
-  !! (ijA_size, irn_jcn). Does not require iblockptr (block-CSR).
-  subroutine petsc_create_matrix(petsc_A, a_mat)
-    use data_structure, only: type_SP_MATRIX
-
-    Mat, intent(out)                    :: petsc_A
-    type(type_SP_MATRIX), intent(in)    :: a_mat
-
-    integer :: i, j
-    integer :: comm, my_id, mpierr
-    integer :: n_local, n_global, n_block_local, block_size, col_block
-    PetscInt, allocatable :: d_nnz(:), o_nnz(:)
-    PetscErrorCode :: ierr
-
-    comm = a_mat%comm
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-
-    block_size    = a_mat%block_size
-    n_global      = a_mat%ng
-    n_block_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
-    n_local       = n_block_local * block_size
-
-    ! Compute diagonal/off-diagonal block counts per block row
-    allocate(d_nnz(n_block_local), o_nnz(n_block_local))
-    d_nnz = 0
-    o_nnz = 0
-    do i = 1, n_block_local
-      do j = 1, a_mat%ijA_size(i)
-        col_block = a_mat%irn_jcn(i, j)
-        if (col_block >= a_mat%my_ind_min .and. col_block <= a_mat%my_ind_max) then
-          d_nnz(i) = d_nnz(i) + 1
-        else
-          o_nnz(i) = o_nnz(i) + 1
-        endif
-      enddo
-    enddo
-
-    ! Create and preallocate
-    call MatCreate(comm, petsc_A, ierr)
-    call MatSetSizes(petsc_A, n_local, n_local, n_global, n_global, ierr)
-    call MatSetType(petsc_A, MATMPIBAIJ, ierr)
-    call MatSetBlockSize(petsc_A, block_size, ierr)
-    call MatMPIBAIJSetPreallocation(petsc_A, block_size, 0, d_nnz, 0, o_nnz, ierr)
-    if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: petsc_create_matrix preallocation ierr=", ierr
-    deallocate(d_nnz, o_nnz)
-
-    if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0)') &
-      "[PETSc] create_matrix: BAIJ ", n_global, "x", n_global, ", block_size=", block_size
-  end subroutine petsc_create_matrix
 
 
   !> Destroy all persistent PETSc objects; safe to call even if never initialized.
