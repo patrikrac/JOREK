@@ -499,7 +499,7 @@ contains
       if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + PCFIELDSPLIT + MUMPS"
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
-      call petsc_setup_toroidal_harmonic_pc(petsc_sys%ksp, petsc_sys%A)
+      call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, 1)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
