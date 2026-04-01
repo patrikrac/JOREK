@@ -83,6 +83,12 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
   my_ind_max = a_mat%index_max(my_id+1)
   bs1 = n_tor
 
+  if (my_id .eq. 0) then
+      write(*,*) '****************************************'
+      write(*,*) '*        construct PC matrices         *'
+      write(*,*) '****************************************'
+  endif
+
   ! --- Determine thread count and pre-allocate per-thread buffers ---
   !$omp parallel
   !$omp master
