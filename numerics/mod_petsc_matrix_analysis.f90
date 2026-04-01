@@ -78,21 +78,21 @@ contains
     character(len=*),intent(in) :: label
 
     PetscErrorCode :: ierr
-    PetscReal      :: norm_f, norm_1, norm_inf
+    PetscReal      :: r_norm_f, r_norm_1, r_norm_inf
     integer        :: comm, my_id, mpierr
 
     call PetscObjectGetComm(A, comm, ierr)
     call MPI_Comm_rank(comm, my_id, mpierr)
 
-    call MatNorm(A, NORM_FROBENIUS, norm_f,   ierr)
-    call MatNorm(A, NORM_1,         norm_1,   ierr)
-    call MatNorm(A, NORM_INFINITY,  norm_inf, ierr)
+    call MatNorm(A, NORM_FROBENIUS, r_norm_f,   ierr)
+    call MatNorm(A, NORM_1,         r_norm_1,   ierr)
+    call MatNorm(A, NORM_INFINITY,  r_norm_inf, ierr)
 
     if (my_id == 0) then
       write(*,'(A,A)')      "[MatNorm] ", trim(label)
-      write(*,'(A,ES14.6)') "  ||A||_F   = ", norm_f
-      write(*,'(A,ES14.6)') "  ||A||_1   = ", norm_1
-      write(*,'(A,ES14.6)') "  ||A||_inf = ", norm_inf
+      write(*,'(A,ES14.6)') "  ||A||_F   = ", r_norm_f
+      write(*,'(A,ES14.6)') "  ||A||_1   = ", r_norm_1
+      write(*,'(A,ES14.6)') "  ||A||_inf = ", r_norm_inf
     endif
   end subroutine petsc_mat_norms
 
