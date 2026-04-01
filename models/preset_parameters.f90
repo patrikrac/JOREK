@@ -643,6 +643,9 @@ subroutine preset_parameters
   init_current_prof  = .false.
   current_prof_initialized = .false.
   
+  use_physics_pc     = .false.              ! Use physics-based block PCSHELL preconditioner
+  debug_physics_pc   = .false.              ! Print PC matrix analysis after first assembly
+
   use_mumps          = .false.              ! Use MUMPS solver
   use_pastix         = .false.              ! Use PASTIX solver
   use_strumpack      = .true.               ! Use STRUMPACK solver  
