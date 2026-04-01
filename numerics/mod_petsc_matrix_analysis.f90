@@ -65,7 +65,9 @@ contains
       write(*,'(A,I0)')       "  Block size  : ", bs
       write(*,'(A,I0)')       "  NNZ used    : ", int(info(MAT_INFO_NZ_USED))
       write(*,'(A,I0)')       "  NNZ alloc   : ", int(info(MAT_INFO_NZ_ALLOCATED))
-      write(*,'(A,ES12.4)')   "  Memory (B)  : ", info(MAT_INFO_MEMORY)
+      ! MAT_INFO_MEMORY is not populated for distributed (MPIBAIJ) matrix types
+      if (info(MAT_INFO_MEMORY) > 0) &
+        write(*,'(A,ES12.4)') "  Memory (B)  : ", info(MAT_INFO_MEMORY)
     endif
   end subroutine petsc_mat_print_info
 
@@ -130,47 +132,74 @@ contains
   !! (Hermitian) Mat using SLEPc EPS with the Krylov-Schur method.
   !!
   !! Assumes A is symmetric positive definite (EPS_HEP problem type).
-  !! Runs two separate EPS solves: one for EPS_LARGEST_REAL and one for
-  !! EPS_SMALLEST_REAL.
+  !! Uses two separate EPS contexts: standard Krylov-Schur for lam_max,
+  !! and STSINVERT shift-and-invert for lam_min (requires a direct solver).
+  !! On convergence failure, outputs are set to 0 and a warning is printed.
   !--------------------------------------------------------------------
   subroutine petsc_mat_eig_bounds(A, lam_min, lam_max)
     Mat,       intent(in)  :: A
     PetscReal, intent(out) :: lam_min, lam_max
 
     EPS            :: eps
+    ST             :: st
+    KSP            :: st_ksp
+    PC             :: st_pc
+    PetscInt       :: nconv
     PetscScalar    :: kr, ki
     PetscErrorCode :: ierr
     integer        :: comm, my_id, mpierr
 
+    lam_min = 0.0d0
+    lam_max = 0.0d0
+
     call PetscObjectGetComm(A, comm, ierr)
     call MPI_Comm_rank(comm, my_id, mpierr)
 
+    ! --- Largest eigenvalue (standard Krylov-Schur, no ST needed) ---
     call EPSCreate(comm, eps, ierr)
     call EPSSetOperators(eps, A, PETSC_NULL_MAT, ierr)
     call EPSSetProblemType(eps, EPS_HEP, ierr)
     call EPSSetType(eps, EPSKRYLOVSCHUR, ierr)
-    call EPSSetFromOptions(eps, ierr)  ! allow runtime override via -eps_* options
-
-    ! --- Largest eigenvalue ---
     call EPSSetWhichEigenpairs(eps, EPS_LARGEST_REAL, ierr)
     call EPSSetDimensions(eps, 1, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
+    call EPSSetFromOptions(eps, ierr)
     call EPSSolve(eps, ierr)
-    call EPSGetEigenvalue(eps, 0, kr, ki, ierr)
-    lam_max = real(kr)
-
-    ! --- Smallest eigenvalue (reuse same context, re-solve) ---
-    call EPSSetWhichEigenpairs(eps, EPS_SMALLEST_REAL, ierr)
-    call EPSSetDimensions(eps, 1, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
-    call EPSSolve(eps, ierr)
-    call EPSGetEigenvalue(eps, 0, kr, ki, ierr)
-    lam_min = real(kr)
-
+    call EPSGetConverged(eps, nconv, ierr)
+    if (nconv > 0) then
+      call EPSGetEigenvalue(eps, 0, kr, ki, ierr)
+      lam_max = real(kr, kind=8)
+    elseif (my_id == 0) then
+      write(*,'(A)') "[EPS] WARNING: largest eigenvalue did not converge"
+    endif
     call EPSDestroy(eps, ierr)
 
-    if (my_id == 0) then
-      write(*,'(A,ES14.6,A,ES14.6)') &
-        "[EPS] lam_min = ", lam_min, "  lam_max = ", lam_max
+    ! --- Smallest eigenvalue: shift-and-invert with MUMPS direct solver.
+    call EPSCreate(comm, eps, ierr)
+    call EPSSetOperators(eps, A, PETSC_NULL_MAT, ierr)
+    call EPSSetProblemType(eps, EPS_HEP, ierr)
+    call EPSSetType(eps, EPSKRYLOVSCHUR, ierr)
+    call EPSGetST(eps, st, ierr)
+    call STSetType(st, STSINVERT, ierr)
+    call STGetKSP(st, st_ksp, ierr)
+    call KSPSetType(st_ksp, KSPPREONLY, ierr)
+    call KSPGetPC(st_ksp, st_pc, ierr)
+    call PCSetType(st_pc, PCLU, ierr)
+    call PCFactorSetMatSolverType(st_pc, MATSOLVERMUMPS, ierr)
+    call EPSSetWhichEigenpairs(eps, EPS_SMALLEST_MAGNITUDE, ierr)
+    call EPSSetDimensions(eps, 1, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
+    call EPSSetFromOptions(eps, ierr)
+    call EPSSolve(eps, ierr)
+    call EPSGetConverged(eps, nconv, ierr)
+    if (nconv > 0) then
+      call EPSGetEigenvalue(eps, 0, kr, ki, ierr)
+      lam_min = real(kr, kind=8)
+    elseif (my_id == 0) then
+      write(*,'(A)') "[EPS] WARNING: smallest eigenvalue did not converge"
     endif
+    call EPSDestroy(eps, ierr)
+
+    if (my_id == 0) &
+      write(*,'(A,ES14.6,A,ES14.6)') "[EPS] lam_min = ", lam_min, "  lam_max = ", lam_max
   end subroutine petsc_mat_eig_bounds
 
 
@@ -190,10 +219,13 @@ contains
     call MPI_Comm_rank(comm, my_id, mpierr)
 
     call petsc_mat_eig_bounds(A, lam_min, lam_max)
-    kappa = lam_max / lam_min
-
-    if (my_id == 0) &
-      write(*,'(A,ES14.6)') "[EPS] kappa(A) = ", kappa
+    if (lam_min > 0.0d0) then
+      kappa = lam_max / lam_min
+      if (my_id == 0) write(*,'(A,ES14.6)') "[EPS] kappa(A) = ", kappa
+    else
+      kappa = 0.0d0
+      if (my_id == 0) write(*,'(A)') "[EPS] kappa(A) : unavailable (lam_min not converged)"
+    endif
   end subroutine petsc_mat_cond_estimate
 
 
@@ -218,7 +250,7 @@ contains
     logical,         intent(in) :: symmetric
 
     EPS               :: eps
-    PetscInt          :: M, N, nev_req, nconv
+    PetscInt          :: M, N, nev_req, nconv, i_eps
     PetscScalar       :: kr, ki
     PetscErrorCode    :: ierr
     integer           :: comm, my_id, mpierr, i, iunit
@@ -245,12 +277,17 @@ contains
     else
       call EPSSetProblemType(eps, EPS_NHEP, ierr)
     endif
-    call EPSSetType(eps, EPSKRYLOVSCHUR, ierr)
 
-    ! Request eigenvalues sorted by largest real part; with nev_req = M the
-    ! Krylov-Schur method converges to all eigenvalues.
-    call EPSSetWhichEigenpairs(eps, EPS_LARGEST_REAL, ierr)
-    call EPSSetDimensions(eps, nev_req, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
+    if (nev_req == M) then
+      ! Full spectrum: EPSLAPACK (dense) — no Krylov subspace constraint.
+      ! Memory cost is O(M^2); only practical for moderate matrix sizes.
+      call EPSSetType(eps, EPSLAPACK, ierr)
+    else
+      ! Partial spectrum: Krylov-Schur requires nev < M (ncv >= nev+1 <= M).
+      call EPSSetType(eps, EPSKRYLOVSCHUR, ierr)
+      call EPSSetWhichEigenpairs(eps, EPS_LARGEST_REAL, ierr)
+      call EPSSetDimensions(eps, nev_req, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
+    endif
 
     ! Allow runtime override (-eps_type, -eps_tol, etc.)
     call EPSSetFromOptions(eps, ierr)
@@ -261,10 +298,10 @@ contains
     ! Collect eigenvalues on rank 0, sort, and write to file
     if (my_id == 0) then
       allocate(eig_r(nconv), eig_i(nconv))
-      do i = 0, nconv - 1
-        call EPSGetEigenvalue(eps, i, kr, ki, ierr)
-        eig_r(i+1) = real(kr, kind=8)
-        eig_i(i+1) = real(ki, kind=8)
+      do i_eps = 0, nconv - 1
+        call EPSGetEigenvalue(eps, i_eps, kr, ki, ierr)
+        eig_r(i_eps+1) = real(kr, kind=8)
+        eig_i(i_eps+1) = real(ki, kind=8)
       enddo
 
       call sort_eigs_by_real(eig_r, eig_i, int(nconv))
