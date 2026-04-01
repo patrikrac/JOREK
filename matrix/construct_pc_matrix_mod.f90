@@ -105,7 +105,7 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
 
   !$omp parallel &
   !$omp   default(none) &
-  !$omp   shared(n_local_elms, local_elms, a_mat, my_ind_min, my_ind_max, bs1, &
+  !$omp   shared(n_local_elms, local_elms, element_list, node_list, a_mat, my_ind_min, my_ind_max, bs1, &
   !$omp          element_thr, nodes_thr, node_out_thr, &
   !$omp          ELM_j_thr, ELM_w_thr, ELM_jpsi_thr, ELM_wu_thr, &
   !$omp          buf1v_thr &
