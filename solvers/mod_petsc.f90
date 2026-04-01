@@ -180,58 +180,6 @@ contains
   end subroutine petsc_create_matrix
 
 
-  !> Create an n_vars-variable MPIBAIJ PC matrix.
-  !! block_size = n_vars * n_tor_local;  n_global = n_vars * a_mat%ng / n_var.
-  subroutine petsc_create_pc_matrix(petsc_A, a_mat, n_vars)
-    use data_structure,  only: type_SP_MATRIX
-    use mod_parameters,  only: n_var
-
-    Mat,                   intent(out) :: petsc_A
-    type(type_SP_MATRIX),  intent(in)  :: a_mat
-    integer,               intent(in)  :: n_vars   ! 1 or 2
-
-    integer :: i, j
-    integer :: comm, my_id, mpierr
-    integer :: n_local, n_global, n_block_local, block_size, col_block
-    PetscInt, allocatable :: d_nnz(:), o_nnz(:)
-    PetscErrorCode :: ierr
-
-    comm = a_mat%comm
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-
-    block_size    = n_vars * a_mat%block_size / n_var
-    n_block_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
-    n_local       = n_block_local * block_size
-    n_global      = n_vars * a_mat%ng / n_var
-
-    allocate(d_nnz(n_block_local), o_nnz(n_block_local))
-    d_nnz = 0
-    o_nnz = 0
-    do i = 1, n_block_local
-      do j = 1, a_mat%ijA_size(i)
-        col_block = a_mat%irn_jcn(i, j)
-        if (col_block >= a_mat%my_ind_min .and. col_block <= a_mat%my_ind_max) then
-          d_nnz(i) = d_nnz(i) + 1
-        else
-          o_nnz(i) = o_nnz(i) + 1
-        endif
-      enddo
-    enddo
-
-    call MatCreate(comm, petsc_A, ierr)
-    call MatSetSizes(petsc_A, n_local, n_local, n_global, n_global, ierr)
-    call MatSetType(petsc_A, MATMPIBAIJ, ierr)
-    call MatSetBlockSize(petsc_A, block_size, ierr)
-    call MatMPIBAIJSetPreallocation(petsc_A, block_size, 0, d_nnz, 0, o_nnz, ierr)
-    if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: petsc_create_pc_matrix ierr=", ierr
-    deallocate(d_nnz, o_nnz)
-
-    if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0,A,I0)') &
-      "[PETSc] create_pc_matrix (", n_vars, "-var): BAIJ ", n_global, "x", n_global, &
-      ", block_size=", block_size
-  end subroutine petsc_create_pc_matrix
-
-
   !> Fill matrix values from JOREK block-CSR
   subroutine petsc_update_matrix(petsc_sys, a_mat)
     use data_structure, only: type_SP_MATRIX
