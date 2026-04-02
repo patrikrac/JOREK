@@ -165,8 +165,6 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
       in_fft = ELM_p_j(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#else
-      call my_fft_elliptic(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm(out_fft, i, j, ELM_j, D1V)
 
@@ -185,16 +183,12 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
       in_fft = ELM_p_jpsi(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#else
-      call my_fft_elliptic(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm(out_fft, i, j, ELM_jpsi, D1V)
 
       in_fft = ELM_p_wu(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#else
-      call my_fft_elliptic(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm(out_fft, i, j, ELM_wu, D1V)
 
@@ -208,7 +202,6 @@ end subroutine element_matrix_elliptic
 
 !-----------------------------------------------------------------
 ! Scatter FFT output for row i, col j into ELM.
-! Mirrors the ELM_p reconstruction loop from mod_elt_matrix_fft.
 !-----------------------------------------------------------------
 subroutine scatter_fft_to_elm(out_fft, i, j, ELM, ndim)
 
@@ -230,7 +223,6 @@ subroutine scatter_fft_to_elm(out_fft, i, j, ELM, ndim)
 
       index_m = n_tor*(j-1) + max(2*(m-1), 1)
 
-      ! l = (k-1) + (m-1)
       l = (k-1) + (m-1)
       if (l .ge. 0 .and. l .le. n_plane/2) then
         ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) +  real(out_fft(l+1))
@@ -244,7 +236,6 @@ subroutine scatter_fft_to_elm(out_fft, i, j, ELM, ndim)
         ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) -  real(out_fft(abs(l)+1))
       endif
 
-      ! l = (k-1) - (m-1)
       l = (k-1) - (m-1)
       if (l .ge. 0 .and. l .le. n_plane/2) then
         ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) +  real(out_fft(l+1))
@@ -262,27 +253,5 @@ subroutine scatter_fft_to_elm(out_fft, i, j, ELM, ndim)
   enddo    ! k
 
 end subroutine scatter_fft_to_elm
-
-!-----------------------------------------------------------------
-! Fallback FFT (no FFTW): mirrors my_fft from mod_elt_matrix_fft.
-!-----------------------------------------------------------------
-subroutine my_fft_elliptic(in_fft, out_fft, n)
-
-  implicit none
-
-  real*8,     intent(in)  :: in_fft(*)
-  complex*16, intent(out) :: out_fft(*)
-  integer,    intent(in)  :: n
-
-  real*8  :: tmp_fft(2*n+2)
-  integer :: ii
-
-  tmp_fft(1:n) = in_fft(1:n)
-  call RFT2(tmp_fft, n, 1)
-  do ii = 1, n
-    out_fft(ii) = cmplx(tmp_fft(2*ii-1), tmp_fft(2*ii))
-  enddo
-
-end subroutine my_fft_elliptic
 
 end module mod_elt_matrix_elliptic
