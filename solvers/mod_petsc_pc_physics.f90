@@ -7,11 +7,12 @@ module mod_petsc_pc_physics
   private
   public :: petsc_setup_physics_pc, petsc_create_pc_matrices, &
             petsc_assemble_pc_matrices, petsc_update_physics_pc_ctx, &
-            petsc_analyze_pc_matrices
+            petsc_analyze_pc_matrices, petsc_test_pc_matrices
 
   type :: type_physics_pc_ctx
     logical :: initialized    = .false.
     logical :: matrices_ready = .false.
+    integer :: comm           = -1    !< MPI communicator shared by all four matrices
     !> 1-var BAIJ matrix for j equation,  block_size = n_tor_local
     Mat :: A_j
     !> 1-var BAIJ matrix for w equation,  block_size = n_tor_local  (= A_j)
@@ -100,6 +101,7 @@ contains
 
     type(type_SP_MATRIX), intent(in) :: a_mat
 
+    g_ctx%comm = a_mat%comm
     call petsc_create_pc_matrix(g_ctx%A_j,    a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%A_w,    a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%A_jpsi, a_mat, 1)
@@ -202,6 +204,18 @@ contains
     if (my_id == 0) write(*,'(A)') &
       "========================================================"
   end subroutine petsc_analyze_pc_matrices
+
+
+  !> Run manufactured-solution solver tests on all four PC sub-matrices.
+  !! Delegates to mod_petsc_matrix_tests using the stored communicator.
+  subroutine petsc_test_pc_matrices(my_id)
+    use mod_petsc_matrix_tests
+
+    integer, intent(in) :: my_id
+
+    call petsc_run_matrix_tests(my_id, g_ctx%comm, &
+                                 g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
+  end subroutine petsc_test_pc_matrices
 
 
   !> PCSHELL apply callback: compute y = M^{-1} x.
