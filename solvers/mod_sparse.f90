@@ -164,8 +164,11 @@ module mod_sparse
         solver%step_success = .true.
         petsc_direct_solved = .true.
       elseif (solver%equilibrium) then
-        ! Equilibrium: JOREK COO format — convert to PETSc then solve directly
+        !TODO: Not working, set_block_csr_permutation fails, why?
         if (.not. solver%petsc_sys%initialized) then
+          if (.not. a_mat%bcsr_mapped) then
+            call set_block_csr_permutations(a_mat)
+          endif
           call petsc_init_system(solver%petsc_sys, a_mat)
         endif
         call petsc_update_matrix(solver%petsc_sys, a_mat)
