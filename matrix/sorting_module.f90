@@ -330,7 +330,7 @@ subroutine set_block_csr_permutations(a_mat)
     !write(*,*) "Row number base :", irn0
     nloc = maxval(a_mat%irn(1:nnz)) - irn0 + 1
     if (a_mat%nr.ne.nloc) then
-      write(*,*) "ERROR in matrix strucutre"
+      write(*,*) "ERROR in matrix structure: a_mat%nr != nloc"
       call exit(1)
     endif
     !a_mat%irn(1:nnz) = a_mat%irn(1:nnz) - irn0 + 1  ! adjust irn to be one-based
@@ -349,8 +349,8 @@ subroutine set_block_csr_permutations(a_mat)
       call exit(1)
     endif
 
-     !write(*,*) "Setting block CSR permutations, nnz =", nnz, " nloc =", nloc, " nblockloc =", nblockloc, &
-     !           " block_size =", block_size, " nnz_blocks =", nnz_blocks
+     write(*,*) "Setting block CSR permutations, nnz =", nnz, " nloc =", nloc, " nblockloc =", nblockloc, &
+                " block_size =", block_size, " nnz_blocks =", nnz_blocks
 
     if (.not.associated(a_mat%iblockptr)) then 
       allocate(a_mat%iblockptr(nblockloc+1))
@@ -382,7 +382,7 @@ subroutine set_block_csr_permutations(a_mat)
     enddo
 
     if ((a_mat%iblockptr(nblockloc+1)-1) /= nnz_blocks) then
-      write(*,*) "ERROR in matrix strucutre: iblockptr(nblockloc+1) != nnz_blocks", a_mat%iblockptr(nblockloc+1) - 1
+      write(*,*) "ERROR in matrix structure: iblockptr(nblockloc+1) != nnz_blocks", a_mat%iblockptr(nblockloc+1) - 1, nnz_blocks
       call exit(1)
     endif
 
