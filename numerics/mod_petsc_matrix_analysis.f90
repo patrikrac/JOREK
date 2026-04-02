@@ -145,7 +145,7 @@ contains
     KSP            :: st_ksp
     PC             :: st_pc
     PetscInt       :: nconv
-    PetscScalar    :: kr, ki
+    PetscScalar    :: kr, ki   ! ki required by EPSGetEigenvalue interface; always 0 for EPS_HEP
     PetscErrorCode :: ierr
     integer        :: comm, my_id, mpierr
 
@@ -223,7 +223,7 @@ contains
       kappa = lam_max / lam_min
       if (my_id == 0) write(*,'(A,ES14.6)') "[EPS] kappa(A) = ", kappa
     else
-      kappa = 0.0d0
+      kappa = -1.0d0   ! sentinel: valid kappa >= 1; -1 signals lam_min not converged
       if (my_id == 0) write(*,'(A)') "[EPS] kappa(A) : unavailable (lam_min not converged)"
     endif
   end subroutine petsc_mat_cond_estimate

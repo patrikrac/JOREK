@@ -186,11 +186,11 @@ contains
     call petsc_mat_diff_norm(g_ctx%A_j, g_ctx%A_w, "A_j vs A_w", diff_norm)
 
 #ifdef USE_SLEPC
-    ! Condition number (symmetric 1-var matrices)
+    ! Condition number (symmetric 1-var matrices); kappa = -1 if lam_min not converged
     call petsc_mat_cond_estimate(g_ctx%A_j, kappa)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[PC] cond(A_j) = ", kappa
+    if (my_id == 0 .and. kappa > 0.0d0) write(*,'(A,ES12.4)') "[PC] cond(A_j) = ", kappa
     call petsc_mat_cond_estimate(g_ctx%A_w, kappa)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[PC] cond(A_w) = ", kappa
+    if (my_id == 0 .and. kappa > 0.0d0) write(*,'(A,ES12.4)') "[PC] cond(A_w) = ", kappa
 
     ! Full spectra — 0 requests all eigenvalues
     call petsc_mat_full_spectrum(g_ctx%A_j,    "A_j",    0, symmetric=.true.)
