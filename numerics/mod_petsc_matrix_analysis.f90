@@ -33,7 +33,8 @@ module mod_petsc_matrix_analysis
 #ifdef USE_SLEPC
   public :: petsc_mat_eig_bounds,    &
             petsc_mat_cond_estimate, &
-            petsc_mat_full_spectrum
+            petsc_mat_full_spectrum, &
+            petsc_mat_sweep_robust_spectrum
 #endif
 
 contains
@@ -129,12 +130,7 @@ contains
 #ifdef USE_SLEPC
   !--------------------------------------------------------------------
   !> Compute the smallest and largest real eigenvalues of a symmetric
-  !! (Hermitian) Mat using SLEPc EPS with the Krylov-Schur method.
-  !!
-  !! Assumes A is symmetric positive definite (EPS_HEP problem type).
-  !! Uses two separate EPS contexts: standard Krylov-Schur for lam_max,
-  !! and STSINVERT shift-and-invert for lam_min (requires a direct solver).
-  !! On convergence failure, outputs are set to 0 and a warning is printed.
+  !! (Hermitian) Mat. Uses Direct LU Factorization for the smallest.
   !--------------------------------------------------------------------
   subroutine petsc_mat_eig_bounds(A, lam_min, lam_max)
     Mat,       intent(in)  :: A
@@ -144,7 +140,8 @@ contains
     ST             :: st
     KSP            :: st_ksp
     PC             :: st_pc
-    PetscInt       :: nconv
+    PetscInt       :: nconv, eps_reason
+    KSPConvergedReason :: ksp_reason
     PetscScalar    :: kr, ki   ! ki required by EPSGetEigenvalue interface; always 0 for EPS_HEP
     PetscErrorCode :: ierr
     integer        :: comm, my_id, mpierr
@@ -155,7 +152,9 @@ contains
     call PetscObjectGetComm(A, comm, ierr)
     call MPI_Comm_rank(comm, my_id, mpierr)
 
-    ! --- Largest eigenvalue (standard Krylov-Schur, no ST needed) ---
+    ! =================================================================
+    ! 1. LARGEST EIGENVALUE (Standard Krylov - Fast, low memory)
+    ! =================================================================
     call EPSCreate(comm, eps, ierr)
     call EPSSetOperators(eps, A, PETSC_NULL_MAT, ierr)
     call EPSSetProblemType(eps, EPS_HEP, ierr)
@@ -164,37 +163,64 @@ contains
     call EPSSetDimensions(eps, 1, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
     call EPSSetFromOptions(eps, ierr)
     call EPSSolve(eps, ierr)
+    
     call EPSGetConverged(eps, nconv, ierr)
     if (nconv > 0) then
       call EPSGetEigenvalue(eps, 0, kr, ki, ierr)
       lam_max = real(kr, kind=8)
     elseif (my_id == 0) then
-      write(*,'(A)') "[EPS] WARNING: largest eigenvalue did not converge"
+      call EPSGetConvergedReason(eps, eps_reason, ierr)
+      write(*,'(A,I0)') "[EPS] WARNING: Largest eigenvalue failed. EPS Reason: ", eps_reason
     endif
     call EPSDestroy(eps, ierr)
 
-    ! --- Smallest eigenvalue: shift-and-invert with MUMPS direct solver.
+    ! =================================================================
+    ! 2. SMALLEST EIGENVALUE (Shift-and-Invert with EXACT Direct Solver)
+    ! =================================================================
     call EPSCreate(comm, eps, ierr)
     call EPSSetOperators(eps, A, PETSC_NULL_MAT, ierr)
     call EPSSetProblemType(eps, EPS_HEP, ierr)
     call EPSSetType(eps, EPSKRYLOVSCHUR, ierr)
+    
+    ! Enable Shift-and-Invert
     call EPSGetST(eps, st, ierr)
     call STSetType(st, STSINVERT, ierr)
+    
+    ! Enforce Direct Factorization (LU)
     call STGetKSP(st, st_ksp, ierr)
     call KSPSetType(st_ksp, KSPPREONLY, ierr)
     call KSPGetPC(st_ksp, st_pc, ierr)
     call PCSetType(st_pc, PCLU, ierr)
+    
+    ! Use MUMPS for parallel direct solve. 
+    ! (If running serially without MUMPS, remove the line below or use MATSOLVERPETSC)
     call PCFactorSetMatSolverType(st_pc, MATSOLVERMUMPS, ierr)
-    call EPSSetWhichEigenpairs(eps, EPS_SMALLEST_MAGNITUDE, ierr)
+    
+    ! IMPORTANT: If your matrix is singular (has a 0 eigenvalue), setting a target 
+    ! of exactly 0.0 will cause LU factorization to crash with a "Zero Pivot" error.
+    ! We shift by a tiny offset to safely avoid exactly hitting a zero eigenvalue.
+    call EPSSetTarget(eps, -1.0d-6, ierr)
+    call EPSSetWhichEigenpairs(eps, EPS_TARGET_MAGNITUDE, ierr)
+    
     call EPSSetDimensions(eps, 1, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
     call EPSSetFromOptions(eps, ierr)
     call EPSSolve(eps, ierr)
+    
     call EPSGetConverged(eps, nconv, ierr)
     if (nconv > 0) then
       call EPSGetEigenvalue(eps, 0, kr, ki, ierr)
       lam_min = real(kr, kind=8)
     elseif (my_id == 0) then
-      write(*,'(A)') "[EPS] WARNING: smallest eigenvalue did not converge"
+      call EPSGetConvergedReason(eps, eps_reason, ierr)
+      write(*,'(A,I0)') "[EPS] ERROR: Smallest eigenvalue failed. EPS Reason: ", eps_reason
+      
+      ! Diagnostics: Check if the direct solver (MUMPS) is what actually failed
+      call KSPGetConvergedReason(st_ksp, ksp_reason, ierr)
+      if (ksp_reason < 0) then
+        write(*,'(A,I0)') "      -> The Direct Solver (LU/MUMPS) failed! KSP Reason: ", ksp_reason
+        if (ksp_reason == -8 .or. ksp_reason == -9) &
+          write(*,'(A)')  "      -> (Likely cause: Matrix is singular/has a null space, causing a zero pivot)"
+      endif
     endif
     call EPSDestroy(eps, ierr)
 
@@ -205,7 +231,6 @@ contains
 
   !--------------------------------------------------------------------
   !> Estimate the spectral condition number kappa = lam_max / lam_min
-  !! for a symmetric positive definite Mat.
   !--------------------------------------------------------------------
   subroutine petsc_mat_cond_estimate(A, kappa)
     Mat,       intent(in)  :: A
@@ -230,30 +255,25 @@ contains
 
 
   !--------------------------------------------------------------------
-  !> Compute the eigenvalue spectrum of a Mat and write it to a file.
-  !!
-  !! @param A         PETSc Mat to analyse
-  !! @param label     Short identifier; output file is {label}_spectrum.dat
-  !! @param n_eigs    Number of eigenvalues to compute.
-  !!                  n_eigs <= 0 requests the full spectrum (all n eigenvalues).
-  !! @param symmetric .true. → use EPS_HEP (Hermitian/symmetric problem).
-  !!                  .false. → use EPS_NHEP (non-symmetric); eigenvalues may
-  !!                            be complex; both Re and Im parts are written.
-  !!
-  !! Output file columns: Re(lambda)  Im(lambda), sorted by Re(lambda) ascending.
-  !! On convergence failure, the file contains only the converged subset.
+  !> Compute a partial eigenvalue spectrum of a Mat and write to file.
+  !> Uses Shift-and-Invert + MUMPS for robust distributed solving.
   !--------------------------------------------------------------------
   subroutine petsc_mat_full_spectrum(A, label, n_eigs, symmetric)
+    implicit none
+
     Mat,             intent(in) :: A
     character(len=*),intent(in) :: label
     integer,         intent(in) :: n_eigs
     logical,         intent(in) :: symmetric
 
-    EPS               :: eps
-    PetscInt          :: M, N, nev_req, nconv, i_eps
-    PetscScalar       :: kr, ki
-    PetscErrorCode    :: ierr
-    integer           :: comm, my_id, mpierr, i, iunit
+    EPS                 :: eps
+    ST                  :: st
+    KSP                 :: ksp
+    PC                  :: pc
+    PetscInt            :: M, N, nev_req, nconv, eps_reason, i_eps
+    PetscScalar         :: kr, ki, target_val
+    PetscErrorCode      :: ierr
+    integer             :: comm, my_id, mpierr, i, iunit
     real*8, allocatable :: eig_r(:), eig_i(:)
     character(len=512)  :: filename
 
@@ -261,94 +281,273 @@ contains
     call MPI_Comm_rank(comm, my_id, mpierr)
     call MatGetSize(A, M, N, ierr)
 
-    ! Number of eigenvalues to request
     nev_req = n_eigs
-    if (nev_req <= 0) nev_req = M   ! full spectrum
-
-    if (my_id == 0) &
-      write(*,'(A,A,A,I0,A,I0,A)') &
-        "[EPS] Computing spectrum of ", trim(label), &
-        " (", nev_req, " / ", M, " eigenvalues) ..."
+    if (nev_req <= 0 .or. nev_req >= M) then
+      nev_req = M/2
+      !nev_req = min(M - 1, 50) ! Capped at 50 for speed and safety
+      if (my_id == 0) then
+        write(*,'(A)') "[EPS] WARNING: Cannot reliably compute FULL spectrum."
+        write(*,'(A,I0,A)') "[EPS] Computing ", nev_req, " extreme eigenvalues instead."
+      endif
+    endif
 
     call EPSCreate(comm, eps, ierr)
     call EPSSetOperators(eps, A, PETSC_NULL_MAT, ierr)
+    
     if (symmetric) then
       call EPSSetProblemType(eps, EPS_HEP, ierr)
     else
       call EPSSetProblemType(eps, EPS_NHEP, ierr)
     endif
 
-    if (nev_req == M) then
-      ! Full spectrum: EPSLAPACK (dense) — no Krylov subspace constraint.
-      ! Memory cost is O(M^2); only practical for moderate matrix sizes.
-      call EPSSetType(eps, EPSLAPACK, ierr)
-    else
-      ! Partial spectrum: Krylov-Schur requires nev < M (ncv >= nev+1 <= M).
-      call EPSSetType(eps, EPSKRYLOVSCHUR, ierr)
-      call EPSSetWhichEigenpairs(eps, EPS_LARGEST_REAL, ierr)
-      call EPSSetDimensions(eps, nev_req, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
-    endif
+    call EPSSetType(eps, EPSKRYLOVSCHUR, ierr)
+    call EPSSetDimensions(eps, nev_req, PETSC_DEFAULT_INTEGER, PETSC_DEFAULT_INTEGER, ierr)
 
-    ! Allow runtime override (-eps_type, -eps_tol, etc.)
+    ! -------------------------------------------------------------------------
+    ! ROBUST ILL-CONDITIONED SETUP: Shift-and-Invert + MUMPS
+    ! -------------------------------------------------------------------------
+    ! 1. Set a target value. Shift-and-invert finds eigenvalues closest to this.
+    target_val = 0.0  ! Change this to sweep different parts of the spectrum
+    call EPSSetTarget(eps, target_val, ierr)
+    call EPSSetWhichEigenpairs(eps, EPS_TARGET_MAGNITUDE, ierr)
+
+    ! 2. Extract Spectral Transformation (ST) and set to Shift-and-Invert
+    call EPSGetST(eps, st, ierr)
+    call STSetType(st, STSINVERT, ierr)
+
+    ! 3. Extract Linear Solver (KSP) and tell it to only apply the preconditioner
+    call STGetKSP(st, ksp, ierr)
+    call KSPSetType(ksp, KSPPREONLY, ierr)
+
+    ! 4. Extract Preconditioner (PC) and set it to Exact LU Factorization
+    call KSPGetPC(ksp, pc, ierr)
+    call PCSetType(pc, PCLU, ierr)
+
+    ! 5. Tell the LU Factorization to use MUMPS (handles MPIBAIJ perfectly)
+    call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
+    ! -------------------------------------------------------------------------
+
     call EPSSetFromOptions(eps, ierr)
-
+    if (my_id == 0) write(*,*) "[EPS] Solving partial spectrum (Shift-and-Invert via MUMPS) ---"
+    
     call EPSSolve(eps, ierr)
     call EPSGetConverged(eps, nconv, ierr)
 
-    ! Collect eigenvalues on rank 0, sort, and write to file
     if (my_id == 0) then
-      allocate(eig_r(nconv), eig_i(nconv))
-      do i_eps = 0, nconv - 1
-        call EPSGetEigenvalue(eps, i_eps, kr, ki, ierr)
-        eig_r(i_eps+1) = real(kr, kind=8)
-        eig_i(i_eps+1) = real(ki, kind=8)
-      enddo
+      if (nconv > 0) then
+        allocate(eig_r(nconv), eig_i(nconv))
+        do i_eps = 0, nconv - 1
+          call EPSGetEigenvalue(eps, i_eps, kr, ki, ierr)
+          eig_r(i_eps+1) = real(kr, kind=8)
+          eig_i(i_eps+1) = real(ki, kind=8)
+        enddo
 
-      call sort_eigs_by_real(eig_r, eig_i, int(nconv))
+        call sort_eigs_by_real(eig_r, eig_i, int(nconv))
 
-      write(filename, '(A,A)') trim(label), "_spectrum.dat"
-      open(newunit=iunit, file=trim(filename), status='replace', action='write')
-      write(iunit,'(A,A)')      "# Spectrum of matrix: ", trim(label)
-      write(iunit,'(A,I0)')     "# Matrix size        : ", M
-      write(iunit,'(A,I0)')     "# Requested          : ", nev_req
-      write(iunit,'(A,I0)')     "# Converged          : ", nconv
-      write(iunit,'(A,L1)')     "# Symmetric (HEP)    : ", symmetric
-      write(iunit,'(A)')        "#"
-      write(iunit,'(A)')        "#        Re(lambda)           Im(lambda)"
-      do i = 1, nconv
-        write(iunit,'(2X,ES22.14,2X,ES22.14)') eig_r(i), eig_i(i)
-      enddo
-      close(iunit)
+        write(filename, '(A,A)') trim(label), "_spectrum.dat"
+        open(newunit=iunit, file=trim(filename), status='replace', action='write')
+        write(iunit,'(A,A)')      "# Spectrum of matrix: ", trim(label)
+        write(iunit,'(A,I0)')     "# Matrix size        : ", M
+        write(iunit,'(A,I0)')     "# Requested          : ", nev_req
+        write(iunit,'(A,I0)')     "# Converged          : ", nconv
+        write(iunit,'(A)')        "#        Re(lambda)           Im(lambda)"
+        do i = 1, nconv
+          write(iunit,'(2X,ES22.14,2X,ES22.14)') eig_r(i), eig_i(i)
+        enddo
+        close(iunit)
 
-      write(*,'(A,I0,A,I0,A,A)') &
-        "[EPS] Converged ", nconv, " / ", nev_req, " eigenvalues -> ", trim(filename)
-      deallocate(eig_r, eig_i)
+        write(*,'(A,I0,A,I0,A,A)') "[EPS] Converged ", nconv, " / ", nev_req, " -> ", trim(filename)
+        deallocate(eig_r, eig_i)
+      else
+        call EPSGetConvergedReason(eps, eps_reason, ierr)
+        write(*,'(A,I0)') "[EPS] ERROR: 0 eigenvalues converged. EPS Reason: ", eps_reason
+      endif
     endif
-
     call EPSDestroy(eps, ierr)
   end subroutine petsc_mat_full_spectrum
 
-
-  !--------------------------------------------------------------------
-  ! Private helper: sort eigenvalue arrays by Re(lambda) ascending
-  ! using insertion sort (adequate for the sizes expected here).
-  !--------------------------------------------------------------------
-  subroutine sort_eigs_by_real(er, ei, n)
-    integer, intent(in)    :: n
-    real*8,  intent(inout) :: er(n), ei(n)
+  subroutine sort_eigs_by_real(eig_r, eig_i, n)
+    integer, intent(in)   :: n
+    real*8, intent(inout) :: eig_r(n), eig_i(n)
     integer :: i, j
-    real*8  :: tr, ti
+    real*8  :: tmp_r, tmp_i
 
-    do i = 2, n
-      tr = er(i);  ti = ei(i)
-      j  = i - 1
-      do while (j >= 1 .and. er(j) > tr)
-        er(j+1) = er(j);  ei(j+1) = ei(j)
-        j = j - 1
+    do i = 1, n - 1
+      do j = i + 1, n
+        if (eig_r(j) < eig_r(i)) then
+          tmp_r = eig_r(i); eig_r(i) = eig_r(j); eig_r(j) = tmp_r
+          tmp_i = eig_i(i); eig_i(i) = eig_i(j); eig_i(j) = tmp_i
+        endif
       enddo
-      er(j+1) = tr;  ei(j+1) = ti
     enddo
   end subroutine sort_eigs_by_real
+
+  !--------------------------------------------------------------------
+  !> Compute the eigenvalue spectrum by sweeping across a range.
+  !> INTEGRATED CLUSTER LOGIC: Uses expanded Krylov subspaces (3x NCV) 
+  !> and safe-shifting to easily untangle dense clusters around zero.
+  !> Filters overlapping duplicates and writes to a single file.
+  !--------------------------------------------------------------------
+  subroutine petsc_mat_sweep_robust_spectrum(A, label, target_start, target_end, n_shifts, nev_per_shift, symmetric)
+    implicit none
+
+    Mat,             intent(in) :: A
+    character(len=*),intent(in) :: label
+    real(kind=8),    intent(in) :: target_start, target_end
+    integer,         intent(in) :: n_shifts, nev_per_shift
+    logical,         intent(in) :: symmetric
+
+    EPS                 :: eps
+    ST                  :: st
+    KSP                 :: ksp
+    PC                  :: pc
+    PetscInt            :: M, N, nev_req, ncv_req, nconv, eps_reason, i_eps
+    PetscScalar         :: kr, ki, target_val, safe_target
+    PetscErrorCode      :: ierr
+    integer             :: comm, my_id, mpierr, i, iunit, i_shift
+    integer             :: total_unique, j
+    logical             :: is_duplicate
+
+    real*8, allocatable :: eig_r_all(:), eig_i_all(:)
+    real*8              :: r_val, i_val, diff
+    real*8, parameter   :: TOL_DUP = 1.0d-6  ! Tolerance to detect duplicates
+    character(len=512)  :: filename
+
+    call PetscObjectGetComm(A, comm, ierr)
+    call MPI_Comm_rank(comm, my_id, mpierr)
+    call MatGetSize(A, M, N, ierr)
+
+    ! 1. Setup Dimensions with CLUSTER EXPANSION
+    nev_req = min(nev_per_shift, M - 1)
+    ncv_req = 3 * nev_req           ! Force 3x subspace to separate clusters
+    if (ncv_req > M) ncv_req = M    ! Cap at matrix size
+
+    ! Allocate maximum possible space for unique eigenvalues
+    allocate(eig_r_all(M), eig_i_all(M))
+    total_unique = 0
+
+    if (my_id == 0) then
+      write(*,'(A)') "[EPS] ========================================================"
+      write(*,'(A,A)') "[EPS] Robust Spectrum Sweep for matrix: ", trim(label)
+      write(*,'(A,I0)') "[EPS] Matrix size     : ", M
+      write(*,'(A,I0,A,I0)') "[EPS] Shifts          : ", n_shifts, " | NEV per shift: ", nev_req
+      write(*,'(A,I0)') "[EPS] Expanded NCV    : ", ncv_req, " (Cluster separation active)"
+      write(*,'(A)') "[EPS] ========================================================"
+    endif
+
+    ! -------------------------------------------------------------------------
+    ! SWEEP LOOP
+    ! -------------------------------------------------------------------------
+    do i_shift = 1, n_shifts
+      
+      ! Calculate the mathematical target
+      if (n_shifts == 1) then
+        target_val = target_start
+      else
+        target_val = target_start + (target_end - target_start) * real(i_shift - 1, kind=8) / real(n_shifts - 1, kind=8)
+      endif
+
+      ! 2. SAFE SHIFT LOGIC (Prevent MUMPS Singularity on exactly 0.0)
+      safe_target = target_val
+      if (abs(safe_target) < 1.0d-12) then
+        safe_target = 1.0d-5
+      endif
+
+      call EPSCreate(comm, eps, ierr)
+      call EPSSetOperators(eps, A, PETSC_NULL_MAT, ierr)
+
+      if (symmetric) then
+        call EPSSetProblemType(eps, EPS_HEP, ierr)
+      else
+        call EPSSetProblemType(eps, EPS_NHEP, ierr)
+      endif
+
+      call EPSSetType(eps, EPSKRYLOVSCHUR, ierr)
+      
+      ! Apply cluster-busting dimensions
+      call EPSSetDimensions(eps, nev_req, ncv_req, PETSC_DEFAULT_INTEGER, ierr)
+
+      ! Set the safe target
+      call EPSSetTarget(eps, safe_target, ierr)
+      call EPSSetWhichEigenpairs(eps, EPS_TARGET_MAGNITUDE, ierr)
+
+      ! Robust Shift-and-Invert via MUMPS
+      call EPSGetST(eps, st, ierr)
+      call STSetType(st, STSINVERT, ierr)
+      call STGetKSP(st, ksp, ierr)
+      call KSPSetType(ksp, KSPPREONLY, ierr)
+      call KSPGetPC(ksp, pc, ierr)
+      call PCSetType(pc, PCLU, ierr)
+      call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
+
+      call EPSSetFromOptions(eps, ierr)
+
+      if (my_id == 0) write(*,'(A,I0,A,I0,A,ES12.4)') &
+           "[EPS] Solving Shift ", i_shift, "/", n_shifts, " | Target: ", real(safe_target, kind=8)
+
+      call EPSSolve(eps, ierr)
+      call EPSGetConverged(eps, nconv, ierr)
+
+      ! -----------------------------------------------------------------------
+      ! Extract and Filter Duplicates
+      ! -----------------------------------------------------------------------
+      if (nconv > 0) then
+        do i_eps = 0, nconv - 1
+          call EPSGetEigenvalue(eps, i_eps, kr, ki, ierr)
+          r_val = real(kr, kind=8)
+          i_val = real(ki, kind=8)
+
+          ! Check against previously found eigenvalues
+          is_duplicate = .false.
+          do j = 1, total_unique
+            diff = abs(r_val - eig_r_all(j)) + abs(i_val - eig_i_all(j))
+            if (diff < TOL_DUP) then
+              is_duplicate = .true.
+              exit
+            endif
+          enddo
+
+          ! Append new unique eigenvalues
+          if (.not. is_duplicate .and. total_unique < M) then
+            total_unique = total_unique + 1
+            eig_r_all(total_unique) = r_val
+            eig_i_all(total_unique) = i_val
+          endif
+        enddo
+      else
+        call EPSGetConvergedReason(eps, eps_reason, ierr)
+        if (my_id == 0) write(*,'(A,I0)') "[EPS] WARNING: 0 converged for this target. Reason: ", eps_reason
+      endif
+
+      call EPSDestroy(eps, ierr)
+    enddo
+
+    ! -------------------------------------------------------------------------
+    ! WRITE CONSOLIDATED FILE
+    ! -------------------------------------------------------------------------
+    if (my_id == 0) then
+      ! (Assuming sort_eigs_by_real is defined elsewhere in your module)
+      if (total_unique > 0) call sort_eigs_by_real(eig_r_all, eig_i_all, total_unique)
+
+      write(filename, '(A,A)') trim(label), "_full_spectrum.dat"
+      open(newunit=iunit, file=trim(filename), status='replace', action='write')
+      write(iunit,'(A,A)')      "# Robust Sweep of matrix       : ", trim(label)
+      write(iunit,'(A,I0)')     "# Matrix size                  : ", M
+      write(iunit,'(A,I0)')     "# Total Unique Found           : ", total_unique
+      write(iunit,'(A)')        "#        Re(lambda)           Im(lambda)"
+      do i = 1, total_unique
+        write(iunit,'(2X,ES22.14,2X,ES22.14)') eig_r_all(i), eig_i_all(i)
+      enddo
+      close(iunit)
+
+      write(*,'(A)') "[EPS] ========================================================"
+      write(*,'(A,I0,A,I0,A,A)') "[EPS] Sweep Complete! Found ", total_unique, &
+           " unique eigenvalues / ", M, " -> ", trim(filename)
+    endif
+
+    deallocate(eig_r_all, eig_i_all)
+  end subroutine petsc_mat_sweep_robust_spectrum
+
 #endif
 
 #endif
