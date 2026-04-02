@@ -10,7 +10,8 @@ module mod_sparse_data
   use mod_strumpack, only:  type_STRUMPACK_SOLVER
 #endif
 #ifdef USE_PETSC
-  use mod_petsc, only: type_PETSC_SYSTEM, petsc_initialize, petsc_finalize, petsc_cleanup
+  use mod_petsc, only: type_PETSC_SYSTEM, petsc_initialize, petsc_finalize, petsc_cleanup, &
+                        petsc_create_matrix
 #endif
   use data_structure, only: type_PRECOND
 

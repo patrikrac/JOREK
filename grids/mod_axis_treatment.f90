@@ -7,6 +7,10 @@
 !!   4: d^2/dRdZ (actually not used, but forced to zero)
 !! - For further details, refer to the JOREK wiki at https://www.jorek.eu/wiki/doku.php?id=grid-axis
 module mod_axis_treatment
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+  use petsc
+#endif
 
 contains
 
@@ -352,6 +356,10 @@ subroutine penalize_dof_on_axis(node_list, dof, element_list, local_elms, n_loca
   integer :: index_large_i, index_node, index_node2, ielm
   integer :: ilarge2, n_tor_local
   integer(kind=int_all):: ijA_position,ijA_position2
+#ifdef USE_PETSC
+  PetscInt              :: petsc_row
+  PetscErrorCode        :: petsc_ierr
+#endif
 
   n_tor_local = (a_mat%i_tor_max - a_mat%i_tor_min + 1)
 
@@ -371,6 +379,12 @@ subroutine penalize_dof_on_axis(node_list, dof, element_list, local_elms, n_loca
 
             index_node = node_list%node(inode)%index(dof)
             if ((index_node .ge. index_min) .and. (index_node .le. index_max)) then
+#ifdef USE_PETSC
+              if (a_mat%petsc_assembled) then
+                petsc_row = n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min
+                call MatSetValue(a_mat%petsc_A, petsc_row, petsc_row, zbig, INSERT_VALUES, petsc_ierr)
+              else
+#endif
               call locate_irn_jcn(index_node,index_node,index_min,index_max,ijA_position,a_mat)
               index_large_i = n_tor_local * n_var * (index_node - 1)
               ilarge2 = ijA_position - 1 + ((k-1)*n_tor_local + in-a_mat%i_tor_min) * n_var*n_tor_local &
@@ -378,6 +392,9 @@ subroutine penalize_dof_on_axis(node_list, dof, element_list, local_elms, n_loca
               a_mat%irn(ilarge2) =  n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min + 1
               a_mat%jcn(ilarge2) =  n_tor_local * n_var * (index_node-1) + (k-1)*n_tor_local + in - a_mat%i_tor_min + 1
               a_mat%val(ilarge2)   = zbig
+#ifdef USE_PETSC
+              endif
+#endif
             end if
 
           enddo

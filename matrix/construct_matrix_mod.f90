@@ -1,6 +1,10 @@
 module construct_matrix_mod
 
 use mod_parameters, only : n_var, n_order, n_degrees_1d
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+use petsc
+#endif
 implicit none
 
 public :: construct_matrix
@@ -26,6 +30,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   use mod_fix_axis_nodes, only: fix_nodes_on_axis
   use vacuum_response, only: vacuum_boundary_integral
   use global_distributed_matrix, only: global_matrix_structure_vacuum
+#ifdef USE_PETSC
+  use mod_petsc, only: petsc_create_matrix
+#endif
   implicit none
 
 #include "r3_info.h"
@@ -53,6 +60,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   integer                           :: my_ind_min, my_ind_max
   integer                           :: node_out(n_vertex_max)
   integer                           :: my_id
+#ifdef USE_PETSC
+  PetscErrorCode                    :: petsc_ierr
+#endif
   integer                           :: xcase2
   real*8                            :: R_axis
   real*8                            :: Z_axis
@@ -96,6 +106,17 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   call new_thread_buffers() 
 
   ! --- Allocation/Reallocation of the sparse matrix and right-hand side vector
+#ifdef USE_PETSC
+  if (.not. harmonic_matrix) then !TODO: Might be unnessecary ... constant protection by harmonic_matrix...
+    ! Direct PETSc assembly: skip irn/jcn/val, use PETSc MPIBAIJ matrix
+    if (.not. a_mat%petsc_assembled) then
+      call petsc_create_matrix(a_mat%petsc_A, a_mat)
+      a_mat%petsc_assembled = .true.
+    else
+      call MatZeroEntries(a_mat%petsc_A, petsc_ierr)
+    endif
+  else
+#endif
   if (associated(a_mat%irn)) call tr_deallocatep(a_mat%irn, "irn", CAT_DMATRIX)
   if (associated(a_mat%jcn)) call tr_deallocatep(a_mat%jcn, "jcn", CAT_DMATRIX)
   if (associated(a_mat%val)) call tr_deallocatep(a_mat%val, "val", CAT_DMATRIX)
@@ -107,6 +128,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   a_mat%irn(1:a_mat%nnz) = 0
   a_mat%jcn(1:a_mat%nnz) = 0
   a_mat%val(1:a_mat%nnz) = 0.0d0
+#ifdef USE_PETSC
+  endif
+#endif
 
   if (associated(rhs_vec%val)) call tr_deallocatep(rhs_vec%val,"rhs",CAT_DMATRIX)
   call tr_allocatep(rhs_vec%val, Int1, a_mat%ng, "rhs", CAT_DMATRIX)
@@ -173,8 +197,18 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     !$omp end do
     !$omp end parallel
 
+#ifdef USE_PETSC
+    if (.not. harmonic_matrix) then
+      ! Flush element contributions (ADD_VALUES) before BCs (INSERT_VALUES)
+      call MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+      call MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+    else
+#endif
     ! --- Memory tracking
     call tr_vnorms("cm_A_bef_bc", a_mat%val, a_mat%nnz)
+#ifdef USE_PETSC
+    endif
+#endif
 
     ! --- Apply boundary conditions.
     call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
@@ -187,8 +221,18 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
       call penalize_dof_on_axis(node_list, 4, element_list, local_elms, n_local_elms, my_ind_min, my_ind_max, a_mat)
     endif
 
+#ifdef USE_PETSC
+    if (.not. harmonic_matrix) then
+      ! Flush BC contributions (INSERT_VALUES) before vacuum (ADD_VALUES)
+      call MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+      call MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+    else
+#endif
     ! --- Memory tracking
     call tr_vnorms("cm_A_aft_bc", a_mat%val, a_mat%nnz)
+#ifdef USE_PETSC
+    endif
+#endif
 
     ! --- Add vacuum response (boundary integral) for free boundary computations
     if ( freeboundary .and. ( sr%n_tor /= 0 ) ) then
@@ -196,7 +240,15 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
                                     resistive_wall, my_ind_min, my_ind_max, rhs_local, tstep, index_now, a_mat)
     endif
 
-    if ( .not. harmonic_matrix ) then 
+#ifdef USE_PETSC
+    if (.not. harmonic_matrix) then
+      ! Final assembly of PETSc matrix
+      call MatAssemblyBegin(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, petsc_ierr)
+      call MatAssemblyEnd(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, petsc_ierr)
+    endif
+#endif
+
+    if ( .not. harmonic_matrix ) then
 #ifdef COMPARE_ELEMENT_MATRIX
       ! TODO: Create a subroutine to compare the element matrix with the right-hand side vector
       !call summarise_element_matrix_comparison(a_mat, rhs_vec, my_id, index_now)
@@ -212,7 +264,11 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   rhs_vec%n  = a_mat%ng
 
   ! --- Check if the matrix is distributed correctly
+#ifdef USE_PETSC
+  if (harmonic_matrix) call check_if_distributed(a_mat)
+#else
   call check_if_distributed(a_mat)
+#endif
 
   ! --- Handle all nessecarry cleanup operations
   call tr_locvnorms("cm_BCRhs",rhs_vec%val,a_mat%ng)
@@ -384,7 +440,6 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
   use mod_parameters, only: n_tor, n_var, n_degrees, n_vertex_max
   use data_structure, only: type_element, type_node, type_node_list, type_SP_MATRIX, thread_struct
   use nodes_elements
-  use mod_locate_irn_jcn
   implicit none
 
   ! Arguments
@@ -396,18 +451,16 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
   integer, intent(in) :: omp_tid
 
   ! Locals
-  integer :: i, j, k, l
-  integer :: i_order, k_order
-  integer :: inode1, inode2, knode
-  integer :: index_node1, index_node2
-  integer :: index_large_i, index_large_k
-  integer :: index_ij, index_kl
-  integer :: ijA_position, ilarge2
+  integer :: i, j
+  integer :: i_order
+  integer :: inode1
+  integer :: index_node1
+  integer :: index_large_i
+  integer :: index_ij
 
   logical :: eliminate_boundary_dofs = .false.
-  logical :: interior
-  logical :: i_bnd, k_bnd
-  integer :: i_bnd_type, k_bnd_type
+  logical :: i_bnd
+  integer :: i_bnd_type
   real*8 :: elm_diagonal_average
   integer :: nnz_counter
 
@@ -420,25 +473,24 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
     do i = 1, n_vertex_max
       do i_order = 1, n_degrees
           do j = 1, n_var * n_tor_local
-            index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
+            index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j
             if (abs(thread_struct(omp_tid)%ELM(index_ij,index_ij)) .ne. 0) nnz_counter = nnz_counter + 1
-            elm_diagonal_average = elm_diagonal_average + abs(thread_struct(omp_tid)%ELM(index_ij,index_ij)) 
+            elm_diagonal_average = elm_diagonal_average + abs(thread_struct(omp_tid)%ELM(index_ij,index_ij))
           enddo
-      enddo 
+      enddo
     enddo
-    elm_diagonal_average = elm_diagonal_average  / nnz_counter 
-    elm_diagonal_average = max(elm_diagonal_average, 1.d0)  ! Avoid division by zero
-    elm_diagonal_average = min(elm_diagonal_average, 1.d12)  ! Avoid too large values 
-  endif   
+    elm_diagonal_average = elm_diagonal_average  / nnz_counter
+    elm_diagonal_average = max(elm_diagonal_average, 1.d0)
+    elm_diagonal_average = min(elm_diagonal_average, 1.d12)
+  endif
 
   ! --- We only look at non-refined elements
   if ((.not. refinement) .or. (refinement .and. (element%n_sons .eq. 0))) then
 
     do i=1,n_vertex_max
 
-      interior = .true.
       i_bnd = .false.
-      
+
       inode1 = node_out(i)
 
       ! --- Get the boundary type of the node
@@ -453,121 +505,42 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
 
         if ((index_node1 .ge. my_ind_min) .and. (index_node1 .le. my_ind_max)) then
 
-          if (eliminate_boundary_dofs .and. i_bnd .and. & 
+          ! --- RHS assembly
+          if (eliminate_boundary_dofs .and. i_bnd .and. &
                 (     (i_bnd_type .eq. 1 .and. (i_order .eq. 1 .or. i_order .eq. 2)) &
                 .or.  (i_bnd_type .eq. 2 .and. (i_order .eq. 1 .or. i_order .eq. 3)) &
                 .or.  (i_bnd_type .eq. 3 .and. (i_order .eq. 1 .or. i_order .eq. 2 .or. i_order .eq. 3))   )) then
 
             do j = 1, n_var * n_tor_local
-          
-              index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
+              index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j
               !$omp critical
               rhs_local(index_large_i+j) = 0.d0
               !$omp end critical
             enddo
           else
             do j = 1, n_var * n_tor_local
-
-              index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
-            
+              index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j
               !$omp atomic
-              rhs_local(index_large_i+j) = rhs_local(index_large_i+j) + thread_struct(omp_tid)%RHS(index_ij) 
+              rhs_local(index_large_i+j) = rhs_local(index_large_i+j) + thread_struct(omp_tid)%RHS(index_ij)
               !$omp end atomic
             enddo
           endif
 
-          do k=1,n_vertex_max
-
-            knode = node_out(k)
-            k_bnd = .false.
-
-            k_bnd_type = node_list%node(knode)%boundary
-            if (k_bnd_type .ne. 0) k_bnd = .true.
-
-
-            interior = .not. (i_bnd .or. k_bnd)
-
-            do k_order = 1, n_degrees
-
-              index_node2 = node_list%node(knode)%index(k_order)
-
-              index_large_k = n_tor_local * n_var * (index_node2 - 1)
-
-              call locate_irn_jcn(index_node1,index_node2,my_ind_min,my_ind_max,ijA_position,a_mat)
-
-              thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local) = 0.d0
-              
-              do j = 1, n_var * n_tor_local
-                index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j   ! index in the ELM matrix
-
-                do l = 1, n_var * n_tor_local
-
-                  index_kl = n_tor_local * n_var * n_degrees * (k-1) +  n_tor_local * n_var * (k_order-1) + l   ! index in the ELM matrix
-
-                  ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
-
-                  a_mat%irn(ilarge2) = index_large_i	+ j
-                  a_mat%jcn(ilarge2) = index_large_k	+ l
-                  
-
-                  thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) = &
-                    thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) + thread_struct(omp_tid)%ELM(index_ij,index_kl)
-                enddo ! n_var * n_tor_local
-
-              enddo ! n_var * n_tor_local
-                if (.not. eliminate_boundary_dofs) then 
-                  !$omp critical
-                  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
-                    thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                  !$omp end critical
-                else
-
-                if (interior) then
-                  !$omp critical
-                  a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
-                    thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                  !$omp end critical
-                else 
-                  if ((i .eq. k) .and. ((i_order .eq. 1 .and. k_order .eq. 1) &
-                                            .or. ((i_bnd_type .eq. 2 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 3 .and. k_order .eq. 3)) & 
-                                            .or. ((i_bnd_type .eq. 1 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 2 .and. k_order .eq. 2)))) then
-
-                    !$omp critical
-                    do j = 1, n_var * n_tor_local
-                      do l = 1, n_var * n_tor_local
-                        ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
-                        if (j .eq. l) then
-                          a_mat%val(ilarge2) = a_mat%val(ilarge2) + elm_diagonal_average
-                        else
-                          a_mat%val(ilarge2) = 0.d0
-                        endif
-                      enddo
-                    enddo
-                    !$omp end critical
-                  else if ((i_bnd .and. (i_order .eq. 1 .or. (i_bnd_type .eq. 2 .and. i_order .eq. 3) .or. &
-                                                            (i_bnd_type .eq. 1 .and. i_order .eq. 2) .or. &
-                                                            (i_bnd_type .eq. 3 .and. (i_order .eq. 2 .or. i_order .eq. 3)))) &
-                            .or. (k_bnd .and. (k_order .eq. 1 .or. (k_bnd_type .eq. 2 .and. k_order .eq. 3) .or. &
-                                                            (k_bnd_type .eq. 1 .and. k_order .eq. 2) .or. &
-                                                            (k_bnd_type .eq. 3 .and. (k_order .eq. 2 .or. k_order .eq. 3))))) then
-                    !$omp critical
-                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = 0.d0
-                    !$omp end critical
-                  else
-                    !$omp critical
-                    a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
-                      a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
-                      thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
-                    !$omp end critical
-                  endif                 
-                endif  
-
-              endif ! zbig_bc
-
-            enddo ! n_degrees
-          enddo ! n_vertex_max
+          ! --- Matrix assembly: dispatch to backend-specific routine
+#ifdef USE_PETSC
+          if (a_mat%petsc_assembled) then
+            call add_block_to_petsc(index_node1, i, i_order, i_bnd, i_bnd_type, &
+                                    node_out, a_mat, omp_tid, n_tor_local, &
+                                    eliminate_boundary_dofs, elm_diagonal_average)
+          else
+#endif
+            call add_block_to_sp_matrix(index_node1, i, i_order, i_bnd, i_bnd_type, &
+                                        node_out, a_mat, omp_tid, n_tor_local, &
+                                        my_ind_min, my_ind_max, &
+                                        eliminate_boundary_dofs, elm_diagonal_average)
+#ifdef USE_PETSC
+          endif
+#endif
 
         endif ! my_ind_min < index < my_ind_max
 
@@ -577,6 +550,230 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
 
   end if
 end subroutine add_to_a_mat
+
+
+!> Assemble element blocks into type_SP_MATRIX (irn/jcn/val arrays).
+!! Called from add_to_a_mat for the non-PETSc path.
+subroutine add_block_to_sp_matrix(index_node1, i, i_order, i_bnd, i_bnd_type, &
+                                   node_out, a_mat, omp_tid, n_tor_local, &
+                                   my_ind_min, my_ind_max, &
+                                   eliminate_boundary_dofs, elm_diagonal_average)
+  use mod_parameters, only: n_var, n_degrees, n_vertex_max
+  use data_structure, only: type_node, type_node_list, type_SP_MATRIX, thread_struct
+  use nodes_elements
+  use mod_locate_irn_jcn
+  implicit none
+
+  integer, intent(in) :: index_node1, i, i_order
+  logical, intent(in) :: i_bnd
+  integer, intent(in) :: i_bnd_type
+  integer, intent(in) :: node_out(:)
+  type(type_SP_MATRIX), intent(inout) :: a_mat
+  integer, intent(in) :: omp_tid, n_tor_local
+  integer, intent(in) :: my_ind_min, my_ind_max
+  logical, intent(in) :: eliminate_boundary_dofs
+  real*8, intent(in) :: elm_diagonal_average
+
+  integer :: j, k, l, k_order
+  integer :: knode
+  integer :: index_node2
+  integer :: index_large_i, index_large_k
+  integer :: index_ij, index_kl
+  integer :: ijA_position, ilarge2
+  logical :: interior, k_bnd
+  integer :: k_bnd_type
+
+  index_large_i = n_tor_local * n_var * (index_node1 - 1)
+
+  do k=1,n_vertex_max
+
+    knode = node_out(k)
+    k_bnd = .false.
+
+    k_bnd_type = node_list%node(knode)%boundary
+    if (k_bnd_type .ne. 0) k_bnd = .true.
+
+    interior = .not. (i_bnd .or. k_bnd)
+
+    do k_order = 1, n_degrees
+
+      index_node2 = node_list%node(knode)%index(k_order)
+
+      index_large_k = n_tor_local * n_var * (index_node2 - 1)
+
+      call locate_irn_jcn(index_node1,index_node2,my_ind_min,my_ind_max,ijA_position,a_mat)
+
+      thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local) = 0.d0
+
+      do j = 1, n_var * n_tor_local
+        index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j
+
+        do l = 1, n_var * n_tor_local
+
+          index_kl = n_tor_local * n_var * n_degrees * (k-1) +  n_tor_local * n_var * (k_order-1) + l
+
+          ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
+
+          a_mat%irn(ilarge2) = index_large_i + j
+          a_mat%jcn(ilarge2) = index_large_k + l
+
+          thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) = &
+            thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) + thread_struct(omp_tid)%ELM(index_ij,index_kl)
+        enddo
+
+      enddo
+
+      if (.not. eliminate_boundary_dofs) then
+        !$omp critical
+        a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+          a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+          thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+        !$omp end critical
+      else
+
+        if (interior) then
+          !$omp critical
+          a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+            a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+            thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+          !$omp end critical
+        else
+          if ((i .eq. k) .and. ((i_order .eq. 1 .and. k_order .eq. 1) &
+                                    .or. ((i_bnd_type .eq. 2 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 3 .and. k_order .eq. 3)) &
+                                    .or. ((i_bnd_type .eq. 1 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 2 .and. k_order .eq. 2)))) then
+
+            !$omp critical
+            do j = 1, n_var * n_tor_local
+              do l = 1, n_var * n_tor_local
+                ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
+                if (j .eq. l) then
+                  a_mat%val(ilarge2) = a_mat%val(ilarge2) + elm_diagonal_average
+                else
+                  a_mat%val(ilarge2) = 0.d0
+                endif
+              enddo
+            enddo
+            !$omp end critical
+          else if ((i_bnd .and. (i_order .eq. 1 .or. (i_bnd_type .eq. 2 .and. i_order .eq. 3) .or. &
+                                                    (i_bnd_type .eq. 1 .and. i_order .eq. 2) .or. &
+                                                    (i_bnd_type .eq. 3 .and. (i_order .eq. 2 .or. i_order .eq. 3)))) &
+                    .or. (k_bnd .and. (k_order .eq. 1 .or. (k_bnd_type .eq. 2 .and. k_order .eq. 3) .or. &
+                                                    (k_bnd_type .eq. 1 .and. k_order .eq. 2) .or. &
+                                                    (k_bnd_type .eq. 3 .and. (k_order .eq. 2 .or. k_order .eq. 3))))) then
+            !$omp critical
+            a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = 0.d0
+            !$omp end critical
+          else
+            !$omp critical
+            a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) = &
+              a_mat%val(ijA_position : ijA_position + n_var*n_tor_local*n_var*n_tor_local - 1) +  &
+              thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local)
+            !$omp end critical
+          endif
+        endif
+
+      endif ! eliminate_boundary_dofs
+
+    enddo ! n_degrees
+  enddo ! n_vertex_max
+
+end subroutine add_block_to_sp_matrix
+
+
+#ifdef USE_PETSC
+!> Assemble element blocks directly into PETSc MPIBAIJ matrix.
+!! Called from add_to_a_mat for the direct PETSc assembly path.
+subroutine add_block_to_petsc(index_node1, i, i_order, i_bnd, i_bnd_type, &
+                               node_out, a_mat, omp_tid, n_tor_local, &
+                               eliminate_boundary_dofs, elm_diagonal_average)
+#include "petsc/finclude/petsc.h"
+  use petsc
+  use mod_parameters, only: n_var, n_degrees, n_vertex_max
+  use data_structure, only: type_node, type_node_list, type_SP_MATRIX, thread_struct
+  use nodes_elements
+  implicit none
+
+  integer, intent(in) :: index_node1, i, i_order
+  logical, intent(in) :: i_bnd
+  integer, intent(in) :: i_bnd_type
+  integer, intent(in) :: node_out(:)
+  type(type_SP_MATRIX), intent(inout) :: a_mat
+  integer, intent(in) :: omp_tid, n_tor_local
+  logical, intent(in) :: eliminate_boundary_dofs
+  real*8, intent(in) :: elm_diagonal_average
+
+  integer :: j, k, l, k_order
+  integer :: knode
+  integer :: index_node2
+  integer :: index_ij, index_kl
+  logical :: interior, k_bnd
+  integer :: k_bnd_type
+  integer :: block_size
+
+  PetscInt :: idxm_petsc(1), idxn_petsc(1)
+  PetscErrorCode :: petsc_ierr
+
+  block_size = n_var * n_tor_local
+
+  do k=1,n_vertex_max
+
+    knode = node_out(k)
+    k_bnd = .false.
+
+    k_bnd_type = node_list%node(knode)%boundary
+    if (k_bnd_type .ne. 0) k_bnd = .true.
+
+    interior = .not. (i_bnd .or. k_bnd)
+
+    do k_order = 1, n_degrees
+
+      index_node2 = node_list%node(knode)%index(k_order)
+
+      ! --- Compute synch_buff from element matrix
+      thread_struct(omp_tid)%synch_buff(1:block_size*block_size) = 0.d0
+      do j = 1, block_size
+        index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j
+        do l = 1, block_size
+          index_kl = n_tor_local * n_var * n_degrees * (k-1) + n_tor_local * n_var * (k_order-1) + l
+          thread_struct(omp_tid)%synch_buff((j-1)*block_size+l) = &
+            thread_struct(omp_tid)%synch_buff((j-1)*block_size+l) + thread_struct(omp_tid)%ELM(index_ij,index_kl)
+        enddo
+      enddo
+
+      ! --- Apply eliminate_boundary_dofs logic
+      if (eliminate_boundary_dofs .and. .not. interior) then
+        if ((i .eq. k) .and. ((i_order .eq. 1 .and. k_order .eq. 1) &
+                                  .or. ((i_bnd_type .eq. 2 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 3 .and. k_order .eq. 3)) &
+                                  .or. ((i_bnd_type .eq. 1 .or. i_bnd_type .eq. 3) .and. (i_order .eq. 2 .and. k_order .eq. 2)))) then
+          ! Diagonal boundary block: replace with diagonal of elm_diagonal_average
+          thread_struct(omp_tid)%synch_buff(1:block_size*block_size) = 0.d0
+          do j = 1, block_size
+            thread_struct(omp_tid)%synch_buff((j-1)*block_size+j) = elm_diagonal_average
+          enddo
+        else if ((i_bnd .and. (i_order .eq. 1 .or. (i_bnd_type .eq. 2 .and. i_order .eq. 3) .or. &
+                                                  (i_bnd_type .eq. 1 .and. i_order .eq. 2) .or. &
+                                                  (i_bnd_type .eq. 3 .and. (i_order .eq. 2 .or. i_order .eq. 3)))) &
+                  .or. (k_bnd .and. (k_order .eq. 1 .or. (k_bnd_type .eq. 2 .and. k_order .eq. 3) .or. &
+                                                  (k_bnd_type .eq. 1 .and. k_order .eq. 2) .or. &
+                                                  (k_bnd_type .eq. 3 .and. (k_order .eq. 2 .or. k_order .eq. 3))))) then
+          ! Off-diagonal boundary block: skip (matrix already zeroed by MatZeroEntries)
+          cycle
+        endif
+      endif
+
+      ! --- Insert block into PETSc matrix
+      idxm_petsc(1) = index_node1 - 1  ! 0-based block row
+      idxn_petsc(1) = index_node2 - 1  ! 0-based block col
+      !$omp critical
+      call MatSetValuesBlocked(a_mat%petsc_A, 1, idxm_petsc, 1, idxn_petsc, &
+                               thread_struct(omp_tid)%synch_buff, ADD_VALUES, petsc_ierr)
+      !$omp end critical
+
+    enddo ! n_degrees
+  enddo ! n_vertex_max
+
+end subroutine add_block_to_petsc
+#endif
 
 
 subroutine define_element_nodes(ielm, node_out, element, nodes, element_father, nodes_father, omp_tid, harmonic_matrix)

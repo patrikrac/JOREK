@@ -61,6 +61,7 @@ DIRS := diagnostics				\
 	models/$(MODEL)				\
 	refinement				\
 	matrix					\
+	modelPC					\
 	particles				\
 	particles/pushers			\
 	particles/examples			\

@@ -1,4 +1,8 @@
 module mod_assembly
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+  use petsc
+#endif
 implicit none
 !> This module provides routines to factorize code in boundary conditions from each models
 
@@ -36,28 +40,42 @@ contains
     real*8,                intent(in)                 :: zbig
     integer,               intent(in)                 :: index_min, index_max
     type(type_SP_MATRIX)                              :: a_mat
-    
+
     logical                                           :: is_local
     integer(kind=int_all)                             :: ija_position, ilarge_vp
     integer                                           :: n_tor_local
         integer,                            intent(in)    :: my_id
+#ifdef USE_PETSC
+    PetscInt                                          :: petsc_row, petsc_col
+    PetscErrorCode                                    :: petsc_ierr
+#endif
 
     if ( (k==0) .or. (k2==0) ) return ! ignore calls for model family extensions not in use (variable number zero)
 
     n_tor_local = a_mat%i_tor_max - a_mat%i_tor_min +1
     if ((index_node .ge. index_min) .and. (index_node .le. index_max)) then
 
+#ifdef USE_PETSC
+       if (a_mat%petsc_assembled) then
+         ! Direct PETSc assembly: set value with INSERT_VALUES (0-based indices)
+         petsc_row = n_tor_local * n_var * (index_node -1) + (k -1)*n_tor_local + in  - a_mat%i_tor_min
+         petsc_col = n_tor_local * n_var * (index_node2-1) + (k2-1)*n_tor_local + in2 - a_mat%i_tor_min
+         call MatSetValue(a_mat%petsc_A, petsc_row, petsc_col, ZBIG, INSERT_VALUES, petsc_ierr)
+         return
+       endif
+#endif
+
        call locate_irn_jcn(index_node,index_node2,index_min,index_max,ijA_position,a_mat)
-                             
+
        !-------- index dans A_mat
        ilarge_vp  = ijA_position  - 1 + ((k-1)*n_tor_local + in-a_mat%i_tor_min ) * n_var*n_tor_local + (k2-1)*n_tor_local + in2&
-                    -a_mat%i_tor_min + 1 
-                               
+                    -a_mat%i_tor_min + 1
+
       !if (my_id == 1) then
       !   write(*,*) "Values before B.C. :", &
       !   & "irn=", a_mat%irn(ilarge_vp), &
       !   & "jcn=", a_mat%jcn(ilarge_vp), &
-      !   & "val=", a_mat%val(ilarge_vp)    
+      !   & "val=", a_mat%val(ilarge_vp)
       !endif
 
        a_mat%irn(ilarge_vp) =  n_tor_local * n_var * (index_node -1) + (k -1)*n_tor_local + in - a_mat%i_tor_min + 1

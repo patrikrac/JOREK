@@ -185,11 +185,17 @@ module global_distributed_matrix
                     
                     ! --- Determine which position in the sparse matrix data structure corresponds
                     !     to the matrix entry at l_row, j_col.
+#ifdef USE_PETSC
+                    if (.not. a_mat%petsc_assembled) then
+#endif
                     sparsepos = det_sparse_pos(l_row, j_col, a_mat%my_ind_min, a_mat)
-                    
+
                     ! --- Set row and column numbers in the sparse matrix data structure
                     a_mat%irn(sparsepos) = l_row
                     a_mat%jcn(sparsepos) = j_col
+#ifdef USE_PETSC
+                    endif
+#endif
                     
                   end do
                 end do

@@ -94,6 +94,10 @@ program JOREK2
   use mod_reduce_noise, only: reduce_noise
 #endif
 
+#ifdef USE_PETSC
+    use mod_petsc_pc_physics, only: petsc_assemble_pc_matrices
+#endif 
+
   use, intrinsic :: iso_c_binding
   use, intrinsic :: iso_fortran_env, only : stdin=>input_unit, &
                                             stdout=>output_unit, &
@@ -741,6 +745,8 @@ write(*,*) "n elements:", element_list%n_elements
   
     call clck_time_barrier(t1); call clck_ldiff(t0,t1,tsecond)
     if (my_id.eq.0) write(*,FMT_TIMING) my_id, '# Elapsed time construct global matrix: ',tsecond
+
+    call petsc_assemble_pc_matrices(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
 
 #ifdef SAVEMATRIX
 

@@ -42,8 +42,11 @@ module mod_sparse
     use omp_lib, only: omp_target_memcpy, omp_get_initial_device, omp_get_default_device, omp_target_is_present
 #endif
 #ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+    use petsc
     use mod_petsc, only: petsc_init_system, petsc_update_matrix, petsc_update_rhs, &
-                         petsc_solve_iterative_and_retrieve, petsc_recover_solution
+                         petsc_solve_iterative_and_retrieve, petsc_recover_solution, &
+                         petsc_solve_and_retrieve
 #endif
 
     implicit none
@@ -68,6 +71,10 @@ module mod_sparse
     real                     :: tt1,tt0
 
     logical :: use_condition_number_estimate = .false.
+    logical :: petsc_direct_solved
+#ifdef USE_PETSC
+    PetscErrorCode :: petsc_ierr
+#endif
 
     external :: solve_mumps_all, solve_pastix_all, solve_strumpack_all
 
@@ -107,6 +114,10 @@ module mod_sparse
       endif
 #endif
 
+      petsc_direct_solved = .false.
+#ifdef USE_PETSC
+      if (.not. a_mat%petsc_assembled) then
+#endif
       if (solver%library.eq.mumps) then
 #ifdef USE_MUMPS
         if (verbose) write(*,*) "Using MUMPS solver"
@@ -135,12 +146,46 @@ module mod_sparse
         call solve_pastix_all(solver%ptss, a_mat, rhs_vec, solver%solve_only, tag)
 #endif
       endif
+#ifdef USE_PETSC
+      endif   ! .not. a_mat%petsc_assembled
 
-      do i=1,rhs_vec%n
-        sol_vec%val(i) =  rhs_vec%val(i)
-      enddo
+      if (a_mat%petsc_assembled) then
+        ! Matrix in PETSc format — irn/jcn/val not available; use PETSc direct solver
+        if (.not. solver%petsc_sys%initialized) then
+          solver%petsc_sys%A = a_mat%petsc_A
+          call MatCreateVecs(solver%petsc_sys%A, solver%petsc_sys%x, solver%petsc_sys%b, petsc_ierr)
+          solver%petsc_sys%initialized = .true.
+        else
+          solver%petsc_sys%A = a_mat%petsc_A
+        endif
+        call petsc_update_rhs(solver%petsc_sys, rhs_vec)
+        call petsc_solve_and_retrieve(solver%petsc_sys)
+        call petsc_recover_solution(solver%petsc_sys, sol_vec)
+        solver%step_success = .true.
+        petsc_direct_solved = .true.
+      elseif (solver%equilibrium) then
+        !TODO: Not working, set_block_csr_permutation fails, why?
+        if (.not. solver%petsc_sys%initialized) then
+          if (.not. a_mat%bcsr_mapped) then
+            call set_block_csr_permutations(a_mat)
+          endif
+          call petsc_init_system(solver%petsc_sys, a_mat)
+        endif
+        call petsc_update_matrix(solver%petsc_sys, a_mat)
+        call petsc_update_rhs(solver%petsc_sys, rhs_vec)
+        call petsc_solve_and_retrieve(solver%petsc_sys)
+        call petsc_recover_solution(solver%petsc_sys, sol_vec)
+        solver%step_success = .true.
+        petsc_direct_solved = .true.
+      endif
+#endif
 
-      solver%step_success = .true.
+      if (.not. petsc_direct_solved) then
+        do i=1,rhs_vec%n
+          sol_vec%val(i) =  rhs_vec%val(i)
+        enddo
+        solver%step_success = .true.
+      endif
 
     elseif (solver%iterative) then
 
@@ -163,6 +208,24 @@ module mod_sparse
         endif
       endif
       solver%solve_only = (solver%solve_only).or.(solver%newton%it.gt.1) ! no PC update within Newton loop
+
+#ifdef USE_PETSC
+      if (a_mat%petsc_assembled) then
+        ! Direct PETSc assembly path: matrix is already in a_mat%petsc_A
+        if (.not. solver%petsc_sys%initialized) then
+          solver%petsc_sys%A = a_mat%petsc_A
+          call MatCreateVecs(solver%petsc_sys%A, solver%petsc_sys%x, solver%petsc_sys%b, petsc_ierr)
+          solver%petsc_sys%initialized = .true.
+        else
+          solver%petsc_sys%A = a_mat%petsc_A
+        endif
+        call petsc_update_rhs(solver%petsc_sys, rhs_vec)
+        solver%iter_prev = solver%iter_gmres
+        call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
+                                                solver%iter_gmres, solver%step_success)
+        call petsc_recover_solution(solver%petsc_sys, sol_vec)
+      else
+#endif
 
       if (.not. a_mat%bcsr_mapped) then
         call set_block_csr_permutations(a_mat)
@@ -257,7 +320,14 @@ module mod_sparse
       if (verbose) write(*,'(A32,I5)') 'Number of iterations: ', solver%iter_gmres
       solver%step_success = (solver%iter_gmres .lt. solver%iter_max)
 #endif
+#ifdef USE_PETSC
+      endif                 ! end if (a_mat%petsc_assembled) else branch
+      if (.not. a_mat%petsc_assembled) then
+        if (use_matrix_equilibration) call scale_vector_column(a_mat, sol_vec%val)
+      endif
+#else
       if (use_matrix_equilibration) call scale_vector_column(a_mat, sol_vec%val)
+#endif
       endif
 
   end subroutine solve_sparse_system

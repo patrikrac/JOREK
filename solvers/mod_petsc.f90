@@ -1,8 +1,13 @@
 module mod_petsc
 #ifdef USE_PETSC
   use mpi_mod
+  use mod_petsc_pc
 #include "petsc/finclude/petsc.h"
   use petsc
+#ifdef USE_SLEPC
+#include "slepc/finclude/slepceps.h"
+  use slepceps
+#endif
 
   implicit none
 
@@ -14,6 +19,7 @@ module mod_petsc
     Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (persistent)
     KSP  :: ksp            ! Krylov solver context (persistent)
     logical :: initialized   = .false.  ! A, x, b created
+    logical :: owns_A        = .false.  ! .true. when A was created by petsc_init_system (old path)
     logical :: ksp_ready     = .false.  ! KSP, A_aij, PC setup + factored
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
@@ -25,14 +31,23 @@ contains
   subroutine petsc_initialize()
     PetscErrorCode :: ierr
     ! PetscCallA(PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-log_view", PETSC_NULL_CHARACTER, ierr))
+#ifdef USE_SLEPC
+    call SlepcInitialize(PETSC_NULL_CHARACTER, ierr)  ! superset of PetscInitialize
+    if (ierr /= 0) print *, "Error initializing SLEPc/PETSc"
+#else
     call PetscInitialize(PETSC_NULL_CHARACTER, ierr)
     if (ierr /= 0) print *, "Error initializing PETSc"
+#endif
   end subroutine
 
 
   subroutine petsc_finalize()
     PetscErrorCode :: ierr
+#ifdef USE_SLEPC
+    call SlepcFinalize(ierr)
+#else
     call PetscFinalize(ierr)
+#endif
   end subroutine petsc_finalize
 
 
@@ -50,6 +65,7 @@ contains
 
 
   !> Initialize BAIJ matrix structure and BAIJ vecs — called once when !initialized
+  !TODO: Redundant with petsc_create_matrix. One must go...
   subroutine petsc_init_system(petsc_sys, a_mat)
     use data_structure, only: type_SP_MATRIX
 
@@ -107,12 +123,64 @@ contains
     call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
 
     petsc_sys%initialized = .true.
+    petsc_sys%owns_A = .true.
     if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0)') "[PETSc] init: BAIJ matrix ", n_global, "x", n_global, &
                                                     ", block_size=", block_size
   end subroutine petsc_init_system
 
 
-  !> Fill matrix values from JOREK block-CSR — called when !solve_only
+  !> Create and preallocate a PETSc MPIBAIJ matrix from the JOREK block structure
+  !! (ijA_size, irn_jcn). Does not require iblockptr (block-CSR).
+  subroutine petsc_create_matrix(petsc_A, a_mat)
+    use data_structure, only: type_SP_MATRIX
+
+    Mat, intent(out)                    :: petsc_A
+    type(type_SP_MATRIX), intent(in)    :: a_mat
+
+    integer :: i, j
+    integer :: comm, my_id, mpierr
+    integer :: n_local, n_global, n_block_local, block_size, col_block
+    PetscInt, allocatable :: d_nnz(:), o_nnz(:)
+    PetscErrorCode :: ierr
+
+    comm = a_mat%comm
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    block_size    = a_mat%block_size
+    n_global      = a_mat%ng
+    n_block_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
+    n_local       = n_block_local * block_size
+
+    ! Compute diagonal/off-diagonal block counts per block row
+    allocate(d_nnz(n_block_local), o_nnz(n_block_local))
+    d_nnz = 0
+    o_nnz = 0
+    do i = 1, n_block_local
+      do j = 1, a_mat%ijA_size(i)
+        col_block = a_mat%irn_jcn(i, j)
+        if (col_block >= a_mat%my_ind_min .and. col_block <= a_mat%my_ind_max) then
+          d_nnz(i) = d_nnz(i) + 1
+        else
+          o_nnz(i) = o_nnz(i) + 1
+        endif
+      enddo
+    enddo
+
+    ! Create and preallocate
+    call MatCreate(comm, petsc_A, ierr)
+    call MatSetSizes(petsc_A, n_local, n_local, n_global, n_global, ierr)
+    call MatSetType(petsc_A, MATMPIBAIJ, ierr)
+    call MatSetBlockSize(petsc_A, block_size, ierr)
+    call MatMPIBAIJSetPreallocation(petsc_A, block_size, 0, d_nnz, 0, o_nnz, ierr)
+    if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: petsc_create_matrix preallocation ierr=", ierr
+    deallocate(d_nnz, o_nnz)
+
+    if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0)') &
+      "[PETSc] create_matrix: BAIJ ", n_global, "x", n_global, ", block_size=", block_size
+  end subroutine petsc_create_matrix
+
+
+  !> Fill matrix values from JOREK block-CSR
   subroutine petsc_update_matrix(petsc_sys, a_mat)
     use data_structure, only: type_SP_MATRIX
 
@@ -433,7 +501,7 @@ contains
       if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + PCFIELDSPLIT + MUMPS"
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
-      call petsc_set_toroidal_harmonic_pc(petsc_sys)
+      call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, 1)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
@@ -489,7 +557,7 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_RHS), intent(inout) :: sol_vec
 
-    Vec             :: x_seq      ! sequential copy, replicated on all ranks
+    Vec             :: x_seq
     VecScatter      :: scatter
     PetscScalar, pointer :: x_arr(:)
     PetscErrorCode :: ierr
@@ -510,85 +578,9 @@ contains
   end subroutine petsc_recover_solution
 
 
-  subroutine petsc_set_toroidal_harmonic_pc(petsc_sys)
-    use mod_parameters, only: n_tor
-    use phys_module,    only: autodistribute_modes, n_mode_families, &
-                              modes_per_family, mode_families_modes
-
-    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-
-    integer :: i, j, k, n_split, split_size, field_size, n_modes_in_fam, idx
-    PetscInt :: block_size
-    PetscInt, allocatable :: fields(:)
-    integer, allocatable :: fam_modes(:)
-    Mat :: F
-    PC :: pc, subpc
-    KSP, pointer, dimension(:) :: subksp_array
-    PetscErrorCode :: ierr
-
-    PetscCallA(MatGetBlockSize(petsc_sys%A, block_size, ierr))
-    PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
-    PetscCallA(PCSetType(pc, PCFIELDSPLIT, ierr))
-    PetscCallA(PCFieldSplitSetBlockSize(pc, block_size, ierr))
-    if (autodistribute_modes) then
-      n_split = (n_tor + 1)/2
-    else
-      n_split = n_mode_families
-    endif
-    split_size = block_size/n_tor
-    do i = 1, n_split
-      if (autodistribute_modes) then
-        if (i == 1) then
-          n_modes_in_fam = 1
-          allocate(fam_modes(1))
-          fam_modes(1) = 1
-        else
-          n_modes_in_fam = 2
-          allocate(fam_modes(2))
-          fam_modes(1) = 2*(i-1)
-          fam_modes(2) = 2*(i-1) + 1
-        endif
-      else
-        n_modes_in_fam = modes_per_family(i)
-        allocate(fam_modes(n_modes_in_fam))
-        fam_modes(1:n_modes_in_fam) = mode_families_modes(i, 1:n_modes_in_fam)
-      endif
-
-      field_size = split_size * n_modes_in_fam
-      allocate(fields(field_size))
-      idx = 0
-      do j = 1, split_size
-        do k = 1, n_modes_in_fam
-          idx = idx + 1
-          fields(idx) = (j-1)*n_tor + (fam_modes(k) - 1)
-        enddo
-      enddo
-      PetscCallA(PetscSortInt(field_size, fields, ierr))
-      PetscCallA(PCFieldSplitSetFields(pc, PETSC_NULL_CHARACTER, field_size, fields, fields, ierr))
-      deallocate(fields, fam_modes)
-    enddo
-
-    PetscCallA(PCSetUp(pc, ierr))
-    PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
-    allocate(subksp_array(n_split))
-    PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
-    do i = 1, n_split
-      PetscCallA(KSPSetType(subksp_array(i), KSPPREONLY, ierr))
-      PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
-      PetscCallA(PCSetType(subpc, PCLU, ierr))
-      PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
-      PetscCallA(KSPSetUp(subksp_array(i), ierr))
-      PetscCallA(PCFactorGetMatrix(subpc, F, ierr))
-      PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (METIS)
-      PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
-      PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
-      PetscCallA(MatMumpsSetIcntl(F, 21, 1,  ierr))   ! out-of-core processing
-    enddo
-    deallocate(subksp_array)
-  end subroutine petsc_set_toroidal_harmonic_pc
-
-
   !> Destroy all persistent PETSc objects; safe to call even if never initialized.
+  !! petsc_sys%A is only destroyed if owns_A=.true. (old path via petsc_init_system).
+  !! In the direct assembly path, A is owned by a_mat%petsc_A.
   subroutine petsc_cleanup(petsc_sys)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     PetscErrorCode :: ierr
@@ -603,7 +595,10 @@ contains
     if (petsc_sys%initialized) then
       call VecDestroy(petsc_sys%b, ierr)
       call VecDestroy(petsc_sys%x, ierr)
-      call MatDestroy(petsc_sys%A, ierr)
+      if (petsc_sys%owns_A) then
+        call MatDestroy(petsc_sys%A, ierr)
+        petsc_sys%owns_A = .false.
+      endif
       petsc_sys%initialized = .false.
     endif
   end subroutine petsc_cleanup

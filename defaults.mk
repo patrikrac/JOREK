@@ -348,6 +348,13 @@ ifeq (1, $(USE_PETSC))
   INCLUDES := $(INCLUDES) $(PETSC_FC_INCLUDES)
 endif
 
+ifeq (1, $(USE_SLEPC))
+  DEFINES  := $(DEFINES) -DUSE_SLEPC
+  include ${SLEPC_DIR}/lib/slepc/conf/slepc_variables
+  LIBS     := $(LIBS) $(SLEPC_LIB)
+  INCLUDES := $(INCLUDES) $(SLEPC_FC_INCLUDES)
+endif
+
 # Do not check to make these files to speed up and clean -d output
 Makefile: ;
 Makefile.inc: ;
