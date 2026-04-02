@@ -2,11 +2,14 @@ module mod_petsc_matrix_tests
 !----------------------------------------------------------------------
 ! Solver tests for PETSc Mat objects using a manufactured solution.
 !
-! For each matrix the test:
-!   1. Generates a random solution vector x_exact.
-!   2. Computes the right-hand side b = A * x_exact.
-!   3. Solves A * x = b with (a) MUMPS direct and (b) iterative Krylov.
-!   4. Reports residual norm, relative error, iteration count, and timing.
+! A_j and A_w (SPD mass matrices) get a full manufactured-solution test:
+!   1. Generate random x_exact, compute b = A * x_exact.
+!   2. Solve A * x = b with MUMPS, CG+BJacobi, and CG+GAMG.
+!   3. Report residual norm, relative error, iteration count, and timing.
+!
+! A_jpsi and A_wu (off-diagonal coupling, singular without BCs) are used
+! only as MatMult operators in physics_pc_apply and are never inverted.
+! They receive a MatMult sanity check only: b = A * x, report ||b||/||x||.
 !
 ! Intended for diagnostic/debug use, not production runs.
 !
@@ -32,14 +35,56 @@ contains
     if (my_id == 0) write(*,'(A)') &
       "=== PC matrix solver tests ================================="
 
-    call petsc_mat_solve_test(my_id, comm, A_j,    "A_j",    symmetric=.true.)
-    call petsc_mat_solve_test(my_id, comm, A_w,    "A_w",    symmetric=.true.)
-    call petsc_mat_solve_test(my_id, comm, A_jpsi, "A_jpsi", symmetric=.false.)
-    call petsc_mat_solve_test(my_id, comm, A_wu,   "A_wu",   symmetric=.false.)
+    ! Diagonal blocks: SPD mass matrices — full solver test
+    call petsc_mat_solve_test(my_id, comm, A_j, "A_j", symmetric=.true.)
+    call petsc_mat_solve_test(my_id, comm, A_w, "A_w", symmetric=.true.)
+
+    ! Off-diagonal blocks: singular without BCs, used as MatMult only in apply
+    call petsc_mat_matvec_test(my_id, comm, A_jpsi, "A_jpsi")
+    call petsc_mat_matvec_test(my_id, comm, A_wu,   "A_wu")
 
     if (my_id == 0) write(*,'(A)') &
       "==========================================================="
   end subroutine petsc_run_matrix_tests
+
+
+  !--------------------------------------------------------------------
+  !> MatMult sanity check for an operator-only matrix (not inverted).
+  !! Verifies the matrix is assembled and non-trivial by computing
+  !! b = A * x for a random x and reporting ||b||_2 / ||x||_2.
+  !--------------------------------------------------------------------
+  subroutine petsc_mat_matvec_test(my_id, comm, A, label)
+    integer,          intent(in) :: my_id, comm
+    Mat,              intent(in) :: A
+    character(len=*), intent(in) :: label
+
+    Vec            :: x, b
+    PetscRandom    :: rctx
+    PetscReal      :: norm_x, norm_b
+    PetscErrorCode :: ierr
+
+    call MatCreateVecs(A, x, b, ierr)
+
+    call PetscRandomCreate(comm, rctx, ierr)
+    call PetscRandomSetType(rctx, "rand", ierr)
+    call VecSetRandom(x, rctx, ierr)
+    call PetscRandomDestroy(rctx, ierr)
+
+    call MatMult(A, x, b, ierr)
+
+    call VecNorm(x, NORM_2, norm_x, ierr)
+    call VecNorm(b, NORM_2, norm_b, ierr)
+
+    if (my_id == 0) then
+      write(*,'(3A)') "  --- ", trim(label), " (MatMult only) ---"
+      write(*,'(A,ES10.3,A,ES10.3,A,ES10.3)') &
+        "  ||A*x||/||x|| = ", norm_b/norm_x, &
+        "  (||x||=", norm_x, "  ||A*x||=", norm_b, ")"
+    endif
+
+    call VecDestroy(x, ierr)
+    call VecDestroy(b, ierr)
+  end subroutine petsc_mat_matvec_test
 
 
   !--------------------------------------------------------------------
@@ -104,6 +149,7 @@ contains
 
     KSP  :: ksp
     PC   :: pc
+    Mat  :: A_op   ! may be a converted copy for AMG
     Vec  :: x_sol
     KSPConvergedReason :: reason
     PetscInt   :: its
@@ -111,16 +157,26 @@ contains
     PetscErrorCode :: ierr
     integer :: cc0, cc1, cr
     real    :: t_elapsed
-    logical :: do_amg
+    logical :: do_amg, converted
 
     do_amg = .false.
     if (present(use_amg)) do_amg = use_amg
+
+    ! PCGAMG requires a scalar (AIJ) matrix for its coarsening algorithm.
+    ! MPIBAIJ block matrices confuse the aggregation, so convert first.
+    converted = .false.
+    if (do_amg) then
+      call MatConvert(A, MATAIJ, MAT_INITIAL_MATRIX, A_op, ierr)
+      converted = .true.
+    else
+      A_op = A
+    endif
 
     call VecDuplicate(b, x_sol, ierr)
     call VecSet(x_sol, 0.0d0, ierr)
 
     call KSPCreate(comm, ksp, ierr)
-    call KSPSetOperators(ksp, A, A, ierr)
+    call KSPSetOperators(ksp, A_op, A_op, ierr)
 
     if (use_direct) then
       call KSPSetType(ksp, KSPPREONLY, ierr)
@@ -173,6 +229,7 @@ contains
 
     call VecDestroy(x_sol, ierr)
     call KSPDestroy(ksp, ierr)
+    if (converted) call MatDestroy(A_op, ierr)
   end subroutine run_one_solve
 
 #endif
