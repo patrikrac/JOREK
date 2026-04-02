@@ -45,7 +45,8 @@ module mod_sparse
 #include "petsc/finclude/petsc.h"
     use petsc
     use mod_petsc, only: petsc_init_system, petsc_update_matrix, petsc_update_rhs, &
-                         petsc_solve_iterative_and_retrieve, petsc_recover_solution
+                         petsc_solve_iterative_and_retrieve, petsc_recover_solution, &
+                         petsc_solve_and_retrieve
 #endif
 
     implicit none
@@ -70,6 +71,7 @@ module mod_sparse
     real                     :: tt1,tt0
 
     logical :: use_condition_number_estimate = .false.
+    logical :: petsc_direct_solved
 #ifdef USE_PETSC
     PetscErrorCode :: petsc_ierr
 #endif
@@ -112,6 +114,10 @@ module mod_sparse
       endif
 #endif
 
+      petsc_direct_solved = .false.
+#ifdef USE_PETSC
+      if (.not. a_mat%petsc_assembled) then
+#endif
       if (solver%library.eq.mumps) then
 #ifdef USE_MUMPS
         if (verbose) write(*,*) "Using MUMPS solver"
@@ -140,12 +146,43 @@ module mod_sparse
         call solve_pastix_all(solver%ptss, a_mat, rhs_vec, solver%solve_only, tag)
 #endif
       endif
+#ifdef USE_PETSC
+      endif   ! .not. a_mat%petsc_assembled
 
-      do i=1,rhs_vec%n
-        sol_vec%val(i) =  rhs_vec%val(i)
-      enddo
+      if (a_mat%petsc_assembled) then
+        ! Matrix in PETSc format — irn/jcn/val not available; use PETSc direct solver
+        if (.not. solver%petsc_sys%initialized) then
+          solver%petsc_sys%A = a_mat%petsc_A
+          call MatCreateVecs(solver%petsc_sys%A, solver%petsc_sys%x, solver%petsc_sys%b, petsc_ierr)
+          solver%petsc_sys%initialized = .true.
+        else
+          solver%petsc_sys%A = a_mat%petsc_A
+        endif
+        call petsc_update_rhs(solver%petsc_sys, rhs_vec)
+        call petsc_solve_and_retrieve(solver%petsc_sys)
+        call petsc_recover_solution(solver%petsc_sys, sol_vec)
+        solver%step_success = .true.
+        petsc_direct_solved = .true.
+      elseif (solver%equilibrium) then
+        ! Equilibrium: JOREK COO format — convert to PETSc then solve directly
+        if (.not. solver%petsc_sys%initialized) then
+          call petsc_init_system(solver%petsc_sys, a_mat)
+        endif
+        call petsc_update_matrix(solver%petsc_sys, a_mat)
+        call petsc_update_rhs(solver%petsc_sys, rhs_vec)
+        call petsc_solve_and_retrieve(solver%petsc_sys)
+        call petsc_recover_solution(solver%petsc_sys, sol_vec)
+        solver%step_success = .true.
+        petsc_direct_solved = .true.
+      endif
+#endif
 
-      solver%step_success = .true.
+      if (.not. petsc_direct_solved) then
+        do i=1,rhs_vec%n
+          sol_vec%val(i) =  rhs_vec%val(i)
+        enddo
+        solver%step_success = .true.
+      endif
 
     elseif (solver%iterative) then
 
