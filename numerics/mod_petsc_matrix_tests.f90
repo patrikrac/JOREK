@@ -63,7 +63,7 @@ contains
 
     ! Random manufactured solution
     call PetscRandomCreate(comm, rctx, ierr)
-    call PetscRandomSetType(rctx, PETSCRAND48, ierr)
+    call PetscRandomSetType(rctx, "rand", ierr)
     call VecSetRandom(x_exact, rctx, ierr)
     call PetscRandomDestroy(rctx, ierr)
 
@@ -78,6 +78,10 @@ contains
                        merge("CG + BJacobi    ", "GMRES + BJacobi ", symmetric), &
                        use_direct=.false., use_cg=symmetric)
 
+    call run_one_solve(my_id, comm, A, b, x_exact, &
+                       merge("CG + GAMG       ", "GMRES + GAMG    ", symmetric), &
+                       use_direct=.false., use_cg=symmetric, use_amg=.true.)
+
     call VecDestroy(x_exact, ierr)
     call VecDestroy(b, ierr)
   end subroutine petsc_mat_solve_test
@@ -90,12 +94,13 @@ contains
   !! @param use_cg      (iterative only) .true. → CG; .false. → GMRES
   !--------------------------------------------------------------------
   subroutine run_one_solve(my_id, comm, A, b, x_exact, solver_name, &
-                            use_direct, use_cg)
-    integer,          intent(in) :: my_id, comm
-    Mat,              intent(in) :: A
-    Vec,              intent(in) :: b, x_exact
-    character(len=*), intent(in) :: solver_name
-    logical,          intent(in) :: use_direct, use_cg
+                            use_direct, use_cg, use_amg)
+    integer,          intent(in)           :: my_id, comm
+    Mat,              intent(in)           :: A
+    Vec,              intent(in)           :: b, x_exact
+    character(len=*), intent(in)           :: solver_name
+    logical,          intent(in)           :: use_direct, use_cg
+    logical,          intent(in), optional :: use_amg
 
     KSP  :: ksp
     PC   :: pc
@@ -106,6 +111,10 @@ contains
     PetscErrorCode :: ierr
     integer :: cc0, cc1, cr
     real    :: t_elapsed
+    logical :: do_amg
+
+    do_amg = .false.
+    if (present(use_amg)) do_amg = use_amg
 
     call VecDuplicate(b, x_sol, ierr)
     call VecSet(x_sol, 0.0d0, ierr)
@@ -125,7 +134,13 @@ contains
         call KSPSetType(ksp, KSPGMRES, ierr)
       endif
       call KSPGetPC(ksp, pc, ierr)
-      call PCSetType(pc, PCBJACOBI, ierr)
+      if (do_amg) then
+        ! PCGAMG: PETSc smoothed-aggregation AMG (no external library needed).
+        ! Override at runtime with -pc_type hypre -pc_hypre_type boomeramg for HYPRE.
+        call PCSetType(pc, PCGAMG, ierr)
+      else
+        call PCSetType(pc, PCBJACOBI, ierr)
+      endif
       call KSPSetTolerances(ksp, 1.0d-10, PETSC_DEFAULT_REAL, &
                              PETSC_DEFAULT_REAL, 10000, ierr)
     endif
