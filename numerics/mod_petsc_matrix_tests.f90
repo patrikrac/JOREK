@@ -197,7 +197,7 @@ contains
       else
         call PCSetType(pc, PCBJACOBI, ierr)
       endif
-      call KSPSetTolerances(ksp, 1.0d-10, PETSC_DEFAULT_REAL, &
+      call KSPSetTolerances(ksp, 1.0d-8, PETSC_DEFAULT_REAL, &
                              PETSC_DEFAULT_REAL, 10000, ierr)
     endif
 
