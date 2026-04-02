@@ -41,7 +41,7 @@ contains
     g_ctx%initialized = .true.
   end subroutine petsc_setup_physics_pc
 
-  
+
   !> Create an n_vars-variable MPIBAIJ PC matrix.
   !! block_size = n_vars * n_tor_local;  n_global = n_vars * a_mat%ng / n_var.
   subroutine petsc_create_pc_matrix(petsc_A, a_mat, n_vars)
@@ -126,6 +126,8 @@ contains
     PetscErrorCode :: ierr
     logical        :: first_assembly
 
+    debug_physics_pc = .true.
+
     first_assembly = .not. g_ctx%matrices_ready
 
     ! Create matrices on first call
@@ -144,8 +146,10 @@ contains
     g_ctx%matrices_ready = .true.
 
     ! Run analysis once after the first assembly
-    if (first_assembly .and. debug_physics_pc) &
+    if (debug_physics_pc) then
       call petsc_analyze_pc_matrices(my_id)
+      call petsc_test_pc_matrices(my_id)
+    endif
   end subroutine petsc_assemble_pc_matrices
 
 
@@ -189,16 +193,17 @@ contains
 
 #ifdef USE_SLEPC
     ! Condition number (symmetric 1-var matrices); kappa = -1 if lam_min not converged
-    call petsc_mat_cond_estimate(g_ctx%A_j, kappa)
-    if (my_id == 0 .and. kappa > 0.0d0) write(*,'(A,ES12.4)') "[PC] cond(A_j) = ", kappa
-    call petsc_mat_cond_estimate(g_ctx%A_w, kappa)
-    if (my_id == 0 .and. kappa > 0.0d0) write(*,'(A,ES12.4)') "[PC] cond(A_w) = ", kappa
+    !call petsc_mat_cond_estimate(g_ctx%A_j, kappa)
+    !!if (my_id == 0) write(*,'(A,ES12.4)') "[PC] cond(A_j) = ", kappa
+    !call petsc_mat_cond_estimate(g_ctx%A_w, kappa)
+    !if (my_id == 0) write(*,'(A,ES12.4)') "[PC] cond(A_w) = ", kappa
 
     ! Full spectra — 0 requests all eigenvalues
-    call petsc_mat_full_spectrum(g_ctx%A_j,    "A_j",    0, symmetric=.true.)
-    call petsc_mat_full_spectrum(g_ctx%A_w,    "A_w",    0, symmetric=.true.)
-    call petsc_mat_full_spectrum(g_ctx%A_jpsi, "A_jpsi", 0, symmetric=.false.)
-    call petsc_mat_full_spectrum(g_ctx%A_wu,   "A_wu",   0, symmetric=.false.)
+    !call petsc_mat_full_spectrum(g_ctx%A_j,    "A_j",    0, symmetric=.true.)
+    !call petsc_mat_full_spectrum(g_ctx%A_w,    "A_w",    0, symmetric=.true.)
+    !call petsc_mat_full_spectrum(g_ctx%A_jpsi, "A_jpsi", 0, symmetric=.false.)
+    !call petsc_mat_full_spectrum(g_ctx%A_wu,   "A_wu",   0, symmetric=.false.)
+    !call petsc_mat_sweep_robust_spectrum(g_ctx%A_j,    "A_j",   -5.0d0, 5.0d0, 5, 200, .true.)
 #endif
 
     if (my_id == 0) write(*,'(A)') &
