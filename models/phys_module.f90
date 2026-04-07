@@ -152,6 +152,9 @@ module phys_module
   real*8  :: pastix_pivot         !< Pastix epsilon for magnitude control (pivot threshold)
   logical :: use_physics_pc       !< Use physics-based block PCSHELL preconditioner
   logical :: debug_physics_pc     !< Print PC matrix analysis (norms, eigenvalues) after first assembly
+  logical :: physics_pc_coupled   !< Use block lower-triangular sweep instead of diagonal-only apply
+  logical :: physics_pc_reassemble !< Reassemble diagonal blocks from simplified integrands instead of extracting from full matrix
+  logical :: physics_pc_monolithic !< Monolithic 4x4 solve (stage-one Schur elimination test)
   logical :: use_newton           !< Use inexact Newton method
   integer :: maxNewton            !< maximum number of Newton iterations
   real(kind=8) :: gamma_Newton    !< Newton gamma-parameter: gmres_tol = gamma_Newton*(normRHScurrent/normRHSprevious)**alpha_Newton

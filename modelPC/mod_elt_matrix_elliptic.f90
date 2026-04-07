@@ -14,7 +14,7 @@ module mod_elt_matrix_elliptic
 ! FFT reconstruction is performed to obtain the mode-space blocks.
 !----------------------------------------------------------------
 implicit none
-public :: element_matrix_elliptic
+public :: element_matrix_elliptic, scatter_fft_to_elm
 
 contains
 

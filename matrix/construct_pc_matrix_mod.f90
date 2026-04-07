@@ -18,7 +18,7 @@ module construct_pc_matrix_mod
 use petsc
 #endif
 implicit none
-public :: construct_pc_elliptic_matrices
+public :: construct_pc_elliptic_matrices, construct_pc_diagonal_matrices
 
 contains
 
@@ -253,5 +253,243 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
 #endif
 
 end subroutine construct_pc_elliptic_matrices
+
+
+!> Assemble the four simplified diagonal PC sub-matrices.
+!!
+!! These are simplified versions of B_11, B_22, B_55, B_66 that
+!! capture only the dominant physics (mass, stiffness, perp diffusion).
+!! They replace the extracted sub-blocks when physics_pc_reassemble = .true.
+!!
+!! @param my_id      MPI rank of this process (0-based)
+!! @param local_elms Pointer to the list of local element indices
+!! @param n_local_elms Number of local elements
+!! @param a_mat      Sparse matrix descriptor (ownership ranges + node indices)
+!! @param R_11       1-var PETSc matrix for psi equation diagonal (mass/R)
+!! @param R_22       1-var PETSc matrix for u equation diagonal (R^3 stiffness)
+!! @param R_55       1-var PETSc matrix for rho equation diagonal (mass + perp diff)
+!! @param R_66       1-var PETSc matrix for T equation diagonal (mass + perp cond)
+subroutine construct_pc_diagonal_matrices(my_id, local_elms, n_local_elms, &
+                                          my_ind_min_in, my_ind_max_in, &
+                                          R_11, R_22, R_55, R_66)
+
+  use mod_elt_matrix_pc_diag
+  use mod_parameters, only: n_tor, n_degrees, n_vertex_max
+  use data_structure,  only: type_element, type_node
+  use nodes_elements
+  use omp_lib
+
+  implicit none
+
+  integer,              intent(in) :: my_id
+  integer,              intent(in) :: local_elms(:)
+  integer,              intent(in) :: n_local_elms
+  integer,              intent(in) :: my_ind_min_in, my_ind_max_in
+#ifdef USE_PETSC
+  Mat, intent(inout) :: R_11, R_22, R_55, R_66
+#endif
+
+  ! --- Ownership range for this process ---
+  integer :: my_ind_min, my_ind_max
+
+#define D1V_CD (n_tor*n_vertex_max*n_degrees)
+
+  ! --- Thread-local variables (OMP private) ---
+  type(type_element), allocatable :: element_thr(:)
+  type(type_node),    allocatable :: nodes_thr(:,:)
+  integer,            allocatable :: node_out_thr(:,:)
+
+  ! Thread-private ELM arrays
+  real*8, allocatable :: ELM_11_thr(:,:,:)
+  real*8, allocatable :: ELM_22_thr(:,:,:)
+  real*8, allocatable :: ELM_55_thr(:,:,:)
+  real*8, allocatable :: ELM_66_thr(:,:,:)
+  real*8, allocatable :: buf1v_thr(:,:)
+
+  integer :: nthreads, omp_tid
+  integer :: ife, ielm, iv, inode
+  integer :: i, i_order, k, k_order
+  integer :: index_node1, index_node2
+  integer :: j, l, idx_ij, idx_kl
+  integer :: bs1
+#ifdef USE_PETSC
+  PetscErrorCode :: petsc_ierr
+  PetscInt :: idxm(1), idxn(1)
+#endif
+
+  my_ind_min = my_ind_min_in
+  my_ind_max = my_ind_max_in
+  bs1 = n_tor
+
+  if (my_id .eq. 0) then
+      write(*,*) '****************************************'
+      write(*,*) '*   construct PC diagonal matrices     *'
+      write(*,*) '****************************************'
+  endif
+
+  ! --- Determine thread count and pre-allocate per-thread buffers ---
+  !$omp parallel
+  !$omp master
+#ifdef _OPENMP
+  nthreads = omp_get_num_threads()
+#else
+  nthreads = 1
+#endif
+  !$omp end master
+  !$omp end parallel
+
+  allocate(element_thr   (nthreads))
+  allocate(nodes_thr     (n_vertex_max, nthreads))
+  allocate(node_out_thr  (n_vertex_max, nthreads))
+  allocate(ELM_11_thr   (D1V_CD, D1V_CD, nthreads))
+  allocate(ELM_22_thr   (D1V_CD, D1V_CD, nthreads))
+  allocate(ELM_55_thr   (D1V_CD, D1V_CD, nthreads))
+  allocate(ELM_66_thr   (D1V_CD, D1V_CD, nthreads))
+  allocate(buf1v_thr    (bs1*bs1, nthreads))
+
+  !$omp parallel &
+  !$omp   default(none) &
+  !$omp   shared(n_local_elms, local_elms, element_list, node_list, my_ind_min, my_ind_max, bs1, &
+  !$omp          element_thr, nodes_thr, node_out_thr, &
+  !$omp          ELM_11_thr, ELM_22_thr, ELM_55_thr, ELM_66_thr, &
+  !$omp          buf1v_thr &
+#ifdef USE_PETSC
+  !$omp          ,R_11, R_22, R_55, R_66 &
+#endif
+  !$omp         ) &
+  !$omp   private(ife, ielm, iv, inode, omp_tid, &
+  !$omp           i, i_order, k, k_order, &
+  !$omp           index_node1, index_node2, &
+  !$omp           j, l, idx_ij, idx_kl &
+#ifdef USE_PETSC
+  !$omp           ,petsc_ierr, idxm, idxn &
+#endif
+  !$omp          )
+
+#ifdef _OPENMP
+  omp_tid = 1 + omp_get_thread_num()
+#else
+  omp_tid = 1
+#endif
+
+  !$omp do schedule(runtime)
+  do ife = 1, n_local_elms
+    ielm = local_elms(ife)
+
+    ! --- Fetch element and nodes ---
+    element_thr(omp_tid) = element_list%element(ielm)
+    do iv = 1, n_vertex_max
+      inode = element_thr(omp_tid)%vertex(iv)
+      nodes_thr(iv, omp_tid)   = node_list%node(inode)
+      node_out_thr(iv, omp_tid) = inode
+    enddo
+
+    ! --- Compute element matrices ---
+    call element_matrix_pc_diag(element_thr(omp_tid), nodes_thr(:,omp_tid), &
+                                 ELM_11_thr(:,:,omp_tid), ELM_22_thr(:,:,omp_tid), &
+                                 ELM_55_thr(:,:,omp_tid), ELM_66_thr(:,:,omp_tid))
+
+#ifdef USE_PETSC
+    ! --- Insert element blocks into PETSc matrices (all four are 1-var) ---
+    do i = 1, n_vertex_max
+      do i_order = 1, n_degrees
+
+        index_node1 = node_list%node(node_out_thr(i,omp_tid))%index(i_order)
+
+        ! Only assemble rows owned by this process
+        if ((index_node1 .lt. my_ind_min) .or. (index_node1 .gt. my_ind_max)) cycle
+
+        idxm(1) = index_node1 - 1   ! 0-based block row
+
+        do k = 1, n_vertex_max
+          do k_order = 1, n_degrees
+
+            index_node2 = node_list%node(node_out_thr(k,omp_tid))%index(k_order)
+            idxn(1) = index_node2 - 1   ! 0-based block col
+
+            ! --- Extract and insert 1-var block for R_11 ---
+            buf1v_thr(:,omp_tid) = 0.d0
+            do j = 1, bs1
+              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+              do l = 1, bs1
+                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_11_thr(idx_ij, idx_kl, omp_tid)
+              enddo
+            enddo
+            !$omp critical
+            call MatSetValuesBlocked(R_11, 1, idxm, 1, idxn, &
+                                     buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
+            !$omp end critical
+
+            ! --- Extract and insert 1-var block for R_22 ---
+            buf1v_thr(:,omp_tid) = 0.d0
+            do j = 1, bs1
+              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+              do l = 1, bs1
+                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_22_thr(idx_ij, idx_kl, omp_tid)
+              enddo
+            enddo
+            !$omp critical
+            call MatSetValuesBlocked(R_22, 1, idxm, 1, idxn, &
+                                     buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
+            !$omp end critical
+
+            ! --- Extract and insert 1-var block for R_55 ---
+            buf1v_thr(:,omp_tid) = 0.d0
+            do j = 1, bs1
+              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+              do l = 1, bs1
+                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_55_thr(idx_ij, idx_kl, omp_tid)
+              enddo
+            enddo
+            !$omp critical
+            call MatSetValuesBlocked(R_55, 1, idxm, 1, idxn, &
+                                     buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
+            !$omp end critical
+
+            ! --- Extract and insert 1-var block for R_66 ---
+            buf1v_thr(:,omp_tid) = 0.d0
+            do j = 1, bs1
+              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+              do l = 1, bs1
+                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_66_thr(idx_ij, idx_kl, omp_tid)
+              enddo
+            enddo
+            !$omp critical
+            call MatSetValuesBlocked(R_66, 1, idxm, 1, idxn, &
+                                     buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
+            !$omp end critical
+
+          enddo  ! k_order
+        enddo    ! k
+
+      enddo  ! i_order
+    enddo    ! i
+#endif
+
+  enddo  ! ife
+  !$omp end do
+  !$omp end parallel
+
+  deallocate(element_thr, nodes_thr, node_out_thr)
+  deallocate(ELM_11_thr, ELM_22_thr, ELM_55_thr, ELM_66_thr)
+  deallocate(buf1v_thr)
+
+#ifdef USE_PETSC
+  ! Interleave Begin/End to allow MPI communication to overlap
+  call MatAssemblyBegin(R_11, MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(R_22, MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(R_55, MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(R_66, MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (R_11, MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (R_22, MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (R_55, MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (R_66, MAT_FINAL_ASSEMBLY, petsc_ierr)
+#endif
+
+end subroutine construct_pc_diagonal_matrices
 
 end module construct_pc_matrix_mod

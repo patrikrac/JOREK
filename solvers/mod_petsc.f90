@@ -462,6 +462,8 @@ contains
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
+    use phys_module, only: use_physics_pc
+    use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -496,10 +498,19 @@ contains
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
 
-      if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + PCFIELDSPLIT + MUMPS"
+      if (use_physics_pc) then
+        if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + Physics PCSHELL"
+      else
+        if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + PCFIELDSPLIT + MUMPS"
+      endif
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
-      call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, 1)
+      if (use_physics_pc) then
+        call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_PHYSICS)
+        call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
+      else
+        call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
+      endif
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
@@ -511,6 +522,7 @@ contains
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))

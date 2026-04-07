@@ -645,6 +645,9 @@ subroutine preset_parameters
   
   use_physics_pc     = .false.              ! Use physics-based block PCSHELL preconditioner
   debug_physics_pc   = .false.              ! Print PC matrix analysis after first assembly
+  physics_pc_coupled    = .false.            ! Block lower-triangular sweep (uses off-diagonal blocks)
+  physics_pc_reassemble = .false.            ! Reassemble diagonal blocks from simplified integrands
+  physics_pc_monolithic = .false.            ! Monolithic 4x4 solve (stage-one Schur test)
 
   use_mumps          = .false.              ! Use MUMPS solver
   use_pastix         = .false.              ! Use PASTIX solver
