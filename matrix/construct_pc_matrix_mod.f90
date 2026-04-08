@@ -10,15 +10,15 @@ module construct_pc_matrix_mod
 ! Assumptions:
 !   - No mesh refinement (PC is an approximation).
 !   - n_tor_local = n_tor  (all toroidal modes on every process).
-!   - Boundary conditions are NOT applied here; the PC matrices
-!     are used as raw operators inside the PCSHELL.
+!   - Boundary conditions are applied via ZBIG penalty method
+!     (matching model199) to diagonal and elliptic constraint blocks.
 !----------------------------------------------------------------
 #ifdef USE_PETSC
 #include "petsc/finclude/petsc.h"
 use petsc
 #endif
 implicit none
-public :: construct_pc_elliptic_matrices, construct_pc_diagonal_matrices
+public :: construct_pc_elliptic_matrices, construct_pc_diagonal_matrices, apply_bc_pc_matrix
 
 contains
 
@@ -241,7 +241,21 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
   deallocate(buf1v_thr)
 
 #ifdef USE_PETSC
-  ! Interleave Begin/End to allow MPI communication to overlap across matrices
+  ! Flush element contributions (ADD_VALUES) before BCs (INSERT_VALUES)
+  call MatAssemblyBegin(A_j,    MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(A_w,    MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(A_jpsi, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(A_wu,   MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (A_j,    MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (A_w,    MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (A_jpsi, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (A_wu,   MAT_FLUSH_ASSEMBLY, petsc_ierr)
+
+  ! Apply BCs to mass matrices only (not off-diagonal couplings A_jpsi, A_wu)
+  call apply_bc_pc_matrix(A_j, 3, local_elms, n_local_elms, my_ind_min, my_ind_max)  ! j
+  call apply_bc_pc_matrix(A_w, 4, local_elms, n_local_elms, my_ind_min, my_ind_max)  ! w
+
+  ! Final assembly
   call MatAssemblyBegin(A_j,    MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyBegin(A_w,    MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyBegin(A_jpsi, MAT_FINAL_ASSEMBLY, petsc_ierr)
@@ -479,7 +493,23 @@ subroutine construct_pc_diagonal_matrices(my_id, local_elms, n_local_elms, &
   deallocate(buf1v_thr)
 
 #ifdef USE_PETSC
-  ! Interleave Begin/End to allow MPI communication to overlap
+  ! Flush element contributions (ADD_VALUES) before BCs (INSERT_VALUES)
+  call MatAssemblyBegin(R_11, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(R_22, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(R_55, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(R_66, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (R_11, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (R_22, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (R_55, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (R_66, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+
+  ! Apply model199-style boundary conditions (ZBIG penalty on diagonal)
+  call apply_bc_pc_matrix(R_11, 1, local_elms, n_local_elms, my_ind_min, my_ind_max)  ! psi
+  call apply_bc_pc_matrix(R_22, 2, local_elms, n_local_elms, my_ind_min, my_ind_max)  ! u
+  call apply_bc_pc_matrix(R_55, 5, local_elms, n_local_elms, my_ind_min, my_ind_max)  ! rho
+  call apply_bc_pc_matrix(R_66, 6, local_elms, n_local_elms, my_ind_min, my_ind_max)  ! T
+
+  ! Final assembly
   call MatAssemblyBegin(R_11, MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyBegin(R_22, MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyBegin(R_55, MAT_FINAL_ASSEMBLY, petsc_ierr)
@@ -491,5 +521,121 @@ subroutine construct_pc_diagonal_matrices(my_id, local_elms, n_local_elms, &
 #endif
 
 end subroutine construct_pc_diagonal_matrices
+
+
+!--------------------------------------------------------------------
+!> Apply model199-style boundary conditions to a single 1-variable
+!! PETSc matrix using the ZBIG penalty method.
+!!
+!! For each boundary node, sets the diagonal entry to ZBIG for the
+!! appropriate derivative DOFs based on boundary type. Respects
+!! is_freebound (STARWALL vacuum) and keep_n0_const flags.
+!!
+!! @param pc_mat      1-var PETSc matrix (BAIJ, block_size = n_tor)
+!! @param var_index   Variable index (1=psi, 2=u, 3=j, 4=w, 5=rho, 6=T)
+!! @param local_elms  List of local element indices
+!! @param n_local_elms Number of local elements
+!! @param my_ind_min  Min node index owned by this process
+!! @param my_ind_max  Max node index owned by this process
+!--------------------------------------------------------------------
+subroutine apply_bc_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
+                               my_ind_min, my_ind_max)
+
+  use mod_parameters, only: n_tor, n_vertex_max, n_order
+  use data_structure,  only: type_node
+  use nodes_elements,  only: node_list, element_list
+  use mod_node_indices, only: calculate_node_indices
+  use phys_module, only: keep_n0_const
+  use vacuum, only: is_freebound
+
+  implicit none
+
+#ifdef USE_PETSC
+  Mat, intent(inout) :: pc_mat
+#endif
+  integer, intent(in) :: var_index
+  integer, intent(in) :: local_elms(:)
+  integer, intent(in) :: n_local_elms
+  integer, intent(in) :: my_ind_min, my_ind_max
+
+  real*8  :: zbig, zbig_backup
+  integer :: i, in, iv, inode, ielm
+  integer :: index_node, index_tmp, kk, ll, iv_dir
+  integer :: node_indices((n_order+1)/2, (n_order+1)/2)
+#ifdef USE_PETSC
+  PetscInt       :: petsc_row
+  PetscErrorCode :: petsc_ierr
+#endif
+
+  call calculate_node_indices(node_indices)
+
+  zbig_backup = 1.d12
+
+  do i = 1, n_local_elms
+    ielm = local_elms(i)
+
+    do iv = 1, n_vertex_max
+      inode = element_list%element(ielm)%vertex(iv)
+
+      if (node_list%node(inode)%boundary .eq. 0) cycle
+
+      do in = 1, n_tor
+        if (keep_n0_const .and. in .eq. 1) then
+          zbig = 1.d15
+        else
+          zbig = zbig_backup
+        endif
+
+        if (is_freebound(in, var_index)) cycle
+
+        !--- Open field lines (boundary type 1 or 3)
+        if ((node_list%node(inode)%boundary .eq. 1) .or. &
+            (node_list%node(inode)%boundary .eq. 3)) then
+
+          iv_dir = 2
+          do kk = 1, (n_order+1)/2
+            if ((iv_dir .eq. 3) .and. (kk .gt. 1)) cycle
+            do ll = 1, (n_order+1)/2
+              if ((iv_dir .eq. 2) .and. (ll .gt. 1)) cycle
+              index_tmp = node_indices(kk, ll)
+              index_node = node_list%node(inode)%index(index_tmp)
+
+              if ((index_node .lt. my_ind_min) .or. (index_node .gt. my_ind_max)) cycle
+
+#ifdef USE_PETSC
+              petsc_row = n_tor * (index_node - 1) + (in - 1)
+              call MatSetValue(pc_mat, petsc_row, petsc_row, zbig, INSERT_VALUES, petsc_ierr)
+#endif
+            enddo
+          enddo
+        endif
+
+        !--- Wall-aligned with flux surface (boundary type 2 or 3)
+        if ((node_list%node(inode)%boundary .eq. 2) .or. &
+            (node_list%node(inode)%boundary .eq. 3)) then
+
+          iv_dir = 3
+          do kk = 1, (n_order+1)/2
+            if ((iv_dir .eq. 3) .and. (kk .gt. 1)) cycle
+            do ll = 1, (n_order+1)/2
+              if ((iv_dir .eq. 2) .and. (ll .gt. 1)) cycle
+              index_tmp = node_indices(kk, ll)
+              index_node = node_list%node(inode)%index(index_tmp)
+
+              if ((index_node .lt. my_ind_min) .or. (index_node .gt. my_ind_max)) cycle
+
+#ifdef USE_PETSC
+              petsc_row = n_tor * (index_node - 1) + (in - 1)
+              call MatSetValue(pc_mat, petsc_row, petsc_row, zbig, INSERT_VALUES, petsc_ierr)
+#endif
+            enddo
+          enddo
+        endif
+
+      enddo  ! in
+    enddo    ! iv
+  enddo      ! i
+
+end subroutine apply_bc_pc_matrix
 
 end module construct_pc_matrix_mod
