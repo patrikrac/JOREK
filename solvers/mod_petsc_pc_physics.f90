@@ -59,6 +59,10 @@ module mod_petsc_pc_physics
     KSP :: ksp_psi, ksp_u, ksp_rho, ksp_T
     logical :: ksp_created = .false.
 
+    !> KSP for elliptic constraint mass matrices (replaces lumped mass inverse)
+    KSP :: ksp_Mj, ksp_Mw
+    logical :: ksp_elliptic_created = .false.
+
     !> Work vectors (1-var size) — allocated once, reused in every apply
     Vec :: work_1, work_2, work_3, work_4, work_5
 
@@ -504,6 +508,12 @@ contains
     call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
   
+    ! --- Step 4b: Set up KSPs for elliptic constraint mass matrices ---
+    call setup_block_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time)
+    call setup_block_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time)
+    g_ctx%ksp_elliptic_created = .true.
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   Elliptic KSPs set up (PREONLY+LU+MUMPS)"
+
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic) then
       ! Monolithic mode: assemble full 4x4 reduced matrix and single KSP
@@ -590,11 +600,13 @@ contains
     call VecGetSubVector(y, g_ctx%is_var(var_rho), y_rho, ierr)
     call VecGetSubVector(y, g_ctx%is_var(var_T),   y_T,   ierr)
 
-    ! --- Step 2: Lumped-mass-scaled constraint residuals ---
-    ! work_1 = D_j^{-1} * x_j  (temp_j)
-    call VecPointwiseMult(g_ctx%work_1, g_ctx%diag_Mj_inv, x_j, ierr)
-    ! work_2 = D_w^{-1} * x_w  (temp_w)
-    call VecPointwiseMult(g_ctx%work_2, g_ctx%diag_Mw_inv, x_w, ierr)
+    ! --- Step 2: Apply inverse of elliptic constraint mass matrices ---
+    ! work_1 = A_33^{-1} * x_j  (temp_j)
+    ! call VecPointwiseMult(g_ctx%work_1, g_ctx%diag_Mj_inv, x_j, ierr)  ! lumped mass approx
+    call KSPSolve(g_ctx%ksp_Mj, x_j, g_ctx%work_1, ierr)
+    ! work_2 = A_44^{-1} * x_w  (temp_w)
+    ! call VecPointwiseMult(g_ctx%work_2, g_ctx%diag_Mw_inv, x_w, ierr)  ! lumped mass approx
+    call KSPSolve(g_ctx%ksp_Mw, x_w, g_ctx%work_2, ierr)
 
     ! --- Step 3: Schur-correct the RHS and solve ---
     if (physics_pc_monolithic) then
@@ -698,15 +710,17 @@ contains
     endif
 
     ! --- Step 4: Back-substitute for j and w ---
-    ! y_j = D_j^{-1} * (x_j - B_31 * y_psi)
+    ! y_j = A_33^{-1} * (x_j - B_31 * y_psi)
     call MatMult(g_ctx%B_31, y_psi, g_ctx%work_3, ierr)
     call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_j, ierr)
-    call VecPointwiseMult(y_j, g_ctx%diag_Mj_inv, g_ctx%work_4, ierr)
+    ! call VecPointwiseMult(y_j, g_ctx%diag_Mj_inv, g_ctx%work_4, ierr)  ! lumped mass approx
+    call KSPSolve(g_ctx%ksp_Mj, g_ctx%work_4, y_j, ierr)
 
-    ! y_w = D_w^{-1} * (x_w - B_42 * y_u)
+    ! y_w = A_44^{-1} * (x_w - B_42 * y_u)
     call MatMult(g_ctx%B_42, y_u, g_ctx%work_3, ierr)
     call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_w, ierr)
-    call VecPointwiseMult(y_w, g_ctx%diag_Mw_inv, g_ctx%work_4, ierr)
+    ! call VecPointwiseMult(y_w, g_ctx%diag_Mw_inv, g_ctx%work_4, ierr)  ! lumped mass approx
+    call KSPSolve(g_ctx%ksp_Mw, g_ctx%work_4, y_w, ierr)
 
     ! --- Step 5: Restore sub-vectors ---
     call VecRestoreSubVector(x, g_ctx%is_var(var_psi), x_psi, ierr)
