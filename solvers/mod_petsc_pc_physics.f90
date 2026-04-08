@@ -25,6 +25,11 @@ module mod_petsc_pc_physics
     !> Lumped mass inverse vectors (1-var layout from extracted sub-blocks)
     Vec :: diag_Mj_inv, diag_Mw_inv
 
+    !> Block diagonal inverse matrices (BAIJ, block_size = n_tor)
+    !! Computed via MatInvertBlockDiagonalMat from B_33/B_44
+    Mat :: Dinv_Mj, Dinv_Mw
+    logical :: dinv_created = .false.
+
     !> Sub-blocks extracted from the full system AIJ matrix.
     !! Naming: B_ij = block at (equation i, variable j).
     !! Coupling blocks for Schur corrections (TO j,w from other eqs):
@@ -198,7 +203,42 @@ contains
 
 
   !--------------------------------------------------------------------
-  !> Compute a Schur-corrected diagonal block:
+  !> Compute block diagonal inverse of a 1-var AIJ matrix.
+  !!
+  !! The extracted sub-blocks (B_33, B_44) are AIJ, but
+  !! MatInvertBlockDiagonalMat requires BAIJ. This routine:
+  !!   1. Converts AIJ -> BAIJ (block_size = n_tor) as a temporary
+  !!   2. Calls MatInvertBlockDiagonalMat to get the inverse
+  !!   3. Destroys the temporary BAIJ copy
+  !--------------------------------------------------------------------
+  subroutine compute_block_diagonal_inverse(B_aij, Dinv, block_size, first_time)
+    Mat, intent(in)    :: B_aij
+    Mat, intent(inout) :: Dinv
+    PetscInt, intent(in) :: block_size
+    logical, intent(in)  :: first_time
+
+    Mat :: B_baij
+    PetscErrorCode :: ierr
+
+    ! Destroy previous inverse if rebuilding
+    if (.not. first_time) call MatDestroy(Dinv, ierr)
+
+    ! Set block size on AIJ so that MatConvert creates BAIJ with correct blocking
+    call MatSetBlockSize(B_aij, block_size, ierr)
+
+    ! Convert AIJ -> BAIJ with the given block size
+    call MatConvert(B_aij, MATBAIJ, MAT_INITIAL_MATRIX, B_baij, ierr)
+
+    ! Compute the inverse of the block diagonal
+    call MatInvertBlockDiagonalMat(B_baij, Dinv, ierr)
+
+    ! Clean up temporary BAIJ copy
+    call MatDestroy(B_baij, ierr)
+  end subroutine compute_block_diagonal_inverse
+
+
+  !--------------------------------------------------------------------
+  !> Compute a Schur-corrected diagonal block using lumped mass inverse:
   !! Atilde = B_diag - B_coupling * diag(M_inv) * B_constraint
   !!
   !! Steps:
@@ -206,7 +246,7 @@ contains
   !!   2. C = B_coupling * B_scaled               (mat-mat product)
   !!   3. Atilde = B_diag - C                     (subtract)
   !--------------------------------------------------------------------
-  subroutine compute_schur_corrected_block(B_diag, B_coupling, B_constraint, &
+  subroutine compute_schur_corrected_block_lumped(B_diag, B_coupling, B_constraint, &
                                             diag_M_inv, Atilde, first_time)
     Mat, intent(in)    :: B_diag, B_coupling, B_constraint
     Vec, intent(in)    :: diag_M_inv
@@ -219,6 +259,42 @@ contains
     ! B_scaled = diag(M_inv) * B_constraint  (left-scale rows)
     call MatDuplicate(B_constraint, MAT_COPY_VALUES, B_scaled, ierr)
     call MatDiagonalScale(B_scaled, diag_M_inv, PETSC_NULL_VEC, ierr)
+
+    ! C = B_coupling * B_scaled
+    call MatMatMult(B_coupling, B_scaled, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C, ierr)
+
+    ! Atilde = B_diag - C
+    ! Always destroy and recreate: sparsity pattern may change between rebuilds
+    if (.not. first_time) call MatDestroy(Atilde, ierr)
+    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
+    call MatAXPY(Atilde, -1.0d0, C, DIFFERENT_NONZERO_PATTERN, ierr)
+
+    call MatDestroy(B_scaled, ierr)
+    call MatDestroy(C, ierr)
+  end subroutine compute_schur_corrected_block_lumped
+
+
+  !--------------------------------------------------------------------
+  !> Compute a Schur-corrected diagonal block using block diagonal inverse:
+  !! Atilde = B_diag - B_coupling * Dinv * B_constraint
+  !!
+  !! Steps:
+  !!   1. B_scaled = Dinv * B_constraint            (mat-mat product)
+  !!   2. C = B_coupling * B_scaled                 (mat-mat product)
+  !!   3. Atilde = B_diag - C                       (subtract)
+  !--------------------------------------------------------------------
+  subroutine compute_schur_corrected_block(B_diag, B_coupling, B_constraint, &
+                                            Dinv, Atilde, first_time)
+    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
+    Mat, intent(in)    :: Dinv
+    Mat, intent(inout) :: Atilde
+    logical, intent(in) :: first_time
+
+    Mat :: B_scaled, C
+    PetscErrorCode :: ierr
+
+    ! B_scaled = Dinv * B_constraint  (block-diagonal mat-mat product)
+    call MatMatMult(Dinv, B_constraint, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, B_scaled, ierr)
 
     ! C = B_coupling * B_scaled
     call MatMatMult(B_coupling, B_scaled, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C, ierr)
@@ -363,6 +439,7 @@ contains
     Mat, intent(in) :: A_full
 
     PetscErrorCode :: ierr
+    PetscInt :: bs_ntor
     integer :: comm, my_id, mpierr
     logical :: first_time, use_reassembled
     PetscReal :: norm_val
@@ -371,7 +448,6 @@ contains
     call PetscObjectGetComm(A_full, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
-    physics_pc_monolithic = .true. !TODO: Only for testing purposes, remove eventually...
 
     first_time = .not. g_ctx%reduced_ready
     use_reassembled = physics_pc_reassemble
@@ -441,15 +517,25 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Sub-blocks extracted (21 blocks)"
     endif
 
-    ! --- Step 3: Compute lumped mass inverse ---
+    ! --- Step 3: Compute block diagonal inverse (n_tor x n_tor blocks) ---
+    bs_ntor = n_tor
+    call compute_block_diagonal_inverse(g_ctx%B_33, g_ctx%Dinv_Mj, bs_ntor, first_time)
+    call compute_block_diagonal_inverse(g_ctx%B_44, g_ctx%Dinv_Mw, bs_ntor, first_time)
+    g_ctx%dinv_created = .true.
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed block diagonal inverse (block_size = n_tor)"
+
+    call MatNorm(g_ctx%Dinv_Mj, NORM_FROBENIUS, norm_val, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mj||_F = ", norm_val
+    call MatNorm(g_ctx%Dinv_Mw, NORM_FROBENIUS, norm_val, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mw||_F = ", norm_val
+
+    ! Also compute lumped mass inverse (kept for reference/debugging)
     call compute_lumped_mass_inverse(g_ctx%B_33, g_ctx%diag_Mj_inv, first_time)
     call compute_lumped_mass_inverse(g_ctx%B_44, g_ctx%diag_Mw_inv, first_time)
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed lumped mass inverse"
-
     call VecNorm(g_ctx%diag_Mj_inv, NORM_2, norm_val, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_j^{-1}||_2 = ", norm_val
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_j^{-1} (lumped)||_2 = ", norm_val
     call VecNorm(g_ctx%diag_Mw_inv, NORM_2, norm_val, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_w^{-1}||_2 = ", norm_val
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_w^{-1} (lumped)||_2 = ", norm_val
 
     ! --- Debug: compare reassembled vs extracted norms ---
     if (use_reassembled .and. debug_physics_pc) then
@@ -474,28 +560,28 @@ contains
     ! --- Step 4: Form Schur-corrected diagonal blocks ---
     ! Choose diagonal blocks: reassembled (R_*) or extracted (B_*)
     if (use_reassembled) then
-      ! Ã_11 = R_11 - B_13 * D_j^{-1} * B_31
+      ! Ã_11 = R_11 - B_13 * Dinv_Mj * B_31
       call compute_schur_corrected_block(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-      ! Ã_22 = R_22 - B_24 * D_w^{-1} * B_42
+                                          g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
+      ! Ã_22 = R_22 - B_24 * Dinv_Mw * B_42
       call compute_schur_corrected_block(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+                                          g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
     else
-      ! Ã_11 = B_11 - B_13 * D_j^{-1} * B_31
+      ! Ã_11 = B_11 - B_13 * Dinv_Mj * B_31
       call compute_schur_corrected_block(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-      ! Ã_22 = B_22 - B_24 * D_w^{-1} * B_42
+                                          g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
+      ! Ã_22 = B_22 - B_24 * Dinv_Mw * B_42
       call compute_schur_corrected_block(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+                                          g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
     endif
 
-    ! Off-diagonal Schur corrections: TODO: Might also reassemble ... 
-    ! Ã_21 = B_21 - B_23 * D_j^{-1} * B_31
+    ! Off-diagonal Schur corrections: TODO: Might also reassemble ...
+    ! Ã_21 = B_21 - B_23 * Dinv_Mj * B_31
     call compute_schur_corrected_block(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
-                                        g_ctx%diag_Mj_inv, g_ctx%Atilde_21, first_time)
-    ! Ã_61 = B_61 - B_63 * D_j^{-1} * B_31
+                                        g_ctx%Dinv_Mj, g_ctx%Atilde_21, first_time)
+    ! Ã_61 = B_61 - B_63 * Dinv_Mj * B_31
     call compute_schur_corrected_block(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
-                                        g_ctx%diag_Mj_inv, g_ctx%Atilde_61, first_time)
+                                        g_ctx%Dinv_Mj, g_ctx%Atilde_61, first_time)
 
     if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
 
@@ -821,7 +907,6 @@ contains
     PetscErrorCode :: ierr
     logical        :: first_assembly
 
-    debug_physics_pc = .true. 
 
     first_assembly = .not. g_ctx%matrices_ready
 
