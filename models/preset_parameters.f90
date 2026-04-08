@@ -643,7 +643,6 @@ subroutine preset_parameters
   init_current_prof  = .false.
   current_prof_initialized = .false.
   
-  !TODO: Add to broadcast parameters and make adjustable via namelist input file.
   use_physics_pc     = .false.              ! Use physics-based block PCSHELL preconditioner
   debug_physics_pc   = .false.              ! Print PC matrix analysis after first assembly
   physics_pc_coupled    = .false.            ! Block lower-triangular sweep (uses off-diagonal blocks)
