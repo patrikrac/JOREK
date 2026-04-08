@@ -95,7 +95,7 @@ program JOREK2
 #endif
 
 #ifdef USE_PETSC
-    use mod_petsc_pc_physics, only: petsc_assemble_pc_matrices
+    use mod_petsc_pc_physics, only: petsc_assemble_pc_matrices, petsc_physics_pc_build_reduced
 #endif 
 
   use, intrinsic :: iso_c_binding
@@ -747,6 +747,7 @@ write(*,*) "n elements:", element_list%n_elements
     if (my_id.eq.0) write(*,FMT_TIMING) my_id, '# Elapsed time construct global matrix: ',tsecond
 
     call petsc_assemble_pc_matrices(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
+    !call petsc_physics_pc_build_reduced(a_mat%petsc_A)
 
 #ifdef SAVEMATRIX
 
