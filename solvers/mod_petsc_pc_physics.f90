@@ -107,18 +107,22 @@ contains
     integer, intent(in) :: comm
 
     PetscInt :: n_local, n_global, rstart, rend
-    PetscInt :: block_size, n_block_local, n_var_dofs
+    PetscInt :: block_size, n_block_local, n_var_dofs, n_block_global
+    !PetscInt :: out_local, out_global, out_start, out_end
     PetscInt, allocatable :: indices(:)
     PetscErrorCode :: ierr
     integer :: v, i, m, k
 
     ! Get parallel layout from the full system matrix
-    call MatGetLocalSize(A_full, n_local, PETSC_NULL_INTEGER, ierr)
-    call MatGetSize(A_full, n_global, PETSC_NULL_INTEGER, ierr)
-    call MatGetOwnershipRange(A_full, rstart, rend, ierr)
+    PetscCallA(MatGetLocalSize(A_full, n_local, PETSC_NULL_INTEGER, ierr))
+    PetscCallA(MatGetSize(A_full, n_global, PETSC_NULL_INTEGER, ierr))
+    PetscCallA(MatGetOwnershipRange(A_full, rstart, rend, ierr))
+
+    !write(*,'(A,I8,A,I8)') "[Physics PC]   Creating variable index sets: local DOFs ", n_local, " [", rstart, "-", rend-1, "]"
 
     block_size    = n_var * n_tor
     n_block_local = n_local / block_size
+    n_block_global = n_global / block_size
     n_var_dofs    = n_block_local * n_tor
 
     allocate(indices(n_var_dofs))
@@ -128,11 +132,18 @@ contains
       do i = 0, n_block_local - 1
         do m = 0, n_tor - 1
           k = k + 1
+          !k = i*(n_tor-1) + m + 1
           indices(k) = rstart + i * block_size + (v-1) * n_tor + m
         enddo
       enddo
-      call ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, &
-                           g_ctx%is_var(v), ierr)
+      PetscCallA(ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, &
+                           g_ctx%is_var(v), ierr))
+
+      ! Print information about the created IS for debugging
+      !PetscCallA(ISGetSize(g_ctx%is_var(v), out_global, ierr))
+      !PetscCallA(ISGetLocalSize(g_ctx%is_var(v), out_local, ierr))
+      !PetscCallA(ISGetMinMax(g_ctx%is_var(v), out_start, out_end, ierr))
+      !write(*,*) "[Physics PC]     Variable ", v, ": local DOFs : ", out_local," global DOFs ", out_global, " [", out_start, "-", out_end, "]"
     enddo
 
     deallocate(indices)
@@ -154,11 +165,11 @@ contains
     PetscErrorCode :: ierr
 
     if (first_time) then
-      call MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), &
-                              MAT_INITIAL_MATRIX, B, ierr)
+      PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), &
+                              MAT_INITIAL_MATRIX, B, ierr))
     else
-      call MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), &
-                              MAT_REUSE_MATRIX, B, ierr)
+      PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), &
+                              MAT_REUSE_MATRIX, B, ierr))
     endif
   end subroutine extract_sub_block
 
@@ -175,10 +186,10 @@ contains
     PetscErrorCode :: ierr
 
     if (first_time) then
-      call MatCreateVecs(B, PETSC_NULL_VEC, diag_M_inv, ierr)
+      PetscCallA(MatCreateVecs(B, PETSC_NULL_VEC, diag_M_inv, ierr))
     endif
-    call MatGetRowSum(B, diag_M_inv, ierr)
-    call VecReciprocal(diag_M_inv, ierr)
+    PetscCallA(MatGetRowSum(B, diag_M_inv, ierr))
+    PetscCallA(VecReciprocal(diag_M_inv, ierr))
   end subroutine compute_lumped_mass_inverse
 
 
@@ -206,7 +217,7 @@ contains
     call MatDiagonalScale(B_scaled, diag_M_inv, PETSC_NULL_VEC, ierr)
 
     ! C = B_coupling * B_scaled
-    call MatMatMult(B_coupling, B_scaled, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, C, ierr)
+    call MatMatMult(B_coupling, B_scaled, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C, ierr)
 
     ! Atilde = B_diag - C
     ! Always destroy and recreate: sparsity pattern may change between rebuilds
@@ -290,8 +301,7 @@ contains
     mats_nest(15) = PETSC_NULL_MAT
     mats_nest(16) = diag_66
 
-    call MatCreateNest(comm, nblocks, PETSC_NULL_IS_ARRAY, nblocks, PETSC_NULL_IS_ARRAY, &
-                       mats_nest, A_nest, ierr)
+    PetscCallA(MatCreateNest(comm, nblocks, PETSC_NULL_IS, nblocks, PETSC_NULL_IS, mats_nest, A_nest, ierr))
 
     ! Destroy old monolithic AIJ if rebuilding
     if (.not. first_time .and. g_ctx%ksp_reduced_created) then
@@ -339,7 +349,6 @@ contains
   !--------------------------------------------------------------------
   !> Build the reduced 4x4 system from the full system matrix.
   !!
-  !! Called from mod_petsc.f90 after the AIJ system matrix is available.
   !! Extracts sub-blocks, computes lumped mass, forms Schur corrections,
   !! and sets up sub-KSPs for the diagonal blocks.
   !--------------------------------------------------------------------
@@ -357,6 +366,8 @@ contains
 
     call PetscObjectGetComm(A_full, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    physics_pc_monolithic = .true. !TODO: Only for testing purposes, remove eventually...
 
     first_time = .not. g_ctx%reduced_ready
     use_reassembled = physics_pc_reassemble
@@ -429,32 +440,31 @@ contains
     ! --- Step 3: Compute lumped mass inverse ---
     call compute_lumped_mass_inverse(g_ctx%B_33, g_ctx%diag_Mj_inv, first_time)
     call compute_lumped_mass_inverse(g_ctx%B_44, g_ctx%diag_Mw_inv, first_time)
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed lumped mass inverse"
 
-    if (my_id == 0) then
-      call VecNorm(g_ctx%diag_Mj_inv, NORM_2, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||D_j^{-1}||_2 = ", norm_val
-      call VecNorm(g_ctx%diag_Mw_inv, NORM_2, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||D_w^{-1}||_2 = ", norm_val
-    endif
+    call VecNorm(g_ctx%diag_Mj_inv, NORM_2, norm_val, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_j^{-1}||_2 = ", norm_val
+    call VecNorm(g_ctx%diag_Mw_inv, NORM_2, norm_val, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_w^{-1}||_2 = ", norm_val
 
     ! --- Debug: compare reassembled vs extracted norms ---
-    if (use_reassembled .and. debug_physics_pc .and. my_id == 0) then
+    if (use_reassembled .and. debug_physics_pc) then
       call MatNorm(g_ctx%B_11, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||B_11 (extracted)||_F = ", norm_val
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_11 (extracted)||_F = ", norm_val
       call MatNorm(g_ctx%R_11, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||R_11 (reassembled)||_F = ", norm_val
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_11 (reassembled)||_F = ", norm_val
       call MatNorm(g_ctx%B_22, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||B_22 (extracted)||_F = ", norm_val
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_22 (extracted)||_F = ", norm_val
       call MatNorm(g_ctx%R_22, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||R_22 (reassembled)||_F = ", norm_val
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_22 (reassembled)||_F = ", norm_val
       call MatNorm(g_ctx%B_55, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||B_55 (extracted)||_F = ", norm_val
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_55 (extracted)||_F = ", norm_val
       call MatNorm(g_ctx%R_55, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||R_55 (reassembled)||_F = ", norm_val
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_55 (reassembled)||_F = ", norm_val
       call MatNorm(g_ctx%B_66, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||B_66 (extracted)||_F = ", norm_val
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_66 (extracted)||_F = ", norm_val
       call MatNorm(g_ctx%R_66, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||R_66 (reassembled)||_F = ", norm_val
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_66 (reassembled)||_F = ", norm_val
     endif
 
     ! --- Step 4: Form Schur-corrected diagonal blocks ---
@@ -475,7 +485,7 @@ contains
                                           g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
     endif
 
-    ! Off-diagonal Schur corrections (always from extracted blocks):
+    ! Off-diagonal Schur corrections: TODO: Might also reassemble ... 
     ! Ã_21 = B_21 - B_23 * D_j^{-1} * B_31
     call compute_schur_corrected_block(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
                                         g_ctx%diag_Mj_inv, g_ctx%Atilde_21, first_time)
@@ -483,17 +493,17 @@ contains
     call compute_schur_corrected_block(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
                                         g_ctx%diag_Mj_inv, g_ctx%Atilde_61, first_time)
 
-    if (my_id == 0) then
-      call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_11||_F = ", norm_val
-      call MatNorm(g_ctx%Atilde_22, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_22||_F = ", norm_val
-      call MatNorm(g_ctx%Atilde_21, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_21||_F = ", norm_val
-      call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
-      write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
-    endif
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
 
+    call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_11||_F = ", norm_val
+    call MatNorm(g_ctx%Atilde_22, NORM_FROBENIUS, norm_val, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_22||_F = ", norm_val
+    call MatNorm(g_ctx%Atilde_21, NORM_FROBENIUS, norm_val, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_21||_F = ", norm_val
+    call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
+  
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic) then
       ! Monolithic mode: assemble full 4x4 reduced matrix and single KSP
@@ -797,6 +807,8 @@ contains
     PetscErrorCode :: ierr
     logical        :: first_assembly
 
+    debug_physics_pc = .true. 
+
     first_assembly = .not. g_ctx%matrices_ready
 
     if (first_assembly) then
@@ -812,8 +824,10 @@ contains
                                         g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
     g_ctx%matrices_ready = .true.
 
-    if (first_assembly .and. debug_physics_pc) &
+    if (first_assembly .and. debug_physics_pc) then
       call petsc_analyze_pc_matrices(my_id)
+      call petsc_test_pc_matrices(my_id)
+    endif
   end subroutine petsc_assemble_pc_matrices
 
 
@@ -852,7 +866,7 @@ contains
     n_elements = element_list%n_elements
     allocate(local_elms(n_elements))
     n_local_elms = 0
-    do ielm = 1, n_elements
+    element_loop: do ielm = 1, n_elements
       do iv = 1, n_vertex_max
         inode = element_list%element(ielm)%vertex(iv)
         do i_order = 1, n_degrees
@@ -860,12 +874,11 @@ contains
           if (idx >= my_ind_min .and. idx <= my_ind_max) then
             n_local_elms = n_local_elms + 1
             local_elms(n_local_elms) = ielm
-            goto 100
+            cycle element_loop 
           endif
         enddo
       enddo
-      100 continue
-    enddo
+    enddo element_loop
 
     ! --- Destroy old matrices on rebuild (they were converted to AIJ after first assembly,
     !     so we must recreate as BAIJ for MatSetValuesBlocked in the assembly loop) ---
@@ -883,25 +896,25 @@ contains
     call MatSetSizes(g_ctx%R_11, n_local_1v, n_local_1v, n_global_1v, n_global_1v, ierr)
     call MatSetType(g_ctx%R_11, MATMPIBAIJ, ierr)
     call MatSetBlockSize(g_ctx%R_11, n_tor, ierr)
-    call MatMPIBAIJSetPreallocation(g_ctx%R_11, n_tor, 20, PETSC_NULL_INTEGER, 20, PETSC_NULL_INTEGER, ierr)
+    call MatMPIBAIJSetPreallocation(g_ctx%R_11, n_tor, 20, PETSC_NULL_INTEGER_ARRAY, 20, PETSC_NULL_INTEGER_ARRAY, ierr)
 
     call MatCreate(comm, g_ctx%R_22, ierr)
     call MatSetSizes(g_ctx%R_22, n_local_1v, n_local_1v, n_global_1v, n_global_1v, ierr)
     call MatSetType(g_ctx%R_22, MATMPIBAIJ, ierr)
     call MatSetBlockSize(g_ctx%R_22, n_tor, ierr)
-    call MatMPIBAIJSetPreallocation(g_ctx%R_22, n_tor, 20, PETSC_NULL_INTEGER, 20, PETSC_NULL_INTEGER, ierr)
+    call MatMPIBAIJSetPreallocation(g_ctx%R_22, n_tor, 20, PETSC_NULL_INTEGER_ARRAY, 20, PETSC_NULL_INTEGER_ARRAY, ierr)
 
     call MatCreate(comm, g_ctx%R_55, ierr)
     call MatSetSizes(g_ctx%R_55, n_local_1v, n_local_1v, n_global_1v, n_global_1v, ierr)
     call MatSetType(g_ctx%R_55, MATMPIBAIJ, ierr)
     call MatSetBlockSize(g_ctx%R_55, n_tor, ierr)
-    call MatMPIBAIJSetPreallocation(g_ctx%R_55, n_tor, 20, PETSC_NULL_INTEGER, 20, PETSC_NULL_INTEGER, ierr)
+    call MatMPIBAIJSetPreallocation(g_ctx%R_55, n_tor, 20, PETSC_NULL_INTEGER_ARRAY, 20, PETSC_NULL_INTEGER_ARRAY, ierr)
 
     call MatCreate(comm, g_ctx%R_66, ierr)
     call MatSetSizes(g_ctx%R_66, n_local_1v, n_local_1v, n_global_1v, n_global_1v, ierr)
     call MatSetType(g_ctx%R_66, MATMPIBAIJ, ierr)
     call MatSetBlockSize(g_ctx%R_66, n_tor, ierr)
-    call MatMPIBAIJSetPreallocation(g_ctx%R_66, n_tor, 20, PETSC_NULL_INTEGER, 20, PETSC_NULL_INTEGER, ierr)
+    call MatMPIBAIJSetPreallocation(g_ctx%R_66, n_tor, 20, PETSC_NULL_INTEGER_ARRAY, 20, PETSC_NULL_INTEGER_ARRAY, ierr)
 
     ! Allow new nonzero entries (conservative pre-allocation may undercount)
     call MatSetOption(g_ctx%R_11, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
