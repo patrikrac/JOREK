@@ -389,6 +389,63 @@ contains
 
 
   !--------------------------------------------------------------------
+  !> Compute a Schur-corrected block using exact M^{-1} via MatMatSolve:
+  !! Atilde = B_diag - B_coupling * M^{-1} * B_constraint
+  !!
+  !! Uses the already-factored KSP (MUMPS) to solve M * X = B_constraint
+  !! for X, then forms C = B_coupling * X.
+  !!
+  !! NOTE: This converts B_constraint to dense for MatMatSolve, so it is
+  !! only suitable for proof-of-concept / small test cases.
+  !--------------------------------------------------------------------
+  subroutine compute_schur_corrected_block_exact(B_diag, B_coupling, &
+                                          B_constraint, ksp_M, Atilde, first_time)
+    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
+    KSP, intent(in)    :: ksp_M
+    Mat, intent(inout) :: Atilde
+    logical, intent(in) :: first_time
+
+    Mat :: F              ! factor matrix from KSP
+    Mat :: B_dense        ! dense copy of B_constraint
+    Mat :: X_dense        ! dense solution: M^{-1} * B_constraint
+    Mat :: X_aij          ! sparse conversion of X_dense
+    Mat :: C              ! B_coupling * X
+    PC  :: pc_obj
+    PetscErrorCode :: ierr
+
+    ! Get factor matrix from already-factored KSP
+    call KSPGetPC(ksp_M, pc_obj, ierr)
+    call PCFactorGetMatrix(pc_obj, F, ierr)
+
+    ! Convert B_constraint to dense for MatMatSolve
+    call MatConvert(B_constraint, MATDENSE, MAT_INITIAL_MATRIX, B_dense, ierr)
+
+    ! Create dense solution matrix of same size
+    call MatDuplicate(B_dense, MAT_DO_NOT_COPY_VALUES, X_dense, ierr)
+
+    ! Solve M * X = B_constraint  (uses MUMPS factorization)
+    call MatMatSolve(F, B_dense, X_dense, ierr)
+
+    ! Convert X back to sparse AIJ for MatMatMult
+    call MatConvert(X_dense, MATAIJ, MAT_INITIAL_MATRIX, X_aij, ierr)
+
+    ! C = B_coupling * X
+    call MatMatMult(B_coupling, X_aij, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C, ierr)
+
+    ! Atilde = B_diag - C
+    if (.not. first_time) call MatDestroy(Atilde, ierr)
+    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
+    call MatAXPY(Atilde, -1.0d0, C, DIFFERENT_NONZERO_PATTERN, ierr)
+
+    ! Clean up
+    call MatDestroy(B_dense, ierr)
+    call MatDestroy(X_dense, ierr)
+    call MatDestroy(X_aij, ierr)
+    call MatDestroy(C, ierr)
+  end subroutine compute_schur_corrected_block_exact
+
+
+  !--------------------------------------------------------------------
   !> Set up a sub-KSP for a diagonal block: PREONLY + LU + MUMPS.
   !--------------------------------------------------------------------
   subroutine setup_block_ksp(ksp_block, B_block, comm, first_time)
@@ -635,34 +692,40 @@ contains
       if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_66 (reassembled)||_F = ", norm_val
     endif
 
-    ! --- Step 4: Form Schur-corrected diagonal blocks ---
-    ! Using Neumann-1 approximation: M^{-1} ~= 2*D^{-1} - D^{-1}*M*D^{-1}
+    ! --- Step 4a: Set up KSPs for elliptic constraint mass matrices ---
+    ! (Must be done before Schur correction so MUMPS factorization is available)
+    call setup_block_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time)
+    call setup_block_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time)
+    g_ctx%ksp_elliptic_created = .true.
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   Elliptic KSPs set up (PREONLY+LU+MUMPS)"
+
+    ! --- Step 4b: Form Schur-corrected blocks using exact M^{-1} via MatMatSolve ---
     ! Choose diagonal blocks: reassembled (R_*) or extracted (B_*)
     if (use_reassembled) then
-      ! Ã_11 = R_11 - B_13 * N1(B_33) * B_31
-      call compute_schur_corrected_block_neumann(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%B_33, g_ctx%Atilde_11, first_time)
-      ! Ã_22 = R_22 - B_24 * N1(B_44) * B_42
-      call compute_schur_corrected_block_neumann(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%B_44, g_ctx%Atilde_22, first_time)
+      ! Ã_11 = R_11 - B_13 * B_33^{-1} * B_31
+      call compute_schur_corrected_block_exact(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
+                                          g_ctx%ksp_Mj, g_ctx%Atilde_11, first_time)
+      ! Ã_22 = R_22 - B_24 * B_44^{-1} * B_42
+      call compute_schur_corrected_block_exact(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
+                                          g_ctx%ksp_Mw, g_ctx%Atilde_22, first_time)
     else
-      ! Ã_11 = B_11 - B_13 * N1(B_33) * B_31
-      call compute_schur_corrected_block_neumann(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%B_33, g_ctx%Atilde_11, first_time)
-      ! Ã_22 = B_22 - B_24 * N1(B_44) * B_42
-      call compute_schur_corrected_block_neumann(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%B_44, g_ctx%Atilde_22, first_time)
+      ! Ã_11 = B_11 - B_13 * B_33^{-1} * B_31
+      call compute_schur_corrected_block_exact(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
+                                          g_ctx%ksp_Mj, g_ctx%Atilde_11, first_time)
+      ! Ã_22 = B_22 - B_24 * B_44^{-1} * B_42
+      call compute_schur_corrected_block_exact(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
+                                          g_ctx%ksp_Mw, g_ctx%Atilde_22, first_time)
     endif
 
-    ! Off-diagonal Schur corrections: TODO: Might also reassemble ...
-    ! Ã_21 = B_21 - B_23 * N1(B_33) * B_31
-    call compute_schur_corrected_block_neumann(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
-                                        g_ctx%B_33, g_ctx%Atilde_21, first_time)
-    ! Ã_61 = B_61 - B_63 * N1(B_33) * B_31
-    call compute_schur_corrected_block_neumann(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
-                                        g_ctx%B_33, g_ctx%Atilde_61, first_time)
+    ! Off-diagonal Schur corrections (always from extracted blocks)
+    ! Ã_21 = B_21 - B_23 * B_33^{-1} * B_31
+    call compute_schur_corrected_block_exact(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
+                                        g_ctx%ksp_Mj, g_ctx%Atilde_21, first_time)
+    ! Ã_61 = B_61 - B_63 * B_33^{-1} * B_31
+    call compute_schur_corrected_block_exact(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
+                                        g_ctx%ksp_Mj, g_ctx%Atilde_61, first_time)
 
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (exact M^{-1})"
 
     call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_11||_F = ", norm_val
@@ -672,12 +735,6 @@ contains
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_21||_F = ", norm_val
     call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
-  
-    ! --- Step 4b: Set up KSPs for elliptic constraint mass matrices ---
-    call setup_block_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time)
-    call setup_block_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time)
-    g_ctx%ksp_elliptic_created = .true.
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Elliptic KSPs set up (PREONLY+LU+MUMPS)"
 
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic) then
