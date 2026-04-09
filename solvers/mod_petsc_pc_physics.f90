@@ -217,8 +217,9 @@ contains
     PetscInt, intent(in) :: block_size
     logical, intent(in)  :: first_time
 
-    Mat :: B_baij
+    Mat :: B_baij, Dinv_baij
     PetscErrorCode :: ierr
+    integer :: comm
 
     ! Destroy previous inverse if rebuilding
     if (.not. first_time) call MatDestroy(Dinv, ierr)
@@ -229,10 +230,18 @@ contains
     ! Convert AIJ -> BAIJ with the given block size
     call MatConvert(B_aij, MATBAIJ, MAT_INITIAL_MATRIX, B_baij, ierr)
 
-    ! Compute the inverse of the block diagonal
-    call MatInvertBlockDiagonalMat(B_baij, Dinv, ierr)
+    ! Pre-create output matrix (required by MatInvertBlockDiagonalMat)
+    call PetscObjectGetComm(B_baij, comm, ierr)
+    call MatCreate(comm, Dinv_baij, ierr)
 
-    ! Clean up temporary BAIJ copy
+    ! Compute the inverse of the block diagonal (result is BAIJ)
+    call MatInvertBlockDiagonalMat(B_baij, Dinv_baij, ierr)
+
+    ! Convert result to AIJ for compatibility with MatMatMult(AIJ, AIJ)
+    call MatConvert(Dinv_baij, MATAIJ, MAT_INITIAL_MATRIX, Dinv, ierr)
+
+    ! Clean up temporaries
+    call MatDestroy(Dinv_baij, ierr)
     call MatDestroy(B_baij, ierr)
   end subroutine compute_block_diagonal_inverse
 
@@ -308,6 +317,75 @@ contains
     call MatDestroy(B_scaled, ierr)
     call MatDestroy(C, ierr)
   end subroutine compute_schur_corrected_block
+
+
+  !--------------------------------------------------------------------
+  !> Compute a Schur-corrected diagonal block using the first-order
+  !! Neumann series approximation of M^{-1}:
+  !!
+  !!   M^{-1} ~= N_1 = 2*D^{-1} - D^{-1} * M * D^{-1}
+  !!
+  !! where D = diag(M). This has the same sparsity pattern as M and
+  !! captures off-diagonal coupling, unlike the scalar diagonal.
+  !!
+  !! The Schur correction becomes:
+  !!   Atilde = B_diag - B_coupling * N_1 * B_constraint
+  !!         = B_diag - 2*B_coupling*D^{-1}*B_constraint
+  !!                  + B_coupling*D^{-1}*M*D^{-1}*B_constraint
+  !!
+  !! Steps:
+  !!   1. T1 = D^{-1} * B_constraint          (row scaling)
+  !!   2. T2 = M * T1                          (mat-mat product)
+  !!   3. T3 = D^{-1} * T2                     (row scaling)
+  !!   4. C1 = B_coupling * T1                  (mat-mat product)
+  !!   5. C2 = B_coupling * T3                  (mat-mat product)
+  !!   6. Atilde = B_diag - 2*C1 + C2           (combine)
+  !--------------------------------------------------------------------
+  subroutine compute_schur_corrected_block_neumann(B_diag, B_coupling, &
+                                            B_constraint, M, Atilde, first_time)
+    Mat, intent(in)    :: B_diag, B_coupling, B_constraint, M
+    Mat, intent(inout) :: Atilde
+    logical, intent(in) :: first_time
+
+    Vec :: d_inv
+    Mat :: T1, T2, T3, C1, C2
+    PetscErrorCode :: ierr
+
+    ! Compute D^{-1} = 1/diag(M)
+    call MatCreateVecs(M, PETSC_NULL_VEC, d_inv, ierr)
+    call MatGetDiagonal(M, d_inv, ierr)
+    call VecReciprocal(d_inv, ierr)
+
+    ! T1 = D^{-1} * B_constraint  (left row-scaling)
+    call MatDuplicate(B_constraint, MAT_COPY_VALUES, T1, ierr)
+    call MatDiagonalScale(T1, d_inv, PETSC_NULL_VEC, ierr)
+
+    ! T2 = M * T1
+    call MatMatMult(M, T1, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, T2, ierr)
+
+    ! T3 = D^{-1} * T2  (left row-scaling)
+    call MatDiagonalScale(T2, d_inv, PETSC_NULL_VEC, ierr)
+    ! T2 is now T3 (in-place), rename for clarity in comments below
+
+    ! C1 = B_coupling * T1
+    call MatMatMult(B_coupling, T1, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C1, ierr)
+
+    ! C2 = B_coupling * T2  (T2 holds D^{-1}*M*D^{-1}*B_constraint)
+    call MatMatMult(B_coupling, T2, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C2, ierr)
+
+    ! Atilde = B_diag - 2*C1 + C2
+    if (.not. first_time) call MatDestroy(Atilde, ierr)
+    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
+    call MatAXPY(Atilde, -2.0d0, C1, DIFFERENT_NONZERO_PATTERN, ierr)
+    call MatAXPY(Atilde,  1.0d0, C2, DIFFERENT_NONZERO_PATTERN, ierr)
+
+    ! Clean up
+    call VecDestroy(d_inv, ierr)
+    call MatDestroy(T1, ierr)
+    call MatDestroy(T2, ierr)
+    call MatDestroy(C1, ierr)
+    call MatDestroy(C2, ierr)
+  end subroutine compute_schur_corrected_block_neumann
 
 
   !--------------------------------------------------------------------
@@ -433,7 +511,7 @@ contains
   !! and sets up sub-KSPs for the diagonal blocks.
   !--------------------------------------------------------------------
   subroutine petsc_physics_pc_build_reduced(A_full)
-    use mod_parameters, only: n_var, n_tor, var_psi, var_u, var_zj, var_w, var_rho, var_T
+    use mod_parameters, only: n_var, n_tor, n_degrees, var_psi, var_u, var_zj, var_w, var_rho, var_T
     use phys_module, only: physics_pc_reassemble, debug_physics_pc, physics_pc_monolithic
 
     Mat, intent(in) :: A_full
@@ -518,7 +596,7 @@ contains
     endif
 
     ! --- Step 3: Compute block diagonal inverse (n_tor x n_tor blocks) ---
-    bs_ntor = n_tor
+    bs_ntor = n_tor  ! TODO: n_degrees*n_tor would be better but axis node breaks uniform blocking
     call compute_block_diagonal_inverse(g_ctx%B_33, g_ctx%Dinv_Mj, bs_ntor, first_time)
     call compute_block_diagonal_inverse(g_ctx%B_44, g_ctx%Dinv_Mw, bs_ntor, first_time)
     g_ctx%dinv_created = .true.
@@ -558,30 +636,31 @@ contains
     endif
 
     ! --- Step 4: Form Schur-corrected diagonal blocks ---
+    ! Using Neumann-1 approximation: M^{-1} ~= 2*D^{-1} - D^{-1}*M*D^{-1}
     ! Choose diagonal blocks: reassembled (R_*) or extracted (B_*)
     if (use_reassembled) then
-      ! Ã_11 = R_11 - B_13 * Dinv_Mj * B_31
-      call compute_schur_corrected_block(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
-      ! Ã_22 = R_22 - B_24 * Dinv_Mw * B_42
-      call compute_schur_corrected_block(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
+      ! Ã_11 = R_11 - B_13 * N1(B_33) * B_31
+      call compute_schur_corrected_block_neumann(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
+                                          g_ctx%B_33, g_ctx%Atilde_11, first_time)
+      ! Ã_22 = R_22 - B_24 * N1(B_44) * B_42
+      call compute_schur_corrected_block_neumann(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
+                                          g_ctx%B_44, g_ctx%Atilde_22, first_time)
     else
-      ! Ã_11 = B_11 - B_13 * Dinv_Mj * B_31
-      call compute_schur_corrected_block(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
-      ! Ã_22 = B_22 - B_24 * Dinv_Mw * B_42
-      call compute_schur_corrected_block(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
+      ! Ã_11 = B_11 - B_13 * N1(B_33) * B_31
+      call compute_schur_corrected_block_neumann(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
+                                          g_ctx%B_33, g_ctx%Atilde_11, first_time)
+      ! Ã_22 = B_22 - B_24 * N1(B_44) * B_42
+      call compute_schur_corrected_block_neumann(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
+                                          g_ctx%B_44, g_ctx%Atilde_22, first_time)
     endif
 
     ! Off-diagonal Schur corrections: TODO: Might also reassemble ...
-    ! Ã_21 = B_21 - B_23 * Dinv_Mj * B_31
-    call compute_schur_corrected_block(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
-                                        g_ctx%Dinv_Mj, g_ctx%Atilde_21, first_time)
-    ! Ã_61 = B_61 - B_63 * Dinv_Mj * B_31
-    call compute_schur_corrected_block(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
-                                        g_ctx%Dinv_Mj, g_ctx%Atilde_61, first_time)
+    ! Ã_21 = B_21 - B_23 * N1(B_33) * B_31
+    call compute_schur_corrected_block_neumann(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
+                                        g_ctx%B_33, g_ctx%Atilde_21, first_time)
+    ! Ã_61 = B_61 - B_63 * N1(B_33) * B_31
+    call compute_schur_corrected_block_neumann(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
+                                        g_ctx%B_33, g_ctx%Atilde_61, first_time)
 
     if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
 
