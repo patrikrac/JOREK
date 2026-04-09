@@ -79,6 +79,7 @@ module mod_petsc_pc_physics
     logical :: work_4v_created = .false.
     IS :: is_reduced(4)
     logical :: is_reduced_created = .false.
+    integer :: apply_count = 0
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx
@@ -459,6 +460,18 @@ contains
     call MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%A_reduced_4x4, ierr)
     call MatDestroy(A_nest, ierr)
 
+    ! Diagnostic: print monolithic matrix info
+    if (my_id == 0) then
+      block
+        PetscInt :: m_rows, m_cols
+        PetscReal :: m_norm
+        call MatGetSize(g_ctx%A_reduced_4x4, m_rows, m_cols, ierr)
+        call MatNorm(g_ctx%A_reduced_4x4, NORM_FROBENIUS, m_norm, ierr)
+        write(*,'(A,I8,A,I8,A,ES12.4)') "[Physics PC]   A_reduced_4x4: ", &
+            m_rows, " x ", m_cols, "  ||.||_F = ", m_norm
+      end block
+    endif
+
     ! Set up monolithic KSP
     if (first_time) then
       call KSPCreate(comm, g_ctx%ksp_reduced, ierr)
@@ -807,8 +820,31 @@ contains
       call VecCopy(g_ctx%work_4, rhs_T, ierr)
       call VecRestoreSubVector(g_ctx%work_rhs_4v, g_ctx%is_reduced(4), rhs_T, ierr)
 
+      ! Diagnostic: print RHS norm before solve (only on first call)
+      if (g_ctx%apply_count < 2) then
+        block
+          PetscReal :: rhs_norm, sol_norm
+          call VecNorm(g_ctx%work_rhs_4v, NORM_2, rhs_norm, ierr)
+          write(*,'(A,I3,A,ES12.4)') "[Physics PC Apply #", g_ctx%apply_count, &
+              "] ||rhs_4v|| = ", rhs_norm
+        end block
+      endif
+
       ! Single monolithic solve
       call KSPSolve(g_ctx%ksp_reduced, g_ctx%work_rhs_4v, g_ctx%work_sol_4v, ierr)
+
+      ! Diagnostic: print solution norm after solve (only on first call)
+      if (g_ctx%apply_count < 2) then
+        block
+          PetscReal :: sol_norm
+          KSPConvergedReason :: reason
+          call VecNorm(g_ctx%work_sol_4v, NORM_2, sol_norm, ierr)
+          call KSPGetConvergedReason(g_ctx%ksp_reduced, reason, ierr)
+          write(*,'(A,I3,A,ES12.4,A,I4)') "[Physics PC Apply #", g_ctx%apply_count, &
+              "] ||sol_4v|| = ", sol_norm, "  KSP reason = ", reason
+        end block
+      endif
+      g_ctx%apply_count = g_ctx%apply_count + 1
 
       ! Scatter solution back to per-variable output vectors
       call VecGetSubVector(g_ctx%work_sol_4v, g_ctx%is_reduced(1), sol_psi, ierr)
