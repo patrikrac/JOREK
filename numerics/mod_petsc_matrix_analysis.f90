@@ -11,6 +11,17 @@ module mod_petsc_matrix_analysis
 !   petsc_mat_norms      (A, label)           -- Frobenius / 1-norm / inf-norm
 !   petsc_mat_diff_norm  (A, B, label, norm)  -- ||A - B||_F
 !
+!   petsc_mat_convert_spectrum (A, label, symmetric)
+!     -- FULL spectrum via dense conversion (assembled matrices only).
+!        MatCreateRedundantMatrix + MatConvert → LAPACK (DSYEVD/DGEEV) on rank 0.
+!        Writes to {label}_dense_spectrum.dat
+!        NOT for MATSHELL — use petsc_mat_probe_spectrum instead.
+!
+!   petsc_mat_probe_spectrum (A, label, symmetric)
+!     -- FULL spectrum via matrix probing (any Mat type, including MATSHELL).
+!        Applies A to N standard basis vectors, builds dense matrix on rank 0,
+!        then calls LAPACK (DSYEVD/DGEEV).  Writes to {label}_probe_spectrum.dat
+!
 ! Additional (USE_SLEPC):
 !   petsc_mat_eig_bounds    (A, lam_min, lam_max) -- extreme eigenvalues via EPS (symmetric)
 !   petsc_mat_cond_estimate (A, kappa)             -- kappa = lam_max / lam_min  (symmetric)
@@ -27,9 +38,11 @@ module mod_petsc_matrix_analysis
 #endif
   implicit none
   private
-  public :: petsc_mat_print_info, &
-            petsc_mat_norms,      &
-            petsc_mat_diff_norm
+  public :: petsc_mat_print_info,      &
+            petsc_mat_norms,           &
+            petsc_mat_diff_norm,       &
+            petsc_mat_convert_spectrum,&
+            petsc_mat_probe_spectrum
 #ifdef USE_SLEPC
   public :: petsc_mat_eig_bounds,    &
             petsc_mat_cond_estimate, &
@@ -125,6 +138,272 @@ contains
     if (my_id == 0) &
       write(*,'(A,A,A,ES14.6)') "[MatDiff] ", trim(label), "  ||A-B||_F = ", norm_out
   end subroutine petsc_mat_diff_norm
+
+
+  !--------------------------------------------------------------------
+  ! Sort eigenvalues by ascending real part.  Used by all spectrum
+  ! routines (defined here so it is available outside USE_SLEPC).
+  !--------------------------------------------------------------------
+  subroutine sort_eigs_by_real(eig_r, eig_i, n)
+    integer, intent(in)   :: n
+    real*8, intent(inout) :: eig_r(n), eig_i(n)
+    integer :: i, j
+    real*8  :: tmp_r, tmp_i
+    do i = 1, n - 1
+      do j = i + 1, n
+        if (eig_r(j) < eig_r(i)) then
+          tmp_r = eig_r(i); eig_r(i) = eig_r(j); eig_r(j) = tmp_r
+          tmp_i = eig_i(i); eig_i(i) = eig_i(j); eig_i(j) = tmp_i
+        endif
+      enddo
+    enddo
+  end subroutine sort_eigs_by_real
+
+
+  !--------------------------------------------------------------------
+  ! Compute all eigenvalues of a dense square matrix via LAPACK.
+  ! A_in is overwritten on exit. eig_r/eig_i must be pre-allocated.
+  ! Symmetric: DSYEVD (divide-and-conquer). Non-symmetric: DGEEV.
+  ! Eigenvalues are sorted ascending by real part on success (info==0).
+  !--------------------------------------------------------------------
+  subroutine lapack_eig_dense(A_in, n, symmetric, eig_r, eig_i, info)
+    implicit none
+    integer, intent(in)    :: n
+    real*8,  intent(inout) :: A_in(n, n)
+    logical, intent(in)    :: symmetric
+    real*8,  intent(out)   :: eig_r(n), eig_i(n)
+    integer, intent(out)   :: info
+
+    integer :: lwork, liwork
+    integer :: iwork_query(1)
+    real*8  :: work_query(1)
+    real*8  :: vl_dummy(1), vr_dummy(1)
+    integer, allocatable :: iwork(:)
+    real*8,  allocatable :: work(:), wr(:), wi(:)
+
+    if (symmetric) then
+      ! DSYEVD: divide-and-conquer; more robust than DSYEV for clustered spectra
+      call DSYEVD('N','U', n, A_in, n, eig_r, work_query, -1, iwork_query, -1, info)
+      lwork  = max(1, int(work_query(1)))
+      liwork = max(1, iwork_query(1))
+      allocate(work(lwork), iwork(liwork))
+      call DSYEVD('N','U', n, A_in, n, eig_r, work, lwork, iwork, liwork, info)
+      eig_i = 0.0d0
+      deallocate(work, iwork)
+    else
+      ! DGEEV: general non-symmetric eigenvalues
+      allocate(wr(n), wi(n))
+      call DGEEV('N','N', n, A_in, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work_query, -1, info)
+      lwork = max(1, int(work_query(1)))
+      allocate(work(lwork))
+      call DGEEV('N','N', n, A_in, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work, lwork, info)
+      eig_r = wr;  eig_i = wi
+      deallocate(work, wr, wi)
+    endif
+
+    if (info == 0) call sort_eigs_by_real(eig_r, eig_i, n)
+  end subroutine lapack_eig_dense
+
+
+  !--------------------------------------------------------------------
+  !> Compute the FULL eigenvalue spectrum of an explicitly assembled Mat.
+  !!
+  !! Strategy: MatCreateRedundantMatrix gathers the parallel sparse matrix
+  !! to one sequential copy per rank → MatConvert to SEQDENSE → MatGetValues
+  !! extracts every entry on rank 0 → LAPACK computes all eigenvalues.
+  !!
+  !! Symmetric matrices: DSYEVD (divide-and-conquer, robust for clusters).
+  !! Non-symmetric matrices: DGEEV.
+  !! Output: {label}_dense_spectrum.dat
+  !!
+  !! NOT suitable for MATSHELL — use petsc_mat_probe_spectrum instead.
+  !--------------------------------------------------------------------
+  subroutine petsc_mat_convert_spectrum(A, label, symmetric)
+    implicit none
+    Mat,             intent(in) :: A
+    character(len=*),intent(in) :: label
+    logical,         intent(in) :: symmetric
+
+    Mat            :: Ared, Adense
+    PetscInt       :: M, N, bs
+    PetscErrorCode :: ierr
+    integer        :: comm, my_id, comm_size, mpierr
+    integer        :: n_int, i, j, iunit, info
+    PetscInt,    allocatable :: col_idxs(:)
+    PetscInt                 :: row_idx_arr(1)
+    PetscScalar, allocatable :: row_vals(:)
+    real*8, allocatable :: A_copy(:,:), eig_r(:), eig_i(:)
+    character(len=512) :: filename
+
+    call PetscObjectGetComm(A, comm, ierr)
+    call MPI_Comm_rank(comm, my_id, mpierr)
+    call MPI_Comm_size(comm, comm_size, mpierr)
+    call MatGetSize(A, M, N, ierr)
+    call MatGetBlockSize(A, bs, ierr)
+    n_int = int(M)
+
+    if (my_id == 0) then
+      write(*,'(A,A)')       "[EPS] Dense LAPACK spectrum for: ", trim(label)
+      write(*,'(A,I0,A,I0)') "[EPS] Matrix size  : ", M, " x ", N
+      write(*,'(A,I0)')      "[EPS] Block size   : ", bs
+      write(*,'(A,I0,A)')    "[EPS] Gathering to seq (", comm_size, " sub-comms)..."
+    endif
+
+    ! Gather parallel matrix — each rank gets a full sequential copy
+    call MatCreateRedundantMatrix(A, comm_size, PETSC_COMM_NULL, MAT_INITIAL_MATRIX, Ared, ierr)
+    if (ierr /= 0) then
+      if (my_id == 0) write(*,'(A)') &
+        "[EPS] ERROR: MatCreateRedundantMatrix failed." // &
+        " Shell matrix? Use petsc_mat_probe_spectrum."
+      return
+    endif
+
+    call MatConvert(Ared, MATSEQDENSE, MAT_INITIAL_MATRIX, Adense, ierr)
+    call MatDestroy(Ared, ierr)
+
+    ! Extract via MatGetValues (avoids lda-padding issues with F90 array pointers)
+    if (my_id == 0) then
+      allocate(A_copy(n_int, n_int), col_idxs(n_int), row_vals(n_int))
+      do j = 1, n_int
+        col_idxs(j) = j - 1
+      enddo
+      do i = 1, n_int
+        row_idx_arr(1) = i - 1
+        call MatGetValues(Adense, 1, row_idx_arr, n_int, col_idxs, row_vals, ierr)
+        A_copy(i, :) = real(row_vals, kind=8)
+      enddo
+      deallocate(col_idxs, row_vals)
+    endif
+    call MatDestroy(Adense, ierr)
+
+    if (my_id == 0) then
+      allocate(eig_r(n_int), eig_i(n_int))
+      call lapack_eig_dense(A_copy, n_int, symmetric, eig_r, eig_i, info)
+      deallocate(A_copy)
+      if (info /= 0) then
+        write(*,'(A,I0)') "[EPS] LAPACK error, info = ", info
+      else
+        write(filename,'(A,A)') trim(label), "_dense_spectrum.dat"
+        open(newunit=iunit, file=trim(filename), status='replace', action='write')
+        write(iunit,'(A,A)')  "# Dense LAPACK spectrum of: ", trim(label)
+        write(iunit,'(A,I0)') "# Matrix size : ", M
+        write(iunit,'(A,L1)') "# Symmetric   : ", symmetric
+        write(iunit,'(A)')    "#        Re(lambda)           Im(lambda)"
+        do i = 1, n_int
+          write(iunit,'(2X,ES22.14,2X,ES22.14)') eig_r(i), eig_i(i)
+        enddo
+        close(iunit)
+        write(*,'(A,I0,A,A)') "[EPS] All ", n_int, " eigenvalues -> ", trim(filename)
+      endif
+      deallocate(eig_r, eig_i)
+    endif
+  end subroutine petsc_mat_convert_spectrum
+
+
+  !--------------------------------------------------------------------
+  !> Compute the FULL eigenvalue spectrum via matrix probing.
+  !!
+  !! Works for ANY Mat type including MATSHELL.  Applies A to each of
+  !! the N standard basis vectors (N collective MatMult calls), gathers
+  !! the result to rank 0, builds the dense matrix, then calls LAPACK.
+  !!
+  !! Symmetric matrices: DSYEVD.  Non-symmetric: DGEEV.
+  !! Output: {label}_probe_spectrum.dat
+  !--------------------------------------------------------------------
+  subroutine petsc_mat_probe_spectrum(A, label, symmetric)
+    implicit none
+    Mat,             intent(in) :: A
+    character(len=*),intent(in) :: label
+    logical,         intent(in) :: symmetric
+
+    Vec                  :: e_col, f_col, f_all
+    VecScatter           :: scat
+    PetscInt             :: M, N, i_col, bs
+    PetscScalar          :: one_val
+    PetscScalar, pointer :: f_arr(:)
+    PetscErrorCode       :: ierr
+    integer              :: comm, my_id, mpierr
+    integer              :: n_int, i, iunit, info
+    real*8, allocatable  :: A_dense(:,:), A_copy(:,:), eig_r(:), eig_i(:)
+    character(len=512)   :: filename
+
+    call PetscObjectGetComm(A, comm, ierr)
+    call MPI_Comm_rank(comm, my_id, mpierr)
+    call MatGetSize(A, M, N, ierr)
+    call MatGetBlockSize(A, bs, ierr)
+    n_int = int(M)
+
+    if (M /= N) then
+      if (my_id == 0) write(*,'(A)') "[EPS] ERROR: petsc_mat_probe_spectrum requires square matrix"
+      return
+    endif
+
+    if (my_id == 0) then
+      write(*,'(A,A)')      "[EPS] Probing spectrum for: ", trim(label)
+      write(*,'(A,I0)')     "[EPS] Matrix size : ", M
+      write(*,'(A,I0)')     "[EPS] Block size  : ", bs
+      write(*,'(A,I0,A)')   "[EPS] Applying A to ", N, " basis vectors (collective)..."
+    endif
+
+    ! Create work vectors (domain and range sides of A)
+    call MatCreateVecs(A, e_col, f_col, ierr)
+    ! Gather f_col to a sequential vector visible on all ranks
+    call VecScatterCreateToAll(f_col, scat, f_all, ierr)
+
+    if (my_id == 0) allocate(A_dense(n_int, n_int))
+    one_val = 1.0d0
+
+    do i_col = 0, N - 1
+      ! Build basis vector e_{i_col}
+      call VecSet(e_col, 0.0d0, ierr)
+      call VecSetValue(e_col, i_col, one_val, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_col, ierr)
+      call VecAssemblyEnd(e_col, ierr)
+
+      call MatMult(A, e_col, f_col, ierr)
+
+      ! Gather result to sequential vector on all ranks
+      call VecScatterBegin(scat, f_col, f_all, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd(scat, f_col, f_all, INSERT_VALUES, SCATTER_FORWARD, ierr)
+
+      ! Column i_col+1 of A = f_all  (only store on rank 0)
+      if (my_id == 0) then
+        call VecGetArrayF90(f_all, f_arr, ierr)
+        A_dense(:, i_col + 1) = real(f_arr, kind=8)
+        call VecRestoreArrayF90(f_all, f_arr, ierr)
+      endif
+    enddo
+
+    call VecDestroy(e_col, ierr)
+    call VecDestroy(f_col, ierr)
+    call VecScatterDestroy(scat, ierr)
+    call VecDestroy(f_all, ierr)
+
+    if (my_id == 0) then
+      write(*,'(A)') "[EPS] Probing complete. Computing eigenvalues via LAPACK..."
+      allocate(A_copy(n_int, n_int), eig_r(n_int), eig_i(n_int))
+      A_copy = A_dense
+      deallocate(A_dense)
+      call lapack_eig_dense(A_copy, n_int, symmetric, eig_r, eig_i, info)
+      deallocate(A_copy)
+      if (info /= 0) then
+        write(*,'(A,I0)') "[EPS] LAPACK error, info = ", info
+      else
+        write(filename,'(A,A)') trim(label), "_probe_spectrum.dat"
+        open(newunit=iunit, file=trim(filename), status='replace', action='write')
+        write(iunit,'(A,A)')  "# Probe spectrum of: ", trim(label)
+        write(iunit,'(A,I0)') "# Matrix size : ", M
+        write(iunit,'(A,L1)') "# Symmetric   : ", symmetric
+        write(iunit,'(A)')    "#        Re(lambda)           Im(lambda)"
+        do i = 1, n_int
+          write(iunit,'(2X,ES22.14,2X,ES22.14)') eig_r(i), eig_i(i)
+        enddo
+        close(iunit)
+        write(*,'(A,I0,A,A)') "[EPS] All ", n_int, " eigenvalues -> ", trim(filename)
+      endif
+      deallocate(eig_r, eig_i)
+    endif
+  end subroutine petsc_mat_probe_spectrum
 
 
 #ifdef USE_SLEPC
@@ -366,22 +645,6 @@ contains
     call EPSDestroy(eps, ierr)
   end subroutine petsc_mat_full_spectrum
 
-  subroutine sort_eigs_by_real(eig_r, eig_i, n)
-    integer, intent(in)   :: n
-    real*8, intent(inout) :: eig_r(n), eig_i(n)
-    integer :: i, j
-    real*8  :: tmp_r, tmp_i
-
-    do i = 1, n - 1
-      do j = i + 1, n
-        if (eig_r(j) < eig_r(i)) then
-          tmp_r = eig_r(i); eig_r(i) = eig_r(j); eig_r(j) = tmp_r
-          tmp_i = eig_i(i); eig_i(i) = eig_i(j); eig_i(j) = tmp_i
-        endif
-      enddo
-    enddo
-  end subroutine sort_eigs_by_real
-
   !--------------------------------------------------------------------
   !> Compute the eigenvalue spectrum by sweeping across a range.
   !> INTEGRATED CLUSTER LOGIC: Uses expanded Krylov subspaces (3x NCV) 
@@ -526,7 +789,6 @@ contains
     ! WRITE CONSOLIDATED FILE
     ! -------------------------------------------------------------------------
     if (my_id == 0) then
-      ! (Assuming sort_eigs_by_real is defined elsewhere in your module)
       if (total_unique > 0) call sort_eigs_by_real(eig_r_all, eig_i_all, total_unique)
 
       write(filename, '(A,A)') trim(label), "_full_spectrum.dat"
