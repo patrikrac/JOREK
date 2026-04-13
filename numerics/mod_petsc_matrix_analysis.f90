@@ -258,7 +258,11 @@ contains
       return
     endif
 
-    call MatConvert(Ared, MATSEQDENSE, MAT_INITIAL_MATRIX, Adense, ierr)
+    ! Only rank 0 converts to dense — avoids comm_size × N² memory across all ranks.
+    ! MatConvert on a sequential (PETSC_COMM_SELF) matrix is a local operation.
+    if (my_id == 0) then
+      call MatConvert(Ared, MATSEQDENSE, MAT_INITIAL_MATRIX, Adense, ierr)
+    endif
     call MatDestroy(Ared, ierr)
 
     ! Extract via MatGetValues (avoids lda-padding issues with F90 array pointers)
@@ -273,11 +277,12 @@ contains
         A_copy(i, :) = real(row_vals, kind=8)
       enddo
       deallocate(col_idxs, row_vals)
+      call MatDestroy(Adense, ierr)
     endif
-    call MatDestroy(Adense, ierr)
 
     if (my_id == 0) then
       allocate(eig_r(n_int), eig_i(n_int))
+      ! Pass A_copy directly — lapack_eig_dense overwrites it, freeing us from a second copy.
       call lapack_eig_dense(A_copy, n_int, symmetric, eig_r, eig_i, info)
       deallocate(A_copy)
       if (info /= 0) then
@@ -324,7 +329,7 @@ contains
     PetscErrorCode       :: ierr
     integer              :: comm, my_id, mpierr
     integer              :: n_int, i, iunit, info
-    real*8, allocatable  :: A_dense(:,:), A_copy(:,:), eig_r(:), eig_i(:)
+    real*8, allocatable  :: A_dense(:,:), eig_r(:), eig_i(:)
     character(len=512)   :: filename
 
     call PetscObjectGetComm(A, comm, ierr)
@@ -381,11 +386,11 @@ contains
 
     if (my_id == 0) then
       write(*,'(A)') "[EPS] Probing complete. Computing eigenvalues via LAPACK..."
-      allocate(A_copy(n_int, n_int), eig_r(n_int), eig_i(n_int))
-      A_copy = A_dense
+      allocate(eig_r(n_int), eig_i(n_int))
+      ! Pass A_dense directly — lapack_eig_dense overwrites it, but we no longer need it.
+      ! Avoids the 2x peak that would result from allocating a separate A_copy.
+      call lapack_eig_dense(A_dense, n_int, symmetric, eig_r, eig_i, info)
       deallocate(A_dense)
-      call lapack_eig_dense(A_copy, n_int, symmetric, eig_r, eig_i, info)
-      deallocate(A_copy)
       if (info /= 0) then
         write(*,'(A,I0)') "[EPS] LAPACK error, info = ", info
       else
