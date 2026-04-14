@@ -527,7 +527,7 @@ contains
     VecScatter     :: scat
     Mat            :: A_exact, diag_55, diag_66
     PC             :: pc_obj
-    PetscInt       :: N_global, n4p
+    PetscInt       :: N_global, n4p, m_local_4v
     PetscErrorCode :: ierr
     PetscScalar, pointer :: arr(:)
     PetscInt, allocatable :: seq_idxs(:)   ! sequential 0..n4-1, used as both row and col idx sets
@@ -786,8 +786,13 @@ contains
     ! =================================================================
     ! Build MATMPIAIJ from A_dense (rank 0 inserts all rows)
     ! =================================================================
+    ! Use the same local row count as work_rhs_4v (created from A_approx's nest layout)
+    ! so that A_exact is compatible with the work vectors in KSPSolve.
+    ! PETSC_DECIDE would distribute rows independently of the nest structure, producing
+    ! a different layout when N is not divisible by the number of MPI ranks.
+    call VecGetLocalSize(g_ctx%work_rhs_4v, m_local_4v, ierr)
     call MatCreate(comm, A_exact, ierr)
-    call MatSetSizes(A_exact, PETSC_DECIDE, PETSC_DECIDE, n4p, n4p, ierr)
+    call MatSetSizes(A_exact, m_local_4v, m_local_4v, n4p, n4p, ierr)
     call MatSetType(A_exact, MATMPIAIJ, ierr)
     call MatSetOption(A_exact, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
     call MatSetUp(A_exact, ierr)
