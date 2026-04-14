@@ -409,8 +409,8 @@ contains
   !> Assemble the monolithic 4x4 reduced system via MatCreateNest +
   !! MatConvert, and set up a single KSP (PREONLY+LU+MUMPS).
   !--------------------------------------------------------------------
-  subroutine assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id)
-    logical, intent(in) :: use_reassembled, first_time
+  subroutine assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, skip_ksp_setup)
+    logical, intent(in) :: use_reassembled, first_time, skip_ksp_setup
     integer, intent(in) :: comm, my_id
 
     Mat :: mats_nest(16), A_nest   ! 1D row-major: (row0,col0), (row0,col1), ...
@@ -463,17 +463,19 @@ contains
     call MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%A_reduced_4x4, ierr)
     call MatDestroy(A_nest, ierr)
 
-    ! Set up monolithic KSP
-    if (first_time) then
-      call KSPCreate(comm, g_ctx%ksp_reduced, ierr)
+    ! Set up monolithic KSP (skipped when probe_exact=.true.: probe owns the KSP)
+    if (.not. skip_ksp_setup) then
+      if (first_time) then
+        call KSPCreate(comm, g_ctx%ksp_reduced, ierr)
+      endif
+      call KSPSetOperators(g_ctx%ksp_reduced, g_ctx%A_reduced_4x4, g_ctx%A_reduced_4x4, ierr)
+      call KSPSetType(g_ctx%ksp_reduced, KSPPREONLY, ierr)
+      call KSPGetPC(g_ctx%ksp_reduced, pc_obj, ierr)
+      call PCSetType(pc_obj, PCLU, ierr)
+      call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
+      call KSPSetUp(g_ctx%ksp_reduced, ierr)
+      g_ctx%ksp_reduced_created = .true.
     endif
-    call KSPSetOperators(g_ctx%ksp_reduced, g_ctx%A_reduced_4x4, g_ctx%A_reduced_4x4, ierr)
-    call KSPSetType(g_ctx%ksp_reduced, KSPPREONLY, ierr)
-    call KSPGetPC(g_ctx%ksp_reduced, pc_obj, ierr)
-    call PCSetType(pc_obj, PCLU, ierr)
-    call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
-    call KSPSetUp(g_ctx%ksp_reduced, ierr)
-    g_ctx%ksp_reduced_created = .true.
 
     ! Allocate 4-var work vectors and create index sets (first time only)
     if (.not. g_ctx%work_4v_created) then
@@ -493,7 +495,13 @@ contains
       g_ctx%is_reduced_created = .true.
     endif
 
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Monolithic 4x4 KSP set up (PREONLY+LU+MUMPS)"
+    if (my_id == 0) then
+      if (skip_ksp_setup) then
+        write(*,'(A)') "[Physics PC]   Monolithic 4x4 approx matrix built (KSP deferred to probe)"
+      else
+        write(*,'(A)') "[Physics PC]   Monolithic 4x4 KSP set up (PREONLY+LU+MUMPS)"
+      endif
+    endif
   end subroutine assemble_monolithic_4x4
 
 
@@ -509,10 +517,10 @@ contains
   !! Must be called AFTER assemble_monolithic_4x4 so that ksp_reduced
   !! and g_ctx%A_reduced_4x4 (the approximate baseline) already exist.
   !--------------------------------------------------------------------
-  subroutine assemble_probed_exact_4x4(use_reassembled, comm, my_id)
+  subroutine assemble_probed_exact_4x4(use_reassembled, comm, first_time, my_id)
     use mod_petsc_matrix_analysis, only: petsc_mat_diff_norm
     implicit none
-    logical, intent(in) :: use_reassembled
+    logical, intent(in) :: use_reassembled, first_time
     integer, intent(in) :: comm, my_id
 
     Vec            :: e_j, z, temp, r_blk, scratch, r_seq
@@ -814,17 +822,23 @@ contains
         norm_diff / norm_approx
     endif
 
-    ! Replace approximate operator and re-factor with MUMPS.
-    ! PCReset would also clear pc->mat to NULL, causing the next KSPSetUp to factor
-    ! nothing and return zero on every solve.  Instead, call PCSetOperators explicitly:
-    ! that sets pc->setupcalled=0 (when the matrix pointer changes) and keeps the
-    ! operator reference valid, guaranteeing a fresh MUMPS factorization on KSPSetUp.
+    ! Replace approximate matrix and set up KSP from scratch.
+    ! assemble_monolithic_4x4 was called with skip_ksp_setup=.true., so ksp_reduced
+    ! does not exist yet on first_time; on subsequent calls it exists but must be
+    ! re-factored with the new A_exact.  A fresh KSPCreate on first_time and a full
+    ! setup sequence on every call avoids any stale-factorization pitfalls.
     call MatDestroy(g_ctx%A_reduced_4x4, ierr)
     g_ctx%A_reduced_4x4 = A_exact
+    if (first_time) then
+      call KSPCreate(comm, g_ctx%ksp_reduced, ierr)
+    endif
     call KSPSetOperators(g_ctx%ksp_reduced, g_ctx%A_reduced_4x4, g_ctx%A_reduced_4x4, ierr)
+    call KSPSetType(g_ctx%ksp_reduced, KSPPREONLY, ierr)
     call KSPGetPC(g_ctx%ksp_reduced, pc_obj, ierr)
-    call PCSetOperators(pc_obj, g_ctx%A_reduced_4x4, g_ctx%A_reduced_4x4, ierr)
+    call PCSetType(pc_obj, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
     call KSPSetUp(g_ctx%ksp_reduced, ierr)
+    g_ctx%ksp_reduced_created = .true.
 
     ! Cleanup local temporaries
     call VecScatterDestroy(scat,    ierr)
@@ -1028,11 +1042,11 @@ contains
 
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic) then
-      ! Monolithic mode: always build approximate matrix first (comparison baseline + non-probe path)
-      call assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id)
-      ! Optionally replace with exact Schur via probing (small problems only)
+      ! When probe_exact=.true., monolithic only builds A_approx for the diagnostic;
+      ! the KSP is owned entirely by assemble_probed_exact_4x4 (avoids stale-factor issues).
+      call assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, physics_pc_probe_exact)
       if (physics_pc_probe_exact) &
-        call assemble_probed_exact_4x4(use_reassembled, comm, my_id)
+        call assemble_probed_exact_4x4(use_reassembled, comm, first_time, my_id)
     else
       ! Block-diagonal mode: 4 separate sub-KSPs
       call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time)
