@@ -815,17 +815,16 @@ contains
     endif
 
     ! Replace approximate operator and re-factor with MUMPS.
-    ! PCReset is required: KSPSetType/PCSetType are no-ops when the type is unchanged,
-    ! so they do NOT trigger re-factorization.  PCReset explicitly destroys the internal
-    ! MUMPS factorization, forcing a fresh numeric factorization on KSPSetUp.
+    ! PCReset would also clear pc->mat to NULL, causing the next KSPSetUp to factor
+    ! nothing and return zero on every solve.  Instead, call PCSetOperators explicitly:
+    ! that sets pc->setupcalled=0 (when the matrix pointer changes) and keeps the
+    ! operator reference valid, guaranteeing a fresh MUMPS factorization on KSPSetUp.
     call MatDestroy(g_ctx%A_reduced_4x4, ierr)
     g_ctx%A_reduced_4x4 = A_exact
     call KSPSetOperators(g_ctx%ksp_reduced, g_ctx%A_reduced_4x4, g_ctx%A_reduced_4x4, ierr)
     call KSPGetPC(g_ctx%ksp_reduced, pc_obj, ierr)
-    call PCReset(pc_obj, ierr)                                    ! destroy old MUMPS factorization
-    call PCSetType(pc_obj, PCLU, ierr)                            ! re-configure (type was cleared by Reset)
-    call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
-    call KSPSetUp(g_ctx%ksp_reduced, ierr)                        ! new symbolic + numeric factor
+    call PCSetOperators(pc_obj, g_ctx%A_reduced_4x4, g_ctx%A_reduced_4x4, ierr)
+    call KSPSetUp(g_ctx%ksp_reduced, ierr)
 
     ! Cleanup local temporaries
     call VecScatterDestroy(scat,    ierr)
