@@ -154,7 +154,9 @@ module phys_module
   logical :: debug_physics_pc     !< Print PC matrix analysis (norms, eigenvalues) after first assembly
   logical :: physics_pc_coupled   !< Use block lower-triangular sweep instead of diagonal-only apply
   logical :: physics_pc_reassemble !< Reassemble diagonal blocks from simplified integrands instead of extracting from full matrix
-  logical :: physics_pc_monolithic !< Monolithic 4x4 solve (stage-one Schur elimination test)
+  logical :: physics_pc_monolithic  !< Monolithic 4x4 solve (stage-one Schur elimination test)
+  logical :: physics_pc_probe_exact !< Probe exact 4x4 Schur complement via basis-vector applications (small problems only)
+  logical :: physics_pc_schur_u    !< Inner Schur complement S_u for the Alfven (psi,u) block
   logical :: use_newton           !< Use inexact Newton method
   integer :: maxNewton            !< maximum number of Newton iterations
   real(kind=8) :: gamma_Newton    !< Newton gamma-parameter: gmres_tol = gamma_Newton*(normRHScurrent/normRHSprevious)**alpha_Newton

@@ -648,6 +648,8 @@ subroutine preset_parameters
   physics_pc_coupled    = .false.            ! Block lower-triangular sweep (uses off-diagonal blocks)
   physics_pc_reassemble = .false.            ! Reassemble diagonal blocks from simplified integrands
   physics_pc_monolithic = .false.            ! Monolithic 4x4 solve (stage-one Schur test)
+  physics_pc_probe_exact = .false.           ! Probe exact 4x4 Schur complement via N mat-vec products (small problems only)
+  physics_pc_schur_u   = .false.            ! Inner Schur complement S_u for Alfven block
 
   use_mumps          = .false.              ! Use MUMPS solver
   use_pastix         = .false.              ! Use PASTIX solver

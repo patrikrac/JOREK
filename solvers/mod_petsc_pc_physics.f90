@@ -60,6 +60,10 @@ module mod_petsc_pc_physics
     !! Atilde_61 = B_61 - B_63 * D_j^{-1} * B_31
     Mat :: Atilde_21, Atilde_61
 
+    !> Inner Schur complement: S_u = Atilde_22 - Atilde_21 * diag(Atilde_11)^{-1} * B_12
+    Mat :: S_u
+    Vec :: diag_A11_inv
+
     !> KSP for each diagonal block of the reduced 4x4 system
     KSP :: ksp_psi, ksp_u, ksp_rho, ksp_T
     logical :: ksp_created = .false.
@@ -79,7 +83,6 @@ module mod_petsc_pc_physics
     logical :: work_4v_created = .false.
     IS :: is_reduced(4)
     logical :: is_reduced_created = .false.
-    integer :: apply_count = 0
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx
@@ -460,18 +463,6 @@ contains
     call MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%A_reduced_4x4, ierr)
     call MatDestroy(A_nest, ierr)
 
-    ! Diagnostic: print monolithic matrix info
-    if (my_id == 0) then
-      block
-        PetscInt :: m_rows, m_cols
-        PetscReal :: m_norm
-        call MatGetSize(g_ctx%A_reduced_4x4, m_rows, m_cols, ierr)
-        call MatNorm(g_ctx%A_reduced_4x4, NORM_FROBENIUS, m_norm, ierr)
-        write(*,'(A,I8,A,I8,A,ES12.4)') "[Physics PC]   A_reduced_4x4: ", &
-            m_rows, " x ", m_cols, "  ||.||_F = ", m_norm
-      end block
-    endif
-
     ! Set up monolithic KSP
     if (first_time) then
       call KSPCreate(comm, g_ctx%ksp_reduced, ierr)
@@ -507,6 +498,311 @@ contains
 
 
   !--------------------------------------------------------------------
+  !> Assemble the EXACT 4×4 Schur complement by probing:
+  !! apply S_4x4 to all 4N standard basis vectors, gather columns to
+  !! rank 0, build a dense AIJ matrix, and replace the approximate
+  !! operator in ksp_reduced.
+  !!
+  !! Cost: 2N KSPSolve (triangular substitutions on existing MUMPS
+  !! factorisations) + 14N MatMult.  Intended for small test problems.
+  !!
+  !! Must be called AFTER assemble_monolithic_4x4 so that ksp_reduced
+  !! and g_ctx%A_reduced_4x4 (the approximate baseline) already exist.
+  !--------------------------------------------------------------------
+  subroutine assemble_probed_exact_4x4(use_reassembled, comm, my_id)
+    use mod_petsc_matrix_analysis, only: petsc_mat_diff_norm
+    implicit none
+    logical, intent(in) :: use_reassembled
+    integer, intent(in) :: comm, my_id
+
+    Vec            :: e_j, z, temp, r_blk, scratch, r_seq
+    VecScatter     :: scat
+    Mat            :: A_exact, diag_55, diag_66
+    PetscInt       :: N_global, n4p
+    PetscErrorCode :: ierr
+    PetscScalar, pointer :: arr(:)
+    PetscInt, allocatable :: seq_idxs(:)   ! sequential 0..n4-1, used as both row and col idx sets
+    PetscInt       :: row_idx(1)
+    integer        :: n, n4, j
+    real*8, allocatable :: A_dense(:,:)
+    PetscReal      :: norm_approx, norm_diff
+
+    call MatGetSize(g_ctx%B_11, N_global, PETSC_NULL_INTEGER, ierr)
+    n   = int(N_global)
+    n4  = 4 * n
+    n4p = int(n4, PetscInt)
+
+    ! Choose reassembled or extracted diagonal blocks for ρ and T
+    if (use_reassembled) then
+      diag_55 = g_ctx%R_55
+      diag_66 = g_ctx%R_66
+    else
+      diag_55 = g_ctx%B_55
+      diag_66 = g_ctx%B_66
+    endif
+
+    ! Local work vectors — work_1..5 not yet allocated at build time
+    call MatCreateVecs(g_ctx%B_11, e_j, PETSC_NULL_VEC, ierr)
+    call VecDuplicate(e_j, z,       ierr)
+    call VecDuplicate(e_j, temp,    ierr)
+    call VecDuplicate(e_j, r_blk,   ierr)
+    call VecDuplicate(e_j, scratch, ierr)
+    call VecScatterCreateToZero(e_j, scat, r_seq, ierr)
+
+    if (my_id == 0) then
+      allocate(A_dense(n4, n4))
+      A_dense = 0.0d0   ! ensure structural zeros are correct before block-by-block fill
+      write(*,'(A,I0,A)') "[Physics PC]   Probing exact 4x4 Schur (4×", n, " columns)..."
+    endif
+
+    ! =================================================================
+    ! Block 1: ψ input → columns 0..n-1
+    !   temp_j = ksp_Mj^{-1} · B_31 · e_ψ
+    !   r_ψ = B_11·e_ψ − B_13·temp_j
+    !   r_u = B_21·e_ψ − B_23·temp_j
+    !   r_ρ = B_51·e_ψ
+    !   r_T = B_61·e_ψ − B_63·temp_j
+    ! =================================================================
+    do j = 0, n-1
+      call VecSet(e_j, 0.0d0, ierr)
+      call VecSetValue(e_j, int(j,PetscInt), 1.0d0, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_j, ierr);  call VecAssemblyEnd(e_j, ierr)
+      call MatMult(g_ctx%B_31, e_j, z,    ierr)
+      call KSPSolve(g_ctx%ksp_Mj, z, temp, ierr)
+
+      ! r_ψ
+      call MatMult(g_ctx%B_11, e_j, r_blk, ierr)
+      call MatMult(g_ctx%B_13, temp, scratch, ierr)
+      call VecAXPY(r_blk, -1.0d0, scratch, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(1:n, j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_u
+      call MatMult(g_ctx%B_21, e_j, r_blk, ierr)
+      call MatMult(g_ctx%B_23, temp, scratch, ierr)
+      call VecAXPY(r_blk, -1.0d0, scratch, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(n+1:2*n, j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_ρ  (no Schur coupling from ψ to ρ through j)
+      call MatMult(g_ctx%B_51, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(2*n+1:3*n, j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_T
+      call MatMult(g_ctx%B_61, e_j, r_blk, ierr)
+      call MatMult(g_ctx%B_63, temp, scratch, ierr)
+      call VecAXPY(r_blk, -1.0d0, scratch, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(3*n+1:4*n, j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+    enddo
+
+    ! =================================================================
+    ! Block 2: u input → columns n..2n-1
+    !   temp_w = ksp_Mw^{-1} · B_42 · e_u
+    !   r_ψ = B_12·e_u
+    !   r_u = B_22·e_u − B_24·temp_w
+    !   r_ρ = B_52·e_u
+    !   r_T = B_62·e_u
+    ! =================================================================
+    do j = 0, n-1
+      call VecSet(e_j, 0.0d0, ierr)
+      call VecSetValue(e_j, int(j,PetscInt), 1.0d0, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_j, ierr);  call VecAssemblyEnd(e_j, ierr)
+      call MatMult(g_ctx%B_42, e_j, z,    ierr)
+      call KSPSolve(g_ctx%ksp_Mw, z, temp, ierr)
+
+      ! r_ψ  (no Schur from u to ψ through j)
+      call MatMult(g_ctx%B_12, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(1:n, n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_u
+      call MatMult(g_ctx%B_22, e_j, r_blk, ierr)
+      call MatMult(g_ctx%B_24, temp, scratch, ierr)
+      call VecAXPY(r_blk, -1.0d0, scratch, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(n+1:2*n, n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_ρ
+      call MatMult(g_ctx%B_52, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(2*n+1:3*n, n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_T  (no Schur: u doesn't drive j-elimination in T row)
+      call MatMult(g_ctx%B_62, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(3*n+1:4*n, n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+    enddo
+
+    ! =================================================================
+    ! Block 3: ρ input → columns 2n..3n-1
+    !   No Schur corrections (ρ not in constraint system)
+    !   r_ψ = 0,  r_u = B_25·e_ρ,  r_ρ = B_55·e_ρ,  r_T = 0
+    ! =================================================================
+    do j = 0, n-1
+      call VecSet(e_j, 0.0d0, ierr)
+      call VecSetValue(e_j, int(j,PetscInt), 1.0d0, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_j, ierr);  call VecAssemblyEnd(e_j, ierr)
+
+      ! r_u
+      call MatMult(g_ctx%B_25, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(n+1:2*n, 2*n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_ρ
+      call MatMult(diag_55, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(2*n+1:3*n, 2*n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+    enddo
+
+    ! =================================================================
+    ! Block 4: T input → columns 3n..4n-1
+    !   No Schur corrections (T not in constraint system)
+    !   r_ψ = B_16·e_T,  r_u = B_26·e_T,  r_ρ = 0,  r_T = B_66·e_T
+    ! =================================================================
+    do j = 0, n-1
+      call VecSet(e_j, 0.0d0, ierr)
+      call VecSetValue(e_j, int(j,PetscInt), 1.0d0, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_j, ierr);  call VecAssemblyEnd(e_j, ierr)
+
+      ! r_ψ
+      call MatMult(g_ctx%B_16, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(1:n, 3*n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_u
+      call MatMult(g_ctx%B_26, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(n+1:2*n, 3*n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! r_T
+      call MatMult(diag_66, e_j, r_blk, ierr)
+      call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        A_dense(3*n+1:4*n, 3*n+j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+    enddo
+
+    ! =================================================================
+    ! Build MATMPIAIJ from A_dense (rank 0 inserts all rows)
+    ! =================================================================
+    call MatCreate(comm, A_exact, ierr)
+    call MatSetSizes(A_exact, PETSC_DECIDE, PETSC_DECIDE, n4p, n4p, ierr)
+    call MatSetType(A_exact, MATMPIAIJ, ierr)
+    call MatSetOption(A_exact, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    call MatSetUp(A_exact, ierr)
+
+    if (my_id == 0) then
+      ! Insert column by column: A_dense(:, j+1) is contiguous (Fortran column-major).
+      ! seq_idxs = row index array [0..n4-1]; row_idx(1) = column index j.
+      allocate(seq_idxs(n4))
+      do j = 0, n4-1
+        seq_idxs(j+1) = int(j, PetscInt)
+      enddo
+      do j = 0, n4-1
+        row_idx(1) = int(j, PetscInt)
+        call MatSetValues(A_exact, n4p, seq_idxs, 1, row_idx, &
+                          A_dense(:, j+1), INSERT_VALUES, ierr)
+      enddo
+      deallocate(seq_idxs, A_dense)
+    endif
+    call MatAssemblyBegin(A_exact, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd  (A_exact, MAT_FINAL_ASSEMBLY, ierr)
+
+    ! Diagnostic: relative Frobenius error vs approximate matrix
+    call petsc_mat_diff_norm(A_exact, g_ctx%A_reduced_4x4, &
+                             "A_exact_4x4 - A_approx_4x4", norm_diff)
+    call MatNorm(g_ctx%A_reduced_4x4, NORM_FROBENIUS, norm_approx, ierr)
+    if (my_id == 0) write(*,'(A,ES12.4)') &
+      "[Physics PC]   ||A_exact - A_approx||_F / ||A_approx||_F = ", &
+      norm_diff / norm_approx
+
+    ! Replace approximate operator and re-factor with MUMPS.
+    ! ksp_reduced already exists (PREONLY+LU+MUMPS) from assemble_monolithic_4x4 called first.
+    call MatDestroy(g_ctx%A_reduced_4x4, ierr)
+    g_ctx%A_reduced_4x4 = A_exact
+    call KSPSetOperators(g_ctx%ksp_reduced, g_ctx%A_reduced_4x4, g_ctx%A_reduced_4x4, ierr)
+    call KSPSetUp(g_ctx%ksp_reduced, ierr)
+
+    ! Cleanup local temporaries
+    call VecScatterDestroy(scat,    ierr)
+    call VecDestroy(r_seq,   ierr)
+    call VecDestroy(e_j,     ierr)
+    call VecDestroy(z,       ierr)
+    call VecDestroy(temp,    ierr)
+    call VecDestroy(r_blk,   ierr)
+    call VecDestroy(scratch, ierr)
+
+    if (my_id == 0) write(*,'(A)') &
+      "[Physics PC]   Exact probed 4x4 set up (PREONLY+LU+MUMPS)"
+  end subroutine assemble_probed_exact_4x4
+
+
+  !--------------------------------------------------------------------
   !> Build the reduced 4x4 system from the full system matrix.
   !!
   !! Extracts sub-blocks, approx mass, forms Schur corrections,
@@ -514,7 +810,8 @@ contains
   !--------------------------------------------------------------------
   subroutine petsc_physics_pc_build_reduced(A_full)
     use mod_parameters, only: n_var, n_tor, n_degrees, var_psi, var_u, var_zj, var_w, var_rho, var_T
-    use phys_module, only: physics_pc_reassemble, debug_physics_pc, physics_pc_monolithic
+    use phys_module, only: physics_pc_reassemble, debug_physics_pc, physics_pc_monolithic, &
+                           physics_pc_schur_u, physics_pc_probe_exact
 
     Mat, intent(in) :: A_full
 
@@ -643,46 +940,27 @@ contains
     g_ctx%ksp_elliptic_created = .true.
     if (my_id == 0) write(*,'(A)') "[Physics PC]   Elliptic KSPs set up (PREONLY+LU+MUMPS)"
 
-    ! --- Step 4b: Form Schur-corrected blocks using exact M^{-1} via MatMatSolve ---
+    ! --- Step 4b: Form Schur-corrected blocks using diagonal M^{-1} ---
     ! Choose diagonal blocks: reassembled (R_*) or extracted (B_*)
     if (use_reassembled) then
-      ! Ã_11 = R_11 - B_13 * B_33^{-1} * B_31
-      call compute_schur_corrected_block_exact(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%ksp_Mj, g_ctx%Atilde_11, first_time)
-      ! call compute_schur_corrected_block_diag(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
-      !                                     g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-      ! Ã_22 = R_22 - B_24 * B_44^{-1} * B_42
-      call compute_schur_corrected_block_exact(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%ksp_Mw, g_ctx%Atilde_22, first_time)
-      ! call compute_schur_corrected_block_diag(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
-      !                                     g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+      call compute_schur_corrected_block_diag(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
+                                          g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
+      call compute_schur_corrected_block_diag(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
+                                          g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
     else
-      ! Ã_11 = B_11 - B_13 * B_33^{-1} * B_31
-      call compute_schur_corrected_block_exact(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%ksp_Mj, g_ctx%Atilde_11, first_time)
-      ! call compute_schur_corrected_block_diag(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
-      !                                     g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-      ! Ã_22 = B_22 - B_24 * B_44^{-1} * B_42
-      call compute_schur_corrected_block_exact(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%ksp_Mw, g_ctx%Atilde_22, first_time)
-      ! call compute_schur_corrected_block_diag(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
-      !                                     g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+      call compute_schur_corrected_block_diag(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
+                                          g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
+      call compute_schur_corrected_block_diag(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
+                                          g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
     endif
 
     ! Off-diagonal Schur corrections (always from extracted blocks)
-    ! Ã_21 = B_21 - B_23 * B_33^{-1} * B_31
-    call compute_schur_corrected_block_exact(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
-                                        g_ctx%ksp_Mj, g_ctx%Atilde_21, first_time)
-    ! call compute_schur_corrected_block_diag(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
-    !                                     g_ctx%diag_Mj_inv, g_ctx%Atilde_21, first_time)
-    ! Ã_61 = B_61 - B_63 * B_33^{-1} * B_31
-    call compute_schur_corrected_block_exact(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
-                                        g_ctx%ksp_Mj, g_ctx%Atilde_61, first_time)
-    ! call compute_schur_corrected_block_diag(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
-    !                                     g_ctx%diag_Mj_inv, g_ctx%Atilde_61, first_time)
-    
+    call compute_schur_corrected_block_diag(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
+                                        g_ctx%diag_Mj_inv, g_ctx%Atilde_21, first_time)
+    call compute_schur_corrected_block_diag(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
+                                        g_ctx%diag_Mj_inv, g_ctx%Atilde_61, first_time)
 
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (exact M^{-1})"
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (diag M^{-1})"
 
     call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_11||_F = ", norm_val
@@ -693,14 +971,36 @@ contains
     call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
 
+    ! --- Step 4c: Inner Schur complement S_u (Alfven block) ---
+    ! S_u = Atilde_22 - Atilde_21 * diag(Atilde_11)^{-1} * B_12
+    ! This captures the u -> psi -> u round-trip (Alfven wave coupling)
+    if (physics_pc_schur_u) then
+      call compute_diag_mass_inverse(g_ctx%Atilde_11, g_ctx%diag_A11_inv, first_time)
+      call compute_schur_corrected_block_diag(g_ctx%Atilde_22, g_ctx%Atilde_21, g_ctx%B_12, &
+                                          g_ctx%diag_A11_inv, g_ctx%S_u, first_time)
+
+      call VecNorm(g_ctx%diag_A11_inv, NORM_2, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||diag(Atilde_11)^{-1}||_2 = ", norm_val
+      call MatNorm(g_ctx%S_u, NORM_FROBENIUS, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||S_u||_F = ", norm_val
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed inner Schur complement S_u"
+    endif
+
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic) then
-      ! Monolithic mode: assemble full 4x4 reduced matrix and single KSP
+      ! Monolithic mode: always build approximate matrix first (comparison baseline + non-probe path)
       call assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id)
+      ! Optionally replace with exact Schur via probing (small problems only)
+      if (physics_pc_probe_exact) &
+        call assemble_probed_exact_4x4(use_reassembled, comm, my_id)
     else
       ! Block-diagonal mode: 4 separate sub-KSPs
       call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time)
-      call setup_block_ksp(g_ctx%ksp_u,   g_ctx%Atilde_22, comm, first_time)
+      if (physics_pc_schur_u) then
+        call setup_block_ksp(g_ctx%ksp_u, g_ctx%S_u, comm, first_time)
+      else
+        call setup_block_ksp(g_ctx%ksp_u, g_ctx%Atilde_22, comm, first_time)
+      endif
       if (use_reassembled) then
         call setup_block_ksp(g_ctx%ksp_rho, g_ctx%R_55, comm, first_time)
         call setup_block_ksp(g_ctx%ksp_T,   g_ctx%R_66, comm, first_time)
@@ -820,31 +1120,8 @@ contains
       call VecCopy(g_ctx%work_4, rhs_T, ierr)
       call VecRestoreSubVector(g_ctx%work_rhs_4v, g_ctx%is_reduced(4), rhs_T, ierr)
 
-      ! Diagnostic: print RHS norm before solve (only on first call)
-      if (g_ctx%apply_count < 2) then
-        block
-          PetscReal :: rhs_norm, sol_norm
-          call VecNorm(g_ctx%work_rhs_4v, NORM_2, rhs_norm, ierr)
-          write(*,'(A,I3,A,ES12.4)') "[Physics PC Apply #", g_ctx%apply_count, &
-              "] ||rhs_4v|| = ", rhs_norm
-        end block
-      endif
-
       ! Single monolithic solve
       call KSPSolve(g_ctx%ksp_reduced, g_ctx%work_rhs_4v, g_ctx%work_sol_4v, ierr)
-
-      ! Diagnostic: print solution norm after solve (only on first call)
-      if (g_ctx%apply_count < 2) then
-        block
-          PetscReal :: sol_norm
-          KSPConvergedReason :: reason
-          call VecNorm(g_ctx%work_sol_4v, NORM_2, sol_norm, ierr)
-          call KSPGetConvergedReason(g_ctx%ksp_reduced, reason, ierr)
-          write(*,'(A,I3,A,ES12.4,A,I4)') "[Physics PC Apply #", g_ctx%apply_count, &
-              "] ||sol_4v|| = ", sol_norm, "  KSP reason = ", reason
-        end block
-      endif
-      g_ctx%apply_count = g_ctx%apply_count + 1
 
       ! Scatter solution back to per-variable output vectors
       call VecGetSubVector(g_ctx%work_sol_4v, g_ctx%is_reduced(1), sol_psi, ierr)
@@ -909,6 +1186,23 @@ contains
       endif
       ! Solve T block: B_66 * y_T = b_T
       call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, y_T, ierr)
+
+      ! --- Backward sweep (upper-triangular correction) ---
+      if (physics_pc_coupled) then
+        ! (B3) y_u -= Ã_22^{-1} * (B_25 * y_rho + B_26 * y_T)
+        call MatMult(g_ctx%B_25, y_rho, g_ctx%work_3, ierr)
+        call MatMult(g_ctx%B_26, y_T, g_ctx%work_4, ierr)
+        call VecAXPY(g_ctx%work_3, 1.0d0, g_ctx%work_4, ierr)
+        call KSPSolve(g_ctx%ksp_u, g_ctx%work_3, g_ctx%work_4, ierr)
+        call VecAXPY(y_u, -1.0d0, g_ctx%work_4, ierr)
+
+        ! (B4) y_psi -= Ã_11^{-1} * (B_12 * y_u + B_16 * y_T)
+        call MatMult(g_ctx%B_12, y_u, g_ctx%work_3, ierr)
+        call MatMult(g_ctx%B_16, y_T, g_ctx%work_4, ierr)
+        call VecAXPY(g_ctx%work_3, 1.0d0, g_ctx%work_4, ierr)
+        call KSPSolve(g_ctx%ksp_psi, g_ctx%work_3, g_ctx%work_4, ierr)
+        call VecAXPY(y_psi, -1.0d0, g_ctx%work_4, ierr)
+      endif
     endif
 
     ! --- Step 4: Back-substitute for j and w ---

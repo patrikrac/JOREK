@@ -225,13 +225,11 @@ contains
     logical,         intent(in) :: symmetric
 
     Mat            :: Ared, Adense
-    PetscInt       :: M, N, bs
+    PetscInt       :: M, N, bs, lda
     PetscErrorCode :: ierr
     integer        :: comm, my_id, comm_size, mpierr
     integer        :: n_int, i, j, iunit, info
-    PetscInt,    allocatable :: col_idxs(:)
-    PetscInt                 :: row_idx_arr(1)
-    PetscScalar, allocatable :: row_vals(:)
+    PetscScalar, pointer :: dense_arr(:,:)
     real*8, allocatable :: A_copy(:,:), eig_r(:), eig_i(:)
     character(len=512) :: filename
 
@@ -250,7 +248,7 @@ contains
     endif
 
     ! Gather parallel matrix — each rank gets a full sequential copy
-    call MatCreateRedundantMatrix(A, comm_size, PETSC_COMM_NULL, MAT_INITIAL_MATRIX, Ared, ierr)
+    call MatCreateRedundantMatrix(A, comm_size, MPI_COMM_NULL, MAT_INITIAL_MATRIX, Ared, ierr)
     if (ierr /= 0) then
       if (my_id == 0) write(*,'(A)') &
         "[EPS] ERROR: MatCreateRedundantMatrix failed." // &
@@ -265,26 +263,27 @@ contains
     endif
     call MatDestroy(Ared, ierr)
 
-    ! Extract via MatGetValues (avoids lda-padding issues with F90 array pointers)
-    if (my_id == 0) then
-      allocate(A_copy(n_int, n_int), col_idxs(n_int), row_vals(n_int))
-      do j = 1, n_int
-        col_idxs(j) = j - 1
-      enddo
-      do i = 1, n_int
-        row_idx_arr(1) = i - 1
-        call MatGetValues(Adense, 1, row_idx_arr, n_int, col_idxs, row_vals, ierr)
-        A_copy(i, :) = real(row_vals, kind=8)
-      enddo
-      deallocate(col_idxs, row_vals)
-      call MatDestroy(Adense, ierr)
-    endif
-
     if (my_id == 0) then
       allocate(eig_r(n_int), eig_i(n_int))
-      ! Pass A_copy directly — lapack_eig_dense overwrites it, freeing us from a second copy.
-      call lapack_eig_dense(A_copy, n_int, symmetric, eig_r, eig_i, info)
-      deallocate(A_copy)
+      call MatDenseGetLDA(Adense, lda, ierr)
+      if (int(lda) == n_int) then
+        ! No lda padding: pass PETSc's internal buffer directly — avoids a second N² allocation.
+        call MatDenseGetArrayF90(Adense, dense_arr, ierr)
+        call lapack_eig_dense(dense_arr, n_int, symmetric, eig_r, eig_i, info)
+        call MatDenseRestoreArrayF90(Adense, dense_arr, ierr)
+        call MatDestroy(Adense, ierr)
+      else
+        ! lda padding present (uncommon): copy column by column, then free Adense before LAPACK.
+        allocate(A_copy(n_int, n_int))
+        call MatDenseGetArrayF90(Adense, dense_arr, ierr)
+        do j = 1, n_int
+          A_copy(:, j) = real(dense_arr(1:n_int, j), kind=8)
+        enddo
+        call MatDenseRestoreArrayF90(Adense, dense_arr, ierr)
+        call MatDestroy(Adense, ierr)
+        call lapack_eig_dense(A_copy, n_int, symmetric, eig_r, eig_i, info)
+        deallocate(A_copy)
+      endif
       if (info /= 0) then
         write(*,'(A,I0)') "[EPS] LAPACK error, info = ", info
       else
