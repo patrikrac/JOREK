@@ -518,6 +518,7 @@ contains
     Vec            :: e_j, z, temp, r_blk, scratch, r_seq
     VecScatter     :: scat
     Mat            :: A_exact, diag_55, diag_66
+    PC             :: pc_obj
     PetscInt       :: N_global, n4p
     PetscErrorCode :: ierr
     PetscScalar, pointer :: arr(:)
@@ -525,12 +526,12 @@ contains
     PetscInt       :: row_idx(1)
     integer        :: n, n4, j
     real*8, allocatable :: A_dense(:,:)
-    PetscReal      :: norm_approx, norm_diff
+    PetscReal      :: norm_approx, norm_diff, norm_exact
 
     call MatGetSize(g_ctx%B_11, N_global, PETSC_NULL_INTEGER, ierr)
     n   = int(N_global)
     n4  = 4 * n
-    n4p = int(n4, PetscInt)
+    n4p = n4
 
     ! Choose reassembled or extracted diagonal blocks for ρ and T
     if (use_reassembled) then
@@ -552,7 +553,8 @@ contains
     if (my_id == 0) then
       allocate(A_dense(n4, n4))
       A_dense = 0.0d0   ! ensure structural zeros are correct before block-by-block fill
-      write(*,'(A,I0,A)') "[Physics PC]   Probing exact 4x4 Schur (4×", n, " columns)..."
+      write(*,'(A,I0,A)') "[Physics PC]   Probing exact 4x4 Schur (4x", n, " columns)..."
+      flush(6)
     endif
 
     ! =================================================================
@@ -563,9 +565,13 @@ contains
     !   r_ρ = B_51·e_ψ
     !   r_T = B_61·e_ψ − B_63·temp_j
     ! =================================================================
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]     Block 1/4 (psi, ksp_Mj):"
+      flush(6)
+    endif
     do j = 0, n-1
       call VecSet(e_j, 0.0d0, ierr)
-      call VecSetValue(e_j, int(j,PetscInt), 1.0d0, INSERT_VALUES, ierr)
+      call VecSetValue(e_j, j, 1.0d0, INSERT_VALUES, ierr)
       call VecAssemblyBegin(e_j, ierr);  call VecAssemblyEnd(e_j, ierr)
       call MatMult(g_ctx%B_31, e_j, z,    ierr)
       call KSPSolve(g_ctx%ksp_Mj, z, temp, ierr)
@@ -615,6 +621,11 @@ contains
         A_dense(3*n+1:4*n, j+1) = real(arr, kind=8)
         call VecRestoreArrayF90(r_seq, arr, ierr)
       endif
+      if (my_id == 0 .and. mod(j+1, max(1,n/10)) == 0) then
+        write(*,'(A,I0,A,I0,A,I0,A)') &
+          "[Physics PC]     Block 1/4: ", j+1, "/", n, " (", (j+1)*100/n, "%)"
+        flush(6)
+      endif
     enddo
 
     ! =================================================================
@@ -625,9 +636,13 @@ contains
     !   r_ρ = B_52·e_u
     !   r_T = B_62·e_u
     ! =================================================================
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]     Block 2/4 (u, ksp_Mw):"
+      flush(6)
+    endif
     do j = 0, n-1
       call VecSet(e_j, 0.0d0, ierr)
-      call VecSetValue(e_j, int(j,PetscInt), 1.0d0, INSERT_VALUES, ierr)
+      call VecSetValue(e_j, j, 1.0d0, INSERT_VALUES, ierr)
       call VecAssemblyBegin(e_j, ierr);  call VecAssemblyEnd(e_j, ierr)
       call MatMult(g_ctx%B_42, e_j, z,    ierr)
       call KSPSolve(g_ctx%ksp_Mw, z, temp, ierr)
@@ -673,6 +688,11 @@ contains
         A_dense(3*n+1:4*n, n+j+1) = real(arr, kind=8)
         call VecRestoreArrayF90(r_seq, arr, ierr)
       endif
+      if (my_id == 0 .and. mod(j+1, max(1,n/10)) == 0) then
+        write(*,'(A,I0,A,I0,A,I0,A)') &
+          "[Physics PC]     Block 2/4: ", j+1, "/", n, " (", (j+1)*100/n, "%)"
+        flush(6)
+      endif
     enddo
 
     ! =================================================================
@@ -680,9 +700,13 @@ contains
     !   No Schur corrections (ρ not in constraint system)
     !   r_ψ = 0,  r_u = B_25·e_ρ,  r_ρ = B_55·e_ρ,  r_T = 0
     ! =================================================================
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]     Block 3/4 (rho, MatMult)..."
+      flush(6)
+    endif
     do j = 0, n-1
       call VecSet(e_j, 0.0d0, ierr)
-      call VecSetValue(e_j, int(j,PetscInt), 1.0d0, INSERT_VALUES, ierr)
+      call VecSetValue(e_j, j, 1.0d0, INSERT_VALUES, ierr)
       call VecAssemblyBegin(e_j, ierr);  call VecAssemblyEnd(e_j, ierr)
 
       ! r_u
@@ -711,9 +735,13 @@ contains
     !   No Schur corrections (T not in constraint system)
     !   r_ψ = B_16·e_T,  r_u = B_26·e_T,  r_ρ = 0,  r_T = B_66·e_T
     ! =================================================================
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]     Block 4/4 (T, MatMult)..."
+      flush(6)
+    endif
     do j = 0, n-1
       call VecSet(e_j, 0.0d0, ierr)
-      call VecSetValue(e_j, int(j,PetscInt), 1.0d0, INSERT_VALUES, ierr)
+      call VecSetValue(e_j, j, 1.0d0, INSERT_VALUES, ierr)
       call VecAssemblyBegin(e_j, ierr);  call VecAssemblyEnd(e_j, ierr)
 
       ! r_ψ
@@ -761,10 +789,10 @@ contains
       ! seq_idxs = row index array [0..n4-1]; row_idx(1) = column index j.
       allocate(seq_idxs(n4))
       do j = 0, n4-1
-        seq_idxs(j+1) = int(j, PetscInt)
+        seq_idxs(j+1) = j
       enddo
       do j = 0, n4-1
-        row_idx(1) = int(j, PetscInt)
+        row_idx(1) = j
         call MatSetValues(A_exact, n4p, seq_idxs, 1, row_idx, &
                           A_dense(:, j+1), INSERT_VALUES, ierr)
       enddo
@@ -777,16 +805,27 @@ contains
     call petsc_mat_diff_norm(A_exact, g_ctx%A_reduced_4x4, &
                              "A_exact_4x4 - A_approx_4x4", norm_diff)
     call MatNorm(g_ctx%A_reduced_4x4, NORM_FROBENIUS, norm_approx, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') &
-      "[Physics PC]   ||A_exact - A_approx||_F / ||A_approx||_F = ", &
-      norm_diff / norm_approx
+    call MatNorm(A_exact,             NORM_FROBENIUS, norm_exact,  ierr)
+    if (my_id == 0) then
+      write(*,'(A,ES12.4)') "[Physics PC]   ||A_approx||_F        = ", norm_approx
+      write(*,'(A,ES12.4)') "[Physics PC]   ||A_exact||_F         = ", norm_exact
+      write(*,'(A,ES12.4)') &
+        "[Physics PC]   ||A_exact - A_approx||_F / ||A_approx||_F = ", &
+        norm_diff / norm_approx
+    endif
 
     ! Replace approximate operator and re-factor with MUMPS.
-    ! ksp_reduced already exists (PREONLY+LU+MUMPS) from assemble_monolithic_4x4 called first.
+    ! PCReset is required: KSPSetType/PCSetType are no-ops when the type is unchanged,
+    ! so they do NOT trigger re-factorization.  PCReset explicitly destroys the internal
+    ! MUMPS factorization, forcing a fresh numeric factorization on KSPSetUp.
     call MatDestroy(g_ctx%A_reduced_4x4, ierr)
     g_ctx%A_reduced_4x4 = A_exact
     call KSPSetOperators(g_ctx%ksp_reduced, g_ctx%A_reduced_4x4, g_ctx%A_reduced_4x4, ierr)
-    call KSPSetUp(g_ctx%ksp_reduced, ierr)
+    call KSPGetPC(g_ctx%ksp_reduced, pc_obj, ierr)
+    call PCReset(pc_obj, ierr)                                    ! destroy old MUMPS factorization
+    call PCSetType(pc_obj, PCLU, ierr)                            ! re-configure (type was cleared by Reset)
+    call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(g_ctx%ksp_reduced, ierr)                        ! new symbolic + numeric factor
 
     ! Cleanup local temporaries
     call VecScatterDestroy(scat,    ierr)
@@ -797,8 +836,10 @@ contains
     call VecDestroy(r_blk,   ierr)
     call VecDestroy(scratch, ierr)
 
-    if (my_id == 0) write(*,'(A)') &
-      "[Physics PC]   Exact probed 4x4 set up (PREONLY+LU+MUMPS)"
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]   Exact probed 4x4 set up (PREONLY+LU+MUMPS)"
+      flush(6)
+    endif
   end subroutine assemble_probed_exact_4x4
 
 
