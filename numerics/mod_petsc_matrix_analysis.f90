@@ -42,7 +42,8 @@ module mod_petsc_matrix_analysis
             petsc_mat_norms,           &
             petsc_mat_diff_norm,       &
             petsc_mat_convert_spectrum,&
-            petsc_mat_probe_spectrum
+            petsc_mat_probe_spectrum,  &
+            petsc_mat_equilibrate
 #ifdef USE_SLEPC
   public :: petsc_mat_eig_bounds,    &
             petsc_mat_cond_estimate, &
@@ -408,6 +409,176 @@ contains
       deallocate(eig_r, eig_i)
     endif
   end subroutine petsc_mat_probe_spectrum
+
+
+  !--------------------------------------------------------------------
+  !> Iterative max-norm equilibration of a distributed PETSc Mat.
+  !!
+  !! Two modes:
+  !!   symmetric = .false. (Ruiz algorithm):
+  !!     Finds separate row scaling D_r and column scaling D_c such that
+  !!     all rows and columns of D_r * A * D_c have max absolute value 1.
+  !!     Useful for general non-symmetric matrices.
+  !!
+  !!   symmetric = .true. (Knight-Ruiz-Ucar symmetry-preserving algorithm):
+  !!     Finds a single diagonal scaling D such that all rows (= columns)
+  !!     of D * A * D have max absolute value 1. The scaled matrix remains
+  !!     symmetric whenever A is symmetric.
+  !!
+  !! The matrix A is modified in-place.
+  !! dr_out and dc_out are the accumulated scalings: A_eq = D_r * A * D_c.
+  !! They are created by this routine; the caller must VecDestroy them.
+  !! For symmetric mode both contain the same values.
+  !!
+  !! Usage: to scale a right-hand side b and unscale solution x:
+  !!   b_scaled = diag(dr_out) * b
+  !!   x_orig   = diag(dc_out) * x_scaled
+  !--------------------------------------------------------------------
+  subroutine petsc_mat_equilibrate(A, label, symmetric, dr_out, dc_out)
+    implicit none
+    Mat,             intent(inout) :: A
+    character(len=*),intent(in)    :: label
+    logical,         intent(in)    :: symmetric
+    Vec,             intent(out)   :: dr_out, dc_out
+
+    PetscInt          :: M_global, N_global, rstart, rend, m_local
+    PetscInt          :: row_global, ncols, k
+    PetscInt, pointer :: row_cols(:)
+    PetscScalar, pointer :: row_vals(:)
+    PetscErrorCode    :: ierr
+    integer           :: comm, my_id, mpierr, iter, maxit, n_int, i
+    real*8            :: tol, aval, res_row, res_col
+    logical           :: conv
+
+    real*8, allocatable    :: r_local(:), c_global(:)
+    Vec                    :: u_r_vec, u_c_vec
+    PetscScalar, pointer   :: u_arr(:)
+
+    call PetscObjectGetComm(A, comm, ierr)
+    call MPI_Comm_rank(comm, my_id, mpierr)
+    call MatGetSize(A, M_global, N_global, ierr)
+    call MatGetOwnershipRange(A, rstart, rend, ierr)
+    m_local = rend - rstart
+    n_int   = int(N_global)
+
+    maxit = 100
+    tol   = 1.0d-8
+
+    allocate(r_local(int(m_local)), c_global(n_int))
+
+    ! Create output accumulation Vecs (parallel, matching A's row/column distributions).
+    ! MatCreateVecs(A, right=col-space, left=row-space, ierr)
+    call MatCreateVecs(A, dc_out, dr_out, ierr)
+    call VecSet(dr_out, 1.0d0, ierr)
+    call VecSet(dc_out, 1.0d0, ierr)
+
+    ! Per-iteration update Vecs
+    call VecDuplicate(dr_out, u_r_vec, ierr)
+    call VecDuplicate(dc_out, u_c_vec, ierr)
+
+    if (my_id == 0) then
+      write(*,'(A,A)') "[EQ] Equilibrating: ", trim(label)
+      if (symmetric) then
+        write(*,'(A)') "[EQ] Mode: symmetric (Knight-Ruiz-Ucar)"
+      else
+        write(*,'(A)') "[EQ] Mode: non-symmetric (Ruiz)"
+      endif
+    endif
+
+    conv = .false.
+    do iter = 1, maxit
+
+      ! --- Compute row max (local) and column max (accumulated globally) ---
+      r_local  = 0.0d0
+      c_global = 0.0d0
+
+      do i = 1, int(m_local)
+        row_global = rstart + (i - 1)
+        call MatGetRow(A, row_global, ncols, row_cols, row_vals, ierr)
+        do k = 1, int(ncols)
+          aval = abs(row_vals(k))
+          r_local(i) = max(r_local(i), aval)
+          ! row_cols is 0-based global; +1 for Fortran indexing
+          c_global(int(row_cols(k)) + 1) = max(c_global(int(row_cols(k)) + 1), aval)
+        enddo
+        call MatRestoreRow(A, row_global, ncols, row_cols, row_vals, ierr)
+      enddo
+
+      call MPI_Allreduce(MPI_IN_PLACE, c_global, n_int, MPI_DOUBLE_PRECISION, &
+                         MPI_MAX, comm, mpierr)
+
+      ! --- Check convergence: all row (and column) max should be ~1 ---
+      res_row = 0.0d0
+      do i = 1, int(m_local)
+        res_row = max(res_row, abs(r_local(i) - 1.0d0))
+      enddo
+      call MPI_Allreduce(MPI_IN_PLACE, res_row, 1, MPI_DOUBLE_PRECISION, &
+                         MPI_MAX, comm, mpierr)
+
+      if (symmetric) then
+        conv = res_row < tol
+      else
+        res_col = maxval(abs(c_global - 1.0d0))
+        conv = (res_row < tol) .and. (res_col < tol)
+      endif
+
+      if (my_id == 0 .and. mod(iter, 10) == 0) &
+        write(*,'(A,I3,A,ES10.2)') "[EQ]   iter ", iter, "  res_row = ", res_row
+
+      if (conv) then
+        if (my_id == 0) write(*,'(A,I3,A)') "[EQ] Converged in ", iter, " iterations."
+        exit
+      endif
+
+      ! --- Build update Vec u_r = 1/sqrt(r) (local rows) ---
+      call VecGetArrayF90(u_r_vec, u_arr, ierr)
+      do i = 1, int(m_local)
+        if (r_local(i) > 0.0d0) then
+          u_arr(i) = 1.0d0 / sqrt(r_local(i))
+        else
+          u_arr(i) = 1.0d0   ! zero row: no scaling
+        endif
+      enddo
+      call VecRestoreArrayF90(u_r_vec, u_arr, ierr)
+
+      if (symmetric) then
+        ! Same D applied to both sides: A ← D * A * D  (preserves symmetry)
+        call MatDiagonalScale(A, u_r_vec, u_r_vec, ierr)
+        call VecPointwiseMult(dr_out, dr_out, u_r_vec, ierr)
+      else
+        ! Non-symmetric: separate row/column scaling
+        ! Build u_c = 1/sqrt(c) for locally owned columns.
+        ! For square MPIAIJ, owned columns == owned rows: rstart..rend-1 (0-based).
+        call VecGetArrayF90(u_c_vec, u_arr, ierr)
+        do i = 1, int(m_local)
+          ! 0-based global column = rstart + i - 1  →  c_global index = rstart + i
+          if (c_global(int(rstart) + i) > 0.0d0) then
+            u_arr(i) = 1.0d0 / sqrt(c_global(int(rstart) + i))
+          else
+            u_arr(i) = 1.0d0   ! zero column: no scaling
+          endif
+        enddo
+        call VecRestoreArrayF90(u_c_vec, u_arr, ierr)
+
+        call MatDiagonalScale(A, u_r_vec, u_c_vec, ierr)
+        call VecPointwiseMult(dr_out, dr_out, u_r_vec, ierr)
+        call VecPointwiseMult(dc_out, dc_out, u_c_vec, ierr)
+      endif
+
+    enddo  ! iter
+
+    if (.not. conv .and. my_id == 0) &
+      write(*,'(A,I0,A)') "[EQ] WARNING: did not converge in ", maxit, " iterations."
+
+    ! For symmetric mode: dc_out holds same values as dr_out
+    if (symmetric) call VecCopy(dr_out, dc_out, ierr)
+
+    call VecDestroy(u_r_vec, ierr)
+    call VecDestroy(u_c_vec, ierr)
+    deallocate(r_local, c_global)
+
+    if (my_id == 0) write(*,'(A)') "[EQ] Equilibration done."
+  end subroutine petsc_mat_equilibrate
 
 
 #ifdef USE_SLEPC
