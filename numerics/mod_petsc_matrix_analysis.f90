@@ -447,7 +447,7 @@ contains
     PetscScalar, pointer :: row_vals(:)
     PetscErrorCode    :: ierr
     integer           :: comm, my_id, mpierr, iter, maxit, n_int, i
-    real*8            :: tol, aval, res_row, res_col
+    real*8            :: tol, aval, res_row, res_col = 0.0d0
     logical           :: conv
 
     real*8, allocatable    :: r_local(:), c_global(:)
@@ -474,7 +474,7 @@ contains
 
     ! Per-iteration update Vecs
     call VecDuplicate(dr_out, u_r_vec, ierr)
-    call VecDuplicate(dc_out, u_c_vec, ierr)
+    if (.not. symmetric) call VecDuplicate(dc_out, u_c_vec, ierr)
 
     if (my_id == 0) then
       write(*,'(A,A)') "[EQ] Equilibrating: ", trim(label)
@@ -507,10 +507,11 @@ contains
       call MPI_Allreduce(MPI_IN_PLACE, c_global, n_int, MPI_DOUBLE_PRECISION, &
                          MPI_MAX, comm, mpierr)
 
-      ! --- Check convergence: all row (and column) max should be ~1 ---
+      ! --- Check convergence: all non-zero rows (and columns) max should be ~1 ---
       res_row = 0.0d0
       do i = 1, int(m_local)
-        res_row = max(res_row, abs(r_local(i) - 1.0d0))
+        if (r_local(i) > 0.0d0) &
+          res_row = max(res_row, abs(r_local(i) - 1.0d0))
       enddo
       call MPI_Allreduce(MPI_IN_PLACE, res_row, 1, MPI_DOUBLE_PRECISION, &
                          MPI_MAX, comm, mpierr)
@@ -518,7 +519,11 @@ contains
       if (symmetric) then
         conv = res_row < tol
       else
-        res_col = maxval(abs(c_global - 1.0d0))
+        res_col = 0.0d0
+        do i = 1, n_int
+          if (c_global(i) > 0.0d0) &
+            res_col = max(res_col, abs(c_global(i) - 1.0d0))
+        enddo
         conv = (res_row < tol) .and. (res_col < tol)
       endif
 
@@ -574,7 +579,7 @@ contains
     if (symmetric) call VecCopy(dr_out, dc_out, ierr)
 
     call VecDestroy(u_r_vec, ierr)
-    call VecDestroy(u_c_vec, ierr)
+    if (.not. symmetric) call VecDestroy(u_c_vec, ierr)
     deallocate(r_local, c_global)
 
     if (my_id == 0) write(*,'(A)') "[EQ] Equilibration done."
