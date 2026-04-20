@@ -528,11 +528,14 @@ contains
     Mat            :: A_exact, diag_55, diag_66
     PC             :: pc_obj
     PetscInt       :: N_global, n4p, m_local_4v
+    PetscInt       :: rstart_1v_p, rend_1v_p
     PetscErrorCode :: ierr
     PetscScalar, pointer :: arr(:)
-    PetscInt, allocatable :: seq_idxs(:)   ! sequential 0..n4-1, used as both row and col idx sets
+    PetscInt, allocatable :: interleaved_idxs(:)  ! block-contiguous → 4N interleaved global index
     PetscInt       :: row_idx(1)
-    integer        :: n, n4, j
+    integer        :: n, n4, j, p, j_loc, kb
+    integer        :: nproc, mpierr, n_local_1v
+    integer, allocatable :: n_local_arr(:), rstart_arr(:)
     real*8, allocatable :: A_dense(:,:)
     PetscReal      :: norm_approx, norm_diff, norm_exact
 
@@ -557,6 +560,40 @@ contains
     call VecDuplicate(e_j, r_blk,   ierr)
     call VecDuplicate(e_j, scratch, ierr)
     call VecScatterCreateToZero(e_j, scat, r_seq, ierr)
+
+    ! Build mapping: block-contiguous 4N index → interleaved 4N global index.
+    ! For P=1 these are identical; for P>1 the 4N matrix layout produced by
+    ! MatConvert(MATNEST→MATMPIAIJ) interleaves variable blocks per process:
+    !   process p owns [rstart_4v_p .. rstart_4v_p + 4*nloc_p - 1] where
+    !   rstart_4v_p = 4 * rstart_1v_p and within that range variable k (0-based)
+    !   occupies [rstart_4v_p + k*nloc_p .. rstart_4v_p + (k+1)*nloc_p - 1].
+    ! Block-contiguous index kb*n + j_global maps to interleaved index:
+    !   4*rstart_1v[p] + kb*nloc[p] + (j_global - rstart_1v[p])
+    ! where p is the process owning j_global in the 1-variable distribution.
+    call MPI_Comm_size(comm, nproc, mpierr)
+    call VecGetOwnershipRange(e_j, rstart_1v_p, rend_1v_p, ierr)
+    n_local_1v = int(rend_1v_p - rstart_1v_p)
+    allocate(n_local_arr(nproc), rstart_arr(nproc+1))
+    call MPI_Allgather(n_local_1v, 1, MPI_INTEGER, n_local_arr, 1, MPI_INTEGER, comm, mpierr)
+    rstart_arr(1) = 0
+    do p = 1, nproc
+      rstart_arr(p+1) = rstart_arr(p) + n_local_arr(p)
+    enddo
+
+    ! Build interleaved_idxs on rank 0 (only rank 0 inserts into A_exact)
+    if (my_id == 0) then
+      allocate(interleaved_idxs(n4))
+      p = 1
+      do j_loc = 0, n-1
+        do while (j_loc >= rstart_arr(p+1))
+          p = p + 1
+        enddo
+        do kb = 0, 3
+          interleaved_idxs(kb*n + j_loc + 1) = &
+            4*rstart_arr(p) + kb*n_local_arr(p) + (j_loc - rstart_arr(p))
+        enddo
+      enddo
+    endif
 
     if (my_id == 0) then
       allocate(A_dense(n4, n4))
@@ -798,19 +835,17 @@ contains
     call MatSetUp(A_exact, ierr)
 
     if (my_id == 0) then
-      ! Insert column by column: A_dense(:, j+1) is contiguous (Fortran column-major).
-      ! seq_idxs = row index array [0..n4-1]; row_idx(1) = column index j.
-      allocate(seq_idxs(n4))
+      ! Insert column j (block-contiguous) into interleaved column interleaved_idxs(j+1).
+      ! Row indices are also remapped via interleaved_idxs so that A_dense(i, j+1) —
+      ! which holds S(bc_row=i-1, bc_col=j) — lands at A_exact(interleaved(i-1), interleaved(j)).
       do j = 0, n4-1
-        seq_idxs(j+1) = j
-      enddo
-      do j = 0, n4-1
-        row_idx(1) = j
-        call MatSetValues(A_exact, n4p, seq_idxs, 1, row_idx, &
+        row_idx(1) = interleaved_idxs(j+1)
+        call MatSetValues(A_exact, n4p, interleaved_idxs, 1, row_idx, &
                           A_dense(:, j+1), INSERT_VALUES, ierr)
       enddo
-      deallocate(seq_idxs, A_dense)
+      deallocate(interleaved_idxs, A_dense)
     endif
+    deallocate(n_local_arr, rstart_arr)
     call MatAssemblyBegin(A_exact, MAT_FINAL_ASSEMBLY, ierr)
     call MatAssemblyEnd  (A_exact, MAT_FINAL_ASSEMBLY, ierr)
 
