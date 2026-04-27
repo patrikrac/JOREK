@@ -492,16 +492,16 @@ contains
 
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
-      PetscCallA(KSPSetType(petsc_sys%ksp, KSPDGMRES, ierr))
+      PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
       ! Set the maximum iterations and restart
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
 
       if (use_physics_pc) then
-        if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + Physics PCSHELL"
+        if (my_id .eq. 0) write(*,*) "[PETSc] setup: GMRES + Physics PCSHELL"
       else
-        if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + PCFIELDSPLIT + MUMPS"
+        if (my_id .eq. 0) write(*,*) "[PETSc] setup: GMRES + PCFIELDSPLIT + MUMPS"
       endif
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
