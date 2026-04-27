@@ -534,8 +534,8 @@ do ms=1, n_gauss
                        + dvisco_dT * T * ( v_x * w0_x + v_y * w0_y ) * BigR * xjac * theta * tstep
 
 !------------------------------------------------------------ equation 3
-             amat_33 = v * zj * BigR * xjac                                
-             amat_31 = (v_x * psi_x + v_y * psi_y ) * BigR * xjac + 2.d0 * v * psi_x * BigR * xjac          
+             amat_33 = v * zj / BigR * xjac                                
+             amat_31 = (v_x * psi_x + v_y * psi_y ) / BigR * xjac !+ 2.d0 * v * psi_x * BigR * xjac          
 
 !------------------------------------------------------------ equation 4
              amat_44 =  v * w * BigR * xjac                                
