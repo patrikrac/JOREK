@@ -55,6 +55,10 @@ module mod_petsc_pc_physics
     !! Atilde_11 = B_11 - B_13 * D_j^{-1} * B_31
     !! Atilde_22 = B_22 - B_24 * D_w^{-1} * B_42
     Mat :: Atilde_11, Atilde_22
+    Mat :: K_psi_correction
+    logical :: psi_correction_ready = .false.
+    Mat :: K_u_correction
+    logical :: u_correction_ready = .false.
     !! Off-diagonal (psi-column and u-column get corrections):
     !! Atilde_21 = B_21 - B_23 * D_j^{-1} * B_31
     !! Atilde_61 = B_61 - B_63 * D_j^{-1} * B_31
@@ -287,6 +291,47 @@ contains
     call MatDestroy(C, ierr)
   end subroutine compute_schur_corrected_block_diag
 
+
+  subroutine compute_schur_corrected_block_psi(B_diag, B_coupling, B_constraint, &
+                                            diag_M_inv, Atilde, first_time)
+
+    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
+    Vec, intent(in)    :: diag_M_inv
+    Mat, intent(inout) :: Atilde
+    logical, intent(in) :: first_time
+
+    PetscErrorCode :: ierr
+
+    if (.not. first_time) call MatDestroy(Atilde, ierr)
+    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
+
+    if (g_ctx%psi_correction_ready) then
+      call MatAXPY(Atilde, -1.0d0, g_ctx%K_psi_correction, DIFFERENT_NONZERO_PATTERN, ierr) !TODO: In principle they have the same non-zero pattern but in practice PETSc might drop some entires which would lead to a different pattern. No idea if that impacts anything?
+    else
+      write(*,*) "[Physics PC]     ERROR: Schur correction block required!"
+    endif
+  end subroutine compute_schur_corrected_block_psi
+
+
+  subroutine compute_schur_corrected_block_u(B_diag, B_coupling, B_constraint, &
+                                            diag_M_inv, Atilde, first_time)
+
+    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
+    Vec, intent(in)    :: diag_M_inv
+    Mat, intent(inout) :: Atilde
+    logical, intent(in) :: first_time
+
+    PetscErrorCode :: ierr
+
+    if (.not. first_time) call MatDestroy(Atilde, ierr)
+    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
+
+    if (g_ctx%u_correction_ready) then
+      call MatAXPY(Atilde, -1.0d0, g_ctx%K_u_correction, DIFFERENT_NONZERO_PATTERN, ierr) !TODO: In principle they have the same non-zero pattern but in practice PETSc might drop some entires which would lead to a different pattern. No idea if that impacts anything?
+    else
+      write(*,*) "[Physics PC]     ERROR: Schur correction block required!"
+    endif
+  end subroutine compute_schur_corrected_block_u
 
   !--------------------------------------------------------------------
   !> Compute a Schur-corrected diagonal block using block diagonal inverse:
@@ -906,6 +951,7 @@ contains
     use mod_parameters, only: n_var, n_tor, n_degrees, var_psi, var_u, var_zj, var_w, var_rho, var_T
     use phys_module, only: physics_pc_reassemble, debug_physics_pc, physics_pc_monolithic, &
                            physics_pc_schur_u, physics_pc_probe_exact
+    use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate
 
     Mat, intent(in) :: A_full
 
@@ -915,6 +961,9 @@ contains
     logical :: first_time, use_reassembled
     PetscReal :: norm_val
     Mat :: diag_11, diag_22, diag_55, diag_66  ! pointers to chosen diagonal blocks
+
+    !Mat :: A_eq
+    !Vec :: dr, dc
 
     call PetscObjectGetComm(A_full, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
@@ -1037,13 +1086,15 @@ contains
     ! --- Step 4b: Form Schur-corrected blocks using diagonal M^{-1} ---
     ! Choose diagonal blocks: reassembled (R_*) or extracted (B_*)
     if (use_reassembled) then
-      call compute_schur_corrected_block_diag(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
+      call compute_schur_corrected_block_psi(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
                                           g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
       call compute_schur_corrected_block_diag(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
                                           g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
     else
-      call compute_schur_corrected_block_diag(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
+      !compute_schur_corrected_block_psi
+      call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
                                           g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
+      !compute_schur_corrected_block_u
       call compute_schur_corrected_block_diag(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
                                           g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
     endif
@@ -1085,8 +1136,19 @@ contains
       ! When probe_exact=.true., monolithic only builds A_approx for the diagnostic;
       ! the KSP is owned entirely by assemble_probed_exact_4x4 (avoids stale-factor issues).
       call assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, physics_pc_probe_exact)
-      if (physics_pc_probe_exact) &
+
+      if (debug_physics_pc) then
+        ! call MatDuplicate(g_ctx%A_reduced_4x4, MAT_COPY_VALUES, A_eq, ierr)
+        ! call petsc_mat_equilibrate(A_eq, "A_reduced_4x4", .false., dr, dc)
+        ! call petsc_mat_convert_spectrum(A_eq, "A_reduced_4x4", .false.)
+        ! call VecDestroy(dr, ierr);  call VecDestroy(dc, ierr)
+        ! call MatDestroy(A_eq, ierr)
+      endif
+
+      if (physics_pc_probe_exact) then
         call assemble_probed_exact_4x4(use_reassembled, comm, first_time, my_id)
+        !call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_exact_4x4", .false.)
+      endif
     else
       ! Block-diagonal mode: 4 separate sub-KSPs
       call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time)
@@ -1395,6 +1457,8 @@ contains
     call petsc_create_pc_matrix(g_ctx%A_w,    a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%A_jpsi, a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%A_wu,   a_mat, 1)
+    call petsc_create_pc_matrix(g_ctx%K_psi_correction, a_mat, 1)
+    call petsc_create_pc_matrix(g_ctx%K_u_correction, a_mat, 1)
   end subroutine petsc_create_pc_matrices
 
 
@@ -1421,11 +1485,18 @@ contains
       PetscCallA(MatZeroEntries(g_ctx%A_w,    ierr))
       PetscCallA(MatZeroEntries(g_ctx%A_jpsi, ierr))
       PetscCallA(MatZeroEntries(g_ctx%A_wu,   ierr))
+      PetscCallA(MatZeroEntries(g_ctx%K_psi_correction, ierr))
+      PetscCallA(MatZeroEntries(g_ctx%K_u_correction, ierr))
     endif
 
     call construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat, &
                                         g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
     g_ctx%matrices_ready = .true.
+
+    call construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
+                                        g_ctx%K_psi_correction, g_ctx%K_u_correction)
+    g_ctx%psi_correction_ready = .true. 
+    g_ctx%u_correction_ready = .true. 
 
     if (first_assembly .and. debug_physics_pc) then
       call petsc_analyze_pc_matrices(my_id)
