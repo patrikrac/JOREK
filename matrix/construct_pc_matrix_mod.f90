@@ -19,7 +19,7 @@ use petsc
 #endif
 implicit none
 public :: construct_pc_elliptic_matrices, construct_pc_diagonal_matrices, apply_bc_pc_matrix
-public :: construct_schur_correction_matrices
+public :: construct_schur_correction_matrices, zero_bc_rows_pc_matrix
 
 contains
 
@@ -712,21 +712,19 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   deallocate(buf1v_thr)
 
 #ifdef USE_PETSC
-  ! Flush element contributions (ADD_VALUES) before BCs (INSERT_VALUES)
-  call MatAssemblyBegin(K_psi_correction,   MAT_FLUSH_ASSEMBLY, petsc_ierr)
-  call MatAssemblyBegin(K_u_correction,   MAT_FLUSH_ASSEMBLY, petsc_ierr)
-  call MatAssemblyEnd  (K_psi_correction,   MAT_FLUSH_ASSEMBLY, petsc_ierr)
-  call MatAssemblyEnd  (K_u_correction,   MAT_FLUSH_ASSEMBLY, petsc_ierr)
-
-  ! Apply BCs to mass matrices only (not off-diagonal couplings A_jpsi, A_wu)
-  !call apply_bc_pc_matrix(K_psi_correction, 1, local_elms, n_local_elms, my_ind_min, my_ind_max)
-  !call apply_bc_pc_matrix(K_u_correction, 2, local_elms, n_local_elms, my_ind_min, my_ind_max)
-
-  ! Final assembly
-  call MatAssemblyBegin(K_psi_correction,   MAT_FINAL_ASSEMBLY, petsc_ierr)
+  ! Final assembly of element contributions before zeroing boundary rows.
+  ! MatZeroRows requires the matrix to be fully assembled.
+  call MatAssemblyBegin(K_psi_correction, MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyBegin(K_u_correction,   MAT_FINAL_ASSEMBLY, petsc_ierr)
-  call MatAssemblyEnd  (K_psi_correction,   MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (K_psi_correction, MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyEnd  (K_u_correction,   MAT_FINAL_ASSEMBLY, petsc_ierr)
+
+  ! Zero rows of constrained boundary DOFs so that
+  !   Atilde = B - K
+  ! preserves B's BC enforcement (B already has ZBIG/elm_diag on those rows;
+  ! K must contribute nothing — neither diagonal nor off-diagonal — there).
+  call zero_bc_rows_pc_matrix(K_psi_correction, 1, local_elms, n_local_elms, my_ind_min, my_ind_max)
+  call zero_bc_rows_pc_matrix(K_u_correction,   2, local_elms, n_local_elms, my_ind_min, my_ind_max)
 #endif
 
 end subroutine construct_schur_correction_matrices
@@ -846,5 +844,126 @@ subroutine apply_bc_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
   enddo      ! i
 
 end subroutine apply_bc_pc_matrix
+
+
+!--------------------------------------------------------------------
+!> Zero out the rows of a 1-variable PC matrix that correspond to
+!! constrained boundary DOFs.
+!!
+!! Used for matrices that are SUBTRACTED from a B-block which already
+!! has BCs enforced (e.g. the Schur correction matrices K_psi, K_u).
+!! Setting those rows to exactly zero ensures `Atilde = B - K` keeps
+!! B's boundary equations untouched. Using a ZBIG diagonal here would
+!! cancel B's ZBIG diagonal during the subtraction; using zero is
+!! correct only when K is consumed via subtraction from a BC-enforced
+!! matrix.
+!!
+!! Constrained DOFs per boundary type (matching apply_bc_pc_matrix):
+!!   type 1 (open field lines):  i_order ∈ {1, 2}  (value, ds)
+!!   type 2 (wall-aligned):      i_order ∈ {1, 3}  (value, dt)
+!!   type 3 (corner):            i_order ∈ {1, 2, 3}
+!! Toroidal modes flagged by `is_freebound(in, var_index)` are skipped.
+!--------------------------------------------------------------------
+subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
+                                   my_ind_min, my_ind_max)
+
+  use mod_parameters,   only: n_tor, n_vertex_max, n_order
+  use nodes_elements,   only: node_list, element_list
+  use mod_node_indices, only: calculate_node_indices
+  use vacuum,           only: is_freebound
+
+  implicit none
+
+#ifdef USE_PETSC
+  Mat, intent(inout) :: pc_mat
+#endif
+  integer, intent(in) :: var_index
+  integer, intent(in) :: local_elms(:)
+  integer, intent(in) :: n_local_elms
+  integer, intent(in) :: my_ind_min, my_ind_max
+
+  integer :: i, in, iv, inode, ielm
+  integer :: index_node, index_tmp, kk, ll, iv_dir
+  integer :: node_indices((n_order+1)/2, (n_order+1)/2)
+  logical :: skip_mode(n_tor)
+
+#ifdef USE_PETSC
+  PetscInt, allocatable :: rows_to_zero(:)
+  PetscInt              :: n_rows_to_zero
+  PetscInt              :: cap
+  PetscErrorCode        :: petsc_ierr
+
+  call calculate_node_indices(node_indices)
+
+  ! is_freebound depends only on (in, var_index); precompute once.
+  do in = 1, n_tor
+    skip_mode(in) = is_freebound(in, var_index)
+  enddo
+
+  ! Upper bound: each local element contributes up to n_vertex_max nodes,
+  ! each with up to 3 constrained DOFs across n_tor modes.
+  cap = n_local_elms * n_vertex_max * 3 * n_tor
+  if (cap < 1) cap = 1
+  allocate(rows_to_zero(cap))
+  n_rows_to_zero = 0
+
+  do i = 1, n_local_elms
+    ielm = local_elms(i)
+    do iv = 1, n_vertex_max
+      inode = element_list%element(ielm)%vertex(iv)
+
+      if (node_list%node(inode)%boundary .eq. 0) cycle
+
+      do in = 1, n_tor
+        if (skip_mode(in)) cycle
+
+        !--- Open field lines: constrain value + ds DOFs
+        if ((node_list%node(inode)%boundary .eq. 1) .or. &
+            (node_list%node(inode)%boundary .eq. 3)) then
+          iv_dir = 2
+          do kk = 1, (n_order+1)/2
+            if ((iv_dir .eq. 3) .and. (kk .gt. 1)) cycle
+            do ll = 1, (n_order+1)/2
+              if ((iv_dir .eq. 2) .and. (ll .gt. 1)) cycle
+              index_tmp  = node_indices(kk, ll)
+              index_node = node_list%node(inode)%index(index_tmp)
+              if ((index_node .lt. my_ind_min) .or. (index_node .gt. my_ind_max)) cycle
+              n_rows_to_zero = n_rows_to_zero + 1
+              rows_to_zero(n_rows_to_zero) = n_tor * (index_node - 1) + (in - 1)
+            enddo
+          enddo
+        endif
+
+        !--- Wall-aligned with flux surface: constrain value + dt DOFs
+        if ((node_list%node(inode)%boundary .eq. 2) .or. &
+            (node_list%node(inode)%boundary .eq. 3)) then
+          iv_dir = 3
+          do kk = 1, (n_order+1)/2
+            if ((iv_dir .eq. 3) .and. (kk .gt. 1)) cycle
+            do ll = 1, (n_order+1)/2
+              if ((iv_dir .eq. 2) .and. (ll .gt. 1)) cycle
+              index_tmp  = node_indices(kk, ll)
+              index_node = node_list%node(inode)%index(index_tmp)
+              if ((index_node .lt. my_ind_min) .or. (index_node .gt. my_ind_max)) cycle
+              n_rows_to_zero = n_rows_to_zero + 1
+              rows_to_zero(n_rows_to_zero) = n_tor * (index_node - 1) + (in - 1)
+            enddo
+          enddo
+        endif
+
+      enddo  ! in
+    enddo    ! iv
+  enddo      ! i
+
+  ! Collective: every rank must call MatZeroRows even with n=0.
+  ! Diag value = 0  →  the rows become identically zero (no diagonal injection).
+  ! Duplicates in rows_to_zero are harmless (idempotent).
+  call MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 0.0d0, &
+                   PETSC_NULL_VEC, PETSC_NULL_VEC, petsc_ierr)
+
+  deallocate(rows_to_zero)
+#endif
+
+end subroutine zero_bc_rows_pc_matrix
 
 end module construct_pc_matrix_mod
