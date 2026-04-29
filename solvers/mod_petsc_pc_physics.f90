@@ -63,6 +63,11 @@ module mod_petsc_pc_physics
     !! Atilde_21 = B_21 - B_23 * D_j^{-1} * B_31
     !! Atilde_61 = B_61 - B_63 * D_j^{-1} * B_31
     Mat :: Atilde_21, Atilde_61
+    !! Element-assembled approximations for the off-diagonal Schur corrections
+    !! (alternative to the diagonal-mass-inverse path; integrand TBD)
+    Mat :: K_21_correction, K_61_correction
+    logical :: correction_21_ready = .false.
+    logical :: correction_61_ready = .false.
 
     !> Inner Schur complement: S_u = Atilde_22 - Atilde_21 * diag(Atilde_11)^{-1} * B_12
     Mat :: S_u
@@ -332,6 +337,46 @@ contains
       write(*,*) "[Physics PC]     ERROR: Schur correction block required!"
     endif
   end subroutine compute_schur_corrected_block_u
+
+
+  !> Off-diagonal Schur correction Atilde_21 = B_21 - K_21_correction
+  !! (element-assembled approximation of B_23 * M_j^{-1} * B_31).
+  subroutine compute_schur_corrected_block_21(B_diag, Atilde, first_time)
+    Mat, intent(in)    :: B_diag
+    Mat, intent(inout) :: Atilde
+    logical, intent(in) :: first_time
+
+    PetscErrorCode :: ierr
+
+    if (.not. first_time) call MatDestroy(Atilde, ierr)
+    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
+
+    if (g_ctx%correction_21_ready) then
+      call MatAXPY(Atilde, -1.0d0, g_ctx%K_21_correction, DIFFERENT_NONZERO_PATTERN, ierr)
+    else
+      write(*,*) "[Physics PC]     ERROR: Schur correction block 21 required!"
+    endif
+  end subroutine compute_schur_corrected_block_21
+
+
+  !> Off-diagonal Schur correction Atilde_61 = B_61 - K_61_correction
+  !! (element-assembled approximation of B_63 * M_j^{-1} * B_31).
+  subroutine compute_schur_corrected_block_61(B_diag, Atilde, first_time)
+    Mat, intent(in)    :: B_diag
+    Mat, intent(inout) :: Atilde
+    logical, intent(in) :: first_time
+
+    PetscErrorCode :: ierr
+
+    if (.not. first_time) call MatDestroy(Atilde, ierr)
+    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
+
+    if (g_ctx%correction_61_ready) then
+      call MatAXPY(Atilde, -1.0d0, g_ctx%K_61_correction, DIFFERENT_NONZERO_PATTERN, ierr)
+    else
+      write(*,*) "[Physics PC]     ERROR: Schur correction block 61 required!"
+    endif
+  end subroutine compute_schur_corrected_block_61
 
   !--------------------------------------------------------------------
   !> Compute a Schur-corrected diagonal block using block diagonal inverse:
@@ -1099,11 +1144,10 @@ contains
                                           g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
     endif
 
-    ! Off-diagonal Schur corrections (always from extracted blocks)
-    call compute_schur_corrected_block_diag(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
-                                        g_ctx%diag_Mj_inv, g_ctx%Atilde_21, first_time)
-    call compute_schur_corrected_block_diag(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
-                                        g_ctx%diag_Mj_inv, g_ctx%Atilde_61, first_time)
+    ! Off-diagonal Schur corrections from element-assembled K_21 / K_61
+    ! (revert to compute_schur_corrected_block_diag(B_*, B_*3, B_31, diag_Mj_inv, ...) for the diagonal-mass path)
+    call compute_schur_corrected_block_21(g_ctx%B_21, g_ctx%Atilde_21, first_time)
+    call compute_schur_corrected_block_61(g_ctx%B_61, g_ctx%Atilde_61, first_time)
 
     if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (diag M^{-1})"
 
@@ -1459,6 +1503,8 @@ contains
     call petsc_create_pc_matrix(g_ctx%A_wu,   a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%K_psi_correction, a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%K_u_correction, a_mat, 1)
+    call petsc_create_pc_matrix(g_ctx%K_21_correction,  a_mat, 1)
+    call petsc_create_pc_matrix(g_ctx%K_61_correction,  a_mat, 1)
   end subroutine petsc_create_pc_matrices
 
 
@@ -1487,6 +1533,8 @@ contains
       PetscCallA(MatZeroEntries(g_ctx%A_wu,   ierr))
       PetscCallA(MatZeroEntries(g_ctx%K_psi_correction, ierr))
       PetscCallA(MatZeroEntries(g_ctx%K_u_correction, ierr))
+      PetscCallA(MatZeroEntries(g_ctx%K_21_correction,  ierr))
+      PetscCallA(MatZeroEntries(g_ctx%K_61_correction,  ierr))
     endif
 
     call construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat, &
@@ -1494,9 +1542,12 @@ contains
     g_ctx%matrices_ready = .true.
 
     call construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
-                                        g_ctx%K_psi_correction, g_ctx%K_u_correction)
-    g_ctx%psi_correction_ready = .true. 
-    g_ctx%u_correction_ready = .true. 
+                                        g_ctx%K_psi_correction, g_ctx%K_u_correction, &
+                                        g_ctx%K_21_correction,  g_ctx%K_61_correction)
+    g_ctx%psi_correction_ready  = .true.
+    g_ctx%u_correction_ready    = .true.
+    g_ctx%correction_21_ready   = .true.
+    g_ctx%correction_61_ready   = .true.
 
     if (first_assembly .and. debug_physics_pc) then
       call petsc_analyze_pc_matrices(my_id)

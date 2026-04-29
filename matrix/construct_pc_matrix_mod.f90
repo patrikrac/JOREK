@@ -527,12 +527,14 @@ end subroutine construct_pc_diagonal_matrices
 !> Assemble the Schur correction matrices.
 !!
 subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
-                                          K_psi_correction, K_u_correction)
+                                          K_psi_correction, K_u_correction,        &
+                                          K_21_correction,  K_61_correction)
 
   use mod_elt_matrix_elliptic
-  use mod_parameters, only: n_tor, n_degrees, n_vertex_max
+  use mod_parameters, only: n_tor, n_degrees, n_vertex_max, var_psi, var_u, var_T
   use data_structure,  only: type_SP_MATRIX, type_element, type_node
   use nodes_elements
+  use phys_module,     only: eliminate_boundary_dofs
   use omp_lib
 
   implicit none
@@ -543,6 +545,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   type(type_SP_MATRIX), intent(in) :: a_mat
 #ifdef USE_PETSC
   Mat, intent(inout) :: K_psi_correction, K_u_correction
+  Mat, intent(inout) :: K_21_correction,  K_61_correction
 #endif
 
   ! --- Ownership range for this process ---
@@ -562,6 +565,8 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   real*8, allocatable :: ELM_wu_thr  (:,:,:)
   real*8, allocatable :: ELM_psi_correction_thr(:,:,:)
   real*8, allocatable :: ELM_u_correction_thr(:,:,:)
+  real*8, allocatable :: ELM_21_correction_thr (:,:,:)
+  real*8, allocatable :: ELM_61_correction_thr (:,:,:)
   real*8, allocatable :: buf1v_thr(:,:)
 
   integer :: nthreads, omp_tid
@@ -605,6 +610,8 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   allocate(ELM_wu_thr   (D1V_CM, D1V_CM, nthreads))
   allocate(ELM_psi_correction_thr (D1V_CM, D1V_CM, nthreads))
   allocate(ELM_u_correction_thr (D1V_CM, D1V_CM, nthreads))
+  allocate(ELM_21_correction_thr  (D1V_CM, D1V_CM, nthreads))
+  allocate(ELM_61_correction_thr  (D1V_CM, D1V_CM, nthreads))
   allocate(buf1v_thr    (bs1*bs1, nthreads))
 
   !$omp parallel &
@@ -612,9 +619,10 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   !$omp   shared(n_local_elms, local_elms, element_list, node_list, a_mat, my_ind_min, my_ind_max, bs1, &
   !$omp          element_thr, nodes_thr, node_out_thr, &
   !$omp          ELM_j_thr, ELM_w_thr, ELM_jpsi_thr, ELM_wu_thr, ELM_psi_correction_thr, ELM_u_correction_thr, &
+  !$omp          ELM_21_correction_thr, ELM_61_correction_thr, &
   !$omp          buf1v_thr &
 #ifdef USE_PETSC
-  !$omp          , K_psi_correction, K_u_correction &
+  !$omp          , K_psi_correction, K_u_correction, K_21_correction, K_61_correction &
 #endif
   !$omp         ) &
   !$omp   private(ife, ielm, iv, inode, omp_tid, &
@@ -649,7 +657,9 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
                                   ELM_j_thr(:,:,omp_tid),    ELM_w_thr(:,:,omp_tid), &
                                   ELM_jpsi_thr(:,:,omp_tid), ELM_wu_thr(:,:,omp_tid), &
                                   ELM_psi_correction=ELM_psi_correction_thr(:,:,omp_tid), &
-                                  ELM_u_correction=ELM_u_correction_thr(:,:,omp_tid))
+                                  ELM_u_correction=ELM_u_correction_thr(:,:,omp_tid), &
+                                  ELM_21_correction=ELM_21_correction_thr(:,:,omp_tid), &
+                                  ELM_61_correction=ELM_61_correction_thr(:,:,omp_tid))
 
 #ifdef USE_PETSC
     ! --- Insert element blocks into PETSc matrices (all four are 1-var) ---
@@ -683,7 +693,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
                                      buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
             !$omp end critical
 
-                        ! --- Extract and insert 1-var block for K_psi_correction ---
+            ! --- Extract and insert 1-var block for K_u_correction ---
             buf1v_thr(:,omp_tid) = 0.d0
             do j = 1, bs1
               idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
@@ -694,6 +704,34 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
             enddo
             !$omp critical
             call MatSetValuesBlocked(K_u_correction, 1, idxm, 1, idxn, &
+                                     buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
+            !$omp end critical
+
+            ! --- Extract and insert 1-var block for K_21_correction (u-eq, psi-col) ---
+            buf1v_thr(:,omp_tid) = 0.d0
+            do j = 1, bs1
+              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+              do l = 1, bs1
+                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_21_correction_thr(idx_ij, idx_kl, omp_tid)
+              enddo
+            enddo
+            !$omp critical
+            call MatSetValuesBlocked(K_21_correction, 1, idxm, 1, idxn, &
+                                     buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
+            !$omp end critical
+
+            ! --- Extract and insert 1-var block for K_61_correction (T-eq, psi-col) ---
+            buf1v_thr(:,omp_tid) = 0.d0
+            do j = 1, bs1
+              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+              do l = 1, bs1
+                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_61_correction_thr(idx_ij, idx_kl, omp_tid)
+              enddo
+            enddo
+            !$omp critical
+            call MatSetValuesBlocked(K_61_correction, 1, idxm, 1, idxn, &
                                      buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
             !$omp end critical
           enddo  ! k_order
@@ -709,6 +747,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
 
   deallocate(element_thr, nodes_thr, node_out_thr)
   deallocate(ELM_j_thr, ELM_w_thr, ELM_jpsi_thr, ELM_wu_thr, ELM_psi_correction_thr, ELM_u_correction_thr)
+  deallocate(ELM_21_correction_thr, ELM_61_correction_thr)
   deallocate(buf1v_thr)
 
 #ifdef USE_PETSC
@@ -716,15 +755,25 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   ! MatZeroRows requires the matrix to be fully assembled.
   call MatAssemblyBegin(K_psi_correction, MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyBegin(K_u_correction,   MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(K_21_correction,  MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(K_61_correction,  MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyEnd  (K_psi_correction, MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyEnd  (K_u_correction,   MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (K_21_correction,  MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (K_61_correction,  MAT_FINAL_ASSEMBLY, petsc_ierr)
 
   ! Zero rows of constrained boundary DOFs so that
   !   Atilde = B - K
   ! preserves B's BC enforcement (B already has ZBIG/elm_diag on those rows;
   ! K must contribute nothing — neither diagonal nor off-diagonal — there).
-  call zero_bc_rows_pc_matrix(K_psi_correction, 1, local_elms, n_local_elms, my_ind_min, my_ind_max)
-  call zero_bc_rows_pc_matrix(K_u_correction,   2, local_elms, n_local_elms, my_ind_min, my_ind_max)
+  ! Only needed when eliminate_boundary_dofs is active in the global matrix,
+  ! since that mode uses elm-diagonal scaling (not ZBIG) for BC rows.
+  if (eliminate_boundary_dofs) then
+    call zero_bc_rows_pc_matrix(K_psi_correction, var_psi, local_elms, n_local_elms, my_ind_min, my_ind_max)
+    call zero_bc_rows_pc_matrix(K_u_correction,   var_u,   local_elms, n_local_elms, my_ind_min, my_ind_max)
+    call zero_bc_rows_pc_matrix(K_21_correction,  var_u,   local_elms, n_local_elms, my_ind_min, my_ind_max)
+    call zero_bc_rows_pc_matrix(K_61_correction,  var_T,   local_elms, n_local_elms, my_ind_min, my_ind_max)
+  endif
 #endif
 
 end subroutine construct_schur_correction_matrices
