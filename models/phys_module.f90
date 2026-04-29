@@ -157,6 +157,7 @@ module phys_module
   logical :: physics_pc_monolithic  !< Monolithic 4x4 solve (stage-one Schur elimination test)
   logical :: physics_pc_probe_exact !< Probe exact 4x4 Schur complement via basis-vector applications (small problems only)
   logical :: physics_pc_schur_u    !< Inner Schur complement S_u for the Alfven (psi,u) block
+  logical :: eliminate_boundary_dofs !< Zero boundary-DOF rows in PC correction matrices and use elm-diagonal BC scaling in global matrix; required for physics PC Schur correction approach
   logical :: use_newton           !< Use inexact Newton method
   integer :: maxNewton            !< maximum number of Newton iterations
   real(kind=8) :: gamma_Newton    !< Newton gamma-parameter: gmres_tol = gamma_Newton*(normRHScurrent/normRHSprevious)**alpha_Newton

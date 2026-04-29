@@ -436,7 +436,7 @@ end subroutine get_element_and_nodes
 
 
 subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_max, omp_tid)
-  use phys_module, only: refinement
+  use phys_module, only: refinement, eliminate_boundary_dofs
   use mod_parameters, only: n_tor, n_var, n_degrees, n_vertex_max
   use data_structure, only: type_element, type_node, type_node_list, type_SP_MATRIX, thread_struct
   use nodes_elements
@@ -458,7 +458,6 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
   integer :: index_large_i
   integer :: index_ij
 
-  logical :: eliminate_boundary_dofs = .false.
   logical :: i_bnd
   integer :: i_bnd_type
   real*8 :: elm_diagonal_average
