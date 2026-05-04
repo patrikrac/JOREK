@@ -59,6 +59,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_j
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_jpsi, ELM_p_wu
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_psi_correction, ELM_p_u_correction
+  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_u_kn_correction
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_21_correction,  ELM_p_61_correction
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_21_n_correction
 
@@ -82,7 +83,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8 :: wst, xjac, xjac_x, xjac_y, BigR
   type(type_fct_values) :: v_fct, psi_fct, u_fct
   real*8 :: amat_mass, amat_31, amat_42, amat_psi_correction, amat_u_correction
-  real*8 :: amat_21_correction, amat_61_correction, amat_21_n_correction
+  real*8 :: amat_21_correction, amat_61_correction, amat_21_n_correction, amat_u_kn_correction
 
   ! Background-field values/derivatives at the current Gauss point (off-diag corrections)
   real*8 :: r0, r0_hat
@@ -133,9 +134,10 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   ELM_p_jpsi = 0.d0;  ELM_p_wu = 0.d0
   if (psi_correction) ELM_p_psi_correction = 0.d0
   if (u_correction) ELM_p_u_correction = 0.d0
-  if (correction_21) ELM_p_21_correction   = 0.d0
-  if (correction_21) ELM_p_21_n_correction = 0.d0
-  if (correction_61) ELM_p_61_correction   = 0.d0
+  if (u_correction)   ELM_p_u_kn_correction  = 0.d0
+  if (correction_21)  ELM_p_21_correction    = 0.d0
+  if (correction_21)  ELM_p_21_n_correction  = 0.d0
+  if (correction_61)  ELM_p_61_correction    = 0.d0
 
   !-----------------------------------------------------------------
   ! Geometry at Gauss points
@@ -342,6 +344,8 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 endif
                 if (u_correction) then
                   ELM_p_u_correction(mp, idx_ij, idx_kl) = ELM_p_u_correction(mp, idx_ij, idx_kl) + wst * amat_u_correction
+                  amat_u_kn_correction = 0.d0   ! placeholder — formula to be filled in
+                  ELM_p_u_kn_correction(mp, idx_ij, idx_kl) = ELM_p_u_kn_correction(mp, idx_ij, idx_kl) + wst * amat_u_kn_correction
                 endif
                 if (correction_21) then
                   ELM_p_21_correction(mp, idx_ij, idx_kl) = ELM_p_21_correction(mp, idx_ij, idx_kl) + wst * amat_21_correction
@@ -390,6 +394,11 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_u_correction, D1V)
+        in_fft = ELM_p_u_kn_correction(1:n_plane, i, j)
+#ifdef USE_FFTW
+        call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#endif
+        call scatter_fft_to_elm_kn(out_fft, i, j, ELM_u_correction, D1V)
       endif
       if (correction_21) then
         in_fft = ELM_p_21_correction(1:n_plane, i, j)
@@ -560,5 +569,66 @@ subroutine scatter_fft_to_elm_n(out_fft, i, j, ELM, ndim)
   enddo    ! k
 
 end subroutine scatter_fft_to_elm_n
+
+!-----------------------------------------------------------------
+! Scatter FFT output for row i, col j into ELM with toroidal
+! mode-number weighting on both test AND trial functions: ELM_kn
+! equivalent. Multiplies by float(mode(ik)) * float(mode(im)).
+! Sign pattern corresponds to d/dphi -> i*n on both functions,
+! giving a real factor -n_k*n_m (i² = -1).
+!-----------------------------------------------------------------
+subroutine scatter_fft_to_elm_kn(out_fft, i, j, ELM, ndim)
+
+  use mod_parameters, only: n_tor, n_plane
+  use phys_module,    only: mode
+
+  implicit none
+
+  complex*16, intent(in)    :: out_fft(1:n_plane)
+  integer,    intent(in)    :: i, j, ndim
+  real*8,     intent(inout) :: ELM(ndim, ndim)
+
+  integer :: k, m, ik, im, l, index_k, index_m
+
+  do k = 1, (n_tor+1)/2
+
+    ik      = max(2*(k-1), 1)
+    index_k = n_tor*(i-1) + ik
+
+    do m = 1, (n_tor+1)/2
+
+      im      = max(2*(m-1), 1)
+      index_m = n_tor*(j-1) + im
+
+      l = (k-1) + (m-1)
+      if (l .ge. 0 .and. l .le. n_plane/2) then
+        ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) - real(out_fft(l+1))        * float(mode(im)) * float(mode(ik))
+        ELM(index_k+1, index_m  ) = ELM(index_k+1, index_m  ) + imag(out_fft(l+1))        * float(mode(im)) * float(mode(ik))
+        ELM(index_k,   index_m+1) = ELM(index_k,   index_m+1) + imag(out_fft(l+1))        * float(mode(im)) * float(mode(ik))
+        ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) + real(out_fft(l+1))        * float(mode(im)) * float(mode(ik))
+      elseif (l .lt. 0 .and. abs(l) .le. n_plane/2) then
+        ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) - real(out_fft(abs(l)+1))   * float(mode(im)) * float(mode(ik))
+        ELM(index_k+1, index_m  ) = ELM(index_k+1, index_m  ) - imag(out_fft(abs(l)+1))   * float(mode(im)) * float(mode(ik))
+        ELM(index_k,   index_m+1) = ELM(index_k,   index_m+1) - imag(out_fft(abs(l)+1))   * float(mode(im)) * float(mode(ik))
+        ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) + real(out_fft(abs(l)+1))   * float(mode(im)) * float(mode(ik))
+      endif
+
+      l = (k-1) - (m-1)
+      if (l .ge. 0 .and. l .le. n_plane/2) then
+        ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) + real(out_fft(l+1))        * float(mode(im)) * float(mode(ik))
+        ELM(index_k+1, index_m  ) = ELM(index_k+1, index_m  ) - imag(out_fft(l+1))        * float(mode(im)) * float(mode(ik))
+        ELM(index_k,   index_m+1) = ELM(index_k,   index_m+1) + imag(out_fft(l+1))        * float(mode(im)) * float(mode(ik))
+        ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) + real(out_fft(l+1))        * float(mode(im)) * float(mode(ik))
+      elseif (l .lt. 0 .and. abs(l) .le. n_plane/2) then
+        ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) + real(out_fft(abs(l)+1))   * float(mode(im)) * float(mode(ik))
+        ELM(index_k+1, index_m  ) = ELM(index_k+1, index_m  ) + imag(out_fft(abs(l)+1))   * float(mode(im)) * float(mode(ik))
+        ELM(index_k,   index_m+1) = ELM(index_k,   index_m+1) - imag(out_fft(abs(l)+1))   * float(mode(im)) * float(mode(ik))
+        ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) + real(out_fft(abs(l)+1))   * float(mode(im)) * float(mode(ik))
+      endif
+
+    enddo  ! m
+  enddo    ! k
+
+end subroutine scatter_fft_to_elm_kn
 
 end module mod_elt_matrix_elliptic
