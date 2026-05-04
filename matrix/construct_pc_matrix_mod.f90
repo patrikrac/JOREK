@@ -610,8 +610,8 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   allocate(ELM_wu_thr   (D1V_CM, D1V_CM, nthreads))
   allocate(ELM_psi_correction_thr (D1V_CM, D1V_CM, nthreads))
   allocate(ELM_u_correction_thr (D1V_CM, D1V_CM, nthreads))
-  allocate(ELM_21_correction_thr  (D1V_CM, D1V_CM, nthreads))
-  allocate(ELM_61_correction_thr  (D1V_CM, D1V_CM, nthreads))
+  allocate(ELM_21_correction_thr (D1V_CM, D1V_CM, nthreads))
+  allocate(ELM_61_correction_thr (D1V_CM, D1V_CM, nthreads))
   allocate(buf1v_thr    (bs1*bs1, nthreads))
 
   !$omp parallel &

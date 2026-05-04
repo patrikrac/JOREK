@@ -15,7 +15,8 @@ module mod_elt_matrix_elliptic
 !   ELM_21_correction : Schur correction coming from amat_23 * amat_33^{-1} * amat_31  (off-diag, u-eq x psi-col)
 !   ELM_61_correction : Schur correction coming from amat_63 * amat_33^{-1} * amat_31  (off-diag, T-eq x psi-col)
 !
-! All four integrands live only in ELM_p (mode-diagonal).
+! Most integrands live only in ELM_p (mode-diagonal); the K_21 toroidal term
+! also uses ELM_n (mode-off-diagonal, multiplied by toroidal mode number at scatter).
 ! FFT reconstruction is performed to obtain the mode-space blocks.
 !----------------------------------------------------------------
 implicit none
@@ -36,7 +37,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   use gauss
   use basis_at_gaussian
   use phys_module, only: fftw_plan, time_evol_theta, tstep, eta_T_dependent, eta, T_max_eta, T_0, visco_T_dependent, visco, &
-                         eta_ohmic, T_max_eta_ohm, gamma
+                         eta_ohmic, T_max_eta_ohm, gamma, F0, mode
   use corr_neg
 
   implicit none
@@ -59,6 +60,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_jpsi, ELM_p_wu
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_psi_correction, ELM_p_u_correction
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_21_correction,  ELM_p_61_correction
+  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_21_n_correction
 
   ! Geometry at Gauss points (first derivatives only — no 2nd derivs needed)
   real*8, dimension(n_gauss,n_gauss)    :: x_g, x_s, x_t
@@ -80,7 +82,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8 :: wst, xjac, xjac_x, xjac_y, BigR
   type(type_fct_values) :: v_fct, psi_fct, u_fct
   real*8 :: amat_mass, amat_31, amat_42, amat_psi_correction, amat_u_correction
-  real*8 :: amat_21_correction, amat_61_correction
+  real*8 :: amat_21_correction, amat_61_correction, amat_21_n_correction
 
   ! Background-field values/derivatives at the current Gauss point (off-diag corrections)
   real*8 :: r0, r0_hat
@@ -131,8 +133,9 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   ELM_p_jpsi = 0.d0;  ELM_p_wu = 0.d0
   if (psi_correction) ELM_p_psi_correction = 0.d0
   if (u_correction) ELM_p_u_correction = 0.d0
-  if (correction_21) ELM_p_21_correction = 0.d0
-  if (correction_61) ELM_p_61_correction = 0.d0
+  if (correction_21) ELM_p_21_correction   = 0.d0
+  if (correction_21) ELM_p_21_n_correction = 0.d0
+  if (correction_61) ELM_p_61_correction   = 0.d0
 
   !-----------------------------------------------------------------
   ! Geometry at Gauss points
@@ -316,8 +319,8 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 ! Derivation: substitute amat_23 / amat_63 with zj_trial → −∇²ψ, then IBP once.
                 ! Background-field gradients (∇ps0, ∇(η_ohm·zj0/R)) are dropped at this stage.
                 !
-                ! K_21 from amat_23 = −v · [ps0, zj] · xjac · θ·dt   (poloidal piece only;
-                !   the toroidal _n piece +ε·F0/R · v · zj_p is omitted here).
+                ! K_21 poloidal piece from amat_23 = −v · [ps0, zj] · xjac · θ·dt.
+                ! Toroidal _n piece (+F0/R · v · zj_p) is assembled separately into ELM_p_21_n_correction.
                 amat_21_correction = (v_fct%v_x * ps0_y - v_fct%v_y * ps0_x) &
                                      * (psi_fct%v_xx - psi_fct%v_x/BigR + psi_fct%v_yy) * xjac * theta * tstep
 
@@ -342,6 +345,10 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 endif
                 if (correction_21) then
                   ELM_p_21_correction(mp, idx_ij, idx_kl) = ELM_p_21_correction(mp, idx_ij, idx_kl) + wst * amat_21_correction
+                  amat_21_n_correction = F0 / BigR * v_fct%v &
+                                         * (-(psi_fct%v_xx + psi_fct%v_yy)) &
+                                         * xjac * theta * tstep
+                  ELM_p_21_n_correction(mp, idx_ij, idx_kl) = ELM_p_21_n_correction(mp, idx_ij, idx_kl) + wst * amat_21_n_correction
                 endif
                 if (correction_61) then
                   ELM_p_61_correction(mp, idx_ij, idx_kl) = ELM_p_61_correction(mp, idx_ij, idx_kl) + wst * amat_61_correction
@@ -390,6 +397,11 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_21_correction, D1V)
+        in_fft = ELM_p_21_n_correction(1:n_plane, i, j)
+#ifdef USE_FFTW
+        call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#endif
+        call scatter_fft_to_elm_n(out_fft, i, j, ELM_21_correction, D1V)
       endif
       if (correction_61) then
         in_fft = ELM_p_61_correction(1:n_plane, i, j)
@@ -488,5 +500,65 @@ subroutine scatter_fft_to_elm(out_fft, i, j, ELM, ndim)
   enddo    ! k
 
 end subroutine scatter_fft_to_elm
+
+!-----------------------------------------------------------------
+! Scatter FFT output for row i, col j into ELM with toroidal
+! mode-number weighting: ELM_n equivalent of scatter_fft_to_elm.
+! Multiplies each entry by float(mode(im)) where im indexes the
+! toroidal wavenumber of the trial (column) function.
+! Sign pattern corresponds to d/dphi -> i*n on Fourier modes.
+!-----------------------------------------------------------------
+subroutine scatter_fft_to_elm_n(out_fft, i, j, ELM, ndim)
+
+  use mod_parameters, only: n_tor, n_plane
+  use phys_module,    only: mode
+
+  implicit none
+
+  complex*16, intent(in)    :: out_fft(1:n_plane)
+  integer,    intent(in)    :: i, j, ndim
+  real*8,     intent(inout) :: ELM(ndim, ndim)
+
+  integer :: k, m, im, l, index_k, index_m
+
+  do k = 1, (n_tor+1)/2
+
+    index_k = n_tor*(i-1) + max(2*(k-1), 1)
+
+    do m = 1, (n_tor+1)/2
+
+      im      = max(2*(m-1), 1)
+      index_m = n_tor*(j-1) + im
+
+      l = (k-1) + (m-1)
+      if (l .ge. 0 .and. l .le. n_plane/2) then
+        ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) + imag(out_fft(l+1))        * float(mode(im))
+        ELM(index_k+1, index_m  ) = ELM(index_k+1, index_m  ) + real(out_fft(l+1))        * float(mode(im))
+        ELM(index_k,   index_m+1) = ELM(index_k,   index_m+1) + real(out_fft(l+1))        * float(mode(im))
+        ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) - imag(out_fft(l+1))        * float(mode(im))
+      elseif (l .lt. 0 .and. abs(l) .le. n_plane/2) then
+        ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) - imag(out_fft(abs(l)+1))   * float(mode(im))
+        ELM(index_k+1, index_m  ) = ELM(index_k+1, index_m  ) + real(out_fft(abs(l)+1))   * float(mode(im))
+        ELM(index_k,   index_m+1) = ELM(index_k,   index_m+1) + real(out_fft(abs(l)+1))   * float(mode(im))
+        ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) + imag(out_fft(abs(l)+1))   * float(mode(im))
+      endif
+
+      l = (k-1) - (m-1)
+      if (l .ge. 0 .and. l .le. n_plane/2) then
+        ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) - imag(out_fft(l+1))        * float(mode(im))
+        ELM(index_k+1, index_m  ) = ELM(index_k+1, index_m  ) - real(out_fft(l+1))        * float(mode(im))
+        ELM(index_k,   index_m+1) = ELM(index_k,   index_m+1) + real(out_fft(l+1))        * float(mode(im))
+        ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) - imag(out_fft(l+1))        * float(mode(im))
+      elseif (l .lt. 0 .and. abs(l) .le. n_plane/2) then
+        ELM(index_k,   index_m  ) = ELM(index_k,   index_m  ) + imag(out_fft(abs(l)+1))   * float(mode(im))
+        ELM(index_k+1, index_m  ) = ELM(index_k+1, index_m  ) - real(out_fft(abs(l)+1))   * float(mode(im))
+        ELM(index_k,   index_m+1) = ELM(index_k,   index_m+1) + real(out_fft(abs(l)+1))   * float(mode(im))
+        ELM(index_k+1, index_m+1) = ELM(index_k+1, index_m+1) + imag(out_fft(abs(l)+1))   * float(mode(im))
+      endif
+
+    enddo  ! m
+  enddo    ! k
+
+end subroutine scatter_fft_to_elm_n
 
 end module mod_elt_matrix_elliptic
