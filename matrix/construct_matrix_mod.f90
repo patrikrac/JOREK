@@ -211,10 +211,12 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 #endif
 
     ! --- Apply boundary conditions.
+if (.not. eliminate_boundary_dofs) then !TODO: This is trivially not true in all cases and needs to be treated more precisely
     call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
                             my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
                             psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
-    
+endif
+
     if (fix_axis_nodes) then
       call fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, my_ind_min, my_ind_max, a_mat)
     elseif(treat_axis)then
