@@ -19,7 +19,7 @@ use petsc
 #endif
 implicit none
 public :: construct_pc_elliptic_matrices, construct_pc_diagonal_matrices, apply_bc_pc_matrix
-public :: construct_schur_correction_matrices, zero_bc_rows_pc_matrix
+public :: construct_schur_correction_matrices
 
 contains
 
