@@ -59,9 +59,9 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_j
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_jpsi, ELM_p_wu
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_psi_correction, ELM_p_u_correction
-  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_u_kn_correction
+  real*8, dimension(n_plane, N1V, N1V) :: ELM_kn_u_correction
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_21_correction,  ELM_p_61_correction
-  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_21_n_correction
+  real*8, dimension(n_plane, N1V, N1V) :: ELM_n_21_correction
 
   ! Geometry at Gauss points (first derivatives only — no 2nd derivs needed)
   real*8, dimension(n_gauss,n_gauss)    :: x_g, x_s, x_t
@@ -134,9 +134,9 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   ELM_p_jpsi = 0.d0;  ELM_p_wu = 0.d0
   if (psi_correction) ELM_p_psi_correction = 0.d0
   if (u_correction) ELM_p_u_correction = 0.d0
-  if (u_correction)   ELM_p_u_kn_correction  = 0.d0
+  if (u_correction)   ELM_kn_u_correction  = 0.d0
   if (correction_21)  ELM_p_21_correction    = 0.d0
-  if (correction_21)  ELM_p_21_n_correction  = 0.d0
+  if (correction_21)  ELM_n_21_correction  = 0.d0
   if (correction_61)  ELM_p_61_correction    = 0.d0
 
   !-----------------------------------------------------------------
@@ -316,20 +316,20 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
 
                 amat_u_correction = - r0_hat * BigR**2 * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * ( v_fct%v_x * u0_y - v_fct%v_y * u0_x) * xjac * theta * tstep  &
                                 + visco_T * BigR * (v_fct%v_xx + v_fct%v_x*BigR + v_fct%v_yy) * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
+                amat_u_kn_correction = - visco_T * 1.d0 / BigR * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * xjac * theta * tstep &
+                                        + visco_T * (1.d0 - (1.d0 / BigR**2)) * v_fct%v * u_fct%v_x * xjac * theta * tstep
 
-                ! Off-diagonal Schur corrections (j eliminated via j(ψ) ≈ −∇²ψ at function level)
-                ! Derivation: substitute amat_23 / amat_63 with zj_trial → −∇²ψ, then IBP once.
-                ! Background-field gradients (∇ps0, ∇(η_ohm·zj0/R)) are dropped at this stage.
-                !
-                ! K_21 poloidal piece from amat_23 = −v · [ps0, zj] · xjac · θ·dt.
-                ! Toroidal _n piece (+F0/R · v · zj_p) is assembled separately into ELM_p_21_n_correction.
+                ! Off-diagonal Schur corrections 
                 amat_21_correction = (v_fct%v_x * ps0_y - v_fct%v_y * ps0_x) &
                                      * (psi_fct%v_xx - psi_fct%v_x/BigR + psi_fct%v_yy) * xjac * theta * tstep
+
+                amat_21_n_correction =  F0 / BigR * (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) * xjac * theta * tstep
 
                 ! K_61 from amat_63 = −2(γ−1)·η_ohm · v · zj · zj0/R · xjac · θ·dt
                 amat_61_correction = - 2.d0 * (gamma - 1.d0) * eta_T_ohm * zj0 / BigR &
                                      * (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) &
                                      * xjac * theta * tstep
+                
                 
                 ! --- 1-var mass (A_w = A_j assigned after FFT) ---
                 ELM_p_j(mp, idx_ij, idx_kl) = ELM_p_j(mp, idx_ij, idx_kl) + wst * amat_mass
@@ -344,15 +344,11 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 endif
                 if (u_correction) then
                   ELM_p_u_correction(mp, idx_ij, idx_kl) = ELM_p_u_correction(mp, idx_ij, idx_kl) + wst * amat_u_correction
-                  amat_u_kn_correction = 0.d0   ! placeholder — formula to be filled in
-                  ELM_p_u_kn_correction(mp, idx_ij, idx_kl) = ELM_p_u_kn_correction(mp, idx_ij, idx_kl) + wst * amat_u_kn_correction
+                  ELM_kn_u_correction(mp, idx_ij, idx_kl) = ELM_kn_u_correction(mp, idx_ij, idx_kl) + wst * amat_u_kn_correction
                 endif
                 if (correction_21) then
                   ELM_p_21_correction(mp, idx_ij, idx_kl) = ELM_p_21_correction(mp, idx_ij, idx_kl) + wst * amat_21_correction
-                  amat_21_n_correction = F0 / BigR * v_fct%v &
-                                         * (-(psi_fct%v_xx + psi_fct%v_yy)) &
-                                         * xjac * theta * tstep
-                  ELM_p_21_n_correction(mp, idx_ij, idx_kl) = ELM_p_21_n_correction(mp, idx_ij, idx_kl) + wst * amat_21_n_correction
+                  ELM_n_21_correction(mp, idx_ij, idx_kl) = ELM_n_21_correction(mp, idx_ij, idx_kl) + wst * amat_21_n_correction
                 endif
                 if (correction_61) then
                   ELM_p_61_correction(mp, idx_ij, idx_kl) = ELM_p_61_correction(mp, idx_ij, idx_kl) + wst * amat_61_correction
@@ -394,7 +390,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_u_correction, D1V)
-        in_fft = ELM_p_u_kn_correction(1:n_plane, i, j)
+        in_fft = ELM_kn_u_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
@@ -406,7 +402,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_21_correction, D1V)
-        in_fft = ELM_p_21_n_correction(1:n_plane, i, j)
+        in_fft = ELM_n_21_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
