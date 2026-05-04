@@ -83,6 +83,8 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8 :: amat_21_correction, amat_61_correction
 
   ! Background-field values/derivatives at the current Gauss point (off-diag corrections)
+  real*8 :: r0, r0_hat
+  real*8 :: u0, u0_x, u0_y
   real*8 :: ps0_x, ps0_y, zj0
   real*8 :: eta_T_ohm
 
@@ -214,6 +216,13 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
           visco_T   = visco
         end if
 
+        r0    = abs(eq_g(mp,5,ms,mt))
+        r0_hat   = BigR**2 * r0
+
+        u0    = eq_g(mp,2,ms,mt)
+        u0_x  = (   y_t(ms,mt) * eq_s(mp,2,ms,mt) - y_s(ms,mt) * eq_t(mp,2,ms,mt) ) / xjac
+        u0_y  = ( - x_t(ms,mt) * eq_s(mp,2,ms,mt) + x_s(ms,mt) * eq_t(mp,2,ms,mt) ) / xjac
+
         ! --- Background field extraction for off-diagonal Schur corrections
         ! ps0 spatial gradient (Cartesian) from synthesized s,t derivatives
         ps0_x = (   y_t(ms,mt) * eq_s(mp,var_psi,ms,mt) - y_s(ms,mt) * eq_t(mp,var_psi,ms,mt) ) / xjac
@@ -299,9 +308,9 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
 
                 ! --- Schur correction equation ---
                 amat_psi_correction = - (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) * (eta_T / BigR) * xjac * theta * tstep
-                ! amat_psi_correction = (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y + 2 * v_fct%v * psi_fct%v_x) * (eta_T / BigR) * xjac * theta * tstep
-                !amat_u_correction = 0.d0
-                amat_u_correction = visco_T * BigR * (v_fct%v_xx + v_fct%v_x/BigR + v_fct%v_yy) * (u_fct%v_xx + u_fct%v_x/BigR + u_fct%v_yy) * xjac * theta * tstep
+
+                amat_u_correction = - r0_hat * BigR**2 * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * ( v_fct%v_x * u0_y - v_fct%v_y * u0_x) * xjac * theta * tstep  &
+                                + visco_T * BigR * (v_fct%v_xx + v_fct%v_x*BigR + v_fct%v_yy) * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
 
                 ! Off-diagonal Schur corrections (j eliminated via j(ψ) ≈ −∇²ψ at function level)
                 ! Derivation: substitute amat_23 / amat_63 with zj_trial → −∇²ψ, then IBP once.
@@ -310,7 +319,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 ! K_21 from amat_23 = −v · [ps0, zj] · xjac · θ·dt   (poloidal piece only;
                 !   the toroidal _n piece +ε·F0/R · v · zj_p is omitted here).
                 amat_21_correction = (v_fct%v_x * ps0_y - v_fct%v_y * ps0_x) &
-                                     * (psi_fct%v_xx + psi_fct%v_yy) * xjac * theta * tstep
+                                     * (psi_fct%v_xx - psi_fct%v_x/BigR + psi_fct%v_yy) * xjac * theta * tstep
 
                 ! K_61 from amat_63 = −2(γ−1)·η_ohm · v · zj · zj0/R · xjac · θ·dt
                 amat_61_correction = - 2.d0 * (gamma - 1.d0) * eta_T_ohm * zj0 / BigR &
