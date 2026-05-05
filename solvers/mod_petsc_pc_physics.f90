@@ -28,7 +28,8 @@ module mod_petsc_pc_physics
     !> Block diagonal inverse matrices (BAIJ, block_size = n_tor)
     !! Computed via MatInvertBlockDiagonalMat from B_33/B_44
     Mat :: Dinv_Mj, Dinv_Mw
-    logical :: dinv_created = .false.
+    logical :: dinv_created   = .false.
+    logical :: dinv_created_w = .false.
 
     !> Sub-blocks extracted from the full system AIJ matrix.
     !! Naming: B_ij = block at (equation i, variable j).
@@ -258,6 +259,125 @@ contains
     call MatDestroy(Dinv_baij, ierr)
     call MatDestroy(B_baij, ierr)
   end subroutine compute_block_diagonal_inverse
+
+
+  !--------------------------------------------------------------------
+  !> Compute per-node 4x4 block-diagonal inverse of a 1-var AIJ mass matrix.
+  !!
+  !! Each mesh node has n_degrees=4 Bezier DOFs. The mass integrand is
+  !! axisymmetric (mode-diagonal), so the (n_degrees*n_tor)^2 block per node
+  !! decomposes into n_tor independent 4x4 blocks — one per harmonic.
+  !!
+  !! For each (node, harmonic) pair, the 4x4 block is extracted via
+  !! MatGetValues and inverted with LAPACK dgesv. The result is a sparse
+  !! matrix Dinv with the same sparsity as B_mass (4 nonzeros per row).
+  !!
+  !! Axis ring nodes share DOF indices with the central axis node; a
+  !! visited array deduplicates them.
+  !--------------------------------------------------------------------
+  subroutine compute_per_node_block_inverse(B_mass, Dinv, dinv_created)
+    use mod_parameters, only: n_tor, n_degrees, n_vertex_max
+    use nodes_elements
+
+    Mat, intent(in)      :: B_mass
+    Mat, intent(inout)   :: Dinv
+    logical, intent(inout) :: dinv_created
+
+    PetscErrorCode :: ierr
+    PetscInt :: rstart, rend, nrows_local, ncols_local, nrows_global, ncols_global
+    integer :: my_ind_min, my_ind_max, n_block_local
+    integer :: ielm, iv, inode, m, j, n_elements
+    integer :: k0       ! 1-based first DOF index for this node
+    integer :: local_blk  ! visited array index (0-based)
+    logical, allocatable :: visited(:)
+    PetscInt :: rows(4)   ! 0-based global row/col indices for the 4x4 block
+    PetscScalar :: block_vals(4,4), rhs(4,4)
+    PetscScalar :: diag_save(4)  ! saved diagonal for singular-block fallback
+    integer :: ipiv(4), info, comm
+
+    external :: dgesv
+
+    call MatGetOwnershipRange(B_mass, rstart, rend, ierr)
+    n_block_local = int((rend - rstart) / n_tor)
+    my_ind_min    = int(rstart / n_tor) + 1   ! 1-based first DOF index
+    my_ind_max    = my_ind_min + n_block_local - 1
+
+    allocate(visited(0:n_block_local-1))
+    visited = .false.
+
+    if (.not. dinv_created) then
+      call MatGetLocalSize(B_mass, nrows_local, ncols_local, ierr)
+      call MatGetSize(B_mass, nrows_global, ncols_global, ierr)
+      call PetscObjectGetComm(B_mass, comm, ierr)
+      call MatCreate(comm, Dinv, ierr)
+      call MatSetSizes(Dinv, nrows_local, ncols_local, nrows_global, ncols_global, ierr)
+      call MatSetType(Dinv, MATMPIAIJ, ierr)
+      ! Each row has exactly n_degrees nonzeros (the 4x4 block for this node, same harmonic)
+      call MatMPIAIJSetPreallocation(Dinv, int(n_degrees, PetscInt), PETSC_NULL_INTEGER_ARRAY, &
+                                     0_PetscInt, PETSC_NULL_INTEGER_ARRAY, ierr)
+      call MatSetOption(Dinv, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+      dinv_created = .true.
+    else
+      call MatZeroEntries(Dinv, ierr)
+    endif
+
+    n_elements = element_list%n_elements
+    do ielm = 1, n_elements
+      do iv = 1, n_vertex_max
+        inode = element_list%element(ielm)%vertex(iv)
+        k0 = node_list%node(inode)%index(1)   ! 1-based first DOF index
+
+        ! Skip if any of the 4 DOFs are not owned by this rank
+        if (k0 < my_ind_min .or. k0 + n_degrees - 1 > my_ind_max) cycle
+
+        local_blk = k0 - my_ind_min   ! 0-based offset into visited array
+        if (visited(local_blk)) cycle
+        visited(local_blk) = .true.
+
+        ! Invert the 4x4 block for each toroidal harmonic independently
+        do m = 0, n_tor - 1
+          ! Global 0-based row/col indices for the 4 Bezier DOFs at this harmonic
+          do j = 1, 4
+            rows(j) = int(k0 + j - 2, PetscInt) * n_tor + m
+          end do
+
+          ! Extract 4x4 block from B_mass.
+          ! Note: MatGetValues fills in row-major order; Fortran 2D is column-major,
+          ! so block_vals(j2, j1) = B_mass[rows(j1), rows(j2)] (transposed).
+          ! LAPACK dgesv then solves block_vals^T * X = I (i.e. actual block * X^T = I),
+          ! and MatSetValues reads back with the same transpose, giving Dinv = block^{-1}.
+          call MatGetValues(B_mass, 4_PetscInt, rows, 4_PetscInt, rows, block_vals, ierr)
+
+          ! Save diagonal before dgesv overwrites block_vals with LU factors
+          do j = 1, 4
+            diag_save(j) = block_vals(j,j)
+          end do
+
+          ! RHS = identity
+          rhs = 0.0d0
+          do j = 1, 4
+            rhs(j,j) = 1.0d0
+          end do
+
+          call dgesv(4, 4, block_vals, 4, ipiv, rhs, 4, info)
+          if (info /= 0) then
+            ! Singular block: fall back to diagonal inverse using saved diagonal
+            rhs = 0.0d0
+            do j = 1, 4
+              if (abs(diag_save(j)) > 0.0d0) rhs(j,j) = 1.0d0 / diag_save(j)
+            end do
+          endif
+
+          call MatSetValues(Dinv, 4_PetscInt, rows, 4_PetscInt, rows, rhs, INSERT_VALUES, ierr)
+        end do
+      end do
+    end do
+
+    deallocate(visited)
+
+    call MatAssemblyBegin(Dinv, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(Dinv, MAT_FINAL_ASSEMBLY, ierr)
+  end subroutine compute_per_node_block_inverse
 
 
   !--------------------------------------------------------------------
@@ -995,7 +1115,7 @@ contains
   subroutine petsc_physics_pc_build_reduced(A_full)
     use mod_parameters, only: n_var, n_tor, n_degrees, var_psi, var_u, var_zj, var_w, var_rho, var_T
     use phys_module, only: physics_pc_reassemble, debug_physics_pc, physics_pc_monolithic, &
-                           physics_pc_schur_u, physics_pc_probe_exact
+                           physics_pc_schur_u, physics_pc_probe_exact, physics_pc_block_inv
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate
 
     Mat, intent(in) :: A_full
@@ -1082,24 +1202,24 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Sub-blocks extracted (21 blocks)"
     endif
 
-    ! --- Step 3: Compute block diagonal inverse (n_tor x n_tor blocks) ---
-    ! bs_ntor = n_tor  ! TODO: n_degrees*n_tor would be better but axis node breaks uniform blocking
-    ! call compute_block_diagonal_inverse(g_ctx%B_33, g_ctx%Dinv_Mj, bs_ntor, first_time)
-    ! call compute_block_diagonal_inverse(g_ctx%B_44, g_ctx%Dinv_Mw, bs_ntor, first_time)
-    ! g_ctx%dinv_created = .true.
-    ! if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed block diagonal inverse (block_size = n_tor)"
-
-    ! call MatNorm(g_ctx%Dinv_Mj, NORM_FROBENIUS, norm_val, ierr)
-    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mj||_F = ", norm_val
-    ! call MatNorm(g_ctx%Dinv_Mw, NORM_FROBENIUS, norm_val, ierr)
-    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mw||_F = ", norm_val
-
-    call compute_diag_mass_inverse(g_ctx%B_33, g_ctx%diag_Mj_inv, first_time)
-    call compute_diag_mass_inverse(g_ctx%B_44, g_ctx%diag_Mw_inv, first_time)
-    call VecNorm(g_ctx%diag_Mj_inv, NORM_2, norm_val, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_j^{-1} (diag)||_2 = ", norm_val
-    call VecNorm(g_ctx%diag_Mw_inv, NORM_2, norm_val, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_w^{-1} (diag)||_2 = ", norm_val
+    ! --- Step 3: Compute mass matrix inverse ---
+    if (physics_pc_block_inv) then
+      ! Per-node 4x4 block-diagonal inverse: captures Bezier DOF coupling within each harmonic
+      call compute_per_node_block_inverse(g_ctx%B_33, g_ctx%Dinv_Mj, g_ctx%dinv_created)
+      call compute_per_node_block_inverse(g_ctx%B_44, g_ctx%Dinv_Mw, g_ctx%dinv_created_w)
+      call MatNorm(g_ctx%Dinv_Mj, NORM_FROBENIUS, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mj||_F (per-node block) = ", norm_val
+      call MatNorm(g_ctx%Dinv_Mw, NORM_FROBENIUS, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mw||_F (per-node block) = ", norm_val
+    else
+      ! Scalar diagonal inverse: 1 / diag(B)
+      call compute_diag_mass_inverse(g_ctx%B_33, g_ctx%diag_Mj_inv, first_time)
+      call compute_diag_mass_inverse(g_ctx%B_44, g_ctx%diag_Mw_inv, first_time)
+      call VecNorm(g_ctx%diag_Mj_inv, NORM_2, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_j^{-1} (diag)||_2 = ", norm_val
+      call VecNorm(g_ctx%diag_Mw_inv, NORM_2, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_w^{-1} (diag)||_2 = ", norm_val
+    endif
 
     ! --- Debug: compare reassembled vs extracted norms ---
     if (use_reassembled .and. debug_physics_pc) then
@@ -1128,28 +1248,45 @@ contains
     g_ctx%ksp_elliptic_created = .true.
     if (my_id == 0) write(*,'(A)') "[Physics PC]   Elliptic KSPs set up (PREONLY+LU+MUMPS)"
 
-    ! --- Step 4b: Form Schur-corrected blocks using diagonal M^{-1} ---
-    ! Choose diagonal blocks: reassembled (R_*) or extracted (B_*)
-    if (use_reassembled) then
-      call compute_schur_corrected_block_psi(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-      call compute_schur_corrected_block_diag(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+    ! --- Step 4b: Form Schur-corrected blocks ---
+    if (physics_pc_block_inv) then
+      ! Use per-node block-diagonal Mat inverse: Atilde = B_diag - B_coupling * Dinv * B_constraint
+      if (use_reassembled) then
+        call compute_schur_corrected_block(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
+                                           g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
+        call compute_schur_corrected_block(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
+                                           g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
+      else
+        call compute_schur_corrected_block(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
+                                           g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
+        call compute_schur_corrected_block(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
+                                           g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
+      endif
+      ! Off-diagonal Schur corrections via Mat inverse (same Dinv_Mj)
+      call compute_schur_corrected_block(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
+                                         g_ctx%Dinv_Mj, g_ctx%Atilde_21, first_time)
+      call compute_schur_corrected_block(g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, &
+                                         g_ctx%Dinv_Mj, g_ctx%Atilde_61, first_time)
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (per-node block M^{-1})"
     else
-      !compute_schur_corrected_block_psi
-      call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
-                                          g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-      !compute_schur_corrected_block_u
-      call compute_schur_corrected_block_diag(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
-                                          g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+      ! Use element-assembled / scalar diagonal paths
+      ! Choose diagonal blocks: reassembled (R_*) or extracted (B_*)
+      if (use_reassembled) then
+        call compute_schur_corrected_block_psi(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
+                                            g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
+        call compute_schur_corrected_block_diag(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
+                                            g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+      else
+        call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
+                                            g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
+        call compute_schur_corrected_block_diag(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
+                                            g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+      endif
+      ! Off-diagonal Schur corrections from element-assembled K_21 / K_61
+      call compute_schur_corrected_block_21(g_ctx%B_21, g_ctx%Atilde_21, first_time)
+      call compute_schur_corrected_block_61(g_ctx%B_61, g_ctx%Atilde_61, first_time)
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (diag M^{-1})"
     endif
-
-    ! Off-diagonal Schur corrections from element-assembled K_21 / K_61
-    ! (revert to compute_schur_corrected_block_diag(B_*, B_*3, B_31, diag_Mj_inv, ...) for the diagonal-mass path)
-    call compute_schur_corrected_block_21(g_ctx%B_21, g_ctx%Atilde_21, first_time)
-    call compute_schur_corrected_block_61(g_ctx%B_61, g_ctx%Atilde_61, first_time)
-
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (diag M^{-1})"
 
     call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_11||_F = ", norm_val
