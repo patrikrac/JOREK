@@ -19,7 +19,7 @@ module mod_petsc_matrix_tests
 #ifdef USE_PETSC
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_settings, only: n_degrees, n_tor
+  use mod_settings, only: n_degrees
   implicit none
   private
   public :: petsc_run_matrix_tests
@@ -165,7 +165,7 @@ contains
     Vec  :: x_sol
     MatNullSpace       :: nullsp
     KSPConvergedReason :: reason
-    PetscInt   :: its
+    PetscInt   :: its, bs
     PetscReal  :: rnorm, err_norm, ref_norm
     PetscErrorCode :: ierr
     integer :: cc0, cc1, cr
@@ -178,13 +178,15 @@ contains
     if (present(use_hypre_amg)) do_hypre_amg = use_hypre_amg
 
     ! PCGAMG and PCHYPRE boomeramg require a scalar (AIJ) matrix.
-    ! Set block size to n_tor * n_degrees unconditionally: this is the true
-    ! FEM mesh-node block (Fourier modes × Hermite DOFs per node) regardless
-    ! of whether A arrived as MPIBAIJ or already-converted MPIAIJ.
+    ! Read the MPIBAIJ block size at runtime (= n_tor_local, not the compile-time
+    ! n_tor constant which can differ). The true mesh-node block is
+    ! n_tor_local * n_degrees; only set it when bs > 1 so that a matrix that
+    ! already arrived as scalar AIJ is left with its default block size of 1.
     converted = .false.
     if (do_amg .or. do_hypre_amg) then
+      call MatGetBlockSize(A, bs, ierr)
       call MatConvert(A, MATAIJ, MAT_INITIAL_MATRIX, A_op, ierr)
-      call MatSetBlockSize(A_op, n_tor * n_degrees, ierr)
+      if (bs > 1) call MatSetBlockSize(A_op, bs * n_degrees, ierr)
       converted = .true.
     else
       A_op = A
@@ -223,18 +225,21 @@ contains
         call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
         call MatSetNearNullSpace(A_op, nullsp, ierr)
         call MatNullSpaceDestroy(nullsp, ierr)
-        ! Nodal coarsening: groups all n_tor*n_degrees DOFs of one FEM mesh
-        ! node (Fourier modes × Hermite degrees) onto the same coarse point.
-        ! The block size set above tells HYPRE the DOF count per node via
-        ! HYPRE_BoomerAMGSetNumFunctions. Without the correct n_tor*n_degrees
-        ! block size, each Hermite DOF coarsens independently.
-        ! Frobenius-norm criterion (=1) works well for mixed-type blocks.
+        ! Nodal coarsening (criterion 6 = measured strength): groups all
+        ! n_tor_local*n_degrees DOFs of one FEM mesh node onto the same coarse
+        ! point. Criterion 6 preserves the SPD property through the Galerkin
+        ! product; criterion 1 (Frobenius norm) does not and causes
+        ! KSP_DIVERGED_INDEFINITE_PC with CG. Skipped if A arrived as scalar
+        ! AIJ (bs=1) since the nodal block structure would be unknown.
+        if (bs > 1) then
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
+              "-hmg_pc_hypre_boomeramg_nodal_coarsen", "6", ierr)
+        endif
+        ! Falgout coarsening: proven stable with nodal_coarsen=6 on 2D FEM
+        ! systems (PETSc ex49 elasticity). Override at runtime with
+        ! -hmg_pc_hypre_boomeramg_coarsen_type HMIS to test parallel scaling.
         call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
-            "-hmg_pc_hypre_boomeramg_nodal_coarsen", "1", ierr)
-        ! HMIS coarsening: parallel-scalable, handles irregular connectivity
-        ! near the magnetic axis.
-        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
-            "-hmg_pc_hypre_boomeramg_coarsen_type", "HMIS", ierr)
+            "-hmg_pc_hypre_boomeramg_coarsen_type", "Falgout", ierr)
         ! Symmetric SOR/Jacobi smoother for SPD mass matrices.
         call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
             "-hmg_pc_hypre_boomeramg_relax_type_all", "symmetric-SOR/Jacobi", ierr)
