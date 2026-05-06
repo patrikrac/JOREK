@@ -198,7 +198,7 @@ contains
     KSP  :: ksp
     PC   :: pc, sub_pc
     KSP, pointer :: sub_ksp(:)
-    Mat  :: A_op, sub_A
+    Mat  :: A_op, sub_A, pmat_dummy
     IS   :: is_axis, is_bulk
     Vec  :: x_sol
     MatNullSpace       :: nullsp
@@ -281,8 +281,11 @@ contains
         call ISDestroy(is_bulk, ierr)
 
         ! Force sub-matrix extraction so sub-KSPs can be configured before
-        ! the actual solve.
+        ! the actual solve.  Must allocate sub_ksp before the call — PETSc
+        ! writes into the array rather than allocating it (pattern from
+        ! mod_petsc_pc_toroidal.f90).
         call KSPSetUp(ksp, ierr)
+        allocate(sub_ksp(2))
         call PCFieldSplitGetSubKSP(pc, nsplit, sub_ksp, ierr)
 
         ! Axis sub-KSP: PREONLY + MUMPS direct
@@ -298,7 +301,7 @@ contains
         ! Set nodal block size on the extracted bulk sub-matrix.  The
         ! sub-matrix does not automatically inherit the block size set on
         ! A_op; setting it here drives nodal coarsening in AMG.
-        call KSPGetOperators(sub_ksp(2), sub_A, PETSC_NULL_MAT, ierr)
+        call KSPGetOperators(sub_ksp(2), sub_A, pmat_dummy, ierr)
         if (bs > 1) call MatSetBlockSize(sub_A, bs * n_degrees, ierr)
 
         if (do_amg) then
@@ -324,6 +327,7 @@ contains
               "-fieldsplit_bulk_pc_hypre_boomeramg_relax_type_all", &
               "symmetric-SOR/Jacobi", ierr)
         endif
+        deallocate(sub_ksp)
 
       else if (do_amg) then
         call PCSetType(pc, PCGAMG, ierr)
