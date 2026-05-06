@@ -4,7 +4,7 @@ module mod_petsc_matrix_tests
 !
 ! A_j and A_w (SPD mass matrices) get a full manufactured-solution test:
 !   1. Generate random x_exact, compute b = A * x_exact.
-!   2. Solve A * x = b with MUMPS, CG+BJacobi, and CG+GAMG.
+!   2. Solve A * x = b with MUMPS, CG+BJacobi, CG+GAMG, and CG+BoomerAMG.
 !   3. Report residual norm, relative error, iteration count, and timing.
 !
 ! A_jpsi and A_wu (off-diagonal coupling, singular without BCs) are used
@@ -19,6 +19,7 @@ module mod_petsc_matrix_tests
 #ifdef USE_PETSC
 #include "petsc/finclude/petsc.h"
   use petsc
+  use mod_settings, only: n_degrees, n_tor
   implicit none
   private
   public :: petsc_run_matrix_tests
@@ -92,6 +93,8 @@ contains
   !!  x_exact = VecSetRandom,  b = A * x_exact
   !!  Test 1: MUMPS direct solver (verifies matrix is non-singular).
   !!  Test 2: CG (symmetric) or GMRES (general) + block Jacobi.
+  !!  Test 3: CG/GMRES + GAMG (smoothed aggregation AMG).
+  !!  Test 4: CG/GMRES + Hypre BoomerAMG (requires HYPRE-enabled PETSc).
   !--------------------------------------------------------------------
   subroutine petsc_mat_solve_test(my_id, comm, A, label, symmetric)
     integer,          intent(in) :: my_id, comm
@@ -127,6 +130,10 @@ contains
                        merge("CG + GAMG       ", "GMRES + GAMG    ", symmetric), &
                        use_direct=.false., use_cg=symmetric, use_amg=.true.)
 
+    call run_one_solve(my_id, comm, A, b, x_exact, &
+                       merge("CG + BoomerAMG   ", "GMRES + BoomerAMG", symmetric), &
+                       use_direct=.false., use_cg=symmetric, use_hypre_amg=.true.)
+
     call VecDestroy(x_exact, ierr)
     call VecDestroy(b, ierr)
   end subroutine petsc_mat_solve_test
@@ -135,38 +142,49 @@ contains
   !--------------------------------------------------------------------
   !> Solve A*x=b, measure relative error against x_exact, and print.
   !!
-  !! @param use_direct  .true. → MUMPS (PREONLY+LU); .false. → iterative
-  !! @param use_cg      (iterative only) .true. → CG; .false. → GMRES
+  !! @param use_direct    .true. → MUMPS (PREONLY+LU); .false. → iterative
+  !! @param use_cg        (iterative only) .true. → CG; .false. → GMRES
+  !! @param use_amg       (iterative only) .true. → PCGAMG
+  !! @param use_hypre_amg (iterative only) .true. → PCHYPRE boomeramg
+  !!                      Requires HYPRE-enabled PETSc. Override tuning at
+  !!                      runtime via -hmg_pc_hypre_boomeramg_* options.
   !--------------------------------------------------------------------
   subroutine run_one_solve(my_id, comm, A, b, x_exact, solver_name, &
-                            use_direct, use_cg, use_amg)
+                            use_direct, use_cg, use_amg, use_hypre_amg)
     integer,          intent(in)           :: my_id, comm
     Mat,              intent(in)           :: A
     Vec,              intent(in)           :: b, x_exact
     character(len=*), intent(in)           :: solver_name
     logical,          intent(in)           :: use_direct, use_cg
     logical,          intent(in), optional :: use_amg
+    logical,          intent(in), optional :: use_hypre_amg
 
     KSP  :: ksp
     PC   :: pc
     Mat  :: A_op   ! may be a converted copy for AMG
     Vec  :: x_sol
+    MatNullSpace       :: nullsp
     KSPConvergedReason :: reason
     PetscInt   :: its
     PetscReal  :: rnorm, err_norm, ref_norm
     PetscErrorCode :: ierr
     integer :: cc0, cc1, cr
     real    :: t_elapsed
-    logical :: do_amg, converted
+    logical :: do_amg, do_hypre_amg, converted
 
-    do_amg = .false.
-    if (present(use_amg)) do_amg = use_amg
+    do_amg       = .false.
+    do_hypre_amg = .false.
+    if (present(use_amg))       do_amg       = use_amg
+    if (present(use_hypre_amg)) do_hypre_amg = use_hypre_amg
 
-    ! PCGAMG requires a scalar (AIJ) matrix for its coarsening algorithm.
-    ! MPIBAIJ block matrices confuse the aggregation, so convert first.
+    ! PCGAMG and PCHYPRE boomeramg require a scalar (AIJ) matrix.
+    ! Set block size to n_tor * n_degrees unconditionally: this is the true
+    ! FEM mesh-node block (Fourier modes × Hermite DOFs per node) regardless
+    ! of whether A arrived as MPIBAIJ or already-converted MPIAIJ.
     converted = .false.
-    if (do_amg) then
+    if (do_amg .or. do_hypre_amg) then
       call MatConvert(A, MATAIJ, MAT_INITIAL_MATRIX, A_op, ierr)
+      call MatSetBlockSize(A_op, n_tor * n_degrees, ierr)
       converted = .true.
     else
       A_op = A
@@ -176,6 +194,9 @@ contains
     call VecSet(x_sol, 0.0d0, ierr)
 
     call KSPCreate(comm, ksp, ierr)
+    ! Use a unique prefix for BoomerAMG so its options don't affect other KSPs.
+    ! Override at runtime via -hmg_pc_hypre_boomeramg_* or -hmg_ksp_* flags.
+    if (do_hypre_amg) call KSPSetOptionsPrefix(ksp, "hmg_", ierr)
     call KSPSetOperators(ksp, A_op, A_op, ierr)
 
     if (use_direct) then
@@ -191,9 +212,32 @@ contains
       endif
       call KSPGetPC(ksp, pc, ierr)
       if (do_amg) then
-        ! PCGAMG: PETSc smoothed-aggregation AMG (no external library needed).
-        ! Override at runtime with -pc_type hypre -pc_hypre_type boomeramg for HYPRE.
         call PCSetType(pc, PCGAMG, ierr)
+        ! Constant near-null space improves GAMG aggregation on the poloidal mesh.
+        call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
+        call MatSetNearNullSpace(A_op, nullsp, ierr)
+        call MatNullSpaceDestroy(nullsp, ierr)
+      else if (do_hypre_amg) then
+        call PCSetType(pc, PCHYPRE, ierr)
+        call PCHYPRESetType(pc, "boomeramg", ierr)
+        call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
+        call MatSetNearNullSpace(A_op, nullsp, ierr)
+        call MatNullSpaceDestroy(nullsp, ierr)
+        ! Nodal coarsening: groups all n_tor*n_degrees DOFs of one FEM mesh
+        ! node (Fourier modes × Hermite degrees) onto the same coarse point.
+        ! The block size set above tells HYPRE the DOF count per node via
+        ! HYPRE_BoomerAMGSetNumFunctions. Without the correct n_tor*n_degrees
+        ! block size, each Hermite DOF coarsens independently.
+        ! Frobenius-norm criterion (=1) works well for mixed-type blocks.
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
+            "-hmg_pc_hypre_boomeramg_nodal_coarsen", "1", ierr)
+        ! HMIS coarsening: parallel-scalable, handles irregular connectivity
+        ! near the magnetic axis.
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
+            "-hmg_pc_hypre_boomeramg_coarsen_type", "HMIS", ierr)
+        ! Symmetric SOR/Jacobi smoother for SPD mass matrices.
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
+            "-hmg_pc_hypre_boomeramg_relax_type_all", "symmetric-SOR/Jacobi", ierr)
       else
         call PCSetType(pc, PCBJACOBI, ierr)
       endif
@@ -230,6 +274,17 @@ contains
     call VecDestroy(x_sol, ierr)
     call KSPDestroy(ksp, ierr)
     if (converted) call MatDestroy(A_op, ierr)
+    ! PetscOptionsSetValue writes to the process-global database and persists
+    ! after this call returns; clear the scoped entries to avoid poisoning
+    ! any later KSP that happens to use the "hmg_" prefix.
+    if (do_hypre_amg) then
+      call PetscOptionsClearValue(PETSC_NULL_OPTIONS, &
+          "-hmg_pc_hypre_boomeramg_nodal_coarsen", ierr)
+      call PetscOptionsClearValue(PETSC_NULL_OPTIONS, &
+          "-hmg_pc_hypre_boomeramg_coarsen_type", ierr)
+      call PetscOptionsClearValue(PETSC_NULL_OPTIONS, &
+          "-hmg_pc_hypre_boomeramg_relax_type_all", ierr)
+    endif
   end subroutine run_one_solve
 
 #endif
