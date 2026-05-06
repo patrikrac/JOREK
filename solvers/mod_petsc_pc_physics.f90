@@ -1852,13 +1852,39 @@ contains
 
 
   !> Run manufactured-solution solver tests on the elliptic PC sub-matrices.
+  !!
+  !! Computes n_axis_dofs by scanning node_list for axis nodes and finding
+  !! the highest block index they own.  Axis nodes sit at the front of the
+  !! global DOF ordering; the scalar row boundary is max_axis_block * n_tor.
+  !! Fieldsplit tests are added when n_axis_dofs > 0.
   subroutine petsc_test_pc_matrices(my_id)
     use mod_petsc_matrix_tests
+    use mod_parameters, only: n_tor, n_degrees
+    use nodes_elements
 
     integer, intent(in) :: my_id
 
+    integer :: inode, i_order, mpierr
+    integer :: max_axis_blk_local, max_axis_blk_global, n_axis_dofs
+
+    ! Find the largest block index assigned to any axis node on this rank.
+    max_axis_blk_local = 0
+    do inode = 1, node_list%n_nodes
+      if (.not. node_list%node(inode)%axis_node) cycle
+      do i_order = 1, n_degrees
+        if (node_list%node(inode)%index(i_order) > max_axis_blk_local) &
+          max_axis_blk_local = node_list%node(inode)%index(i_order)
+      end do
+    end do
+    call MPI_Allreduce(max_axis_blk_local, max_axis_blk_global, 1, &
+                       MPI_INTEGER, MPI_MAX, g_ctx%comm, mpierr)
+    ! Each block index corresponds to n_tor scalar rows in A_j
+    ! (construct_pc_matrix_mod.f90 uses bs1 = n_tor, assuming n_tor_local = n_tor).
+    n_axis_dofs = max_axis_blk_global * n_tor
+
     call petsc_run_matrix_tests(my_id, g_ctx%comm, &
-                                 g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
+                                 g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu, &
+                                 n_axis_dofs)
   end subroutine petsc_test_pc_matrices
 
 #endif
