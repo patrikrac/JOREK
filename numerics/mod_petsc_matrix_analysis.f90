@@ -233,6 +233,9 @@ contains
     PetscScalar, pointer :: dense_arr(:,:)
     real*8, allocatable :: A_copy(:,:), eig_r(:), eig_i(:)
     character(len=512) :: filename
+    PetscReal      :: norm_1, norm_F, norm_inf, norm_max
+    Vec            :: maxabs_vec
+    real*8         :: rho_A, norm_2_upper
 
     call PetscObjectGetComm(A, comm, ierr)
     call MPI_Comm_rank(comm, my_id, mpierr)
@@ -247,6 +250,15 @@ contains
       write(*,'(A,I0)')      "[EPS] Block size   : ", bs
       write(*,'(A,I0,A)')    "[EPS] Gathering to seq (", comm_size, " sub-comms)..."
     endif
+
+    ! Collective norm computations on A before the gather (all ranks participate).
+    call MatNorm(A, NORM_1,         norm_1,   ierr)
+    call MatNorm(A, NORM_FROBENIUS, norm_F,   ierr)
+    call MatNorm(A, NORM_INFINITY,  norm_inf, ierr)
+    call MatCreateVecs(A, PETSC_NULL_VEC, maxabs_vec, ierr)
+    call MatGetRowMaxAbs(A, maxabs_vec, PETSC_NULL_INTEGER, ierr)
+    call VecMax(maxabs_vec, PETSC_NULL_INTEGER, norm_max, ierr)
+    call VecDestroy(maxabs_vec, ierr)
 
     ! Gather parallel matrix — each rank gets a full sequential copy
     call MatCreateRedundantMatrix(A, comm_size, MPI_COMM_NULL, MAT_INITIAL_MATRIX, Ared, ierr)
@@ -288,17 +300,48 @@ contains
       if (info /= 0) then
         write(*,'(A,I0)') "[EPS] LAPACK error, info = ", info
       else
+        ! Spectral radius: rho(A) = max_i |lambda_i|
+        rho_A = 0.0d0
+        do i = 1, n_int
+          rho_A = max(rho_A, sqrt(eig_r(i)**2 + eig_i(i)**2))
+        enddo
+        ! Tightest available upper bound on ||A||_2 from the two standard bounds:
+        !   ||A||_2 <= ||A||_F  (Frobenius)
+        !   ||A||_2 <= sqrt(||A||_1 * ||A||_inf)  (Horn & Johnson)
+        norm_2_upper = min(real(norm_F, kind=8), &
+                           sqrt(real(norm_1, kind=8) * real(norm_inf, kind=8)))
+
         write(filename,'(A,A)') trim(label), "_dense_spectrum.dat"
         open(newunit=iunit, file=trim(filename), status='replace', action='write')
-        write(iunit,'(A,A)')  "# Dense LAPACK spectrum of: ", trim(label)
-        write(iunit,'(A,I0)') "# Matrix size : ", M
-        write(iunit,'(A,L1)') "# Symmetric   : ", symmetric
-        write(iunit,'(A)')    "#        Re(lambda)           Im(lambda)"
+        write(iunit,'(A,A)')    "# Dense LAPACK spectrum of: ", trim(label)
+        write(iunit,'(A,I0)')   "# Matrix size : ", M
+        write(iunit,'(A,L1)')   "# Symmetric   : ", symmetric
+        write(iunit,'(A,ES22.14)') "# rho(A)                        = ", rho_A
+        write(iunit,'(A,ES22.14)') "# ||A||_1                       = ", real(norm_1, kind=8)
+        write(iunit,'(A,ES22.14)') "# ||A||_F                       = ", real(norm_F, kind=8)
+        write(iunit,'(A,ES22.14)') "# ||A||_inf                     = ", real(norm_inf, kind=8)
+        write(iunit,'(A,ES22.14)') "# ||A||_max                     = ", real(norm_max, kind=8)
+        write(iunit,'(A,ES22.14)') "# ||A||_2 <= min(F,sqrt(1*inf)) = ", norm_2_upper
+        write(iunit,'(A,ES22.14)') "# ||A||_2 - rho(A) <=           = ", norm_2_upper - rho_A
+        write(iunit,'(A)')      "#        Re(lambda)           Im(lambda)"
         do i = 1, n_int
           write(iunit,'(2X,ES22.14,2X,ES22.14)') eig_r(i), eig_i(i)
         enddo
         close(iunit)
+
         write(*,'(A,I0,A,A)') "[EPS] All ", n_int, " eigenvalues -> ", trim(filename)
+        write(*,'(A)') "[EPS] --- Non-normality measure ---"
+        write(*,'(A,ES12.4)') "[EPS]  rho(A)               = ", rho_A
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_1              = ", real(norm_1,   kind=8)
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_F              = ", real(norm_F,   kind=8)
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_inf            = ", real(norm_inf, kind=8)
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_max            = ", real(norm_max, kind=8)
+        write(*,'(A,ES12.4)') "[EPS]  sqrt(||_1*||_inf)    = ", &
+          sqrt(real(norm_1, kind=8) * real(norm_inf, kind=8))
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_2 <=           = ", norm_2_upper
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_2 - rho(A) <=  = ", norm_2_upper - rho_A
+        if (symmetric) write(*,'(A)') &
+          "[EPS]  (symmetric matrix: ||A||_2 = rho(A) exactly)"
       endif
       deallocate(eig_r, eig_i)
     endif
@@ -488,7 +531,7 @@ contains
       ! --- Compute row max via MatGetRowMaxAbs ---
       r_local = 0.0d0
       call MatCreateVecs(A, PETSC_NULL_VEC, r_max_tmp, ierr)
-      call MatGetRowMaxAbs(A, r_max_tmp, PETSC_NULL_INTEGER, ierr)
+      call MatGetRowMaxAbs(A, r_max_tmp, PETSC_NULL_INTEGER_ARRAY, ierr)
       call VecGetArrayF90(r_max_tmp, u_arr, ierr)
       do i = 1, int(m_local)
         r_local(i) = real(u_arr(i), kind=8)
