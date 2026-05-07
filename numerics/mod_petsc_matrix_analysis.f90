@@ -442,16 +442,13 @@ contains
     Vec,             intent(out)   :: dr_out, dc_out
 
     PetscInt          :: M_global, N_global, rstart, rend, m_local
-    PetscInt          :: row_global, ncols, k
-    PetscInt, pointer :: row_cols(:)
-    PetscScalar, pointer :: row_vals(:)
     PetscErrorCode    :: ierr
     integer           :: comm, my_id, mpierr, iter, maxit, n_int, i
-    real*8            :: tol, aval, res_row, res_col = 0.0d0
+    real*8            :: tol, res_row, res_col = 0.0d0
     logical           :: conv
 
     real*8, allocatable    :: r_local(:), c_global(:)
-    Vec                    :: u_r_vec, u_c_vec
+    Vec                    :: u_r_vec, u_c_vec, r_max_tmp
     PetscScalar, pointer   :: u_arr(:)
 
     call PetscObjectGetComm(A, comm, ierr)
@@ -488,24 +485,22 @@ contains
     conv = .false.
     do iter = 1, maxit
 
-      ! --- Compute row max (local) and column max (accumulated globally) ---
-      r_local  = 0.0d0
-      c_global = 0.0d0
-
+      ! --- Compute row max via MatGetRowMaxAbs ---
+      r_local = 0.0d0
+      call MatCreateVecs(A, PETSC_NULL_VEC, r_max_tmp, ierr)
+      call MatGetRowMaxAbs(A, r_max_tmp, PETSC_NULL_INTEGER, ierr)
+      call VecGetArrayF90(r_max_tmp, u_arr, ierr)
       do i = 1, int(m_local)
-        row_global = rstart + (i - 1)
-        call MatGetRow(A, row_global, ncols, row_cols, row_vals, ierr)
-        do k = 1, int(ncols)
-          aval = abs(row_vals(k))
-          r_local(i) = max(r_local(i), aval)
-          ! row_cols is 0-based global; +1 for Fortran indexing
-          c_global(int(row_cols(k)) + 1) = max(c_global(int(row_cols(k)) + 1), aval)
-        enddo
-        call MatRestoreRow(A, row_global, ncols, row_cols, row_vals, ierr)
+        r_local(i) = real(u_arr(i), kind=8)
       enddo
+      call VecRestoreArrayF90(r_max_tmp, u_arr, ierr)
+      call VecDestroy(r_max_tmp, ierr)
 
-      call MPI_Allreduce(MPI_IN_PLACE, c_global, n_int, MPI_DOUBLE_PRECISION, &
-                         MPI_MAX, comm, mpierr)
+      ! --- Compute column max via MatGetColumnNorms (non-symmetric only) ---
+      c_global = 0.0d0
+      if (.not. symmetric) then
+        call MatGetColumnNorms(A, NORM_INFINITY, c_global, ierr)
+      endif
 
       if (iter == 1 .and. my_id == 0) then
         write(*,'(A,ES10.2,A,ES10.2,A,I0)') &
