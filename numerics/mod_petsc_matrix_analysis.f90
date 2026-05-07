@@ -507,6 +507,12 @@ contains
       call MPI_Allreduce(MPI_IN_PLACE, c_global, n_int, MPI_DOUBLE_PRECISION, &
                          MPI_MAX, comm, mpierr)
 
+      if (iter == 1 .and. my_id == 0) then
+        write(*,'(A,ES10.2,A,ES10.2,A,I0)') &
+          "[EQ]   iter 1 r_local range: [", minval(r_local), ", ", maxval(r_local), &
+          "]  nnz-rows=", count(r_local > 0.0d0)
+      endif
+
       ! --- Check convergence: all non-zero rows (and columns) max should be ~1 ---
       res_row = 0.0d0
       do i = 1, int(m_local)
@@ -527,8 +533,14 @@ contains
         conv = (res_row < tol) .and. (res_col < tol)
       endif
 
-      if (my_id == 0 .and. mod(iter, 10) == 0) &
-        write(*,'(A,I3,A,ES10.2)') "[EQ]   iter ", iter, "  res_row = ", res_row
+      if (my_id == 0) then
+        if (symmetric) then
+          write(*,'(A,I3,A,ES10.2)') "[EQ]   iter ", iter, "  res_row = ", res_row
+        else
+          write(*,'(A,I3,2(A,ES10.2))') "[EQ]   iter ", iter, &
+            "  res_row = ", res_row, "  res_col = ", res_col
+        endif
+      endif
 
       if (conv) then
         if (my_id == 0) write(*,'(A,I3,A)') "[EQ] Converged in ", iter, " iterations."
