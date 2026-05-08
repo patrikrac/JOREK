@@ -262,18 +262,21 @@ contains
 
 
   !--------------------------------------------------------------------
-  !> Compute per-node 4x4 block-diagonal inverse of a 1-var AIJ mass matrix.
+  !> Compute per-node full block-diagonal inverse of a 1-var AIJ mass matrix.
   !!
-  !! Each mesh node has n_degrees=4 Bezier DOFs. The mass integrand is
-  !! axisymmetric (mode-diagonal), so the (n_degrees*n_tor)^2 block per node
-  !! decomposes into n_tor independent 4x4 blocks — one per harmonic.
+  !! For each interior node, the full (n_degrees*n_tor)^2 block is extracted
+  !! and inverted with LAPACK dgesv in one call. Axis nodes are grouped: all
+  !! unique DOFs across axis nodes are collected and their combined
+  !! (n_axis_dofs*n_tor)^2 block is inverted as a single unit. This handles
+  !! both treat_axis (all axis nodes share the same 4 DOFs) and
+  !! force_central_node (axis nodes share only DOF 1, distinct DOFs 2-4).
   !!
-  !! For each (node, harmonic) pair, the 4x4 block is extracted via
-  !! MatGetValues and inverted with LAPACK dgesv. The result is a sparse
-  !! matrix Dinv with the same sparsity as B_mass (4 nonzeros per row).
+  !! Row indices are built in DOF-major order: all n_tor harmonics for DOF 1,
+  !! then all n_tor harmonics for DOF 2, etc.
   !!
-  !! Axis ring nodes share DOF indices with the central axis node; a
-  !! visited array deduplicates them.
+  !! MatGetValues fills row-major into Fortran column-major memory, yielding
+  !! the transpose of the actual block. dgesv solves the transposed system,
+  !! and MatSetValues re-transposes — giving the correct block inverse.
   !--------------------------------------------------------------------
   subroutine compute_per_node_block_inverse(B_mass, Dinv, dinv_created)
     use mod_parameters, only: n_tor, n_degrees, n_vertex_max
@@ -286,24 +289,20 @@ contains
     PetscErrorCode :: ierr
     PetscInt :: rstart, rend, nrows_local, ncols_local, nrows_global, ncols_global
     integer :: my_ind_min, my_ind_max, n_block_local
-    integer :: ielm, iv, inode, m, j, n_elements
-    integer :: k0       ! 1-based first DOF index for this node
-    integer :: local_blk  ! visited array index (0-based)
-    logical, allocatable :: visited(:)
-    PetscInt :: rows(4)   ! 0-based global row/col indices for the 4x4 block
-    PetscScalar :: block_vals(4,4), rhs(4,4)
-    PetscScalar :: diag_save(4)  ! saved diagonal for singular-block fallback
-    integer :: ipiv(4), info, comm
+    integer :: ielm, iv, inode, j, d, cnt, n_elements
+    integer :: k0, local_blk, block_n, n_axis_dofs
+    integer :: info, comm
+    logical, allocatable :: visited(:), in_axis_set(:)
+    integer, allocatable :: axis_dof_list(:), ipiv_blk(:)
+    PetscInt, allocatable :: rows_node(:), axis_rows(:)
+    PetscScalar, allocatable :: blk(:,:), rhs_blk(:,:), diag_save_blk(:)
 
     external :: dgesv
 
     call MatGetOwnershipRange(B_mass, rstart, rend, ierr)
     n_block_local = int((rend - rstart) / n_tor)
-    my_ind_min    = int(rstart / n_tor) + 1   ! 1-based first DOF index
+    my_ind_min    = int(rstart / n_tor) + 1
     my_ind_max    = my_ind_min + n_block_local - 1
-
-    allocate(visited(0:n_block_local-1))
-    visited = .false.
 
     if (.not. dinv_created) then
       call MatGetLocalSize(B_mass, nrows_local, ncols_local, ierr)
@@ -312,9 +311,9 @@ contains
       call MatCreate(comm, Dinv, ierr)
       call MatSetSizes(Dinv, nrows_local, ncols_local, nrows_global, ncols_global, ierr)
       call MatSetType(Dinv, MATMPIAIJ, ierr)
-      ! Each row has exactly n_degrees nonzeros (the 4x4 block for this node, same harmonic)
-      call MatMPIAIJSetPreallocation(Dinv, int(n_degrees, PetscInt), PETSC_NULL_INTEGER_ARRAY, &
-                                     0_PetscInt, PETSC_NULL_INTEGER_ARRAY, ierr)
+      ! Hint: n_degrees*n_tor nonzeros per row (axis rows may have more, allowed by PETSC_FALSE)
+      call MatMPIAIJSetPreallocation(Dinv, n_degrees*n_tor, PETSC_NULL_INTEGER_ARRAY, &
+                                     0, PETSC_NULL_INTEGER_ARRAY, ierr)
       call MatSetOption(Dinv, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
       dinv_created = .true.
     else
@@ -322,58 +321,107 @@ contains
     endif
 
     n_elements = element_list%n_elements
+
+    !--- Pass 0: collect unique axis DOFs owned by this rank ---
+    allocate(in_axis_set(n_block_local))
+    in_axis_set = .false.
+    n_axis_dofs = 0
     do ielm = 1, n_elements
       do iv = 1, n_vertex_max
         inode = element_list%element(ielm)%vertex(iv)
-        k0 = node_list%node(inode)%index(1)   ! 1-based first DOF index
-
-        ! Skip if any of the 4 DOFs are not owned by this rank
-        if (k0 < my_ind_min .or. k0 + n_degrees - 1 > my_ind_max) cycle
-
-        local_blk = k0 - my_ind_min   ! 0-based offset into visited array
-        if (visited(local_blk)) cycle
-        visited(local_blk) = .true.
-
-        ! Invert the 4x4 block for each toroidal harmonic independently
-        do m = 0, n_tor - 1
-          ! Global 0-based row/col indices for the 4 Bezier DOFs at this harmonic
-          do j = 1, 4
-            rows(j) = int(k0 + j - 2, PetscInt) * n_tor + m
-          end do
-
-          ! Extract 4x4 block from B_mass.
-          ! Note: MatGetValues fills in row-major order; Fortran 2D is column-major,
-          ! so block_vals(j2, j1) = B_mass[rows(j1), rows(j2)] (transposed).
-          ! LAPACK dgesv then solves block_vals^T * X = I (i.e. actual block * X^T = I),
-          ! and MatSetValues reads back with the same transpose, giving Dinv = block^{-1}.
-          call MatGetValues(B_mass, 4_PetscInt, rows, 4_PetscInt, rows, block_vals, ierr)
-
-          ! Save diagonal before dgesv overwrites block_vals with LU factors
-          do j = 1, 4
-            diag_save(j) = block_vals(j,j)
-          end do
-
-          ! RHS = identity
-          rhs = 0.0d0
-          do j = 1, 4
-            rhs(j,j) = 1.0d0
-          end do
-
-          call dgesv(4, 4, block_vals, 4, ipiv, rhs, 4, info)
-          if (info /= 0) then
-            ! Singular block: fall back to diagonal inverse using saved diagonal
-            rhs = 0.0d0
-            do j = 1, 4
-              if (abs(diag_save(j)) > 0.0d0) rhs(j,j) = 1.0d0 / diag_save(j)
-            end do
-          endif
-
-          call MatSetValues(Dinv, 4_PetscInt, rows, 4_PetscInt, rows, rhs, INSERT_VALUES, ierr)
+        if (.not. node_list%node(inode)%axis_node) cycle
+        do j = 1, n_degrees
+          d = node_list%node(inode)%index(j)
+          if (d < my_ind_min .or. d > my_ind_max) cycle
+          if (in_axis_set(d - my_ind_min + 1)) cycle
+          in_axis_set(d - my_ind_min + 1) = .true.
+          n_axis_dofs = n_axis_dofs + 1
         end do
       end do
     end do
+    allocate(axis_dof_list(max(1, n_axis_dofs)))
+    cnt = 0
+    do d = my_ind_min, my_ind_max
+      if (in_axis_set(d - my_ind_min + 1)) then
+        cnt = cnt + 1
+        axis_dof_list(cnt) = d
+      end if
+    end do
+    deallocate(in_axis_set)
 
-    deallocate(visited)
+    !--- Pass 1: interior nodes ---
+    allocate(visited(0:n_block_local-1))
+    visited = .false.
+    block_n = n_degrees * n_tor
+    allocate(rows_node(block_n), blk(block_n,block_n), rhs_blk(block_n,block_n))
+    allocate(diag_save_blk(block_n), ipiv_blk(block_n))
+
+    do ielm = 1, n_elements
+      do iv = 1, n_vertex_max
+        inode = element_list%element(ielm)%vertex(iv)
+        if (node_list%node(inode)%axis_node) cycle
+        k0 = node_list%node(inode)%index(1)
+        if (k0 < my_ind_min .or. k0 + n_degrees - 1 > my_ind_max) cycle
+        local_blk = k0 - my_ind_min
+        if (visited(local_blk)) cycle
+        visited(local_blk) = .true.
+
+        ! Row indices: DOF-major (all n_tor harmonics for DOF j, then DOF j+1, ...)
+        do j = 1, n_degrees
+          d = node_list%node(inode)%index(j)
+          do cnt = 0, n_tor - 1
+            rows_node((j-1)*n_tor + cnt + 1) = (d - 1) * n_tor + cnt
+          end do
+        end do
+
+        call MatGetValues(B_mass, block_n, rows_node, block_n, rows_node, blk, ierr)
+        do j = 1, block_n
+          diag_save_blk(j) = blk(j,j)
+        end do
+        rhs_blk = 0.d0
+        do j = 1, block_n; rhs_blk(j,j) = 1.d0; end do
+        call dgesv(block_n, block_n, blk, block_n, ipiv_blk, rhs_blk, block_n, info)
+        if (info /= 0) then
+          rhs_blk = 0.d0
+          do j = 1, block_n
+            if (abs(diag_save_blk(j)) > 0.d0) rhs_blk(j,j) = 1.d0 / diag_save_blk(j)
+          end do
+        end if
+        call MatSetValues(Dinv, block_n, rows_node, block_n, rows_node, rhs_blk, INSERT_VALUES, ierr)
+      end do
+    end do
+    deallocate(visited, rows_node, blk, rhs_blk, diag_save_blk, ipiv_blk)
+
+    !--- Pass 2: axis node group ---
+    if (n_axis_dofs > 0) then
+      block_n = n_axis_dofs * n_tor
+      allocate(axis_rows(block_n), blk(block_n,block_n), rhs_blk(block_n,block_n))
+      allocate(diag_save_blk(block_n), ipiv_blk(block_n))
+
+      do d = 1, n_axis_dofs
+        do cnt = 0, n_tor - 1
+          axis_rows((d-1)*n_tor + cnt + 1) = (axis_dof_list(d) - 1) * n_tor + cnt
+        end do
+      end do
+
+      call MatGetValues(B_mass, block_n, axis_rows, block_n, axis_rows, blk, ierr)
+      do j = 1, block_n
+        diag_save_blk(j) = blk(j,j)
+      end do
+      rhs_blk = 0.d0
+      do j = 1, block_n; rhs_blk(j,j) = 1.d0; end do
+      call dgesv(block_n, block_n, blk, block_n, ipiv_blk, rhs_blk, block_n, info)
+      if (info /= 0) then
+        rhs_blk = 0.d0
+        do j = 1, block_n
+          if (abs(diag_save_blk(j)) > 0.d0) rhs_blk(j,j) = 1.d0 / diag_save_blk(j)
+        end do
+      end if
+      call MatSetValues(Dinv, block_n, axis_rows, block_n, axis_rows, rhs_blk, INSERT_VALUES, ierr)
+      deallocate(axis_rows, blk, rhs_blk, diag_save_blk, ipiv_blk)
+    end if
+
+    deallocate(axis_dof_list)
 
     call MatAssemblyBegin(Dinv, MAT_FINAL_ASSEMBLY, ierr)
     call MatAssemblyEnd(Dinv, MAT_FINAL_ASSEMBLY, ierr)
