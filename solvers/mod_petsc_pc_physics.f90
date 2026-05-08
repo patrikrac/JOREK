@@ -1174,6 +1174,7 @@ contains
     logical :: first_time, use_reassembled
     PetscReal :: norm_val
     Mat :: diag_11, diag_22, diag_55, diag_66  ! pointers to chosen diagonal blocks
+    Mat :: prod_tmp                              ! temporary for block-inverse diagnostic
 
     !Mat :: A_eq
     !Vec :: dr, dc
@@ -1259,6 +1260,19 @@ contains
       if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mj||_F (per-node block) = ", norm_val
       call MatNorm(g_ctx%Dinv_Mw, NORM_FROBENIUS, norm_val, ierr)
       if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mw||_F (per-node block) = ", norm_val
+      if (debug_physics_pc) then
+        ! Verify: ||Dinv_Mj * B_33 - I||_F and ||Dinv_Mw * B_44 - I||_F
+        call MatMatMult(g_ctx%Dinv_Mj, g_ctx%B_33, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, prod_tmp, ierr)
+        call MatShift(prod_tmp, -1.0d0, ierr)
+        call MatNorm(prod_tmp, NORM_FROBENIUS, norm_val, ierr)
+        if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mj * B_33 - I||_F = ", norm_val
+        call MatDestroy(prod_tmp, ierr)
+        call MatMatMult(g_ctx%Dinv_Mw, g_ctx%B_44, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, prod_tmp, ierr)
+        call MatShift(prod_tmp, -1.0d0, ierr)
+        call MatNorm(prod_tmp, NORM_FROBENIUS, norm_val, ierr)
+        if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mw * B_44 - I||_F = ", norm_val
+        call MatDestroy(prod_tmp, ierr)
+      end if
     else
       ! Scalar diagonal inverse: 1 / diag(B)
       call compute_diag_mass_inverse(g_ctx%B_33, g_ctx%diag_Mj_inv, first_time)
