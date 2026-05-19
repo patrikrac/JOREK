@@ -224,6 +224,8 @@ contains
     Mat,             intent(in) :: A
     character(len=*),intent(in) :: label
     logical,         intent(in) :: symmetric
+    Mat            :: A_eq
+    Vec            :: dr, dc
 
     Mat            :: Ared, Adense
     PetscInt       :: M, N, bs, lda
@@ -233,15 +235,19 @@ contains
     PetscScalar, pointer :: dense_arr(:,:)
     real*8, allocatable :: A_copy(:,:), eig_r(:), eig_i(:)
     character(len=512) :: filename
-    PetscReal      :: norm_1, norm_F, norm_inf, norm_max
+    PetscReal      :: d_norm_1, d_norm_F, d_norm_inf, d_norm_max
     Vec            :: maxabs_vec
-    real*8         :: rho_A, norm_2_upper
+    real*8         :: rho_A, d_norm_2_upper
 
-    call PetscObjectGetComm(A, comm, ierr)
+
+    call MatDuplicate(A, MAT_COPY_VALUES, A_eq, ierr)
+    call petsc_mat_equilibrate(A_eq, label, symmetric, dr, dc)
+
+    call PetscObjectGetComm(A_eq, comm, ierr)
     call MPI_Comm_rank(comm, my_id, mpierr)
     call MPI_Comm_size(comm, comm_size, mpierr)
-    call MatGetSize(A, M, N, ierr)
-    call MatGetBlockSize(A, bs, ierr)
+    call MatGetSize(A_eq, M, N, ierr)
+    call MatGetBlockSize(A_eq, bs, ierr)
     n_int = int(M)
 
     if (my_id == 0) then
@@ -252,16 +258,16 @@ contains
     endif
 
     ! Collective norm computations on A before the gather (all ranks participate).
-    call MatNorm(A, NORM_1,         norm_1,   ierr)
-    call MatNorm(A, NORM_FROBENIUS, norm_F,   ierr)
-    call MatNorm(A, NORM_INFINITY,  norm_inf, ierr)
-    call MatCreateVecs(A, PETSC_NULL_VEC, maxabs_vec, ierr)
-    call MatGetRowMaxAbs(A, maxabs_vec, PETSC_NULL_INTEGER, ierr)
-    call VecMax(maxabs_vec, PETSC_NULL_INTEGER, norm_max, ierr)
+    call MatNorm(A_eq, NORM_1,         d_norm_1,   ierr)
+    call MatNorm(A_eq, NORM_FROBENIUS, d_norm_F,   ierr)
+    call MatNorm(A_eq, NORM_INFINITY,  d_norm_inf, ierr)
+    call MatCreateVecs(A_eq, PETSC_NULL_VEC, maxabs_vec, ierr)
+    call MatGetRowMaxAbs(A_eq, maxabs_vec, PETSC_NULL_INTEGER_ARRAY, ierr)
+    call VecMax(maxabs_vec, PETSC_NULL_INTEGER, d_norm_max, ierr)
     call VecDestroy(maxabs_vec, ierr)
 
     ! Gather parallel matrix — each rank gets a full sequential copy
-    call MatCreateRedundantMatrix(A, comm_size, MPI_COMM_NULL, MAT_INITIAL_MATRIX, Ared, ierr)
+    call MatCreateRedundantMatrix(A_eq, comm_size, MPI_COMM_NULL, MAT_INITIAL_MATRIX, Ared, ierr)
     if (ierr /= 0) then
       if (my_id == 0) write(*,'(A)') &
         "[EPS] ERROR: MatCreateRedundantMatrix failed." // &
@@ -308,8 +314,8 @@ contains
         ! Tightest available upper bound on ||A||_2 from the two standard bounds:
         !   ||A||_2 <= ||A||_F  (Frobenius)
         !   ||A||_2 <= sqrt(||A||_1 * ||A||_inf)  (Horn & Johnson)
-        norm_2_upper = min(real(norm_F, kind=8), &
-                           sqrt(real(norm_1, kind=8) * real(norm_inf, kind=8)))
+        d_norm_2_upper = min(real(d_norm_F, kind=8), &
+                           sqrt(real(d_norm_1, kind=8) * real(d_norm_inf, kind=8)))
 
         write(filename,'(A,A)') trim(label), "_dense_spectrum.dat"
         open(newunit=iunit, file=trim(filename), status='replace', action='write')
@@ -317,12 +323,12 @@ contains
         write(iunit,'(A,I0)')   "# Matrix size : ", M
         write(iunit,'(A,L1)')   "# Symmetric   : ", symmetric
         write(iunit,'(A,ES22.14)') "# rho(A)                        = ", rho_A
-        write(iunit,'(A,ES22.14)') "# ||A||_1                       = ", real(norm_1, kind=8)
-        write(iunit,'(A,ES22.14)') "# ||A||_F                       = ", real(norm_F, kind=8)
-        write(iunit,'(A,ES22.14)') "# ||A||_inf                     = ", real(norm_inf, kind=8)
-        write(iunit,'(A,ES22.14)') "# ||A||_max                     = ", real(norm_max, kind=8)
-        write(iunit,'(A,ES22.14)') "# ||A||_2 <= min(F,sqrt(1*inf)) = ", norm_2_upper
-        write(iunit,'(A,ES22.14)') "# ||A||_2 - rho(A) <=           = ", norm_2_upper - rho_A
+        write(iunit,'(A,ES22.14)') "# ||A||_1                       = ", real(d_norm_1, kind=8)
+        write(iunit,'(A,ES22.14)') "# ||A||_F                       = ", real(d_norm_F, kind=8)
+        write(iunit,'(A,ES22.14)') "# ||A||_inf                     = ", real(d_norm_inf, kind=8)
+        write(iunit,'(A,ES22.14)') "# ||A||_max                     = ", real(d_norm_max, kind=8)
+        write(iunit,'(A,ES22.14)') "# ||A||_2 <= min(F,sqrt(1*inf)) = ", d_norm_2_upper
+        write(iunit,'(A,ES22.14)') "# ||A||_2 - rho(A) <=           = ", d_norm_2_upper - rho_A
         write(iunit,'(A)')      "#        Re(lambda)           Im(lambda)"
         do i = 1, n_int
           write(iunit,'(2X,ES22.14,2X,ES22.14)') eig_r(i), eig_i(i)
@@ -332,19 +338,22 @@ contains
         write(*,'(A,I0,A,A)') "[EPS] All ", n_int, " eigenvalues -> ", trim(filename)
         write(*,'(A)') "[EPS] --- Non-normality measure ---"
         write(*,'(A,ES12.4)') "[EPS]  rho(A)               = ", rho_A
-        write(*,'(A,ES12.4)') "[EPS]  ||A||_1              = ", real(norm_1,   kind=8)
-        write(*,'(A,ES12.4)') "[EPS]  ||A||_F              = ", real(norm_F,   kind=8)
-        write(*,'(A,ES12.4)') "[EPS]  ||A||_inf            = ", real(norm_inf, kind=8)
-        write(*,'(A,ES12.4)') "[EPS]  ||A||_max            = ", real(norm_max, kind=8)
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_1              = ", real(d_norm_1,   kind=8)
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_F              = ", real(d_norm_F,   kind=8)
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_inf            = ", real(d_norm_inf, kind=8)
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_max            = ", real(d_norm_max, kind=8)
         write(*,'(A,ES12.4)') "[EPS]  sqrt(||_1*||_inf)    = ", &
-          sqrt(real(norm_1, kind=8) * real(norm_inf, kind=8))
-        write(*,'(A,ES12.4)') "[EPS]  ||A||_2 <=           = ", norm_2_upper
-        write(*,'(A,ES12.4)') "[EPS]  ||A||_2 - rho(A) <=  = ", norm_2_upper - rho_A
+          sqrt(real(d_norm_1, kind=8) * real(d_norm_inf, kind=8))
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_2 <=           = ", d_norm_2_upper
+        write(*,'(A,ES12.4)') "[EPS]  ||A||_2 - rho(A) <=  = ", d_norm_2_upper - rho_A
         if (symmetric) write(*,'(A)') &
           "[EPS]  (symmetric matrix: ||A||_2 = rho(A) exactly)"
       endif
       deallocate(eig_r, eig_i)
     endif
+
+    call VecDestroy(dr, ierr);  call VecDestroy(dc, ierr)
+    call MatDestroy(A_eq, ierr)
   end subroutine petsc_mat_convert_spectrum
 
 
