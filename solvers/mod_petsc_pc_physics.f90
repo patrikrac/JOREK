@@ -93,6 +93,21 @@ module mod_petsc_pc_physics
     logical :: work_4v_created = .false.
     IS :: is_reduced(4)
     logical :: is_reduced_created = .false.
+
+    Mat :: M_hydro
+    KSP :: ksp_hydro 
+    logical :: ksp_hydro_created = .false.
+    IS :: is_hydro(3)
+    Vec :: work_rhs_3v
+
+    Mat :: A_alfven
+    KSP :: ksp_alfven
+    logical :: ksp_alfven_created = .false.
+    Vec :: work_rhs_2v
+
+    Vec :: hydro_predictor_3v
+
+    Mat :: S_PBP
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx
@@ -215,51 +230,6 @@ contains
     PetscCallA(MatGetDiagonal(B, diag_M_inv, ierr))
     PetscCallA(VecReciprocal(diag_M_inv, ierr))
   end subroutine compute_diag_mass_inverse
-
-
-  !--------------------------------------------------------------------
-  !> Compute block diagonal inverse of a 1-var AIJ matrix.
-  !!
-  !! The extracted sub-blocks (B_33, B_44) are AIJ, but
-  !! MatInvertBlockDiagonalMat requires BAIJ. This routine:
-  !!   1. Converts AIJ -> BAIJ (block_size = n_tor) as a temporary
-  !!   2. Calls MatInvertBlockDiagonalMat to get the inverse
-  !!   3. Destroys the temporary BAIJ copy
-  !--------------------------------------------------------------------
-  subroutine compute_block_diagonal_inverse(B_aij, Dinv, block_size, first_time)
-    Mat, intent(in)    :: B_aij
-    Mat, intent(inout) :: Dinv
-    PetscInt, intent(in) :: block_size
-    logical, intent(in)  :: first_time
-
-    Mat :: B_baij, Dinv_baij
-    PetscErrorCode :: ierr
-    integer :: comm
-
-    ! Destroy previous inverse if rebuilding
-    if (.not. first_time) call MatDestroy(Dinv, ierr)
-
-    ! Set block size on AIJ so that MatConvert creates BAIJ with correct blocking
-    call MatSetBlockSize(B_aij, block_size, ierr)
-
-    ! Convert AIJ -> BAIJ with the given block size
-    call MatConvert(B_aij, MATBAIJ, MAT_INITIAL_MATRIX, B_baij, ierr)
-
-    ! Pre-create output matrix (required by MatInvertBlockDiagonalMat)
-    call PetscObjectGetComm(B_baij, comm, ierr)
-    call MatCreate(comm, Dinv_baij, ierr)
-
-    ! Compute the inverse of the block diagonal (result is BAIJ)
-    call MatInvertBlockDiagonalMat(B_baij, Dinv_baij, ierr)
-
-    ! Convert result to AIJ for compatibility with MatMatMult(AIJ, AIJ)
-    call MatConvert(Dinv_baij, MATAIJ, MAT_INITIAL_MATRIX, Dinv, ierr)
-
-    ! Clean up temporaries
-    call MatDestroy(Dinv_baij, ierr)
-    call MatDestroy(B_baij, ierr)
-  end subroutine compute_block_diagonal_inverse
-
 
   !--------------------------------------------------------------------
   !> Compute per-node full block-diagonal inverse of a 1-var AIJ mass matrix.
@@ -508,7 +478,6 @@ contains
 
 
   !> Off-diagonal Schur correction Atilde_21 = B_21 - K_21_correction
-  !! (element-assembled approximation of B_23 * M_j^{-1} * B_31).
   subroutine compute_schur_corrected_block_21(B_diag, Atilde, first_time)
     Mat, intent(in)    :: B_diag
     Mat, intent(inout) :: Atilde
@@ -528,7 +497,6 @@ contains
 
 
   !> Off-diagonal Schur correction Atilde_61 = B_61 - K_61_correction
-  !! (element-assembled approximation of B_63 * M_j^{-1} * B_31).
   subroutine compute_schur_corrected_block_61(B_diag, Atilde, first_time)
     Mat, intent(in)    :: B_diag
     Mat, intent(inout) :: Atilde
@@ -668,6 +636,7 @@ contains
   !! MatConvert, and set up a single KSP (PREONLY+LU+MUMPS).
   !--------------------------------------------------------------------
   subroutine assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, skip_ksp_setup)
+     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate
     logical, intent(in) :: use_reassembled, first_time, skip_ksp_setup
     integer, intent(in) :: comm, my_id
 
@@ -678,6 +647,9 @@ contains
     PetscInt :: rstart, rend, n_local, n_global
     PetscInt, parameter :: nblocks = 4
     integer :: k
+
+    Mat :: mats_nest_hydro(9), A_nest_hydro
+    Mat :: mats_nest_alfven(4), A_nest_alfven, A_alfven_2x2
 
     ! Choose diagonal blocks B_55/B_66 or R_55/R_66
     if (use_reassembled) then
@@ -721,6 +693,45 @@ contains
     call MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%A_reduced_4x4, ierr)
     call MatDestroy(A_nest, ierr)
 
+    mats_nest_hydro(1) = g_ctx%Atilde_22
+    mats_nest_hydro(2) = g_ctx%B_25
+    mats_nest_hydro(3) = g_ctx%B_26
+    mats_nest_hydro(4) = g_ctx%B_52
+    mats_nest_hydro(5) = diag_55
+    mats_nest_hydro(6) = PETSC_NULL_MAT
+    mats_nest_hydro(7) = g_ctx%B_62
+    mats_nest_hydro(8) = PETSC_NULL_MAT
+    mats_nest_hydro(9) = diag_66
+
+    PetscCallA(MatCreateNest(comm, 3, PETSC_NULL_IS, 3, PETSC_NULL_IS, mats_nest_hydro, A_nest_hydro, ierr))
+
+    if (.not. first_time .and. g_ctx%ksp_hydro_created) then
+      call MatDestroy(g_ctx%M_hydro, ierr)
+    endif
+
+    call MatConvert(A_nest_hydro, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%M_hydro, ierr)
+    call MatDestroy(A_nest_hydro, ierr)
+
+    !call petsc_mat_convert_spectrum(g_ctx%M_hydro, "M_hydro", .false.)
+    !call petsc_test_pc_matrix(g_ctx%M_hydro, "M_hydro", .false., my_id)
+
+    mats_nest_alfven(1) = g_ctx%Atilde_11
+    mats_nest_alfven(2) = g_ctx%B_12
+    mats_nest_alfven(3) = g_ctx%Atilde_21
+    mats_nest_alfven(4) = g_ctx%Atilde_22
+
+    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, mats_nest_alfven, A_nest_alfven, ierr))
+
+    if (.not. first_time .and. g_ctx%ksp_alfven_created) then
+      call MatDestroy(g_ctx%A_alfven, ierr)
+    endif
+
+    call MatConvert(A_nest_alfven, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%A_alfven, ierr)
+    call MatDestroy(A_nest_alfven, ierr)
+
+    !call petsc_mat_convert_spectrum(g_ctx%A_alfven, "A_alfven_2x2", .false.)
+    !call petsc_test_pc_matrix(g_ctx%A_alfven, "A_alfven_2x2", .false., my_id)
+
     ! Set up monolithic KSP (skipped when probe_exact=.true.: probe owns the KSP)
     if (.not. skip_ksp_setup) then
       if (first_time) then
@@ -734,6 +745,29 @@ contains
       call KSPSetUp(g_ctx%ksp_reduced, ierr)
       g_ctx%ksp_reduced_created = .true.
     endif
+
+    ! Create ksp for sub-blocks (Alfven and hydro (For now mumps but to be changed...))
+    if (first_time) then
+      call KSPCreate(comm, g_ctx%ksp_hydro, ierr)
+    endif
+    call KSPSetOperators(g_ctx%ksp_hydro, g_ctx%M_hydro, g_ctx%M_hydro, ierr)
+    call KSPSetType(g_ctx%ksp_hydro, KSPPREONLY, ierr)
+    call KSPGetPC(g_ctx%ksp_hydro, pc_obj, ierr)
+    call PCSetType(pc_obj, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(g_ctx%ksp_hydro, ierr)
+    g_ctx%ksp_hydro_created = .true.
+
+    if (first_time) then
+      call KSPCreate(comm, g_ctx%ksp_alfven, ierr)
+    endif
+    call KSPSetOperators(g_ctx%ksp_alfven, g_ctx%A_alfven, g_ctx%A_alfven, ierr)
+    call KSPSetType(g_ctx%ksp_alfven, KSPPREONLY, ierr)
+    call KSPGetPC(g_ctx%ksp_alfven, pc_obj, ierr)
+    call PCSetType(pc_obj, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(g_ctx%ksp_alfven, ierr)
+    g_ctx%ksp_alfven_created = .true.
 
     ! Allocate 4-var work vectors and create index sets (first time only)
     if (.not. g_ctx%work_4v_created) then
@@ -749,6 +783,12 @@ contains
       do k = 1, 4
         call ISCreateStride(comm, n_local, rstart + (k-1)*n_local, 1, &
                             g_ctx%is_reduced(k), ierr)
+      enddo
+
+      call MatCreateVecs(g_ctx%M_hydro, g_ctx%hydro_predictor_3v, g_ctx%work_rhs_3v, ierr)
+      do k = 1, 3
+        call ISCreateStride(comm, n_local, rstart + (k-1)*n_local, 1, &
+                            g_ctx%is_hydro(k), ierr)
       enddo
       g_ctx%is_reduced_created = .true.
     endif
@@ -1332,22 +1372,21 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (per-node block M^{-1})"
     else
       ! Use element-assembled / scalar diagonal paths
-      ! Choose diagonal blocks: reassembled (R_*) or extracted (B_*)
       if (use_reassembled) then
         call compute_schur_corrected_block_psi(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
                                             g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-        call compute_schur_corrected_block_diag(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
+        call compute_schur_corrected_block_u(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
                                             g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
       else
         call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
                                             g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-        call compute_schur_corrected_block_diag(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
+        call compute_schur_corrected_block_u(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
                                             g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
       endif
       ! Off-diagonal Schur corrections from element-assembled K_21 / K_61
       call compute_schur_corrected_block_21(g_ctx%B_21, g_ctx%Atilde_21, first_time)
       call compute_schur_corrected_block_61(g_ctx%B_61, g_ctx%Atilde_61, first_time)
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (diag M^{-1})"
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
     endif
 
     call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
@@ -1363,15 +1402,49 @@ contains
     ! S_u = Atilde_22 - Atilde_21 * diag(Atilde_11)^{-1} * B_12
     ! This captures the u -> psi -> u round-trip (Alfven wave coupling)
     if (physics_pc_schur_u) then
-      call compute_diag_mass_inverse(g_ctx%Atilde_11, g_ctx%diag_A11_inv, first_time)
-      call compute_schur_corrected_block_diag(g_ctx%Atilde_22, g_ctx%Atilde_21, g_ctx%B_12, &
-                                          g_ctx%diag_A11_inv, g_ctx%S_u, first_time)
+      !TODO...
 
       call VecNorm(g_ctx%diag_A11_inv, NORM_2, norm_val, ierr)
       if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||diag(Atilde_11)^{-1}||_2 = ", norm_val
       call MatNorm(g_ctx%S_u, NORM_FROBENIUS, norm_val, ierr)
       if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||S_u||_F = ", norm_val
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed inner Schur complement S_u"
+    endif
+
+    if (debug_physics_pc) then
+      call petsc_test_pc_matrix(g_ctx%B_33, "B_33", .true., my_id)
+      call petsc_test_pc_matrix(g_ctx%B_44, "B_44", .true., my_id)
+      call petsc_test_pc_matrix(g_ctx%Atilde_11, "Atilde_11", .false., my_id)
+      call petsc_test_pc_matrix(g_ctx%Atilde_22, "Atilde_22", .false., my_id)
+
+       call petsc_test_pc_matrix(g_ctx%S_PBP, "S_PBP", .false., my_id)
+
+      call petsc_test_pc_matrix(g_ctx%Atilde_21, "Atilde_21", .false., my_id)
+      call petsc_test_pc_matrix(g_ctx%B_51, "B_51", .false., my_id)
+
+
+      call petsc_test_pc_matrix(g_ctx%B_25, "B_25", .false., my_id)
+      call petsc_test_pc_matrix(g_ctx%B_66, "B_66", .false., my_id)
+
+      call petsc_test_pc_matrix(g_ctx%B_61, "B_61", .false., my_id)
+
+      ! ! --- Compute block spectra for diagnostics ---
+      ! call petsc_mat_convert_spectrum(g_ctx%Atilde_11, "Atilde_11", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%Atilde_22, "Atilde_22", .false.)
+
+      ! call petsc_mat_convert_spectrum(g_ctx%Atilde_21, "Atilde_21", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%Atilde_61, "Atilde_61", .false.)
+
+      ! call petsc_mat_convert_spectrum(g_ctx%B_12, "B_12", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%B_16, "B_16", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%B_25, "B_25", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%B_26, "B_26", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%B_51, "B_51", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%B_52, "B_52", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%B_62, "B_62", .false.)
+
+      ! call petsc_mat_convert_spectrum(g_ctx%B_55, "B_55", .false.)
+      ! call petsc_mat_convert_spectrum(g_ctx%B_66, "B_66", .false.)
     endif
 
     ! --- Step 5: Set up solver(s) ---
@@ -1381,16 +1454,13 @@ contains
       call assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, physics_pc_probe_exact)
 
       if (debug_physics_pc) then
-        ! call MatDuplicate(g_ctx%A_reduced_4x4, MAT_COPY_VALUES, A_eq, ierr)
-        ! call petsc_mat_equilibrate(A_eq, "A_reduced_4x4", .false., dr, dc)
-        ! call petsc_mat_convert_spectrum(A_eq, "A_reduced_4x4", .false.)
-        ! call VecDestroy(dr, ierr);  call VecDestroy(dc, ierr)
-        ! call MatDestroy(A_eq, ierr)
+        !call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false.)
+        call petsc_test_pc_matrix(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false., my_id)
       endif
 
       if (physics_pc_probe_exact) then
         call assemble_probed_exact_4x4(use_reassembled, comm, first_time, my_id)
-        !call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_exact_4x4", .false.)
+       ! call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_exact_4x4", .false.)
       endif
     else
       ! Block-diagonal mode: 4 separate sub-KSPs
@@ -1458,6 +1528,8 @@ contains
     Vec :: rhs_psi, rhs_u, rhs_rho, rhs_T
     Vec :: sol_psi, sol_u, sol_rho, sol_T
 
+    logical :: multi_step = .false. ! Placeholder flag for multi-step solver variant (default in the future)
+
     if (.not. g_ctx%reduced_ready) then
       ierr = 1
       return
@@ -1480,14 +1552,12 @@ contains
 
     ! --- Step 2: Apply inverse of elliptic constraint mass matrices ---
     ! work_1 = A_33^{-1} * x_j  (temp_j)
-    ! call VecPointwiseMult(g_ctx%work_1, g_ctx%diag_Mj_inv, x_j, ierr)  ! mass approx
     call KSPSolve(g_ctx%ksp_Mj, x_j, g_ctx%work_1, ierr)
     ! work_2 = A_44^{-1} * x_w  (temp_w)
-    ! call VecPointwiseMult(g_ctx%work_2, g_ctx%diag_Mw_inv, x_w, ierr)  ! mass approx
     call KSPSolve(g_ctx%ksp_Mw, x_w, g_ctx%work_2, ierr)
 
     ! --- Step 3: Schur-correct the RHS and solve ---
-    if (physics_pc_monolithic) then
+    if (physics_pc_monolithic .and. .not. multi_step) then
       ! ---- Monolithic 4x4 solve ----
       ! Compute Schur-corrected RHS into work vectors, then scatter into monolithic vector
 
@@ -1538,6 +1608,32 @@ contains
       call VecGetSubVector(g_ctx%work_sol_4v, g_ctx%is_reduced(4), sol_T, ierr)
       call VecCopy(sol_T, y_T, ierr)
       call VecRestoreSubVector(g_ctx%work_sol_4v, g_ctx%is_reduced(4), sol_T, ierr)
+
+    else if (physics_pc_monolithic .and. multi_step) then
+      ! Mulit-Step solve
+      ! Stage A: solving the hydro block
+      ! Solve M_hydro * hydro_predictor = r_hydro
+      call MatMult(g_ctx%B_23, g_ctx%work_1, g_ctx%work_3, ierr)
+      call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
+      call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
+      call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, ierr)
+      call VecGetSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(1), rhs_u, ierr)
+      call VecCopy(g_ctx%work_5, rhs_u, ierr)
+      call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(1), rhs_u, ierr)
+
+      ! b_rho = x_rho (no Schur correction)
+      call VecGetSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(2), rhs_rho, ierr)
+      call VecCopy(x_rho, rhs_rho, ierr)
+      call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(2), rhs_rho, ierr)
+
+      ! b_T = x_T - B_63 * temp_j  → store in work_4
+      call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
+      call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
+      call VecGetSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(3), rhs_T, ierr)
+      call VecCopy(g_ctx%work_4, rhs_T, ierr)
+      call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(3), rhs_T, ierr)
+
+      call KSPSolve(g_ctx%ksp_hydro, g_ctx%work_rhs_3v, g_ctx%hydro_predictor_3v, ierr)
 
     else
       ! ---- Block-diagonal / block-triangular solve ----
@@ -1608,13 +1704,11 @@ contains
     ! y_j = A_33^{-1} * (x_j - B_31 * y_psi)
     call MatMult(g_ctx%B_31, y_psi, g_ctx%work_3, ierr)
     call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_j, ierr)
-    ! call VecPointwiseMult(y_j, g_ctx%diag_Mj_inv, g_ctx%work_4, ierr)  ! mass approx
     call KSPSolve(g_ctx%ksp_Mj, g_ctx%work_4, y_j, ierr)
 
     ! y_w = A_44^{-1} * (x_w - B_42 * y_u)
     call MatMult(g_ctx%B_42, y_u, g_ctx%work_3, ierr)
     call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_w, ierr)
-    ! call VecPointwiseMult(y_w, g_ctx%diag_Mw_inv, g_ctx%work_4, ierr)  ! mass approx
     call KSPSolve(g_ctx%ksp_Mw, g_ctx%work_4, y_w, ierr)
 
     ! --- Step 5: Restore sub-vectors ---
@@ -1704,6 +1798,8 @@ contains
     call petsc_create_pc_matrix(g_ctx%K_u_correction, a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%K_21_correction,  a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%K_61_correction,  a_mat, 1)
+
+    call petsc_create_pc_matrix(g_ctx%S_PBP, a_mat, 1)
   end subroutine petsc_create_pc_matrices
 
 
@@ -1734,6 +1830,7 @@ contains
       PetscCallA(MatZeroEntries(g_ctx%K_u_correction, ierr))
       PetscCallA(MatZeroEntries(g_ctx%K_21_correction,  ierr))
       PetscCallA(MatZeroEntries(g_ctx%K_61_correction,  ierr))
+      PetscCallA(MatZeroEntries(g_ctx%S_PBP,  ierr))
     endif
 
     call construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat, &
@@ -1742,7 +1839,7 @@ contains
 
     call construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
                                         g_ctx%K_psi_correction, g_ctx%K_u_correction, &
-                                        g_ctx%K_21_correction,  g_ctx%K_61_correction)
+                                        g_ctx%K_21_correction,  g_ctx%K_61_correction, g_ctx%S_PBP)
     g_ctx%psi_correction_ready  = .true.
     g_ctx%u_correction_ready    = .true.
     g_ctx%correction_21_ready   = .true.
@@ -1948,6 +2045,37 @@ contains
                                  g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu, &
                                  n_axis_dofs)
   end subroutine petsc_test_pc_matrices
+
+    subroutine petsc_test_pc_matrix(A, mat_name, symmetric, my_id)
+    use mod_petsc_matrix_tests
+    use mod_parameters, only: n_tor, n_degrees
+    use nodes_elements
+
+    Mat,     intent(in) :: A
+    character(len=*), intent(in) :: mat_name
+    logical, intent(in) :: symmetric
+    integer, intent(in) :: my_id
+
+    integer :: inode, i_order, mpierr
+    integer :: max_axis_blk_local, max_axis_blk_global, n_axis_dofs
+
+    ! Find the largest block index assigned to any axis node on this rank.
+    max_axis_blk_local = 0
+    do inode = 1, node_list%n_nodes
+      if (.not. node_list%node(inode)%axis_node) cycle
+      do i_order = 1, n_degrees
+        if (node_list%node(inode)%index(i_order) > max_axis_blk_local) &
+          max_axis_blk_local = node_list%node(inode)%index(i_order)
+      end do
+    end do
+    call MPI_Allreduce(max_axis_blk_local, max_axis_blk_global, 1, &
+                       MPI_INTEGER, MPI_MAX, g_ctx%comm, mpierr)
+    ! Each block index corresponds to n_tor scalar rows in A_j
+    ! (construct_pc_matrix_mod.f90 uses bs1 = n_tor, assuming n_tor_local = n_tor).
+    n_axis_dofs = max_axis_blk_global * n_tor
+
+    call petsc_run_matrix_test(my_id, g_ctx%comm, A, mat_name, symmetric, n_axis_dofs)
+  end subroutine petsc_test_pc_matrix
 
 #endif
 end module mod_petsc_pc_physics
