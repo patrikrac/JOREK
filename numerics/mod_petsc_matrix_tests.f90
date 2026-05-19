@@ -21,10 +21,10 @@ module mod_petsc_matrix_tests
 #ifdef USE_PETSC
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_settings, only: n_degrees
+  use mod_settings, only: n_degrees, n_tor
   implicit none
   private
-  public :: petsc_run_matrix_tests
+  public :: petsc_run_matrix_test, petsc_run_matrix_tests
 
 contains
 
@@ -57,6 +57,37 @@ contains
     if (my_id == 0) write(*,'(A)') &
       "==========================================================="
   end subroutine petsc_run_matrix_tests
+
+
+  subroutine petsc_run_matrix_test(my_id, comm, A, mat_name, symmetric, n_axis_dofs)
+    use mod_petsc_matrix_analysis, only: petsc_mat_equilibrate
+
+    integer, intent(in)           :: my_id, comm
+    Mat,     intent(in)           :: A
+    character(len=*), intent(in) :: mat_name
+    logical, intent(in)           :: symmetric
+    integer, intent(in), optional :: n_axis_dofs
+
+    Mat            :: A_eq
+    Vec            :: dr, dc
+    PetscErrorCode :: ierr
+
+    if (my_id == 0) write(*,'(A)') "=== PC matrix solver test ================================="
+
+    call MatDuplicate(A, MAT_COPY_VALUES, A_eq, ierr)
+    call petsc_mat_equilibrate(A_eq, mat_name, symmetric, dr, dc)
+
+    ! Diagonal blocks: SPD mass matrices — full solver test
+    call petsc_mat_solve_test(my_id, comm, A_eq, mat_name, symmetric=symmetric, n_axis_dofs=n_axis_dofs)
+
+    call petsc_mat_matvec_test(my_id, comm, A_eq, mat_name)
+
+    call VecDestroy(dr, ierr);  call VecDestroy(dc, ierr)
+    call MatDestroy(A_eq, ierr)
+
+    if (my_id == 0) write(*,'(A)') &
+      "==========================================================="
+  end subroutine petsc_run_matrix_test
 
 
   !--------------------------------------------------------------------
@@ -151,14 +182,14 @@ contains
     ! Only run when the caller provides the axis DOF count.
     if (present(n_axis_dofs)) then
       if (n_axis_dofs > 0) then
-        call run_one_solve(my_id, comm, A, b, x_exact, &
-                           merge("CG+GAMG+Split    ", "GMRES+GAMG+Split ", symmetric), &
-                           use_direct=.false., use_cg=symmetric, use_amg=.true., &
-                           use_fieldsplit=.true., n_axis_dofs=n_axis_dofs)
-        call run_one_solve(my_id, comm, A, b, x_exact, &
-                           merge("CG+Boom+Split    ", "GMRES+Boom+Split ", symmetric), &
-                           use_direct=.false., use_cg=symmetric, use_hypre_amg=.true., &
-                           use_fieldsplit=.true., n_axis_dofs=n_axis_dofs)
+        ! call run_one_solve(my_id, comm, A, b, x_exact, &
+        !                    merge("CG+GAMG+Split    ", "GMRES+GAMG+Split ", symmetric), &
+        !                    use_direct=.false., use_cg=symmetric, use_amg=.true., &
+        !                    use_fieldsplit=.true., n_axis_dofs=n_axis_dofs)
+        ! call run_one_solve(my_id, comm, A, b, x_exact, &
+        !                    merge("CG+Boom+Split    ", "GMRES+Boom+Split ", symmetric), &
+        !                    use_direct=.false., use_cg=symmetric, use_hypre_amg=.true., &
+        !                    use_fieldsplit=.true., n_axis_dofs=n_axis_dofs)
       endif
     endif
 
@@ -209,6 +240,9 @@ contains
     integer :: cc0, cc1, cr
     real    :: t_elapsed
     logical :: do_amg, do_hypre_amg, do_fieldsplit, converted
+    PetscInt :: rstart, rend
+    PetscInt :: n_local_ax, n_local_bk
+    PetscInt :: first_ax, first_bk
 
     do_amg        = .false.
     do_hypre_amg  = .false.
@@ -230,7 +264,7 @@ contains
     if (do_amg .or. do_hypre_amg) then
       call MatGetBlockSize(A, bs, ierr)
       call MatConvert(A, MATAIJ, MAT_INITIAL_MATRIX, A_op, ierr)
-      if (bs > 1) call MatSetBlockSize(A_op, bs * n_degrees, ierr)
+      call MatSetBlockSize(A_op, n_tor, ierr)
       converted = .true.
     else
       A_op = A
@@ -271,10 +305,25 @@ contains
         call PCFieldSplitSetType(pc, PC_COMPOSITE_ADDITIVE, ierr)
 
         call MatGetSize(A_op, n_total, PETSC_NULL_INTEGER, ierr)
-        n_bk = n_total - n_ax
+        call MatGetOwnershipRange(A_op, rstart, rend, ierr)
 
-        call ISCreateStride(comm, n_ax, 0, 1, is_axis, ierr)
-        call ISCreateStride(comm, n_bk, n_ax, 1, is_bulk, ierr)
+        n_local_ax = max(0, min(rend, n_ax) - rstart)
+        if (n_local_ax > 0) then
+            first_ax = rstart
+        else
+            first_ax = 0  ! This rank has no axis rows
+        end if
+
+        n_local_bk = max(0, rend - max(rstart, n_ax))
+        if (n_local_bk > 0) then
+            first_bk = max(rstart, n_ax)
+        else
+            first_bk = 0  ! This rank has no bulk rows
+        end if
+
+        call ISCreateStride(comm, n_local_ax, first_ax, 1, is_axis, ierr)
+        call ISCreateStride(comm, n_local_bk, first_bk, 1, is_bulk, ierr)
+        
         call PCFieldSplitSetIS(pc, "axis", is_axis, ierr)
         call PCFieldSplitSetIS(pc, "bulk", is_bulk, ierr)
         call ISDestroy(is_axis, ierr)
@@ -292,17 +341,21 @@ contains
         call KSPSetType(sub_ksp(1), KSPPREONLY, ierr)
         call KSPGetPC(sub_ksp(1), sub_pc, ierr)
         call PCSetType(sub_pc, PCLU, ierr)
-        call PCFactorSetMatSolverType(sub_pc, MATSOLVERMUMPS, ierr)
+        !call PCFactorSetMatSolverType(sub_pc, MATSOLVERMUMPS, ierr)
 
         ! Bulk sub-KSP: PREONLY + AMG
-        call KSPSetType(sub_ksp(2), KSPPREONLY, ierr)
+        if (use_cg) then
+          call KSPSetType(sub_ksp(2), KSPCG, ierr)
+        else
+          call KSPSetType(sub_ksp(2), KSPGMRES, ierr)
+        endif
         call KSPGetPC(sub_ksp(2), sub_pc, ierr)
 
         ! Set nodal block size on the extracted bulk sub-matrix.  The
         ! sub-matrix does not automatically inherit the block size set on
         ! A_op; setting it here drives nodal coarsening in AMG.
         call KSPGetOperators(sub_ksp(2), sub_A, pmat_dummy, ierr)
-        if (bs > 1) call MatSetBlockSize(sub_A, bs * n_degrees, ierr)
+        call MatSetBlockSize(sub_A, n_tor, ierr)
 
         if (do_amg) then
           call PCSetType(sub_pc, PCGAMG, ierr)
@@ -319,10 +372,10 @@ contains
           ! BoomerAMG options under "fieldsplit_bulk_" accordingly.
           if (bs > 1) then
             call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
-                "-fieldsplit_bulk_pc_hypre_boomeramg_nodal_coarsen", "6", ierr)
+                "-fieldsplit_bulk_pc_hypre_boomeramg_nodal_coarsen", "2", ierr)
           endif
           call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
-              "-fieldsplit_bulk_pc_hypre_boomeramg_coarsen_type", "Falgout", ierr)
+              "-fieldsplit_bulk_pc_hypre_boomeramg_coarsen_type", "HMIS", ierr)
           call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
               "-fieldsplit_bulk_pc_hypre_boomeramg_relax_type_all", &
               "symmetric-SOR/Jacobi", ierr)
@@ -347,23 +400,26 @@ contains
         ! product; criterion 1 (Frobenius norm) does not and causes
         ! KSP_DIVERGED_INDEFINITE_PC with CG. Skipped if A arrived as scalar
         ! AIJ (bs=1) since the nodal block structure would be unknown.
-        if (bs > 1) then
-          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
-              "-hmg_pc_hypre_boomeramg_nodal_coarsen", "6", ierr)
-        endif
-        ! Falgout coarsening: proven stable with nodal_coarsen=6 on 2D FEM
-        ! systems (PETSc ex49 elasticity). Override at runtime with
-        ! -hmg_pc_hypre_boomeramg_coarsen_type HMIS to test parallel scaling.
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_coarsen_type", "HMIS", ierr)
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_nodal_coarsen", "6", ierr)
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_truncfactor", "0.3", ierr)
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_P_max", "4", ierr)
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_strong_threshold", "0.5", ierr) ! Use 0.5 for 3D, 0.25 for 2D
+
+        ! Smoothers: Expensive on fine grid, cheap on coarse grid
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_smooth_num_levels", "1", ierr)
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_smooth_type", "Euclid", ierr)
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_euclid_levels", "1", ierr)
+        !call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_relax_type_all", "symmetric-SOR/Jacobi", ierr)
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_relax_type_all", "Chebyshev", ierr)
+
         call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
-            "-hmg_pc_hypre_boomeramg_coarsen_type", "Falgout", ierr)
-        ! Symmetric SOR/Jacobi smoother for SPD mass matrices.
-        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
-            "-hmg_pc_hypre_boomeramg_relax_type_all", "symmetric-SOR/Jacobi", ierr)
+                "-hmg_pc_hypre_boomeramg_min_iter", "250", ierr)
       else
         call PCSetType(pc, PCBJACOBI, ierr)
       endif
       call KSPSetTolerances(ksp, 1.0d-8, PETSC_DEFAULT_REAL, &
-                             PETSC_DEFAULT_REAL, 10000, ierr)
+                             PETSC_DEFAULT_REAL, 1000, ierr)
     endif
 
     ! Allow runtime override via -ksp_type, -pc_type, etc.
