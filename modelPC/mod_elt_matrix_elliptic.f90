@@ -30,7 +30,8 @@ contains
 
 subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_wu, &
                                    ELM_psi_correction, ELM_u_correction, &
-                                   ELM_21_correction,  ELM_61_correction)
+                                   ELM_21_correction,  ELM_61_correction, &
+                                   ELM_schur_PBP)
 
   use mod_parameters
   use data_structure, only: type_element, type_node
@@ -53,6 +54,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8, dimension(D1V, D1V), intent(out) :: ELM_jpsi, ELM_wu
   real*8, dimension(D1V, D1V), intent(out), optional :: ELM_psi_correction, ELM_u_correction
   real*8, dimension(D1V, D1V), intent(out), optional :: ELM_21_correction,  ELM_61_correction
+  real*8, dimension(D1V, D1V), intent(out), optional :: ELM_schur_PBP
 
   ! ELM_p workspace — local thread-stack buffers, zeroed each call
   ! ELM_p_w omitted: A_w uses the same mass integrand as A_j, so ELM_w = ELM_j
@@ -62,6 +64,10 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8, dimension(n_plane, N1V, N1V) :: ELM_kn_u_correction
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_21_correction,  ELM_p_61_correction
   real*8, dimension(n_plane, N1V, N1V) :: ELM_n_21_correction
+
+  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_schur
+  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_schur_n
+  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_schur_kn
 
   ! Geometry at Gauss points (first derivatives only — no 2nd derivs needed)
   real*8, dimension(n_gauss,n_gauss)    :: x_g, x_s, x_t
@@ -74,6 +80,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   ! Computational-coordinate s,t derivatives of background fields at Gauss points
   ! (only synthesized when off-diagonal Schur corrections are requested)
   real*8, dimension(n_plane, n_var, n_gauss, n_gauss) :: eq_s, eq_t
+  real*8, dimension(n_plane, n_var, n_gauss, n_gauss) :: eq_ss, eq_st, eq_tt
 
   ! Loop indices
   integer :: i, j, ms, mt, mp, in, k, l, m, index_k, index_m
@@ -91,6 +98,13 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8 :: ps0_x, ps0_y, zj0
   real*8 :: eta_T_ohm
 
+  ! Variables for the Schur operator weak form
+  real*8 :: ps0_xx, ps0_yy, ps0_xy
+  real*8 :: Q0, Q0x, Q0y, Q1, Q1x, Q1y
+  real*8 :: W0, W0x, W0y, W1, W1x, W1y
+  real*8 :: amat_schur, amat_schur_n, amat_schur_kn
+  real*8 :: amat_01, amat_10
+
   ! Values at Gauss points
   real*8 :: T0
 
@@ -100,26 +114,20 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
 
   ! Schur correction
   logical :: psi_correction, u_correction, correction_21, correction_61
+  logical :: schur_PBP
 
   ! FFT workspace
   real*8     :: in_fft(1:n_plane)
   complex*16 :: out_fft(1:n_plane)
 
   ! Check for optional Schur correction output
-  if (present(ELM_psi_correction)) then
-    psi_correction = .true.
-  else
-    psi_correction = .false.
-  endif
-
-  if (present(ELM_u_correction)) then
-    u_correction = .true.
-  else
-    u_correction = .false.
-  endif
+  psi_correction = present(ELM_psi_correction)
+  u_correction = present(ELM_u_correction)
 
   correction_21 = present(ELM_21_correction)
   correction_61 = present(ELM_61_correction)
+
+  schur_PBP = present(ELM_schur_PBP)
 
   !-----------------------------------------------------------------
   ! Initialise
@@ -138,6 +146,12 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   if (correction_21)  ELM_p_21_correction    = 0.d0
   if (correction_21)  ELM_n_21_correction  = 0.d0
   if (correction_61)  ELM_p_61_correction    = 0.d0
+  if (schur_PBP) then
+    ELM_p_schur = 0.d0
+    ELM_p_schur_n = 0.d0
+    ELM_p_schur_kn = 0.d0
+  endif
+  
 
   !-----------------------------------------------------------------
   ! Geometry at Gauss points
@@ -145,6 +159,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   x_g  = 0.d0; x_s  = 0.d0; x_t  = 0.d0; x_st  = 0.d0; x_ss  = 0.d0; x_tt  = 0.d0;
   y_g  = 0.d0; y_s  = 0.d0; y_t  = 0.d0; y_st  = 0.d0; y_ss  = 0.d0; y_tt  = 0.d0;
   eq_g = 0.d0; eq_s = 0.d0; eq_t = 0.d0
+  eq_ss = 0.d0; eq_st = 0.d0; eq_tt = 0.d0
 
   theta = time_evol_theta
 
@@ -170,6 +185,9 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 eq_g(mp,k,ms,mt) = eq_g(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H(i,j,ms,mt)   * HZ(in,mp)
                 eq_s(mp,k,ms,mt) = eq_s(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_s(i,j,ms,mt) * HZ(in,mp)
                 eq_t(mp,k,ms,mt) = eq_t(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_t(i,j,ms,mt) * HZ(in,mp)
+                eq_ss(mp,k,ms,mt) = eq_ss(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_ss(i,j,ms,mt) * HZ(in,mp)
+                eq_st(mp,k,ms,mt) = eq_st(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_st(i,j,ms,mt) * HZ(in,mp)
+                eq_tt(mp,k,ms,mt) = eq_tt(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_tt(i,j,ms,mt) * HZ(in,mp)
               enddo
             enddo
           enddo
@@ -232,6 +250,22 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         ! ps0 spatial gradient (Cartesian) from synthesized s,t derivatives
         ps0_x = (   y_t(ms,mt) * eq_s(mp,var_psi,ms,mt) - y_s(ms,mt) * eq_t(mp,var_psi,ms,mt) ) / xjac
         ps0_y = ( - x_t(ms,mt) * eq_s(mp,var_psi,ms,mt) + x_s(ms,mt) * eq_t(mp,var_psi,ms,mt) ) / xjac
+
+        ! Second derivatives of ps0 via coordinate transformation
+        ps0_xx = (eq_ss(mp,var_psi,ms,mt) * y_t(ms,mt)**2 - 2.d0*eq_st(mp,var_psi,ms,mt) * y_s(ms,mt)*y_t(ms,mt) + eq_tt(mp,var_psi,ms,mt) * y_s(ms,mt)**2  &
+              + eq_s(mp,var_psi,ms,mt) * (y_st(ms,mt)*y_t(ms,mt) - y_tt(ms,mt)*y_s(ms,mt) )                              &
+              + eq_t(mp,var_psi,ms,mt) * (y_st(ms,mt)*y_s(ms,mt) - y_ss(ms,mt)*y_t(ms,mt) ) )    / xjac**2               &
+              - xjac_x * (eq_s(mp,var_psi,ms,mt) * y_t(ms,mt) - eq_t(mp,var_psi,ms,mt) * y_s(ms,mt)) / xjac**2
+        ps0_yy = (eq_ss(mp,var_psi,ms,mt) * x_t(ms,mt)**2 - 2.d0*eq_st(mp,var_psi,ms,mt) * x_s(ms,mt)*x_t(ms,mt) + eq_tt(mp,var_psi,ms,mt) * x_s(ms,mt)**2  &
+              + eq_s(mp,var_psi,ms,mt) * (x_st(ms,mt)*x_t(ms,mt) - x_tt(ms,mt)*x_s(ms,mt) )                              &
+              + eq_t(mp,var_psi,ms,mt) * (x_st(ms,mt)*x_s(ms,mt) - x_ss(ms,mt)*x_t(ms,mt) ) )    / xjac**2               &
+              - xjac_y * (- eq_s(mp,var_psi,ms,mt) * x_t(ms,mt) + eq_t(mp,var_psi,ms,mt) * x_s(ms,mt) ) / xjac**2
+        ps0_xy = (- eq_ss(mp,var_psi,ms,mt) * y_t(ms,mt)*x_t(ms,mt) - eq_tt(mp,var_psi,ms,mt) * x_s(ms,mt)*y_s(ms,mt)                    &
+              + eq_st(mp,var_psi,ms,mt) * (y_s(ms,mt)*x_t(ms,mt)  + y_t(ms,mt)*x_s(ms,mt)  )                             &
+              - eq_s(mp,var_psi,ms,mt)  * (x_st(ms,mt)*y_t(ms,mt) - x_tt(ms,mt)*y_s(ms,mt) )                             &
+              - eq_t(mp,var_psi,ms,mt)  * (x_st(ms,mt)*y_s(ms,mt) - x_ss(ms,mt)*y_t(ms,mt) )  )  / xjac**2               &
+              - xjac_x * (- eq_s(mp,var_psi,ms,mt) * x_t(ms,mt) + eq_t(mp,var_psi,ms,mt) * x_s(ms,mt) )   / xjac**2
+
         ! Background current density (value only — used as scalar weight in K_61)
         zj0   = eq_g(mp,var_zj,ms,mt)
 
@@ -298,6 +332,11 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                         + psi_fct%v_s * (x_st(ms,mt)*x_t(ms,mt) - x_tt(ms,mt)*x_s(ms,mt) )                              &
                         + psi_fct%v_t * (x_st(ms,mt)*x_s(ms,mt) - x_ss(ms,mt)*x_t(ms,mt) ) )    / xjac**2               &
                         - xjac_y * (- psi_fct%v_s * x_t(ms,mt) + psi_fct%v_t * x_s(ms,mt) ) / xjac**2
+                psi_fct%v_xy = (- psi_fct%v_ss * y_t(ms,mt)*x_t(ms,mt) - psi_fct%v_tt * x_s(ms,mt)*y_s(ms,mt)                    &
+                      + psi_fct%v_st * (y_s(ms,mt)*x_t(ms,mt)  + y_t(ms,mt)*x_s(ms,mt)  )                         &
+                      - psi_fct%v_s  * (x_st(ms,mt)*y_t(ms,mt) - x_tt(ms,mt)*y_s(ms,mt) )                         &
+                      - psi_fct%v_t  * (x_st(ms,mt)*y_s(ms,mt) - x_ss(ms,mt)*y_t(ms,mt) )  )  / xjac**2           &
+                      - xjac_x * (- psi_fct%v_s * x_t(ms,mt) + psi_fct%v_t * x_s(ms,mt) )   / xjac**2
 
                 u_fct = psi_fct
 
@@ -312,12 +351,14 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 amat_42 = (v_fct%v_x*psi_fct%v_x + v_fct%v_y*psi_fct%v_y) * BigR * xjac
 
                 ! --- Schur correction equation ---
-                amat_psi_correction = - (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) * (eta_T / BigR) * xjac * theta * tstep
+                amat_psi_correction = - (eta_T / BigR) * (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) * xjac * theta * tstep
 
                 amat_u_correction = - r0_hat * BigR**2 * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * ( v_fct%v_x * u0_y - v_fct%v_y * u0_x) * xjac * theta * tstep  &
-                                + visco_T * BigR * (v_fct%v_xx + v_fct%v_x*BigR + v_fct%v_yy) * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
-                amat_u_kn_correction = - visco_T * 1.d0 / BigR * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * xjac * theta * tstep &
-                                        + visco_T * (1.d0 - (1.d0 / BigR**2)) * v_fct%v * u_fct%v_x * xjac * theta * tstep
+                                      + visco_T * BigR * (v_fct%v_xx + v_fct%v_x*BigR + v_fct%v_yy) * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep 
+                                      
+                amat_u_kn_correction = - visco_T * (1.d0 / BigR) * v_fct%v * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep 
+                                        !+ visco_T * 1.d0 / BigR * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * xjac * theta * tstep &
+                                        !- visco_T * (1.d0 + (1.d0 / BigR**2)) * v_fct%v * u_fct%v_x * xjac * theta * tstep
 
                 ! Off-diagonal Schur corrections 
                 amat_21_correction = (v_fct%v_x * ps0_y - v_fct%v_y * ps0_x) &
@@ -325,11 +366,50 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
 
                 amat_21_n_correction =  F0 / BigR * (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) * xjac * theta * tstep
 
-                ! K_61 from amat_63 = −2(γ−1)·η_ohm · v · zj · zj0/R · xjac · θ·dt
                 amat_61_correction = - 2.d0 * (gamma - 1.d0) * eta_T_ohm * zj0 / BigR &
                                      * (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) &
                                      * xjac * theta * tstep
+
+                ! 1. Poloidal parts of grad_parallel (Q0 for test v, W0 for trial u)
+                Q0  = (ps0_x * v_fct%v_y - ps0_y * v_fct%v_x) / BigR
+                Q0x = -(ps0_x * v_fct%v_y - ps0_y * v_fct%v_x) / BigR**2 &
+                      + (ps0_xx * v_fct%v_y + ps0_x * v_fct%v_xy - ps0_xy * v_fct%v_x - ps0_y * v_fct%v_xx) / BigR
+                Q0y = (ps0_xy * v_fct%v_y + ps0_x * v_fct%v_yy - ps0_yy * v_fct%v_x - ps0_y * v_fct%v_xy) / BigR
                 
+                W0  = (ps0_x * u_fct%v_y - ps0_y * u_fct%v_x) / BigR
+                W0x = -(ps0_x * u_fct%v_y - ps0_y * u_fct%v_x) / BigR**2 &
+                      + (ps0_xx * u_fct%v_y + ps0_x * u_fct%v_xy - ps0_xy * u_fct%v_x - ps0_y * u_fct%v_xx) / BigR
+                W0y = (ps0_xy * u_fct%v_y + ps0_x * u_fct%v_yy - ps0_yy * u_fct%v_x - ps0_y * u_fct%v_xy) / BigR
+                
+                ! 2. Toroidal parts of grad_parallel (Q1 for test v, W1 for trial u)
+                Q1  = F0 / BigR**2 * v_fct%v
+                Q1x = -2.d0 * F0 / BigR**3 * v_fct%v + F0 / BigR**2 * v_fct%v_x
+                Q1y = F0 / BigR**2 * v_fct%v_y
+
+                W1  = F0 / BigR**2 * u_fct%v
+                W1x = -2.d0 * F0 / BigR**3 * u_fct%v + F0 / BigR**2 * u_fct%v_x
+                W1y = F0 / BigR**2 * u_fct%v_y
+
+                ! 3. Construct the Matrix Entries
+                ! Term 1: Inertia (-rho_hat * grad_pol v * grad_pol u) 
+                amat_schur = - r0_hat * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * BigR * xjac & !                               - amat_u_correction &
+                              + (tstep**2) * ( (Q0x * W0x + Q0y * W0y) + (2.d0 / BigR) * Q0 * W0x ) * BigR * xjac
+
+                ! Term 2: dt^2 * [grad_pol q * grad_pol w + 2/R * q * w_R]
+                ! Part 00: purely poloidal (no phi derivatives)
+                !amat_schur = amat_schur + (tstep**2) * ( (Q0x * W0x + Q0y * W0y) + (2.d0 / BigR) * Q0 * W0x ) * BigR * xjac
+
+                !if (amat_schur == 0.d0) write(*,*) 'Zero inertia term at mp=', mp, 'ms=', ms, 'mt=', mt, 'i=', i, 'j=', j, 'k=', k, 'l=', l
+
+                ! Part n: single phi derivative cross-terms. 
+                ! amat_01 is d/dphi on trial function (u).
+                ! amat_10 is d/dphi on test function (v). Toroidal IBP flips the sign and transfers it to 'u'.
+                amat_01 = (Q0x * W1x + Q0y * W1y) + (2.d0 / BigR) * Q0 * W1x
+                amat_10 = (Q1x * W0x + Q1y * W0y) + (2.d0 / BigR) * Q1 * W0x
+                amat_schur_n = (tstep**2) * (amat_01 - amat_10) * BigR * xjac
+
+                ! Part kn: d/dphi on BOTH test and trial functions
+                amat_schur_kn = (tstep**2) * ((Q1x * W1x + Q1y * W1y) + (2.d0 / BigR) * Q1 * W1x ) * BigR * xjac
                 
                 ! --- 1-var mass (A_w = A_j assigned after FFT) ---
                 ELM_p_j(mp, idx_ij, idx_kl) = ELM_p_j(mp, idx_ij, idx_kl) + wst * amat_mass
@@ -354,6 +434,12 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                   ELM_p_61_correction(mp, idx_ij, idx_kl) = ELM_p_61_correction(mp, idx_ij, idx_kl) + wst * amat_61_correction
                 endif
 
+                if (schur_PBP) then
+                  ELM_p_schur(mp, idx_ij, idx_kl) = ELM_p_schur(mp, idx_ij, idx_kl) + wst * amat_schur
+                  ELM_p_schur_n(mp, idx_ij, idx_kl) = ELM_p_schur_n(mp, idx_ij, idx_kl) + wst * amat_schur_n
+                  ELM_p_schur_kn(mp, idx_ij, idx_kl) = ELM_p_schur_kn(mp, idx_ij, idx_kl) + wst * amat_schur_kn
+                endif
+
               enddo  ! l
             enddo    ! k
 
@@ -366,11 +452,10 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   enddo    ! ms
 
   !-----------------------------------------------------------------
-  ! FFT reconstruction — 1-var matrix (A_j); A_w is a copy
+  ! FFT reconstruction — 1-var matrix 
   !-----------------------------------------------------------------
   do i = 1, N1V
     do j = 1, N1V
-
       in_fft = ELM_p_j(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
@@ -390,6 +475,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_u_correction, D1V)
+
         in_fft = ELM_kn_u_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
@@ -402,6 +488,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_21_correction, D1V)
+
         in_fft = ELM_n_21_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
@@ -416,6 +503,27 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         call scatter_fft_to_elm(out_fft, i, j, ELM_61_correction, D1V)
       endif
 
+        if (schur_PBP) then
+          in_fft = ELM_p_schur(1:n_plane, i, j)
+#ifdef USE_FFTW
+          call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#endif
+          call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
+
+          in_fft = ELM_p_schur_n(1:n_plane, i, j)
+#ifdef USE_FFTW
+          call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#endif
+          call scatter_fft_to_elm_n(out_fft, i, j, ELM_schur_PBP, D1V)
+
+          in_fft = ELM_p_schur_kn(1:n_plane, i, j)
+#ifdef USE_FFTW
+          call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#endif
+          call scatter_fft_to_elm_kn(out_fft, i, j, ELM_schur_PBP, D1V)
+
+        endif
+
     enddo
   enddo
 
@@ -425,6 +533,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   if (u_correction) ELM_u_correction = 0.5d0 * ELM_u_correction
   if (correction_21) ELM_21_correction = 0.5d0 * ELM_21_correction
   if (correction_61) ELM_61_correction = 0.5d0 * ELM_61_correction
+  if (schur_PBP) ELM_schur_PBP = 0.5d0 * ELM_schur_PBP
 
   !-----------------------------------------------------------------
   ! FFT reconstruction — 1-var off-diagonal coupling matrices (A_jpsi, A_wu)

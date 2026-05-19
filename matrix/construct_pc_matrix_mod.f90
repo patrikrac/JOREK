@@ -528,7 +528,7 @@ end subroutine construct_pc_diagonal_matrices
 !!
 subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
                                           K_psi_correction, K_u_correction,        &
-                                          K_21_correction,  K_61_correction)
+                                          K_21_correction,  K_61_correction, K_schur_PBP)
 
   use mod_elt_matrix_elliptic
   use mod_parameters, only: n_tor, n_degrees, n_vertex_max, var_psi, var_u, var_T
@@ -546,6 +546,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
 #ifdef USE_PETSC
   Mat, intent(inout) :: K_psi_correction, K_u_correction
   Mat, intent(inout) :: K_21_correction,  K_61_correction
+  Mat, intent(inout) :: K_schur_PBP
 #endif
 
   ! --- Ownership range for this process ---
@@ -567,6 +568,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   real*8, allocatable :: ELM_u_correction_thr(:,:,:)
   real*8, allocatable :: ELM_21_correction_thr (:,:,:)
   real*8, allocatable :: ELM_61_correction_thr (:,:,:)
+  real*8, allocatable :: ELM_schur_PBP_thr (:,:,:)
   real*8, allocatable :: buf1v_thr(:,:)
 
   integer :: nthreads, omp_tid
@@ -612,6 +614,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   allocate(ELM_u_correction_thr (D1V_CM, D1V_CM, nthreads))
   allocate(ELM_21_correction_thr (D1V_CM, D1V_CM, nthreads))
   allocate(ELM_61_correction_thr (D1V_CM, D1V_CM, nthreads))
+  allocate(ELM_schur_PBP_thr (D1V_CM, D1V_CM, nthreads))
   allocate(buf1v_thr    (bs1*bs1, nthreads))
 
   !$omp parallel &
@@ -619,10 +622,10 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   !$omp   shared(n_local_elms, local_elms, element_list, node_list, a_mat, my_ind_min, my_ind_max, bs1, &
   !$omp          element_thr, nodes_thr, node_out_thr, &
   !$omp          ELM_j_thr, ELM_w_thr, ELM_jpsi_thr, ELM_wu_thr, ELM_psi_correction_thr, ELM_u_correction_thr, &
-  !$omp          ELM_21_correction_thr, ELM_61_correction_thr, &
+  !$omp          ELM_21_correction_thr, ELM_61_correction_thr, ELM_schur_PBP_thr, &
   !$omp          buf1v_thr &
 #ifdef USE_PETSC
-  !$omp          , K_psi_correction, K_u_correction, K_21_correction, K_61_correction &
+  !$omp          , K_psi_correction, K_u_correction, K_21_correction, K_61_correction, K_schur_PBP &
 #endif
   !$omp         ) &
   !$omp   private(ife, ielm, iv, inode, omp_tid, &
@@ -659,7 +662,8 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
                                   ELM_psi_correction=ELM_psi_correction_thr(:,:,omp_tid), &
                                   ELM_u_correction=ELM_u_correction_thr(:,:,omp_tid), &
                                   ELM_21_correction=ELM_21_correction_thr(:,:,omp_tid), &
-                                  ELM_61_correction=ELM_61_correction_thr(:,:,omp_tid))
+                                  ELM_61_correction=ELM_61_correction_thr(:,:,omp_tid), &
+                                  ELM_schur_PBP=ELM_schur_PBP_thr(:,:,omp_tid))
 
 #ifdef USE_PETSC
     ! --- Insert element blocks into PETSc matrices (all four are 1-var) ---
@@ -734,6 +738,22 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
             call MatSetValuesBlocked(K_61_correction, 1, idxm, 1, idxn, &
                                      buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
             !$omp end critical
+
+            ! --- Extract and insert 1-var block for K_schur_PBP (schur_PBP-eq, psi-col) ---
+            buf1v_thr(:,omp_tid) = 0.d0
+            do j = 1, bs1
+              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+              do l = 1, bs1
+                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_schur_PBP_thr(idx_ij, idx_kl, omp_tid)
+              enddo
+            enddo
+            !$omp critical
+            call MatSetValuesBlocked(K_schur_PBP, 1, idxm, 1, idxn, &
+                                     buf1v_thr(:,omp_tid), ADD_VALUES, petsc_ierr)
+            !$omp end critical
+
+
           enddo  ! k_order
         enddo    ! k
 
@@ -757,10 +777,12 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
   call MatAssemblyBegin(K_u_correction,   MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyBegin(K_21_correction,  MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyBegin(K_61_correction,  MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyBegin(K_schur_PBP,  MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyEnd  (K_psi_correction, MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyEnd  (K_u_correction,   MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyEnd  (K_21_correction,  MAT_FINAL_ASSEMBLY, petsc_ierr)
   call MatAssemblyEnd  (K_61_correction,  MAT_FINAL_ASSEMBLY, petsc_ierr)
+  call MatAssemblyEnd  (K_schur_PBP,  MAT_FINAL_ASSEMBLY, petsc_ierr)
 
   ! Zero rows of constrained boundary DOFs so that
   !   Atilde = B - K
@@ -773,6 +795,8 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
     call zero_bc_rows_pc_matrix(K_u_correction,   var_u,   local_elms, n_local_elms, my_ind_min, my_ind_max)
     call zero_bc_rows_pc_matrix(K_21_correction,  var_u,   local_elms, n_local_elms, my_ind_min, my_ind_max)
     call zero_bc_rows_pc_matrix(K_61_correction,  var_T,   local_elms, n_local_elms, my_ind_min, my_ind_max)
+    
+    call apply_dirichlet_bnd(K_schur_PBP, var_u, local_elms, n_local_elms, my_ind_min, my_ind_max)
   endif
 #endif
 
@@ -1014,5 +1038,110 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
 #endif
 
 end subroutine zero_bc_rows_pc_matrix
+
+
+subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
+                               my_ind_min, my_ind_max)
+
+  use mod_parameters,   only: n_tor, n_vertex_max, n_order
+  use nodes_elements,   only: node_list, element_list
+  use mod_node_indices, only: calculate_node_indices
+  use vacuum,           only: is_freebound
+
+  implicit none
+
+#ifdef USE_PETSC
+#include <petsc/finclude/petscmat.h>
+  Mat, intent(inout)  :: pc_mat
+#endif
+  integer, intent(in) :: var_index
+  integer, intent(in) :: local_elms(:)
+  integer, intent(in) :: n_local_elms
+  integer, intent(in) :: my_ind_min, my_ind_max
+
+  integer :: i, in, iv, inode, ielm
+  integer :: index_node, index_tmp, kk, ll, iv_dir
+  integer :: node_indices((n_order+1)/2, (n_order+1)/2)
+  logical :: skip_mode(n_tor)
+
+#ifdef USE_PETSC
+  PetscInt, allocatable :: rows_to_zero(:)
+  PetscInt              :: n_rows_to_zero
+  PetscInt              :: cap
+  PetscErrorCode        :: petsc_ierr
+
+  call calculate_node_indices(node_indices)
+
+  ! is_freebound depends only on (in, var_index); precompute once.
+  do in = 1, n_tor
+    skip_mode(in) = is_freebound(in, var_index)
+  enddo
+
+  ! Upper bound: n_local_elms * n_vertex_max * 3 DOFs * n_tor
+  cap = n_local_elms * n_vertex_max * 3 * n_tor
+  if (cap < 1) cap = 1
+  allocate(rows_to_zero(cap))
+  n_rows_to_zero = 0
+
+  do i = 1, n_local_elms
+    ielm = local_elms(i)
+    do iv = 1, n_vertex_max
+      inode = element_list%element(ielm)%vertex(iv)
+
+      if (node_list%node(inode)%boundary .eq. 0) cycle
+
+      do in = 1, n_tor
+        if (skip_mode(in)) cycle
+
+        !--- Open field lines: constrain value + ds DOFs
+        if ((node_list%node(inode)%boundary .eq. 1) .or. &
+            (node_list%node(inode)%boundary .eq. 3)) then
+          iv_dir = 2
+          do kk = 1, (n_order+1)/2
+            if ((iv_dir .eq. 3) .and. (kk .gt. 1)) cycle
+            do ll = 1, (n_order+1)/2
+              if ((iv_dir .eq. 2) .and. (ll .gt. 1)) cycle
+              index_tmp  = node_indices(kk, ll)
+              index_node = node_list%node(inode)%index(index_tmp)
+              if ((index_node .lt. my_ind_min) .or. (index_node .gt. my_ind_max)) cycle
+              
+              n_rows_to_zero = n_rows_to_zero + 1
+              rows_to_zero(n_rows_to_zero) = n_tor * (index_node - 1) + (in - 1)
+            enddo
+          enddo
+        endif
+
+        !--- Wall-aligned with flux surface: constrain value + dt DOFs
+        if ((node_list%node(inode)%boundary .eq. 2) .or. &
+            (node_list%node(inode)%boundary .eq. 3)) then
+          iv_dir = 3
+          do kk = 1, (n_order+1)/2
+            if ((iv_dir .eq. 3) .and. (kk .gt. 1)) cycle
+            do ll = 1, (n_order+1)/2
+              if ((iv_dir .eq. 2) .and. (ll .gt. 1)) cycle
+              index_tmp  = node_indices(kk, ll)
+              index_node = node_list%node(inode)%index(index_tmp)
+              if ((index_node .lt. my_ind_min) .or. (index_node .gt. my_ind_max)) cycle
+              
+              n_rows_to_zero = n_rows_to_zero + 1
+              rows_to_zero(n_rows_to_zero) = n_tor * (index_node - 1) + (in - 1)
+            enddo
+          enddo
+        endif
+
+      enddo  ! in
+    enddo    ! iv
+  enddo      ! i
+
+  ! --- Zero the matrix rows and set diagonal to 1.0 ---
+  ! 1.0d0 ensures the standalone matrix is non-singular.
+  ! PETSC_NULL_VEC tells PETSc not to touch the RHS or Solution vectors.
+  call MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, &
+                   PETSC_NULL_VEC, PETSC_NULL_VEC, petsc_ierr)
+
+  deallocate(rows_to_zero)
+#endif
+
+end subroutine apply_dirichlet_bnd
 
 end module construct_pc_matrix_mod
