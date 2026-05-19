@@ -392,7 +392,7 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
 
                 ! 3. Construct the Matrix Entries
                 ! Term 1: Inertia (-rho_hat * grad_pol v * grad_pol u) 
-                amat_schur = - r0_hat * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * BigR * xjac & !                               - amat_u_correction &
+                amat_schur = - r0_hat * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * BigR * xjac & ! - amat_u_correction &
                               + (tstep**2) * ( (Q0x * W0x + Q0y * W0y) + (2.d0 / BigR) * Q0 * W0x ) * BigR * xjac
 
                 ! Term 2: dt^2 * [grad_pol q * grad_pol w + 2/R * q * w_R]
