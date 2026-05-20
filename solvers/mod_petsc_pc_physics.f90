@@ -108,6 +108,8 @@ module mod_petsc_pc_physics
     Vec :: hydro_predictor_3v
 
     Mat :: S_PBP
+    KSP :: ksp_S_PBP
+    logical :: ksp_S_PBP_created = .false.
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx
@@ -768,6 +770,33 @@ contains
     call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
     call KSPSetUp(g_ctx%ksp_alfven, ierr)
     g_ctx%ksp_alfven_created = .true.
+
+    ! S_PBP (inner Alfven Schur operator, u-sized) — direct solver for the
+    ! three-step Alfven corrector. Guard against an unassembled S_PBP: a zero
+    ! matrix would make MUMPS fail opaquely or produce garbage.
+    block
+      PetscReal :: norm_spbp
+      call MatNorm(g_ctx%S_PBP, NORM_FROBENIUS, norm_spbp, ierr)
+      if (norm_spbp <= 0.0d0) then
+        if (my_id == 0) write(*,'(A)') &
+          "[Physics PC] ERROR: S_PBP is empty/zero — element assembly missing; cannot set up ksp_S_PBP"
+        ierr = 1
+        return
+      endif
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||S_PBP||_F = ", norm_spbp
+    end block
+
+    if (first_time) then
+      call KSPCreate(comm, g_ctx%ksp_S_PBP, ierr)
+    endif
+    call KSPSetOperators(g_ctx%ksp_S_PBP, g_ctx%S_PBP, g_ctx%S_PBP, ierr)
+    call KSPSetType(g_ctx%ksp_S_PBP, KSPPREONLY, ierr)
+    call KSPGetPC(g_ctx%ksp_S_PBP, pc_obj, ierr)
+    call PCSetType(pc_obj, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_obj, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(g_ctx%ksp_S_PBP, ierr)
+    g_ctx%ksp_S_PBP_created = .true.
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   ksp_S_PBP set up (PREONLY+LU+MUMPS)"
 
     ! Allocate 4-var work vectors and create index sets (first time only)
     if (.not. g_ctx%work_4v_created) then
@@ -1453,6 +1482,17 @@ contains
       ! the KSP is owned entirely by assemble_probed_exact_4x4 (avoids stale-factor issues).
       call assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, physics_pc_probe_exact)
 
+      ! Sub-block KSPs needed by the three-step (multi_step) apply:
+      !   ksp_psi (Atilde_11)  -> magnetic predictor
+      !   ksp_rho (B_55)       -> transport correction (rho)
+      !   ksp_T   (B_66)       -> transport correction (T)
+      ! Set up unconditionally: cheap, reused, keeps control flow simple.
+      call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time)
+      call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time)
+      call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time)
+      g_ctx%ksp_created = .true.
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   Monolithic sub-KSPs (psi/rho/T) set up"
+
       if (debug_physics_pc) then
         !call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false.)
         call petsc_test_pc_matrix(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false., my_id)
@@ -1514,7 +1554,7 @@ contains
   !--------------------------------------------------------------------
   subroutine physics_pc_apply(pc_obj, x, y, ierr)
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
-    use phys_module, only: physics_pc_coupled, physics_pc_monolithic
+    use phys_module, only: physics_pc_coupled, physics_pc_monolithic, physics_pc_multi_step
 
     PC :: pc_obj
     Vec :: x, y
@@ -1527,8 +1567,6 @@ contains
     ! Monolithic mode sub-vector views
     Vec :: rhs_psi, rhs_u, rhs_rho, rhs_T
     Vec :: sol_psi, sol_u, sol_rho, sol_T
-
-    logical :: multi_step = .false. ! Placeholder flag for multi-step solver variant (default in the future)
 
     if (.not. g_ctx%reduced_ready) then
       ierr = 1
@@ -1557,7 +1595,7 @@ contains
     call KSPSolve(g_ctx%ksp_Mw, x_w, g_ctx%work_2, ierr)
 
     ! --- Step 3: Schur-correct the RHS and solve ---
-    if (physics_pc_monolithic .and. .not. multi_step) then
+    if (physics_pc_monolithic .and. .not. physics_pc_multi_step) then
       ! ---- Monolithic 4x4 solve ----
       ! Compute Schur-corrected RHS into work vectors, then scatter into monolithic vector
 
@@ -1609,10 +1647,13 @@ contains
       call VecCopy(sol_T, y_T, ierr)
       call VecRestoreSubVector(g_ctx%work_sol_4v, g_ctx%is_reduced(4), sol_T, ierr)
 
-    else if (physics_pc_monolithic .and. multi_step) then
-      ! Mulit-Step solve
-      ! Stage A: solving the hydro block
-      ! Solve M_hydro * hydro_predictor = r_hydro
+    else if (physics_pc_monolithic .and. physics_pc_multi_step) then
+      ! ===== Three-step predictor-corrector =====
+      ! Shared prelude already computed: work_1 = M_j^-1 x_j (temp_j),
+      !                                  work_2 = M_w^-1 x_w (temp_w).
+
+      ! --- Step 1: Hydro predictor — joint 3x3 M_hydro solve (u,rho,T) ---
+      ! b_u  = x_u - B_23*temp_j - B_24*temp_w
       call MatMult(g_ctx%B_23, g_ctx%work_1, g_ctx%work_3, ierr)
       call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
       call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
@@ -1621,12 +1662,12 @@ contains
       call VecCopy(g_ctx%work_5, rhs_u, ierr)
       call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(1), rhs_u, ierr)
 
-      ! b_rho = x_rho (no Schur correction)
+      ! b_rho = x_rho
       call VecGetSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(2), rhs_rho, ierr)
       call VecCopy(x_rho, rhs_rho, ierr)
       call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(2), rhs_rho, ierr)
 
-      ! b_T = x_T - B_63 * temp_j  → store in work_4
+      ! b_T = x_T - B_63*temp_j
       call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
       call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
       call VecGetSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(3), rhs_T, ierr)
@@ -1634,6 +1675,55 @@ contains
       call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(3), rhs_T, ierr)
 
       call KSPSolve(g_ctx%ksp_hydro, g_ctx%work_rhs_3v, g_ctx%hydro_predictor_3v, ierr)
+
+      ! Extract predicted velocity and temperature (rho_h unused: rho comes
+      ! from the Step 4 transport correction).
+      ! work_5 := u_pred, work_4 := T_pred (kept across Steps 2-3 as noted).
+      call VecGetSubVector(g_ctx%hydro_predictor_3v, g_ctx%is_hydro(1), sol_u, ierr)
+      call VecCopy(sol_u, g_ctx%work_5, ierr)
+      call VecRestoreSubVector(g_ctx%hydro_predictor_3v, g_ctx%is_hydro(1), sol_u, ierr)
+      call VecGetSubVector(g_ctx%hydro_predictor_3v, g_ctx%is_hydro(3), sol_T, ierr)
+      call VecCopy(sol_T, g_ctx%work_4, ierr)
+      call VecRestoreSubVector(g_ctx%hydro_predictor_3v, g_ctx%is_hydro(3), sol_T, ierr)
+
+      ! --- Step 2: Magnetic predictor — advect flux with predicted u, T ---
+      ! b_psi = x_psi - B_13*temp_j - B_12*u_pred - B_16*T_pred
+      call MatMult(g_ctx%B_13, g_ctx%work_1, g_ctx%work_3, ierr)
+      call VecWAXPY(y_psi, -1.0d0, g_ctx%work_3, x_psi, ierr)
+      call MatMult(g_ctx%B_12, g_ctx%work_5, g_ctx%work_3, ierr)
+      call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)
+      call MatMult(g_ctx%B_16, g_ctx%work_4, g_ctx%work_3, ierr)
+      call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)
+      call VecCopy(y_psi, g_ctx%work_3, ierr)
+      call KSPSolve(g_ctx%ksp_psi, g_ctx%work_3, y_psi, ierr)
+
+      ! --- Step 3: Alfven corrector — full block solve of S_PBP, bare RHS ---
+      ! r_u = x_u - B_23*temp_j - B_24*temp_w
+      call MatMult(g_ctx%B_23, g_ctx%work_1, g_ctx%work_3, ierr)
+      call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
+      call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
+      call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, ierr)
+      call KSPSolve(g_ctx%ksp_S_PBP, g_ctx%work_5, y_u, ierr)
+
+      ! --- Step 4: Transport correction for rho and T ---
+      ! b_rho = x_rho - B_51*y_psi - B_52*y_u
+      call MatMult(g_ctx%B_51, y_psi, g_ctx%work_3, ierr)
+      call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_rho, ierr)
+      call MatMult(g_ctx%B_52, y_u, g_ctx%work_3, ierr)
+      call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
+      call KSPSolve(g_ctx%ksp_rho, g_ctx%work_4, y_rho, ierr)
+
+      ! b_T = x_T - B_63*temp_j - B_61*y_psi - B_62*y_u
+      call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
+      call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
+      call MatMult(g_ctx%B_61, y_psi, g_ctx%work_3, ierr)
+      call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
+      call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
+      call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
+      call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, y_T, ierr)
+
+      ! y_psi, y_u, y_rho, y_T are now set; shared back-substitution below
+      ! recovers y_j, y_w from y_psi, y_u.
 
     else
       ! ---- Block-diagonal / block-triangular solve ----

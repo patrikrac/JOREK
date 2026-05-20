@@ -155,6 +155,7 @@ module phys_module
   logical :: physics_pc_coupled   !< Use block lower-triangular sweep instead of diagonal-only apply
   logical :: physics_pc_reassemble !< Reassemble diagonal blocks from simplified integrands instead of extracting from full matrix
   logical :: physics_pc_monolithic  !< Monolithic 4x4 solve (stage-one Schur elimination test)
+  logical :: physics_pc_multi_step  !< Three-step predictor-corrector apply (hydro -> mag. predictor -> Alfven corrector -> transport)
   logical :: physics_pc_probe_exact !< Probe exact 4x4 Schur complement via basis-vector applications (small problems only)
   logical :: physics_pc_schur_u    !< Inner Schur complement S_u for the Alfven (psi,u) block
   logical :: physics_pc_block_inv  !< Invert per-node 4x4 blocks of B_33/B_44 for Schur correction (better than scalar diagonal)
