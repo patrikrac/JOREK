@@ -1703,6 +1703,10 @@ contains
       call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
       call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
       call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, ierr)
+      ! Add psi -> u Lorentz coupling so the corrector residual matches
+      ! the coupled (psi,u) block: r_u -= Atilde_21 * y_psi
+      call MatMult(g_ctx%Atilde_21, y_psi, g_ctx%work_3, ierr)
+      call VecAXPY (g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
       call KSPSolve(g_ctx%ksp_S_PBP, g_ctx%work_5, y_u, ierr)
 
       ! --- Step 4: Transport correction for rho and T ---
