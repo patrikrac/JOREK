@@ -70,10 +70,6 @@ module mod_petsc_pc_physics
     logical :: correction_21_ready = .false.
     logical :: correction_61_ready = .false.
 
-    !> Inner Schur complement: S_u = Atilde_22 - Atilde_21 * diag(Atilde_11)^{-1} * B_12
-    Mat :: S_u
-    Vec :: diag_A11_inv
-
     !> KSP for each diagonal block of the reduced 4x4 system
     KSP :: ksp_psi, ksp_u, ksp_rho, ksp_T
     logical :: ksp_created = .false.
@@ -110,6 +106,15 @@ module mod_petsc_pc_physics
     Mat :: S_PBP
     KSP :: ksp_S_PBP
     logical :: ksp_S_PBP_created = .false.
+
+    ! --- Sub-blocks PC: 2x2 super-blocks (psi,u) and (rho,T) ---
+    Mat :: K_A_block, K_B_block          !< 2x2 MatNests of (psi,u) and (rho,T) sub-systems
+    Mat :: K_A_aij,   K_B_aij            !< MPIAIJ conversions of the MatNests for MUMPS
+    KSP :: ksp_block_A, ksp_block_B      !< PREONLY + LU + MUMPS solvers, one per super-block
+    Vec :: rhs_A, sol_A                  !< (psi,u)-sized packed work vectors
+    Vec :: rhs_B, sol_B                  !< (rho,T)-sized packed work vectors
+    Vec :: tmp_rho, tmp_T                !< 1-variable scratch for GS residual updates
+    logical :: sub_blocks_setup_done = .false.
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx
@@ -631,6 +636,161 @@ contains
     call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
     call KSPSetUp(ksp_block, ierr)
   end subroutine setup_block_ksp
+
+  !> Pack two 1-variable PETSc vecs into one 2v-sized packed vec.
+  !!
+  !! y_packed must already exist with size = size(x1) + size(x2).
+  !! Layout: top half = x1, bottom half = x2.
+  subroutine pack_2v(x1, x2, y_packed, ierr)
+    Vec            :: x1, x2, y_packed
+    PetscErrorCode :: ierr
+
+    PetscScalar, pointer :: a_x1(:), a_x2(:), a_y(:)
+    PetscInt :: n1, n2
+
+    call VecGetLocalSize(x1, n1, ierr)
+    call VecGetLocalSize(x2, n2, ierr)
+
+    call VecGetArrayReadF90(x1, a_x1, ierr)
+    call VecGetArrayReadF90(x2, a_x2, ierr)
+    call VecGetArrayF90    (y_packed, a_y, ierr)
+
+    a_y(1     : n1     ) = a_x1(1:n1)
+    a_y(n1+1  : n1+n2  ) = a_x2(1:n2)
+
+    call VecRestoreArrayReadF90(x1, a_x1, ierr)
+    call VecRestoreArrayReadF90(x2, a_x2, ierr)
+    call VecRestoreArrayF90    (y_packed, a_y, ierr)
+  end subroutine pack_2v
+
+  !> Inverse of pack_2v: unpack a 2v-sized packed vec into two 1v vecs.
+  subroutine unpack_2v(x_packed, y1, y2, ierr)
+    Vec            :: x_packed, y1, y2
+    PetscErrorCode :: ierr
+
+    PetscScalar, pointer :: a_x(:), a_y1(:), a_y2(:)
+    PetscInt :: n1, n2
+
+    call VecGetLocalSize(y1, n1, ierr)
+    call VecGetLocalSize(y2, n2, ierr)
+
+    call VecGetArrayReadF90(x_packed, a_x, ierr)
+    call VecGetArrayF90    (y1, a_y1, ierr)
+    call VecGetArrayF90    (y2, a_y2, ierr)
+
+    a_y1(1:n1) = a_x(1     : n1     )
+    a_y2(1:n2) = a_x(n1+1  : n1+n2  )
+
+    call VecRestoreArrayReadF90(x_packed, a_x, ierr)
+    call VecRestoreArrayF90    (y1, a_y1, ierr)
+    call VecRestoreArrayF90    (y2, a_y2, ierr)
+  end subroutine unpack_2v
+
+  !> Block-Jacobi apply: y_A = K_A^-1 x_A, y_B = K_B^-1 x_B (parallel, no coupling).
+  !!
+  !! Mode 1 of the sub-blocks PC. Independent solves on the (psi,u) Alfven block
+  !! and the (rho,T) transport block — cross-block coupling is ignored.
+  subroutine apply_block_jacobi(x_psi, x_u, x_rho, x_T, &
+                                y_psi, y_u, y_rho, y_T, ierr)
+    Vec            :: x_psi, x_u, x_rho, x_T
+    Vec            :: y_psi, y_u, y_rho, y_T
+    PetscErrorCode :: ierr
+
+    ! Pack inputs into 2v rhs vectors
+    call pack_2v(x_psi, x_u,   g_ctx%rhs_A, ierr)
+    call pack_2v(x_rho, x_T,   g_ctx%rhs_B, ierr)
+
+    ! Solve each super-block (PREONLY + LU + MUMPS)
+    call KSPSolve(g_ctx%ksp_block_A, g_ctx%rhs_A, g_ctx%sol_A, ierr)
+    call KSPSolve(g_ctx%ksp_block_B, g_ctx%rhs_B, g_ctx%sol_B, ierr)
+
+    ! Unpack into outputs
+    call unpack_2v(g_ctx%sol_A, y_psi, y_u,   ierr)
+    call unpack_2v(g_ctx%sol_B, y_rho, y_T,   ierr)
+  end subroutine apply_block_jacobi
+
+  !> Block-GS-forward apply: solve K_A, propagate to (rho,T), solve K_B.
+  !!
+  !! Mode 2 of the sub-blocks PC. Forward Gauss-Seidel sweep:
+  !!   1. y_A = K_A^-1 x_A
+  !!   2. r_B = x_B - C_BA * y_A      where C_BA = [B_51 B_52; B_61 B_62]
+  !!   3. y_B = K_B^-1 r_B
+  !!
+  !! Captures the (psi,u) -> (rho,T) coupling via the C_BA submatrices.
+  subroutine apply_block_gs_forward(x_psi, x_u, x_rho, x_T, &
+                                    y_psi, y_u, y_rho, y_T, ierr)
+    Vec            :: x_psi, x_u, x_rho, x_T
+    Vec            :: y_psi, y_u, y_rho, y_T
+    PetscErrorCode :: ierr
+
+    ! 1. Forward sweep on Alfven super-block
+    call pack_2v(x_psi, x_u, g_ctx%rhs_A, ierr)
+    call KSPSolve(g_ctx%ksp_block_A, g_ctx%rhs_A, g_ctx%sol_A, ierr)
+    call unpack_2v(g_ctx%sol_A, y_psi, y_u, ierr)
+
+    ! 2. Residual on transport super-block:
+    !    r_rho = x_rho - B_51 * y_psi - B_52 * y_u
+    !    r_T   = x_T   - B_61 * y_psi - B_62 * y_u
+    call VecCopy(x_rho, g_ctx%tmp_rho, ierr)
+    call MatMult(g_ctx%B_51, y_psi, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%tmp_rho, -1.0d0, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_52, y_u,   g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%tmp_rho, -1.0d0, g_ctx%work_3, ierr)
+
+    call VecCopy(x_T, g_ctx%tmp_T, ierr)
+    call MatMult(g_ctx%B_61, y_psi, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%tmp_T, -1.0d0, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_62, y_u,   g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%tmp_T, -1.0d0, g_ctx%work_3, ierr)
+
+    ! 3. Pack residuals and solve K_B
+    call pack_2v(g_ctx%tmp_rho, g_ctx%tmp_T, g_ctx%rhs_B, ierr)
+    call KSPSolve(g_ctx%ksp_block_B, g_ctx%rhs_B, g_ctx%sol_B, ierr)
+    call unpack_2v(g_ctx%sol_B, y_rho, y_T, ierr)
+  end subroutine apply_block_gs_forward
+
+  !> Block-GS-symmetric apply: forward sweep + backward sweep.
+  !!
+  !! Mode 3 of the sub-blocks PC. Symmetric Gauss-Seidel — three block solves total.
+  !!
+  !!   Forward sweep (same as mode 2):
+  !!     y_A = K_A^-1 x_A
+  !!     r_B = x_B - C_BA * y_A
+  !!     y_B = K_B^-1 r_B
+  !!
+  !!   Backward sweep:
+  !!     r_A = x_A - C_AB * y_B    where C_AB = [0 B_16; B_25 B_26]
+  !!                                            (B_15 is structurally zero in model199)
+  !!     y_A = K_A^-1 r_A
+  !!
+  subroutine apply_block_gs_symmetric(x_psi, x_u, x_rho, x_T, &
+                                      y_psi, y_u, y_rho, y_T, ierr)
+    Vec            :: x_psi, x_u, x_rho, x_T
+    Vec            :: y_psi, y_u, y_rho, y_T
+    PetscErrorCode :: ierr
+
+    ! --- Forward sweep (identical to apply_block_gs_forward) ---
+    call apply_block_gs_forward(x_psi, x_u, x_rho, x_T, &
+                                y_psi, y_u, y_rho, y_T, ierr)
+
+    ! --- Backward sweep ---
+    ! r_psi = x_psi - B_16 * y_T          (no B_15: psi-rho coupling is zero in model199)
+    call VecCopy(x_psi, g_ctx%work_1, ierr)
+    call MatMult(g_ctx%B_16, y_T, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_1, -1.0d0, g_ctx%work_3, ierr)
+
+    ! r_u = x_u - B_25 * y_rho - B_26 * y_T
+    call VecCopy(x_u, g_ctx%work_2, ierr)
+    call MatMult(g_ctx%B_25, y_rho, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_2, -1.0d0, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_26, y_T,   g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_2, -1.0d0, g_ctx%work_3, ierr)
+
+    ! Pack residuals and re-solve K_A
+    call pack_2v(g_ctx%work_1, g_ctx%work_2, g_ctx%rhs_A, ierr)
+    call KSPSolve(g_ctx%ksp_block_A, g_ctx%rhs_A, g_ctx%sol_A, ierr)
+    call unpack_2v(g_ctx%sol_A, y_psi, y_u, ierr)
+  end subroutine apply_block_gs_symmetric
 
 
   !--------------------------------------------------------------------
@@ -1232,7 +1392,8 @@ contains
   subroutine petsc_physics_pc_build_reduced(A_full)
     use mod_parameters, only: n_var, n_tor, n_degrees, var_psi, var_u, var_zj, var_w, var_rho, var_T
     use phys_module, only: physics_pc_reassemble, debug_physics_pc, physics_pc_monolithic, &
-                           physics_pc_schur_u, physics_pc_probe_exact, physics_pc_block_inv
+                           physics_pc_multi_step, physics_pc_probe_exact, physics_pc_block_inv, &
+                           physics_pc_sub_blocks
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate
 
     Mat, intent(in) :: A_full
@@ -1251,6 +1412,20 @@ contains
     call PetscObjectGetComm(A_full, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
+    ! --- PC mode mutual exclusivity check ---
+    if (physics_pc_sub_blocks .and. &
+        (physics_pc_monolithic .or. physics_pc_multi_step)) then
+      if (my_id == 0) then
+        write(*,'(A)') &
+          "[Physics PC] ERROR: physics_pc_sub_blocks is mutually exclusive with " // &
+          "physics_pc_monolithic and physics_pc_multi_step."
+        write(*,'(A)') &
+          "[Physics PC]   Set exactly one of: physics_pc_monolithic, " // &
+          "physics_pc_multi_step, or physics_pc_sub_blocks."
+      endif
+      ierr = 1
+      return
+    endif
 
     first_time = .not. g_ctx%reduced_ready
     use_reassembled = physics_pc_reassemble
@@ -1427,19 +1602,6 @@ contains
     call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
 
-    ! --- Step 4c: Inner Schur complement S_u (Alfven block) ---
-    ! S_u = Atilde_22 - Atilde_21 * diag(Atilde_11)^{-1} * B_12
-    ! This captures the u -> psi -> u round-trip (Alfven wave coupling)
-    if (physics_pc_schur_u) then
-      !TODO...
-
-      call VecNorm(g_ctx%diag_A11_inv, NORM_2, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||diag(Atilde_11)^{-1}||_2 = ", norm_val
-      call MatNorm(g_ctx%S_u, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||S_u||_F = ", norm_val
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed inner Schur complement S_u"
-    endif
-
     if (debug_physics_pc) then
       call petsc_test_pc_matrix(g_ctx%B_33, "B_33", .true., my_id)
       call petsc_test_pc_matrix(g_ctx%B_44, "B_44", .true., my_id)
@@ -1502,14 +1664,56 @@ contains
         call assemble_probed_exact_4x4(use_reassembled, comm, first_time, my_id)
        ! call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_exact_4x4", .false.)
       endif
+    else if (physics_pc_sub_blocks) then
+      ! ===== Sub-blocks PC: build 2x2 super-blocks (psi,u) and (rho,T) =====
+
+      ! Build K_A (psi,u) 2x2 MatNest from refs to existing Atilde_*/B_12
+      block
+        Mat :: mats_nest_A(4)
+        mats_nest_A(1) = g_ctx%Atilde_11
+        mats_nest_A(2) = g_ctx%B_12
+        mats_nest_A(3) = g_ctx%Atilde_21
+        mats_nest_A(4) = g_ctx%Atilde_22
+        call MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, &
+                           mats_nest_A, g_ctx%K_A_block, ierr)
+      end block
+
+      ! Build K_B (rho,T) 2x2 MatNest (rho-T and T-rho cross terms are zero in model199)
+      block
+        Mat :: mats_nest_B(4)
+        mats_nest_B(1) = g_ctx%B_55
+        mats_nest_B(2) = PETSC_NULL_MAT
+        mats_nest_B(3) = PETSC_NULL_MAT
+        mats_nest_B(4) = g_ctx%B_66
+        call MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, &
+                           mats_nest_B, g_ctx%K_B_block, ierr)
+      end block
+
+      ! Convert each MatNest to MPIAIJ for MUMPS factorization.
+      ! Pattern matches mod_petsc_pc_physics.f90:700/719/736 (A_reduced_4x4, M_hydro, A_alfven).
+      call MatConvert(g_ctx%K_A_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_A_aij, ierr)
+      call MatConvert(g_ctx%K_B_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_B_aij, ierr)
+
+      ! Set up the two KSPs (PREONLY + LU + MUMPS) via the existing helper
+      call setup_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time)
+      call setup_block_ksp(g_ctx%ksp_block_B, g_ctx%K_B_aij, comm, first_time)
+
+      ! Allocate packed work vectors (size matches each AIJ super-block)
+      if (.not. g_ctx%sub_blocks_setup_done) then
+        call MatCreateVecs(g_ctx%K_A_aij, g_ctx%rhs_A, g_ctx%sol_A, ierr)
+        call MatCreateVecs(g_ctx%K_B_aij, g_ctx%rhs_B, g_ctx%sol_B, ierr)
+        call MatCreateVecs(g_ctx%B_55,    g_ctx%tmp_rho, PETSC_NULL_VEC, ierr)
+        call MatCreateVecs(g_ctx%B_66,    g_ctx%tmp_T,   PETSC_NULL_VEC, ierr)
+        g_ctx%sub_blocks_setup_done = .true.
+      endif
+
+      g_ctx%ksp_created = .true.
+      if (my_id == 0) write(*,'(A)') &
+        "[Physics PC]   Sub-blocks PC set up: K_A (psi,u) and K_B (rho,T), PREONLY+LU+MUMPS"
     else
       ! Block-diagonal mode: 4 separate sub-KSPs
       call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time)
-      if (physics_pc_schur_u) then
-        call setup_block_ksp(g_ctx%ksp_u, g_ctx%S_u, comm, first_time)
-      else
-        call setup_block_ksp(g_ctx%ksp_u, g_ctx%Atilde_22, comm, first_time)
-      endif
+      call setup_block_ksp(g_ctx%ksp_u, g_ctx%Atilde_22, comm, first_time)
       if (use_reassembled) then
         call setup_block_ksp(g_ctx%ksp_rho, g_ctx%R_55, comm, first_time)
         call setup_block_ksp(g_ctx%ksp_T,   g_ctx%R_66, comm, first_time)
@@ -1554,7 +1758,8 @@ contains
   !--------------------------------------------------------------------
   subroutine physics_pc_apply(pc_obj, x, y, ierr)
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
-    use phys_module, only: physics_pc_coupled, physics_pc_monolithic, physics_pc_multi_step
+    use phys_module, only: physics_pc_monolithic, physics_pc_multi_step, &
+                           physics_pc_sub_blocks, physics_pc_sub_blocks_mode
 
     PC :: pc_obj
     Vec :: x, y
@@ -1742,56 +1947,37 @@ contains
       call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
       call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
       call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, ierr)
-      if (physics_pc_coupled) then
-        ! Lower-triangular correction: b_u -= Ã_21 * y_psi
-        call MatMult(g_ctx%Atilde_21, y_psi, g_ctx%work_3, ierr)
-        call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
-      endif
       ! Solve u block: Ã_22 * y_u = b_u
       call KSPSolve(g_ctx%ksp_u, g_ctx%work_5, y_u, ierr)
 
       ! b_rho = x_rho
-      if (physics_pc_coupled) then
-        ! Lower-triangular correction: b_rho -= B_51 * y_psi + B_52 * y_u
-        call VecCopy(x_rho, g_ctx%work_5, ierr)
-        call MatMult(g_ctx%B_51, y_psi, g_ctx%work_3, ierr)
-        call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
-        call MatMult(g_ctx%B_52, y_u, g_ctx%work_3, ierr)
-        call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
-        call KSPSolve(g_ctx%ksp_rho, g_ctx%work_5, y_rho, ierr)
-      else
-        call KSPSolve(g_ctx%ksp_rho, x_rho, y_rho, ierr)
-      endif
+      call KSPSolve(g_ctx%ksp_rho, x_rho, y_rho, ierr)
 
       ! b_T = x_T - B_63 * temp_j
       call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
       call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
-      if (physics_pc_coupled) then
-        ! Lower-triangular correction: b_T -= Ã_61 * y_psi + B_62 * y_u
-        call MatMult(g_ctx%Atilde_61, y_psi, g_ctx%work_3, ierr)
-        call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
-        call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
-        call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
-      endif
       ! Solve T block: B_66 * y_T = b_T
       call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, y_T, ierr)
 
-      ! --- Backward sweep (upper-triangular correction) ---
-      if (physics_pc_coupled) then
-        ! (B3) y_u -= Ã_22^{-1} * (B_25 * y_rho + B_26 * y_T)
-        call MatMult(g_ctx%B_25, y_rho, g_ctx%work_3, ierr)
-        call MatMult(g_ctx%B_26, y_T, g_ctx%work_4, ierr)
-        call VecAXPY(g_ctx%work_3, 1.0d0, g_ctx%work_4, ierr)
-        call KSPSolve(g_ctx%ksp_u, g_ctx%work_3, g_ctx%work_4, ierr)
-        call VecAXPY(y_u, -1.0d0, g_ctx%work_4, ierr)
+    else if (physics_pc_sub_blocks) then
+      ! ===== Sub-blocks PC: (psi,u) Alfven + (rho,T) transport =====
+      select case (physics_pc_sub_blocks_mode)
+      case (1)
+        call apply_block_jacobi(x_psi, x_u, x_rho, x_T, &
+                                y_psi, y_u, y_rho, y_T, ierr)
+      case (2)
+        call apply_block_gs_forward(x_psi, x_u, x_rho, x_T, &
+                                    y_psi, y_u, y_rho, y_T, ierr)
+      case (3)
+        call apply_block_gs_symmetric(x_psi, x_u, x_rho, x_T, &
+                                      y_psi, y_u, y_rho, y_T, ierr)
+      case default
+        if (my_id == 0) write(*,'(A,I0)') &
+          "[Physics PC] ERROR: invalid physics_pc_sub_blocks_mode = ", physics_pc_sub_blocks_mode
+        ierr = 1
+        return
+      end select
 
-        ! (B4) y_psi -= Ã_11^{-1} * (B_12 * y_u + B_16 * y_T)
-        call MatMult(g_ctx%B_12, y_u, g_ctx%work_3, ierr)
-        call MatMult(g_ctx%B_16, y_T, g_ctx%work_4, ierr)
-        call VecAXPY(g_ctx%work_3, 1.0d0, g_ctx%work_4, ierr)
-        call KSPSolve(g_ctx%ksp_psi, g_ctx%work_3, g_ctx%work_4, ierr)
-        call VecAXPY(y_psi, -1.0d0, g_ctx%work_4, ierr)
-      endif
     endif
 
     ! --- Step 4: Back-substitute for j and w ---
