@@ -393,23 +393,21 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 ! 3. Construct the Matrix Entries
                 ! Term 1: Inertia (-rho_hat * grad_pol v * grad_pol u) 
                 amat_schur = - r0_hat * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * BigR * xjac & ! - amat_u_correction &
-                              + (theta*tstep)**2 * ( (Q0x * W0x + Q0y * W0y) + (2.d0 / BigR) * Q0 * W0x ) * BigR * xjac
+                              - (theta*tstep)**2 * ( (Q0x * W0x + Q0y * W0y) + (2.d0 / BigR) * Q0 * W0x ) * BigR * xjac
 
                 ! Term 2: dt^2 * [grad_pol q * grad_pol w + 2/R * q * w_R]
                 ! Part 00: purely poloidal (no phi derivatives)
                 !amat_schur = amat_schur + (tstep**2) * ( (Q0x * W0x + Q0y * W0y) + (2.d0 / BigR) * Q0 * W0x ) * BigR * xjac
-
-                !if (amat_schur == 0.d0) write(*,*) 'Zero inertia term at mp=', mp, 'ms=', ms, 'mt=', mt, 'i=', i, 'j=', j, 'k=', k, 'l=', l
 
                 ! Part n: single phi derivative cross-terms. 
                 ! amat_01 is d/dphi on trial function (u).
                 ! amat_10 is d/dphi on test function (v). Toroidal IBP flips the sign and transfers it to 'u'.
                 amat_01 = (Q0x * W1x + Q0y * W1y) + (2.d0 / BigR) * Q0 * W1x
                 amat_10 = (Q1x * W0x + Q1y * W0y) + (2.d0 / BigR) * Q1 * W0x
-                amat_schur_n = (theta*tstep)**2 * (amat_01 - amat_10) * BigR * xjac
+                amat_schur_n = - (theta*tstep)**2 * (amat_01 - amat_10) * BigR * xjac
 
                 ! Part kn: d/dphi on BOTH test and trial functions
-                amat_schur_kn = (theta*tstep)**2 * ((Q1x * W1x + Q1y * W1y) + (2.d0 / BigR) * Q1 * W1x ) * BigR * xjac
+                amat_schur_kn = - (theta*tstep)**2 * ((Q1x * W1x + Q1y * W1y) + (2.d0 / BigR) * Q1 * W1x ) * BigR * xjac !- amat_u_kn_correction
                 
                 ! --- 1-var mass (A_w = A_j assigned after FFT) ---
                 ELM_p_j(mp, idx_ij, idx_kl) = ELM_p_j(mp, idx_ij, idx_kl) + wst * amat_mass
