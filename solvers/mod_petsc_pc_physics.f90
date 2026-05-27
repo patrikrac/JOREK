@@ -95,15 +95,15 @@ module mod_petsc_pc_physics
     logical :: ksp_hydro_created = .false.
     IS :: is_hydro(3)
     Vec :: work_rhs_3v
+    Vec :: hydro_predictor_3v
 
     Mat :: A_alfven
     KSP :: ksp_alfven
     logical :: ksp_alfven_created = .false.
     Vec :: work_rhs_2v
 
-    Vec :: hydro_predictor_3v
-
-    Mat :: S_PBP
+    Mat :: S_u ! Exact schur complement, to be removed ?
+    Mat :: S_PBP ! Approximation (Physics Based) of the Schur complement S_u
     KSP :: ksp_S_PBP
     logical :: ksp_S_PBP_created = .false.
 
@@ -557,61 +557,325 @@ contains
   end subroutine compute_schur_corrected_block
 
 
-  !--------------------------------------------------------------------
-  !> Compute a Schur-corrected block using exact M^{-1} via MatMatSolve:
+!--------------------------------------------------------------------
+  !> Compute a Schur-corrected block using vector probing:
   !! Atilde = B_diag - B_coupling * M^{-1} * B_constraint
   !!
-  !! Uses the already-factored KSP (MUMPS) to solve M * X = B_constraint
-  !! for X, then forms C = B_coupling * X.
-  !!
-  !! NOTE: This converts B_constraint to dense for MatMatSolve, so it is
-  !! only suitable for proof-of-concept / small test cases.
+  !! Uses a KSP (MUMPS) to solve M * y = z column-by-column (probing).
+  !! Rank 0 gathers the columns into a dense array, and a fresh sparse 
+  !! MATMPIAIJ is assembled at the end.
   !--------------------------------------------------------------------
-  subroutine compute_schur_corrected_block_exact(B_diag, B_coupling, &
-                                          B_constraint, ksp_M, Atilde, first_time)
-    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
-    KSP, intent(in)    :: ksp_M
-    Mat, intent(inout) :: Atilde
+  subroutine compute_schur_corrected_block_exact(M, B_diag, B_coupling, &
+                                          B_constraint, Atilde, first_time)
+    implicit none
+    Mat, intent(in)     :: M, B_diag, B_coupling, B_constraint
+    Mat, intent(inout)  :: Atilde
     logical, intent(in) :: first_time
 
-    Mat :: F              ! factor matrix from KSP
-    Mat :: B_dense        ! dense copy of B_constraint
-    Mat :: X_dense        ! dense solution: M^{-1} * B_constraint
-    Mat :: X_aij          ! sparse conversion of X_dense
-    Mat :: C              ! B_coupling * X
-    PC  :: pc_obj
+    KSP            :: ksp_M
+    PC             :: pc_M
+    Vec            :: e_j, z, y, r_corr, r_diag, r_seq
+    VecScatter     :: scat
     PetscErrorCode :: ierr
+    PetscInt       :: N_global, m_local, n_local
+    integer        :: n, j, my_id, mpierr
+    MPI_Comm       :: comm
 
-    ! Get factor matrix from already-factored KSP
-    call KSPGetPC(ksp_M, pc_obj, ierr)
-    call PCFactorGetMatrix(pc_obj, F, ierr)
+    PetscScalar, pointer  :: arr(:)
+    real*8, allocatable   :: S_dense(:,:)
+    PetscInt, allocatable :: row_idxs(:)
+    PetscInt       :: col_idx(1)
 
-    ! Convert B_constraint to dense for MatMatSolve
-    call MatConvert(B_constraint, MATDENSE, MAT_INITIAL_MATRIX, B_dense, ierr)
+    ! Infer communicator and rank from the input matrix
+    call PetscObjectGetComm(B_diag, comm, ierr)
+    call MPI_Comm_rank(comm, my_id, mpierr)
 
-    ! Create dense solution matrix of same size
-    call MatDuplicate(B_dense, MAT_DO_NOT_COPY_VALUES, X_dense, ierr)
+    ! Get the global size of the block (assume square mapping for the variable)
+    call MatGetSize(B_diag, PETSC_NULL_INTEGER, N_global, ierr)
+    n = int(N_global)
 
-    ! Solve M * X = B_constraint  (uses MUMPS factorization)
-    call MatMatSolve(F, B_dense, X_dense, ierr)
+    if (my_id == 0) then
+      allocate(S_dense(n, n))
+      S_dense = 0.0d0
+      write(*,'(A,I0,A)') "[Diagnostics] Probing exact Schur block (", n, " columns)..."
+      flush(6)
+    endif
 
-    ! Convert X back to sparse AIJ for MatMatMult
-    call MatConvert(X_dense, MATAIJ, MAT_INITIAL_MATRIX, X_aij, ierr)
+    ! -----------------------------------------------------------------
+    ! 1. Set Up the Exact LU KSP for M
+    ! -----------------------------------------------------------------
+    call KSPCreate(comm, ksp_M, ierr)
+    call KSPSetOperators(ksp_M, M, M, ierr)
+    call KSPSetType(ksp_M, KSPPREONLY, ierr)
+    call KSPGetPC(ksp_M, pc_M, ierr)
+    call PCSetType(pc_M, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_M, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(ksp_M, ierr)
 
-    ! C = B_coupling * X
-    call MatMatMult(B_coupling, X_aij, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C, ierr)
+    ! -----------------------------------------------------------------
+    ! 2. Allocate Vector Workspace
+    ! -----------------------------------------------------------------
+    ! e_j : Domain of B_constraint (and B_diag)
+    ! z   : Range of B_constraint
+    call MatCreateVecs(B_constraint, e_j, z, ierr)
+    
+    ! y   : Domain of M (Solution of M y = z)
+    call MatCreateVecs(M, y, PETSC_NULL_VEC, ierr)
+    
+    ! r_diag, r_corr : Range of B_diag / B_coupling
+    call MatCreateVecs(B_diag, PETSC_NULL_VEC, r_diag, ierr)
+    call VecDuplicate(r_diag, r_corr, ierr)
 
-    ! Atilde = B_diag - C
+    ! Sequential vector for gathering results on Rank 0
+    call VecScatterCreateToZero(r_diag, scat, r_seq, ierr)
+
+    ! -----------------------------------------------------------------
+    ! 3. Probe the Matrix Column by Column
+    ! -----------------------------------------------------------------
+    do j = 0, n-1
+      ! Set up standard basis vector e_j
+      call VecSet(e_j, 0.0d0, ierr)
+      call VecSetValue(e_j, j, 1.0d0, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_j, ierr)
+      call VecAssemblyEnd(e_j, ierr)
+
+      ! z = B_constraint * e_j
+      call MatMult(B_constraint, e_j, z, ierr)
+
+      ! Solve M * y = z
+      call KSPSolve(ksp_M, z, y, ierr)
+
+      ! r_corr = B_coupling * y
+      call MatMult(B_coupling, y, r_corr, ierr)
+
+      ! r_diag = B_diag * e_j
+      call MatMult(B_diag, e_j, r_diag, ierr)
+
+      ! r_diag = r_diag - r_corr (This is the j-th column of Atilde)
+      call VecAXPY(r_diag, -1.0d0, r_corr, ierr)
+
+      ! Scatter the j-th column to Rank 0
+      call VecScatterBegin(scat, r_diag, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, r_diag, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+
+      ! Insert into dense Fortran array
+      if (my_id == 0) then
+        call VecGetArrayF90(r_seq, arr, ierr)
+        S_dense(1:n, j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(r_seq, arr, ierr)
+      endif
+
+      ! Status output
+      if (my_id == 0 .and. mod(j+1, max(1,n/10)) == 0) then
+        write(*,'(A,I0,A,I0,A,I0,A)') &
+          "[Diagnostics]   Probed: ", j+1, "/", n, " (", (j+1)*100/n, "%)"
+        flush(6)
+      endif
+    enddo
+
+    ! -----------------------------------------------------------------
+    ! 4. Construct the Parallel Sparse Matrix from the Dense Array
+    ! -----------------------------------------------------------------
+    ! Get local parallel layout matching the working vectors
+    call VecGetLocalSize(r_diag, m_local, ierr)
+    call VecGetLocalSize(e_j,    n_local, ierr)
+
     if (.not. first_time) call MatDestroy(Atilde, ierr)
-    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
-    call MatAXPY(Atilde, -1.0d0, C, DIFFERENT_NONZERO_PATTERN, ierr)
 
-    ! Clean up
-    call MatDestroy(B_dense, ierr)
-    call MatDestroy(X_dense, ierr)
-    call MatDestroy(X_aij, ierr)
-    call MatDestroy(C, ierr)
+    call MatCreate(comm, Atilde, ierr)
+    call MatSetSizes(Atilde, m_local, n_local, n, n, ierr)
+    call MatSetType(Atilde, MATMPIAIJ, ierr)
+    call MatSetOption(Atilde, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    call MatSetUp(Atilde, ierr)
+
+    if (my_id == 0) then
+      allocate(row_idxs(n))
+      do j = 0, n-1
+        row_idxs(j+1) = j
+      enddo
+
+      ! Insert dense column by dense column
+      do j = 0, n-1
+        col_idx(1) = j
+        call MatSetValues(Atilde, n, row_idxs, 1, col_idx, &
+                          S_dense(:, j+1), INSERT_VALUES, ierr)
+      enddo
+
+      deallocate(row_idxs)
+      deallocate(S_dense)
+    endif
+
+    call MatAssemblyBegin(Atilde, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd  (Atilde, MAT_FINAL_ASSEMBLY, ierr)
+
+    ! -----------------------------------------------------------------
+    ! 5. Cleanup Workspace
+    ! -----------------------------------------------------------------
+    call VecScatterDestroy(scat, ierr)
+    call VecDestroy(r_seq,  ierr)
+    call VecDestroy(e_j,    ierr)
+    call VecDestroy(z,      ierr)
+    call VecDestroy(y,      ierr)
+    call VecDestroy(r_diag, ierr)
+    call VecDestroy(r_corr, ierr)
+    call KSPDestroy(ksp_M,  ierr)
+
   end subroutine compute_schur_corrected_block_exact
+
+
+  !--------------------------------------------------------------------
+  !> Compute the explicitly preconditioned matrix: B = M^{-1} * A
+  !!
+  !! Uses a KSP (MUMPS) to solve M * y = z where z = A * e_j.
+  !! Rank 0 gathers the columns into a dense array, and a fresh sparse 
+  !! MATMPIAIJ is assembled at the end to be passed to an eigensolver.
+  !--------------------------------------------------------------------
+  subroutine compute_explicit_preconditioned_matrix(M, A, B, first_time)
+    implicit none
+    Mat, intent(in)     :: M, A
+    Mat, intent(inout)  :: B
+    logical, intent(in) :: first_time
+
+    KSP            :: ksp_M
+    PC             :: pc_M
+    Vec            :: e_j, z, y, y_seq
+    VecScatter     :: scat
+    PetscErrorCode :: ierr
+    PetscInt       :: N_global, m_local, n_local
+    integer        :: n, j, my_id, mpierr
+    MPI_Comm       :: comm
+
+    PetscScalar, pointer  :: arr(:)
+    real*8, allocatable   :: B_dense(:,:)
+    PetscInt, allocatable :: row_idxs(:)
+    PetscInt       :: col_idx(1)
+
+    ! Infer communicator and rank from the input matrix
+    call PetscObjectGetComm(A, comm, ierr)
+    call MPI_Comm_rank(comm, my_id, mpierr)
+
+    ! Get the global size of the matrix
+    call MatGetSize(A, PETSC_NULL_INTEGER, N_global, ierr)
+    n = int(N_global)
+
+    if (my_id == 0) then
+      allocate(B_dense(n, n))
+      B_dense = 0.0d0
+      write(*,'(A,I0,A)') "[Diagnostics] Probing M^{-1} A (", n, " columns)..."
+      flush(6)
+    endif
+
+    ! -----------------------------------------------------------------
+    ! 1. Set Up the Exact LU KSP for M
+    ! -----------------------------------------------------------------
+    call KSPCreate(comm, ksp_M, ierr)
+    call KSPSetOperators(ksp_M, M, M, ierr)
+    call KSPSetType(ksp_M, KSPPREONLY, ierr)
+    call KSPGetPC(ksp_M, pc_M, ierr)
+    call PCSetType(pc_M, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_M, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(ksp_M, ierr)
+
+    ! -----------------------------------------------------------------
+    ! 2. Allocate Vector Workspace
+    ! -----------------------------------------------------------------
+    ! e_j : Domain of A
+    ! z   : Range of A (which is also Domain of M)
+    call MatCreateVecs(A, e_j, z, ierr)
+    
+    ! y   : Solution of M y = z
+    call VecDuplicate(z, y, ierr)
+    
+    ! Sequential vector for gathering results on Rank 0
+    call VecScatterCreateToZero(y, scat, y_seq, ierr)
+
+    ! -----------------------------------------------------------------
+    ! 3. Probe the Matrix Column by Column
+    ! -----------------------------------------------------------------
+    do j = 0, n-1
+      ! Set up standard basis vector e_j
+      call VecSet(e_j, 0.0d0, ierr)
+      call VecSetValue(e_j, j, 1.0d0, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_j, ierr)
+      call VecAssemblyEnd(e_j, ierr)
+
+      ! z = A * e_j  (Extract the j-th column of A)
+      call MatMult(A, e_j, z, ierr)
+
+      ! Solve M * y = z  (Apply M^{-1} to the j-th column of A)
+      call KSPSolve(ksp_M, z, y, ierr)
+
+      ! Scatter the j-th column of the result to Rank 0
+      call VecScatterBegin(scat, y, y_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, y, y_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+
+      ! Insert into dense Fortran array
+      if (my_id == 0) then
+        call VecGetArrayF90(y_seq, arr, ierr)
+        B_dense(1:n, j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(y_seq, arr, ierr)
+      endif
+
+      ! Status output
+      if (my_id == 0 .and. mod(j+1, max(1,n/10)) == 0) then
+        write(*,'(A,I0,A,I0,A,I0,A)') &
+          "[Diagnostics]   Probed: ", j+1, "/", n, " (", (j+1)*100/n, "%)"
+        flush(6)
+      endif
+    enddo
+
+    ! -----------------------------------------------------------------
+    ! 4. Construct the Parallel Sparse Matrix from the Dense Array
+    ! -----------------------------------------------------------------
+    ! Get local parallel layout matching the working vectors
+    call VecGetLocalSize(y,   m_local, ierr)
+    call VecGetLocalSize(e_j, n_local, ierr)
+
+    if (.not. first_time) call MatDestroy(B, ierr)
+
+    call MatCreate(comm, B, ierr)
+    call MatSetSizes(B, m_local, n_local, n, n, ierr)
+    call MatSetType(B, MATMPIAIJ, ierr)
+    ! B will be mathematically dense, so allow new non-zero allocation
+    call MatSetOption(B, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    call MatSetUp(B, ierr)
+
+    if (my_id == 0) then
+      allocate(row_idxs(n))
+      do j = 0, n-1
+        row_idxs(j+1) = j
+      enddo
+
+      ! Insert dense column by dense column
+      do j = 0, n-1
+        col_idx(1) = j
+        call MatSetValues(B, n, row_idxs, 1, col_idx, &
+                          B_dense(:, j+1), INSERT_VALUES, ierr)
+      enddo
+
+      deallocate(row_idxs)
+      deallocate(B_dense)
+    endif
+
+    call MatAssemblyBegin(B, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd  (B, MAT_FINAL_ASSEMBLY, ierr)
+
+    ! -----------------------------------------------------------------
+    ! 5. Cleanup Workspace
+    ! -----------------------------------------------------------------
+    call VecScatterDestroy(scat, ierr)
+    call VecDestroy(y_seq, ierr)
+    call VecDestroy(e_j,   ierr)
+    call VecDestroy(z,     ierr)
+    call VecDestroy(y,     ierr)
+    call KSPDestroy(ksp_M, ierr)
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Diagnostics] Assembly of B = M^{-1} A complete."
+      flush(6)
+    endif
+
+  end subroutine compute_explicit_preconditioned_matrix
 
 
   !--------------------------------------------------------------------
@@ -636,6 +900,91 @@ contains
     call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
     call KSPSetUp(ksp_block, ierr)
   end subroutine setup_block_ksp
+
+  !--------------------------------------------------------------------
+  !> Set up a sub-KSP for a diagonal block: PREONLY + GAMG (1 V-Cycle).
+  !--------------------------------------------------------------------
+  subroutine setup_block_ksp_amg(ksp_block, B_block, comm, first_time)
+    implicit none
+
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+
+    PC :: pc
+    PetscErrorCode :: ierr
+
+    if (first_time) then
+      call KSPCreate(comm, ksp_block, ierr)
+    endif
+    
+    call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+    
+    ! PREONLY means "just apply the preconditioner once". 
+    ! For an AMG preconditioner, this results in exactly one V-cycle.
+    call KSPSetType(ksp_block, KSPPREONLY, ierr)
+    
+    call KSPGetPC(ksp_block, pc, ierr)
+    
+    ! Set the preconditioner to PETSc's native Algebraic Multigrid (GAMG)
+    call PCSetType(pc, PCGAMG, ierr)
+    
+    ! (Optional but recommended) Explicitly set it to use Smoothed Aggregation.
+    ! Smoothed Aggregation is much better for block/non-M-matrices than classical AMG.
+    call PCGAMGSetType(pc, PCGAMGAGG, ierr)
+    
+    call KSPSetUp(ksp_block, ierr)
+    
+  end subroutine setup_block_ksp_amg
+
+  !--------------------------------------------------------------------
+  !> Set up a sub-KSP for a diagonal block: GMRES + GAMG (3-10 iters)
+  !--------------------------------------------------------------------
+  subroutine setup_block_ksp_amg_krylov(ksp_block, B_block, comm, first_time, max_its)
+    implicit none
+
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+    integer, intent(in) :: max_its      ! Pass in 3 to 10
+
+    PC :: pc
+    PetscErrorCode :: ierr
+    PetscReal :: rtol, abstol, dtol
+
+    if (first_time) then
+      call KSPCreate(comm, ksp_block, ierr)
+    endif
+    
+    call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+    
+    ! 1. Choose a lightweight Krylov solver
+    ! GMRES is highly robust for non-symmetric/non-M-matrices.
+    call KSPSetType(ksp_block, KSPGMRES, ierr)
+    
+    ! Keep memory footprint tiny by telling GMRES to restart 
+    ! at max_its (it will only allocate 'max_its' search vectors).
+    call KSPGMRESSetRestart(ksp_block, max_its, ierr)
+    
+    ! 2. Set tolerances and max iterations
+    ! Set a loose relative tolerance (e.g., 1.0d-2 = 1% error reduction)
+    ! so it can exit early if it converges in 3-4 iterations.
+    ! Otherwise, it will hard-stop at 'max_its'.
+    rtol   = 1.0d-2  
+    abstol = 1.0d-50 ! Ignore absolute tolerance
+    dtol   = 1.0d4   ! Divergence tolerance
+    call KSPSetTolerances(ksp_block, rtol, abstol, dtol, max_its, ierr)
+    
+    ! 3. Set the Preconditioner to GAMG
+    call KSPGetPC(ksp_block, pc, ierr)
+    call PCSetType(pc, PCGAMG, ierr)
+    call PCGAMGSetType(pc, PCGAMGAGG, ierr)
+    
+    call KSPSetUp(ksp_block, ierr)
+    
+  end subroutine setup_block_ksp_amg_krylov
 
   !> Pack two 1-variable PETSc vecs into one 2v-sized packed vec.
   !!
@@ -1405,7 +1754,8 @@ contains
     PetscReal :: norm_val
     Mat :: diag_11, diag_22, diag_55, diag_66  ! pointers to chosen diagonal blocks
     Mat :: prod_tmp                              ! temporary for block-inverse diagnostic
-
+    
+    Mat :: B_tmp ! Store the preconditioned matrix B = M^{-1} A 
     !Mat :: A_eq
     !Vec :: dr, dc
 
@@ -1584,12 +1934,16 @@ contains
       else
         call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
                                             g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
+        !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%Atilde_11, first_time)
         call compute_schur_corrected_block_u(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
                                             g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+        !call compute_schur_corrected_block_exact( g_ctx%B_44, g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, g_ctx%Atilde_22, first_time)
       endif
       ! Off-diagonal Schur corrections from element-assembled K_21 / K_61
       call compute_schur_corrected_block_21(g_ctx%B_21, g_ctx%Atilde_21, first_time)
+      !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, g_ctx%Atilde_21, first_time)
       call compute_schur_corrected_block_61(g_ctx%B_61, g_ctx%Atilde_61, first_time)
+      !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, g_ctx%Atilde_61, first_time)
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
     endif
 
@@ -1602,22 +1956,20 @@ contains
     call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
 
+    ! Compute exact S_u = Atilde_22 - Atilde_21 * Atilde_11^{-1} * Atilde_12 for diagnostics (not used in PC apply)
+    !call compute_schur_corrected_block_exact(g_ctx%Atilde_11, g_ctx%Atilde_22, g_ctx%Atilde_21, g_ctx%B_12, g_ctx%S_u, first_time)
+    !call compute_explicit_preconditioned_matrix(g_ctx%S_PBP, g_ctx%S_u, B_tmp, first_time)
+
     if (debug_physics_pc) then
       call petsc_test_pc_matrix(g_ctx%B_33, "B_33", .true., my_id)
       call petsc_test_pc_matrix(g_ctx%B_44, "B_44", .true., my_id)
-      call petsc_test_pc_matrix(g_ctx%Atilde_11, "Atilde_11", .false., my_id)
-      call petsc_test_pc_matrix(g_ctx%Atilde_22, "Atilde_22", .false., my_id)
+      ! call petsc_test_pc_matrix(g_ctx%Atilde_11, "Atilde_11", .false., my_id)
+      ! call petsc_test_pc_matrix(g_ctx%Atilde_22, "Atilde_22", .false., my_id)
 
        call petsc_test_pc_matrix(g_ctx%S_PBP, "S_PBP", .false., my_id)
+       !call petsc_test_pc_matrix(g_ctx%S_u, "S_u", .false., my_id)
 
-      call petsc_test_pc_matrix(g_ctx%Atilde_21, "Atilde_21", .false., my_id)
-      call petsc_test_pc_matrix(g_ctx%B_51, "B_51", .false., my_id)
-
-
-      call petsc_test_pc_matrix(g_ctx%B_25, "B_25", .false., my_id)
       call petsc_test_pc_matrix(g_ctx%B_66, "B_66", .false., my_id)
-
-      call petsc_test_pc_matrix(g_ctx%B_61, "B_61", .false., my_id)
 
       ! ! --- Compute block spectra for diagnostics ---
       ! call petsc_mat_convert_spectrum(g_ctx%Atilde_11, "Atilde_11", .false.)
@@ -1636,7 +1988,14 @@ contains
 
       ! call petsc_mat_convert_spectrum(g_ctx%B_55, "B_55", .false.)
       ! call petsc_mat_convert_spectrum(g_ctx%B_66, "B_66", .false.)
+
+      !call petsc_mat_convert_spectrum(g_ctx%S_PBP, "S_PBP_2", .false.)
+      !call petsc_mat_convert_spectrum(g_ctx%S_u, "S_u", .false.)
+      !call petsc_mat_convert_spectrum(B_tmp, "S_prec", .false.)
     endif
+
+    !Copy S_u into S_PBP
+    !call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
 
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic) then
@@ -1657,7 +2016,9 @@ contains
 
       if (debug_physics_pc) then
         !call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false.)
-        call petsc_test_pc_matrix(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false., my_id)
+        !call petsc_test_pc_matrix(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false., my_id)
+        !call petsc_test_pc_matrix(g_ctx%M_hydro, "M_hydro", .false., my_id)
+        !call petsc_test_pc_matrix(g_ctx%A_alfven, "A_alfven_2x2", .false., my_id)
       endif
 
       if (physics_pc_probe_exact) then
@@ -1696,7 +2057,7 @@ contains
 
       ! Set up the two KSPs (PREONLY + LU + MUMPS) via the existing helper
       call setup_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time)
-      call setup_block_ksp(g_ctx%ksp_block_B, g_ctx%K_B_aij, comm, first_time)
+      call setup_block_ksp_amg_krylov(g_ctx%ksp_block_B, g_ctx%K_B_aij, comm, first_time, 5)
 
       ! Allocate packed work vectors (size matches each AIJ super-block)
       if (.not. g_ctx%sub_blocks_setup_done) then
@@ -1937,47 +2298,47 @@ contains
     else
       ! ---- Block-diagonal / block-triangular solve ----
       ! b_psi = x_psi - B_13 * temp_j
-      call MatMult(g_ctx%B_13, g_ctx%work_1, g_ctx%work_3, ierr)
-      call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_psi, ierr)
-      ! Solve psi block: Ã_11 * y_psi = b_psi
-      call KSPSolve(g_ctx%ksp_psi, g_ctx%work_4, y_psi, ierr)
+      ! call MatMult(g_ctx%B_13, g_ctx%work_1, g_ctx%work_3, ierr)
+      ! call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_psi, ierr)
+      ! ! Solve psi block: Ã_11 * y_psi = b_psi
+      ! call KSPSolve(g_ctx%ksp_psi, g_ctx%work_4, y_psi, ierr)
 
-      ! b_u = x_u - B_23 * temp_j - B_24 * temp_w
-      call MatMult(g_ctx%B_23, g_ctx%work_1, g_ctx%work_3, ierr)
-      call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
-      call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
-      call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, ierr)
-      ! Solve u block: Ã_22 * y_u = b_u
-      call KSPSolve(g_ctx%ksp_u, g_ctx%work_5, y_u, ierr)
+      ! ! b_u = x_u - B_23 * temp_j - B_24 * temp_w
+      ! call MatMult(g_ctx%B_23, g_ctx%work_1, g_ctx%work_3, ierr)
+      ! call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
+      ! call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
+      ! call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, ierr)
+      ! ! Solve u block: Ã_22 * y_u = b_u
+      ! call KSPSolve(g_ctx%ksp_u, g_ctx%work_5, y_u, ierr)
 
-      ! b_rho = x_rho
-      call KSPSolve(g_ctx%ksp_rho, x_rho, y_rho, ierr)
+      ! ! b_rho = x_rho
+      ! call KSPSolve(g_ctx%ksp_rho, x_rho, y_rho, ierr)
 
-      ! b_T = x_T - B_63 * temp_j
-      call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
-      call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
-      ! Solve T block: B_66 * y_T = b_T
-      call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, y_T, ierr)
+      ! ! b_T = x_T - B_63 * temp_j
+      ! call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
+      ! call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
+      ! ! Solve T block: B_66 * y_T = b_T
+      ! call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, y_T, ierr)
 
-    else if (physics_pc_sub_blocks) then
-      ! ===== Sub-blocks PC: (psi,u) Alfven + (rho,T) transport =====
-      select case (physics_pc_sub_blocks_mode)
-      case (1)
-        call apply_block_jacobi(x_psi, x_u, x_rho, x_T, &
-                                y_psi, y_u, y_rho, y_T, ierr)
-      case (2)
-        call apply_block_gs_forward(x_psi, x_u, x_rho, x_T, &
-                                    y_psi, y_u, y_rho, y_T, ierr)
-      case (3)
-        call apply_block_gs_symmetric(x_psi, x_u, x_rho, x_T, &
+      if (physics_pc_sub_blocks) then
+        ! ===== Sub-blocks PC: (psi,u) Alfven + (rho,T) transport =====
+        select case (physics_pc_sub_blocks_mode)
+        case (1)
+          call apply_block_jacobi(x_psi, x_u, x_rho, x_T, &
+                                  y_psi, y_u, y_rho, y_T, ierr)
+        case (2)
+          call apply_block_gs_forward(x_psi, x_u, x_rho, x_T, &
                                       y_psi, y_u, y_rho, y_T, ierr)
-      case default
-        if (my_id == 0) write(*,'(A,I0)') &
-          "[Physics PC] ERROR: invalid physics_pc_sub_blocks_mode = ", physics_pc_sub_blocks_mode
-        ierr = 1
-        return
-      end select
-
+        case (3)
+          call apply_block_gs_symmetric(x_psi, x_u, x_rho, x_T, &
+                                        y_psi, y_u, y_rho, y_T, ierr)
+        case default
+          write(*,'(A,I0)') &
+            "[Physics PC] ERROR: invalid physics_pc_sub_blocks_mode = ", physics_pc_sub_blocks_mode
+          ierr = 1
+          return
+        end select
+      endif
     endif
 
     ! --- Step 4: Back-substitute for j and w ---
@@ -2126,8 +2487,8 @@ contains
     g_ctx%correction_61_ready   = .true.
 
     if (first_assembly .and. debug_physics_pc) then
-      call petsc_analyze_pc_matrices(my_id)
-      call petsc_test_pc_matrices(my_id)
+      !call petsc_analyze_pc_matrices(my_id)
+      !call petsc_test_pc_matrices(my_id)
     endif
   end subroutine petsc_assemble_pc_matrices
 
