@@ -11,7 +11,7 @@ module mod_sparse_data
 #endif
 #ifdef USE_PETSC
   use mod_petsc, only: type_PETSC_SYSTEM, petsc_initialize, petsc_finalize, petsc_cleanup, &
-                        petsc_create_matrix
+                        petsc_create_matrix, petsc_print_version
 #endif
   use data_structure, only: type_PRECOND
 
@@ -108,6 +108,7 @@ module mod_sparse_data
     endif
 #ifdef USE_PETSC
     call petsc_initialize()
+    call petsc_print_version()
 #endif
     return
   end subroutine setup
