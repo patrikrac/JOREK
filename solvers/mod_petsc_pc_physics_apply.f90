@@ -60,6 +60,28 @@ contains
     call VecRestoreArrayF90    (y2, a_y2, ierr)
   end subroutine unpack_2v
 
+  !> Compute the j,w-folded Alfven-row residuals.
+  !!   r_psi = x_psi - B_13 * temp_j
+  !!   r_u   = x_u   - B_23 * temp_j - B_24 * temp_w
+  !! where temp_j = g_ctx%work_1, temp_w = g_ctx%work_2 (set by the dispatcher).
+  !! `scratch` must be a work vec distinct from r_psi, r_u, work_1, work_2.
+  !! (The rho row needs no fold: r_rho = x_rho. The T row fold, r_T = x_T - B_63*temp_j,
+  !!  is a single MatMult and is done inline by callers.)
+  subroutine fold_alfven_residual(x_psi, x_u, r_psi, r_u, scratch, ierr)
+    Vec            :: x_psi, x_u, r_psi, r_u, scratch
+    PetscErrorCode :: ierr
+
+    ! r_psi = x_psi - B_13 * temp_j
+    call MatMult(g_ctx%B_13, g_ctx%work_1, scratch, ierr)
+    call VecWAXPY(r_psi, -1.0d0, scratch, x_psi, ierr)
+
+    ! r_u = x_u - B_23 * temp_j - B_24 * temp_w
+    call MatMult(g_ctx%B_23, g_ctx%work_1, scratch, ierr)
+    call VecWAXPY(r_u, -1.0d0, scratch, x_u, ierr)
+    call MatMult(g_ctx%B_24, g_ctx%work_2, scratch, ierr)
+    call VecAXPY(r_u, -1.0d0, scratch, ierr)
+  end subroutine fold_alfven_residual
+
   !> Block-Jacobi apply: y_A = K_A^-1 x_A, y_B = K_B^-1 x_B (parallel, no coupling).
   !!
   !! Mode 1 of the sub-blocks PC. Independent solves on the (psi,u) Alfven block
@@ -87,7 +109,8 @@ contains
   !!
   !! Mode 2 of the sub-blocks PC. Forward Gauss-Seidel sweep:
   !!   1. y_A = K_A^-1 x_A
-  !!   2. r_B = x_B - C_BA * y_A      where C_BA = [B_51 B_52; B_61 B_62]
+  !!   2. r_B = x_B - C_BA * y_A      where C_BA = [B_51 B_52; Atilde_61 B_62]
+  !!                                  (RHS uses j,w-folded residuals)
   !!   3. y_B = K_B^-1 r_B
   !!
   !! Captures the (psi,u) -> (rho,T) coupling via the C_BA submatrices.
@@ -97,27 +120,30 @@ contains
     Vec            :: y_psi, y_u, y_rho, y_T
     PetscErrorCode :: ierr
 
-    ! 1. Forward sweep on Alfven super-block
-    call pack_2v(x_psi, x_u, g_ctx%rhs_A, ierr)
+    ! 1. Forward sweep on the Alfven super-block, using the j,w-folded RHS.
+    !    work_4 = r_psi, work_5 = r_u  (work_3 = scratch; work_1/work_2 = temp_j/temp_w preserved)
+    call fold_alfven_residual(x_psi, x_u, g_ctx%work_4, g_ctx%work_5, g_ctx%work_3, ierr)
+    call pack_2v(g_ctx%work_4, g_ctx%work_5, g_ctx%rhs_A, ierr)
     call KSPSolve(g_ctx%ksp_block_A, g_ctx%rhs_A, g_ctx%sol_A, ierr)
     call unpack_2v(g_ctx%sol_A, y_psi, y_u, ierr)
 
-    ! 2. Residual on transport super-block:
-    !    r_rho = x_rho - B_51 * y_psi - B_52 * y_u
-    !    r_T   = x_T   - B_61 * y_psi - B_62 * y_u
+    ! 2a. rho residual (no j,w fold): tmp_rho = x_rho - B_51*y_psi - B_52*y_u
     call VecCopy(x_rho, g_ctx%tmp_rho, ierr)
     call MatMult(g_ctx%B_51, y_psi, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%tmp_rho, -1.0d0, g_ctx%work_3, ierr)
     call MatMult(g_ctx%B_52, y_u,   g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%tmp_rho, -1.0d0, g_ctx%work_3, ierr)
 
-    call VecCopy(x_T, g_ctx%tmp_T, ierr)
-    call MatMult(g_ctx%B_61, y_psi, g_ctx%work_3, ierr)
+    ! 2b. T residual with j,w fold and Schur-corrected Atilde_61:
+    !     tmp_T = (x_T - B_63*temp_j) - Atilde_61*y_psi - B_62*y_u
+    call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
+    call VecWAXPY(g_ctx%tmp_T, -1.0d0, g_ctx%work_3, x_T, ierr)
+    call MatMult(g_ctx%Atilde_61, y_psi, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%tmp_T, -1.0d0, g_ctx%work_3, ierr)
-    call MatMult(g_ctx%B_62, y_u,   g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%tmp_T, -1.0d0, g_ctx%work_3, ierr)
 
-    ! 3. Pack residuals and solve K_B
+    ! 3. Solve transport super-block K_B (block-diagonal rho,T)
     call pack_2v(g_ctx%tmp_rho, g_ctx%tmp_T, g_ctx%rhs_B, ierr)
     call KSPSolve(g_ctx%ksp_block_B, g_ctx%rhs_B, g_ctx%sol_B, ierr)
     call unpack_2v(g_ctx%sol_B, y_rho, y_T, ierr)
@@ -148,20 +174,22 @@ contains
                                 y_psi, y_u, y_rho, y_T, ierr)
 
     ! --- Backward sweep ---
-    ! r_psi = x_psi - B_16 * y_T          (no B_15: psi-rho coupling is zero in model199)
-    call VecCopy(x_psi, g_ctx%work_1, ierr)
+    ! Re-solve the Alfven block with the dropped upper coupling K_alpha,beta applied as a
+    ! corrector, on the SAME j,w-folded residual as the forward sweep.
+    !   work_4 = r_psi - B_16*y_T
+    !   work_5 = r_u   - B_25*y_rho - B_26*y_T
+    ! NOTE: must NOT reuse work_1/work_2 here (they hold temp_j/temp_w needed by the fold).
+    call fold_alfven_residual(x_psi, x_u, g_ctx%work_4, g_ctx%work_5, g_ctx%work_3, ierr)
+
     call MatMult(g_ctx%B_16, y_T, g_ctx%work_3, ierr)
-    call VecAXPY(g_ctx%work_1, -1.0d0, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
 
-    ! r_u = x_u - B_25 * y_rho - B_26 * y_T
-    call VecCopy(x_u, g_ctx%work_2, ierr)
     call MatMult(g_ctx%B_25, y_rho, g_ctx%work_3, ierr)
-    call VecAXPY(g_ctx%work_2, -1.0d0, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
     call MatMult(g_ctx%B_26, y_T,   g_ctx%work_3, ierr)
-    call VecAXPY(g_ctx%work_2, -1.0d0, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
 
-    ! Pack residuals and re-solve K_A
-    call pack_2v(g_ctx%work_1, g_ctx%work_2, g_ctx%rhs_A, ierr)
+    call pack_2v(g_ctx%work_4, g_ctx%work_5, g_ctx%rhs_A, ierr)
     call KSPSolve(g_ctx%ksp_block_A, g_ctx%rhs_A, g_ctx%sol_A, ierr)
     call unpack_2v(g_ctx%sol_A, y_psi, y_u, ierr)
   end subroutine apply_block_gs_symmetric
@@ -234,11 +262,17 @@ contains
   end subroutine apply_monolithic_4x4
 
   !--------------------------------------------------------------------
-  !> Apply path: three-step predictor-corrector.
-  !> Stages: hydro predictor (M_hydro joint 3x3 solve for u,rho,T) ->
-  !>         magnetic predictor (ksp_psi) ->
-  !>         Alfven corrector (ksp_S_PBP, with Atilde_21 coupling) ->
-  !>         transport correction (ksp_rho, ksp_T).
+  !> Apply path: segregated-Schur (Chacon parabolization) predictor-corrector.
+  !> Inverts the reduced 4x4 (psi,u,rho,T) WITHOUT factoring the coupled (psi,u)
+  !> 2x2, via two separable solves of the Alfven pair:
+  !>   Predictor: t_psi = Atilde_11^-1 r_psi ; y_u = S_PBP^-1 (r_u - Atilde_21 t_psi)
+  !>   Corrector: y_psi = Atilde_11^-1 (r_psi - B_12 y_u)
+  !>   Transport: y_rho = B_55^-1(r_rho - B_51 y_psi - B_52 y_u)
+  !>              y_T   = B_66^-1(r_T   - Atilde_61 y_psi - B_62 y_u)
+  !> If physics_pc_multi_step_symmetric, a backward corrector applies the dropped
+  !> weak feedback K_alpha,beta = [[0,B_16],[B_25,B_26]] via the same segregated solves.
+  !> S_PBP = Atilde_22 - Atilde_21 Atilde_11^-1 B_12 is the element-assembled
+  !> parabolized momentum operator (ksp_S_PBP); all inner solves are MUMPS.
   !>
   !> Precondition: physics_pc_apply (the dispatcher) has already populated
   !>   g_ctx%work_1 = M_j^{-1} x_j   (temp_j)
@@ -250,85 +284,66 @@ contains
     Vec, intent(inout) :: y_psi, y_u, y_rho, y_T
     PetscErrorCode, intent(out) :: ierr
 
-    Vec :: rhs_u, rhs_rho, rhs_T
-    Vec :: sol_u, sol_T
+    ! Inputs from dispatcher: work_1 = temp_j = M_j^-1 x_j, work_2 = temp_w = M_w^-1 x_w.
+    ! work_1/work_2 are preserved until the last fold (the B_63*temp_j term in the T row).
 
-    ! --- Step 1: Hydro predictor — joint 3x3 M_hydro solve (u,rho,T) ---
-    ! b_u  = x_u - B_23*temp_j - B_24*temp_w
-    call MatMult(g_ctx%B_23, g_ctx%work_1, g_ctx%work_3, ierr)
-    call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
-    call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
-    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, ierr)
-    call VecGetSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(1), rhs_u, ierr)
-    call VecCopy(g_ctx%work_5, rhs_u, ierr)
-    call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(1), rhs_u, ierr)
+    ! --- Folded Alfven residuals: work_3 = r_psi, work_4 = r_u (scratch work_5) ---
+    call fold_alfven_residual(x_psi, x_u, g_ctx%work_3, g_ctx%work_4, g_ctx%work_5, ierr)
 
-    ! b_rho = x_rho
-    call VecGetSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(2), rhs_rho, ierr)
-    call VecCopy(x_rho, rhs_rho, ierr)
-    call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(2), rhs_rho, ierr)
+    ! --- Predictor: velocity from the parabolized momentum operator S_PBP ---
+    !   t_psi = Atilde_11^-1 * r_psi
+    call KSPSolve(g_ctx%ksp_psi, g_ctx%work_3, g_ctx%work_5, ierr)        ! work_5 = t_psi
+    !   rhs_u = r_u - Atilde_21 * t_psi   (use y_psi as scratch for Atilde_21*t_psi)
+    call MatMult(g_ctx%Atilde_21, g_ctx%work_5, y_psi, ierr)             ! y_psi = Atilde_21 t_psi
+    call VecWAXPY(y_u, -1.0d0, y_psi, g_ctx%work_4, ierr)                ! y_u = r_u - Atilde_21 t_psi
+    !   y_u = S_PBP^-1 rhs_u   (solve out-of-place into work_5, then copy)
+    call KSPSolve(g_ctx%ksp_S_PBP, y_u, g_ctx%work_5, ierr)             ! work_5 = velocity
+    call VecCopy(g_ctx%work_5, y_u, ierr)                               ! y_u = velocity
 
-    ! b_T = x_T - B_63*temp_j
-    call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
-    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
-    call VecGetSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(3), rhs_T, ierr)
-    call VecCopy(g_ctx%work_4, rhs_T, ierr)
-    call VecRestoreSubVector(g_ctx%work_rhs_3v, g_ctx%is_hydro(3), rhs_T, ierr)
+    ! --- Corrector: flux back-substitution  y_psi = Atilde_11^-1 (r_psi - B_12 y_u) ---
+    call MatMult(g_ctx%B_12, y_u, g_ctx%work_4, ierr)                   ! work_4 = B_12 y_u
+    call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, g_ctx%work_3, ierr) ! work_5 = r_psi - B_12 y_u
+    call KSPSolve(g_ctx%ksp_psi, g_ctx%work_5, y_psi, ierr)             ! y_psi = corrected flux
 
-    call KSPSolve(g_ctx%ksp_hydro, g_ctx%work_rhs_3v, g_ctx%hydro_predictor_3v, ierr)
-
-    ! Extract predicted velocity and temperature (rho_h unused: rho comes
-    ! from the Step 4 transport correction).
-    ! work_5 := u_pred, work_4 := T_pred (kept across Steps 2-3 as noted).
-    call VecGetSubVector(g_ctx%hydro_predictor_3v, g_ctx%is_hydro(1), sol_u, ierr)
-    call VecCopy(sol_u, g_ctx%work_5, ierr)
-    call VecRestoreSubVector(g_ctx%hydro_predictor_3v, g_ctx%is_hydro(1), sol_u, ierr)
-    call VecGetSubVector(g_ctx%hydro_predictor_3v, g_ctx%is_hydro(3), sol_T, ierr)
-    call VecCopy(sol_T, g_ctx%work_4, ierr)
-    call VecRestoreSubVector(g_ctx%hydro_predictor_3v, g_ctx%is_hydro(3), sol_T, ierr)
-
-    ! --- Step 2: Magnetic predictor — advect flux with predicted u, T ---
-    ! b_psi = x_psi - B_13*temp_j - B_12*u_pred - B_16*T_pred
-    call MatMult(g_ctx%B_13, g_ctx%work_1, g_ctx%work_3, ierr)
-    call VecWAXPY(y_psi, -1.0d0, g_ctx%work_3, x_psi, ierr)
-    call MatMult(g_ctx%B_12, g_ctx%work_5, g_ctx%work_3, ierr)
-    call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)
-    call MatMult(g_ctx%B_16, g_ctx%work_4, g_ctx%work_3, ierr)
-    call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)
-    call VecCopy(y_psi, g_ctx%work_3, ierr)
-    call KSPSolve(g_ctx%ksp_psi, g_ctx%work_3, y_psi, ierr)
-
-    ! --- Step 3: Alfven corrector — full block solve of S_PBP, bare RHS ---
-    ! r_u = x_u - B_23*temp_j - B_24*temp_w
-    call MatMult(g_ctx%B_23, g_ctx%work_1, g_ctx%work_3, ierr)
-    call MatMult(g_ctx%B_24, g_ctx%work_2, g_ctx%work_4, ierr)
-    call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_u, ierr)
-    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_4, ierr)
-    ! Add psi -> u Lorentz coupling so the corrector residual matches
-    ! the coupled (psi,u) block: r_u -= Atilde_21 * y_psi
-    call MatMult(g_ctx%Atilde_21, y_psi, g_ctx%work_3, ierr)
-    call VecAXPY (g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
-    call KSPSolve(g_ctx%ksp_S_PBP, g_ctx%work_5, y_u, ierr)
-
-    ! --- Step 4: Transport correction for rho and T ---
-    ! b_rho = x_rho - B_51*y_psi - B_52*y_u
+    ! --- Transport rho: y_rho = B_55^-1 (x_rho - B_51 y_psi - B_52 y_u) ---
     call MatMult(g_ctx%B_51, y_psi, g_ctx%work_3, ierr)
-    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_rho, ierr)
+    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_rho, ierr)      ! work_4 = x_rho - B_51 y_psi
     call MatMult(g_ctx%B_52, y_u, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
     call KSPSolve(g_ctx%ksp_rho, g_ctx%work_4, y_rho, ierr)
 
-    ! b_T = x_T - B_63*temp_j - B_61*y_psi - B_62*y_u
+    ! --- Transport T: r_T = x_T - B_63 temp_j; y_T = B_66^-1 (r_T - Atilde_61 y_psi - B_62 y_u) ---
     call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_3, ierr)
-    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
-    call MatMult(g_ctx%B_61, y_psi, g_ctx%work_3, ierr)
+    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)        ! work_4 = r_T
+    call MatMult(g_ctx%Atilde_61, y_psi, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
     call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
     call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, y_T, ierr)
 
-    ! y_psi, y_u, y_rho, y_T are now set; shared back-substitution below
-    ! recovers y_j, y_w from y_psi, y_u.
+    ! --- Optional backward corrector for the dropped weak feedback K_alpha,beta = [[0,B16],[B25,B26]] ---
+    ! Applied via the SAME segregated (Atilde_11, S_PBP) solves, NOT a joint 2x2.
+    ! Here temp_j/temp_w (work_1/work_2) are no longer needed, so they are reused as scratch.
+    if (physics_pc_multi_step_symmetric) then
+      ! c_psi = B_16 y_T   (work_3) ;  c_u = B_25 y_rho + B_26 y_T  (work_4)
+      call MatMult(g_ctx%B_16, y_T, g_ctx%work_3, ierr)
+      call MatMult(g_ctx%B_25, y_rho, g_ctx%work_4, ierr)
+      call MatMult(g_ctx%B_26, y_T,   g_ctx%work_1, ierr)
+      call VecAXPY(g_ctx%work_4, 1.0d0, g_ctx%work_1, ierr)            ! work_4 = c_u
+
+      ! d_u = S_PBP^-1 ( c_u - Atilde_21 Atilde_11^-1 c_psi )
+      call KSPSolve(g_ctx%ksp_psi, g_ctx%work_3, g_ctx%work_5, ierr)   ! work_5 = Atilde_11^-1 c_psi
+      call MatMult(g_ctx%Atilde_21, g_ctx%work_5, g_ctx%work_1, ierr)  ! work_1 = Atilde_21 (...)
+      call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_1, ierr)           ! work_4 = c_u - Atilde_21 (...)
+      call KSPSolve(g_ctx%ksp_S_PBP, g_ctx%work_4, g_ctx%work_1, ierr) ! work_1 = d_u
+      call VecAXPY(y_u, -1.0d0, g_ctx%work_1, ierr)                    ! y_u -= d_u
+
+      ! d_psi = Atilde_11^-1 ( c_psi - B_12 d_u )
+      call MatMult(g_ctx%B_12, g_ctx%work_1, g_ctx%work_2, ierr)       ! work_2 = B_12 d_u  (work_1 = d_u)
+      call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_2, g_ctx%work_3, ierr) ! work_4 = c_psi - B_12 d_u
+      call KSPSolve(g_ctx%ksp_psi, g_ctx%work_4, g_ctx%work_2, ierr)   ! work_2 = d_psi
+      call VecAXPY(y_psi, -1.0d0, g_ctx%work_2, ierr)                  ! y_psi -= d_psi
+    endif
 
     ierr = 0
   end subroutine apply_block_predictor_corrector
@@ -347,7 +362,8 @@ contains
   subroutine physics_pc_apply(pc_obj, x, y, ierr)
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
     use phys_module, only: physics_pc_monolithic, physics_pc_multi_step, &
-                           physics_pc_sub_blocks, physics_pc_sub_blocks_mode
+                           physics_pc_sub_blocks, physics_pc_sub_blocks_mode, &
+                           physics_pc_multi_step_symmetric
 
     PC :: pc_obj
     Vec :: x, y
