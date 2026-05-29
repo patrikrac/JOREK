@@ -280,6 +280,7 @@ contains
   !--------------------------------------------------------------------
   subroutine apply_block_predictor_corrector(x_psi, x_u, x_rho, x_T, &
                                              y_psi, y_u, y_rho, y_T, ierr)
+    use phys_module, only: physics_pc_multi_step_symmetric
     Vec, intent(in)    :: x_psi, x_u, x_rho, x_T
     Vec, intent(inout) :: y_psi, y_u, y_rho, y_T
     PetscErrorCode, intent(out) :: ierr
