@@ -55,13 +55,13 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   integer                           :: ife, ielm
   integer                           :: i_v(n_var)
   integer, allocatable              :: i_harm(:)
-  integer                           :: ierr
+  integer                           :: mpi_ierr
   integer                           :: omp_nthreads, omp_tid, n_tor_local
   integer                           :: my_ind_min, my_ind_max
   integer                           :: node_out(n_vertex_max)
   integer                           :: my_id
 #ifdef USE_PETSC
-  PetscErrorCode                    :: petsc_ierr
+  PetscErrorCode                    :: ierr
 #endif
   integer                           :: xcase2
   real*8                            :: R_axis
@@ -113,7 +113,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
       call petsc_create_matrix(a_mat%petsc_A, a_mat)
       a_mat%petsc_assembled = .true.
     else
-      call MatZeroEntries(a_mat%petsc_A, petsc_ierr)
+      PetscCallA(MatZeroEntries(a_mat%petsc_A, ierr))
     endif
   else
 #endif
@@ -200,8 +200,8 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 #ifdef USE_PETSC
     if (.not. harmonic_matrix) then
       ! Flush element contributions (ADD_VALUES) before BCs (INSERT_VALUES)
-      call MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
-      call MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+      PetscCallA(MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, ierr))
+      PetscCallA(MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, ierr))
     else
 #endif
     ! --- Memory tracking
@@ -211,11 +211,11 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 #endif
 
     ! --- Apply boundary conditions.
-if (.not. eliminate_boundary_dofs) then !TODO: This is trivially not true in all cases and needs to be treated more precisely
-    call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
-                            my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
-                            psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
-endif
+    if (.not. eliminate_boundary_dofs) then !TODO: This is trivially not true in all cases and needs to be treated more precisely
+      call boundary_conditions(my_id, node_list, element_list,  bnd_node_list,local_elms, n_local_elms,  &
+                              my_ind_min, my_ind_max, rhs_local, xpoint2, xcase2, R_axis, Z_axis,        & 
+                              psi_axis, psi_bnd, R_xpoint, Z_xpoint, psi_xpoint, a_mat)
+    endif
 
     if (fix_axis_nodes) then
       call fix_nodes_on_axis(node_list, element_list, local_elms, n_local_elms, my_ind_min, my_ind_max, a_mat)
@@ -226,8 +226,8 @@ endif
 #ifdef USE_PETSC
     if (.not. harmonic_matrix) then
       ! Flush BC contributions (INSERT_VALUES) before vacuum (ADD_VALUES)
-      call MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
-      call MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, petsc_ierr)
+      PetscCallA(MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, ierr))
+      PetscCallA(MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, ierr))
     else
 #endif
     ! --- Memory tracking
@@ -245,8 +245,10 @@ endif
 #ifdef USE_PETSC
     if (.not. harmonic_matrix) then
       ! Final assembly of PETSc matrix
-      call MatAssemblyBegin(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, petsc_ierr)
-      call MatAssemblyEnd(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, petsc_ierr)
+      PetscCallA(MatAssemblyBegin(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, ierr))
+      PetscCallA(MatAssemblyEnd(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, ierr))
+
+      !call MatSetOption(a_mat%petsc_A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
     endif
 #endif
 
@@ -262,7 +264,7 @@ endif
     endif
     
   ! --- Collect the right-hand side vector from all processes 
-  call MPI_AllReduce(RHS_local,rhs_vec%val,a_mat%ng,MPI_DOUBLE_PRECISION,MPI_SUM,a_mat%comm,ierr)
+  call MPI_AllReduce(RHS_local,rhs_vec%val,a_mat%ng,MPI_DOUBLE_PRECISION,MPI_SUM,a_mat%comm,mpi_ierr)
   rhs_vec%n  = a_mat%ng
 
   ! --- Check if the matrix is distributed correctly
@@ -470,6 +472,7 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
   n_tor_local = a_mat%i_tor_max - a_mat%i_tor_min + 1
 
   if (eliminate_boundary_dofs) then
+    elm_diagonal_average = 0.d0
     nnz_counter = 0
     do i = 1, n_vertex_max
       do i_order = 1, n_degrees
@@ -712,7 +715,7 @@ subroutine add_block_to_petsc(index_node1, i, i_order, i_bnd, i_bnd_type, &
   integer :: block_size
 
   PetscInt :: idxm_petsc(1), idxn_petsc(1)
-  PetscErrorCode :: petsc_ierr
+  PetscErrorCode :: ierr
 
   block_size = n_var * n_tor_local
 
@@ -766,8 +769,8 @@ subroutine add_block_to_petsc(index_node1, i, i_order, i_bnd, i_bnd_type, &
       idxm_petsc(1) = index_node1 - 1  ! 0-based block row
       idxn_petsc(1) = index_node2 - 1  ! 0-based block col
       !$omp critical
-      call MatSetValuesBlocked(a_mat%petsc_A, 1, idxm_petsc, 1, idxn_petsc, &
-                               thread_struct(omp_tid)%synch_buff, ADD_VALUES, petsc_ierr)
+      PetscCallA(MatSetValuesBlocked(a_mat%petsc_A, 1, idxm_petsc, 1, idxn_petsc, &
+                               thread_struct(omp_tid)%synch_buff, ADD_VALUES, ierr))
       !$omp end critical
 
     enddo ! n_degrees
