@@ -53,13 +53,16 @@ contains
 
   subroutine petsc_print_version()
     PetscErrorCode :: ierr
+    integer :: my_id, mpierr
     character(len=256) :: version_string
-
     call PetscGetVersion(version_string, ierr)
     if (ierr == 0) then
-      print *, "----------------------------------------"
-      print *, "JOREK linked with ", trim(version_string)
-      print *, "----------------------------------------"
+      call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, mpierr)
+      if (my_id == 0) then
+        print *, "----------------------------------------"
+        print *, "JOREK linked with ", trim(version_string)
+        print *, "----------------------------------------"
+      end if
     end if
   end subroutine petsc_print_version
 

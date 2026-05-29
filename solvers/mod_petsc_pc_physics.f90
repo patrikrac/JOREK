@@ -11,18 +11,17 @@ module mod_petsc_pc_physics
        compute_schur_corrected_block_u, compute_schur_corrected_block_21, &
        compute_schur_corrected_block_61, compute_schur_corrected_block_exact, &
        compute_explicit_preconditioned_matrix, &
-       setup_block_ksp, setup_block_ksp_amg_krylov, &
+       setup_block_ksp, setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
        assemble_monolithic_4x4, assemble_probed_exact_4x4
   use mod_petsc_pc_physics_element, only: &
        petsc_create_pc_matrices, petsc_assemble_pc_matrices, &
        petsc_assemble_pc_diagonal_matrices, petsc_update_physics_pc_ctx, &
-       petsc_analyze_pc_matrices, petsc_test_pc_matrices, petsc_test_pc_matrix
+       petsc_test_pc_matrix
   use mod_petsc_pc_physics_apply, only: physics_pc_apply
   implicit none
   private
   public :: petsc_setup_physics_pc, petsc_create_pc_matrices, &
             petsc_assemble_pc_matrices, petsc_update_physics_pc_ctx, &
-            petsc_analyze_pc_matrices, petsc_test_pc_matrices, &
             petsc_physics_pc_build_reduced
 
 contains
@@ -68,6 +67,7 @@ contains
     Mat :: prod_tmp                              ! temporary for block-inverse diagnostic
     
     Mat :: B_tmp ! Store the preconditioned matrix B = M^{-1} A 
+    PetscViewer :: viewer
     !Mat :: A_eq
     !Vec :: dr, dc
 
@@ -286,9 +286,10 @@ contains
       ! call petsc_test_pc_matrix(g_ctx%Atilde_11, "Atilde_11", .false., my_id)
       ! call petsc_test_pc_matrix(g_ctx%Atilde_22, "Atilde_22", .false., my_id)
 
-       call petsc_test_pc_matrix(g_ctx%S_PBP, "S_PBP", .false., my_id)
-       !call petsc_test_pc_matrix(g_ctx%S_u, "S_u", .false., my_id)
+      !call petsc_test_pc_matrix(g_ctx%S_PBP, "S_PBP", .false., my_id)
+      !call petsc_test_pc_matrix(g_ctx%S_u, "S_u", .false., my_id)
 
+      call petsc_test_pc_matrix(g_ctx%B_55, "B_55", .false., my_id)
       call petsc_test_pc_matrix(g_ctx%B_66, "B_66", .false., my_id)
 
       ! ! --- Compute block spectra for diagnostics ---
@@ -368,6 +369,14 @@ contains
         mats_nest_B(4) = g_ctx%B_66
         call MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, &
                            mats_nest_B, g_ctx%K_B_block, ierr)
+
+        ! call PetscViewerBinaryOpen(PETSC_COMM_WORLD, "A_rho_matrix.dat", FILE_MODE_WRITE, viewer, ierr)
+        ! call MatView(g_ctx%B_55, viewer, ierr)
+        ! call PetscViewerDestroy(viewer, ierr)
+
+        ! call PetscViewerBinaryOpen(PETSC_COMM_WORLD, "A_p_matrix.dat", FILE_MODE_WRITE, viewer, ierr)
+        ! call MatView(g_ctx%B_66, viewer, ierr)
+        ! call PetscViewerDestroy(viewer, ierr)
       end block
 
       ! Convert each MatNest to MPIAIJ for MUMPS factorization.
@@ -377,7 +386,7 @@ contains
 
       ! Set up the two KSPs (PREONLY + LU + MUMPS) via the existing helper
       call setup_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time)
-      call setup_block_ksp_amg_krylov(g_ctx%ksp_block_B, g_ctx%K_B_aij, comm, first_time, 5)
+      call setup_block_ksp_hypre_amg_krylov(g_ctx%ksp_block_B, g_ctx%K_B_aij, comm, first_time, 3)
 
       ! Allocate packed work vectors (size matches each AIJ super-block)
       if (.not. g_ctx%sub_blocks_setup_done) then

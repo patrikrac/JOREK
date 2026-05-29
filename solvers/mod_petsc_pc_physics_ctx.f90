@@ -17,6 +17,7 @@ module mod_petsc_pc_physics_ctx
     logical :: reduced_ready  = .false.
     integer :: comm           = -1
     !> 1-var BAIJ matrices from separate element-level assembly
+    ! TODO: The following matrices are unused and depriciated!
     Mat :: A_j, A_w, A_jpsi, A_wu
 
     !> Index sets for each variable in the full system vector (1=psi..6=T)

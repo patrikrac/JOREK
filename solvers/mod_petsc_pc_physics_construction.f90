@@ -19,7 +19,7 @@ module mod_petsc_pc_physics_construction
   public :: compute_schur_corrected_block_exact
   public :: compute_explicit_preconditioned_matrix
   public :: setup_block_ksp
-  public :: setup_block_ksp_amg_krylov
+  public :: setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov
   public :: assemble_monolithic_4x4
   public :: assemble_probed_exact_4x4
 
@@ -873,6 +873,73 @@ contains
     call KSPSetUp(ksp_block, ierr)
     
   end subroutine setup_block_ksp_amg_krylov
+
+  subroutine setup_block_ksp_hypre_amg_krylov(ksp_block, B_block, comm, first_time, max_its)
+    implicit none
+
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+    integer, intent(in) :: max_its      ! Pass in 3 to 10
+
+    PC :: pc
+    MatNullSpace :: nullsp
+    PetscErrorCode :: ierr
+    PetscReal :: rtol, abstol, dtol
+
+    if (first_time) then
+      call KSPCreate(comm, ksp_block, ierr)
+    endif
+    
+    call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+    
+    ! Set options prefix to match the hmg_ configuration
+    call KSPSetOptionsPrefix(ksp_block, "hmg_", ierr)
+
+    ! 1. Choose a lightweight Krylov solver
+    call KSPSetType(ksp_block, KSPGMRES, ierr)
+    
+    ! Keep memory footprint tiny
+    call KSPGMRESSetRestart(ksp_block, max_its, ierr)
+    
+    ! 2. Set tolerances and max iterations
+    rtol   = 1.0d-2  
+    abstol = 1.0d-50 
+    dtol   = 1.0d4   
+    call KSPSetTolerances(ksp_block, rtol, abstol, dtol, max_its, ierr)
+    
+    ! 3. Set the Preconditioner to Hypre BoomerAMG
+    call KSPGetPC(ksp_block, pc, ierr)
+    call PCSetType(pc, PCHYPRE, ierr)
+    call PCHYPRESetType(pc, "boomeramg", ierr)
+
+    ! Set Near Null Space on the operator
+    call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
+    call MatSetNearNullSpace(B_block, nullsp, ierr)
+    call MatNullSpaceDestroy(nullsp, ierr)
+
+    ! 4. Set Hypre options via the PETSc options database
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_coarsen_type", "HMIS", ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_nodal_coarsen", "6", ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_truncfactor", "0.3", ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_P_max", "4", ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_strong_threshold", "0.5", ierr)
+
+    ! Smoothers
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_smooth_num_levels", "1", ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_smooth_type", "Euclid", ierr)
+    !call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_euclid_levels", "1", ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_relax_type_all", "Chebyshev", ierr)
+    !call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-hmg_pc_hypre_boomeramg_min_iter", "250", ierr)
+
+    ! Apply the options database changes to this KSP instance
+    call KSPSetFromOptions(ksp_block, ierr)
+    
+    call KSPSetUp(ksp_block, ierr)
+    
+  end subroutine setup_block_ksp_hypre_amg_krylov
+
   !--------------------------------------------------------------------
   !> Assemble the monolithic 4x4 reduced system via MatCreateNest +
   !! MatConvert, and set up a single KSP (PREONLY+LU+MUMPS).

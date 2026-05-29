@@ -10,9 +10,7 @@ module mod_petsc_pc_physics_element
   public :: petsc_create_pc_matrices
   public :: petsc_assemble_pc_matrices
   public :: petsc_assemble_pc_diagonal_matrices
-  public :: petsc_update_physics_pc_ctx
-  public :: petsc_analyze_pc_matrices
-  public :: petsc_test_pc_matrices
+  public :: petsc_update_physics_pc_ctx 
   public :: petsc_test_pc_matrix
 
 contains
@@ -77,10 +75,10 @@ contains
     type(type_SP_MATRIX), intent(in) :: a_mat
 
     g_ctx%comm = a_mat%comm
-    call petsc_create_pc_matrix(g_ctx%A_j,    a_mat, 1)
-    call petsc_create_pc_matrix(g_ctx%A_w,    a_mat, 1)
-    call petsc_create_pc_matrix(g_ctx%A_jpsi, a_mat, 1)
-    call petsc_create_pc_matrix(g_ctx%A_wu,   a_mat, 1)
+    !call petsc_create_pc_matrix(g_ctx%A_j,    a_mat, 1)
+    !call petsc_create_pc_matrix(g_ctx%A_w,    a_mat, 1)
+    !call petsc_create_pc_matrix(g_ctx%A_jpsi, a_mat, 1)
+    !call petsc_create_pc_matrix(g_ctx%A_wu,   a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%K_psi_correction, a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%K_u_correction, a_mat, 1)
     call petsc_create_pc_matrix(g_ctx%K_21_correction,  a_mat, 1)
@@ -109,20 +107,20 @@ contains
     if (first_assembly) then
       call petsc_create_pc_matrices(a_mat)
     else
-      PetscCallA(MatZeroEntries(g_ctx%A_j,    ierr))
-      PetscCallA(MatZeroEntries(g_ctx%A_w,    ierr))
-      PetscCallA(MatZeroEntries(g_ctx%A_jpsi, ierr))
-      PetscCallA(MatZeroEntries(g_ctx%A_wu,   ierr))
-      PetscCallA(MatZeroEntries(g_ctx%K_psi_correction, ierr))
-      PetscCallA(MatZeroEntries(g_ctx%K_u_correction, ierr))
-      PetscCallA(MatZeroEntries(g_ctx%K_21_correction,  ierr))
-      PetscCallA(MatZeroEntries(g_ctx%K_61_correction,  ierr))
-      PetscCallA(MatZeroEntries(g_ctx%S_PBP,  ierr))
+      ! PetscCallA(MatDestroy(g_ctx%A_j,    ierr))
+      ! PetscCallA(MatDestroy(g_ctx%A_w,    ierr))
+      ! PetscCallA(MatDestroy(g_ctx%A_jpsi, ierr))
+      ! PetscCallA(MatDestroy(g_ctx%A_wu,   ierr))
+      PetscCallA(MatDestroy(g_ctx%K_psi_correction, ierr))
+      PetscCallA(MatDestroy(g_ctx%K_u_correction, ierr))
+      PetscCallA(MatDestroy(g_ctx%K_21_correction,  ierr))
+      PetscCallA(MatDestroy(g_ctx%K_61_correction,  ierr))
+      PetscCallA(MatDestroy(g_ctx%S_PBP,  ierr))
+      call petsc_create_pc_matrices(a_mat)
     endif
 
-    call construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat, &
-                                        g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
-    g_ctx%matrices_ready = .true.
+    !call construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat, &
+    !                                    g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
 
     call construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
                                         g_ctx%K_psi_correction, g_ctx%K_u_correction, &
@@ -131,11 +129,7 @@ contains
     g_ctx%u_correction_ready    = .true.
     g_ctx%correction_21_ready   = .true.
     g_ctx%correction_61_ready   = .true.
-
-    if (first_assembly .and. debug_physics_pc) then
-      !call petsc_analyze_pc_matrices(my_id)
-      !call petsc_test_pc_matrices(my_id)
-    endif
+    g_ctx%matrices_ready = .true.
   end subroutine petsc_assemble_pc_matrices
 
 
@@ -255,83 +249,6 @@ contains
   end subroutine petsc_update_physics_pc_ctx
 
 
-  !> Print structural info and norms for the elliptic PC sub-matrices.
-  subroutine petsc_analyze_pc_matrices(my_id)
-    use mod_petsc_matrix_analysis
-
-    integer, intent(in) :: my_id
-    PetscReal :: diff_norm
-#ifdef USE_SLEPC
-    PetscReal :: kappa
-#endif
-
-    if (my_id == 0) write(*,'(A)') &
-      "=== PC matrix analysis ================================="
-
-    call petsc_mat_print_info(g_ctx%A_j,    "A_j")
-    call petsc_mat_print_info(g_ctx%A_w,    "A_w")
-    call petsc_mat_print_info(g_ctx%A_jpsi, "A_jpsi")
-    call petsc_mat_print_info(g_ctx%A_wu,   "A_wu")
-
-    call petsc_mat_norms(g_ctx%A_j,    "A_j")
-    call petsc_mat_norms(g_ctx%A_w,    "A_w")
-    call petsc_mat_norms(g_ctx%A_jpsi, "A_jpsi")
-    call petsc_mat_norms(g_ctx%A_wu,   "A_wu")
-
-    call petsc_mat_diff_norm(g_ctx%A_j, g_ctx%A_w, "A_j vs A_w", diff_norm)
-
-#ifdef USE_SLEPC
-    !call petsc_mat_cond_estimate(g_ctx%A_j, kappa)
-    !if (my_id == 0 .and. kappa > 0.0d0) write(*,'(A,ES12.4)') "[PC] cond(A_j) = ", kappa
-    !call petsc_mat_cond_estimate(g_ctx%A_w, kappa)
-    !if (my_id == 0 .and. kappa > 0.0d0) write(*,'(A,ES12.4)') "[PC] cond(A_w) = ", kappa
-
-    !call petsc_mat_full_spectrum(g_ctx%A_j,    "A_j",    0, symmetric=.true.)
-    !call petsc_mat_full_spectrum(g_ctx%A_w,    "A_w",    0, symmetric=.true.)
-    !call petsc_mat_full_spectrum(g_ctx%A_jpsi, "A_jpsi", 0, symmetric=.false.)
-    !call petsc_mat_full_spectrum(g_ctx%A_wu,   "A_wu",   0, symmetric=.false.)
-#endif
-
-    if (my_id == 0) write(*,'(A)') &
-      "========================================================"
-  end subroutine petsc_analyze_pc_matrices
-
-
-  !> Run manufactured-solution solver tests on the elliptic PC sub-matrices.
-  !!
-  !! Computes n_axis_dofs by scanning node_list for axis nodes and finding
-  !! the highest block index they own.  Axis nodes sit at the front of the
-  !! global DOF ordering; the scalar row boundary is max_axis_block * n_tor.
-  !! Fieldsplit tests are added when n_axis_dofs > 0.
-  subroutine petsc_test_pc_matrices(my_id)
-    use mod_petsc_matrix_tests
-    use mod_parameters, only: n_tor, n_degrees
-    use nodes_elements
-
-    integer, intent(in) :: my_id
-
-    integer :: inode, i_order, mpierr
-    integer :: max_axis_blk_local, max_axis_blk_global, n_axis_dofs
-
-    ! Find the largest block index assigned to any axis node on this rank.
-    max_axis_blk_local = 0
-    do inode = 1, node_list%n_nodes
-      if (.not. node_list%node(inode)%axis_node) cycle
-      do i_order = 1, n_degrees
-        if (node_list%node(inode)%index(i_order) > max_axis_blk_local) &
-          max_axis_blk_local = node_list%node(inode)%index(i_order)
-      end do
-    end do
-    call MPI_Allreduce(max_axis_blk_local, max_axis_blk_global, 1, &
-                       MPI_INTEGER, MPI_MAX, g_ctx%comm, mpierr)
-    ! Each block index corresponds to n_tor scalar rows in A_j
-    ! (construct_pc_matrix_mod.f90 uses bs1 = n_tor, assuming n_tor_local = n_tor).
-    n_axis_dofs = max_axis_blk_global * n_tor
-
-    call petsc_run_matrix_tests(my_id, g_ctx%comm, &
-                                 g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu, &
-                                 n_axis_dofs)
-  end subroutine petsc_test_pc_matrices
 
     subroutine petsc_test_pc_matrix(A, mat_name, symmetric, my_id)
     use mod_petsc_matrix_tests
