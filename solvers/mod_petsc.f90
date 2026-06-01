@@ -389,16 +389,10 @@ contains
     PC :: pc ! Maybe should be part of petsc_sys in the future
     PetscViewerAndFormat :: vf
     KSPConvergedReason :: reason
-    Mat :: A_aij, F
-    Vec :: b_aij, x_aij
     KSPType :: ksp_type
 
     PetscCallA(PetscObjectGetComm(petsc_sys%A, comm, ierr))
     call MPI_COMM_RANK(comm, my_id, mpierr)
-
-    !PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
-    !PetscCallA(MatCreateVecs(A_aij, x_aij, b_aij, ierr))
-    !PetscCallA(VecCopy(petsc_sys%b, b_aij, ierr))
 
     PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
     PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A, petsc_sys%A, ierr))
@@ -406,52 +400,23 @@ contains
     PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
     PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
 
-    ! PetscCallA(KSPSetType(petsc_sys%ksp, KSPDGMRES, ierr))
     PetscCallA(KSPSetType(petsc_sys%ksp, KSPPREONLY, ierr))
-    !PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
     ! Set the preconditioner
     PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
-    ! --- Additive Schwarz
-    !PetscCallA(PCSetType(pc, PCASM, ierr)) ! Set additive Schwarz method
-    !PetscCallA(PCASMSetTotalSubdomains(pc, 5, PETSC_NULL_IS, PETSC_NULL_IS, ierr))
-    !PetscCallA(PCASMSetOverlap(pc, 2, ierr))
-    !PetscCallA(PCASMSetType(pc, PC_ASM_BASIC, ierr)) ! Set type of restriction/interpolation
-    ! --- AMG
-    !PetscCallA(PCSetType(pc, PCGAMG, ierr))
-    !PetscCallA(PCGAMGSetThreshold(pc, [0.1], 1, ierr))
-    !PetscCallA(PCGAMGSetAggressiveLevels(pc, 1, ierr))
     ! --- LU
     PetscCallA(PCSetType(pc, PCLU, ierr))
     PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
 
-    !PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
-
-    PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
-
-    PetscCallA(PCFactorSetMatOrderingType(pc,MATORDERINGND,ierr))
-    PetscCallA(PCFactorGetMatrix(pc, F, ierr))
-    PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))  ! fill-reducing ordering
-    PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))  ! workspace expansion %
-    PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))  ! numerical scaling (auto)
-    PetscCallA(MatMumpsSetIcntl(F, 21, 1, ierr))
-
     PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+    petsc_sys%ksp_ready = .true.
 
     PetscCallA(KSPGetType(petsc_sys%ksp, ksp_type, ierr))
     if (my_id == 0) print *, "KSP type:", ksp_type
 
-    ! Set the maximum iterations of the linear system
-    PetscCallA(KSPSetTolerances(petsc_sys%ksp, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, 400, ierr))
-    PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
-
     if (my_id .eq. 0) print *, "Solving the system using PETSc"
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b, petsc_sys%x, ierr))
     PetscCallA(KSPDestroy(petsc_sys%ksp, ierr))
-    !PetscCallA(MatDestroy(A_aij, ierr))
-    !PetscCallA(VecCopy(x_aij, petsc_sys%x, ierr))
-    !PetscCallA(VecDestroy(b_aij, ierr))
-    !PetscCallA(VecDestroy(x_aij, ierr))
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
@@ -614,9 +579,9 @@ contains
     n_global = a_mat%ng
     n_local  = a_mat%ng   ! Phase 1: serial COMM_SELF -> local == global
 
-    call MatCreate(comm, petsc_sys%A, ierr)
-    call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
-    call MatSetType(petsc_sys%A, MATAIJ, ierr)
+    PetscCallA(MatCreate(comm, petsc_sys%A, ierr))
+    PetscCallA(MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr))
+    PetscCallA(MatSetType(petsc_sys%A, MATAIJ, ierr))
 
     ! Per-row nonzero count (overestimate: duplicates counted separately, safe)
     allocate(d_nnz(n_global))
@@ -625,21 +590,21 @@ contains
       r = a_mat%irn(k)
       d_nnz(r) = d_nnz(r) + 1
     enddo
-    call MatSeqAIJSetPreallocation(petsc_sys%A, 0, d_nnz, ierr)
+    PetscCallA(MatSeqAIJSetPreallocation(petsc_sys%A, 0, d_nnz, ierr))
     deallocate(d_nnz)
 
     ! Tolerate any preallocation underestimate rather than aborting
-    call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    PetscCallA(MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr))
 
     do k = 1, a_mat%nnz
       row(1) = a_mat%irn(k) - 1
       col(1) = a_mat%jcn(k) - 1
       v(1)   = a_mat%val(k)
-      call MatSetValues(petsc_sys%A, 1, row, 1, col, v, ADD_VALUES, ierr)
+      PetscCallA(MatSetValues(petsc_sys%A, 1, row, 1, col, v, ADD_VALUES, ierr))
     enddo
 
-    call MatAssemblyBegin(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
-    call MatAssemblyEnd(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
+    PetscCallA(MatAssemblyBegin(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr))
+    PetscCallA(MatAssemblyEnd(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr))
 
     call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
 
