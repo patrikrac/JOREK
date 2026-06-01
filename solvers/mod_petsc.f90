@@ -591,6 +591,98 @@ contains
   end subroutine petsc_recover_solution
 
 
+  !> Assemble a scalar MATAIJ equilibrium matrix directly from JOREK COO
+  !! triplets (a_mat%irn/jcn/val, 1-based, with duplicate entries).
+  !! ADD_VALUES sums duplicates natively — no sort/dedup needed.
+  subroutine petsc_equilibrium_assemble(petsc_sys, a_mat)
+    use data_structure, only: type_SP_MATRIX
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_SP_MATRIX), intent(in)       :: a_mat
+
+    integer :: k, r
+    integer :: comm, my_id, mpierr
+    PetscInt :: n_global, n_local
+    PetscInt :: row(1), col(1)
+    PetscScalar :: v(1)
+    PetscInt, allocatable :: d_nnz(:)
+    PetscErrorCode :: ierr
+
+    comm = a_mat%comm
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    n_global = a_mat%ng
+    n_local  = a_mat%ng   ! Phase 1: serial COMM_SELF -> local == global
+
+    call MatCreate(comm, petsc_sys%A, ierr)
+    call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
+    call MatSetType(petsc_sys%A, MATAIJ, ierr)
+
+    ! Per-row nonzero count (overestimate: duplicates counted separately, safe)
+    allocate(d_nnz(n_global))
+    d_nnz = 0
+    do k = 1, a_mat%nnz
+      r = a_mat%irn(k)
+      d_nnz(r) = d_nnz(r) + 1
+    enddo
+    call MatSeqAIJSetPreallocation(petsc_sys%A, 0, d_nnz, ierr)
+    deallocate(d_nnz)
+
+    ! Tolerate any preallocation underestimate rather than aborting
+    call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+
+    do k = 1, a_mat%nnz
+      row(1) = a_mat%irn(k) - 1
+      col(1) = a_mat%jcn(k) - 1
+      v(1)   = a_mat%val(k)
+      call MatSetValues(petsc_sys%A, 1, row, 1, col, v, ADD_VALUES, ierr)
+    enddo
+
+    call MatAssemblyBegin(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
+
+    call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
+
+    petsc_sys%initialized = .true.
+    petsc_sys%owns_A       = .true.
+    if (my_id .eq. 0) write(*,'(A,I0,A,I0)') &
+      "[PETSc] equilibrium: AIJ matrix ", n_global, "x", n_global
+  end subroutine petsc_equilibrium_assemble
+
+
+  !> Fill the equilibrium RHS: rank 0 sets all global entries, assembly scatters.
+  !! Works for serial (COMM_SELF) and distributed (COMM_WORLD) equilibrium solves.
+  subroutine petsc_equilibrium_rhs(petsc_sys, rhs_vec)
+    use data_structure, only: type_RHS
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_RHS), intent(in)             :: rhs_vec
+
+    integer :: i, comm, my_id, mpierr
+    PetscInt :: ng
+    PetscInt, allocatable :: idx(:)
+    PetscErrorCode :: ierr
+
+    call PetscObjectGetComm(petsc_sys%b, comm, ierr)
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    call VecSet(petsc_sys%b, 0.0d0, ierr)
+
+    if (my_id .eq. 0) then
+      ng = rhs_vec%n
+      allocate(idx(ng))
+      do i = 1, ng
+        idx(i) = i - 1
+      enddo
+      call VecSetValues(petsc_sys%b, ng, idx, rhs_vec%val(1:ng), INSERT_VALUES, ierr)
+      deallocate(idx)
+    endif
+
+    call VecAssemblyBegin(petsc_sys%b, ierr)
+    call VecAssemblyEnd(petsc_sys%b, ierr)
+  end subroutine petsc_equilibrium_rhs
+
+
   !> Destroy all persistent PETSc objects; safe to call even if never initialized.
   !! petsc_sys%A is only destroyed if owns_A=.true. (old path via petsc_init_system).
   !! In the direct assembly path, A is owned by a_mat%petsc_A.

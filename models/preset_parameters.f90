@@ -662,8 +662,9 @@ subroutine preset_parameters
   
   use_mumps_eq       = .false.              ! Use MUMPS equilibrium solver
   use_pastix_eq      = .false.              ! Use PASTIX equilibrium solver
-  use_strumpack_eq   = .false.              ! Use STRUMPACK equilibrium olver  
-  
+  use_strumpack_eq   = .false.              ! Use STRUMPACK equilibrium olver
+  use_petsc_eq       = .false.              ! Use PETSc equilibrium solver
+
   use_mumps_prj      = .true.               ! Use MUMPS projection solver
   use_pastix_prj     = .false.              ! Use PASTIX projection solver
   use_strumpack_prj  = .false.              ! Use STRUMPACK projection olver  

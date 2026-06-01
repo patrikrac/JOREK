@@ -118,7 +118,7 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
   integer :: ierr, i
   integer, intent(in) :: my_id, n_cpu
   integer :: nsolvers=0
-  logical :: solvers(4), solvers_eq(3)
+  logical :: solvers(4), solvers_eq(4)
   integer :: mpi_required, mpi_provided
 
   ! WARNING for axis treatment
@@ -209,7 +209,15 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
     stop
  endif
 #endif
-  
+
+#ifndef USE_PETSC
+  if (use_petsc_eq) then
+     write(*,*) ' FATAL : use_petsc_eq requires JOREK compiled with USE_PETSC = 1 in Makefile.inc'
+     call MPI_Abort(MPI_COMM_WORLD, 3, ierr)
+     stop
+  endif
+#endif
+
   ! --- Check solver consistency
 #ifdef USE_PETSC
   if (.not. gmres) then
@@ -234,7 +242,7 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
 #endif
  
 #ifndef USE_PETSC
-  solvers_eq = (/use_mumps_eq,use_pastix_eq,use_strumpack_eq/)
+  solvers_eq = (/use_mumps_eq,use_pastix_eq,use_strumpack_eq,use_petsc_eq/)
   nsolvers = 0
   do i=1,size(solvers_eq)
     if (solvers_eq(i)) nsolvers = nsolvers + 1

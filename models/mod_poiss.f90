@@ -727,6 +727,8 @@ if (my_id == 0) then
 
   solver%equilibrium = .true.
   solver%verbose = .false.
+  ! NOTE: when use_petsc_eq is set, solve_sparse_system intercepts the
+  ! equilibrium solve before this library selection is consulted.
   if (use_strumpack_eq) then
     solver%library = strumpack
   elseif (use_mumps_eq) then

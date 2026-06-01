@@ -73,7 +73,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 rho_file, T_file, ffprime_file, Fprofile_file,      &
                 bc_natural_open, bc_natural_flux, gamma_sheath,     &
                 freeboundary, resistive_wall, freeb_change_indices, &
-                use_mumps_eq, use_pastix_eq, use_strumpack_eq,      &
+                use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering, use_strumpack,           &
                 use_BLR_compression, epsilon_BLR, just_in_time_BLR, &

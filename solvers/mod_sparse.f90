@@ -17,7 +17,7 @@ module mod_sparse
     use mod_simulation_data, only: type_MHD_SIM
     use mod_sparse_data, only: type_SP_SOLVER, mumps, pastix, strumpack
     use mod_preconditioner, only: initialize_preconditioner, reset_preconditioner, update_pc_rhs, gather_solution
-    use phys_module, only: use_matrix_equilibration
+    use phys_module, only: use_matrix_equilibration, use_petsc_eq
     use mod_matrix_equilibration, only: matrix_equilibration, scale_vector_row, scale_vector_column, scale_vector_column_inverse
     use mod_cond_estimator, only: estimate_condition_number, estimate_condition_number_2
 #ifdef DIRECT_CONSTRUCTION
@@ -46,7 +46,8 @@ module mod_sparse
     use petsc
     use mod_petsc, only: petsc_init_system, petsc_update_matrix, petsc_update_rhs, &
                          petsc_solve_iterative_and_retrieve, petsc_recover_solution, &
-                         petsc_solve_and_retrieve
+                         petsc_solve_and_retrieve, petsc_equilibrium_assemble, &
+                         petsc_equilibrium_rhs, petsc_cleanup
 #endif
 
     implicit none
@@ -116,6 +117,18 @@ module mod_sparse
 
       petsc_direct_solved = .false.
 #ifdef USE_PETSC
+      if (solver%equilibrium .and. use_petsc_eq) then
+        ! --- Equilibrium (Grad-Shafranov) via scalar MATAIJ + LU/MUMPS.
+        !     Raw COO with duplicate entries -> ADD_VALUES sums them.
+        call petsc_equilibrium_assemble(solver%petsc_sys, a_mat)
+        call petsc_equilibrium_rhs(solver%petsc_sys, rhs_vec)
+        call petsc_solve_and_retrieve(solver%petsc_sys)
+        call petsc_recover_solution(solver%petsc_sys, sol_vec)
+        call petsc_cleanup(solver%petsc_sys)   ! structure changes each Picard/Newton iteration
+        solver%step_success = .true.
+        petsc_direct_solved = .true.
+      else if (.not. a_mat%petsc_assembled) then
+#else
       if (.not. a_mat%petsc_assembled) then
 #endif
       if (solver%library.eq.mumps) then
@@ -146,8 +159,8 @@ module mod_sparse
         call solve_pastix_all(solver%ptss, a_mat, rhs_vec, solver%solve_only, tag)
 #endif
       endif
+      endif   ! equilibrium-petsc / .not. a_mat%petsc_assembled
 #ifdef USE_PETSC
-      endif   ! .not. a_mat%petsc_assembled
 
       if (a_mat%petsc_assembled) then
         ! Matrix in PETSc format — irn/jcn/val not available; use PETSc direct solver
@@ -158,20 +171,6 @@ module mod_sparse
         else
           solver%petsc_sys%A = a_mat%petsc_A
         endif
-        call petsc_update_rhs(solver%petsc_sys, rhs_vec)
-        call petsc_solve_and_retrieve(solver%petsc_sys)
-        call petsc_recover_solution(solver%petsc_sys, sol_vec)
-        solver%step_success = .true.
-        petsc_direct_solved = .true.
-      elseif (solver%equilibrium) then
-        !TODO: Not working, set_block_csr_permutation fails, why?
-        if (.not. solver%petsc_sys%initialized) then
-          if (.not. a_mat%bcsr_mapped) then
-            call set_block_csr_permutations(a_mat)
-          endif
-          call petsc_init_system(solver%petsc_sys, a_mat)
-        endif
-        call petsc_update_matrix(solver%petsc_sys, a_mat)
         call petsc_update_rhs(solver%petsc_sys, rhs_vec)
         call petsc_solve_and_retrieve(solver%petsc_sys)
         call petsc_recover_solution(solver%petsc_sys, sol_vec)
