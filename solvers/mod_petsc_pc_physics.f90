@@ -12,7 +12,8 @@ module mod_petsc_pc_physics
        compute_schur_corrected_block_61, compute_schur_corrected_block_exact, &
        compute_explicit_preconditioned_matrix, &
        setup_block_ksp, setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
-       assemble_monolithic_4x4, assemble_probed_exact_4x4
+       assemble_monolithic_4x4, assemble_probed_exact_4x4, &
+       verify_alfven_2x2_segregated
   use mod_petsc_pc_physics_element, only: &
        petsc_create_pc_matrices, petsc_assemble_pc_matrices, &
        petsc_assemble_pc_diagonal_matrices, petsc_update_physics_pc_ctx, &
@@ -276,8 +277,11 @@ contains
     call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
     if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
 
-    ! Compute exact S_u = Atilde_22 - Atilde_21 * Atilde_11^{-1} * Atilde_12 for diagnostics (not used in PC apply)
-    !call compute_schur_corrected_block_exact(g_ctx%Atilde_11, g_ctx%Atilde_22, g_ctx%Atilde_21, g_ctx%B_12, g_ctx%S_u, first_time)
+    ! Build the EXACT Schur complement S_u = Atilde_22 - Atilde_21 * Atilde_11^{-1} * B_12
+    ! (column-probing, n_u MUMPS solves on Atilde_11). Stage-1 verification: this exact
+    ! S_u is copied into S_PBP below so the segregated apply uses the exact operator.
+    call compute_schur_corrected_block_exact(g_ctx%Atilde_11, g_ctx%Atilde_22, &
+                                             g_ctx%Atilde_21, g_ctx%B_12, g_ctx%S_u, first_time)
     !call compute_explicit_preconditioned_matrix(g_ctx%S_PBP, g_ctx%S_u, B_tmp, first_time)
 
     if (debug_physics_pc) then
@@ -315,8 +319,15 @@ contains
       !call petsc_mat_convert_spectrum(B_tmp, "S_prec", .false.)
     endif
 
-    !Copy S_u into S_PBP
-    !call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
+    ! Stage-1: overwrite the element-assembled S_PBP with the exact S_u so the
+    ! existing predictor-corrector apply (via ksp_S_PBP) uses the exact Schur.
+    ! NOTE: S_PBP is block-size-1 BAIJ (petsc_create_pc_matrix) while S_u is MPIAIJ
+    !   from probing; their row layouts differ in origin. If this MatCopy errors at
+    !   runtime (type/layout mismatch), the fallback is to delete this line and instead
+    !   rebind the KSP operator in assemble_monolithic_4x4 where ksp_S_PBP is created:
+    !   change `KSPSetOperators(ksp_S_PBP, S_PBP, S_PBP)` to
+    !   `KSPSetOperators(ksp_S_PBP, g_ctx%S_u, g_ctx%S_u)`.
+    call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
 
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic .or. physics_pc_multi_step) then
@@ -334,6 +345,13 @@ contains
       call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time)
       g_ctx%ksp_created = .true.
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Monolithic/multi-step sub-KSPs (psi/rho/T) set up"
+
+      ! Stage-1 verification: confirm the segregated (Atilde_11, exact S_u) solve of the
+      ! 2x2 Alfven block reproduces the direct A_alfven MUMPS solve to machine precision.
+      ! Requires ksp_alfven + ksp_S_PBP (holding exact S_u) — both set up by the call above.
+      if (debug_physics_pc) then
+        call verify_alfven_2x2_segregated(comm, my_id)
+      endif
 
       if (debug_physics_pc) then
         !call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false.)

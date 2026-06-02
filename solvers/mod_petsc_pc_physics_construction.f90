@@ -22,6 +22,7 @@ module mod_petsc_pc_physics_construction
   public :: setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov
   public :: assemble_monolithic_4x4
   public :: assemble_probed_exact_4x4
+  public :: verify_alfven_2x2_segregated
 
 contains
 
@@ -1528,6 +1529,118 @@ contains
       flush(6)
     endif
   end subroutine assemble_probed_exact_4x4
+
+  !--------------------------------------------------------------------
+  !> Stage-1 verification of the segregated 2x2 Alfven solve.
+  !!
+  !! Solves a random RHS on the 2x2 Alfven block K_A = [[Atilde_11, B_12],
+  !! [Atilde_21, Atilde_22]] two ways and prints the relative error:
+  !!   (a) ground truth: direct MUMPS solve via ksp_alfven (assembled A_alfven)
+  !!   (b) segregated block factorization using ksp_psi (Atilde_11^-1),
+  !!       Atilde_21, ksp_S_PBP (which must hold the EXACT S_u), B_12:
+  !!         t_psi  = Atilde_11^-1 b_psi
+  !!         y_u    = S_u^-1 (b_u - Atilde_21 t_psi)
+  !!         y_psi  = Atilde_11^-1 (b_psi - B_12 y_u)
+  !!
+  !! Precondition: ksp_alfven, ksp_psi, and ksp_S_PBP are all set up, and the
+  !! S_u -> S_PBP copy (or KSP rebind) is active so ksp_S_PBP solves the exact
+  !! Schur complement. Expect rel_err <~ 1e-10.
+  !--------------------------------------------------------------------
+  subroutine verify_alfven_2x2_segregated(comm, my_id)
+    integer, intent(in) :: comm, my_id
+
+    Vec :: b, x_exact, x_seg
+    Vec :: b_psi, b_u, t_psi, y_psi, y_u, rhs_u, rhs_psi, scratch_u, scratch_psi
+    PetscScalar, pointer :: a_b(:), a_x(:)
+    PetscRandom :: rctx
+    PetscReal   :: nrm_diff, nrm_exact, rel_err
+    PetscInt    :: n1_local, n2_local
+    PetscErrorCode :: ierr
+
+    ! Packed (psi,u) work vectors on the assembled 2x2 layout
+    call MatCreateVecs(g_ctx%A_alfven, x_exact, b, ierr)
+    call VecDuplicate(b, x_seg, ierr)
+
+    ! 1-variable work vectors: psi-sized from Atilde_11, u-sized from S_PBP (=S_u)
+    call MatCreateVecs(g_ctx%Atilde_11, t_psi, b_psi, ierr)   ! psi-sized
+    call VecDuplicate(b_psi, y_psi,       ierr)
+    call VecDuplicate(b_psi, rhs_psi,     ierr)
+    call VecDuplicate(b_psi, scratch_psi, ierr)
+    call MatCreateVecs(g_ctx%S_PBP, y_u, b_u, ierr)           ! u-sized
+    call VecDuplicate(b_u, rhs_u,     ierr)
+    call VecDuplicate(b_u, scratch_u, ierr)
+
+    ! --- Random RHS on the packed 2x2 layout ---
+    call PetscRandomCreate(comm, rctx, ierr)
+    call PetscRandomSetType(rctx, PETSCRAND48, ierr)
+    call VecSetRandom(b, rctx, ierr)
+    call PetscRandomDestroy(rctx, ierr)
+
+    ! --- Ground truth: x_exact = K_A^-1 b (direct MUMPS on assembled A_alfven) ---
+    call KSPSolve(g_ctx%ksp_alfven, b, x_exact, ierr)
+
+    ! --- Split packed b into b_psi (top half) and b_u (bottom half) ---
+    call VecGetLocalSize(b_psi, n1_local, ierr)
+    call VecGetLocalSize(b_u,   n2_local, ierr)
+    call VecGetArrayReadF90(b, a_b, ierr)
+    call VecGetArrayF90(b_psi, a_x, ierr)
+    a_x(1:n1_local) = a_b(1:n1_local)
+    call VecRestoreArrayF90(b_psi, a_x, ierr)
+    call VecGetArrayF90(b_u, a_x, ierr)
+    a_x(1:n2_local) = a_b(n1_local+1 : n1_local+n2_local)
+    call VecRestoreArrayF90(b_u, a_x, ierr)
+    call VecRestoreArrayReadF90(b, a_b, ierr)
+
+    ! --- Segregated block-factorization solve ---
+    ! t_psi = Atilde_11^-1 b_psi
+    call KSPSolve(g_ctx%ksp_psi, b_psi, t_psi, ierr)
+    ! rhs_u = b_u - Atilde_21 t_psi
+    call MatMult(g_ctx%Atilde_21, t_psi, scratch_u, ierr)
+    call VecWAXPY(rhs_u, -1.0d0, scratch_u, b_u, ierr)
+    ! y_u = S_u^-1 rhs_u   (ksp_S_PBP holds the exact S_u)
+    call KSPSolve(g_ctx%ksp_S_PBP, rhs_u, y_u, ierr)
+    ! rhs_psi = b_psi - B_12 y_u
+    call MatMult(g_ctx%B_12, y_u, scratch_psi, ierr)
+    call VecWAXPY(rhs_psi, -1.0d0, scratch_psi, b_psi, ierr)
+    ! y_psi = Atilde_11^-1 rhs_psi
+    call KSPSolve(g_ctx%ksp_psi, rhs_psi, y_psi, ierr)
+
+    ! --- Pack (y_psi, y_u) into x_seg ---
+    call VecGetArrayF90(x_seg, a_x, ierr)
+    call VecGetArrayReadF90(y_psi, a_b, ierr)
+    a_x(1:n1_local) = a_b(1:n1_local)
+    call VecRestoreArrayReadF90(y_psi, a_b, ierr)
+    call VecGetArrayReadF90(y_u, a_b, ierr)
+    a_x(n1_local+1 : n1_local+n2_local) = a_b(1:n2_local)
+    call VecRestoreArrayReadF90(y_u, a_b, ierr)
+    call VecRestoreArrayF90(x_seg, a_x, ierr)
+
+    ! --- Relative error: ||x_seg - x_exact|| / ||x_exact|| ---
+    call VecAXPY(x_seg, -1.0d0, x_exact, ierr)     ! x_seg <- x_seg - x_exact
+    call VecNorm(x_seg,   NORM_2, nrm_diff,  ierr)
+    call VecNorm(x_exact, NORM_2, nrm_exact, ierr)
+    if (nrm_exact > 0.0d0) then
+      rel_err = nrm_diff / nrm_exact
+    else
+      rel_err = nrm_diff
+    endif
+    if (my_id == 0) write(*,'(A,ES12.4)') &
+      "[Physics PC]   [verify 2x2] ||x_seg - x_exact||/||x_exact|| = ", rel_err
+
+    ! --- Cleanup ---
+    call VecDestroy(b,           ierr)
+    call VecDestroy(x_exact,     ierr)
+    call VecDestroy(x_seg,       ierr)
+    call VecDestroy(b_psi,       ierr)
+    call VecDestroy(b_u,         ierr)
+    call VecDestroy(t_psi,       ierr)
+    call VecDestroy(y_psi,       ierr)
+    call VecDestroy(y_u,         ierr)
+    call VecDestroy(rhs_u,       ierr)
+    call VecDestroy(rhs_psi,     ierr)
+    call VecDestroy(scratch_u,   ierr)
+    call VecDestroy(scratch_psi, ierr)
+  end subroutine verify_alfven_2x2_segregated
 
 #endif
 end module mod_petsc_pc_physics_construction
