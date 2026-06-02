@@ -558,7 +558,9 @@ contains
 
   !> Assemble a scalar MATAIJ equilibrium matrix directly from JOREK COO
   !! triplets (a_mat%irn/jcn/val, 1-based, with duplicate entries).
-  !! ADD_VALUES sums duplicates natively — no sort/dedup needed.
+  !! ADD_VALUES sums duplicates natively. Serial (n_cpu==1, COMM_SELF) preallocates
+  !! from COO row counts; parallel (n_cpu>1, COMM_WORLD) lets PETSc choose the row
+  !! distribution and scatters rank-0-set entries during MatAssembly.
   subroutine petsc_equilibrium_assemble(petsc_sys, a_mat)
     use data_structure, only: type_SP_MATRIX
 
@@ -566,7 +568,7 @@ contains
     type(type_SP_MATRIX), intent(in)       :: a_mat
 
     integer :: k, r
-    integer :: comm, my_id, mpierr
+    integer :: comm, my_id, n_cpu, mpierr
     PetscInt :: n_global, n_local
     PetscInt :: row(1), col(1)
     PetscScalar :: v(1)
@@ -575,43 +577,51 @@ contains
 
     comm = a_mat%comm
     call MPI_COMM_RANK(comm, my_id, mpierr)
+    call MPI_COMM_SIZE(comm, n_cpu, mpierr)
 
     n_global = a_mat%ng
-    n_local  = a_mat%ng   ! Phase 1: serial COMM_SELF -> local == global
 
-    PetscCallA(MatCreate(comm, petsc_sys%A, ierr))
-    PetscCallA(MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr))
-    PetscCallA(MatSetType(petsc_sys%A, MATAIJ, ierr))
+    call MatCreate(comm, petsc_sys%A, ierr)
+    if (n_cpu .eq. 1) then
+      n_local = a_mat%ng
+      call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
+      call MatSetType(petsc_sys%A, MATAIJ, ierr)
+      ! Per-row count from COO (duplicate-overestimate, safe); rank owns all rows.
+      allocate(d_nnz(n_global))
+      d_nnz = 0
+      do k = 1, a_mat%nnz
+        r = a_mat%irn(k)
+        d_nnz(r) = d_nnz(r) + 1
+      enddo
+      call MatSeqAIJSetPreallocation(petsc_sys%A, 0, d_nnz, ierr)
+      deallocate(d_nnz)
+    else
+      call MatSetSizes(petsc_sys%A, PETSC_DECIDE, PETSC_DECIDE, n_global, n_global, ierr)
+      call MatSetType(petsc_sys%A, MATAIJ, ierr)
+      call MatSetUp(petsc_sys%A, ierr)   ! dynamic allocation; assembly is rank-0 only, perf secondary
+    endif
 
-    ! Per-row nonzero count (overestimate: duplicates counted separately, safe)
-    allocate(d_nnz(n_global))
-    d_nnz = 0
-    do k = 1, a_mat%nnz
-      r = a_mat%irn(k)
-      d_nnz(r) = d_nnz(r) + 1
-    enddo
-    PetscCallA(MatSeqAIJSetPreallocation(petsc_sys%A, 0, d_nnz, ierr))
-    deallocate(d_nnz)
+    call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
 
-    ! Tolerate any preallocation underestimate rather than aborting
-    PetscCallA(MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr))
+    ! Only rank 0 holds the COO; off-rank entries are cached and shipped at assembly.
+    if (my_id .eq. 0) then
+      do k = 1, a_mat%nnz
+        row(1) = a_mat%irn(k) - 1
+        col(1) = a_mat%jcn(k) - 1
+        v(1)   = a_mat%val(k)
+        call MatSetValues(petsc_sys%A, 1, row, 1, col, v, ADD_VALUES, ierr)
+      enddo
+    endif
 
-    do k = 1, a_mat%nnz
-      row(1) = a_mat%irn(k) - 1
-      col(1) = a_mat%jcn(k) - 1
-      v(1)   = a_mat%val(k)
-      PetscCallA(MatSetValues(petsc_sys%A, 1, row, 1, col, v, ADD_VALUES, ierr))
-    enddo
-
-    PetscCallA(MatAssemblyBegin(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr))
-    PetscCallA(MatAssemblyEnd(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr))
+    call MatAssemblyBegin(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(petsc_sys%A, MAT_FINAL_ASSEMBLY, ierr)
 
     call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
 
     petsc_sys%initialized = .true.
     petsc_sys%owns_A       = .true.
-    if (my_id .eq. 0) write(*,'(A,I0,A,I0)') &
-      "[PETSc] equilibrium: AIJ matrix ", n_global, "x", n_global
+    if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0)') &
+      "[PETSc] equilibrium: AIJ matrix ", n_global, "x", n_global, " on ranks=", n_cpu
   end subroutine petsc_equilibrium_assemble
 
 

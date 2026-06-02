@@ -10,8 +10,8 @@ module mod_sparse_data
   use mod_strumpack, only:  type_STRUMPACK_SOLVER
 #endif
 #ifdef USE_PETSC
-  use mod_petsc, only: type_PETSC_SYSTEM, petsc_initialize, petsc_finalize, petsc_cleanup, &
-                        petsc_create_matrix, petsc_print_version
+  use mod_petsc, only: type_PETSC_SYSTEM, petsc_cleanup, &
+                        petsc_create_matrix
 #endif
   use data_structure, only: type_PRECOND
 
@@ -106,10 +106,8 @@ module mod_sparse_data
     elseif (use_pastix) then
       self%library = pastix
     endif
-#ifdef USE_PETSC
-    call petsc_initialize()
-    call petsc_print_version()
-#endif
+    ! NOTE: PetscInitialize is done once globally in jorek2_main (after MPI_Init),
+    !       not here — multiple solver instances share one PETSc session.
     return
   end subroutine setup
 
@@ -144,8 +142,9 @@ module mod_sparse_data
     if (self%spss%initialized) call strumpack_finalize(self%spss)
 #endif
 #ifdef USE_PETSC
+    ! Per-instance cleanup only (KSP/mats/vecs). PetscFinalize is done once
+    ! globally in jorek2_main before MPI_Finalize.
     call petsc_cleanup(self%petsc_sys)
-    call petsc_finalize()
 #endif
 
     self%solve_only   = .false.

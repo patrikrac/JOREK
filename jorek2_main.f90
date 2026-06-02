@@ -96,7 +96,8 @@ program JOREK2
 
 #ifdef USE_PETSC
     use mod_petsc_pc_physics, only: petsc_assemble_pc_matrices, petsc_physics_pc_build_reduced
-#endif 
+    use mod_petsc, only: petsc_initialize, petsc_finalize, petsc_print_version
+#endif
 
   use, intrinsic :: iso_c_binding
   use, intrinsic :: iso_fortran_env, only : stdin=>input_unit, &
@@ -218,7 +219,14 @@ mpi_required = 0
   call MPI_Init_thread(mpi_required, mpi_provided, StatInfo)
 
   call init_threads()  ! on some systems init_threads needs to come after mpi_init_thread
-  
+
+#ifdef USE_PETSC
+  ! --- Initialize PETSc once, globally (after MPI_Init, before any solver use
+  !     including the Grad-Shafranov equilibrium). Finalized before end program.
+  call petsc_initialize()
+  call petsc_print_version()
+#endif
+
   ! --- Determine number of MPI procs
   call MPI_COMM_SIZE(MPI_COMM_WORLD, comm_size, ierr)
   n_cpu = comm_size
@@ -431,7 +439,10 @@ mpi_required = 0
 
       ! --- Compute the plasma equilibrium
       if (equil) then
+        call clck_time_barrier(t0)
         call equilibrium(my_id,node_list,element_list,bnd_node_list,bnd_elm_list,xpoint,xcase, .true.)
+        call clck_time_barrier(t1); call clck_ldiff(t0,t1,tsecond)
+        if (my_id .eq. 0) write(*,FMT_TIMING) my_id, '# Time to equilibrium (R/Z grid):',tsecond
         if (export_for_nemec) then
           if(my_id ==0 ) call export_nemec(node_list, element_list, xpoint, xcase)
         endif
@@ -464,7 +475,10 @@ mpi_required = 0
       end if
       
       ! --- Compute the plasma equilibrium
+      call clck_time_barrier(t0)
       call equilibrium(my_id, node_list, element_list, bnd_node_list, bnd_elm_list, xpoint,xcase, .false.)
+      call clck_time_barrier(t1); call clck_ldiff(t0,t1,tsecond)
+      if (my_id .eq. 0) write(*,FMT_TIMING) my_id, '# Time to equilibrium (flux grid):',tsecond
 
     else
       if (my_id == 0 .and. export_polar_boundary) then
@@ -1211,6 +1225,9 @@ if (allocated(node_list%node)) call dealloc_node_list(node_list)
 if (allocated(aux_node_list%node)) call dealloc_node_list(aux_node_list)
 
   call r3_info_summary ()                                ! timing
+#ifdef USE_PETSC
+  call petsc_finalize()                                  ! finalize PETSc before MPI
+#endif
   call MPI_FINALIZE(IERR)                                ! clean up MPI
 
 end program JOREK2
