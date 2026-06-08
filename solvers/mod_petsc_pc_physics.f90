@@ -12,6 +12,7 @@ module mod_petsc_pc_physics
        compute_schur_corrected_block_61, compute_schur_corrected_block_exact, &
        compute_explicit_preconditioned_matrix, &
        setup_block_ksp, setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
+       setup_alfven_block_ksp, &
        assemble_monolithic_4x4, assemble_probed_exact_4x4, &
        verify_alfven_2x2_segregated
   use mod_petsc_pc_physics_element, only: &
@@ -402,8 +403,9 @@ contains
       call MatConvert(g_ctx%K_A_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_A_aij, ierr)
       call MatConvert(g_ctx%K_B_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_B_aij, ierr)
 
-      ! Set up the two KSPs (PREONLY + LU + MUMPS) via the existing helper
-      call setup_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time)
+      ! Set up the two KSPs. K_A (psi,u): switchable solver (direct LU/MUMPS or
+      ! toroidal mode-split PC) via ALFVEN_BLOCK_SOLVER. K_B (rho,T): Hypre AMG.
+      call setup_alfven_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time)
       call setup_block_ksp_hypre_amg_krylov(g_ctx%ksp_block_B, g_ctx%K_B_aij, comm, first_time, 3)
 
       ! Allocate packed work vectors (size matches each AIJ super-block)

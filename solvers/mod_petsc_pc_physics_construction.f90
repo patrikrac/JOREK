@@ -4,8 +4,16 @@ module mod_petsc_pc_physics_construction
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx
+  use mod_petsc_pc_toroidal, only: petsc_setup_toroidal_harmonic_pc_blocked
   implicit none
   private
+
+  ! --- Compile-time selector for the (psi,u) Alfven super-block solver ---
+  ! Edit ALFVEN_BLOCK_SOLVER and rebuild to switch.
+  integer, parameter :: ALFVEN_SOLVER_DIRECT   = 1   ! PREONLY + LU + MUMPS (default)
+  integer, parameter :: ALFVEN_SOLVER_TOROIDAL = 2   ! GMRES + toroidal mode-split PC
+  integer, parameter :: ALFVEN_BLOCK_SOLVER    = ALFVEN_SOLVER_DIRECT
+  integer, parameter :: ALFVEN_TOROIDAL_MAXITS = 5   ! outer GMRES iters (TOROIDAL only)
 
   public :: create_variable_index_sets
   public :: extract_sub_block
@@ -19,6 +27,7 @@ module mod_petsc_pc_physics_construction
   public :: compute_schur_corrected_block_exact
   public :: compute_explicit_preconditioned_matrix
   public :: setup_block_ksp
+  public :: setup_alfven_block_ksp
   public :: setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov
   public :: assemble_monolithic_4x4
   public :: assemble_probed_exact_4x4
@@ -789,6 +798,47 @@ contains
     call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
     call KSPSetUp(ksp_block, ierr)
   end subroutine setup_block_ksp
+
+  !--------------------------------------------------------------------
+  !> Set up the KSP for the (psi,u) Alfven super-block K_A.
+  !! Compile-time switch ALFVEN_BLOCK_SOLVER selects the method.
+  !! Signature matches setup_block_ksp so the call site is a drop-in swap.
+  !--------------------------------------------------------------------
+  subroutine setup_alfven_block_ksp(ksp_block, B_block, comm, first_time)
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+
+    PetscReal :: rtol, abstol, dtol
+    PetscErrorCode :: ierr
+
+    select case (ALFVEN_BLOCK_SOLVER)
+    case (ALFVEN_SOLVER_TOROIDAL)
+      if (first_time) then
+        call KSPCreate(comm, ksp_block, ierr)
+      endif
+      call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+
+      ! Outer GMRES wrapper (mirrors setup_block_ksp_amg_krylov): a few
+      ! iterations recover inter-mode-family coupling that the additive
+      ! fieldsplit drops, at a fraction of a full direct factorization.
+      call KSPSetType(ksp_block, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp_block, ALFVEN_TOROIDAL_MAXITS, ierr)
+      rtol   = 1.0d-50   ! effectively disabled: hard-stop at ALFVEN_TOROIDAL_MAXITS iters
+      abstol = 1.0d-50
+      dtol   = 1.0d4
+      call KSPSetTolerances(ksp_block, rtol, abstol, dtol, ALFVEN_TOROIDAL_MAXITS, ierr)
+
+      ! Inner PC: toroidal mode-family fieldsplit (exact LU per family).
+      ! Also issues PCSetUp/KSPSetUp on ksp_block.
+      call petsc_setup_toroidal_harmonic_pc_blocked(ksp_block, B_block, comm)
+
+    case default
+      ! ALFVEN_SOLVER_DIRECT: current behaviour (PREONLY + LU + MUMPS).
+      call setup_block_ksp(ksp_block, B_block, comm, first_time)
+    end select
+  end subroutine setup_alfven_block_ksp
 
   !--------------------------------------------------------------------
   !> Set up a sub-KSP for a diagonal block: PREONLY + GAMG (1 V-Cycle).
