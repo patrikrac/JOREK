@@ -5,6 +5,7 @@ module mod_petsc_pc_physics_construction
   use petsc
   use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx
   use mod_petsc_pc_toroidal, only: petsc_setup_toroidal_harmonic_pc_blocked
+  use mod_petsc_pc_physics_apply, only: k_a_exact_mult
   implicit none
   private
 
@@ -12,6 +13,7 @@ module mod_petsc_pc_physics_construction
   ! Edit ALFVEN_BLOCK_SOLVER and rebuild to switch.
   integer, parameter :: ALFVEN_SOLVER_DIRECT   = 1   ! PREONLY + LU + MUMPS (default)
   integer, parameter :: ALFVEN_SOLVER_TOROIDAL = 2   ! GMRES + toroidal mode-split PC
+  integer, parameter :: ALFVEN_SOLVER_TOROIDAL_EXACT = 3   ! GMRES on EXACT Schur shell + toroidal PC from approx K_A_aij
   integer, parameter :: ALFVEN_BLOCK_SOLVER    = ALFVEN_SOLVER_DIRECT
   integer, parameter :: ALFVEN_TOROIDAL_MAXITS = 5   ! outer GMRES iters (TOROIDAL only)
 
@@ -27,6 +29,7 @@ module mod_petsc_pc_physics_construction
   public :: compute_schur_corrected_block_exact
   public :: compute_explicit_preconditioned_matrix
   public :: setup_block_ksp
+  public :: setup_constraint_mass_ksp
   public :: setup_alfven_block_ksp
   public :: setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov
   public :: assemble_monolithic_4x4
@@ -800,6 +803,68 @@ contains
   end subroutine setup_block_ksp
 
   !--------------------------------------------------------------------
+  !> Set up the KSP for a constraint mass matrix (B_33 = M_jj or B_44 = M_ww).
+  !! These blocks are geometry-only and simulation-invariant (no theta*tstep,
+  !! no state dependence -- see model199/mod_elt_matrix.f90 eqs 3/4), so the
+  !! MUMPS factorization is performed ONCE (first_time) and reused for the whole
+  !! run. Signature matches setup_block_ksp for a drop-in swap.
+  !--------------------------------------------------------------------
+  subroutine setup_constraint_mass_ksp(ksp_block, B_block, comm, first_time)
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+
+    PC :: pc
+    PetscErrorCode :: ierr
+
+    ! Operator never changes: skip re-factorization on every rebuild after the first.
+    if (.not. first_time) return
+
+    call KSPCreate(comm, ksp_block, ierr)
+    call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+    call KSPSetType(ksp_block, KSPPREONLY, ierr)
+    call KSPGetPC(ksp_block, pc, ierr)
+    call PCSetType(pc, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(ksp_block, ierr)
+  end subroutine setup_constraint_mass_ksp
+
+  !--------------------------------------------------------------------
+  !> Create the exact-(psi,u)-Schur MATSHELL and its 1-variable work vecs (once).
+  !! K_A_aij is passed for sizing/parallel layout; the shell's MULT reads blocks
+  !! and KSPs directly from g_ctx. All work vecs are 1-variable sized.
+  !--------------------------------------------------------------------
+  subroutine setup_k_a_exact_shell(K_A_aij, comm)
+    Mat, intent(in)     :: K_A_aij
+    integer, intent(in) :: comm
+
+    PetscInt :: n_loc, n_glob
+    PetscErrorCode :: ierr
+
+    if (g_ctx%kae_setup_done) return
+
+    ! Shell sized exactly like K_A_aij (square 2-variable [psi|u] system).
+    call MatGetLocalSize(K_A_aij, n_loc, PETSC_NULL_INTEGER, ierr)
+    call MatGetSize(K_A_aij, n_glob, PETSC_NULL_INTEGER, ierr)
+    call MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, &
+                        PETSC_NULL_INTEGER, g_ctx%K_A_exact_shell, ierr)
+    call MatShellSetOperation(g_ctx%K_A_exact_shell, MATOP_MULT, k_a_exact_mult, ierr)
+
+    ! 1-variable work vecs. B_31 has psi columns / j rows; B_42 has u columns / w rows.
+    call MatCreateVecs(g_ctx%B_31, g_ctx%kae_p, g_ctx%kae_tj, ierr)   ! p~psi(col), tj~j(row)
+    call MatCreateVecs(g_ctx%B_42, g_ctx%kae_q, g_ctx%kae_tw, ierr)   ! q~u(col),   tw~w(row)
+    call VecDuplicate(g_ctx%kae_tj, g_ctx%kae_sj,   ierr)
+    call VecDuplicate(g_ctx%kae_tw, g_ctx%kae_sw,   ierr)
+    call VecDuplicate(g_ctx%kae_p,  g_ctx%kae_ypsi, ierr)
+    call VecDuplicate(g_ctx%kae_q,  g_ctx%kae_yu,   ierr)
+    call VecDuplicate(g_ctx%kae_p,  g_ctx%kae_spsi, ierr)
+    call VecDuplicate(g_ctx%kae_q,  g_ctx%kae_su,   ierr)
+
+    g_ctx%kae_setup_done = .true.
+  end subroutine setup_k_a_exact_shell
+
+  !--------------------------------------------------------------------
   !> Set up the KSP for the (psi,u) Alfven super-block K_A.
   !! Compile-time switch ALFVEN_BLOCK_SOLVER selects the method.
   !! Signature matches setup_block_ksp so the call site is a drop-in swap.
@@ -817,22 +882,59 @@ contains
     case (ALFVEN_SOLVER_TOROIDAL)
       if (first_time) then
         call KSPCreate(comm, ksp_block, ierr)
+        call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+
+        ! Outer GMRES wrapper (mirrors setup_block_ksp_amg_krylov): a few
+        ! iterations recover inter-mode-family coupling that the additive
+        ! fieldsplit drops, at a fraction of a full direct factorization.
+        call KSPSetType(ksp_block, KSPGMRES, ierr)
+        call KSPGMRESSetRestart(ksp_block, ALFVEN_TOROIDAL_MAXITS, ierr)
+        rtol   = 1.0d-50   ! effectively disabled: hard-stop at ALFVEN_TOROIDAL_MAXITS iters
+        abstol = 1.0d-50
+        dtol   = 1.0d4
+        call KSPSetTolerances(ksp_block, rtol, abstol, dtol, ALFVEN_TOROIDAL_MAXITS, ierr)
+
+        ! Inner PC: toroidal mode-family fieldsplit (exact LU per family).
+        ! STRUCTURAL setup (splits + sub-KSP config) depends only on the mode
+        ! layout, so it is done ONCE. Re-calling it every rebuild would append
+        ! another set of fieldsplit index sets to the same PC (PCSetType is a
+        ! no-op when the type is unchanged, so it does not reset the splits).
+        ! Also issues PCSetUp/KSPSetUp on ksp_block.
+        call petsc_setup_toroidal_harmonic_pc_blocked(ksp_block, B_block, comm)
+      else
+        ! Rebuild: B_block (K_A_aij) holds new values; refresh the operator and let
+        ! PCSetUp re-extract the per-family submatrices and refactor (mirrors the
+        ! global toroidal PC in mod_petsc.f90).
+        call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+        call KSPSetUp(ksp_block, ierr)
       endif
-      call KSPSetOperators(ksp_block, B_block, B_block, ierr)
 
-      ! Outer GMRES wrapper (mirrors setup_block_ksp_amg_krylov): a few
-      ! iterations recover inter-mode-family coupling that the additive
-      ! fieldsplit drops, at a fraction of a full direct factorization.
-      call KSPSetType(ksp_block, KSPGMRES, ierr)
-      call KSPGMRESSetRestart(ksp_block, ALFVEN_TOROIDAL_MAXITS, ierr)
-      rtol   = 1.0d-50   ! effectively disabled: hard-stop at ALFVEN_TOROIDAL_MAXITS iters
-      abstol = 1.0d-50
-      dtol   = 1.0d4
-      call KSPSetTolerances(ksp_block, rtol, abstol, dtol, ALFVEN_TOROIDAL_MAXITS, ierr)
+    case (ALFVEN_SOLVER_TOROIDAL_EXACT)
+      if (first_time) then
+        call KSPCreate(comm, ksp_block, ierr)
 
-      ! Inner PC: toroidal mode-family fieldsplit (exact LU per family).
-      ! Also issues PCSetUp/KSPSetUp on ksp_block.
-      call petsc_setup_toroidal_harmonic_pc_blocked(ksp_block, B_block, comm)
+        ! Ensure the exact-operator shell + work vecs exist (once).
+        call setup_k_a_exact_shell(B_block, comm)
+
+        ! GMRES iterates on the EXACT shell (Amat); the toroidal mode-split PC is
+        ! built from the cheap approximate K_A_aij (Pmat). Fixed hard-stop iters.
+        call KSPSetOperators(ksp_block, g_ctx%K_A_exact_shell, B_block, ierr)
+        call KSPSetType(ksp_block, KSPGMRES, ierr)
+        call KSPGMRESSetRestart(ksp_block, ALFVEN_TOROIDAL_MAXITS, ierr)
+        rtol   = 1.0d-50
+        abstol = 1.0d-50
+        dtol   = 1.0d4
+        call KSPSetTolerances(ksp_block, rtol, abstol, dtol, ALFVEN_TOROIDAL_MAXITS, ierr)
+
+        ! Inner PC from the approximate K_A_aij (STRUCTURAL setup once; see the
+        ! ALFVEN_SOLVER_TOROIDAL branch for why it must not be re-called).
+        call petsc_setup_toroidal_harmonic_pc_blocked(ksp_block, B_block, comm)
+      else
+        ! Rebuild: Amat (shell) is unchanged; Pmat (K_A_aij) holds new values.
+        ! Refresh operators and refactor the fieldsplit submatrices via PCSetUp.
+        call KSPSetOperators(ksp_block, g_ctx%K_A_exact_shell, B_block, ierr)
+        call KSPSetUp(ksp_block, ierr)
+      endif
 
     case default
       ! ALFVEN_SOLVER_DIRECT: current behaviour (PREONLY + LU + MUMPS).

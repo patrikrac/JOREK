@@ -117,6 +117,19 @@ module mod_petsc_pc_physics_ctx
     Vec :: rhs_B, sol_B                  !< (rho,T)-sized packed work vectors
     Vec :: tmp_rho, tmp_T                !< 1-variable scratch for GS residual updates
     logical :: sub_blocks_setup_done = .false.
+
+    ! --- Part 2a: exact Alfven operator MATSHELL (ALFVEN_SOLVER_TOROIDAL_EXACT) ---
+    !! Shell applies K_A_exact*(p,q):
+    !!   y_psi = B_11 p + B_12 q - B_13 (M_jj^-1 B_31 p)
+    !!   y_u   = B_21 p + B_22 q - B_23 (M_jj^-1 B_31 p) - B_24 (M_ww^-1 B_42 q)
+    !! All work vecs are 1-variable sized; created once.
+    Mat :: K_A_exact_shell
+    Vec :: kae_p,  kae_q              !< unpacked inputs (psi-, u-sized)
+    Vec :: kae_tj, kae_tw             !< M_jj^-1 B_31 p (j-), M_ww^-1 B_42 q (w-)
+    Vec :: kae_sj, kae_sw             !< scratch for B_31 p (j-), B_42 q (w-)
+    Vec :: kae_ypsi, kae_yu           !< accumulated outputs (psi-, u-sized)
+    Vec :: kae_spsi, kae_su           !< scratch for the -B_1x/-B_2x terms
+    logical :: kae_setup_done = .false.
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx

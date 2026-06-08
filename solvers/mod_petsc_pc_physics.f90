@@ -11,7 +11,8 @@ module mod_petsc_pc_physics
        compute_schur_corrected_block_u, compute_schur_corrected_block_21, &
        compute_schur_corrected_block_61, compute_schur_corrected_block_exact, &
        compute_explicit_preconditioned_matrix, &
-       setup_block_ksp, setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
+       setup_block_ksp, setup_constraint_mass_ksp, &
+       setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
        setup_alfven_block_ksp, &
        assemble_monolithic_4x4, assemble_probed_exact_4x4, &
        verify_alfven_2x2_segregated
@@ -221,8 +222,8 @@ contains
 
     ! --- Step 4a: Set up KSPs for elliptic constraint mass matrices ---
     ! (Must be done before Schur correction so MUMPS factorization is available)
-    call setup_block_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time)
-    call setup_block_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time)
+    call setup_constraint_mass_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time)
+    call setup_constraint_mass_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time)
     g_ctx%ksp_elliptic_created = .true.
     if (my_id == 0) write(*,'(A)') "[Physics PC]   Elliptic KSPs set up (PREONLY+LU+MUMPS)"
 
@@ -368,9 +369,13 @@ contains
     else if (physics_pc_sub_blocks) then
       ! ===== Sub-blocks PC: build 2x2 super-blocks (psi,u) and (rho,T) =====
 
-      ! Build K_A (psi,u) 2x2 MatNest from refs to existing Atilde_*/B_12
+      ! Build K_A (psi,u) 2x2 MatNest from refs to existing Atilde_*/B_12.
+      ! The nest must be recreated each rebuild (it references Atilde_* handles that
+      ! compute_schur_corrected_block_* destroys+recreates), so destroy the previous
+      ! nest first to avoid leaking one MatNest per rebuild.
       block
         Mat :: mats_nest_A(4)
+        if (.not. first_time) call MatDestroy(g_ctx%K_A_block, ierr)
         mats_nest_A(1) = g_ctx%Atilde_11
         mats_nest_A(2) = g_ctx%B_12
         mats_nest_A(3) = g_ctx%Atilde_21
@@ -382,6 +387,7 @@ contains
       ! Build K_B (rho,T) 2x2 MatNest (rho-T and T-rho cross terms are zero in model199)
       block
         Mat :: mats_nest_B(4)
+        if (.not. first_time) call MatDestroy(g_ctx%K_B_block, ierr)
         mats_nest_B(1) = g_ctx%B_55
         mats_nest_B(2) = PETSC_NULL_MAT
         mats_nest_B(3) = PETSC_NULL_MAT
@@ -400,12 +406,21 @@ contains
 
       ! Convert each MatNest to MPIAIJ for MUMPS factorization.
       ! Pattern matches mod_petsc_pc_physics.f90:700/719/736 (A_reduced_4x4, M_hydro, A_alfven).
+      ! Destroy the previous AIJ first (MAT_INITIAL_MATRIX allocates a new object each
+      ! rebuild) to avoid leaking one matrix per rebuild.
+      if (.not. first_time) call MatDestroy(g_ctx%K_A_aij, ierr)
+      if (.not. first_time) call MatDestroy(g_ctx%K_B_aij, ierr)
       call MatConvert(g_ctx%K_A_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_A_aij, ierr)
       call MatConvert(g_ctx%K_B_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_B_aij, ierr)
 
       ! Set up the two KSPs. K_A (psi,u): switchable solver (direct LU/MUMPS or
       ! toroidal mode-split PC) via ALFVEN_BLOCK_SOLVER. K_B (rho,T): Hypre AMG.
       call setup_alfven_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time)
+      ! K_B (rho,T): Hypre BoomerAMG. On solve_only steps, build_reduced is NOT called
+      ! (mod_petsc.f90), so this KSP and its AMG hierarchy persist and are reused as-is
+      ! while the outer FGMRES uses the fresh A for mat-vecs (lagged-PC reuse across
+      ! timesteps). On rebuild events K_B has genuinely changed (theta*tstep, state),
+      ! so refreshing the hierarchy here is correct. See cost analysis Part 2b.
       call setup_block_ksp_hypre_amg_krylov(g_ctx%ksp_block_B, g_ctx%K_B_aij, comm, first_time, 3)
 
       ! Allocate packed work vectors (size matches each AIJ super-block)

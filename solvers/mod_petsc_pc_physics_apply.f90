@@ -8,6 +8,7 @@ module mod_petsc_pc_physics_apply
   private
 
   public :: physics_pc_apply
+  public :: k_a_exact_mult
 
 contains
 
@@ -59,6 +60,50 @@ contains
     call VecRestoreArrayF90    (y1, a_y1, ierr)
     call VecRestoreArrayF90    (y2, a_y2, ierr)
   end subroutine unpack_2v
+
+  !> MATSHELL MATOP_MULT callback: y = K_A_exact * x  (exact (psi,u) Schur operator).
+  !!
+  !!   unpack x -> (p, q)
+  !!   tj = M_jj^-1 (B_31 p);   tw = M_ww^-1 (B_42 q)
+  !!   y_psi = B_11 p + B_12 q - B_13 tj
+  !!   y_u   = B_21 p + B_22 q - B_23 tj - B_24 tw
+  !!   pack (y_psi, y_u) -> y
+  !!
+  !! Work vecs live in g_ctx (created once by setup_k_a_exact_shell). The shell
+  !! context is unused; all state is read from the g_ctx singleton.
+  subroutine k_a_exact_mult(A_shell, x, y, ierr)
+    Mat            :: A_shell
+    Vec            :: x, y
+    PetscErrorCode :: ierr
+
+    ! 1. unpack the packed 2v input into (p, q)
+    call unpack_2v(x, g_ctx%kae_p, g_ctx%kae_q, ierr)
+
+    ! 2. exact constraint eliminations
+    call MatMult(g_ctx%B_31, g_ctx%kae_p, g_ctx%kae_sj, ierr)      ! sj = B_31 p
+    call KSPSolve(g_ctx%ksp_Mj, g_ctx%kae_sj, g_ctx%kae_tj, ierr)  ! tj = M_jj^-1 sj
+    call MatMult(g_ctx%B_42, g_ctx%kae_q, g_ctx%kae_sw, ierr)      ! sw = B_42 q
+    call KSPSolve(g_ctx%ksp_Mw, g_ctx%kae_sw, g_ctx%kae_tw, ierr)  ! tw = M_ww^-1 sw
+
+    ! 3. y_psi = B_11 p + B_12 q - B_13 tj
+    call MatMult(g_ctx%B_11, g_ctx%kae_p, g_ctx%kae_ypsi, ierr)
+    call MatMultAdd(g_ctx%B_12, g_ctx%kae_q, g_ctx%kae_ypsi, g_ctx%kae_ypsi, ierr)
+    call MatMult(g_ctx%B_13, g_ctx%kae_tj, g_ctx%kae_spsi, ierr)
+    call VecAXPY(g_ctx%kae_ypsi, -1.0d0, g_ctx%kae_spsi, ierr)
+
+    ! 4. y_u = B_21 p + B_22 q - B_23 tj - B_24 tw
+    call MatMult(g_ctx%B_21, g_ctx%kae_p, g_ctx%kae_yu, ierr)
+    call MatMultAdd(g_ctx%B_22, g_ctx%kae_q, g_ctx%kae_yu, g_ctx%kae_yu, ierr)
+    call MatMult(g_ctx%B_23, g_ctx%kae_tj, g_ctx%kae_su, ierr)
+    call VecAXPY(g_ctx%kae_yu, -1.0d0, g_ctx%kae_su, ierr)
+    call MatMult(g_ctx%B_24, g_ctx%kae_tw, g_ctx%kae_su, ierr)
+    call VecAXPY(g_ctx%kae_yu, -1.0d0, g_ctx%kae_su, ierr)
+
+    ! 5. pack outputs
+    call pack_2v(g_ctx%kae_ypsi, g_ctx%kae_yu, y, ierr)
+
+    ierr = 0
+  end subroutine k_a_exact_mult
 
   !> Compute the j,w-folded Alfven-row residuals.
   !!   r_psi = x_psi - B_13 * temp_j
