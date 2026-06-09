@@ -441,6 +441,7 @@ contains
     integer :: comm, my_id, mpierr
     KSPConvergedReason :: reason
     PetscLogDouble :: t1, t2
+    PetscLogDouble :: ts1, ts2
     KSPType :: ksp_type
     PetscInt :: its
     PetscReal :: petsc_norm
@@ -454,6 +455,7 @@ contains
       PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
       PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
+      PetscCallA(PetscTime(ts1, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
@@ -483,11 +485,14 @@ contains
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
 
+      PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
+      if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
 
     else if (.not. solve_only) then
       if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: refactorizing"
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
+      PetscCallA(PetscTime(ts1, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
@@ -495,7 +500,9 @@ contains
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
 
+      PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
+      if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
 
     else
       ! solve_only: update A for mat-vec products but reuse PC factorization
