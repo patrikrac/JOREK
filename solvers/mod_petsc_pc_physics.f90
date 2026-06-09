@@ -13,7 +13,7 @@ module mod_petsc_pc_physics
        compute_explicit_preconditioned_matrix, &
        setup_block_ksp, setup_constraint_mass_ksp, &
        setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
-       setup_alfven_block_ksp, &
+       setup_alfven_block_ksp, setup_rho_block_ksp, setup_T_block_ksp, &
        assemble_monolithic_4x4, assemble_probed_exact_4x4, &
        verify_alfven_2x2_segregated
   use mod_petsc_pc_physics_element, only: &
@@ -173,11 +173,11 @@ contains
       ! Per-node 4x4 block-diagonal inverse: captures Bezier DOF coupling within each harmonic
       call compute_per_node_block_inverse(g_ctx%B_33, g_ctx%Dinv_Mj, g_ctx%dinv_created)
       call compute_per_node_block_inverse(g_ctx%B_44, g_ctx%Dinv_Mw, g_ctx%dinv_created_w)
-      call MatNorm(g_ctx%Dinv_Mj, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mj||_F (per-node block) = ", norm_val
-      call MatNorm(g_ctx%Dinv_Mw, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mw||_F (per-node block) = ", norm_val
       if (debug_physics_pc) then
+        call MatNorm(g_ctx%Dinv_Mj, NORM_FROBENIUS, norm_val, ierr)
+        if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mj||_F (per-node block) = ", norm_val
+        call MatNorm(g_ctx%Dinv_Mw, NORM_FROBENIUS, norm_val, ierr)
+        if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Dinv_Mw||_F (per-node block) = ", norm_val
         ! Verify: ||Dinv_Mj * B_33 - I||_F and ||Dinv_Mw * B_44 - I||_F
         call MatMatMult(g_ctx%Dinv_Mj, g_ctx%B_33, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, prod_tmp, ierr)
         call MatShift(prod_tmp, -1.0d0, ierr)
@@ -194,10 +194,12 @@ contains
       ! Scalar diagonal inverse: 1 / diag(B)
       call compute_diag_mass_inverse(g_ctx%B_33, g_ctx%diag_Mj_inv, first_time)
       call compute_diag_mass_inverse(g_ctx%B_44, g_ctx%diag_Mw_inv, first_time)
-      call VecNorm(g_ctx%diag_Mj_inv, NORM_2, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_j^{-1} (diag)||_2 = ", norm_val
-      call VecNorm(g_ctx%diag_Mw_inv, NORM_2, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_w^{-1} (diag)||_2 = ", norm_val
+      if (debug_physics_pc) then
+        call VecNorm(g_ctx%diag_Mj_inv, NORM_2, norm_val, ierr)
+        if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_j^{-1} (diag)||_2 = ", norm_val
+        call VecNorm(g_ctx%diag_Mw_inv, NORM_2, norm_val, ierr)
+        if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||D_w^{-1} (diag)||_2 = ", norm_val
+      end if
     endif
 
     ! --- Debug: compare reassembled vs extracted norms ---
@@ -222,10 +224,9 @@ contains
 
     ! --- Step 4a: Set up KSPs for elliptic constraint mass matrices ---
     ! (Must be done before Schur correction so MUMPS factorization is available)
-    call setup_constraint_mass_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time)
-    call setup_constraint_mass_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time)
+    call setup_constraint_mass_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time, "Mj constraint-mass KSP")
+    call setup_constraint_mass_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time, "Mw constraint-mass KSP")
     g_ctx%ksp_elliptic_created = .true.
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Elliptic KSPs set up (PREONLY+LU+MUMPS)"
 
     ! --- Step 4b: Form Schur-corrected blocks ---
     if (physics_pc_block_inv) then
@@ -270,14 +271,16 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
     endif
 
-    call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_11||_F = ", norm_val
-    call MatNorm(g_ctx%Atilde_22, NORM_FROBENIUS, norm_val, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_22||_F = ", norm_val
-    call MatNorm(g_ctx%Atilde_21, NORM_FROBENIUS, norm_val, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_21||_F = ", norm_val
-    call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
+    if (debug_physics_pc) then
+      call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_11||_F = ", norm_val
+      call MatNorm(g_ctx%Atilde_22, NORM_FROBENIUS, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_22||_F = ", norm_val
+      call MatNorm(g_ctx%Atilde_21, NORM_FROBENIUS, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_21||_F = ", norm_val
+      call MatNorm(g_ctx%Atilde_61, NORM_FROBENIUS, norm_val, ierr)
+      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
+    end if
 
     ! Build the EXACT Schur complement S_u = Atilde_22 - Atilde_21 * Atilde_11^{-1} * B_12
     ! (column-probing, n_u MUMPS solves on Atilde_11). Stage-1 verification: this exact
@@ -342,11 +345,10 @@ contains
       !   ksp_rho (B_55)       -> transport correction (rho)
       !   ksp_T   (B_66)       -> transport correction (T)
       ! Set up unconditionally: cheap, reused, keeps control flow simple.
-      call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time)
-      call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time)
-      call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time)
+      call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time, "psi predictor KSP (Atilde_11)")
+      call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time, "rho-block KSP")
+      call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time, "T-block KSP")
       g_ctx%ksp_created = .true.
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   Monolithic/multi-step sub-KSPs (psi/rho/T) set up"
 
       ! Stage-1 verification: confirm the segregated (Atilde_11, exact S_u) solve of the
       ! 2x2 Alfven block reproduces the direct A_alfven MUMPS solve to machine precision.
@@ -367,7 +369,7 @@ contains
        ! call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_exact_4x4", .false.)
       endif
     else if (physics_pc_sub_blocks) then
-      ! ===== Sub-blocks PC: build 2x2 super-blocks (psi,u) and (rho,T) =====
+      ! ===== Sub-blocks PC: (psi,u) Alfven super-block + independent rho, T blocks =====
 
       ! Build K_A (psi,u) 2x2 MatNest from refs to existing Atilde_*/B_12.
       ! The nest must be recreated each rebuild (it references Atilde_* handles that
@@ -384,70 +386,48 @@ contains
                            mats_nest_A, g_ctx%K_A_block, ierr)
       end block
 
-      ! Build K_B (rho,T) 2x2 MatNest (rho-T and T-rho cross terms are zero in model199)
-      block
-        Mat :: mats_nest_B(4)
-        if (.not. first_time) call MatDestroy(g_ctx%K_B_block, ierr)
-        mats_nest_B(1) = g_ctx%B_55
-        mats_nest_B(2) = PETSC_NULL_MAT
-        mats_nest_B(3) = PETSC_NULL_MAT
-        mats_nest_B(4) = g_ctx%B_66
-        call MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, &
-                           mats_nest_B, g_ctx%K_B_block, ierr)
-
-        ! call PetscViewerBinaryOpen(PETSC_COMM_WORLD, "A_rho_matrix.dat", FILE_MODE_WRITE, viewer, ierr)
-        ! call MatView(g_ctx%B_55, viewer, ierr)
-        ! call PetscViewerDestroy(viewer, ierr)
-
-        ! call PetscViewerBinaryOpen(PETSC_COMM_WORLD, "A_p_matrix.dat", FILE_MODE_WRITE, viewer, ierr)
-        ! call MatView(g_ctx%B_66, viewer, ierr)
-        ! call PetscViewerDestroy(viewer, ierr)
-      end block
-
-      ! Convert each MatNest to MPIAIJ for MUMPS factorization.
-      ! Pattern matches mod_petsc_pc_physics.f90:700/719/736 (A_reduced_4x4, M_hydro, A_alfven).
-      ! Destroy the previous AIJ first (MAT_INITIAL_MATRIX allocates a new object each
-      ! rebuild) to avoid leaking one matrix per rebuild.
+      ! Convert the K_A MatNest to MPIAIJ for the Alfven block solver.
+      ! Destroy the previous AIJ first (MAT_INITIAL_MATRIX allocates a new object
+      ! each rebuild) to avoid leaking one matrix per rebuild.
       if (.not. first_time) call MatDestroy(g_ctx%K_A_aij, ierr)
-      if (.not. first_time) call MatDestroy(g_ctx%K_B_aij, ierr)
       call MatConvert(g_ctx%K_A_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_A_aij, ierr)
-      call MatConvert(g_ctx%K_B_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_B_aij, ierr)
 
-      ! Set up the two KSPs. K_A (psi,u): switchable solver (direct LU/MUMPS or
-      ! toroidal mode-split PC) via ALFVEN_BLOCK_SOLVER. K_B (rho,T): Hypre AMG.
-      call setup_alfven_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time)
-      ! K_B (rho,T): Hypre BoomerAMG. On solve_only steps, build_reduced is NOT called
-      ! (mod_petsc.f90), so this KSP and its AMG hierarchy persist and are reused as-is
-      ! while the outer FGMRES uses the fresh A for mat-vecs (lagged-PC reuse across
-      ! timesteps). On rebuild events K_B has genuinely changed (theta*tstep, state),
-      ! so refreshing the hierarchy here is correct. See cost analysis Part 2b.
-      call setup_block_ksp_hypre_amg_krylov(g_ctx%ksp_block_B, g_ctx%K_B_aij, comm, first_time, 3)
+      ! K_A (psi,u): switchable solver (direct LU/MUMPS or toroidal mode-split PC)
+      ! via ALFVEN_BLOCK_SOLVER.
+      call setup_alfven_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time, &
+                                  "Alfven (psi,u)-block KSP")
 
-      ! Allocate packed work vectors (size matches each AIJ super-block)
+      ! rho (B_55) and T (B_66): independent transport blocks, each with its own
+      ! (physics-motivated) AMG solver, applied directly to the extracted diagonal
+      ! sub-blocks. No bundling, no packed (rho,T) work vectors. On solve_only steps
+      ! build_reduced is NOT called (mod_petsc.f90), so these KSPs and their AMG
+      ! hierarchies persist and are reused as-is while the outer FGMRES uses the fresh
+      ! A for mat-vecs (lagged-PC reuse across timesteps). On rebuild events B_55/B_66
+      ! have genuinely changed (theta*tstep, state), so refreshing here is correct.
+      call setup_rho_block_ksp(g_ctx%ksp_rho, g_ctx%B_55, comm, first_time, "rho-block KSP")
+      call setup_T_block_ksp  (g_ctx%ksp_T,   g_ctx%B_66, comm, first_time, "T-block KSP")
+
+      ! Allocate the Alfven packed work vectors + 1-variable rho/T residual scratch.
       if (.not. g_ctx%sub_blocks_setup_done) then
         call MatCreateVecs(g_ctx%K_A_aij, g_ctx%rhs_A, g_ctx%sol_A, ierr)
-        call MatCreateVecs(g_ctx%K_B_aij, g_ctx%rhs_B, g_ctx%sol_B, ierr)
         call MatCreateVecs(g_ctx%B_55,    g_ctx%tmp_rho, PETSC_NULL_VEC, ierr)
         call MatCreateVecs(g_ctx%B_66,    g_ctx%tmp_T,   PETSC_NULL_VEC, ierr)
         g_ctx%sub_blocks_setup_done = .true.
       endif
 
       g_ctx%ksp_created = .true.
-      if (my_id == 0) write(*,'(A)') &
-        "[Physics PC]   Sub-blocks PC set up: K_A (psi,u) and K_B (rho,T), PREONLY+LU+MUMPS"
     else
       ! Block-diagonal mode: 4 separate sub-KSPs
-      call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time)
-      call setup_block_ksp(g_ctx%ksp_u, g_ctx%Atilde_22, comm, first_time)
+      call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time, "psi-block KSP")
+      call setup_block_ksp(g_ctx%ksp_u,   g_ctx%Atilde_22, comm, first_time, "u-block KSP")
       if (use_reassembled) then
-        call setup_block_ksp(g_ctx%ksp_rho, g_ctx%R_55, comm, first_time)
-        call setup_block_ksp(g_ctx%ksp_T,   g_ctx%R_66, comm, first_time)
+        call setup_block_ksp(g_ctx%ksp_rho, g_ctx%R_55, comm, first_time, "rho-block KSP")
+        call setup_block_ksp(g_ctx%ksp_T,   g_ctx%R_66, comm, first_time, "T-block KSP")
       else
-        call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55, comm, first_time)
-        call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66, comm, first_time)
+        call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55, comm, first_time, "rho-block KSP")
+        call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66, comm, first_time, "T-block KSP")
       endif
       g_ctx%ksp_created = .true.
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   Sub-KSPs set up (PREONLY+LU+MUMPS)"
     endif
 
     ! --- Step 6: Allocate work vectors (first time only) ---

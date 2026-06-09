@@ -31,12 +31,28 @@ module mod_petsc_pc_physics_construction
   public :: setup_block_ksp
   public :: setup_constraint_mass_ksp
   public :: setup_alfven_block_ksp
+  public :: setup_rho_block_ksp, setup_T_block_ksp
   public :: setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov
   public :: assemble_monolithic_4x4
   public :: assemble_probed_exact_4x4
   public :: verify_alfven_2x2_segregated
 
 contains
+
+  !--------------------------------------------------------------------
+  !> Print one coherent setup line on rank 0:  "[Physics PC]   <label>: <method>"
+  !! Used by the block-KSP setup routines so each reports what it configured.
+  !--------------------------------------------------------------------
+  subroutine pc_print_block_setup(comm, label, method)
+    integer,          intent(in) :: comm
+    character(len=*), intent(in) :: label, method
+
+    integer        :: rank
+    PetscErrorCode :: ierr
+
+    call MPI_Comm_rank(comm, rank, ierr)
+    if (rank == 0) write(*,'(A)') "[Physics PC]   " // trim(label) // ": " // trim(method)
+  end subroutine pc_print_block_setup
 
   !--------------------------------------------------------------------
   !> Create variable index sets for extracting sub-vectors from the
@@ -782,11 +798,12 @@ contains
   !--------------------------------------------------------------------
   !> Set up a sub-KSP for a diagonal block: PREONLY + LU + MUMPS.
   !--------------------------------------------------------------------
-  subroutine setup_block_ksp(ksp_block, B_block, comm, first_time)
+  subroutine setup_block_ksp(ksp_block, B_block, comm, first_time, label)
     KSP, intent(inout) :: ksp_block
     Mat, intent(in)    :: B_block
     integer, intent(in) :: comm
     logical, intent(in) :: first_time
+    character(len=*), intent(in), optional :: label
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -800,6 +817,8 @@ contains
     call PCSetType(pc, PCLU, ierr)
     call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
     call KSPSetUp(ksp_block, ierr)
+
+    if (present(label)) call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS)")
   end subroutine setup_block_ksp
 
   !--------------------------------------------------------------------
@@ -809,11 +828,12 @@ contains
   !! MUMPS factorization is performed ONCE (first_time) and reused for the whole
   !! run. Signature matches setup_block_ksp for a drop-in swap.
   !--------------------------------------------------------------------
-  subroutine setup_constraint_mass_ksp(ksp_block, B_block, comm, first_time)
+  subroutine setup_constraint_mass_ksp(ksp_block, B_block, comm, first_time, label)
     KSP, intent(inout)  :: ksp_block
     Mat, intent(in)     :: B_block
     integer, intent(in) :: comm
     logical, intent(in) :: first_time
+    character(len=*), intent(in), optional :: label
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -828,6 +848,8 @@ contains
     call PCSetType(pc, PCLU, ierr)
     call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
     call KSPSetUp(ksp_block, ierr)
+
+    if (present(label)) call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS), factored once")
   end subroutine setup_constraint_mass_ksp
 
   !--------------------------------------------------------------------
@@ -869,17 +891,20 @@ contains
   !! Compile-time switch ALFVEN_BLOCK_SOLVER selects the method.
   !! Signature matches setup_block_ksp so the call site is a drop-in swap.
   !--------------------------------------------------------------------
-  subroutine setup_alfven_block_ksp(ksp_block, B_block, comm, first_time)
+  subroutine setup_alfven_block_ksp(ksp_block, B_block, comm, first_time, label)
     KSP, intent(inout)  :: ksp_block
     Mat, intent(in)     :: B_block
     integer, intent(in) :: comm
     logical, intent(in) :: first_time
+    character(len=*), intent(in), optional :: label
 
     PetscReal :: rtol, abstol, dtol
     PetscErrorCode :: ierr
+    character(len=64) :: method
 
     select case (ALFVEN_BLOCK_SOLVER)
     case (ALFVEN_SOLVER_TOROIDAL)
+      method = "GMRES + toroidal mode-split PC"
       if (first_time) then
         call KSPCreate(comm, ksp_block, ierr)
         call KSPSetOperators(ksp_block, B_block, B_block, ierr)
@@ -910,6 +935,7 @@ contains
       endif
 
     case (ALFVEN_SOLVER_TOROIDAL_EXACT)
+      method = "GMRES on exact Schur shell + toroidal PC"
       if (first_time) then
         call KSPCreate(comm, ksp_block, ierr)
 
@@ -938,8 +964,11 @@ contains
 
     case default
       ! ALFVEN_SOLVER_DIRECT: current behaviour (PREONLY + LU + MUMPS).
+      method = "PREONLY + LU (MUMPS)"
       call setup_block_ksp(ksp_block, B_block, comm, first_time)
     end select
+
+    if (present(label)) call pc_print_block_setup(comm, label, method)
   end subroutine setup_alfven_block_ksp
 
   !--------------------------------------------------------------------
@@ -1090,8 +1119,47 @@ contains
     call KSPSetFromOptions(ksp_block, ierr)
     
     call KSPSetUp(ksp_block, ierr)
-    
+
   end subroutine setup_block_ksp_hypre_amg_krylov
+
+  !--------------------------------------------------------------------
+  !> Set up the KSP for the density (rho, B_55) transport block.
+  !! Physics-motivated, block-specific solver. Placeholder body: currently
+  !! delegates to the shared Hypre BoomerAMG setup (GMRES(3) wrapper). The
+  !! rho-specific AMG configuration will be dropped in here later, independent
+  !! of the T block. Signature matches the setup_block_ksp family.
+  !--------------------------------------------------------------------
+  subroutine setup_rho_block_ksp(ksp_block, B_block, comm, first_time, label)
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+    character(len=*), intent(in), optional :: label
+
+    call setup_block_ksp_hypre_amg_krylov(ksp_block, B_block, comm, first_time, 3)
+
+    if (present(label)) call pc_print_block_setup(comm, label, "GMRES(3) + Hypre BoomerAMG")
+  end subroutine setup_rho_block_ksp
+
+  !--------------------------------------------------------------------
+  !> Set up the KSP for the temperature/pressure (T, B_66) transport block.
+  !! Physics-motivated, block-specific solver. Placeholder body: currently
+  !! delegates to the shared Hypre BoomerAMG setup (GMRES(3) wrapper). The
+  !! T-specific AMG configuration (e.g. anisotropy-aware) will be dropped in
+  !! here later, independent of the rho block. Signature matches the
+  !! setup_block_ksp family.
+  !--------------------------------------------------------------------
+  subroutine setup_T_block_ksp(ksp_block, B_block, comm, first_time, label)
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+    character(len=*), intent(in), optional :: label
+
+    call setup_block_ksp_hypre_amg_krylov(ksp_block, B_block, comm, first_time, 3)
+
+    if (present(label)) call pc_print_block_setup(comm, label, "GMRES(3) + Hypre BoomerAMG")
+  end subroutine setup_T_block_ksp
 
   !--------------------------------------------------------------------
   !> Assemble the monolithic 4x4 reduced system via MatCreateNest +

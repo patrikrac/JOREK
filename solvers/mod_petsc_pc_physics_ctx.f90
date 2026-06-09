@@ -109,13 +109,12 @@ module mod_petsc_pc_physics_ctx
     KSP :: ksp_S_PBP
     logical :: ksp_S_PBP_created = .false.
 
-    ! --- Sub-blocks PC: 2x2 super-blocks (psi,u) and (rho,T) ---
-    Mat :: K_A_block, K_B_block          !< 2x2 MatNests of (psi,u) and (rho,T) sub-systems
-    Mat :: K_A_aij,   K_B_aij            !< MPIAIJ conversions of the MatNests for MUMPS
-    KSP :: ksp_block_A, ksp_block_B      !< PREONLY + LU + MUMPS solvers, one per super-block
+    ! --- Sub-blocks PC: (psi,u) Alfven super-block + independent rho, T blocks ---
+    Mat :: K_A_block                     !< 2x2 MatNest of the (psi,u) Alfven super-system
+    Mat :: K_A_aij                       !< MPIAIJ conversion of K_A_block for the block solver
+    KSP :: ksp_block_A                   !< (psi,u) Alfven super-block solver
     Vec :: rhs_A, sol_A                  !< (psi,u)-sized packed work vectors
-    Vec :: rhs_B, sol_B                  !< (rho,T)-sized packed work vectors
-    Vec :: tmp_rho, tmp_T                !< 1-variable scratch for GS residual updates
+    Vec :: tmp_rho, tmp_T                !< 1-variable rho/T residual vectors (GS + direct solves)
     logical :: sub_blocks_setup_done = .false.
 
     ! --- Part 2a: exact Alfven operator MATSHELL (ALFVEN_SOLVER_TOROIDAL_EXACT) ---

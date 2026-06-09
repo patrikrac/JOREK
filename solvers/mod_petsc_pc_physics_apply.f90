@@ -127,27 +127,26 @@ contains
     call VecAXPY(r_u, -1.0d0, scratch, ierr)
   end subroutine fold_alfven_residual
 
-  !> Block-Jacobi apply: y_A = K_A^-1 x_A, y_B = K_B^-1 x_B (parallel, no coupling).
+  !> Block-Jacobi apply: y_A = K_A^-1 x_A, y_rho = B_55^-1 x_rho, y_T = B_66^-1 x_T
+  !! (parallel, no coupling).
   !!
   !! Mode 1 of the sub-blocks PC. Independent solves on the (psi,u) Alfven block
-  !! and the (rho,T) transport block — cross-block coupling is ignored.
+  !! and the separate rho (B_55) and T (B_66) transport blocks — cross-block
+  !! coupling is ignored.
   subroutine apply_block_jacobi(x_psi, x_u, x_rho, x_T, &
                                 y_psi, y_u, y_rho, y_T, ierr)
     Vec            :: x_psi, x_u, x_rho, x_T
     Vec            :: y_psi, y_u, y_rho, y_T
     PetscErrorCode :: ierr
 
-    ! Pack inputs into 2v rhs vectors
-    call pack_2v(x_psi, x_u,   g_ctx%rhs_A, ierr)
-    call pack_2v(x_rho, x_T,   g_ctx%rhs_B, ierr)
-
-    ! Solve each super-block (PREONLY + LU + MUMPS)
+    ! Solve the Alfven super-block (packed psi,u).
+    call pack_2v(x_psi, x_u, g_ctx%rhs_A, ierr)
     call KSPSolve(g_ctx%ksp_block_A, g_ctx%rhs_A, g_ctx%sol_A, ierr)
-    call KSPSolve(g_ctx%ksp_block_B, g_ctx%rhs_B, g_ctx%sol_B, ierr)
+    call unpack_2v(g_ctx%sol_A, y_psi, y_u, ierr)
 
-    ! Unpack into outputs
-    call unpack_2v(g_ctx%sol_A, y_psi, y_u,   ierr)
-    call unpack_2v(g_ctx%sol_B, y_rho, y_T,   ierr)
+    ! Independent transport-block solves (block-Jacobi: no cross coupling).
+    call KSPSolve(g_ctx%ksp_rho, x_rho, y_rho, ierr)
+    call KSPSolve(g_ctx%ksp_T,   x_T,   y_T,   ierr)
   end subroutine apply_block_jacobi
 
   !> Block-GS-forward apply: solve K_A, propagate to (rho,T), solve K_B.
@@ -156,7 +155,7 @@ contains
   !!   1. y_A = K_A^-1 x_A
   !!   2. r_B = x_B - C_BA * y_A      where C_BA = [B_51 B_52; Atilde_61 B_62]
   !!                                  (RHS uses j,w-folded residuals)
-  !!   3. y_B = K_B^-1 r_B
+  !!   3. y_rho = B_55^-1 r_rho, y_T = B_66^-1 r_T   (B is block-diagonal in rho,T)
   !!
   !! Captures the (psi,u) -> (rho,T) coupling via the C_BA submatrices.
   subroutine apply_block_gs_forward(x_psi, x_u, x_rho, x_T, &
@@ -188,10 +187,9 @@ contains
     call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%tmp_T, -1.0d0, g_ctx%work_3, ierr)
 
-    ! 3. Solve transport super-block K_B (block-diagonal rho,T)
-    call pack_2v(g_ctx%tmp_rho, g_ctx%tmp_T, g_ctx%rhs_B, ierr)
-    call KSPSolve(g_ctx%ksp_block_B, g_ctx%rhs_B, g_ctx%sol_B, ierr)
-    call unpack_2v(g_ctx%sol_B, y_rho, y_T, ierr)
+    ! 3. Solve the independent transport blocks on their folded residuals.
+    call KSPSolve(g_ctx%ksp_rho, g_ctx%tmp_rho, y_rho, ierr)
+    call KSPSolve(g_ctx%ksp_T,   g_ctx%tmp_T,   y_T,   ierr)
   end subroutine apply_block_gs_forward
 
   !> Block-GS-symmetric apply: forward sweep + backward sweep.
