@@ -27,6 +27,7 @@ module mod_petsc_pc_physics_construction
   public :: compute_schur_corrected_block_21
   public :: compute_schur_corrected_block_61
   public :: compute_schur_corrected_block_exact
+  public :: compute_full_momentum_schur_exact
   public :: compute_explicit_preconditioned_matrix
   public :: setup_block_ksp
   public :: setup_constraint_mass_ksp
@@ -638,6 +639,156 @@ contains
     call KSPDestroy(ksp_M,  ierr)
 
   end subroutine compute_schur_corrected_block_exact
+
+
+  !--------------------------------------------------------------------
+  !> Build the EXACT full momentum Schur complement (channels A+B):
+  !!   S_u = Atilde_22
+  !!         - Atilde_21 Atilde_11^{-1} B_12        (A: magnetic)
+  !!         - B_25 B_55^{-1} B_52                   (B: pressure, rho)
+  !!         - B_26 B_66^{-1} B_62                   (B: pressure, T)
+  !! Channel C (flutter, coupled A_pp triangular solve via B_51/Atilde_61/
+  !! B_16) is a design-doc-gated term (H5) and is intentionally omitted here.
+  !! Column-probing: u-sized basis vectors, three MUMPS solves per column.
+  !! Mirrors compute_schur_corrected_block_exact.
+  !--------------------------------------------------------------------
+  subroutine compute_full_momentum_schur_exact(S_u, first_time)
+    implicit none
+    Mat, intent(inout)  :: S_u
+    logical, intent(in) :: first_time
+
+    KSP            :: ksp_psi_l, ksp_rho_l, ksp_T_l
+    PC             :: pc_l
+    Vec            :: e_j, col, d_u
+    Vec            :: z_psi, y_psi, r_psi
+    Vec            :: z_rho, y_rho, r_rho
+    Vec            :: z_T,   y_T,   r_T
+    Vec            :: col_seq
+    VecScatter     :: scat
+    PetscErrorCode :: ierr
+    PetscInt       :: N_global, m_local, n_local
+    integer        :: n, j, my_id, mpierr
+    MPI_Comm       :: comm
+    PetscScalar, pointer  :: arr(:)
+    real*8, allocatable   :: S_dense(:,:)
+    PetscInt, allocatable :: row_idxs(:)
+    PetscInt       :: col_idx(1)
+
+    call PetscObjectGetComm(g_ctx%Atilde_22, comm, ierr)
+    call MPI_Comm_rank(comm, my_id, mpierr)
+    call MatGetSize(g_ctx%Atilde_22, PETSC_NULL_INTEGER, N_global, ierr)
+    n = int(N_global)
+
+    if (my_id == 0) then
+      allocate(S_dense(n, n)); S_dense = 0.0d0
+      write(*,'(A,I0,A)') "[Diagnostics] Probing full momentum Schur S_u (", n, " columns)..."
+      flush(6)
+    endif
+
+    ! Three exact LU (MUMPS) KSPs for the diagonal blocks
+    call KSPCreate(comm, ksp_psi_l, ierr)
+    call KSPSetOperators(ksp_psi_l, g_ctx%Atilde_11, g_ctx%Atilde_11, ierr)
+    call KSPSetType(ksp_psi_l, KSPPREONLY, ierr)
+    call KSPGetPC(ksp_psi_l, pc_l, ierr); call PCSetType(pc_l, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_l, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(ksp_psi_l, ierr)
+
+    call KSPCreate(comm, ksp_rho_l, ierr)
+    call KSPSetOperators(ksp_rho_l, g_ctx%B_55, g_ctx%B_55, ierr)
+    call KSPSetType(ksp_rho_l, KSPPREONLY, ierr)
+    call KSPGetPC(ksp_rho_l, pc_l, ierr); call PCSetType(pc_l, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_l, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(ksp_rho_l, ierr)
+
+    call KSPCreate(comm, ksp_T_l, ierr)
+    call KSPSetOperators(ksp_T_l, g_ctx%B_66, g_ctx%B_66, ierr)
+    call KSPSetType(ksp_T_l, KSPPREONLY, ierr)
+    call KSPGetPC(ksp_T_l, pc_l, ierr); call PCSetType(pc_l, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc_l, MATSOLVERMUMPS, ierr)
+    call KSPSetUp(ksp_T_l, ierr)
+
+    ! Work vectors. e_j/col/d_u/r_* are u-sized; z/y per channel are block-sized.
+    call MatCreateVecs(g_ctx%B_12, e_j,   z_psi, ierr)   ! e_j: u (domain), z_psi: psi (range)
+    call MatCreateVecs(g_ctx%Atilde_11, y_psi, PETSC_NULL_VEC, ierr)
+    call MatCreateVecs(g_ctx%Atilde_22, d_u, col, ierr)  ! both u-sized
+    call VecDuplicate(col, r_psi, ierr)
+    call VecDuplicate(col, r_rho, ierr)
+    call VecDuplicate(col, r_T,   ierr)
+    call MatCreateVecs(g_ctx%B_52, PETSC_NULL_VEC, z_rho, ierr)  ! z_rho: rho (range)
+    call MatCreateVecs(g_ctx%B_55, y_rho, PETSC_NULL_VEC, ierr)
+    call MatCreateVecs(g_ctx%B_62, PETSC_NULL_VEC, z_T, ierr)    ! z_T: T (range)
+    call MatCreateVecs(g_ctx%B_66, y_T, PETSC_NULL_VEC, ierr)
+    call VecScatterCreateToZero(col, scat, col_seq, ierr)
+
+    do j = 0, n-1
+      call VecSet(e_j, 0.0d0, ierr)
+      call VecSetValue(e_j, j, 1.0d0, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_j, ierr); call VecAssemblyEnd(e_j, ierr)
+
+      ! diagonal: d_u = Atilde_22 e_j
+      call MatMult(g_ctx%Atilde_22, e_j, d_u, ierr)
+
+      ! channel A (magnetic): r_psi = Atilde_21 Atilde_11^{-1} (B_12 e_j)
+      call MatMult(g_ctx%B_12, e_j, z_psi, ierr)
+      call KSPSolve(ksp_psi_l, z_psi, y_psi, ierr)
+      call MatMult(g_ctx%Atilde_21, y_psi, r_psi, ierr)
+
+      ! channel B (rho): r_rho = B_25 B_55^{-1} (B_52 e_j)
+      call MatMult(g_ctx%B_52, e_j, z_rho, ierr)
+      call KSPSolve(ksp_rho_l, z_rho, y_rho, ierr)
+      call MatMult(g_ctx%B_25, y_rho, r_rho, ierr)
+
+      ! channel B (T): r_T = B_26 B_66^{-1} (B_62 e_j)
+      call MatMult(g_ctx%B_62, e_j, z_T, ierr)
+      call KSPSolve(ksp_T_l, z_T, y_T, ierr)
+      call MatMult(g_ctx%B_26, y_T, r_T, ierr)
+
+      ! col = d_u - r_psi - r_rho - r_T
+      call VecCopy(d_u, col, ierr)
+      call VecAXPY(col, -1.0d0, r_psi, ierr)
+      call VecAXPY(col, -1.0d0, r_rho, ierr)
+      call VecAXPY(col, -1.0d0, r_T,   ierr)
+
+      call VecScatterBegin(scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(col_seq, arr, ierr)
+        S_dense(1:n, j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(col_seq, arr, ierr)
+      endif
+      if (my_id == 0 .and. mod(j+1, max(1,n/10)) == 0) then
+        write(*,'(A,I0,A,I0)') "[Diagnostics]   S_u probed: ", j+1, "/", n
+        flush(6)
+      endif
+    enddo
+
+    call VecGetLocalSize(col, m_local, ierr)
+    call VecGetLocalSize(e_j, n_local, ierr)
+    if (.not. first_time) call MatDestroy(S_u, ierr)
+    call MatCreate(comm, S_u, ierr)
+    call MatSetSizes(S_u, m_local, n_local, n, n, ierr)
+    call MatSetType(S_u, MATMPIAIJ, ierr)
+    call MatSetOption(S_u, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    call MatSetUp(S_u, ierr)
+    if (my_id == 0) then
+      allocate(row_idxs(n))
+      do j = 0, n-1; row_idxs(j+1) = j; enddo
+      do j = 0, n-1
+        col_idx(1) = j
+        call MatSetValues(S_u, n, row_idxs, 1, col_idx, S_dense(:, j+1), INSERT_VALUES, ierr)
+      enddo
+      deallocate(row_idxs); deallocate(S_dense)
+    endif
+    call MatAssemblyBegin(S_u, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd  (S_u, MAT_FINAL_ASSEMBLY, ierr)
+
+    call VecScatterDestroy(scat, ierr); call VecDestroy(col_seq, ierr)
+    call VecDestroy(e_j, ierr);   call VecDestroy(col, ierr);   call VecDestroy(d_u, ierr)
+    call VecDestroy(z_psi, ierr); call VecDestroy(y_psi, ierr); call VecDestroy(r_psi, ierr)
+    call VecDestroy(z_rho, ierr); call VecDestroy(y_rho, ierr); call VecDestroy(r_rho, ierr)
+    call VecDestroy(z_T, ierr);   call VecDestroy(y_T, ierr);   call VecDestroy(r_T, ierr)
+    call KSPDestroy(ksp_psi_l, ierr); call KSPDestroy(ksp_rho_l, ierr); call KSPDestroy(ksp_T_l, ierr)
+  end subroutine compute_full_momentum_schur_exact
 
 
   !--------------------------------------------------------------------

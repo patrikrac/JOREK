@@ -11,6 +11,7 @@ module mod_petsc_pc_physics
        compute_schur_corrected_block_u, compute_schur_corrected_block_21, &
        compute_schur_corrected_block_61, compute_schur_corrected_block_exact, &
        compute_explicit_preconditioned_matrix, &
+       compute_full_momentum_schur_exact, &
        setup_block_ksp, setup_constraint_mass_ksp, &
        setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
        setup_alfven_block_ksp, setup_rho_block_ksp, setup_T_block_ksp, &
@@ -57,7 +58,8 @@ contains
     use phys_module, only: physics_pc_reassemble, debug_physics_pc, physics_pc_monolithic, &
                            physics_pc_multi_step, physics_pc_probe_exact, physics_pc_block_inv, &
                            physics_pc_sub_blocks
-    use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate
+    use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate, &
+                                         petsc_mat_diff_norm
 
     Mat, intent(in) :: A_full
 
@@ -69,8 +71,12 @@ contains
     Mat :: diag_11, diag_22, diag_55, diag_66  ! pointers to chosen diagonal blocks
     Mat :: prod_tmp                              ! temporary for block-inverse diagnostic
     
-    Mat :: B_tmp ! Store the preconditioned matrix B = M^{-1} A 
+    Mat :: B_tmp ! Store the preconditioned matrix B = M^{-1} A
     PetscViewer :: viewer
+    ! Slice 1 offline S_PBP verification: build full momentum Schur S_u, measure
+    ! sigma(S_PBP^-1 S_u), and SKIP the Stage-1 S_u->S_PBP overwrite. Set .false.
+    ! to restore the production Stage-1 path (exact magnetic S_u copied into S_PBP).
+    logical :: verify_spbp_spectrum
     !Mat :: A_eq
     !Vec :: dr, dc
 
@@ -282,12 +288,20 @@ contains
       if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||Atilde_61||_F = ", norm_val
     end if
 
-    ! Build the EXACT Schur complement S_u = Atilde_22 - Atilde_21 * Atilde_11^{-1} * B_12
-    ! (column-probing, n_u MUMPS solves on Atilde_11). Stage-1 verification: this exact
-    ! S_u is copied into S_PBP below so the segregated apply uses the exact operator.
-    call compute_schur_corrected_block_exact(g_ctx%Atilde_11, g_ctx%Atilde_22, &
-                                             g_ctx%Atilde_21, g_ctx%B_12, g_ctx%S_u, first_time)
-    !call compute_explicit_preconditioned_matrix(g_ctx%S_PBP, g_ctx%S_u, B_tmp, first_time)
+    ! --- Slice 1 offline S_PBP verification switch.  When .true., build the FULL
+    !     momentum Schur S_u (channels A+B) as the reference and skip the Stage-1
+    !     S_u->S_PBP overwrite (below) so the ASSEMBLED S_PBP is what gets measured.
+    verify_spbp_spectrum = .true.
+
+    if (verify_spbp_spectrum) then
+      ! Exact reference: full momentum Schur (channels A+B), held fixed across arms.
+      call compute_full_momentum_schur_exact(g_ctx%S_u, first_time)
+    else
+      ! Build the EXACT magnetic-only Schur S_u = Atilde_22 - Atilde_21 Atilde_11^{-1} B_12
+      ! (column-probing, n_u MUMPS solves on Atilde_11). Stage-1: copied into S_PBP below.
+      call compute_schur_corrected_block_exact(g_ctx%Atilde_11, g_ctx%Atilde_22, &
+                                               g_ctx%Atilde_21, g_ctx%B_12, g_ctx%S_u, first_time)
+    endif
 
     if (debug_physics_pc) then
       call petsc_test_pc_matrix(g_ctx%B_33, "B_33", .true., my_id)
@@ -324,15 +338,43 @@ contains
       !call petsc_mat_convert_spectrum(B_tmp, "S_prec", .false.)
     endif
 
-    ! Stage-1: overwrite the element-assembled S_PBP with the exact S_u so the
-    ! existing predictor-corrector apply (via ksp_S_PBP) uses the exact Schur.
-    ! NOTE: S_PBP is block-size-1 BAIJ (petsc_create_pc_matrix) while S_u is MPIAIJ
-    !   from probing; their row layouts differ in origin. If this MatCopy errors at
-    !   runtime (type/layout mismatch), the fallback is to delete this line and instead
-    !   rebind the KSP operator in assemble_monolithic_4x4 where ksp_S_PBP is created:
-    !   change `KSPSetOperators(ksp_S_PBP, S_PBP, S_PBP)` to
-    !   `KSPSetOperators(ksp_S_PBP, g_ctx%S_u, g_ctx%S_u)`.
-    call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
+    if (verify_spbp_spectrum) then
+      ! --- Slice 1 offline verification: measure the element-assembled S_PBP
+      !     against the exact full momentum Schur S_u. Writes eigenvalue .dat
+      !     files for offline Julia clustering analysis. ---
+      ! SPD check of the assembled candidate S_PBP (symmetric -> DSYEVD; writes
+      ! S_PBP_sym_dense_spectrum.dat with all-real eigenvalues).
+      call petsc_mat_convert_spectrum(g_ctx%S_PBP, "S_PBP_sym", .true.)
+
+      ! sigma(S_PBP^-1 S_u): B_tmp = S_PBP^-1 S_u, then full spectrum (complex).
+      ! B_tmp is a transient local (not SAVEd): pass .true. so the builder always
+      ! MatCreates fresh (never MatDestroys an uninitialized handle on a rebuild);
+      ! we destroy it ourselves right after taking its spectrum.
+      call compute_explicit_preconditioned_matrix(g_ctx%S_PBP, g_ctx%S_u, B_tmp, .true.)
+      call petsc_mat_convert_spectrum(B_tmp, "S_prec", .false.)
+      call MatDestroy(B_tmp, ierr)
+
+      ! Magnitude reference (NOT expected to be zero): ||S_u - S_PBP||_F.
+      ! petsc_mat_diff_norm duplicates the FIRST arg and MatAXPYs the second with
+      ! SAME_NONZERO_PATTERN, so the DENSE matrix (S_u, probed) must be first and
+      ! the sparse one (S_PBP) second -- matches construction precedent
+      ! petsc_mat_diff_norm(A_exact, A_reduced_4x4). Reuses norm_val.
+      call petsc_mat_diff_norm(g_ctx%S_u, g_ctx%S_PBP, "S_u_vs_S_PBP", norm_val)
+
+      ! NOTE: deliberately NO MatCopy(S_u -> S_PBP) here -- the assembled S_PBP
+      ! must survive for the measurement; the production apply path is not
+      ! exercised in this verification configuration.
+    else
+      ! Stage-1: overwrite the element-assembled S_PBP with the exact S_u so the
+      ! existing predictor-corrector apply (via ksp_S_PBP) uses the exact Schur.
+      ! NOTE: S_PBP is block-size-1 BAIJ (petsc_create_pc_matrix) while S_u is MPIAIJ
+      !   from probing; their row layouts differ in origin. If this MatCopy errors at
+      !   runtime (type/layout mismatch), the fallback is to delete this line and instead
+      !   rebind the KSP operator in assemble_monolithic_4x4 where ksp_S_PBP is created:
+      !   change `KSPSetOperators(ksp_S_PBP, S_PBP, S_PBP)` to
+      !   `KSPSetOperators(ksp_S_PBP, g_ctx%S_u, g_ctx%S_u)`.
+      call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
+    endif
 
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic .or. physics_pc_multi_step) then
