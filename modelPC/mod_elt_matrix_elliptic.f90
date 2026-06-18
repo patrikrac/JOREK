@@ -105,23 +105,15 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8 :: amat_schur, amat_schur_n, amat_schur_kn, amat_schur_inertia
   real*8 :: amat_01, amat_10
 
-  ! --- S_PBP physics-enrichment switches (compile-time research knobs; remove once a
-  !     winning model is chosen). Flip these and recompile to select an enrichment. ---
-  !   spec(S_PBP^-1 S_u) baseline is [~1e-3, ~37] (kappa ~ 4e4), SPD.
-  !   Two spectral tails, attacked from opposite sides:
-  !     lambda >> 1 (->37): S_PBP too SMALL (missing dissipation) -> ADD viscosity/diffusion
-  !     lambda << 1 (->1e-3): S_PBP too LARGE (over-strong ideal tension) -> RELAX tension
-  logical :: schur_visco          = .false.  ! add viscosity to S_PBP (Atilde_22 enrichment); targets lambda>>1
-  integer :: schur_resistive_mode = 0        ! 0=none, 1=relaxation (targets lambda<<1), 2=diffusion (targets lambda>>1)
-  real*8  :: c_resist             = 1.0d0    ! explicit-diffusion coefficient scale (mode 2)
-  real*8  :: c_lambda             = 1.0d0    ! poloidal lambda_elt scale (mode 1 relaxation)
+  ! --- S_PBP default model (design doc Definition 1): the assembled momentum-Schur
+  !     approximation is S_PBP = inertia + viscosity + relaxed tension + S_geo. All
+  !     four terms are unconditional; the gated/optional terms (kink, interchange
+  !     drive, flutter, equilibrium flow) are not part of this operator. ---
+  real*8, parameter :: c_lambda = 1.0d0   ! poloidal lambda_elt scale (tension relaxation)
 
-  ! --- Geodesic compression S_geo (design doc eq.24). Default OFF = baseline arm;
-  !     flip to .true. and recompile for the "with S_geo" measurement arm. ---
-  logical :: schur_geo            = .false.
   real*8  :: amat_schur_geo, p0, zeta
 
-  ! Element-representative geometry for the resistive relaxation (mode 1):
+  ! Element-representative geometry for the resistive tension relaxation:
   !   area_elt ~ h^2 (poloidal 1/h^2 proxy), R0 = area-weighted mean major radius.
   real*8  :: area_elt, R0_elt
 
@@ -135,10 +127,6 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
   real*8, dimension(n_plane, N1V, N1V) :: ELM_p_visco     ! poloidal viscous integrand
   real*8, dimension(n_plane, N1V, N1V) :: ELM_kn_visco    ! toroidal viscous integrand (kn channel)
   real*8 :: amat_visco, amat_visco_kn
-
-  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_diff      ! poloidal resistive diffusion
-  real*8, dimension(n_plane, N1V, N1V) :: ELM_kn_diff     ! toroidal resistive diffusion (kn channel)
-  real*8 :: amat_diff, amat_diff_kn
 
   ! Values at Gauss points
   real*8 :: T0
@@ -187,17 +175,11 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
     ELM_p_schur_n  = 0.d0        ! Term 2 toroidal-cross tension
     ELM_p_schur_kn = 0.d0        ! Term 2 toroidal-squared tension
     ELM_tension    = 0.d0
-    if (schur_geo) ELM_p_schur_geo = 0.d0
+    ELM_p_schur_geo = 0.d0       ! S_geo geodesic compression
+    ELM_p_visco  = 0.d0
+    ELM_kn_visco = 0.d0
     area_elt = 0.d0
     R0_elt   = 0.d0
-    if (schur_visco) then
-      ELM_p_visco  = 0.d0
-      ELM_kn_visco = 0.d0
-    endif
-    if (schur_resistive_mode == 2) then
-      ELM_p_diff  = 0.d0
-      ELM_kn_diff = 0.d0
-    endif
   endif
   
 
@@ -411,13 +393,11 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
 
                 ! ============================================================
                 ! S_PBP: element approximation of the velocity Schur complement
-                !   S_u = Atilde_22 - Atilde_21 * Atilde_11^-1 * B_12
-                ! Baseline S_PBP = inertia (from Atilde_22) + IDEAL Alfven tension
-                !   (Atilde_21 (dt M_psi^-1) B_12, i.e. ideal/frozen-flux Atilde_11^-1
-                !    -> constant (theta*dt)^2 weight). Enrichments (compile-time switches):
-                !     schur_visco         : + viscosity in Atilde_22
-                !     schur_resistive_mode=1: relax tension by tau_R(n) (resistive Atilde_11^-1)
-                !     schur_resistive_mode=2: + explicit resistive diffusion
+                !   S_u = Atilde_22 - Atilde_21 * Atilde_11^-1 * B_12 - (pressure channel)
+                ! Default model (design doc Definition 1), all terms unconditional:
+                !   inertia (from Atilde_22) + viscosity (Atilde_22 enrichment)
+                !   + relaxed Alfven tension (tau_R(n), resistive Atilde_11^-1)
+                !   + S_geo geodesic compression (pressure channel).
                 ! ============================================================
                 ! --- Schur correction equation ---
                 amat_psi_correction = - (eta_T / BigR) * (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) * xjac * theta * tstep
@@ -470,36 +450,19 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 !   -(4 gamma/(1+zeta)) (theta*dt)^2 * R * p0 * (d_Z v)(d_Z u).
                 ! d_Z = d_y (poloidal Z). Negative leading sign -> ADDS dissipation
                 ! in the negative-definite S_PBP convention (same as amat_schur).
-                if (schur_geo) then
-                  amat_schur_geo = - (4.d0*gamma/(1.d0+zeta)) * (theta*tstep)**2 &
-                                     * p0 * v_fct%v_y * u_fct%v_y * BigR * xjac
-                endif
+                amat_schur_geo = - (4.d0*gamma/(1.d0+zeta)) * (theta*tstep)**2 &
+                                   * p0 * v_fct%v_y * u_fct%v_y * BigR * xjac
 
                 ! Viscosity (Atilde_22 enrichment): poloidal biharmonic + toroidal companion.
-                ! SIGN: all enrichment integrands carry the SAME leading minus as the baseline
-                ! S_PBP terms (inertia amat_schur_inertia, tension amat_schur/_n/_kn are all
-                ! negative). S_PBP is assembled negative-(semi)definite, so a negative integrand
-                ! ADDS dissipation. The n0 (scatter_fft_to_elm) and n2 (scatter_fft_to_elm_kn)
-                ! channels both match the validated amat_schur_kn convention. Confirm via the
-                ! SPD check of spec(S_PBP^-1 S_u) in the sweep (a wrong sign injects negatives).
-                if (schur_visco) then
-                  amat_visco    = - visco_T * BigR * (v_fct%v_xx + v_fct%v_x*BigR + v_fct%v_yy) &
-                                              * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
-                  amat_visco_kn = - visco_T * (1.d0 / BigR) * v_fct%v &
-                                              * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
-                endif
-
-                ! Explicit resistive diffusion (Atilde_22 enrichment):
-                !   c_resist*eta_T*theta*dt * [ (grad_pol v . grad_pol u) + (n/R)^2 v u ].
-                ! Poloidal part weighted by R (weak form); toroidal part carries 1/R^2,
-                ! the scatter_fft_to_elm_kn supplying the n^2 -> (n/R)^2 v u R = n^2 v u / R.
-                ! SIGN: negative leading sign on both channels (see viscosity note above).
-                if (schur_resistive_mode == 2) then
-                  amat_diff    = - c_resist * eta_T * (v_fct%v_x*u_fct%v_x + v_fct%v_y*u_fct%v_y) &
-                                          * BigR * xjac * theta * tstep
-                  amat_diff_kn = - c_resist * eta_T * (1.d0 / BigR) * v_fct%v * u_fct%v &
-                                          * xjac * theta * tstep
-                endif
+                ! SIGN: all S_PBP integrands carry the SAME leading minus (inertia, tension,
+                ! S_geo are all negative). S_PBP is assembled negative-(semi)definite, so a
+                ! negative integrand ADDS dissipation. The n0 (scatter_fft_to_elm) and n2
+                ! (scatter_fft_to_elm_kn) channels both match the validated amat_schur_kn
+                ! convention.
+                amat_visco    = - visco_T * BigR * (v_fct%v_xx + v_fct%v_x*BigR + v_fct%v_yy) &
+                                            * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
+                amat_visco_kn = - visco_T * (1.d0 / BigR) * v_fct%v &
+                                            * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
 
                 ! Term 2: dt^2 * [grad_pol q * grad_pol w + 2/R * q * w_R]
                 ! Part 00: purely poloidal (no phi derivatives)
@@ -543,18 +506,9 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                   ELM_p_schur(mp, idx_ij, idx_kl)    = ELM_p_schur(mp, idx_ij, idx_kl)    + wst * amat_schur
                   ELM_p_schur_n(mp, idx_ij, idx_kl)  = ELM_p_schur_n(mp, idx_ij, idx_kl)  + wst * amat_schur_n
                   ELM_p_schur_kn(mp, idx_ij, idx_kl) = ELM_p_schur_kn(mp, idx_ij, idx_kl) + wst * amat_schur_kn
-                  if (schur_geo) then
-                    ELM_p_schur_geo(mp, idx_ij, idx_kl) = ELM_p_schur_geo(mp, idx_ij, idx_kl) &
-                                                          + wst * amat_schur_geo
-                  endif
-                  if (schur_visco) then
-                    ELM_p_visco(mp, idx_ij, idx_kl)  = ELM_p_visco(mp, idx_ij, idx_kl)  + wst * amat_visco
-                    ELM_kn_visco(mp, idx_ij, idx_kl) = ELM_kn_visco(mp, idx_ij, idx_kl) + wst * amat_visco_kn
-                  endif
-                  if (schur_resistive_mode == 2) then
-                    ELM_p_diff(mp, idx_ij, idx_kl)  = ELM_p_diff(mp, idx_ij, idx_kl)  + wst * amat_diff
-                    ELM_kn_diff(mp, idx_ij, idx_kl) = ELM_kn_diff(mp, idx_ij, idx_kl) + wst * amat_diff_kn
-                  endif
+                  ELM_p_schur_geo(mp, idx_ij, idx_kl) = ELM_p_schur_geo(mp, idx_ij, idx_kl) + wst * amat_schur_geo
+                  ELM_p_visco(mp, idx_ij, idx_kl)  = ELM_p_visco(mp, idx_ij, idx_kl)  + wst * amat_visco
+                  ELM_kn_visco(mp, idx_ij, idx_kl) = ELM_kn_visco(mp, idx_ij, idx_kl) + wst * amat_visco_kn
                 endif
 
               enddo  ! l
@@ -631,15 +585,13 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
           ! Geodesic compression S_geo: poloidal (n0) channel, directly into
           ! ELM_schur_PBP (not relaxed; the d_Z v * d_Z u factor has no phi deriv,
           ! the phi-coupling comes from the 3D p0). Gets the 0.5 scaling below.
-          if (schur_geo) then
-            in_fft = ELM_p_schur_geo(1:n_plane, i, j)
+          in_fft = ELM_p_schur_geo(1:n_plane, i, j)
 #ifdef USE_FFTW
-            call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+          call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
-            call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
-          endif
+          call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
 
-          ! Tension channels -> ELM_tension (relaxed later if schur_resistive_mode==1)
+          ! Tension channels -> ELM_tension (relaxed later)
           in_fft = ELM_p_schur(1:n_plane, i, j)
 #ifdef USE_FFTW
           call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
@@ -658,33 +610,18 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
 #endif
           call scatter_fft_to_elm_kn(out_fft, i, j, ELM_tension, D1V)
 
-          if (schur_visco) then
-            in_fft = ELM_p_visco(1:n_plane, i, j)
+          ! Viscosity: n0 (poloidal) + kn (toroidal) channels into ELM_schur_PBP.
+          in_fft = ELM_p_visco(1:n_plane, i, j)
 #ifdef USE_FFTW
-            call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+          call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
-            call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
+          call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
 
-            in_fft = ELM_kn_visco(1:n_plane, i, j)
+          in_fft = ELM_kn_visco(1:n_plane, i, j)
 #ifdef USE_FFTW
-            call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+          call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
-            call scatter_fft_to_elm_kn(out_fft, i, j, ELM_schur_PBP, D1V)
-          endif
-
-          if (schur_resistive_mode == 2) then
-            in_fft = ELM_p_diff(1:n_plane, i, j)
-#ifdef USE_FFTW
-            call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#endif
-            call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
-
-            in_fft = ELM_kn_diff(1:n_plane, i, j)
-#ifdef USE_FFTW
-            call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#endif
-            call scatter_fft_to_elm_kn(out_fft, i, j, ELM_schur_PBP, D1V)
-          endif
+          call scatter_fft_to_elm_kn(out_fft, i, j, ELM_schur_PBP, D1V)
         endif
 
     enddo
@@ -703,11 +640,9 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
     ! Applied per-harmonic (nonlinear in n) as a row scaling of the harmonic-diagonal
     ! tension block by 1/(1 + theta*eta_T*dt*lambda_elt(n)) (the (theta*dt)^2 already lives
     ! in amat_schur). Reduces to the ideal limit as eta_T -> 0.
-    if (schur_resistive_mode == 1) then
-      if (area_elt > 0.d0) R0_elt = R0_elt / area_elt   ! area-weighted mean major radius
-      call apply_schur_relaxation(ELM_tension, D1V, area_elt, R0_elt, &
-                                  c_lambda, eta_T, theta, tstep)
-    endif
+    if (area_elt > 0.d0) R0_elt = R0_elt / area_elt   ! area-weighted mean major radius
+    call apply_schur_relaxation(ELM_tension, D1V, area_elt, R0_elt, &
+                                c_lambda, eta_T, theta, tstep)
 
     ELM_schur_PBP = ELM_schur_PBP + ELM_tension
     ELM_schur_PBP = 0.5d0 * ELM_schur_PBP
