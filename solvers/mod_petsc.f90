@@ -258,6 +258,46 @@ contains
   end subroutine petsc_update_rhs
 
 
+  !> Load an FGMRES initial guess into petsc_sys%x from the JOREK sol_vec (the
+  !! previous time-step increment). Mirrors petsc_update_rhs ownership slicing so
+  !! that x and b share the same global layout. If sol_vec is not yet allocated
+  !! (e.g. the first step of a fresh, non-restart run) the guess degrades to zero,
+  !! reproducing the standard zero-start. Used together with KSPSetInitialGuessNonzero.
+  subroutine petsc_update_initial_guess(petsc_sys, sol_vec)
+    use data_structure, only: type_RHS
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_RHS), intent(in) :: sol_vec
+
+    integer :: i, my_id, mpierr, comm
+    PetscInt :: i_start, i_end, n_local
+    PetscInt, allocatable :: indices_petsc(:)
+    PetscErrorCode :: ierr
+
+    if (.not. associated(sol_vec%val)) then
+      PetscCallA(VecSet(petsc_sys%x, 0.0d0, ierr))
+      return
+    endif
+
+    PetscCallA(PetscObjectGetComm(petsc_sys%x, comm, ierr))
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    PetscCallA(VecGetOwnershipRange(petsc_sys%x, i_start, i_end, ierr))
+    n_local = i_end - i_start
+
+    allocate(indices_petsc(n_local))
+    do i = 1, n_local
+      indices_petsc(i) = i_start + (i - 1)
+    end do
+
+    PetscCallA(VecSetValues(petsc_sys%x, n_local, indices_petsc, sol_vec%val(i_start+1:i_end), INSERT_VALUES, ierr))
+    PetscCallA(VecAssemblyBegin(petsc_sys%x, ierr))
+    PetscCallA(VecAssemblyEnd(petsc_sys%x, ierr))
+    deallocate(indices_petsc)
+
+  end subroutine petsc_update_initial_guess
+
+
   subroutine petsc_print_matrix_info(petsc_sys)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     PetscErrorCode :: ierr
@@ -464,6 +504,12 @@ contains
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetType(petsc_sys%ksp, KSPFGMRES, ierr))
 
+      ! Warm-start: consume the JOREK initial guess (previous-step increment) loaded into
+      ! petsc_sys%x_aij before each KSPSolve. The convergence reference stays the rhs norm
+      ! ||b|| (PETSc default; KSPConvergedDefaultSetUIRNorm is NOT set), so the stopping
+      ! criterion is identical to the zero-start behaviour - only the starting point changes.
+      PetscCallA(KSPSetInitialGuessNonzero(petsc_sys%ksp, PETSC_TRUE, ierr))
+
       ! Set the maximum iterations and restart
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
@@ -512,8 +558,9 @@ contains
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
     end if
 
-    ! Copy RHS, solve, copy solution back
+    ! Copy RHS and warm-start guess, solve, copy solution back
     PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
+    PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for FGMRES
 
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))

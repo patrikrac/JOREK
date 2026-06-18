@@ -45,6 +45,7 @@ module mod_sparse
 #include "petsc/finclude/petsc.h"
     use petsc
     use mod_petsc, only: petsc_init_system, petsc_update_matrix, petsc_update_rhs, &
+                         petsc_update_initial_guess, &
                          petsc_solve_iterative_and_retrieve, petsc_recover_solution, &
                          petsc_solve_and_retrieve, petsc_equilibrium_assemble, &
                          petsc_equilibrium_rhs, petsc_cleanup
@@ -219,6 +220,7 @@ module mod_sparse
           solver%petsc_sys%A = a_mat%petsc_A
         endif
         call petsc_update_rhs(solver%petsc_sys, rhs_vec)
+        call petsc_update_initial_guess(solver%petsc_sys, sol_vec)  ! warm-start from previous increment
         solver%iter_prev = solver%iter_gmres
         call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
                                                 solver%iter_gmres, solver%step_success)
@@ -240,6 +242,7 @@ module mod_sparse
       endif
       call petsc_update_matrix(solver%petsc_sys, a_mat)
       call petsc_update_rhs(solver%petsc_sys, rhs_vec)
+      call petsc_update_initial_guess(solver%petsc_sys, sol_vec)  ! warm-start from previous increment
       solver%iter_prev = solver%iter_gmres
       call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
                                               solver%iter_gmres, solver%step_success)
