@@ -402,10 +402,10 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 ! --- Schur correction equation ---
                 amat_psi_correction = - (eta_T / BigR) * (v_fct%v_x * psi_fct%v_x + v_fct%v_y * psi_fct%v_y) * xjac * theta * tstep
 
-                amat_u_correction = - r0_hat * BigR**2 * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * ( v_fct%v_x * u0_y - v_fct%v_y * u0_x) * xjac * theta * tstep  &
-                                      + visco_T * BigR * (v_fct%v_xx + v_fct%v_x*BigR + v_fct%v_yy) * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep 
+                amat_u_correction = - r0_hat * BigR**2 * (u_fct%v_xx + u_fct%v_x/BigR + u_fct%v_yy) * ( v_fct%v_x * u0_y - v_fct%v_y * u0_x) * xjac * theta * tstep  &
+                                      + visco_T * BigR * (v_fct%v_xx + v_fct%v_x/BigR + v_fct%v_yy) * (u_fct%v_xx + u_fct%v_x/BigR + u_fct%v_yy) * xjac * theta * tstep 
                                       
-                amat_u_kn_correction = - visco_T * (1.d0 / BigR) * v_fct%v * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep 
+                amat_u_kn_correction = - visco_T * (1.d0 / BigR) * v_fct%v * (u_fct%v_xx + u_fct%v_x/BigR + u_fct%v_yy) * xjac * theta * tstep 
                                         !+ visco_T * 1.d0 / BigR * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * xjac * theta * tstep &
                                         !- visco_T * (1.d0 + (1.d0 / BigR**2)) * v_fct%v * u_fct%v_x * xjac * theta * tstep
 
@@ -441,7 +441,11 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
 
                 ! 3. Construct the Matrix Entries
                 ! Term 1: Inertia (from Atilde_22) — NOT relaxed
-                amat_schur_inertia = - r0_hat * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * BigR * xjac
+                ! Carries the Gears mass factor (1+zeta), matching model199 amat_22
+                ! (unity for Crank-Nicolson, zeta=0). Keeps the inertia:tension:S_geo
+                ! scaling consistent with the exact S_u (mass ~ (1+zeta), couplings ~
+                ! (theta*dt)^2/(1+zeta)).
+                amat_schur_inertia = - r0_hat * (v_fct%v_x * u_fct%v_x + v_fct%v_y * u_fct%v_y) * BigR * xjac * (1.d0 + zeta)
                 ! Term 2: ideal poloidal Alfven tension (from Atilde_21 Atilde_11^-1 B_12) — relaxable
                 ! Gears 1/(1+zeta) factor (design doc Remark 2; unity for Crank-Nicolson, zeta=0).
                 amat_schur = - (theta*tstep)**2 / (1.d0+zeta) * ( (Q0x * W0x + Q0y * W0y) + (2.d0 / BigR) * Q0 * W0x ) * BigR * xjac
@@ -459,10 +463,10 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
                 ! negative integrand ADDS dissipation. The n0 (scatter_fft_to_elm) and n2
                 ! (scatter_fft_to_elm_kn) channels both match the validated amat_schur_kn
                 ! convention.
-                amat_visco    = - visco_T * BigR * (v_fct%v_xx + v_fct%v_x*BigR + v_fct%v_yy) &
-                                            * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
+                amat_visco    = - visco_T * BigR * (v_fct%v_xx + v_fct%v_x/BigR + v_fct%v_yy) &
+                                            * (u_fct%v_xx + u_fct%v_x/BigR + u_fct%v_yy) * xjac * theta * tstep
                 amat_visco_kn = - visco_T * (1.d0 / BigR) * v_fct%v &
-                                            * (u_fct%v_xx + u_fct%v_x*BigR + u_fct%v_yy) * xjac * theta * tstep
+                                            * (u_fct%v_xx + u_fct%v_x/BigR + u_fct%v_yy) * xjac * theta * tstep
 
                 ! Term 2: dt^2 * [grad_pol q * grad_pol w + 2/R * q * w_R]
                 ! Part 00: purely poloidal (no phi derivatives)
