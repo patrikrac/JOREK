@@ -642,13 +642,21 @@ contains
 
 
   !--------------------------------------------------------------------
-  !> Build the EXACT full momentum Schur complement (channels A+B):
+  !> Build the EXACT full momentum Schur complement (channels A+B+C):
   !!   S_u = Atilde_22
-  !!         - Atilde_21 Atilde_11^{-1} B_12        (A: magnetic)
-  !!         - B_25 B_55^{-1} B_52                   (B: pressure, rho)
-  !!         - B_26 B_66^{-1} B_62                   (B: pressure, T)
-  !! Channel C (flutter, coupled A_pp triangular solve via B_51/Atilde_61/
-  !! B_16) is a design-doc-gated term (H5) and is intentionally omitted here.
+  !!         - Atilde_21 Atilde_11^{-1} B_12                  (A: magnetic)
+  !!         - B_25 B_55^{-1} B_52                             (B: pressure, rho)
+  !!         - B_26 B_66^{-1} B_62                             (B: pressure, T)
+  !!         + B_25 B_55^{-1} B_51      Atilde_11^{-1} B_12    (C: pressure-flutter)
+  !!         + B_26 B_66^{-1} Atilde_61 Atilde_11^{-1} B_12    (C: thermal-flutter)
+  !! Channel C are the L-coupling cross-terms of A_pp^{-1} (eq.10 of the design
+  !! doc). They REUSE y_psi = Atilde_11^{-1}(B_12 e_j) already formed for channel
+  !! A, plus one extra B_55 and one extra B_66 solve per column. Note the sign:
+  !! channel C is ADDED (A_pp^{-1} off-diagonal block carries a minus, and S_u
+  !! subtracts the whole A_up A_pp^{-1} A_pu, so the two minuses cancel).
+  !! Toggle include_channel_C=.false. to recover the old A+B-only S_u (H5:
+  !! measure the flutter contribution per benchmark arm). The U-coupling (B_16)
+  !! cross-term is higher-order (negligible) and remains omitted.
   !! Column-probing: u-sized basis vectors, three MUMPS solves per column.
   !! Mirrors compute_schur_corrected_block_exact.
   !--------------------------------------------------------------------
@@ -656,6 +664,10 @@ contains
     implicit none
     Mat, intent(inout)  :: S_u
     logical, intent(in) :: first_time
+
+    ! Toggle: .true. builds the full S_u (A+B+C); .false. recovers the old
+    ! A+B-only reference. Flip and re-run to measure Channel C per arm (H5).
+    logical, parameter :: include_channel_C = .true.
 
     KSP            :: ksp_psi_l, ksp_rho_l, ksp_T_l
     PC             :: pc_l
@@ -682,6 +694,11 @@ contains
     if (my_id == 0) then
       allocate(S_dense(n, n)); S_dense = 0.0d0
       write(*,'(A,I0,A)') "[Diagnostics] Probing full momentum Schur S_u (", n, " columns)..."
+      if (include_channel_C) then
+        write(*,'(A)') "[Diagnostics]   channels: A (magnetic) + B (pressure) + C (flutter cross-terms)"
+      else
+        write(*,'(A)') "[Diagnostics]   channels: A (magnetic) + B (pressure)   [C OMITTED]"
+      endif
       flush(6)
     endif
 
@@ -743,11 +760,27 @@ contains
       call KSPSolve(ksp_T_l, z_T, y_T, ierr)
       call MatMult(g_ctx%B_26, y_T, r_T, ierr)
 
-      ! col = d_u - r_psi - r_rho - r_T
+      ! col = d_u - r_psi - r_rho - r_T  (channels A + B)
       call VecCopy(d_u, col, ierr)
       call VecAXPY(col, -1.0d0, r_psi, ierr)
       call VecAXPY(col, -1.0d0, r_rho, ierr)
       call VecAXPY(col, -1.0d0, r_T,   ierr)
+
+      ! channel C: L-coupling cross-terms of A_pp^{-1}, ADDED to col.
+      ! Reuses y_psi = Atilde_11^{-1}(B_12 e_j) from channel A; z_*/y_*/r_* are
+      ! free scratch here (their channel-B contributions are already in col).
+      if (include_channel_C) then
+        ! pressure-flutter:  + B_25 B_55^{-1} B_51 y_psi
+        call MatMult (g_ctx%B_51,    y_psi, z_rho, ierr)
+        call KSPSolve(ksp_rho_l,     z_rho, y_rho, ierr)
+        call MatMult (g_ctx%B_25,    y_rho, r_rho, ierr)
+        call VecAXPY (col, +1.0d0,   r_rho,        ierr)
+        ! thermal-flutter:   + B_26 B_66^{-1} Atilde_61 y_psi
+        call MatMult (g_ctx%Atilde_61, y_psi, z_T, ierr)
+        call KSPSolve(ksp_T_l,         z_T,   y_T, ierr)
+        call MatMult (g_ctx%B_26,      y_T,   r_T, ierr)
+        call VecAXPY (col, +1.0d0,     r_T,        ierr)
+      endif
 
       call VecScatterBegin(scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
