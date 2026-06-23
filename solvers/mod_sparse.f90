@@ -129,38 +129,38 @@ module mod_sparse
         solver%step_success = .true.
         petsc_direct_solved = .true.
       else if (.not. a_mat%petsc_assembled) then
-#else
-      if (.not. a_mat%petsc_assembled) then
 #endif
-      if (solver%library.eq.mumps) then
+        if (solver%library.eq.mumps) then
 #ifdef USE_MUMPS
-        if (verbose) write(*,*) "Using MUMPS solver"
-        solver%mmss%equilibrium = solver%equilibrium
-        call solve_mumps_all(solver%mmss, a_mat, rhs_vec, solver%solve_only, tag)
+          if (verbose) write(*,*) "Using MUMPS solver"
+          solver%mmss%equilibrium = solver%equilibrium
+          call solve_mumps_all(solver%mmss, a_mat, rhs_vec, solver%solve_only, tag)
 #endif
-      elseif (solver%library.eq.strumpack) then
+        elseif (solver%library.eq.strumpack) then
 #ifdef USE_STRUMPACK
-        if (verbose) write(*,*) "Using STRUMPACK solver"
+          if (verbose) write(*,*) "Using STRUMPACK solver"
 # ifdef USE_GPU
-      ! In the case of STRUMPACK/pastix the matrix is deallocated, but since it is renamed this only works here
-      !$omp target exit data map(delete: a_mat%val(1:a_mat%nnz), a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz))
+        ! In the case of STRUMPACK/pastix the matrix is deallocated, but since it is renamed this only works here
+        !$omp target exit data map(delete: a_mat%val(1:a_mat%nnz), a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz))
 # endif
         solver%spss%equilibrium = solver%equilibrium
         call solve_strumpack_all(solver%spss, a_mat, rhs_vec, solver%solve_only, tag)
 #endif
-      elseif (solver%library.eq.pastix) then
+        elseif (solver%library.eq.pastix) then
 #if (defined USE_PASTIX) || (defined USE_PASTIX6)
-        if (verbose) write(*,*) "Using PaStiX solver"
+          if (verbose) write(*,*) "Using PaStiX solver"
 # ifdef USE_GPU
-      ! In the case of STRUMPACK/pastix the matrix is deallocated, but since it is renamed this only works here
-      !$omp target exit data map(delete: a_mat%val(1:a_mat%nnz), a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz))
+          ! In the case of STRUMPACK/pastix the matrix is deallocated, but since it is renamed this only works here
+          !$omp target exit data map(delete: a_mat%val(1:a_mat%nnz), a_mat%irn(1:a_mat%nnz), a_mat%jcn(1:a_mat%nnz))
 # endif
-        solver%ptss%equilibrium = solver%equilibrium
-        solver%ptss%refine = .true.
-        call solve_pastix_all(solver%ptss, a_mat, rhs_vec, solver%solve_only, tag)
+          solver%ptss%equilibrium = solver%equilibrium
+          solver%ptss%refine = .true.
+          call solve_pastix_all(solver%ptss, a_mat, rhs_vec, solver%solve_only, tag)
 #endif
-      endif
+        endif
+#ifdef USE_PETSC
       endif   ! equilibrium-petsc / .not. a_mat%petsc_assembled
+#endif
 #ifdef USE_PETSC
 
       if (a_mat%petsc_assembled) then
