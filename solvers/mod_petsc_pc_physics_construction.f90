@@ -1943,7 +1943,7 @@ contains
 
     ! --- Random RHS on the packed 2x2 layout ---
     call PetscRandomCreate(comm, rctx, ierr)
-    call PetscRandomSetType(rctx, PETSCRAND48, ierr)
+    call PetscRandomSetType(rctx, "rand", ierr)
     call VecSetRandom(b, rctx, ierr)
     call PetscRandomDestroy(rctx, ierr)
 
