@@ -129,6 +129,25 @@ module mod_petsc_pc_physics_ctx
     Vec :: kae_ypsi, kae_yu           !< accumulated outputs (psi-, u-sized)
     Vec :: kae_spsi, kae_su           !< scratch for the -B_1x/-B_2x terms
     logical :: kae_setup_done = .false.
+
+    ! ================================================================
+    ! TEMPORARY diagnostic (Option A, Step 2) -- TO BE REPLACED (Step 3).
+    ! S_PBP MatShell using the consistent-mass approximation
+    !   Atilde_11^{-1} -> (1+zeta)^{-1} M_j^{-1}     (M_j = B_33 = ksp_Mj)
+    ! with channels B and C kept EXACT (dedicated B_55/B_66 MUMPS solves).
+    ! Built only for offline spectrum analysis vs the exact S_u; isolates the
+    ! quality of the Atilde_11^{-1} -> (1+zeta)^{-1} M_j^{-1} substitution.
+    ! Delete these fields + setup_S_PBP_diag_shell/materialize_S_PBP_diag_aij
+    ! once the production S_PBP operator exists.
+    ! ================================================================
+    Mat     :: S_PBP_diag_shell
+    KSP     :: spbpd_ksp_B55, spbpd_ksp_B66   !< dedicated EXACT (MUMPS LU) B_55/B_66 solves
+    real*8  :: spbpd_inv_gears = 1.0d0        !< cached 1/(1+zeta)
+    logical :: spbpd_setup_done = .false.
+    Vec     :: spbpd_zpsi, spbpd_ypsi         !< psi-sized: B_12 x ; (1+zeta)^-1 M_j^-1 B_12 x
+    Vec     :: spbpd_zrho, spbpd_yrho         !< rho-sized scratch (channels B/C)
+    Vec     :: spbpd_zT,   spbpd_yT           !< T-sized scratch   (channels B/C)
+    Vec     :: spbpd_ru                       !< u-sized channel accumulator scratch
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx

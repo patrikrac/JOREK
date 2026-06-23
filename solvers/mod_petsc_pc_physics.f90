@@ -12,6 +12,7 @@ module mod_petsc_pc_physics
        compute_schur_corrected_block_61, compute_schur_corrected_block_exact, &
        compute_explicit_preconditioned_matrix, &
        compute_full_momentum_schur_exact, &
+       setup_S_PBP_diag_shell, materialize_S_PBP_diag_aij, &
        setup_block_ksp, setup_constraint_mass_ksp, &
        setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
        setup_alfven_block_ksp, setup_rho_block_ksp, setup_T_block_ksp, &
@@ -72,6 +73,7 @@ contains
     Mat :: prod_tmp                              ! temporary for block-inverse diagnostic
     
     Mat :: B_tmp ! Store the preconditioned matrix B = M^{-1} A
+    Mat :: S_PBP_diag_aij  ! TEMPORARY (Option A, Step 2): materialized diagnostic shell
     PetscViewer :: viewer
     ! Slice 1 offline S_PBP verification: build full momentum Schur S_u, measure
     ! sigma(S_PBP^-1 S_u), and SKIP the Stage-1 S_u->S_PBP overwrite. Set .false.
@@ -289,14 +291,26 @@ contains
     end if
 
     ! --- Slice 1 offline S_PBP verification switch.  When .true., build the FULL
-    !     momentum Schur S_u (channels A+B) as the reference and skip the Stage-1
-    !     S_u->S_PBP overwrite (below) so the ASSEMBLED S_PBP is what gets measured.
+    !     momentum Schur S_u (channels A+B+C) as the reference, build the diagnostic
+    !     S_PBP MatShell (Atilde_11^-1 -> (1+zeta)^-1 M_j^-1, channels B/C kept exact),
+    !     and measure sigma(S_PBP_diag^-1 S_u). Skips the Stage-1 S_u->S_PBP overwrite.
     verify_spbp_spectrum = .false.
 
     if (verify_spbp_spectrum) then
-      ! Exact reference: full momentum Schur (channels A+B), held fixed across arms.
+      ! Exact reference: full momentum Schur (channels A+B+C), held fixed across arms.
       call compute_full_momentum_schur_exact(g_ctx%S_u, first_time)
       call petsc_mat_convert_spectrum(g_ctx%S_u, "S_u_exact", .false.)
+
+      ! TEMPORARY diagnostic (Option A, Step 2) -- TO BE REPLACED (Step 3):
+      ! consistent-mass S_PBP shell, materialized to AIJ, then raw + preconditioned
+      ! spectra. spec(S_PBP_diag^-1 S_u) isolates the Atilde_11^-1 -> M_j^-1 quality.
+      call setup_S_PBP_diag_shell(comm, first_time)
+      call materialize_S_PBP_diag_aij(S_PBP_diag_aij, .true.)
+      call petsc_mat_convert_spectrum(S_PBP_diag_aij, "S_PBP_diag", .false.)
+      call compute_explicit_preconditioned_matrix(S_PBP_diag_aij, g_ctx%S_u, B_tmp, .true.)
+      call petsc_mat_convert_spectrum(B_tmp, "S_PBP_diag_inv_S_u", .false.)
+      call MatDestroy(S_PBP_diag_aij, ierr)
+      call MatDestroy(B_tmp, ierr)
     else
       !call compute_schur_corrected_block_exact(g_ctx%Atilde_11, g_ctx%Atilde_22, &
       !                                         g_ctx%Atilde_21, g_ctx%B_12, g_ctx%S_u, first_time)

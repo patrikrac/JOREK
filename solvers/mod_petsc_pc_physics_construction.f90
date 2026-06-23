@@ -5,7 +5,8 @@ module mod_petsc_pc_physics_construction
   use petsc
   use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx
   use mod_petsc_pc_toroidal, only: petsc_setup_toroidal_harmonic_pc_blocked
-  use mod_petsc_pc_physics_apply, only: k_a_exact_mult
+  use mod_petsc_pc_physics_apply, only: k_a_exact_mult, s_pbp_diag_mult
+  use phys_module, only: time_evol_zeta
   implicit none
   private
 
@@ -29,6 +30,8 @@ module mod_petsc_pc_physics_construction
   public :: compute_schur_corrected_block_exact
   public :: compute_full_momentum_schur_exact
   public :: compute_explicit_preconditioned_matrix
+  public :: setup_S_PBP_diag_shell        ! TEMPORARY diagnostic (Option A, Step 2)
+  public :: materialize_S_PBP_diag_aij    ! TEMPORARY diagnostic (Option A, Step 2)
   public :: setup_block_ksp
   public :: setup_constraint_mass_ksp
   public :: setup_alfven_block_ksp
@@ -1069,6 +1072,140 @@ contains
 
     g_ctx%kae_setup_done = .true.
   end subroutine setup_k_a_exact_shell
+
+  !--------------------------------------------------------------------
+  !> TEMPORARY (Option A, Step 2) -- TO BE REPLACED (Step 3).
+  !> Set up the diagnostic S_PBP MatShell that approximates Atilde_11^{-1} by
+  !! (1+zeta)^{-1} M_j^{-1} and keeps channels B, C exact. Reuses g_ctx%ksp_Mj
+  !! (consistent mass = B_33) and creates dedicated EXACT MUMPS solves for
+  !! B_55, B_66. Work vecs and the shell are created once.
+  !--------------------------------------------------------------------
+  subroutine setup_S_PBP_diag_shell(comm, first_time)
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+
+    PC             :: pc_l
+    PetscInt       :: n_loc, n_glob
+    PetscErrorCode :: ierr
+
+    ! cached scalar weight 1/(1+zeta) -- refreshed every call (zeta may change).
+    ! CN: zeta=0 -> 1 ; Gears: zeta=1/2 -> 2/3.
+    g_ctx%spbpd_inv_gears = 1.0d0 / (1.0d0 + time_evol_zeta)
+
+    if (.not. g_ctx%spbpd_setup_done) then
+      ! --- one-time creation of KSP objects, work vecs, and the shell ---
+      ! Dedicated EXACT (MUMPS LU) solves for the B-channel diagonal blocks, so the
+      ! diagnostic matches the exact-S_u reference channels regardless of how the
+      ! production ksp_rho/ksp_T happen to be configured (B_55/B_66 vs R_55/R_66).
+      call KSPCreate(comm, g_ctx%spbpd_ksp_B55, ierr)
+      call KSPSetType(g_ctx%spbpd_ksp_B55, KSPPREONLY, ierr)
+      call KSPGetPC(g_ctx%spbpd_ksp_B55, pc_l, ierr); call PCSetType(pc_l, PCLU, ierr)
+      call PCFactorSetMatSolverType(pc_l, MATSOLVERMUMPS, ierr)
+
+      call KSPCreate(comm, g_ctx%spbpd_ksp_B66, ierr)
+      call KSPSetType(g_ctx%spbpd_ksp_B66, KSPPREONLY, ierr)
+      call KSPGetPC(g_ctx%spbpd_ksp_B66, pc_l, ierr); call PCSetType(pc_l, PCLU, ierr)
+      call PCFactorSetMatSolverType(pc_l, MATSOLVERMUMPS, ierr)
+
+      ! work vecs: psi-, u-, rho-, T-sized. Atilde_21: psi(col)->u(row).
+      call MatCreateVecs(g_ctx%Atilde_21, g_ctx%spbpd_zpsi, g_ctx%spbpd_ru, ierr)
+      call VecDuplicate(g_ctx%spbpd_zpsi, g_ctx%spbpd_ypsi, ierr)
+      call MatCreateVecs(g_ctx%B_52, PETSC_NULL_VEC, g_ctx%spbpd_zrho, ierr)
+      call VecDuplicate(g_ctx%spbpd_zrho, g_ctx%spbpd_yrho, ierr)
+      call MatCreateVecs(g_ctx%B_62, PETSC_NULL_VEC, g_ctx%spbpd_zT, ierr)
+      call VecDuplicate(g_ctx%spbpd_zT, g_ctx%spbpd_yT, ierr)
+
+      ! the shell itself, sized like the u-block (Atilde_22 : square, u x u)
+      call MatGetLocalSize(g_ctx%Atilde_22, n_loc, PETSC_NULL_INTEGER, ierr)
+      call MatGetSize(g_ctx%Atilde_22, n_glob, PETSC_NULL_INTEGER, ierr)
+      call MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, &
+                          PETSC_NULL_INTEGER, g_ctx%S_PBP_diag_shell, ierr)
+      call MatShellSetOperation(g_ctx%S_PBP_diag_shell, MATOP_MULT, s_pbp_diag_mult, ierr)
+
+      g_ctx%spbpd_setup_done = .true.
+    endif
+
+    ! (re)bind + (re)factor the B-channel solves on the CURRENT B_55/B_66 (the
+    ! blocks are rebuilt each PC rebuild), mirroring the exact-S_u builder's freshness.
+    call KSPSetOperators(g_ctx%spbpd_ksp_B55, g_ctx%B_55, g_ctx%B_55, ierr)
+    call KSPSetUp(g_ctx%spbpd_ksp_B55, ierr)
+    call KSPSetOperators(g_ctx%spbpd_ksp_B66, g_ctx%B_66, g_ctx%B_66, ierr)
+    call KSPSetUp(g_ctx%spbpd_ksp_B66, ierr)
+  end subroutine setup_S_PBP_diag_shell
+
+  !--------------------------------------------------------------------
+  !> TEMPORARY (Option A, Step 2) -- TO BE REPLACED (Step 3).
+  !> Materialize the S_PBP_diag MatShell into an explicit MPIAIJ matrix by
+  !! column-probing (MatMult on unit vectors), so the dense spectrum and
+  !! preconditioned-spectrum drivers (which LU-factor) can consume it.
+  !! Mirrors the assembly half of compute_full_momentum_schur_exact.
+  !--------------------------------------------------------------------
+  subroutine materialize_S_PBP_diag_aij(aij, first_time)
+    Mat, intent(inout)  :: aij
+    logical, intent(in) :: first_time
+
+    Vec            :: e_j, col, col_seq
+    VecScatter     :: scat
+    PetscErrorCode :: ierr
+    PetscInt       :: N_global, m_local, n_local
+    integer        :: n, j, my_id, mpierr
+    MPI_Comm       :: comm
+    PetscScalar, pointer  :: arr(:)
+    real*8, allocatable   :: S_dense(:,:)
+    PetscInt, allocatable :: row_idxs(:)
+    PetscInt       :: col_idx(1)
+
+    call PetscObjectGetComm(g_ctx%S_PBP_diag_shell, comm, ierr)
+    call MPI_Comm_rank(comm, my_id, mpierr)
+    call MatGetSize(g_ctx%S_PBP_diag_shell, PETSC_NULL_INTEGER, N_global, ierr)
+    n = int(N_global)
+
+    if (my_id == 0) then
+      allocate(S_dense(n, n)); S_dense = 0.0d0
+      write(*,'(A,I0,A)') "[Diagnostics] Materializing S_PBP_diag shell (", n, " columns)..."
+      flush(6)
+    endif
+
+    call MatCreateVecs(g_ctx%S_PBP_diag_shell, e_j, col, ierr)
+    call VecScatterCreateToZero(col, scat, col_seq, ierr)
+
+    do j = 0, n-1
+      call VecSet(e_j, 0.0d0, ierr)
+      call VecSetValue(e_j, j, 1.0d0, INSERT_VALUES, ierr)
+      call VecAssemblyBegin(e_j, ierr); call VecAssemblyEnd(e_j, ierr)
+      call MatMult(g_ctx%S_PBP_diag_shell, e_j, col, ierr)
+      call VecScatterBegin(scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd  (scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (my_id == 0) then
+        call VecGetArrayF90(col_seq, arr, ierr)
+        S_dense(1:n, j+1) = real(arr, kind=8)
+        call VecRestoreArrayF90(col_seq, arr, ierr)
+      endif
+    enddo
+
+    call VecGetLocalSize(col, m_local, ierr)
+    call VecGetLocalSize(e_j, n_local, ierr)
+    if (.not. first_time) call MatDestroy(aij, ierr)
+    call MatCreate(comm, aij, ierr)
+    call MatSetSizes(aij, m_local, n_local, n, n, ierr)
+    call MatSetType(aij, MATMPIAIJ, ierr)
+    call MatSetOption(aij, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    call MatSetUp(aij, ierr)
+    if (my_id == 0) then
+      allocate(row_idxs(n))
+      do j = 0, n-1; row_idxs(j+1) = j; enddo
+      do j = 0, n-1
+        col_idx(1) = j
+        call MatSetValues(aij, n, row_idxs, 1, col_idx, S_dense(:, j+1), INSERT_VALUES, ierr)
+      enddo
+      deallocate(row_idxs); deallocate(S_dense)
+    endif
+    call MatAssemblyBegin(aij, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd  (aij, MAT_FINAL_ASSEMBLY, ierr)
+
+    call VecScatterDestroy(scat, ierr); call VecDestroy(col_seq, ierr)
+    call VecDestroy(e_j, ierr); call VecDestroy(col, ierr)
+  end subroutine materialize_S_PBP_diag_aij
 
   !--------------------------------------------------------------------
   !> Set up the KSP for the (psi,u) Alfven super-block K_A.

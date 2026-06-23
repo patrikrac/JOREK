@@ -9,6 +9,7 @@ module mod_petsc_pc_physics_apply
 
   public :: physics_pc_apply
   public :: k_a_exact_mult
+  public :: s_pbp_diag_mult   ! TEMPORARY diagnostic (Option A, Step 2) -- remove with Step 3
 
 contains
 
@@ -104,6 +105,69 @@ contains
 
     ierr = 0
   end subroutine k_a_exact_mult
+
+  !> MATSHELL MATOP_MULT callback: y = S_PBP_diag * x   (TEMPORARY, Option A).
+  !!
+  !! Diagnostic momentum-Schur approximation that replaces ONLY the magnetic-
+  !! channel inner inverse Atilde_11^{-1} by the consistent-mass weight
+  !! (1+zeta)^{-1} M_j^{-1} (M_j = B_33, already factored as ksp_Mj); channels
+  !! B and C are kept EXACT via dedicated B_55/B_66 MUMPS solves. Mirrors
+  !! compute_full_momentum_schur_exact term-by-term, so spec(S_PBP_diag^{-1} S_u)
+  !! isolates purely the quality of Atilde_11^{-1} -> (1+zeta)^{-1} M_j^{-1}.
+  !!
+  !!   ypsi = (1+zeta)^{-1} M_j^{-1} (B_12 x)
+  !!   y    = Atilde_22 x
+  !!        - Atilde_21 ypsi                                      (A: magnetic)
+  !!        - B_25 B_55^{-1}(B_52 x) - B_26 B_66^{-1}(B_62 x)     (B: pressure)
+  !!        + B_25 B_55^{-1}(B_51 ypsi)                           (C: pressure-flutter)
+  !!        + B_26 B_66^{-1}(Atilde_61 ypsi)                      (C: thermal-flutter)
+  !!
+  !! Work vecs live in g_ctx (created once by setup_S_PBP_diag_shell). The shell
+  !! context is unused; all state is read from the g_ctx singleton.
+  !! TO BE REPLACED by the production S_PBP operator (Step 3).
+  subroutine s_pbp_diag_mult(A_shell, x, y, ierr)
+    Mat            :: A_shell
+    Vec            :: x, y
+    PetscErrorCode :: ierr
+
+    ! diagonal: y = Atilde_22 x
+    call MatMult(g_ctx%Atilde_22, x, y, ierr)
+
+    ! consistent-mass psi response: ypsi = (1+zeta)^-1 M_j^-1 (B_12 x)
+    call MatMult (g_ctx%B_12,  x,               g_ctx%spbpd_zpsi, ierr)
+    call KSPSolve(g_ctx%ksp_Mj, g_ctx%spbpd_zpsi, g_ctx%spbpd_ypsi, ierr)
+    call VecScale(g_ctx%spbpd_ypsi, g_ctx%spbpd_inv_gears, ierr)
+
+    ! channel A (magnetic): y -= Atilde_21 ypsi
+    call MatMult(g_ctx%Atilde_21, g_ctx%spbpd_ypsi, g_ctx%spbpd_ru, ierr)
+    call VecAXPY(y, -1.0d0, g_ctx%spbpd_ru, ierr)
+
+    ! channel B (rho): y -= B_25 B_55^-1 (B_52 x)
+    call MatMult (g_ctx%B_52, x,                  g_ctx%spbpd_zrho, ierr)
+    call KSPSolve(g_ctx%spbpd_ksp_B55, g_ctx%spbpd_zrho, g_ctx%spbpd_yrho, ierr)
+    call MatMult (g_ctx%B_25, g_ctx%spbpd_yrho,   g_ctx%spbpd_ru,   ierr)
+    call VecAXPY(y, -1.0d0, g_ctx%spbpd_ru, ierr)
+
+    ! channel B (T): y -= B_26 B_66^-1 (B_62 x)
+    call MatMult (g_ctx%B_62, x,                  g_ctx%spbpd_zT, ierr)
+    call KSPSolve(g_ctx%spbpd_ksp_B66, g_ctx%spbpd_zT, g_ctx%spbpd_yT, ierr)
+    call MatMult (g_ctx%B_26, g_ctx%spbpd_yT,     g_ctx%spbpd_ru, ierr)
+    call VecAXPY(y, -1.0d0, g_ctx%spbpd_ru, ierr)
+
+    ! channel C (pressure-flutter): y += B_25 B_55^-1 (B_51 ypsi)
+    call MatMult (g_ctx%B_51, g_ctx%spbpd_ypsi,   g_ctx%spbpd_zrho, ierr)
+    call KSPSolve(g_ctx%spbpd_ksp_B55, g_ctx%spbpd_zrho, g_ctx%spbpd_yrho, ierr)
+    call MatMult (g_ctx%B_25, g_ctx%spbpd_yrho,   g_ctx%spbpd_ru,   ierr)
+    call VecAXPY(y, +1.0d0, g_ctx%spbpd_ru, ierr)
+
+    ! channel C (thermal-flutter): y += B_26 B_66^-1 (Atilde_61 ypsi)
+    call MatMult (g_ctx%Atilde_61, g_ctx%spbpd_ypsi, g_ctx%spbpd_zT, ierr)
+    call KSPSolve(g_ctx%spbpd_ksp_B66, g_ctx%spbpd_zT, g_ctx%spbpd_yT, ierr)
+    call MatMult (g_ctx%B_26, g_ctx%spbpd_yT,     g_ctx%spbpd_ru, ierr)
+    call VecAXPY(y, +1.0d0, g_ctx%spbpd_ru, ierr)
+
+    ierr = 0
+  end subroutine s_pbp_diag_mult
 
   !> Compute the j,w-folded Alfven-row residuals.
   !!   r_psi = x_psi - B_13 * temp_j
