@@ -1,4 +1,5 @@
 module mod_petsc_pc_toroidal
+#ifdef USE_PETSC
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
@@ -195,5 +196,6 @@ contains
     enddo
     deallocate(subksp_array)
   end subroutine petsc_setup_toroidal_harmonic_pc_blocked
-
+  
+#endif
 end module mod_petsc_pc_toroidal

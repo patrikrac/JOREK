@@ -1,4 +1,5 @@
 module mod_petsc_pc
+#ifdef USE_PETSC
   use mod_petsc_pc_toroidal
   use mod_petsc_pc_physics
 #include "petsc/finclude/petsc.h"
@@ -24,5 +25,5 @@ contains
         call petsc_setup_physics_pc(ksp, A)
     end select
   end subroutine petsc_setup_pc
-
+#endif
 end module mod_petsc_pc
