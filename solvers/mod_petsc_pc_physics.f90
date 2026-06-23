@@ -291,16 +291,15 @@ contains
     ! --- Slice 1 offline S_PBP verification switch.  When .true., build the FULL
     !     momentum Schur S_u (channels A+B) as the reference and skip the Stage-1
     !     S_u->S_PBP overwrite (below) so the ASSEMBLED S_PBP is what gets measured.
-    verify_spbp_spectrum = .true.
+    verify_spbp_spectrum = .false.
 
     if (verify_spbp_spectrum) then
       ! Exact reference: full momentum Schur (channels A+B), held fixed across arms.
       call compute_full_momentum_schur_exact(g_ctx%S_u, first_time)
+      call petsc_mat_convert_spectrum(g_ctx%S_u, "S_u_exact", .false.)
     else
-      ! Build the EXACT magnetic-only Schur S_u = Atilde_22 - Atilde_21 Atilde_11^{-1} B_12
-      ! (column-probing, n_u MUMPS solves on Atilde_11). Stage-1: copied into S_PBP below.
-      call compute_schur_corrected_block_exact(g_ctx%Atilde_11, g_ctx%Atilde_22, &
-                                               g_ctx%Atilde_21, g_ctx%B_12, g_ctx%S_u, first_time)
+      !call compute_schur_corrected_block_exact(g_ctx%Atilde_11, g_ctx%Atilde_22, &
+      !                                         g_ctx%Atilde_21, g_ctx%B_12, g_ctx%S_u, first_time)
     endif
 
     if (debug_physics_pc) then
@@ -344,7 +343,7 @@ contains
       !     files for offline Julia clustering analysis. ---
       ! SPD check of the assembled candidate S_PBP (symmetric -> DSYEVD; writes
       ! S_PBP_sym_dense_spectrum.dat with all-real eigenvalues).
-      call petsc_mat_convert_spectrum(g_ctx%S_PBP, "S_PBP_sym", .true.)
+      call petsc_mat_convert_spectrum(g_ctx%S_PBP, "S_PBP", .true.)
 
       ! sigma(S_PBP^-1 S_u): B_tmp = S_PBP^-1 S_u, then full spectrum (complex).
       ! B_tmp is a transient local (not SAVEd): pass .true. so the builder always
@@ -373,7 +372,7 @@ contains
       !   rebind the KSP operator in assemble_monolithic_4x4 where ksp_S_PBP is created:
       !   change `KSPSetOperators(ksp_S_PBP, S_PBP, S_PBP)` to
       !   `KSPSetOperators(ksp_S_PBP, g_ctx%S_u, g_ctx%S_u)`.
-      call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
+      !call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
     endif
 
     ! --- Step 5: Set up solver(s) ---
@@ -410,13 +409,11 @@ contains
         call assemble_probed_exact_4x4(use_reassembled, comm, first_time, my_id)
        ! call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_exact_4x4", .false.)
       endif
+
     else if (physics_pc_sub_blocks) then
       ! ===== Sub-blocks PC: (psi,u) Alfven super-block + independent rho, T blocks =====
 
       ! Build K_A (psi,u) 2x2 MatNest from refs to existing Atilde_*/B_12.
-      ! The nest must be recreated each rebuild (it references Atilde_* handles that
-      ! compute_schur_corrected_block_* destroys+recreates), so destroy the previous
-      ! nest first to avoid leaking one MatNest per rebuild.
       block
         Mat :: mats_nest_A(4)
         if (.not. first_time) call MatDestroy(g_ctx%K_A_block, ierr)
@@ -429,8 +426,6 @@ contains
       end block
 
       ! Convert the K_A MatNest to MPIAIJ for the Alfven block solver.
-      ! Destroy the previous AIJ first (MAT_INITIAL_MATRIX allocates a new object
-      ! each rebuild) to avoid leaking one matrix per rebuild.
       if (.not. first_time) call MatDestroy(g_ctx%K_A_aij, ierr)
       call MatConvert(g_ctx%K_A_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_A_aij, ierr)
 
@@ -439,13 +434,6 @@ contains
       call setup_alfven_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time, &
                                   "Alfven (psi,u)-block KSP")
 
-      ! rho (B_55) and T (B_66): independent transport blocks, each with its own
-      ! (physics-motivated) AMG solver, applied directly to the extracted diagonal
-      ! sub-blocks. No bundling, no packed (rho,T) work vectors. On solve_only steps
-      ! build_reduced is NOT called (mod_petsc.f90), so these KSPs and their AMG
-      ! hierarchies persist and are reused as-is while the outer FGMRES uses the fresh
-      ! A for mat-vecs (lagged-PC reuse across timesteps). On rebuild events B_55/B_66
-      ! have genuinely changed (theta*tstep, state), so refreshing here is correct.
       call setup_rho_block_ksp(g_ctx%ksp_rho, g_ctx%B_55, comm, first_time, "rho-block KSP")
       call setup_T_block_ksp  (g_ctx%ksp_T,   g_ctx%B_66, comm, first_time, "T-block KSP")
 
@@ -456,7 +444,6 @@ contains
         call MatCreateVecs(g_ctx%B_66,    g_ctx%tmp_T,   PETSC_NULL_VEC, ierr)
         g_ctx%sub_blocks_setup_done = .true.
       endif
-
       g_ctx%ksp_created = .true.
     else
       ! Block-diagonal mode: 4 separate sub-KSPs
