@@ -138,6 +138,12 @@ contains
     call KSPSolve(g_ctx%ksp_Mj, g_ctx%spbpd_zpsi, g_ctx%spbpd_ypsi, ierr)
     call VecScale(g_ctx%spbpd_ypsi, g_ctx%spbpd_inv_gears, ierr)
 
+    ! per-harmonic toroidal resistive relaxation: approximates Atilde_11^-1's
+    ! resistive skin WITHOUT a solve. Applied to ypsi so BOTH channel A and the
+    ! reused channel C see the relaxed response. Toggle: spbpd_use_toroidal_relax.
+    if (g_ctx%spbpd_use_toroidal_relax) &
+      call VecPointwiseMult(g_ctx%spbpd_ypsi, g_ctx%spbpd_ypsi, g_ctx%spbpd_relax, ierr)
+
     ! channel A (magnetic): y -= Atilde_21 ypsi
     call MatMult(g_ctx%Atilde_21, g_ctx%spbpd_ypsi, g_ctx%spbpd_ru, ierr)
     call VecAXPY(y, -1.0d0, g_ctx%spbpd_ru, ierr)

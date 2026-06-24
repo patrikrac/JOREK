@@ -1081,12 +1081,17 @@ contains
   !! B_55, B_66. Work vecs and the shell are created once.
   !--------------------------------------------------------------------
   subroutine setup_S_PBP_diag_shell(comm, first_time)
+    use mod_parameters, only: n_tor
+    use phys_module,    only: time_evol_theta, tstep, eta, mode, R_geo
     integer, intent(in) :: comm
     logical, intent(in) :: first_time
 
     PC             :: pc_l
-    PetscInt       :: n_loc, n_glob
+    PetscInt       :: n_loc, n_glob, rstart, rend
     PetscErrorCode :: ierr
+    PetscScalar, pointer :: relax_arr(:)
+    integer        :: i, off, nloc_entries
+    real*8         :: ktor2
 
     ! cached scalar weight 1/(1+zeta) -- refreshed every call (zeta may change).
     ! CN: zeta=0 -> 1 ; Gears: zeta=1/2 -> 2/3.
@@ -1110,6 +1115,7 @@ contains
       ! work vecs: psi-, u-, rho-, T-sized. Atilde_21: psi(col)->u(row).
       call MatCreateVecs(g_ctx%Atilde_21, g_ctx%spbpd_zpsi, g_ctx%spbpd_ru, ierr)
       call VecDuplicate(g_ctx%spbpd_zpsi, g_ctx%spbpd_ypsi, ierr)
+      call VecDuplicate(g_ctx%spbpd_zpsi, g_ctx%spbpd_relax, ierr)
       call MatCreateVecs(g_ctx%B_52, PETSC_NULL_VEC, g_ctx%spbpd_zrho, ierr)
       call VecDuplicate(g_ctx%spbpd_zrho, g_ctx%spbpd_yrho, ierr)
       call MatCreateVecs(g_ctx%B_62, PETSC_NULL_VEC, g_ctx%spbpd_zT, ierr)
@@ -1131,6 +1137,25 @@ contains
     call KSPSetUp(g_ctx%spbpd_ksp_B55, ierr)
     call KSPSetOperators(g_ctx%spbpd_ksp_B66, g_ctx%B_66, g_ctx%B_66, ierr)
     call KSPSetUp(g_ctx%spbpd_ksp_B66, ierr)
+
+    ! per-harmonic TOROIDAL resistive relaxation factor applied to the M_j^-1
+    ! response (mirrors apply_schur_relaxation, toroidal part only):
+    !   fac(slot) = 1 / (1 + theta*tstep*eta*(mode(slot)/R_geo)^2 / (1+zeta))
+    ! mode(:) already encodes the real/imag pairing (e.g. n_tor=3 -> 0,8,8), so
+    ! off = mod(idx,n_tor)+1 indexes it directly. Representative global eta(center)
+    ! and R_geo. The poloidal c_lambda/area term lives at assembly and is NOT here:
+    ! this shell measures how much of the resistive tail is toroidal-k. NOTE the
+    ! 1/(1+zeta) follows App A eq.27 (exact weight); apply_schur_relaxation omits it.
+    call VecGetOwnershipRange(g_ctx%spbpd_relax, rstart, rend, ierr)
+    nloc_entries = int(rend - rstart)
+    call VecGetArrayF90(g_ctx%spbpd_relax, relax_arr, ierr)
+    do i = 1, nloc_entries
+      off   = mod(int(rstart) + (i - 1), n_tor) + 1
+      ktor2 = 0.d0
+      if (R_geo > 0.d0) ktor2 = (dble(mode(off)) / R_geo)**2
+      relax_arr(i) = 1.0d0 / (1.0d0 + time_evol_theta * tstep * eta * ktor2 * g_ctx%spbpd_inv_gears)
+    enddo
+    call VecRestoreArrayF90(g_ctx%spbpd_relax, relax_arr, ierr)
   end subroutine setup_S_PBP_diag_shell
 
   !--------------------------------------------------------------------
