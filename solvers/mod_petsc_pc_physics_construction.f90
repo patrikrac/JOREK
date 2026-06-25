@@ -102,8 +102,7 @@ contains
           indices(k) = rstart + i * block_size + (v-1) * n_tor + m
         enddo
       enddo
-      PetscCallA(ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, &
-                           g_ctx%is_var(v), ierr))
+      PetscCallA(ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, g_ctx%is_var(v), ierr))
 
       ! Print information about the created IS for debugging
       !PetscCallA(ISGetSize(g_ctx%is_var(v), out_global, ierr))
@@ -131,11 +130,9 @@ contains
     PetscErrorCode :: ierr
 
     if (first_time) then
-      PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), &
-                              MAT_INITIAL_MATRIX, B, ierr))
+      PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), MAT_INITIAL_MATRIX, B, ierr))
     else
-      PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), &
-                              MAT_REUSE_MATRIX, B, ierr))
+      PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), MAT_REUSE_MATRIX, B, ierr))
     endif
   end subroutine extract_sub_block
 
@@ -193,7 +190,7 @@ contains
     logical, allocatable :: visited(:), in_axis_set(:)
     integer, allocatable :: axis_dof_list(:), ipiv_blk(:)
     PetscInt, allocatable :: rows_node(:), axis_rows(:)
-    PetscScalar, allocatable :: blk(:,:), rhs_blk(:,:), diag_save_blk(:)
+    PetscScalar, allocatable :: blk(:), rhs_blk(:), diag_save_blk(:)
 
     external :: dgesv
 
@@ -251,7 +248,7 @@ contains
     allocate(visited(0:n_block_local-1))
     visited = .false.
     block_n = n_degrees * n_tor
-    allocate(rows_node(block_n), blk(block_n,block_n), rhs_blk(block_n,block_n))
+    allocate(rows_node(block_n), blk(block_n*block_n), rhs_blk(block_n*block_n))
     allocate(diag_save_blk(block_n), ipiv_blk(block_n))
 
     do ielm = 1, n_elements
@@ -274,15 +271,15 @@ contains
 
         call MatGetValues(B_mass, block_n, rows_node, block_n, rows_node, blk, ierr)
         do j = 1, block_n
-          diag_save_blk(j) = blk(j,j)
+          diag_save_blk(j) = blk((j-1)*block_n + j)
         end do
         rhs_blk = 0.d0
-        do j = 1, block_n; rhs_blk(j,j) = 1.d0; end do
+        do j = 1, block_n; rhs_blk((j-1)*block_n + j) = 1.d0; end do
         call dgesv(block_n, block_n, blk, block_n, ipiv_blk, rhs_blk, block_n, info)
         if (info /= 0) then
           rhs_blk = 0.d0
           do j = 1, block_n
-            if (abs(diag_save_blk(j)) > 0.d0) rhs_blk(j,j) = 1.d0 / diag_save_blk(j)
+            if (abs(diag_save_blk(j)) > 0.d0) rhs_blk((j-1)*block_n + j) = 1.d0 / diag_save_blk(j)
           end do
         end if
         call MatSetValues(Dinv, block_n, rows_node, block_n, rows_node, rhs_blk, INSERT_VALUES, ierr)
@@ -293,7 +290,7 @@ contains
     !--- Pass 2: axis node group ---
     if (n_axis_dofs > 0) then
       block_n = n_axis_dofs * n_tor
-      allocate(axis_rows(block_n), blk(block_n,block_n), rhs_blk(block_n,block_n))
+      allocate(axis_rows(block_n), blk(block_n*block_n), rhs_blk(block_n*block_n))
       allocate(diag_save_blk(block_n), ipiv_blk(block_n))
 
       do d = 1, n_axis_dofs
@@ -304,15 +301,15 @@ contains
 
       call MatGetValues(B_mass, block_n, axis_rows, block_n, axis_rows, blk, ierr)
       do j = 1, block_n
-        diag_save_blk(j) = blk(j,j)
+        diag_save_blk(j) = blk((j-1)*block_n + j)
       end do
       rhs_blk = 0.d0
-      do j = 1, block_n; rhs_blk(j,j) = 1.d0; end do
+      do j = 1, block_n; rhs_blk((j-1)*block_n + j) = 1.d0; end do
       call dgesv(block_n, block_n, blk, block_n, ipiv_blk, rhs_blk, block_n, info)
       if (info /= 0) then
         rhs_blk = 0.d0
         do j = 1, block_n
-          if (abs(diag_save_blk(j)) > 0.d0) rhs_blk(j,j) = 1.d0 / diag_save_blk(j)
+          if (abs(diag_save_blk(j)) > 0.d0) rhs_blk((j-1)*block_n + j) = 1.d0 / diag_save_blk(j)
         end do
       end if
       call MatSetValues(Dinv, block_n, axis_rows, block_n, axis_rows, rhs_blk, INSERT_VALUES, ierr)
@@ -581,9 +578,9 @@ contains
 
       ! Insert into dense Fortran array
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         S_dense(1:n, j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! Status output
@@ -788,9 +785,9 @@ contains
       call VecScatterBegin(scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(col_seq, arr, ierr)
+        call VecGetArray(col_seq, arr, ierr)
         S_dense(1:n, j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(col_seq, arr, ierr)
+        call VecRestoreArray(col_seq, arr, ierr)
       endif
       if (my_id == 0 .and. mod(j+1, max(1,n/10)) == 0) then
         write(*,'(A,I0,A,I0)') "[Diagnostics]   S_u probed: ", j+1, "/", n
@@ -915,9 +912,9 @@ contains
 
       ! Insert into dense Fortran array
       if (my_id == 0) then
-        call VecGetArrayF90(y_seq, arr, ierr)
+        call VecGetArray(y_seq, arr, ierr)
         B_dense(1:n, j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(y_seq, arr, ierr)
+        call VecRestoreArray(y_seq, arr, ierr)
       endif
 
       ! Status output
@@ -1148,14 +1145,14 @@ contains
     ! 1/(1+zeta) follows App A eq.27 (exact weight); apply_schur_relaxation omits it.
     call VecGetOwnershipRange(g_ctx%spbpd_relax, rstart, rend, ierr)
     nloc_entries = int(rend - rstart)
-    call VecGetArrayF90(g_ctx%spbpd_relax, relax_arr, ierr)
+    call VecGetArray(g_ctx%spbpd_relax, relax_arr, ierr)
     do i = 1, nloc_entries
       off   = mod(int(rstart) + (i - 1), n_tor) + 1
       ktor2 = 0.d0
       if (R_geo > 0.d0) ktor2 = (dble(mode(off)) / R_geo)**2
       relax_arr(i) = 1.0d0 / (1.0d0 + time_evol_theta * tstep * eta * ktor2 * g_ctx%spbpd_inv_gears)
     enddo
-    call VecRestoreArrayF90(g_ctx%spbpd_relax, relax_arr, ierr)
+    call VecRestoreArray(g_ctx%spbpd_relax, relax_arr, ierr)
   end subroutine setup_S_PBP_diag_shell
 
   !--------------------------------------------------------------------
@@ -1202,9 +1199,9 @@ contains
       call VecScatterBegin(scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, col, col_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(col_seq, arr, ierr)
+        call VecGetArray(col_seq, arr, ierr)
         S_dense(1:n, j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(col_seq, arr, ierr)
+        call VecRestoreArray(col_seq, arr, ierr)
       endif
     enddo
 
@@ -1443,7 +1440,7 @@ contains
     call PCHYPRESetType(pc, "boomeramg", ierr)
 
     ! Set Near Null Space on the operator
-    call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
+    call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC_ARRAY, nullsp, ierr)
     call MatSetNearNullSpace(B_block, nullsp, ierr)
     call MatNullSpaceDestroy(nullsp, ierr)
 
@@ -1558,7 +1555,7 @@ contains
     mats_nest(15) = PETSC_NULL_MAT
     mats_nest(16) = diag_66
 
-    PetscCallA(MatCreateNest(comm, nblocks, PETSC_NULL_IS, nblocks, PETSC_NULL_IS, mats_nest, A_nest, ierr))
+    PetscCallA(MatCreateNest(comm, nblocks, PETSC_NULL_IS_ARRAY, nblocks, PETSC_NULL_IS_ARRAY, mats_nest, A_nest, ierr))
 
     ! Destroy old monolithic AIJ if rebuilding
     if (.not. first_time .and. g_ctx%ksp_reduced_created) then
@@ -1579,7 +1576,7 @@ contains
     mats_nest_hydro(8) = PETSC_NULL_MAT
     mats_nest_hydro(9) = diag_66
 
-    PetscCallA(MatCreateNest(comm, 3, PETSC_NULL_IS, 3, PETSC_NULL_IS, mats_nest_hydro, A_nest_hydro, ierr))
+    PetscCallA(MatCreateNest(comm, 3, PETSC_NULL_IS_ARRAY, 3, PETSC_NULL_IS_ARRAY, mats_nest_hydro, A_nest_hydro, ierr))
 
     if (.not. first_time .and. g_ctx%ksp_hydro_created) then
       call MatDestroy(g_ctx%M_hydro, ierr)
@@ -1596,7 +1593,7 @@ contains
     mats_nest_alfven(3) = g_ctx%Atilde_21
     mats_nest_alfven(4) = g_ctx%Atilde_22
 
-    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, mats_nest_alfven, A_nest_alfven, ierr))
+    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats_nest_alfven, A_nest_alfven, ierr))
 
     if (.not. first_time .and. g_ctx%ksp_alfven_created) then
       call MatDestroy(g_ctx%A_alfven, ierr)
@@ -1829,9 +1826,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(1:n, j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_u
@@ -1841,9 +1838,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(n+1:2*n, j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_ρ  (no Schur coupling from ψ to ρ through j)
@@ -1851,9 +1848,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(2*n+1:3*n, j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_T
@@ -1863,9 +1860,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(3*n+1:4*n, j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
       if (my_id == 0 .and. mod(j+1, max(1,n/10)) == 0) then
         write(*,'(A,I0,A,I0,A,I0,A)') &
@@ -1898,9 +1895,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(1:n, n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_u
@@ -1910,9 +1907,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(n+1:2*n, n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_ρ
@@ -1920,9 +1917,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(2*n+1:3*n, n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_T  (no Schur: u doesn't drive j-elimination in T row)
@@ -1930,9 +1927,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(3*n+1:4*n, n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
       if (my_id == 0 .and. mod(j+1, max(1,n/10)) == 0) then
         write(*,'(A,I0,A,I0,A,I0,A)') &
@@ -1960,9 +1957,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(n+1:2*n, 2*n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_ρ
@@ -1970,9 +1967,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(2*n+1:3*n, 2*n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
     enddo
 
@@ -1995,9 +1992,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(1:n, 3*n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_u
@@ -2005,9 +2002,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(n+1:2*n, 3*n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
 
       ! r_T
@@ -2015,9 +2012,9 @@ contains
       call VecScatterBegin(scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       call VecScatterEnd  (scat, r_blk, r_seq, INSERT_VALUES, SCATTER_FORWARD, ierr)
       if (my_id == 0) then
-        call VecGetArrayF90(r_seq, arr, ierr)
+        call VecGetArray(r_seq, arr, ierr)
         A_dense(3*n+1:4*n, 3*n+j+1) = real(arr, kind=8)
-        call VecRestoreArrayF90(r_seq, arr, ierr)
+        call VecRestoreArray(r_seq, arr, ierr)
       endif
     enddo
 
@@ -2148,14 +2145,14 @@ contains
     ! --- Split packed b into b_psi (top half) and b_u (bottom half) ---
     call VecGetLocalSize(b_psi, n1_local, ierr)
     call VecGetLocalSize(b_u,   n2_local, ierr)
-    call VecGetArrayReadF90(b, a_b, ierr)
-    call VecGetArrayF90(b_psi, a_x, ierr)
+    call VecGetArrayRead(b, a_b, ierr)
+    call VecGetArray(b_psi, a_x, ierr)
     a_x(1:n1_local) = a_b(1:n1_local)
-    call VecRestoreArrayF90(b_psi, a_x, ierr)
-    call VecGetArrayF90(b_u, a_x, ierr)
+    call VecRestoreArray(b_psi, a_x, ierr)
+    call VecGetArray(b_u, a_x, ierr)
     a_x(1:n2_local) = a_b(n1_local+1 : n1_local+n2_local)
-    call VecRestoreArrayF90(b_u, a_x, ierr)
-    call VecRestoreArrayReadF90(b, a_b, ierr)
+    call VecRestoreArray(b_u, a_x, ierr)
+    call VecRestoreArrayRead(b, a_b, ierr)
 
     ! --- Segregated block-factorization solve ---
     ! t_psi = Atilde_11^-1 b_psi
@@ -2172,14 +2169,14 @@ contains
     call KSPSolve(g_ctx%ksp_psi, rhs_psi, y_psi, ierr)
 
     ! --- Pack (y_psi, y_u) into x_seg ---
-    call VecGetArrayF90(x_seg, a_x, ierr)
-    call VecGetArrayReadF90(y_psi, a_b, ierr)
+    call VecGetArray(x_seg, a_x, ierr)
+    call VecGetArrayRead(y_psi, a_b, ierr)
     a_x(1:n1_local) = a_b(1:n1_local)
-    call VecRestoreArrayReadF90(y_psi, a_b, ierr)
-    call VecGetArrayReadF90(y_u, a_b, ierr)
+    call VecRestoreArrayRead(y_psi, a_b, ierr)
+    call VecGetArrayRead(y_u, a_b, ierr)
     a_x(n1_local+1 : n1_local+n2_local) = a_b(1:n2_local)
-    call VecRestoreArrayReadF90(y_u, a_b, ierr)
-    call VecRestoreArrayF90(x_seg, a_x, ierr)
+    call VecRestoreArrayRead(y_u, a_b, ierr)
+    call VecRestoreArray(x_seg, a_x, ierr)
 
     ! --- Relative error: ||x_seg - x_exact|| / ||x_exact|| ---
     call VecAXPY(x_seg, -1.0d0, x_exact, ierr)     ! x_seg <- x_seg - x_exact

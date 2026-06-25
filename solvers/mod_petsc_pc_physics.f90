@@ -435,7 +435,7 @@ contains
         mats_nest_A(2) = g_ctx%B_12
         mats_nest_A(3) = g_ctx%Atilde_21
         mats_nest_A(4) = g_ctx%Atilde_22
-        call MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, &
+        call MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, &
                            mats_nest_A, g_ctx%K_A_block, ierr)
       end block
 

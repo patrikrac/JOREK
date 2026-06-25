@@ -359,13 +359,13 @@ contains
 
         if (do_amg) then
           call PCSetType(sub_pc, PCGAMG, ierr)
-          call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
+          call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC_ARRAY, nullsp, ierr)
           call MatSetNearNullSpace(sub_A, nullsp, ierr)
           call MatNullSpaceDestroy(nullsp, ierr)
         else if (do_hypre_amg) then
           call PCSetType(sub_pc, PCHYPRE, ierr)
           call PCHYPRESetType(sub_pc, "boomeramg", ierr)
-          call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
+          call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC_ARRAY, nullsp, ierr)
           call MatSetNearNullSpace(sub_A, nullsp, ierr)
           call MatNullSpaceDestroy(nullsp, ierr)
           ! PCFIELDSPLIT sub-KSPs are prefixed "fieldsplit_<name>_"; set
@@ -385,13 +385,13 @@ contains
       else if (do_amg) then
         call PCSetType(pc, PCGAMG, ierr)
         ! Constant near-null space improves GAMG aggregation on the poloidal mesh.
-        call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
+        call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC_ARRAY, nullsp, ierr)
         call MatSetNearNullSpace(A_op, nullsp, ierr)
         call MatNullSpaceDestroy(nullsp, ierr)
       else if (do_hypre_amg) then
         call PCSetType(pc, PCHYPRE, ierr)
         call PCHYPRESetType(pc, "boomeramg", ierr)
-        call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC, nullsp, ierr)
+        call MatNullSpaceCreate(comm, PETSC_TRUE, 0, PETSC_NULL_VEC_ARRAY, nullsp, ierr)
         call MatSetNearNullSpace(A_op, nullsp, ierr)
         call MatNullSpaceDestroy(nullsp, ierr)
         ! Nodal coarsening (criterion 6 = measured strength): groups all
@@ -443,8 +443,8 @@ contains
         "  ", trim(solver_name), "  its=", its, &
         "  |r|=", rnorm, "  rel_err=", err_norm/ref_norm, &
         "  t=", t_elapsed, "s"
-      if (reason < 0) &
-        write(*,'(A,I0)') "    WARNING: KSP diverged, reason=", reason
+      if (reason%v < 0) &
+        write(*,'(A,I0)') "    WARNING: KSP diverged, reason=", reason%v
     endif
 
     call VecDestroy(x_sol, ierr)

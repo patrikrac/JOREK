@@ -27,16 +27,16 @@ contains
     call VecGetLocalSize(x1, n1, ierr)
     call VecGetLocalSize(x2, n2, ierr)
 
-    call VecGetArrayReadF90(x1, a_x1, ierr)
-    call VecGetArrayReadF90(x2, a_x2, ierr)
-    call VecGetArrayF90    (y_packed, a_y, ierr)
+    call VecGetArrayRead(x1, a_x1, ierr)
+    call VecGetArrayRead(x2, a_x2, ierr)
+    call VecGetArray    (y_packed, a_y, ierr)
 
     a_y(1     : n1     ) = a_x1(1:n1)
     a_y(n1+1  : n1+n2  ) = a_x2(1:n2)
 
-    call VecRestoreArrayReadF90(x1, a_x1, ierr)
-    call VecRestoreArrayReadF90(x2, a_x2, ierr)
-    call VecRestoreArrayF90    (y_packed, a_y, ierr)
+    call VecRestoreArrayRead(x1, a_x1, ierr)
+    call VecRestoreArrayRead(x2, a_x2, ierr)
+    call VecRestoreArray    (y_packed, a_y, ierr)
   end subroutine pack_2v
 
   !> Inverse of pack_2v: unpack a 2v-sized packed vec into two 1v vecs.
@@ -50,16 +50,16 @@ contains
     call VecGetLocalSize(y1, n1, ierr)
     call VecGetLocalSize(y2, n2, ierr)
 
-    call VecGetArrayReadF90(x_packed, a_x, ierr)
-    call VecGetArrayF90    (y1, a_y1, ierr)
-    call VecGetArrayF90    (y2, a_y2, ierr)
+    call VecGetArrayRead(x_packed, a_x, ierr)
+    call VecGetArray    (y1, a_y1, ierr)
+    call VecGetArray    (y2, a_y2, ierr)
 
     a_y1(1:n1) = a_x(1     : n1     )
     a_y2(1:n2) = a_x(n1+1  : n1+n2  )
 
-    call VecRestoreArrayReadF90(x_packed, a_x, ierr)
-    call VecRestoreArrayF90    (y1, a_y1, ierr)
-    call VecRestoreArrayF90    (y2, a_y2, ierr)
+    call VecRestoreArrayRead(x_packed, a_x, ierr)
+    call VecRestoreArray    (y1, a_y1, ierr)
+    call VecRestoreArray    (y2, a_y2, ierr)
   end subroutine unpack_2v
 
   !> MATSHELL MATOP_MULT callback: y = K_A_exact * x  (exact (psi,u) Schur operator).
