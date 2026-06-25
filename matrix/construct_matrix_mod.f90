@@ -769,8 +769,7 @@ subroutine add_block_to_petsc(index_node1, i, i_order, i_bnd, i_bnd_type, &
       idxm_petsc(1) = index_node1 - 1  ! 0-based block row
       idxn_petsc(1) = index_node2 - 1  ! 0-based block col
       !$omp critical
-      PetscCallA(MatSetValuesBlocked(a_mat%petsc_A, 1, idxm_petsc, 1, idxn_petsc, &
-                               thread_struct(omp_tid)%synch_buff, ADD_VALUES, ierr))
+      PetscCallA(MatSetValuesBlocked(a_mat%petsc_A, 1, idxm_petsc, 1, idxn_petsc, thread_struct(omp_tid)%synch_buff, ADD_VALUES, ierr))
       !$omp end critical
 
     enddo ! n_degrees

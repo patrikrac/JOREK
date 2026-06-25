@@ -304,7 +304,7 @@ contains
     integer ::  my_id, comm, mpierr
     logical :: speaker
     PetscInt :: M, N
-    MatInfo :: info(MAT_INFO_SIZE)
+    MatInfo :: info
     PetscReal :: norm
     PetscBool :: flg
 
@@ -318,8 +318,8 @@ contains
     if (speaker) print *, "Matrix size M = ", M, " ; N = ", N
     call MatGetInfo(petsc_sys%A, MAT_GLOBAL_SUM, info, ierr)
     if (speaker) then
-       print "(A, I0)", " NNZ used = ", int(info(MAT_INFO_NZ_USED))
-       print "(A, I0)", " NNZ stored = ", int(info(MAT_INFO_NZ_ALLOCATED))
+       print "(A, I0)", " NNZ used = ", int(info%nz_used)
+       print "(A, I0)", " NNZ stored = ", int(info%nz_allocated)
     endif
 
     if (speaker) print *, "End PETSC Matrix info ---"
@@ -372,11 +372,11 @@ contains
     call MatCreateVecs(petsc_sys%A, x, PETSC_NULL_VEC, ierr)
     call VecGetOwnershipRange(x, i_start, i_end, ierr)
     n_local = i_end - i_start
-    call VecGetArrayF90(x, x_arr, ierr)
+    call VecGetArray(x, x_arr, ierr)
     do i = 1, n_local
       x_arr(i) = x_global(i_start + i)  ! i_start+1 to i_end maps to x_global indices
     enddo
-    call VecRestoreArrayF90(x, x_arr, ierr)
+    call VecRestoreArray(x, x_arr, ierr)
     call VecAssemblyBegin(x, ierr)
     call VecAssemblyEnd(x, ierr)
 
@@ -573,7 +573,7 @@ contains
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
     n_iter    = its
-    converged = (reason > 0)
+    converged = (reason%v > 0)
 
     if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
 
@@ -599,11 +599,11 @@ contains
     PetscCallA(VecScatterBegin(scatter, petsc_sys%x, x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
     PetscCallA(VecScatterEnd(scatter, petsc_sys%x, x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
 
-    PetscCallA(VecGetArrayF90(x_seq, x_arr, ierr))
+    PetscCallA(VecGetArray(x_seq, x_arr, ierr))
 
     sol_vec%val(:) = x_arr(:)
 
-    PetscCallA(VecRestoreArrayF90(x_seq, x_arr, ierr))
+    PetscCallA(VecRestoreArray(x_seq, x_arr, ierr))
 
     PetscCallA(VecScatterDestroy(scatter, ierr))
     PetscCallA(VecDestroy(x_seq, ierr))

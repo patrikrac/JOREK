@@ -181,8 +181,7 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(A_j, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(A_j, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for A_w ---
@@ -195,8 +194,7 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(A_w, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(A_w, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for A_jpsi (psi->j coupling) ---
@@ -209,8 +207,7 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(A_jpsi, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(A_jpsi, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for A_wu (u->w coupling) ---
@@ -223,8 +220,7 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(A_wu, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(A_wu, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
           enddo  ! k_order
@@ -433,8 +429,7 @@ subroutine construct_pc_diagonal_matrices(my_id, local_elms, n_local_elms, &
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(R_11, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(R_11, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for R_22 ---
@@ -447,8 +442,7 @@ subroutine construct_pc_diagonal_matrices(my_id, local_elms, n_local_elms, &
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(R_22, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(R_22, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for R_55 ---
@@ -461,8 +455,7 @@ subroutine construct_pc_diagonal_matrices(my_id, local_elms, n_local_elms, &
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(R_55, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(R_55, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for R_66 ---
@@ -475,8 +468,7 @@ subroutine construct_pc_diagonal_matrices(my_id, local_elms, n_local_elms, &
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(R_66, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(R_66, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
           enddo  ! k_order
@@ -694,8 +686,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(K_psi_correction, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(K_psi_correction, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for K_u_correction ---
@@ -708,8 +699,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(K_u_correction, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(K_u_correction, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for K_21_correction (u-eq, psi-col) ---
@@ -722,8 +712,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(K_21_correction, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(K_21_correction, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for K_61_correction (T-eq, psi-col) ---
@@ -736,8 +725,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(K_61_correction, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(K_61_correction, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for K_schur_PBP (schur_PBP-eq, psi-col) ---
@@ -750,8 +738,7 @@ subroutine construct_schur_correction_matrices(my_id, local_elms, n_local_elms, 
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(K_schur_PBP, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(K_schur_PBP, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
 
@@ -1033,8 +1020,7 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
   ! Collective: every rank must call MatZeroRows even with n=0.
   ! Diag value = 0  →  the rows become identically zero (no diagonal injection).
   ! Duplicates in rows_to_zero are harmless (idempotent).
-  PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 0.0d0, &
-                   PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
+  PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 0.0d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
 
   deallocate(rows_to_zero)
 #endif
@@ -1138,8 +1124,7 @@ subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
   ! --- Zero the matrix rows and set diagonal to 1.0 ---
   ! 1.0d0 ensures the standalone matrix is non-singular.
   ! PETSC_NULL_VEC tells PETSc not to touch the RHS or Solution vectors.
-  PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, &
-                   PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
+  PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
 
   deallocate(rows_to_zero)
 #endif

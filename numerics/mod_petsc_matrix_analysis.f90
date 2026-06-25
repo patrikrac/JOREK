@@ -64,7 +64,7 @@ contains
 
     PetscErrorCode :: ierr
     PetscInt       :: M, N, bs
-    MatInfo        :: info(MAT_INFO_SIZE)
+    MatInfo        :: info
     integer        :: comm, my_id, mpierr
 
     call PetscObjectGetComm(A, comm, ierr)
@@ -78,11 +78,11 @@ contains
       write(*,'(A,A)')        "[MatInfo] ", trim(label)
       write(*,'(A,I0,A,I0)')  "  Global size : ", M, " x ", N
       write(*,'(A,I0)')       "  Block size  : ", bs
-      write(*,'(A,I0)')       "  NNZ used    : ", int(info(MAT_INFO_NZ_USED))
-      write(*,'(A,I0)')       "  NNZ alloc   : ", int(info(MAT_INFO_NZ_ALLOCATED))
-      ! MAT_INFO_MEMORY is not populated for distributed (MPIBAIJ) matrix types
-      if (info(MAT_INFO_MEMORY) > 0) &
-        write(*,'(A,ES12.4)') "  Memory (B)  : ", info(MAT_INFO_MEMORY)
+      write(*,'(A,I0)')       "  NNZ used    : ", int(info%nz_used)
+      write(*,'(A,I0)')       "  NNZ alloc   : ", int(info%nz_allocated)
+      ! memory is not populated for distributed (MPIBAIJ) matrix types
+      if (info%memory > 0) &
+        write(*,'(A,ES12.4)') "  Memory (B)  : ", info%memory
     endif
   end subroutine petsc_mat_print_info
 
@@ -425,9 +425,9 @@ contains
 
       ! Column i_col+1 of A = f_all  (only store on rank 0)
       if (my_id == 0) then
-        call VecGetArrayF90(f_all, f_arr, ierr)
+        call VecGetArray(f_all, f_arr, ierr)
         A_dense(:, i_col + 1) = real(f_arr, kind=8)
-        call VecRestoreArrayF90(f_all, f_arr, ierr)
+        call VecRestoreArray(f_all, f_arr, ierr)
       endif
     enddo
 
@@ -541,11 +541,11 @@ contains
       r_local = 0.0d0
       call MatCreateVecs(A, PETSC_NULL_VEC, r_max_tmp, ierr)
       call MatGetRowMaxAbs(A, r_max_tmp, PETSC_NULL_INTEGER_ARRAY, ierr)
-      call VecGetArrayF90(r_max_tmp, u_arr, ierr)
+      call VecGetArray(r_max_tmp, u_arr, ierr)
       do i = 1, int(m_local)
         r_local(i) = real(u_arr(i), kind=8)
       enddo
-      call VecRestoreArrayF90(r_max_tmp, u_arr, ierr)
+      call VecRestoreArray(r_max_tmp, u_arr, ierr)
       call VecDestroy(r_max_tmp, ierr)
 
       ! --- Compute column max via MatGetColumnNorms (non-symmetric only) ---
@@ -595,7 +595,7 @@ contains
       endif
 
       ! --- Build update Vec u_r = 1/sqrt(r) (local rows) ---
-      call VecGetArrayF90(u_r_vec, u_arr, ierr)
+      call VecGetArray(u_r_vec, u_arr, ierr)
       do i = 1, int(m_local)
         if (r_local(i) > 0.0d0) then
           u_arr(i) = 1.0d0 / sqrt(r_local(i))
@@ -603,7 +603,7 @@ contains
           u_arr(i) = 1.0d0   ! zero row: no scaling
         endif
       enddo
-      call VecRestoreArrayF90(u_r_vec, u_arr, ierr)
+      call VecRestoreArray(u_r_vec, u_arr, ierr)
 
       if (symmetric) then
         ! Same D applied to both sides: A ← D * A * D  (preserves symmetry)
@@ -613,7 +613,7 @@ contains
         ! Non-symmetric: separate row/column scaling
         ! Build u_c = 1/sqrt(c) for locally owned columns.
         ! For square MPIAIJ, owned columns == owned rows: rstart..rend-1 (0-based).
-        call VecGetArrayF90(u_c_vec, u_arr, ierr)
+        call VecGetArray(u_c_vec, u_arr, ierr)
         do i = 1, int(m_local)
           ! 0-based global column = rstart + i - 1  →  c_global index = rstart + i
           if (c_global(int(rstart) + i) > 0.0d0) then
@@ -622,7 +622,7 @@ contains
             u_arr(i) = 1.0d0   ! zero column: no scaling
           endif
         enddo
-        call VecRestoreArrayF90(u_c_vec, u_arr, ierr)
+        call VecRestoreArray(u_c_vec, u_arr, ierr)
 
         call MatDiagonalScale(A, u_r_vec, u_c_vec, ierr)
         call VecPointwiseMult(dr_out, dr_out, u_r_vec, ierr)
