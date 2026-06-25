@@ -157,6 +157,7 @@ module phys_module
   logical :: physics_pc_monolithic  !< Monolithic 4x4 solve (stage-one Schur elimination test)
   logical :: physics_pc_multi_step  !< Three-step predictor-corrector apply (hydro -> mag. predictor -> Alfven corrector -> transport)
   logical :: physics_pc_multi_step_symmetric  !< Add backward K_alpha,beta corrector to the segregated multi_step apply
+  logical :: physics_pc_wave_schur  !< multi_step sub-mode: use the new wave-Schur block-LDU predictor-corrector apply (Sec. 5.4) instead of the segregated-Schur variant
   logical :: physics_pc_sub_blocks       !< 2x2 super-block PC: (psi,u) Alfven + (rho,T) transport
   integer :: physics_pc_sub_blocks_mode  !< Apply variant: 1=Jacobi, 2=GS-forward, 3=GS-symmetric
   logical :: physics_pc_probe_exact !< Probe exact 4x4 Schur complement via basis-vector applications (small problems only)

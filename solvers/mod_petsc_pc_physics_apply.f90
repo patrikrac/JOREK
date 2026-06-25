@@ -463,6 +463,110 @@ contains
   end subroutine apply_block_predictor_corrector
 
   !--------------------------------------------------------------------
+  !> Apply path: wave-Schur block-LDU predictor-corrector (new 4-variable scheme).
+  !>
+  !> Implements the single block-LDU sweep of Sec. 5.4, eq. (algorithm) in
+  !>   docs/superpowers/research/2026-06-22-toroidal-wave-schur-progress.
+  !> Unlike apply_block_predictor_corrector (the older segregated-Schur variant),
+  !> the predictor carries the full (psi*, rho*, T*) into the momentum wave solve,
+  !> and the corrector applies the single weak upper coupling A_16 against T*. The
+  !> pressure feedback (channel B) and the psi<-T coupling are thus captured in ONE
+  !> forward sweep, so no separate symmetric backward corrector is needed.
+  !>
+  !>   0. Fold (exact):  r~_psi = x_psi - B_13 temp_j
+  !>                     r~_u   = x_u   - B_23 temp_j - B_24 temp_w
+  !>                     r~_T   = x_T   - B_63 temp_j
+  !>   1. Predictor:     psi* = Atilde_11^-1 r~_psi
+  !>                     rho* = B_55^-1 (x_rho - B_51 psi*)
+  !>                     T*   = B_66^-1 (r~_T  - Atilde_61 psi*)
+  !>   2. Wave solve:    u    = S_PBP^-1 (r~_u - Atilde_21 psi* - B_25 rho* - B_26 T*)
+  !>   3. Corrector:     psi  = psi* - Atilde_11^-1 (B_12 u + B_16 T*)
+  !>                     rho  = rho* - B_55^-1 (B_52 u)
+  !>                     T    = T*   - B_66^-1 (B_62 u)
+  !>   4. Constraints (delta_j, delta_w) are restored by the dispatcher.
+  !>
+  !> NOTE on the fold: eq. (algorithm) abbreviates r~_u = r_2 - A_24 M_w^-1 r_w, but
+  !> the reduced row-2 operator Atilde_21 = A_21 - A_23 M_j^-1 A_31 also carries the
+  !> A_23 path, so the EXACT residual fold must include -A_23 M_j^-1 r_j as well. We
+  !> therefore reuse fold_alfven_residual, which folds both temp_j and temp_w.
+  !>
+  !> The predictor freezes the lower-triangular blocks B_51, Atilde_61 against the
+  !> PREDICTOR flux psi* (not the corrected psi), exactly as the LDU sweep prescribes;
+  !> the rho/T correctors then build on the predictor values rho*/T*.
+  !>
+  !> All inner solves (Atilde_11=ksp_psi, B_55=ksp_rho, B_66=ksp_T, S_PBP=ksp_S_PBP)
+  !> are the MUMPS KSPs already set up for the multi_step path.
+  !>
+  !> Work-vector roles:
+  !>   work_1 = temp_j, work_2 = temp_w   (inputs; read by the folds, then free)
+  !>   work_3, work_5 = scratch
+  !>   work_4 = r~_u (held from the fold until the wave RHS is formed)
+  !>   y_psi  = psi*  (predictor flux, corrected in place in step 3)
+  !>   tmp_rho = rho*, tmp_T = T*  (predictor pressure, corrected into y_rho / y_T)
+  !>   y_u    = u
+  !>
+  !> Precondition: physics_pc_apply (the dispatcher) has already populated
+  !>   g_ctx%work_1 = M_j^{-1} x_j   (temp_j)
+  !>   g_ctx%work_2 = M_w^{-1} x_w   (temp_w)
+  !--------------------------------------------------------------------
+  subroutine apply_wave_schur_predictor_corrector(x_psi, x_u, x_rho, x_T, &
+                                                  y_psi, y_u, y_rho, y_T, ierr)
+    Vec, intent(in)    :: x_psi, x_u, x_rho, x_T
+    Vec, intent(inout) :: y_psi, y_u, y_rho, y_T
+    PetscErrorCode, intent(out) :: ierr
+
+    ! --- Step 0: exact j,w fold of the (psi,u) rows -> work_3 = r~_psi, work_4 = r~_u ---
+    call fold_alfven_residual(x_psi, x_u, g_ctx%work_3, g_ctx%work_4, g_ctx%work_5, ierr)
+
+    ! --- Step 0: fold of the T row -> tmp_T = r~_T = x_T - B_63 temp_j ---
+    call MatMult(g_ctx%B_63, g_ctx%work_1, g_ctx%work_5, ierr)
+    call VecWAXPY(g_ctx%tmp_T, -1.0d0, g_ctx%work_5, x_T, ierr)
+    ! temp_j/temp_w (work_1/work_2) are no longer needed below.
+
+    ! --- Step 1: predictor flux  psi* = Atilde_11^-1 r~_psi   (work_3 = r~_psi) ---
+    call KSPSolve(g_ctx%ksp_psi, g_ctx%work_3, y_psi, ierr)              ! y_psi = psi*
+
+    ! --- Step 1: predictor density  rho* = B_55^-1 (x_rho - B_51 psi*) ---
+    call MatMult(g_ctx%B_51, y_psi, g_ctx%work_3, ierr)
+    call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, x_rho, ierr)       ! work_5 = x_rho - B_51 psi*
+    call KSPSolve(g_ctx%ksp_rho, g_ctx%work_5, g_ctx%tmp_rho, ierr)      ! tmp_rho = rho*
+
+    ! --- Step 1: predictor temperature  T* = B_66^-1 (r~_T - Atilde_61 psi*) ---
+    call MatMult(g_ctx%Atilde_61, y_psi, g_ctx%work_3, ierr)
+    call VecWAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, g_ctx%tmp_T, ierr) ! work_5 = r~_T - Atilde_61 psi*
+    call KSPSolve(g_ctx%ksp_T, g_ctx%work_5, g_ctx%tmp_T, ierr)          ! tmp_T = T*
+
+    ! --- Step 2: wave solve  u = S_PBP^-1 (r~_u - Atilde_21 psi* - B_25 rho* - B_26 T*) ---
+    call VecCopy(g_ctx%work_4, g_ctx%work_5, ierr)                       ! work_5 = r~_u
+    call MatMult(g_ctx%Atilde_21, y_psi, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_25, g_ctx%tmp_rho, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_26, g_ctx%tmp_T, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
+    call KSPSolve(g_ctx%ksp_S_PBP, g_ctx%work_5, y_u, ierr)             ! y_u = u
+
+    ! --- Step 3: flux corrector  psi = psi* - Atilde_11^-1 (B_12 u + B_16 T*) ---
+    call MatMult(g_ctx%B_12, y_u, g_ctx%work_3, ierr)                   ! work_3 = B_12 u
+    call MatMult(g_ctx%B_16, g_ctx%tmp_T, g_ctx%work_5, ierr)           ! work_5 = B_16 T*
+    call VecAXPY(g_ctx%work_3, 1.0d0, g_ctx%work_5, ierr)               ! work_3 = B_12 u + B_16 T*
+    call KSPSolve(g_ctx%ksp_psi, g_ctx%work_3, g_ctx%work_5, ierr)      ! work_5 = correction
+    call VecAXPY(y_psi, -1.0d0, g_ctx%work_5, ierr)                     ! y_psi = psi
+
+    ! --- Step 3: density corrector  rho = rho* - B_55^-1 (B_52 u) ---
+    call MatMult(g_ctx%B_52, y_u, g_ctx%work_3, ierr)
+    call KSPSolve(g_ctx%ksp_rho, g_ctx%work_3, g_ctx%work_5, ierr)      ! work_5 = B_55^-1 B_52 u
+    call VecWAXPY(y_rho, -1.0d0, g_ctx%work_5, g_ctx%tmp_rho, ierr)     ! y_rho = rho
+
+    ! --- Step 3: temperature corrector  T = T* - B_66^-1 (B_62 u) ---
+    call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
+    call KSPSolve(g_ctx%ksp_T, g_ctx%work_3, g_ctx%work_5, ierr)        ! work_5 = B_66^-1 B_62 u
+    call VecWAXPY(y_T, -1.0d0, g_ctx%work_5, g_ctx%tmp_T, ierr)         ! y_T = T
+
+    ierr = 0
+  end subroutine apply_wave_schur_predictor_corrector
+
+  !--------------------------------------------------------------------
   !> PCSHELL apply callback: compute y = P^{-1} x.
   !!
   !! Algorithm:
@@ -477,7 +581,7 @@ contains
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
     use phys_module, only: physics_pc_monolithic, physics_pc_multi_step, &
                            physics_pc_sub_blocks, physics_pc_sub_blocks_mode, &
-                           physics_pc_multi_step_symmetric
+                           physics_pc_multi_step_symmetric, physics_pc_wave_schur
 
     PC :: pc_obj
     Vec :: x, y
@@ -515,8 +619,15 @@ contains
 
     ! --- Step 3: Schur-correct the RHS and solve ---
     if (physics_pc_multi_step) then
-      call apply_block_predictor_corrector(x_psi, x_u, x_rho, x_T, &
-                                           y_psi, y_u, y_rho, y_T, ierr)
+      if (physics_pc_wave_schur) then
+        ! New wave-Schur block-LDU sweep (Sec. 5.4): full predictor + A_16 corrector.
+        call apply_wave_schur_predictor_corrector(x_psi, x_u, x_rho, x_T, &
+                                                  y_psi, y_u, y_rho, y_T, ierr)
+      else
+        ! Older segregated-Schur predictor-corrector (optionally symmetric).
+        call apply_block_predictor_corrector(x_psi, x_u, x_rho, x_T, &
+                                             y_psi, y_u, y_rho, y_T, ierr)
+      endif
 
     else if (physics_pc_monolithic) then
       call apply_monolithic_4x4(x_psi, x_u, x_rho, x_T, &
