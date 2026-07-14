@@ -85,7 +85,7 @@ contains
       PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (METIS)
       PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
       PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
-      PetscCallA(MatMumpsSetIcntl(F, 21, 1,  ierr))   ! out-of-core processing
+      PetscCallA(MatMumpsSetIcntl(F, 22, 1,  ierr))   ! out-of-core processing
     enddo
     deallocate(subksp_array)
   end subroutine petsc_setup_toroidal_harmonic_pc
@@ -192,7 +192,7 @@ contains
       PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (METIS)
       PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
       PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
-      PetscCallA(MatMumpsSetIcntl(F, 21, 1,  ierr))   ! out-of-core processing
+      PetscCallA(MatMumpsSetIcntl(F, 22, 1,  ierr))   ! out-of-core processing
     enddo
     deallocate(subksp_array)
   end subroutine petsc_setup_toroidal_harmonic_pc_blocked
