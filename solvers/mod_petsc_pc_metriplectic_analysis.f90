@@ -336,7 +336,7 @@ contains
   ! spec Sec. 4, note Sec. "Elimination" for the tau/(1+zeta) scaling).
   !
   !   h      = M_psi^-1 r_psi / (1+zeta)
-  !   rhs_u  = -r_u/(1+zeta) - tau * Dp h        (u-row negation: note Sec. 6)
+  !   rhs_u  = -r_u/(1+zeta) + tau * Dp h        (u-row negation: note Sec. 6)
   !   du     = P_u^-1 rhs_u
   !   dpsi   = h - tau * M_psi^-1 (D du)
   !   dj     = B33^-1 (r_j - B31 dpsi)           (constraint recovery)
@@ -353,9 +353,12 @@ contains
     call KSPSolve(m_ksp_Mpsi, m_rpsi, m_h, ierr)
     call VecScale(m_h, 1.d0/m_opz, ierr)
 
-    ! rhs_u = -r_u/(1+zeta) - tau * Dp h   (accumulated in m_t2)
+    ! rhs_u = -r_u/(1+zeta) + tau * Dp h   (accumulated in m_t2)
+    ! Sign: JOREK u-row = -(1+z)A_rho du + tdt*Dp dpsi; negating to the SPD
+    ! form flips BOTH terms -> the Dp coupling enters with MINUS, and the
+    ! eliminated RHS carries +tau*Dp*h (T3-verified; note Sec. 6 corrected).
     call MatMult(g_mctx%Dp_op, m_h, m_t2, ierr)
-    call VecAXPBY(m_t2, -1.d0/m_opz, -m_tau, m_ru, ierr)
+    call VecAXPBY(m_t2, -1.d0/m_opz, +m_tau, m_ru, ierr)
 
     ! du = P_u^-1 rhs_u
     call KSPSolve(m_ksp_Pu, m_t2, m_du, ierr)
