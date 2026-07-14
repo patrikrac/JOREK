@@ -470,8 +470,9 @@ contains
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
-    use phys_module, only: use_physics_pc
+    use phys_module, only: use_physics_pc, metriplectic_analysis
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
+    use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_run_analysis
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -527,6 +528,7 @@ contains
       else
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
       endif
+      if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
@@ -542,6 +544,7 @@ contains
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
+      if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))

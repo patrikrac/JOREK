@@ -1043,7 +1043,7 @@ end subroutine zero_bc_rows_pc_matrix
 
 
 subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
-                               my_ind_min, my_ind_max)
+                               my_ind_min, my_ind_max, symmetric)
 
   use mod_parameters,   only: n_tor, n_vertex_max, n_order
   use nodes_elements,   only: node_list, element_list
@@ -1060,6 +1060,9 @@ subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
   integer, intent(in) :: local_elms(:)
   integer, intent(in) :: n_local_elms
   integer, intent(in) :: my_ind_min, my_ind_max
+  !> Optional: eliminate rows AND columns (MatZeroRowsColumns) so a
+  !! symmetric operator stays exactly symmetric after BC application.
+  logical, intent(in), optional :: symmetric
 
   integer :: i, in, iv, inode, ielm
   integer :: index_node, index_tmp, kk, ll, iv_dir
@@ -1138,8 +1141,18 @@ subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
   ! --- Zero the matrix rows and set diagonal to 1.0 ---
   ! 1.0d0 ensures the standalone matrix is non-singular.
   ! PETSC_NULL_VEC tells PETSc not to touch the RHS or Solution vectors.
-  PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, &
-                   PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
+  if (present(symmetric)) then
+    if (symmetric) then
+      PetscCallA(MatZeroRowsColumns(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, &
+                       PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
+    else
+      PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, &
+                       PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
+    endif
+  else
+    PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, &
+                     PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
+  endif
 
   deallocate(rows_to_zero)
 #endif
