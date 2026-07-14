@@ -298,16 +298,16 @@ contains
 
     call VecGetLocalSize(x1, n1, ierr); call VecGetLocalSize(x2, n2, ierr)
     call VecGetLocalSize(x3, n3, ierr); call VecGetLocalSize(x4, n4, ierr)
-    call VecGetArrayRead(x1, a1, ierr); call VecGetArrayRead(x2, a2, ierr)
-    call VecGetArrayRead(x3, a3, ierr); call VecGetArrayRead(x4, a4, ierr)
-    call VecGetArray(y, ay, ierr)
+    call VecGetArrayReadF90(x1, a1, ierr); call VecGetArrayReadF90(x2, a2, ierr)
+    call VecGetArrayReadF90(x3, a3, ierr); call VecGetArrayReadF90(x4, a4, ierr)
+    call VecGetArrayF90(y, ay, ierr)
     ay(1:n1)                   = a1(1:n1)
     ay(n1+1:n1+n2)             = a2(1:n2)
     ay(n1+n2+1:n1+n2+n3)       = a3(1:n3)
     ay(n1+n2+n3+1:n1+n2+n3+n4) = a4(1:n4)
-    call VecRestoreArrayRead(x1, a1, ierr); call VecRestoreArrayRead(x2, a2, ierr)
-    call VecRestoreArrayRead(x3, a3, ierr); call VecRestoreArrayRead(x4, a4, ierr)
-    call VecRestoreArray(y, ay, ierr)
+    call VecRestoreArrayReadF90(x1, a1, ierr); call VecRestoreArrayReadF90(x2, a2, ierr)
+    call VecRestoreArrayReadF90(x3, a3, ierr); call VecRestoreArrayReadF90(x4, a4, ierr)
+    call VecRestoreArrayF90(y, ay, ierr)
   end subroutine pack_4v
 
   subroutine unpack_4v(x, y1, y2, y3, y4, ierr)
@@ -315,19 +315,18 @@ contains
     PetscErrorCode :: ierr
     PetscScalar, pointer :: ax(:), a1(:), a2(:), a3(:), a4(:)
     PetscInt :: n1, n2, n3, n4
-
     call VecGetLocalSize(y1, n1, ierr); call VecGetLocalSize(y2, n2, ierr)
     call VecGetLocalSize(y3, n3, ierr); call VecGetLocalSize(y4, n4, ierr)
-    call VecGetArrayRead(x, ax, ierr)
-    call VecGetArray(y1, a1, ierr); call VecGetArray(y2, a2, ierr)
-    call VecGetArray(y3, a3, ierr); call VecGetArray(y4, a4, ierr)
+    call VecGetArrayReadF90(x, ax, ierr)
+    call VecGetArrayF90(y1, a1, ierr); call VecGetArrayF90(y2, a2, ierr)
+    call VecGetArrayF90(y3, a3, ierr); call VecGetArrayF90(y4, a4, ierr)
     a1(1:n1) = ax(1:n1)
     a2(1:n2) = ax(n1+1:n1+n2)
     a3(1:n3) = ax(n1+n2+1:n1+n2+n3)
     a4(1:n4) = ax(n1+n2+n3+1:n1+n2+n3+n4)
-    call VecRestoreArrayRead(x, ax, ierr)
-    call VecRestoreArray(y1, a1, ierr); call VecRestoreArray(y2, a2, ierr)
-    call VecRestoreArray(y3, a3, ierr); call VecRestoreArray(y4, a4, ierr)
+    call VecRestoreArrayReadF90(x, ax, ierr)
+    call VecRestoreArrayF90(y1, a1, ierr); call VecRestoreArrayF90(y2, a2, ierr)
+    call VecRestoreArrayF90(y3, a3, ierr); call VecRestoreArrayF90(y4, a4, ierr)
   end subroutine unpack_4v
 
 
