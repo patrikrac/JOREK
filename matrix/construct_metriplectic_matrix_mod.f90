@@ -289,7 +289,10 @@ subroutine construct_metriplectic_matrices(my_id, local_elms, n_local_elms, a_ma
 
     call apply_dirichlet_bnd(M_psi,  var_psi, local_elms, n_local_elms, my_ind_min, my_ind_max, symmetric=.true.)
     call apply_dirichlet_bnd(L_rho,  var_u,   local_elms, n_local_elms, my_ind_min, my_ind_max, symmetric=.true.)
-    call apply_dirichlet_bnd(W_para, var_u,   local_elms, n_local_elms, my_ind_min, my_ind_max, symmetric=.true.)
+    ! W_para: zero diagonal on BC rows — the composed P_u = L_rho + tau^2*W_para
+    ! then carries exactly L_rho's unit Dirichlet diagonal at every tau.
+    call apply_dirichlet_bnd(W_para, var_u,   local_elms, n_local_elms, my_ind_min, my_ind_max, &
+                             symmetric=.true., diag_value=0.d0)
   endif
 #endif
 

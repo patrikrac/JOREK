@@ -35,6 +35,7 @@ module mod_petsc_pc_metriplectic_analysis
   ! --- Module state consumed by the PCSHELL apply callback ---
   Mat :: m_A4                          !< 4-var reference system (AIJ)
   Mat :: m_B31, m_B42                  !< constraint coupling blocks
+  Mat :: m_B33, m_B44                  !< constraint diagonal blocks (T3b)
   KSP :: m_ksp_Mpsi                    !< consistent-mass solve on M_psi
   KSP :: m_ksp_Pu                      !< direct solve on composed P_u
   KSP :: m_ksp_B33, m_ksp_B44          !< constraint-mass solves
@@ -98,6 +99,8 @@ contains
     call extract_block(A_full, var_w,   var_w,   B44)
     m_B31 = B31
     m_B42 = B42
+    m_B33 = B33
+    m_B44 = B44
 
     ! --- 4-var nest -> AIJ (row-major block order) ---
     mats_nest       = PETSC_NULL_MAT
@@ -121,6 +124,7 @@ contains
 
     call setup_pu_solver(m_tau, comm)   ! compose + factor P_u at the run's tau
     call run_T3(comm, my_id)
+    call run_T3b(comm, my_id)
     call run_T4(comm, my_id)
     call run_T5a(comm, my_id)
 
@@ -571,6 +575,102 @@ contains
     PetscCallA(VecDestroy(yp, ierr)); PetscCallA(VecDestroy(yu, ierr))
     PetscCallA(VecDestroy(yj, ierr)); PetscCallA(VecDestroy(yw, ierr))
   end subroutine run_T3
+
+
+  !====================================================================
+  ! T3b: segregated apply vs direct solve of the IDEAL-ONLY reference
+  !   A_id = [ (1+z)M_psi   tdt*D      0    0  ;
+  !            tdt*Dp      -(1+z)L_rho 0    0  ;
+  !            B31          0          B33  0  ;
+  !            0            B42        0    B44 ]   (tdt = tau*(1+z))
+  ! assembled from OUR operators in JOREK sign convention. Against this,
+  ! the segregated apply is an exact block elimination except P_u vs the
+  ! discrete Schur (L_rho + tau^2 Dp M^-1 D): T3b isolates precisely the
+  ! continuous-vs-discrete Schur consistency gap (spec Sec. 2.2, T3).
+  !====================================================================
+  subroutine run_T3b(comm, my_id)
+    integer, intent(in) :: comm, my_id
+
+    Mat :: Mpsi_s, D_s, Dp_s, Lrho_s
+    Mat :: mats_nest(16), A_nest, A_id
+    KSP :: ksp_ref
+    Vec :: b4, y4, z4
+    Vec :: yp, yu, yj, yw
+    PetscRandom :: rnd
+    PetscReal :: e_psi, e_u, e_j, e_w, n_psi, n_u, n_j, n_w
+    PetscErrorCode :: ierr
+    integer :: trial
+    real*8 :: tdt
+    PC :: dummy_pc
+
+    tdt = m_tau * m_opz
+
+    ! Scaled AIJ copies of the element-assembled operators (JOREK convention)
+    PetscCallA(MatConvert(g_mctx%M_psi, MATMPIAIJ, MAT_INITIAL_MATRIX, Mpsi_s, ierr))
+    PetscCallA(MatScale(Mpsi_s, m_opz, ierr))
+    PetscCallA(MatConvert(g_mctx%D_op, MATMPIAIJ, MAT_INITIAL_MATRIX, D_s, ierr))
+    PetscCallA(MatScale(D_s, tdt, ierr))
+    PetscCallA(MatConvert(g_mctx%Dp_op, MATMPIAIJ, MAT_INITIAL_MATRIX, Dp_s, ierr))
+    PetscCallA(MatScale(Dp_s, tdt, ierr))
+    PetscCallA(MatConvert(g_mctx%L_rho, MATMPIAIJ, MAT_INITIAL_MATRIX, Lrho_s, ierr))
+    PetscCallA(MatScale(Lrho_s, -m_opz, ierr))
+
+    mats_nest     = PETSC_NULL_MAT
+    mats_nest( 1) = Mpsi_s;  mats_nest( 2) = D_s
+    mats_nest( 5) = Dp_s;    mats_nest( 6) = Lrho_s
+    mats_nest( 9) = m_B31;   mats_nest(11) = m_B33
+    mats_nest(14) = m_B42;   mats_nest(16) = m_B44
+    PetscCallA(MatCreateNest(comm, 4, PETSC_NULL_IS, 4, PETSC_NULL_IS, mats_nest, A_nest, ierr))
+    PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, A_id, ierr))
+    PetscCallA(MatDestroy(A_nest, ierr))
+
+    call setup_lu_ksp(A_id, ksp_ref, comm, symmetric=.false.)
+    PetscCallA(MatCreateVecs(A_id, y4, b4, ierr))
+    PetscCallA(VecDuplicate(y4, z4, ierr))
+    PetscCallA(VecDuplicate(m_rpsi, yp, ierr))
+    PetscCallA(VecDuplicate(m_rpsi, yu, ierr))
+    PetscCallA(VecDuplicate(m_rpsi, yj, ierr))
+    PetscCallA(VecDuplicate(m_rpsi, yw, ierr))
+    PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+
+    if (my_id == 0) write(*,'(A)') &
+      "[Metriplectic] T3b: ideal-only reference (isolates Schur consistency gap)"
+    if (my_id == 0) write(*,'(A)') &
+      "[Metriplectic] T3b: trial   err_psi       err_u         err_j         err_w"
+
+    do trial = 1, 3
+      PetscCallA(VecSetRandom(b4, rnd, ierr))
+      PetscCallA(KSPSolve(ksp_ref, b4, y4, ierr))
+      call metriplectic_halfpc_apply(dummy_pc, b4, z4, ierr)
+
+      call unpack_4v(y4, yp, yu, yj, yw, ierr)
+      PetscCallA(VecNorm(yp, NORM_2, n_psi, ierr))
+      PetscCallA(VecNorm(yu, NORM_2, n_u,   ierr))
+      PetscCallA(VecNorm(yj, NORM_2, n_j,   ierr))
+      PetscCallA(VecNorm(yw, NORM_2, n_w,   ierr))
+
+      PetscCallA(VecAXPY(z4, -1.d0, y4, ierr))
+      call unpack_4v(z4, yp, yu, yj, yw, ierr)
+      PetscCallA(VecNorm(yp, NORM_2, e_psi, ierr))
+      PetscCallA(VecNorm(yu, NORM_2, e_u,   ierr))
+      PetscCallA(VecNorm(yj, NORM_2, e_j,   ierr))
+      PetscCallA(VecNorm(yw, NORM_2, e_w,   ierr))
+
+      if (my_id == 0) write(*,'(A,I5,2X,4ES14.4)') "[Metriplectic] T3b:", trial, &
+        e_psi/max(n_psi,tiny(1.d0)), e_u/max(n_u,tiny(1.d0)), &
+        e_j/max(n_j,tiny(1.d0)),     e_w/max(n_w,tiny(1.d0))
+    enddo
+
+    PetscCallA(PetscRandomDestroy(rnd, ierr))
+    PetscCallA(KSPDestroy(ksp_ref, ierr))
+    PetscCallA(VecDestroy(b4, ierr)); PetscCallA(VecDestroy(y4, ierr))
+    PetscCallA(VecDestroy(z4, ierr))
+    PetscCallA(VecDestroy(yp, ierr)); PetscCallA(VecDestroy(yu, ierr))
+    PetscCallA(VecDestroy(yj, ierr)); PetscCallA(VecDestroy(yw, ierr))
+    PetscCallA(MatDestroy(A_id,   ierr))
+    PetscCallA(MatDestroy(Mpsi_s, ierr)); PetscCallA(MatDestroy(D_s,    ierr))
+    PetscCallA(MatDestroy(Dp_s,   ierr)); PetscCallA(MatDestroy(Lrho_s, ierr))
+  end subroutine run_T3b
 
 
   !====================================================================
