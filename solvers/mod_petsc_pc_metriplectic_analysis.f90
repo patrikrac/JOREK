@@ -10,6 +10,11 @@ module mod_petsc_pc_metriplectic_analysis
 !   T2  : SPD of P_u + extreme singular values across a tau sweep
 !   T3  : segregated ideal-half solve vs direct MUMPS solve of the
 !         4-var (psi,u,j,w) reference system with constraint rows kept
+!   T3b : same apply vs the IDEAL-ONLY reference built from our own
+!         operators (isolates the P_u-vs-discrete-Schur gap in norm)
+!   T3c : Ritz values of P_u^-1 (L_rho + tau^2 Dp M^-1 D) — spectral
+!         equivalence of the continuous parabolization with the exact
+!         discrete Schur complement (MATSHELL, the decisive u-block gate)
 !   T4  : harmonic n-n' coupling table of D_op (Remark 6 measurement)
 !   T5a : Ritz values of the ideal-half-preconditioned 4-var system
 !         (diagnostic PCSHELL = prototype of the Slice-B apply)
@@ -125,6 +130,7 @@ contains
     call setup_pu_solver(m_tau, comm)   ! compose + factor P_u at the run's tau
     call run_T3(comm, my_id)
     call run_T3b(comm, my_id)
+    call run_T3c(comm, my_id)
     call run_T4(comm, my_id)
     call run_T5a(comm, my_id)
 
@@ -671,6 +677,122 @@ contains
     PetscCallA(MatDestroy(Mpsi_s, ierr)); PetscCallA(MatDestroy(D_s,    ierr))
     PetscCallA(MatDestroy(Dp_s,   ierr)); PetscCallA(MatDestroy(Lrho_s, ierr))
   end subroutine run_T3b
+
+
+  !====================================================================
+  ! T3c: spectral equivalence of P_u with the exact discrete Schur
+  !   S = L_rho + tau^2 * Dp M_psi^-1 D          (MATSHELL, matrix-free)
+  ! Ritz values of P_u^-1 S from preconditioned GMRES. This is the
+  ! decisive u-block gate: T3b measures the NORM gap between W_para and
+  ! Dp M^-1 D, which is O(1) at grid scale by construction (the mass
+  ! inverse inserts an L2 projection between the factors, and random
+  ! vectors are grid-scale dominated). What the Krylov method needs is
+  ! a bounded spectrum of P_u^-1 S — measured here in isolation from
+  ! the kink/dissipative content that pollutes T5a.
+  ! Requires m_ksp_Pu factored at m_tau (call after setup_pu_solver).
+  !====================================================================
+  subroutine run_T3c(comm, my_id)
+    integer, intent(in) :: comm, my_id
+
+    Mat :: S_shell
+    KSP :: ksp
+    PC  :: pc
+    Vec :: b, x
+    PetscRandom :: rnd
+    PetscReal :: r_eig(60), c_eig(60)
+    PetscInt  :: neig, its, n_loc, n_glob
+    KSPConvergedReason :: reason
+    PetscErrorCode :: ierr
+    integer :: i, jmin
+    real*8  :: tmp, re_min, re_max, im_max
+    character(len=16) :: converged_txt
+
+    call MatGetLocalSize(m_Pu_aij, n_loc, PETSC_NULL_INTEGER, ierr)
+    call MatGetSize(m_Pu_aij, n_glob, PETSC_NULL_INTEGER, ierr)
+    call MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, &
+                        PETSC_NULL_INTEGER, S_shell, ierr)
+    call MatShellSetOperation(S_shell, MATOP_MULT, schur_discrete_mult, ierr)
+
+    PetscCallA(MatCreateVecs(m_Pu_aij, x, b, ierr))
+    PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+    PetscCallA(VecSetRandom(b, rnd, ierr))
+
+    PetscCallA(KSPCreate(comm, ksp, ierr))
+    PetscCallA(KSPSetOperators(ksp, S_shell, S_shell, ierr))
+    PetscCallA(KSPSetType(ksp, KSPGMRES, ierr))
+    PetscCallA(KSPGMRESSetRestart(ksp, 60, ierr))
+    PetscCallA(KSPSetTolerances(ksp, 1.d-10, 1.d-50, PETSC_CURRENT_REAL, 60, ierr))
+    PetscCallA(KSPSetComputeEigenvalues(ksp, PETSC_TRUE, ierr))
+    PetscCallA(KSPGetPC(ksp, pc, ierr))
+    PetscCallA(PCSetType(pc, PCSHELL, ierr))
+    PetscCallA(PCShellSetApply(pc, pu_pc_apply, ierr))
+
+    call KSPSolve(ksp, b, x, ierr)
+    PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
+    PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
+    converged_txt = "not converged"
+    if (reason > 0) converged_txt = "converged"
+    PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
+
+    do i = 1, neig-1
+      jmin = i + minloc(r_eig(i:neig), 1) - 1
+      if (jmin /= i) then
+        tmp = r_eig(i); r_eig(i) = r_eig(jmin); r_eig(jmin) = tmp
+        tmp = c_eig(i); c_eig(i) = c_eig(jmin); c_eig(jmin) = tmp
+      endif
+    enddo
+    re_min = r_eig(1); re_max = r_eig(1); im_max = 0.d0
+    do i = 1, neig
+      re_max = max(re_max, r_eig(i))
+      im_max = max(im_max, abs(c_eig(i)))
+    enddo
+
+    if (my_id == 0) then
+      write(*,'(A,ES11.4)') "[Metriplectic] T3c: spec(P_u^-1 S_discrete) at tau =", m_tau
+      write(*,'(A,I5,A,A)') "[Metriplectic] T3c: GMRES iterations = ", its, &
+                            ", ", trim(converged_txt)
+      write(*,'(A,3ES13.4)') "[Metriplectic] T3c: min Re, max Re, max |Im| = ", &
+                             re_min, re_max, im_max
+      write(*,'(A,I4,A)')   "[Metriplectic] T3c: ", neig, " Ritz values (Re, Im):"
+      do i = 1, neig
+        write(*,'(A,2ES14.5)') "[Metriplectic] T3c:   ", r_eig(i), c_eig(i)
+      enddo
+    endif
+
+    PetscCallA(KSPDestroy(ksp, ierr))
+    PetscCallA(PetscRandomDestroy(rnd, ierr))
+    PetscCallA(VecDestroy(b, ierr))
+    PetscCallA(VecDestroy(x, ierr))
+    PetscCallA(MatDestroy(S_shell, ierr))
+  end subroutine run_T3c
+
+
+  !> MATSHELL MULT: y = L_rho x + tau^2 * Dp M_psi^-1 D x  (discrete Schur).
+  !! BC rows: L_rho carries unit diag, D/Dp rows are zero -> identity rows,
+  !! matching P_u exactly (W_para BC diag is 0), so BC dofs contribute a
+  !! trivial eigenvalue-1 cluster to T3c.
+  subroutine schur_discrete_mult(A, x, y, ierr)
+    Mat :: A
+    Vec :: x, y
+    PetscErrorCode :: ierr
+
+    call MatMult(g_mctx%D_op, x, m_t1, ierr)
+    call KSPSolve(m_ksp_Mpsi, m_t1, m_t2, ierr)
+    call MatMult(g_mctx%Dp_op, m_t2, y, ierr)
+    call MatMult(g_mctx%L_rho, x, m_t1, ierr)
+    call VecAXPBY(y, 1.d0, m_tau**2, m_t1, ierr)
+    ierr = 0
+  end subroutine schur_discrete_mult
+
+
+  !> PCSHELL apply for T3c: y = P_u^-1 x via the factored MUMPS solve.
+  subroutine pu_pc_apply(pc, x, y, ierr)
+    PC  :: pc
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call KSPSolve(m_ksp_Pu, x, y, ierr)
+    ierr = 0
+  end subroutine pu_pc_apply
 
 
   !====================================================================
