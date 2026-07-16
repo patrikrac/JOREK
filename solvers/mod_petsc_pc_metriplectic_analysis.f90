@@ -17,7 +17,10 @@ module mod_petsc_pc_metriplectic_analysis
 !         discrete Schur complement (MATSHELL, the decisive u-block gate)
 !   T4  : harmonic n-n' coupling table of D_op (Remark 6 measurement)
 !   T5a : Ritz values of the ideal-half-preconditioned 4-var system
-!         (diagnostic PCSHELL = prototype of the Slice-B apply)
+!         (PCSHELL delegates to the production ideal-half apply)
+!   T6  : sweep constraint exactness (both orders) + T6b mass-model gap
+!   T5b : Ritz values of the FULL-SWEEP-preconditioned 4-var system (gate G2)
+!   T5c : Ritz values of the production full-system apply (rho/T included)
 !
 ! Reference system (constraints as rows, NEVER folded):
 !   A4 = [ B11 B12 B13  0  ;
@@ -32,6 +35,11 @@ module mod_petsc_pc_metriplectic_analysis
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_metriplectic_ctx, only: g_mctx
+  use mod_petsc_pc_metriplectic_assembly, only: create_index_sets, extract_block, &
+        setup_lu_ksp, setup_mass_ksp, metriplectic_build_sweep, metriplectic_refresh_Pu
+  use mod_petsc_pc_metriplectic_apply, only: metriplectic_ideal_half_solve, &
+        metriplectic_recover_jw, metriplectic_sweep_apply_4v, &
+        metriplectic_sweep_apply_full, mpc_sweep_order
   implicit none
   private
 
@@ -40,10 +48,10 @@ module mod_petsc_pc_metriplectic_analysis
   ! --- Module state consumed by the PCSHELL apply callback ---
   Mat :: m_A4                          !< 4-var reference system (AIJ)
   Mat :: m_B31, m_B42                  !< constraint coupling blocks
-  Mat :: m_B33, m_B44                  !< constraint diagonal blocks (T3b)
-  KSP :: m_ksp_Mpsi                    !< consistent-mass solve on M_psi
-  KSP :: m_ksp_Pu                      !< direct solve on composed P_u
-  KSP :: m_ksp_B33, m_ksp_B44          !< constraint-mass solves
+  Mat :: m_B33, m_B44                  !< constraint diagonal blocks (T3b, T6)
+  Mat :: m_B11, m_B22                  !< true diagonal blocks (T6b mass-model gap)
+  KSP :: m_ksp_Mpsi                    !< consistent-mass solve on M_psi (T3c shell)
+  KSP :: m_ksp_Pu                      !< direct solve on composed P_u (T2/T3c refs)
   Mat :: m_Pu_aij                      !< AIJ copy of the composed P_u
   logical :: m_pu_solver_ready = .false.
   real*8 :: m_tau  = 0.d0              !< tau used in the apply
@@ -67,7 +75,7 @@ contains
     Mat :: B11, B12, B13, B21, B22, B23, B24, B31, B33, B42, B44
     Mat :: mats_nest(16), A_nest
     PetscErrorCode :: ierr
-    integer :: comm, v
+    integer :: comm
 
     if (.not. g_mctx%matrices_ready) then
       if (my_id == 0) write(*,'(A)') &
@@ -84,11 +92,14 @@ contains
       write(*,'(A,ES12.4,A,F8.4)') "[Metriplectic] tau = ", m_tau, ",  (1+zeta) = ", m_opz
     endif
 
-    ! --- Variable index sets (independent copy; layout as in
-    !     mod_petsc_pc_physics_construction::create_variable_index_sets) ---
+    ! --- Variable index sets (shared with the sweep; persistent) ---
     if (.not. g_mctx%is_created) then
       call create_index_sets(A_full, comm)
     endif
+
+    ! --- Build the production sweep (pair solves, ctx solvers, P_u at run tau);
+    !     the delegated ideal-half apply and T6/T5b/T5c consume it ---
+    call metriplectic_build_sweep(A_full, my_id)
 
     ! --- Extract the Jacobian blocks of the 4-var reference system ---
     call extract_block(A_full, var_psi, var_psi, B11)
@@ -106,6 +117,8 @@ contains
     m_B42 = B42
     m_B33 = B33
     m_B44 = B44
+    m_B11 = B11
+    m_B22 = B22
 
     ! --- 4-var nest -> AIJ (row-major block order) ---
     mats_nest       = PETSC_NULL_MAT
@@ -117,27 +130,27 @@ contains
     PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, m_A4, ierr))
     PetscCallA(MatDestroy(A_nest, ierr))
 
-    ! --- Work vectors and constraint/mass solvers ---
+    ! --- Work vectors and reference-solver setup ---
     call create_work_vecs(ierr)
     call setup_mass_ksp(g_mctx%M_psi, m_ksp_Mpsi, comm)
-    call setup_lu_ksp(B33, m_ksp_B33, comm, symmetric=.false.)
-    call setup_lu_ksp(B44, m_ksp_B44, comm, symmetric=.false.)
 
     ! --- Checks ---
     call run_T1(comm, my_id)
     call run_T2(comm, my_id, metriplectic_analysis_nsweep)
 
-    call setup_pu_solver(m_tau, comm)   ! compose + factor P_u at the run's tau
+    call setup_pu_solver(m_tau, comm)   ! analysis-local P_u factor (T3c shell PC)
     call run_T3(comm, my_id)
     call run_T3b(comm, my_id)
     call run_T3c(comm, my_id)
+    call run_T6(comm, my_id)
     call run_T4(comm, my_id)
     call run_T5a(comm, my_id)
+    call run_T5b(comm, my_id)
+    call run_T5c(comm, my_id, A_full)
 
-    ! --- Cleanup (keep g_mctx element operators; destroy analysis objects) ---
+    ! --- Cleanup (keep g_mctx operators, sweep objects, and index sets —
+    !     the production apply owns them; destroy analysis-local objects) ---
     PetscCallA(KSPDestroy(m_ksp_Mpsi, ierr))
-    PetscCallA(KSPDestroy(m_ksp_B33, ierr))
-    PetscCallA(KSPDestroy(m_ksp_B44, ierr))
     if (m_pu_solver_ready) then
       PetscCallA(KSPDestroy(m_ksp_Pu, ierr))
       PetscCallA(MatDestroy(m_Pu_aij, ierr))
@@ -151,10 +164,6 @@ contains
     PetscCallA(MatDestroy(B24, ierr)); PetscCallA(MatDestroy(B31, ierr))
     PetscCallA(MatDestroy(B33, ierr)); PetscCallA(MatDestroy(B42, ierr))
     PetscCallA(MatDestroy(B44, ierr))
-    do v = 1, 6
-      PetscCallA(ISDestroy(g_mctx%is_var(v), ierr))
-    enddo
-    g_mctx%is_created = .false.
 
     if (my_id == 0) write(*,'(A)') &
       "[Metriplectic] ================ analysis complete ================"
@@ -162,97 +171,12 @@ contains
 
 
   !====================================================================
-  ! Setup helpers
+  ! Setup helpers (create_index_sets / extract_block / setup_lu_ksp /
+  ! setup_mass_ksp now live in the assembly module — shared with the sweep)
   !====================================================================
 
-  !> Variable index sets on A_full's layout (independent of the old PC ctx).
-  subroutine create_index_sets(A_full, comm)
-    use mod_parameters, only: n_var, n_tor
-    Mat,     intent(in) :: A_full
-    integer, intent(in) :: comm
-
-    PetscInt :: n_local, rstart, rend
-    PetscInt :: block_size, n_block_local, n_var_dofs
-    PetscInt, allocatable :: indices(:)
-    PetscErrorCode :: ierr
-    integer :: v, i, m, k
-
-    PetscCallA(MatGetLocalSize(A_full, n_local, PETSC_NULL_INTEGER, ierr))
-    PetscCallA(MatGetOwnershipRange(A_full, rstart, rend, ierr))
-
-    block_size    = n_var * n_tor
-    n_block_local = n_local / block_size
-    n_var_dofs    = n_block_local * n_tor
-
-    allocate(indices(n_var_dofs))
-    do v = 1, 6
-      k = 0
-      do i = 0, n_block_local - 1
-        do m = 0, n_tor - 1
-          k = k + 1
-          indices(k) = rstart + i * block_size + (v-1) * n_tor + m
-        enddo
-      enddo
-      PetscCallA(ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, &
-                                 g_mctx%is_var(v), ierr))
-    enddo
-    deallocate(indices)
-    g_mctx%is_created = .true.
-  end subroutine create_index_sets
-
-
-  subroutine extract_block(A_full, eq_row, var_col, B)
-    Mat, intent(in)    :: A_full
-    integer, intent(in) :: eq_row, var_col
-    Mat, intent(out)    :: B
-    PetscErrorCode :: ierr
-    PetscCallA(MatCreateSubMatrix(A_full, g_mctx%is_var(eq_row), g_mctx%is_var(var_col), &
-                                  MAT_INITIAL_MATRIX, B, ierr))
-  end subroutine extract_block
-
-
-  !> Direct MUMPS solver (LU, or Cholesky when symmetric=.true.).
-  subroutine setup_lu_ksp(A, ksp, comm, symmetric)
-    Mat,     intent(in)  :: A
-    KSP,     intent(out) :: ksp
-    integer, intent(in)  :: comm
-    logical, intent(in)  :: symmetric
-    PC :: pc
-    PetscErrorCode :: ierr
-
-    PetscCallA(KSPCreate(comm, ksp, ierr))
-    PetscCallA(KSPSetOperators(ksp, A, A, ierr))
-    PetscCallA(KSPSetType(ksp, KSPPREONLY, ierr))
-    PetscCallA(KSPGetPC(ksp, pc, ierr))
-    if (symmetric) then
-      PetscCallA(PCSetType(pc, PCCHOLESKY, ierr))
-    else
-      PetscCallA(PCSetType(pc, PCLU, ierr))
-    endif
-    PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
-    PetscCallA(KSPSetUp(ksp, ierr))
-  end subroutine setup_lu_ksp
-
-
-  !> Consistent-mass solve: CG + Jacobi, tight tolerance.
-  subroutine setup_mass_ksp(A, ksp, comm)
-    Mat,     intent(in)  :: A
-    KSP,     intent(out) :: ksp
-    integer, intent(in)  :: comm
-    PC :: pc
-    PetscErrorCode :: ierr
-
-    PetscCallA(KSPCreate(comm, ksp, ierr))
-    PetscCallA(KSPSetOperators(ksp, A, A, ierr))
-    PetscCallA(KSPSetType(ksp, KSPCG, ierr))
-    PetscCallA(KSPSetTolerances(ksp, 1.d-12, 1.d-50, PETSC_CURRENT_REAL, 500, ierr))
-    PetscCallA(KSPGetPC(ksp, pc, ierr))
-    PetscCallA(PCSetType(pc, PCJACOBI, ierr))
-    PetscCallA(KSPSetUp(ksp, ierr))
-  end subroutine setup_mass_ksp
-
-
-  !> (Re)compose P_u at tau_in, convert to AIJ, factor with MUMPS Cholesky.
+  !> (Re)compose P_u at tau_in, convert to AIJ, factor with MUMPS Cholesky
+  !! (analysis-local copy bound to m_ksp_Pu; the T3c shell PC uses it).
   subroutine setup_pu_solver(tau_in, comm)
     use mod_petsc_pc_metriplectic_assembly, only: metriplectic_compose_P_u
     real*8,  intent(in) :: tau_in
@@ -341,16 +265,10 @@ contains
 
 
   !====================================================================
-  ! Diagnostic PCSHELL apply: segregated ideal-half solve with
-  ! post-hoc constraint recovery (prototype of the Slice-B apply;
-  ! spec Sec. 4, note Sec. "Elimination" for the tau/(1+zeta) scaling).
-  !
-  !   h      = M_psi^-1 r_psi / (1+zeta)
-  !   rhs_u  = -r_u/(1+zeta) + tau * Dp h        (u-row negation: note Sec. 6)
-  !   du     = P_u^-1 rhs_u
-  !   dpsi   = h - tau * M_psi^-1 (D du)
-  !   dj     = B33^-1 (r_j - B31 dpsi)           (constraint recovery)
-  !   dw     = B44^-1 (r_w - B42 du)
+  ! Diagnostic PCSHELL apply: DELEGATES to the production ideal-half
+  ! routines (mod_petsc_pc_metriplectic_apply; ctx-owned solvers, P_u
+  ! factored by build_sweep/refresh_Pu). Keeping this thin wrapper makes
+  ! T3/T3b/T5a regression tests of the production code path.
   !====================================================================
   subroutine metriplectic_halfpc_apply(pc, x, y, ierr)
     PC  :: pc
@@ -358,36 +276,8 @@ contains
     PetscErrorCode :: ierr
 
     call unpack_4v(x, m_rpsi, m_ru, m_rj, m_rw, ierr)
-
-    ! h = M^-1 r_psi / (1+zeta)
-    call KSPSolve(m_ksp_Mpsi, m_rpsi, m_h, ierr)
-    call VecScale(m_h, 1.d0/m_opz, ierr)
-
-    ! rhs_u = -r_u/(1+zeta) + tau * Dp h   (accumulated in m_t2)
-    ! Sign: JOREK u-row = -(1+z)A_rho du + tdt*Dp dpsi; negating to the SPD
-    ! form flips BOTH terms -> the Dp coupling enters with MINUS, and the
-    ! eliminated RHS carries +tau*Dp*h (T3-verified; note Sec. 6 corrected).
-    call MatMult(g_mctx%Dp_op, m_h, m_t2, ierr)
-    call VecAXPBY(m_t2, -1.d0/m_opz, +m_tau, m_ru, ierr)
-
-    ! du = P_u^-1 rhs_u
-    call KSPSolve(m_ksp_Pu, m_t2, m_du, ierr)
-
-    ! dpsi = h - tau * M^-1 (D du)
-    call MatMult(g_mctx%D_op, m_du, m_t1, ierr)
-    call KSPSolve(m_ksp_Mpsi, m_t1, m_dpsi, ierr)
-    call VecAYPX(m_dpsi, -m_tau, m_h, ierr)
-
-    ! dj = B33^-1 (r_j - B31 dpsi)
-    call MatMult(m_B31, m_dpsi, m_t1, ierr)
-    call VecAYPX(m_t1, -1.d0, m_rj, ierr)
-    call KSPSolve(m_ksp_B33, m_t1, m_dj, ierr)
-
-    ! dw = B44^-1 (r_w - B42 du)
-    call MatMult(m_B42, m_du, m_t2, ierr)
-    call VecAYPX(m_t2, -1.d0, m_rw, ierr)
-    call KSPSolve(m_ksp_B44, m_t2, m_dw, ierr)
-
+    call metriplectic_ideal_half_solve(m_rpsi, m_ru, m_dpsi, m_du)
+    call metriplectic_recover_jw(m_rj, m_rw, m_dpsi, m_du, m_dj, m_dw)
     call pack_4v(m_dpsi, m_du, m_dj, m_dw, y, ierr)
     ierr = 0
   end subroutine metriplectic_halfpc_apply
@@ -864,8 +754,11 @@ contains
 
   !====================================================================
   ! T5a: Ritz values of the ideal-half-preconditioned 4-var system.
-  ! P_u is re-composed at tau/4, tau, 4*tau (system fixed at tau):
-  ! measures spectrum quality and its sensitivity to compose-lag.
+  ! The PRODUCTION P_u factorization (ctx ksp_Pu) is refreshed at
+  ! tau/4, tau, 4*tau while the system and the apply's tau scalars stay
+  ! at the run tau — the factorization-lag model of a lagged PC. (Slice A
+  ! lagged the tau scalars too; the matched-tau row is identical, the
+  ! off-tau rows changed meaning on 2026-07-16 — see the gate record.)
   !====================================================================
   subroutine run_T5a(comm, my_id)
     integer, intent(in) :: comm, my_id
@@ -887,7 +780,7 @@ contains
 
     do it3 = 1, 3
       tau_s = tau_run * 4.d0**(it3 - 2)
-      call setup_pu_solver(tau_s, comm)
+      call metriplectic_refresh_Pu(tau_s)
 
       PetscCallA(MatCreateVecs(m_A4, x4, b4, ierr))
       PetscCallA(PetscRandomCreate(comm, rnd, ierr))
@@ -936,9 +829,253 @@ contains
       PetscCallA(VecDestroy(x4, ierr))
     enddo
 
-    ! Restore P_u at the run's tau
-    call setup_pu_solver(tau_run, comm)
+    ! Restore the production P_u at the run's tau
+    call metriplectic_refresh_Pu(tau_run)
   end subroutine run_T5a
+
+
+  !====================================================================
+  ! T6: sweep bookkeeping checks (gate G2, part 1).
+  !  (a) Constraint exactness, both orders: the sweep output must satisfy
+  !      B31 dpsi + B33 dj = r_j and B42 du + B44 dw = r_w to roundoff
+  !      (note Sec. sweep, "Constraint exactness of the PC") — this pins
+  !      the single-consumption rule and the pack/unpack plumbing.
+  !  (b) T6b, mass-model gap: |(1+z)M_psi z - B11 z|/|B11 z| and
+  !      |-(1+z)L_rho z - B22 z|/|B22 z| — the dissipative + model content
+  !      of the true diagonal blocks beyond the middle mass M_red
+  !      (bounded model choice; recorded, not gated).
+  !====================================================================
+  subroutine run_T6(comm, my_id)
+    use phys_module, only: time_evol_zeta
+    integer, intent(in) :: comm, my_id
+
+    Vec :: x4, y4
+    PetscRandom :: rnd
+    PetscReal :: cj, cw, nj, nw, gpsi, gu, npsi_r, nu_r
+    PetscErrorCode :: ierr
+    integer :: io
+    character(len=2) :: orders(2)
+    PC :: dummy_pc
+    real*8 :: opz
+
+    opz = 1.d0 + time_evol_zeta
+    orders(1) = 'SK'; orders(2) = 'KS'
+    PetscCallA(MatCreateVecs(m_A4, y4, x4, ierr))
+    PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+
+    if (my_id == 0) write(*,'(A)') &
+      "[Metriplectic] T6: sweep constraint exactness (relative residual of the constraint rows)"
+    do io = 1, 2
+      mpc_sweep_order = orders(io)
+      PetscCallA(VecSetRandom(x4, rnd, ierr))
+      call metriplectic_sweep_apply_4v(dummy_pc, x4, y4, ierr)
+
+      call unpack_4v(x4, m_rpsi, m_ru, m_rj, m_rw, ierr)
+      call unpack_4v(y4, m_dpsi, m_du, m_dj, m_dw, ierr)
+
+      ! |B31 dpsi + B33 dj - rj| / |rj|
+      call MatMult(m_B31, m_dpsi, m_t1, ierr)
+      call MatMultAdd(m_B33, m_dj, m_t1, m_t1, ierr)
+      call VecAXPY(m_t1, -1.d0, m_rj, ierr)
+      PetscCallA(VecNorm(m_t1, NORM_2, cj, ierr))
+      PetscCallA(VecNorm(m_rj, NORM_2, nj, ierr))
+
+      ! |B42 du + B44 dw - rw| / |rw|
+      call MatMult(m_B42, m_du, m_t1, ierr)
+      call MatMultAdd(m_B44, m_dw, m_t1, m_t1, ierr)
+      call VecAXPY(m_t1, -1.d0, m_rw, ierr)
+      PetscCallA(VecNorm(m_t1, NORM_2, cw, ierr))
+      PetscCallA(VecNorm(m_rw, NORM_2, nw, ierr))
+
+      if (my_id == 0) write(*,'(A,A,A,2ES14.4)') &
+        "[Metriplectic] T6:  order ", orders(io), "  (j, w) = ", &
+        cj/max(nj,tiny(1.d0)), cw/max(nw,tiny(1.d0))
+    enddo
+    mpc_sweep_order = 'SK'
+
+    ! --- T6b: mass-model content of the true diagonal blocks ---
+    PetscCallA(VecSetRandom(m_h, rnd, ierr))
+    call MatMult(m_B11, m_h, m_t1, ierr)
+    call MatMult(g_mctx%M_psi, m_h, m_t2, ierr)
+    call VecAXPBY(m_t2, -1.d0, opz, m_t1, ierr)      ! t2 = opz*Mpsi z - B11 z
+    PetscCallA(VecNorm(m_t2, NORM_2, gpsi, ierr))
+    PetscCallA(VecNorm(m_t1, NORM_2, npsi_r, ierr))
+
+    call MatMult(m_B22, m_h, m_t1, ierr)
+    call MatMult(g_mctx%L_rho, m_h, m_t2, ierr)
+    call VecAXPBY(m_t2, -1.d0, -opz, m_t1, ierr)     ! t2 = -opz*Lrho z - B22 z
+    PetscCallA(VecNorm(m_t2, NORM_2, gu, ierr))
+    PetscCallA(VecNorm(m_t1, NORM_2, nu_r, ierr))
+
+    if (my_id == 0) write(*,'(A,2ES14.4)') &
+      "[Metriplectic] T6b: mass-model gap |M_red z - B_diag z|/|B_diag z| (psi, u) = ", &
+      gpsi/max(npsi_r,tiny(1.d0)), gu/max(nu_r,tiny(1.d0))
+
+    PetscCallA(PetscRandomDestroy(rnd, ierr))
+    PetscCallA(VecDestroy(x4, ierr))
+    PetscCallA(VecDestroy(y4, ierr))
+  end subroutine run_T6
+
+
+  !====================================================================
+  ! T5b: Ritz values of the FULL-SWEEP-preconditioned 4-var system
+  ! (gate G2, part 2). Same factorization-lag protocol as T5a.
+  ! Expectation: the T5a dissipative band and the sub-unit band collapse
+  ! into the treated spectrum; residual outliers = kink + model mismatch.
+  !====================================================================
+  subroutine run_T5b(comm, my_id)
+    integer, intent(in) :: comm, my_id
+
+    KSP :: ksp
+    PC  :: pc
+    Vec :: b4, x4
+    PetscRandom :: rnd
+    PetscReal :: r_eig(60), c_eig(60)
+    PetscInt  :: neig, its
+    KSPConvergedReason :: reason
+    PetscErrorCode :: ierr
+    integer :: it3, i, jmin
+    real*8  :: tau_run, tau_s, tmp, re_min, re_max, im_max
+    character(len=64) :: head
+    character(len=16) :: converged_txt
+
+    tau_run = m_tau
+
+    do it3 = 1, 3
+      tau_s = tau_run * 4.d0**(it3 - 2)
+      call metriplectic_refresh_Pu(tau_s)
+
+      PetscCallA(MatCreateVecs(m_A4, x4, b4, ierr))
+      PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+      PetscCallA(VecSetRandom(b4, rnd, ierr))
+
+      PetscCallA(KSPCreate(comm, ksp, ierr))
+      PetscCallA(KSPSetOperators(ksp, m_A4, m_A4, ierr))
+      PetscCallA(KSPSetType(ksp, KSPGMRES, ierr))
+      PetscCallA(KSPGMRESSetRestart(ksp, 60, ierr))
+      PetscCallA(KSPSetTolerances(ksp, 1.d-10, 1.d-50, PETSC_CURRENT_REAL, 60, ierr))
+      PetscCallA(KSPSetComputeEigenvalues(ksp, PETSC_TRUE, ierr))
+      PetscCallA(KSPGetPC(ksp, pc, ierr))
+      PetscCallA(PCSetType(pc, PCSHELL, ierr))
+      PetscCallA(PCShellSetApply(pc, metriplectic_sweep_apply_4v, ierr))
+
+      call KSPSolve(ksp, b4, x4, ierr)
+      PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
+      PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
+      converged_txt = "not converged"
+      if (reason > 0) converged_txt = "converged"
+      PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
+
+      do i = 1, neig-1
+        jmin = i + minloc(r_eig(i:neig), 1) - 1
+        if (jmin /= i) then
+          tmp = r_eig(i); r_eig(i) = r_eig(jmin); r_eig(jmin) = tmp
+          tmp = c_eig(i); c_eig(i) = c_eig(jmin); c_eig(jmin) = tmp
+        endif
+      enddo
+      re_min = r_eig(1); re_max = r_eig(1); im_max = 0.d0
+      do i = 1, neig
+        re_max = max(re_max, r_eig(i))
+        im_max = max(im_max, abs(c_eig(i)))
+      enddo
+
+      if (my_id == 0) then
+        write(head,'(A,ES11.4,A,ES11.4)') " P_u at tau_s=", tau_s, ", system tau=", tau_run
+        write(*,'(A,A,A,A)')    "[Metriplectic] T5b:", trim(head), &
+                                ", order ", mpc_sweep_order
+        write(*,'(A,I5,A,A)')   "[Metriplectic] T5b: GMRES iterations = ", its, &
+                                ", ", trim(converged_txt)
+        write(*,'(A,3ES13.4)')  "[Metriplectic] T5b: min Re, max Re, max |Im| = ", &
+                                re_min, re_max, im_max
+        write(*,'(A,I4,A)')     "[Metriplectic] T5b: ", neig, " Ritz values (Re, Im):"
+        do i = 1, neig
+          write(*,'(A,2ES14.5)') "[Metriplectic] T5b:   ", r_eig(i), c_eig(i)
+        enddo
+      endif
+
+      PetscCallA(KSPDestroy(ksp, ierr))
+      PetscCallA(PetscRandomDestroy(rnd, ierr))
+      PetscCallA(VecDestroy(b4, ierr))
+      PetscCallA(VecDestroy(x4, ierr))
+    enddo
+
+    call metriplectic_refresh_Pu(tau_run)
+  end subroutine run_T5b
+
+
+  !====================================================================
+  ! T5c: Ritz values of the production full-system apply on the FULL
+  ! Jacobian (rho/T recovery included) — what the outer FGMRES will see.
+  ! First measurement of the untreated pressure back-coupling band.
+  !====================================================================
+  subroutine run_T5c(comm, my_id, A_full)
+    integer, intent(in) :: comm, my_id
+    Mat,     intent(in) :: A_full
+
+    KSP :: ksp
+    PC  :: pc
+    Vec :: b, x
+    PetscRandom :: rnd
+    PetscReal :: r_eig(60), c_eig(60)
+    PetscInt  :: neig, its
+    KSPConvergedReason :: reason
+    PetscErrorCode :: ierr
+    integer :: i, jmin
+    real*8  :: tmp, re_min, re_max, im_max
+    character(len=16) :: converged_txt
+
+    PetscCallA(MatCreateVecs(A_full, x, b, ierr))
+    PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+    PetscCallA(VecSetRandom(b, rnd, ierr))
+
+    PetscCallA(KSPCreate(comm, ksp, ierr))
+    PetscCallA(KSPSetOperators(ksp, A_full, A_full, ierr))
+    PetscCallA(KSPSetType(ksp, KSPGMRES, ierr))
+    PetscCallA(KSPGMRESSetRestart(ksp, 60, ierr))
+    PetscCallA(KSPSetTolerances(ksp, 1.d-10, 1.d-50, PETSC_CURRENT_REAL, 60, ierr))
+    PetscCallA(KSPSetComputeEigenvalues(ksp, PETSC_TRUE, ierr))
+    PetscCallA(KSPGetPC(ksp, pc, ierr))
+    PetscCallA(PCSetType(pc, PCSHELL, ierr))
+    PetscCallA(PCShellSetApply(pc, metriplectic_sweep_apply_full, ierr))
+
+    call KSPSolve(ksp, b, x, ierr)
+    PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
+    PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
+    converged_txt = "not converged"
+    if (reason > 0) converged_txt = "converged"
+    PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
+
+    do i = 1, neig-1
+      jmin = i + minloc(r_eig(i:neig), 1) - 1
+      if (jmin /= i) then
+        tmp = r_eig(i); r_eig(i) = r_eig(jmin); r_eig(jmin) = tmp
+        tmp = c_eig(i); c_eig(i) = c_eig(jmin); c_eig(jmin) = tmp
+      endif
+    enddo
+    re_min = r_eig(1); re_max = r_eig(1); im_max = 0.d0
+    do i = 1, neig
+      re_max = max(re_max, r_eig(i))
+      im_max = max(im_max, abs(c_eig(i)))
+    enddo
+
+    if (my_id == 0) then
+      write(*,'(A,A)')       "[Metriplectic] T5c: production apply on the full system, order ", &
+                             mpc_sweep_order
+      write(*,'(A,I5,A,A)')  "[Metriplectic] T5c: GMRES iterations = ", its, &
+                             ", ", trim(converged_txt)
+      write(*,'(A,3ES13.4)') "[Metriplectic] T5c: min Re, max Re, max |Im| = ", &
+                             re_min, re_max, im_max
+      write(*,'(A,I4,A)')    "[Metriplectic] T5c: ", neig, " Ritz values (Re, Im):"
+      do i = 1, neig
+        write(*,'(A,2ES14.5)') "[Metriplectic] T5c:   ", r_eig(i), c_eig(i)
+      enddo
+    endif
+
+    PetscCallA(KSPDestroy(ksp, ierr))
+    PetscCallA(PetscRandomDestroy(rnd, ierr))
+    PetscCallA(VecDestroy(b, ierr))
+    PetscCallA(VecDestroy(x, ierr))
+  end subroutine run_T5c
 
 #endif
 end module mod_petsc_pc_metriplectic_analysis

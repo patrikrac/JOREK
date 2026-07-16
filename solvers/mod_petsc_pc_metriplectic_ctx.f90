@@ -32,18 +32,37 @@ module mod_petsc_pc_metriplectic_ctx
     Mat :: P_u       !< L_rho + tau^2 * W_para  (composed, not re-assembled)
     logical :: P_u_created = .false.
 
-    !> True sub-blocks of the full system for T3/T5a reference solves
-    !! (extracted from the full Jacobian; independent copies — nothing
-    !!  shared with g_ctx of the old physics PC).
-    Mat :: A_alfven_true      !< 2x2 (psi,u) MatNest->AIJ from the full Jacobian
+    !> Variable index sets on the full Jacobian's layout (shared by the
+    !! analysis checks and the production sweep; persistent once created).
     IS  :: is_var(6)
     logical :: is_created = .false.
 
-    !> Solvers used by the analysis (created on demand)
-    KSP :: ksp_P_u            !< Cholesky/MUMPS on P_u (T2, T3, T5a)
-    KSP :: ksp_M_psi          !< consistent-mass solve on M_psi (T3, T5a)
-    KSP :: ksp_alfven_ref     !< MUMPS LU on A_alfven_true (T3 reference)
-    logical :: ksp_created = .false.
+    !> --- Sweep operators (stage B/C, spec Sec. 6; note Sec. "sweep") ---
+    !! True-Jacobian sub-blocks, extracted copies owned by the sweep
+    !! (suffix s; independent of the analysis module's m_* handles).
+    Mat :: A_pair_psij        !< 2x2 [B11 B13; B31 B33] MatNest->AIJ (S-half, psi/j pair)
+    Mat :: A_pair_uw          !< 2x2 [B22 B24; B42 B44] MatNest->AIJ (S-half, u/w pair)
+    Mat :: B_31s, B_33s       !< constraint row blocks (j recovery; B_33s factored once)
+    Mat :: B_42s, B_44s       !< constraint row blocks (w recovery; B_44s factored once)
+    Mat :: B_52s, B_55s       !< rho recovery: drho = B55^-1 (r_rho - B52 du)
+    Mat :: B_62s, B_66s       !< T   recovery: dT   = B66^-1 (r_T   - B62 du)
+    Mat :: Pu_aij             !< AIJ copy of composed P_u bound to ksp_Pu
+
+    !> Sweep solvers (created/refreshed by metriplectic_build_sweep)
+    KSP :: ksp_pair_psij      !< MUMPS LU on A_pair_psij
+    KSP :: ksp_pair_uw        !< MUMPS LU on A_pair_uw
+    KSP :: ksp_Pu             !< MUMPS Cholesky on Pu_aij (refresh via refresh_Pu)
+    KSP :: ksp_Mpsi           !< CG+Jacobi consistent-mass solve on M_psi
+    KSP :: ksp_B33, ksp_B44   !< MUMPS LU, factored ONCE (constant constraint masses)
+    KSP :: ksp_B55, ksp_B66   !< MUMPS LU on rho/T diagonal blocks (refreshed)
+    logical :: sweep_ready       = .false.
+    logical :: sweep_once_done   = .false.  !< B33/B44 factored-once guard
+    real*8  :: tau_Pu            = -1.d0    !< tau at which ksp_Pu is factored
+
+    !> Sweep work vectors: 2-var packed pair vecs + rho/T sized 1-var vecs
+    Vec :: wv_pair_psij_1, wv_pair_psij_2
+    Vec :: wv_pair_uw_1,   wv_pair_uw_2
+    Vec :: wv_rho_1, wv_rho_2, wv_T_1, wv_T_2
 
     !> Work vectors (1-var sized), created with the matrices
     Vec :: wv_psi_1, wv_psi_2, wv_u_1, wv_u_2
