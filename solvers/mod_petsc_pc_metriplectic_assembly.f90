@@ -19,6 +19,13 @@ module mod_petsc_pc_metriplectic_assembly
   public :: metriplectic_build_sweep
   public :: metriplectic_refresh_Pu
 
+  ! --- TEMPORARY diagnostic: per-block stiffness-norm log (note Sec.
+  ! "Coefficient table"). Flip to .false. to disable; delete this block
+  ! and its call site in metriplectic_build_sweep once no longer needed. ---
+  logical, parameter :: LOG_STIFFNESS_METRICS = .true.
+  character(len=*), parameter :: STIFFNESS_LOG_FILE = 'metriplectic_stiffness.dat'
+  logical, save :: g_stiffness_header_written = .false.
+
 contains
 
   !--------------------------------------------------------------------
@@ -389,6 +396,8 @@ contains
           "[Metriplectic] sweep built (pair solves + P_u Schur K-half); tau = ", g_mctx%dt_theta
       endif
     endif
+
+    if (LOG_STIFFNESS_METRICS) call log_stiffness_metrics(my_id, opz, tdt)
   end subroutine metriplectic_build_sweep
 
 
@@ -410,6 +419,87 @@ contains
     call setup_lu_ksp(g_mctx%Pu_aij, g_mctx%ksp_Pu, g_mctx%comm, symmetric=.true.)
     g_mctx%tau_Pu = tau_in
   end subroutine metriplectic_refresh_Pu
+
+
+  !--------------------------------------------------------------------
+  !> TEMPORARY diagnostic. Per-block Frobenius-norm proxy for how much
+  !! each element-assembled operator (note Sec. "Coefficient table":
+  !! M_psi, D, D', L_rho, W_para) contributes to the K-half/S-half
+  !! stiffness, appended each PC rebuild so the balance can be tracked
+  !! over a run. Scalars match the coefficients actually assembled into
+  !! A_kideal / P_u a few lines up (note Sec. "halves"): (1+zeta) on
+  !! M_psi/L_rho, theta*dt on D/D', tau^2 on W_para.
+  !--------------------------------------------------------------------
+  subroutine log_stiffness_metrics(my_id, opz, tdt)
+    use phys_module, only: index_now, t_now
+
+    integer, intent(in) :: my_id
+    real*8,  intent(in) :: opz, tdt
+
+    Mat :: A_aij
+    PetscReal :: nrm_Mpsi, nrm_D, nrm_Dp, nrm_Lrho, nrm_Wpara, nrm_tot
+    real*8    :: f_Mpsi, f_D, f_Dp, f_Lrho, f_Wpara
+    integer :: u, ios
+    PetscErrorCode :: ierr
+
+    PetscCallA(MatConvert(g_mctx%M_psi, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_Mpsi, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    PetscCallA(MatConvert(g_mctx%D_op, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_D, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    PetscCallA(MatConvert(g_mctx%Dp_op, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_Dp, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    PetscCallA(MatConvert(g_mctx%L_rho, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_Lrho, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    PetscCallA(MatConvert(g_mctx%W_para, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_Wpara, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    nrm_Mpsi  = opz               * nrm_Mpsi
+    nrm_D     = tdt               * nrm_D
+    nrm_Dp    = tdt               * nrm_Dp
+    nrm_Lrho  = opz               * nrm_Lrho
+    nrm_Wpara = g_mctx%dt_theta**2 * nrm_Wpara
+
+    nrm_tot = nrm_Mpsi + nrm_D + nrm_Dp + nrm_Lrho + nrm_Wpara
+    if (nrm_tot > 0.d0) then
+      f_Mpsi  = nrm_Mpsi  / nrm_tot
+      f_D     = nrm_D     / nrm_tot
+      f_Dp    = nrm_Dp    / nrm_tot
+      f_Lrho  = nrm_Lrho  / nrm_tot
+      f_Wpara = nrm_Wpara / nrm_tot
+    else
+      f_Mpsi = 0.d0; f_D = 0.d0; f_Dp = 0.d0; f_Lrho = 0.d0; f_Wpara = 0.d0
+    endif
+
+    if (my_id /= 0) return
+
+    if (.not. g_stiffness_header_written) then
+      open(newunit=u, file=STIFFNESS_LOG_FILE, status='replace', action='write', iostat=ios)
+      if (ios == 0) then
+        write(u,'(A)') '# step  time  tau  nrm_Mpsi  nrm_D  nrm_Dp  nrm_Lrho  nrm_Wpara  '// &
+                        'frac_Mpsi  frac_D  frac_Dp  frac_Lrho  frac_Wpara'
+        close(u)
+      endif
+      g_stiffness_header_written = .true.
+    endif
+
+    open(newunit=u, file=STIFFNESS_LOG_FILE, status='old', position='append', action='write', iostat=ios)
+    if (ios == 0) then
+      write(u,'(I8,1X,ES14.6,1X,ES14.6,5(1X,ES14.6),5(1X,F10.6))') &
+        index_now, t_now, g_mctx%dt_theta, &
+        nrm_Mpsi, nrm_D, nrm_Dp, nrm_Lrho, nrm_Wpara, &
+        f_Mpsi, f_D, f_Dp, f_Lrho, f_Wpara
+      close(u)
+    endif
+  end subroutine log_stiffness_metrics
 
 #endif
 end module mod_petsc_pc_metriplectic_assembly
