@@ -656,6 +656,8 @@ subroutine preset_parameters
   physics_pc_block_inv  = .false.           ! Per-node 4x4 block-diagonal mass inverse for Schur correction
   metriplectic_analysis        = .false.    ! Metriplectic PC Slice-A analysis (T1-T5a) off by default
   metriplectic_analysis_nsweep = 5          ! Number of dt points in the T2 conditioning sweep
+  use_metriplectic_pc          = .false.    ! Metriplectic HSS sweep PCSHELL off by default
+  metriplectic_sweep_order     = 'SK'       ! Sweep order: dissipative pairs first ('SK') or ideal first ('KS')
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 
   use_mumps          = .false.              ! Use MUMPS solver
