@@ -261,27 +261,36 @@ contains
   !====================================================================
   subroutine metriplectic_build_sweep(A_full, my_id)
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
+    use phys_module,    only: time_evol_zeta, metriplectic_analysis, &
+                              metriplectic_coupled_ideal
 
     Mat,     intent(in) :: A_full
     integer, intent(in) :: my_id
 
     Mat :: B11, B13, B22, B24
+    Mat :: Mps, Ds, Dps, Ls
     Mat :: mats2(4), A_nest
     PetscErrorCode :: ierr
     integer :: comm
+    real*8 :: tdt, opz
 
     call PetscObjectGetComm(A_full, comm, ierr)
     if (.not. g_mctx%is_created) call create_index_sets(A_full, comm)
+    g_mctx%ideal_coupled = metriplectic_coupled_ideal
+    opz = 1.d0 + time_evol_zeta
+    tdt = g_mctx%dt_theta * opz
 
     ! --- destroy per-build objects from a previous build ---
     if (g_mctx%sweep_ready) then
       PetscCallA(KSPDestroy(g_mctx%ksp_pair_psij, ierr))
       PetscCallA(KSPDestroy(g_mctx%ksp_pair_uw,   ierr))
+      PetscCallA(KSPDestroy(g_mctx%ksp_kideal,    ierr))
       PetscCallA(KSPDestroy(g_mctx%ksp_B55,       ierr))
       PetscCallA(KSPDestroy(g_mctx%ksp_B66,       ierr))
       PetscCallA(KSPDestroy(g_mctx%ksp_Mpsi,      ierr))
       PetscCallA(MatDestroy(g_mctx%A_pair_psij, ierr))
       PetscCallA(MatDestroy(g_mctx%A_pair_uw,   ierr))
+      PetscCallA(MatDestroy(g_mctx%A_kideal,    ierr))
       PetscCallA(MatDestroy(g_mctx%B_31s, ierr))
       PetscCallA(MatDestroy(g_mctx%B_42s, ierr))
       PetscCallA(MatDestroy(g_mctx%B_52s, ierr))
@@ -324,9 +333,30 @@ contains
     PetscCallA(MatDestroy(B11, ierr)); PetscCallA(MatDestroy(B13, ierr))
     PetscCallA(MatDestroy(B22, ierr)); PetscCallA(MatDestroy(B24, ierr))
 
+    ! --- coupled model-Alfven K-half [(1+z)M_psi, tdt D; tdt Dp, -(1+z)L_rho]
+    !     (exact ideal solve, JOREK sign convention — same construction as the
+    !      T3b ideal-reference upper block; the P_u Schur path stays as the
+    !      iterative upgrade route, cf. the T3c grid-scale tail) ---
+    PetscCallA(MatConvert(g_mctx%M_psi, MATMPIAIJ, MAT_INITIAL_MATRIX, Mps, ierr))
+    PetscCallA(MatScale(Mps, opz, ierr))
+    PetscCallA(MatConvert(g_mctx%D_op, MATMPIAIJ, MAT_INITIAL_MATRIX, Ds, ierr))
+    PetscCallA(MatScale(Ds, tdt, ierr))
+    PetscCallA(MatConvert(g_mctx%Dp_op, MATMPIAIJ, MAT_INITIAL_MATRIX, Dps, ierr))
+    PetscCallA(MatScale(Dps, tdt, ierr))
+    PetscCallA(MatConvert(g_mctx%L_rho, MATMPIAIJ, MAT_INITIAL_MATRIX, Ls, ierr))
+    PetscCallA(MatScale(Ls, -opz, ierr))
+    mats2(1) = Mps;  mats2(2) = Ds
+    mats2(3) = Dps;  mats2(4) = Ls
+    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, mats2, A_nest, ierr))
+    PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_mctx%A_kideal, ierr))
+    PetscCallA(MatDestroy(A_nest, ierr))
+    PetscCallA(MatDestroy(Mps, ierr)); PetscCallA(MatDestroy(Ds,  ierr))
+    PetscCallA(MatDestroy(Dps, ierr)); PetscCallA(MatDestroy(Ls,  ierr))
+
     ! --- solvers ---
     call setup_lu_ksp(g_mctx%A_pair_psij, g_mctx%ksp_pair_psij, comm, symmetric=.false.)
     call setup_lu_ksp(g_mctx%A_pair_uw,   g_mctx%ksp_pair_uw,   comm, symmetric=.false.)
+    call setup_lu_ksp(g_mctx%A_kideal,    g_mctx%ksp_kideal,    comm, symmetric=.false.)
     call setup_lu_ksp(g_mctx%B_55s, g_mctx%ksp_B55, comm, symmetric=.false.)
     call setup_lu_ksp(g_mctx%B_66s, g_mctx%ksp_B66, comm, symmetric=.false.)
     call setup_mass_ksp(g_mctx%M_psi, g_mctx%ksp_Mpsi, comm)
@@ -337,17 +367,28 @@ contains
                                g_mctx%wv_pair_psij_2, ierr))
       PetscCallA(MatCreateVecs(g_mctx%A_pair_uw,   g_mctx%wv_pair_uw_1, &
                                g_mctx%wv_pair_uw_2, ierr))
+      PetscCallA(MatCreateVecs(g_mctx%A_kideal,  g_mctx%wv_kid_1, g_mctx%wv_kid_2, ierr))
       PetscCallA(MatCreateVecs(g_mctx%B_55s, g_mctx%wv_rho_1, g_mctx%wv_rho_2, ierr))
       PetscCallA(MatCreateVecs(g_mctx%B_66s, g_mctx%wv_T_1,   g_mctx%wv_T_2,   ierr))
       g_mctx%sweep_once_done = .true.
     endif
 
-    ! --- P_u composed and factored at the run's tau ---
-    call metriplectic_refresh_Pu(g_mctx%dt_theta)
+    ! --- P_u composed and factored at the run's tau (needed by the Schur
+    !     K-half path and the analysis checks; skipped in pure coupled runs) ---
+    if ((.not. g_mctx%ideal_coupled) .or. metriplectic_analysis) then
+      call metriplectic_refresh_Pu(g_mctx%dt_theta)
+    endif
 
     g_mctx%sweep_ready = .true.
-    if (my_id == 0) write(*,'(A,ES12.4)') &
-      "[Metriplectic] sweep built (pair solves + P_u factored); tau = ", g_mctx%dt_theta
+    if (my_id == 0) then
+      if (g_mctx%ideal_coupled) then
+        write(*,'(A,ES12.4)') &
+          "[Metriplectic] sweep built (pair solves + coupled K-half); tau = ", g_mctx%dt_theta
+      else
+        write(*,'(A,ES12.4)') &
+          "[Metriplectic] sweep built (pair solves + P_u Schur K-half); tau = ", g_mctx%dt_theta
+      endif
+    endif
   end subroutine metriplectic_build_sweep
 
 

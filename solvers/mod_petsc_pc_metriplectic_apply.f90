@@ -74,7 +74,11 @@ contains
 
 
   !====================================================================
-  ! Reduced K-half solve (segregated; Slice-A algebra with ctx solvers).
+  ! Reduced K-half solve.
+  ! Default (ideal_coupled): exact coupled 2x2 MUMPS solve of the model
+  ! Alfven system A_kideal — no Schur substitution, no T3c grid-scale
+  ! tail (this fixed the intear FGMRES stall of 2026-07-16).
+  ! Schur path (ideal_coupled=.false., iterative upgrade route):
   !   h     = M_psi^-1 rpsi / (1+z)             [note SK step 3]
   !   RHS_u = -ru/(1+z) + tau * Dp h            [note Sec. 6: u-row negation
   !                                              flips BOTH terms -> +tau Dp h]
@@ -86,6 +90,13 @@ contains
     Vec :: rpsi, ru, dpsi, du
     PetscErrorCode :: ierr
     real*8 :: opz, tau
+
+    if (g_mctx%ideal_coupled) then
+      call pack_2v(rpsi, ru, g_mctx%wv_kid_1, ierr)
+      call KSPSolve(g_mctx%ksp_kideal, g_mctx%wv_kid_1, g_mctx%wv_kid_2, ierr)
+      call unpack_2v(g_mctx%wv_kid_2, dpsi, du, ierr)
+      return
+    endif
 
     opz = 1.d0 + time_evol_zeta
     tau = g_mctx%dt_theta
