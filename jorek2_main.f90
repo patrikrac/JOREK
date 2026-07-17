@@ -763,7 +763,8 @@ write(*,*) "n elements:", element_list%n_elements
     
 #ifdef USE_PETSC
     if (use_physics_pc) call petsc_assemble_pc_matrices(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
-    if (metriplectic_analysis) call metriplectic_assemble(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
+    if (metriplectic_analysis .or. use_metriplectic_pc) &
+      call metriplectic_assemble(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
 #endif
 
 #ifdef SAVEMATRIX

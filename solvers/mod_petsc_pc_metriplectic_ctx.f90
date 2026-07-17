@@ -47,10 +47,13 @@ module mod_petsc_pc_metriplectic_ctx
     Mat :: B_52s, B_55s       !< rho recovery: drho = B55^-1 (r_rho - B52 du)
     Mat :: B_62s, B_66s       !< T   recovery: dT   = B66^-1 (r_T   - B62 du)
     Mat :: Pu_aij             !< AIJ copy of composed P_u bound to ksp_Pu
+    Mat :: A_kideal           !< coupled model-Alfven K-half
+                              !! [(1+z)M_psi, tdt*D; tdt*Dp, -(1+z)L_rho] (tdt = theta*dt)
 
     !> Sweep solvers (created/refreshed by metriplectic_build_sweep)
     KSP :: ksp_pair_psij      !< MUMPS LU on A_pair_psij
     KSP :: ksp_pair_uw        !< MUMPS LU on A_pair_uw
+    KSP :: ksp_kideal         !< MUMPS LU on A_kideal (exact coupled K-half solve)
     KSP :: ksp_Pu             !< MUMPS Cholesky on Pu_aij (refresh via refresh_Pu)
     KSP :: ksp_Mpsi           !< CG+Jacobi consistent-mass solve on M_psi
     KSP :: ksp_B33, ksp_B44   !< MUMPS LU, factored ONCE (constant constraint masses)
@@ -58,10 +61,14 @@ module mod_petsc_pc_metriplectic_ctx
     logical :: sweep_ready       = .false.
     logical :: sweep_once_done   = .false.  !< B33/B44 factored-once guard
     real*8  :: tau_Pu            = -1.d0    !< tau at which ksp_Pu is factored
+    logical :: ideal_coupled     = .true.   !< K-half solve: coupled 2x2 MUMPS (exact,
+                                            !! default) vs P_u Schur path (T3c tail;
+                                            !! iterative upgrade route)
 
     !> Sweep work vectors: 2-var packed pair vecs + rho/T sized 1-var vecs
     Vec :: wv_pair_psij_1, wv_pair_psij_2
     Vec :: wv_pair_uw_1,   wv_pair_uw_2
+    Vec :: wv_kid_1, wv_kid_2
     Vec :: wv_rho_1, wv_rho_2, wv_T_1, wv_T_2
 
     !> Work vectors (1-var sized), created with the matrices

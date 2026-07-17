@@ -19,6 +19,13 @@ module mod_petsc_pc_metriplectic_assembly
   public :: metriplectic_build_sweep
   public :: metriplectic_refresh_Pu
 
+  ! --- TEMPORARY diagnostic: per-block stiffness-norm log (note Sec.
+  ! "Coefficient table"). Flip to .false. to disable; delete this block
+  ! and its call site in metriplectic_build_sweep once no longer needed. ---
+  logical, parameter :: LOG_STIFFNESS_METRICS = .true.
+  character(len=*), parameter :: STIFFNESS_LOG_FILE = 'metriplectic_stiffness.dat'
+  logical, save :: g_stiffness_header_written = .false.
+
 contains
 
   !--------------------------------------------------------------------
@@ -261,27 +268,36 @@ contains
   !====================================================================
   subroutine metriplectic_build_sweep(A_full, my_id)
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
+    use phys_module,    only: time_evol_zeta, metriplectic_analysis, &
+                              metriplectic_coupled_ideal
 
     Mat,     intent(in) :: A_full
     integer, intent(in) :: my_id
 
     Mat :: B11, B13, B22, B24
+    Mat :: Mps, Ds, Dps, Ls
     Mat :: mats2(4), A_nest
     PetscErrorCode :: ierr
     integer :: comm
+    real*8 :: tdt, opz
 
     call PetscObjectGetComm(A_full, comm, ierr)
     if (.not. g_mctx%is_created) call create_index_sets(A_full, comm)
+    g_mctx%ideal_coupled = metriplectic_coupled_ideal
+    opz = 1.d0 + time_evol_zeta
+    tdt = g_mctx%dt_theta * opz
 
     ! --- destroy per-build objects from a previous build ---
     if (g_mctx%sweep_ready) then
       PetscCallA(KSPDestroy(g_mctx%ksp_pair_psij, ierr))
       PetscCallA(KSPDestroy(g_mctx%ksp_pair_uw,   ierr))
+      PetscCallA(KSPDestroy(g_mctx%ksp_kideal,    ierr))
       PetscCallA(KSPDestroy(g_mctx%ksp_B55,       ierr))
       PetscCallA(KSPDestroy(g_mctx%ksp_B66,       ierr))
       PetscCallA(KSPDestroy(g_mctx%ksp_Mpsi,      ierr))
       PetscCallA(MatDestroy(g_mctx%A_pair_psij, ierr))
       PetscCallA(MatDestroy(g_mctx%A_pair_uw,   ierr))
+      PetscCallA(MatDestroy(g_mctx%A_kideal,    ierr))
       PetscCallA(MatDestroy(g_mctx%B_31s, ierr))
       PetscCallA(MatDestroy(g_mctx%B_42s, ierr))
       PetscCallA(MatDestroy(g_mctx%B_52s, ierr))
@@ -324,9 +340,30 @@ contains
     PetscCallA(MatDestroy(B11, ierr)); PetscCallA(MatDestroy(B13, ierr))
     PetscCallA(MatDestroy(B22, ierr)); PetscCallA(MatDestroy(B24, ierr))
 
+    ! --- coupled model-Alfven K-half [(1+z)M_psi, tdt D; tdt Dp, -(1+z)L_rho]
+    !     (exact ideal solve, JOREK sign convention — same construction as the
+    !      T3b ideal-reference upper block; the P_u Schur path stays as the
+    !      iterative upgrade route, cf. the T3c grid-scale tail) ---
+    PetscCallA(MatConvert(g_mctx%M_psi, MATMPIAIJ, MAT_INITIAL_MATRIX, Mps, ierr))
+    PetscCallA(MatScale(Mps, opz, ierr))
+    PetscCallA(MatConvert(g_mctx%D_op, MATMPIAIJ, MAT_INITIAL_MATRIX, Ds, ierr))
+    PetscCallA(MatScale(Ds, tdt, ierr))
+    PetscCallA(MatConvert(g_mctx%Dp_op, MATMPIAIJ, MAT_INITIAL_MATRIX, Dps, ierr))
+    PetscCallA(MatScale(Dps, tdt, ierr))
+    PetscCallA(MatConvert(g_mctx%L_rho, MATMPIAIJ, MAT_INITIAL_MATRIX, Ls, ierr))
+    PetscCallA(MatScale(Ls, -opz, ierr))
+    mats2(1) = Mps;  mats2(2) = Ds
+    mats2(3) = Dps;  mats2(4) = Ls
+    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, mats2, A_nest, ierr))
+    PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_mctx%A_kideal, ierr))
+    PetscCallA(MatDestroy(A_nest, ierr))
+    PetscCallA(MatDestroy(Mps, ierr)); PetscCallA(MatDestroy(Ds,  ierr))
+    PetscCallA(MatDestroy(Dps, ierr)); PetscCallA(MatDestroy(Ls,  ierr))
+
     ! --- solvers ---
     call setup_lu_ksp(g_mctx%A_pair_psij, g_mctx%ksp_pair_psij, comm, symmetric=.false.)
     call setup_lu_ksp(g_mctx%A_pair_uw,   g_mctx%ksp_pair_uw,   comm, symmetric=.false.)
+    call setup_lu_ksp(g_mctx%A_kideal,    g_mctx%ksp_kideal,    comm, symmetric=.false.)
     call setup_lu_ksp(g_mctx%B_55s, g_mctx%ksp_B55, comm, symmetric=.false.)
     call setup_lu_ksp(g_mctx%B_66s, g_mctx%ksp_B66, comm, symmetric=.false.)
     call setup_mass_ksp(g_mctx%M_psi, g_mctx%ksp_Mpsi, comm)
@@ -337,17 +374,30 @@ contains
                                g_mctx%wv_pair_psij_2, ierr))
       PetscCallA(MatCreateVecs(g_mctx%A_pair_uw,   g_mctx%wv_pair_uw_1, &
                                g_mctx%wv_pair_uw_2, ierr))
+      PetscCallA(MatCreateVecs(g_mctx%A_kideal,  g_mctx%wv_kid_1, g_mctx%wv_kid_2, ierr))
       PetscCallA(MatCreateVecs(g_mctx%B_55s, g_mctx%wv_rho_1, g_mctx%wv_rho_2, ierr))
       PetscCallA(MatCreateVecs(g_mctx%B_66s, g_mctx%wv_T_1,   g_mctx%wv_T_2,   ierr))
       g_mctx%sweep_once_done = .true.
     endif
 
-    ! --- P_u composed and factored at the run's tau ---
-    call metriplectic_refresh_Pu(g_mctx%dt_theta)
+    ! --- P_u composed and factored at the run's tau (needed by the Schur
+    !     K-half path and the analysis checks; skipped in pure coupled runs) ---
+    if ((.not. g_mctx%ideal_coupled) .or. metriplectic_analysis) then
+      call metriplectic_refresh_Pu(g_mctx%dt_theta)
+    endif
 
     g_mctx%sweep_ready = .true.
-    if (my_id == 0) write(*,'(A,ES12.4)') &
-      "[Metriplectic] sweep built (pair solves + P_u factored); tau = ", g_mctx%dt_theta
+    if (my_id == 0) then
+      if (g_mctx%ideal_coupled) then
+        write(*,'(A,ES12.4)') &
+          "[Metriplectic] sweep built (pair solves + coupled K-half); tau = ", g_mctx%dt_theta
+      else
+        write(*,'(A,ES12.4)') &
+          "[Metriplectic] sweep built (pair solves + P_u Schur K-half); tau = ", g_mctx%dt_theta
+      endif
+    endif
+
+    if (LOG_STIFFNESS_METRICS) call log_stiffness_metrics(my_id, opz, tdt)
   end subroutine metriplectic_build_sweep
 
 
@@ -369,6 +419,87 @@ contains
     call setup_lu_ksp(g_mctx%Pu_aij, g_mctx%ksp_Pu, g_mctx%comm, symmetric=.true.)
     g_mctx%tau_Pu = tau_in
   end subroutine metriplectic_refresh_Pu
+
+
+  !--------------------------------------------------------------------
+  !> TEMPORARY diagnostic. Per-block Frobenius-norm proxy for how much
+  !! each element-assembled operator (note Sec. "Coefficient table":
+  !! M_psi, D, D', L_rho, W_para) contributes to the K-half/S-half
+  !! stiffness, appended each PC rebuild so the balance can be tracked
+  !! over a run. Scalars match the coefficients actually assembled into
+  !! A_kideal / P_u a few lines up (note Sec. "halves"): (1+zeta) on
+  !! M_psi/L_rho, theta*dt on D/D', tau^2 on W_para.
+  !--------------------------------------------------------------------
+  subroutine log_stiffness_metrics(my_id, opz, tdt)
+    use phys_module, only: index_now, t_now
+
+    integer, intent(in) :: my_id
+    real*8,  intent(in) :: opz, tdt
+
+    Mat :: A_aij
+    PetscReal :: nrm_Mpsi, nrm_D, nrm_Dp, nrm_Lrho, nrm_Wpara, nrm_tot
+    real*8    :: f_Mpsi, f_D, f_Dp, f_Lrho, f_Wpara
+    integer :: u, ios
+    PetscErrorCode :: ierr
+
+    PetscCallA(MatConvert(g_mctx%M_psi, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_Mpsi, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    PetscCallA(MatConvert(g_mctx%D_op, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_D, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    PetscCallA(MatConvert(g_mctx%Dp_op, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_Dp, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    PetscCallA(MatConvert(g_mctx%L_rho, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_Lrho, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    PetscCallA(MatConvert(g_mctx%W_para, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
+    PetscCallA(MatNorm(A_aij, NORM_FROBENIUS, nrm_Wpara, ierr))
+    PetscCallA(MatDestroy(A_aij, ierr))
+
+    nrm_Mpsi  = opz               * nrm_Mpsi
+    nrm_D     = tdt               * nrm_D
+    nrm_Dp    = tdt               * nrm_Dp
+    nrm_Lrho  = opz               * nrm_Lrho
+    nrm_Wpara = g_mctx%dt_theta**2 * nrm_Wpara
+
+    nrm_tot = nrm_Mpsi + nrm_D + nrm_Dp + nrm_Lrho + nrm_Wpara
+    if (nrm_tot > 0.d0) then
+      f_Mpsi  = nrm_Mpsi  / nrm_tot
+      f_D     = nrm_D     / nrm_tot
+      f_Dp    = nrm_Dp    / nrm_tot
+      f_Lrho  = nrm_Lrho  / nrm_tot
+      f_Wpara = nrm_Wpara / nrm_tot
+    else
+      f_Mpsi = 0.d0; f_D = 0.d0; f_Dp = 0.d0; f_Lrho = 0.d0; f_Wpara = 0.d0
+    endif
+
+    if (my_id /= 0) return
+
+    if (.not. g_stiffness_header_written) then
+      open(newunit=u, file=STIFFNESS_LOG_FILE, status='replace', action='write', iostat=ios)
+      if (ios == 0) then
+        write(u,'(A)') '# step  time  tau  nrm_Mpsi  nrm_D  nrm_Dp  nrm_Lrho  nrm_Wpara  '// &
+                        'frac_Mpsi  frac_D  frac_Dp  frac_Lrho  frac_Wpara'
+        close(u)
+      endif
+      g_stiffness_header_written = .true.
+    endif
+
+    open(newunit=u, file=STIFFNESS_LOG_FILE, status='old', position='append', action='write', iostat=ios)
+    if (ios == 0) then
+      write(u,'(I8,1X,ES14.6,1X,ES14.6,5(1X,ES14.6),5(1X,F10.6))') &
+        index_now, t_now, g_mctx%dt_theta, &
+        nrm_Mpsi, nrm_D, nrm_Dp, nrm_Lrho, nrm_Wpara, &
+        f_Mpsi, f_D, f_Dp, f_Lrho, f_Wpara
+      close(u)
+    endif
+  end subroutine log_stiffness_metrics
 
 #endif
 end module mod_petsc_pc_metriplectic_assembly

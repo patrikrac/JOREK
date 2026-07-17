@@ -73,6 +73,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 bc_natural_open,                                    &
                 use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
                 metriplectic_analysis, metriplectic_analysis_nsweep, &
+                use_metriplectic_pc, metriplectic_sweep_order,      &
+                metriplectic_coupled_ideal,                         &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &

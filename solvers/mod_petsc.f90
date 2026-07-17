@@ -470,9 +470,12 @@ contains
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
-    use phys_module, only: use_physics_pc, metriplectic_analysis
+    use phys_module, only: use_physics_pc, metriplectic_analysis, &
+                           use_metriplectic_pc, metriplectic_sweep_order
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
     use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_run_analysis
+    use mod_petsc_pc_metriplectic_assembly, only: metriplectic_build_sweep
+    use mod_petsc_pc_metriplectic_apply, only: metriplectic_sweep_apply_full, mpc_sweep_order
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -480,6 +483,7 @@ contains
 
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
+    PC :: pc_shell
     KSPConvergedReason :: reason
     PetscLogDouble :: t1, t2
     PetscLogDouble :: ts1, ts2
@@ -515,8 +519,17 @@ contains
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
 
+      if (use_physics_pc .and. use_metriplectic_pc) then
+        if (my_id .eq. 0) write(*,*) &
+          "[PETSc] ERROR: use_physics_pc and use_metriplectic_pc are mutually exclusive"
+        error stop "conflicting PC selection"
+      endif
       if (use_physics_pc) then
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + Physics PCSHELL"
+      else if (use_metriplectic_pc) then
+        if (my_id .eq. 0) write(*,*) &
+          "[PETSc] setup: FGMRES + Metriplectic HSS sweep PCSHELL (order " // &
+          metriplectic_sweep_order // ")"
       else
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + PCFIELDSPLIT + MUMPS"
       endif
@@ -525,6 +538,12 @@ contains
       if (use_physics_pc) then
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_PHYSICS)
         call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
+      else if (use_metriplectic_pc) then
+        mpc_sweep_order = metriplectic_sweep_order
+        PetscCallA(KSPGetPC(petsc_sys%ksp, pc_shell, ierr))
+        PetscCallA(PCSetType(pc_shell, PCSHELL, ierr))
+        PetscCallA(PCShellSetApply(pc_shell, metriplectic_sweep_apply_full, ierr))
+        call metriplectic_build_sweep(petsc_sys%A_aij, my_id)
       else
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
       endif
@@ -544,6 +563,7 @@ contains
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
+      if (use_metriplectic_pc) call metriplectic_build_sweep(petsc_sys%A_aij, my_id)
       if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
