@@ -43,7 +43,7 @@ module mod_petsc_pc_metriplectic_analysis
   implicit none
   private
 
-  public :: petsc_metriplectic_run_analysis
+  public :: petsc_metriplectic_run_analysis, petsc_metriplectic_track_energies
 
   ! --- Module state consumed by the PCSHELL apply callback ---
   Mat :: m_A4                          !< 4-var reference system (AIJ)
@@ -1076,6 +1076,125 @@ contains
     PetscCallA(VecDestroy(b, ierr))
     PetscCallA(VecDestroy(x, ierr))
   end subroutine run_T5c
+
+  !====================================================================
+  ! Dynamically track physical and continuous-Schur energies of vectors
+  !====================================================================
+  subroutine petsc_metriplectic_track_energies(time, istep, X_global, dX_global, my_id)
+    use mod_parameters, only: var_psi, var_u, var_zj, var_w
+    use phys_module,    only: time_evol_zeta
+    
+    real*8, intent(in)  :: time
+    integer, intent(in) :: istep
+    Vec, intent(in)     :: X_global   !< The global state vector
+    Vec, intent(in)     :: dX_global  !< The Newton increment vector (solution of GMRES)
+    integer, intent(in) :: my_id      !< MPI rank
+
+    ! Local PETSc variables
+    Vec :: vec_psi, vec_u, vec_j, vec_w
+    Vec :: dvec_psi, dvec_u
+    Vec :: tmp_1, tmp_2
+    PetscErrorCode :: ierr
+    real*8 :: E_M, E_K, E_A, E_P
+    real*8 :: dE_M, dE_K, dE_A, dE_P
+    real*8 :: E_j_viol, E_w_viol
+
+    if (.not. g_mctx%matrices_ready .or. .not. g_mctx%is_created) return
+
+    ! Extract state variables
+    PetscCallA(VecGetSubVector(X_global, g_mctx%is_var(var_psi), vec_psi, ierr))
+    PetscCallA(VecGetSubVector(X_global, g_mctx%is_var(var_u),   vec_u,   ierr))
+    PetscCallA(VecGetSubVector(X_global, g_mctx%is_var(var_zj),  vec_j,   ierr))
+    PetscCallA(VecGetSubVector(X_global, g_mctx%is_var(var_w),   vec_w,   ierr))
+
+    ! Extract increment variables
+    PetscCallA(VecGetSubVector(dX_global, g_mctx%is_var(var_psi), dvec_psi, ierr))
+    PetscCallA(VecGetSubVector(dX_global, g_mctx%is_var(var_u),   dvec_u,   ierr))
+
+    PetscCallA(VecDuplicate(vec_psi, tmp_1, ierr))
+    PetscCallA(VecDuplicate(vec_psi, tmp_2, ierr))
+
+    ! 1. Magnetic Flux Energy (E_M)
+    PetscCallA(MatMult(g_mctx%M_psi, vec_psi, tmp_1, ierr))
+    PetscCallA(VecDot(vec_psi, tmp_1, E_M, ierr))
+
+    ! 2. Kinetic Energy (E_K)
+    PetscCallA(MatMult(g_mctx%L_rho, vec_u, tmp_1, ierr))
+    PetscCallA(VecDot(vec_u, tmp_1, E_K, ierr))
+
+    ! 3. Alfvenic Perturbation Energy (E_A)
+    PetscCallA(MatMult(g_mctx%W_para, vec_u, tmp_1, ierr))
+    PetscCallA(VecDot(vec_u, tmp_1, E_A, ierr))
+
+    ! 4. Total Preconditioner Schur Energy (E_P)
+    PetscCallA(MatMult(g_mctx%Pu_aij, vec_u, tmp_1, ierr))
+    PetscCallA(VecDot(vec_u, tmp_1, E_P, ierr))
+
+    ! 5. Operator Energies on the Increment (\delta X)
+    PetscCallA(MatMult(g_mctx%M_psi, dvec_psi, tmp_1, ierr))
+    PetscCallA(VecDot(dvec_psi, tmp_1, dE_M, ierr))
+
+    PetscCallA(MatMult(g_mctx%L_rho, dvec_u, tmp_1, ierr))
+    PetscCallA(VecDot(dvec_u, tmp_1, dE_K, ierr))
+
+    PetscCallA(MatMult(g_mctx%W_para, dvec_u, tmp_1, ierr))
+    PetscCallA(VecDot(dvec_u, tmp_1, dE_A, ierr))
+
+    PetscCallA(MatMult(g_mctx%Pu_aij, dvec_u, tmp_1, ierr))
+    PetscCallA(VecDot(dvec_u, tmp_1, dE_P, ierr))
+
+    ! 6. Current constraint violation (j): || B31*psi + B33*j ||^2
+    PetscCallA(MatMult(g_mctx%B_31s, vec_psi, tmp_1, ierr))
+    PetscCallA(MatMultAdd(g_mctx%B_33s, vec_j, tmp_1, tmp_1, ierr))
+    PetscCallA(VecNorm(tmp_1, NORM_2, E_j_viol, ierr))
+    E_j_viol = E_j_viol**2.d0
+
+    ! 7. Vorticity constraint violation (w): || B42*u + B44*w ||^2
+    PetscCallA(MatMult(g_mctx%B_42s, vec_u, tmp_1, ierr))
+    PetscCallA(MatMultAdd(g_mctx%B_44s, vec_w, tmp_1, tmp_1, ierr))
+    PetscCallA(VecNorm(tmp_1, NORM_2, E_w_viol, ierr))
+    E_w_viol = E_w_viol**2.d0
+
+    PetscCallA(VecDestroy(tmp_1, ierr))
+    PetscCallA(VecDestroy(tmp_2, ierr))
+
+    PetscCallA(VecRestoreSubVector(X_global,  g_mctx%is_var(var_psi), vec_psi,  ierr))
+    PetscCallA(VecRestoreSubVector(X_global,  g_mctx%is_var(var_u),   vec_u,    ierr))
+    PetscCallA(VecRestoreSubVector(X_global,  g_mctx%is_var(var_zj),  vec_j,    ierr))
+    PetscCallA(VecRestoreSubVector(X_global,  g_mctx%is_var(var_w),   vec_w,    ierr))
+    PetscCallA(VecRestoreSubVector(dX_global, g_mctx%is_var(var_psi), dvec_psi, ierr))
+    PetscCallA(VecRestoreSubVector(dX_global, g_mctx%is_var(var_u),   dvec_u,   ierr))
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Metriplectic] ---- Operator Energies (State) ----"
+      write(*,'(A,ES14.6)') "[Metriplectic] E_M (Flux Mass)     = ", E_M
+      write(*,'(A,ES14.6)') "[Metriplectic] E_K (Kinetic Flow)  = ", E_K
+      write(*,'(A,ES14.6)') "[Metriplectic] E_A (Alfvenic Pert) = ", E_A
+      write(*,'(A,ES14.6)') "[Metriplectic] E_P (Total Schur)   = ", E_P
+      write(*,'(A)') "[Metriplectic] ---- Constraint Violations ----"
+      write(*,'(A,ES14.6)') "[Metriplectic] E_j_viol            = ", E_j_viol
+      write(*,'(A,ES14.6)') "[Metriplectic] E_w_viol            = ", E_w_viol
+      write(*,'(A)') "[Metriplectic] ---- Operator Energies (Delta) ----"
+      write(*,'(A,ES14.6)') "[Metriplectic] dE_M (Flux Mass)    = ", dE_M
+      write(*,'(A,ES14.6)') "[Metriplectic] dE_K (Kinetic Flow) = ", dE_K
+      write(*,'(A,ES14.6)') "[Metriplectic] dE_A (Alfvenic Pert)= ", dE_A
+      write(*,'(A,ES14.6)') "[Metriplectic] dE_P (Total Schur)  = ", dE_P
+
+      open(unit=123, file='metriplectic_energies.csv', position='append', status='unknown')
+      if (istep == 1) then
+        write(123, '(A)') "# Metriplectic Operator Energies"
+        write(123, '(A)') "# E_M = Int( (1/R) * psi^2 ) dV"
+        write(123, '(A)') "# E_K = Int( rho_hat * R * |Grad(u)|^2 ) dV"
+        write(123, '(A)') "# E_A = Int( (1/R) * |Grad(R^2 B.Grad u)|^2 ) dV"
+        write(123, '(A)') "# E_P = E_K + tau^2 * E_A"
+        write(123, '(A)') "# E_j_viol = || B31*psi + B33*j ||^2"
+        write(123, '(A)') "# E_w_viol = || B42*u + B44*w ||^2"
+        write(123, '(A)') "time,step,E_M,E_K,E_A,E_P,E_j_viol,E_w_viol,dE_M,dE_K,dE_A,dE_P"
+      endif
+      write(123, '(ES14.6,I8,10ES16.8)') time, istep, E_M, E_K, E_A, E_P, E_j_viol, E_w_viol, dE_M, dE_K, dE_A, dE_P
+      close(123)
+    endif
+  end subroutine petsc_metriplectic_track_energies
 
 #endif
 end module mod_petsc_pc_metriplectic_analysis
