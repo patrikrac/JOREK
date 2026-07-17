@@ -140,6 +140,13 @@ contains
     g_mctx%matrices_ready = .true.
     if (my_id == 0) write(*,'(A,ES12.4)') &
       "[Metriplectic] operators assembled; tau = theta*dt/(1+zeta) = ", g_mctx%dt_theta
+
+    ! TEMPORARY diagnostic: fires here (not in metriplectic_build_sweep) so
+    ! it also covers the analysis-only path (use_metriplectic_pc=.false.,
+    ! metriplectic_analysis=.true.), which never calls build_sweep.
+    if (LOG_STIFFNESS_METRICS) &
+      call log_stiffness_metrics(my_id, 1.d0 + time_evol_zeta, &
+                                 g_mctx%dt_theta * (1.d0 + time_evol_zeta))
   end subroutine metriplectic_assemble
 
 
@@ -396,8 +403,6 @@ contains
           "[Metriplectic] sweep built (pair solves + P_u Schur K-half); tau = ", g_mctx%dt_theta
       endif
     endif
-
-    if (LOG_STIFFNESS_METRICS) call log_stiffness_metrics(my_id, opz, tdt)
   end subroutine metriplectic_build_sweep
 
 
@@ -425,9 +430,11 @@ contains
   !> TEMPORARY diagnostic. Per-block Frobenius-norm proxy for how much
   !! each element-assembled operator (note Sec. "Coefficient table":
   !! M_psi, D, D', L_rho, W_para) contributes to the K-half/S-half
-  !! stiffness, appended each PC rebuild so the balance can be tracked
-  !! over a run. Scalars match the coefficients actually assembled into
-  !! A_kideal / P_u a few lines up (note Sec. "halves"): (1+zeta) on
+  !! stiffness, appended every metriplectic_assemble call (i.e. whenever
+  !! metriplectic_analysis .or. use_metriplectic_pc, jorek2_main.f90) so
+  !! the balance can be tracked over a run in either mode. Scalars match
+  !! the coefficients A_kideal / P_u actually assemble in
+  !! metriplectic_build_sweep (note Sec. "halves"): (1+zeta) on
   !! M_psi/L_rho, theta*dt on D/D', tau^2 on W_para.
   !--------------------------------------------------------------------
   subroutine log_stiffness_metrics(my_id, opz, tdt)
