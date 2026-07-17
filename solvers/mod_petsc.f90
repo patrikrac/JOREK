@@ -760,5 +760,69 @@ contains
     endif
   end subroutine petsc_cleanup
 
+  !====================================================================
+  ! Wrapper to pack the JOREK state vector and call the energy tracking
+  !====================================================================
+  subroutine petsc_metriplectic_pack_and_track(petsc_sys, mhd_sim, time, istep, my_id)
+    use data_structure, only: type_MHD_SIM
+    use mod_parameters, only: n_var, n_tor, n_degrees
+    use phys_module, only: keep_n0_const, treat_axis, metriplectic_analysis
+    use mod_axis_treatment, only: new_to_old_dofs_on_the_axis
+    use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_track_energies
+    
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_MHD_SIM),      intent(in)    :: mhd_sim
+    real*8,                  intent(in)    :: time
+    integer,                 intent(in)    :: istep
+    integer,                 intent(in)    :: my_id
+
+    Vec :: X_global
+    PetscErrorCode :: ierr
+    integer :: i, j, k, in_tor, index_node, idx, i_tor_min
+    PetscInt :: petsc_idx
+    real*8 :: val
+
+    if (.not. metriplectic_analysis) return
+    if (.not. petsc_sys%initialized) return
+
+    ! Create a vector with the same layout as the Newton increment
+    PetscCallA(VecDuplicate(petsc_sys%x, X_global, ierr))
+    PetscCallA(VecSet(X_global, 0.0d0, ierr))
+
+    i_tor_min = 1
+    if ( keep_n0_const ) i_tor_min = 2
+
+    do i = 1, mhd_sim%node_list%n_nodes
+      if (.not. mhd_sim%node_list%node(i)%constrained) then
+        ! We do not currently handle axis unpacking because the tracking 
+        ! is primarily to evaluate energies in the bulk, and axis nodes
+        ! require the old-to-new DOF transformation.
+        if (treat_axis .and. mhd_sim%node_list%node(i)%axis_node) cycle
+
+        do j = 1, n_degrees
+          index_node = mhd_sim%node_list%node(i)%index(j)
+          do k = 1, n_var
+            do in_tor = i_tor_min, n_tor
+              idx = n_tor*n_var * (index_node - 1) + n_tor*(k-1) + in_tor
+              if (idx > 0) then
+                petsc_idx = idx - 1 ! PETSc uses 0-based indexing
+                val = mhd_sim%node_list%node(i)%values(in_tor,j,k)
+                PetscCallA(VecSetValue(X_global, petsc_idx, val, INSERT_VALUES, ierr))
+              endif
+            enddo
+          enddo
+        enddo
+      endif
+    enddo
+
+    PetscCallA(VecAssemblyBegin(X_global, ierr))
+    PetscCallA(VecAssemblyEnd(X_global, ierr))
+
+    ! Call the actual tracking subroutine
+    call petsc_metriplectic_track_energies(time, istep, X_global, petsc_sys%x_aij, my_id)
+
+    PetscCallA(VecDestroy(X_global, ierr))
+  end subroutine petsc_metriplectic_pack_and_track
+
 #endif
 end module mod_petsc
