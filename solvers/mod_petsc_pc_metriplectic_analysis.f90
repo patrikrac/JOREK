@@ -22,6 +22,15 @@ module mod_petsc_pc_metriplectic_analysis
 !   T5b : Ritz values of the FULL-SWEEP-preconditioned 4-var system (gate G2)
 !   T5c : Ritz values of the production full-system apply (rho/T included)
 !
+! Stage-D pair-Schur battery (spec Sec. 7.3; runs INSTEAD of T3..T5c when
+! metriplectic_khalf == 'PS'; T1/T2 operator certification still run):
+!   PS1 : block-LDU (tight inner Schur) vs A_k4 MUMPS LU — sign/layout gate
+!   PS2 : Ritz of P_uw^-1 S_uw — the parabolization gate (screening: min
+!         positive Ritz rises with eta_num across the namelist arms)
+!   PS3 : 4-var Ritz, single-pass 'PS' apply vs 'K4' LU reference apply
+!         (separates Schur-approx cost from the additive model gap)
+!   PS4 : inner FGMRES(P_uw) iteration counts on S_uw to fixed r/r0
+!
 ! Reference system (constraints as rows, NEVER folded):
 !   A4 = [ B11 B12 B13  0  ;
 !          B21 B22 B23 B24 ;
@@ -39,7 +48,7 @@ module mod_petsc_pc_metriplectic_analysis
         setup_lu_ksp, setup_mass_ksp, metriplectic_build_sweep, metriplectic_refresh_Pu
   use mod_petsc_pc_metriplectic_apply, only: metriplectic_ideal_half_solve, &
         metriplectic_recover_jw, metriplectic_sweep_apply_4v, &
-        metriplectic_sweep_apply_full, mpc_sweep_order
+        metriplectic_sweep_apply_full, metriplectic_ps_ldu_solve, mpc_sweep_order
   implicit none
   private
 
@@ -138,15 +147,25 @@ contains
     call run_T1(comm, my_id)
     call run_T2(comm, my_id, metriplectic_analysis_nsweep)
 
-    call setup_pu_solver(m_tau, comm)   ! analysis-local P_u factor (T3c shell PC)
-    call run_T3(comm, my_id)
-    call run_T3b(comm, my_id)
-    call run_T3c(comm, my_id)
-    call run_T6(comm, my_id)
-    call run_T4(comm, my_id)
-    call run_T5a(comm, my_id)
-    call run_T5b(comm, my_id)
-    call run_T5c(comm, my_id, A_full)
+    if (g_mctx%khalf_mode == 'PS') then
+      ! Stage-D pair-Schur battery (spec Sec. 7.3, note Sec. pschecks).
+      ! The T-battery is retired from active PS runs; set metriplectic_khalf
+      ! to 'K2'/'PU'/'K4' to exercise it for regression.
+      call run_PS1(comm, my_id)
+      call run_PS2(comm, my_id)
+      call run_PS3(comm, my_id)
+      call run_PS4(comm, my_id)
+    else
+      call setup_pu_solver(m_tau, comm)   ! analysis-local P_u factor (T3c shell PC)
+      call run_T3(comm, my_id)
+      call run_T3b(comm, my_id)
+      call run_T3c(comm, my_id)
+      call run_T6(comm, my_id)
+      call run_T4(comm, my_id)
+      call run_T5a(comm, my_id)
+      call run_T5b(comm, my_id)
+      call run_T5c(comm, my_id, A_full)
+    endif
 
     ! --- Cleanup (keep g_mctx operators, sweep objects, and index sets —
     !     the production apply owns them; destroy analysis-local objects) ---
@@ -1076,6 +1095,317 @@ contains
     PetscCallA(VecDestroy(b, ierr))
     PetscCallA(VecDestroy(x, ierr))
   end subroutine run_T5c
+
+
+  !====================================================================
+  ! PS1: factorization exactness (sign/layout gate; spec Sec. 7.3, note
+  ! Prop. ldu). The block-LDU apply with a TIGHT inner Schur solve must
+  ! reproduce the direct MUMPS solve of A_k4 (the model it factorizes) to
+  ! roundoff. This is the net for the P_uw and LDU sign chain, in the role
+  ! T3 played for Slice A. Any O(1) value = a sign/layout error.
+  !====================================================================
+  subroutine run_PS1(comm, my_id)
+    integer, intent(in) :: comm, my_id
+
+    Vec :: b4, x4_lu, x4_ldu
+    PetscRandom :: rnd
+    PetscReal :: dnorm, xnorm
+    PetscErrorCode :: ierr
+    integer :: k, ps_it_save
+    real*8  :: ps_tol_save
+
+    ! force an (essentially) exact inner Schur solve for the duration
+    ps_it_save  = g_mctx%ps_inner_it
+    ps_tol_save = g_mctx%ps_inner_tol
+    g_mctx%ps_inner_it = 200
+    call KSPSetTolerances(g_mctx%ksp_Suw, 1.d-12, 1.d-50, PETSC_CURRENT_REAL, 200, ierr)
+
+    PetscCallA(MatCreateVecs(g_mctx%A_k4, x4_lu, b4, ierr))
+    PetscCallA(VecDuplicate(b4, x4_ldu, ierr))
+    PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+
+    if (my_id == 0) write(*,'(A)') &
+      "[Metriplectic] PS1: block-LDU (tight inner) vs A_k4 MUMPS LU, |x_LDU - x_LU|/|x_LU|"
+
+    do k = 1, 3
+      PetscCallA(VecSetRandom(b4, rnd, ierr))
+      call KSPSolve(g_mctx%ksp_k4, b4, x4_lu, ierr)         ! A_k4^-1 b (reference)
+
+      call unpack_4v(b4, m_rpsi, m_ru, m_rj, m_rw, ierr)
+      call metriplectic_ps_ldu_solve(m_rpsi, m_ru, m_rj, m_rw, &
+                                     m_dpsi, m_du, m_dj, m_dw)
+      call pack_4v(m_dpsi, m_du, m_dj, m_dw, x4_ldu, ierr)
+
+      call VecAXPY(x4_ldu, -1.d0, x4_lu, ierr)
+      PetscCallA(VecNorm(x4_ldu, NORM_2, dnorm, ierr))
+      PetscCallA(VecNorm(x4_lu,  NORM_2, xnorm, ierr))
+      if (my_id == 0) write(*,'(A,I2,A,ES14.4)') &
+        "[Metriplectic] PS1:  RHS ", k, "  rel. diff = ", dnorm/max(xnorm,tiny(1.d0))
+    enddo
+
+    PetscCallA(PetscRandomDestroy(rnd, ierr))
+    PetscCallA(VecDestroy(b4, ierr))
+    PetscCallA(VecDestroy(x4_lu, ierr))
+    PetscCallA(VecDestroy(x4_ldu, ierr))
+
+    ! restore the as-built inner-solver configuration
+    g_mctx%ps_inner_it  = ps_it_save
+    g_mctx%ps_inner_tol = ps_tol_save
+    if (ps_it_save > 0) then
+      call KSPSetTolerances(g_mctx%ksp_Suw, ps_tol_save, PETSC_CURRENT_REAL, &
+                            PETSC_CURRENT_REAL, ps_it_save, ierr)
+    else
+      call KSPSetTolerances(g_mctx%ksp_Suw, ps_tol_save, PETSC_CURRENT_REAL, &
+                            PETSC_CURRENT_REAL, 30, ierr)
+    endif
+  end subroutine run_PS1
+
+
+  !====================================================================
+  ! PS2: the parabolization gate (spec Sec. 7.3, note Sec. pschecks).
+  ! Ritz values of P_uw^-1 S_uw (matrix-free exact Schur S_uw vs the
+  ! sparse P_uw). Generalizes T3c to the screened pair setting. At
+  ! eta_num = 0: the T3c picture in pair form (cluster at 1, tail -> 0);
+  ! the SCREENING claim is that the min positive Ritz RISES with eta_num
+  ! (compared across the eta_num namelist arms). If it does not rise, the
+  ! two-level correction moves to the critical path.
+  !====================================================================
+  subroutine run_PS2(comm, my_id)
+    integer, intent(in) :: comm, my_id
+
+    KSP :: ksp
+    PC  :: pc
+    Vec :: b, x
+    PetscRandom :: rnd
+    PetscReal :: r_eig(60), c_eig(60)
+    PetscInt  :: neig, its
+    KSPConvergedReason :: reason
+    PetscErrorCode :: ierr
+    integer :: i, jmin, ncluster
+    real*8  :: tmp, re_min, re_max, im_max, re_minpos
+    character(len=16) :: converged_txt
+
+    PetscCallA(MatCreateVecs(g_mctx%A_pair_uw, x, b, ierr))
+    PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+    PetscCallA(VecSetRandom(b, rnd, ierr))
+
+    PetscCallA(KSPCreate(comm, ksp, ierr))
+    PetscCallA(KSPSetOperators(ksp, g_mctx%S_uw_shell, g_mctx%S_uw_shell, ierr))
+    PetscCallA(KSPSetType(ksp, KSPGMRES, ierr))
+    PetscCallA(KSPGMRESSetRestart(ksp, 60, ierr))
+    PetscCallA(KSPSetTolerances(ksp, 1.d-10, 1.d-50, PETSC_CURRENT_REAL, 60, ierr))
+    PetscCallA(KSPSetComputeEigenvalues(ksp, PETSC_TRUE, ierr))
+    PetscCallA(KSPGetPC(ksp, pc, ierr))
+    PetscCallA(PCSetType(pc, PCSHELL, ierr))
+    PetscCallA(PCShellSetApply(pc, ps_puw_pc_apply, ierr))
+
+    call KSPSolve(ksp, b, x, ierr)
+    PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
+    PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
+    converged_txt = "not converged"
+    if (reason > 0) converged_txt = "converged"
+    PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
+
+    do i = 1, neig-1
+      jmin = i + minloc(r_eig(i:neig), 1) - 1
+      if (jmin /= i) then
+        tmp = r_eig(i); r_eig(i) = r_eig(jmin); r_eig(jmin) = tmp
+        tmp = c_eig(i); c_eig(i) = c_eig(jmin); c_eig(jmin) = tmp
+      endif
+    enddo
+    re_min = r_eig(1); re_max = r_eig(1); im_max = 0.d0
+    re_minpos = huge(1.d0); ncluster = 0
+    do i = 1, neig
+      re_max = max(re_max, r_eig(i))
+      im_max = max(im_max, abs(c_eig(i)))
+      if (r_eig(i) > 0.d0) re_minpos = min(re_minpos, r_eig(i))
+      if (r_eig(i) >= 0.9d0 .and. r_eig(i) <= 1.1d0) ncluster = ncluster + 1
+    enddo
+    if (re_minpos == huge(1.d0)) re_minpos = 0.d0
+
+    if (my_id == 0) then
+      write(*,'(A,ES11.4)') "[Metriplectic] PS2: spec(P_uw^-1 S_uw) at tau =", m_tau
+      write(*,'(A,I5,A,A)') "[Metriplectic] PS2: GMRES iterations = ", its, &
+                            ", ", trim(converged_txt)
+      write(*,'(A,4ES13.4)') &
+        "[Metriplectic] PS2: min Re, min Re>0, max Re, max |Im| = ", &
+        re_min, re_minpos, re_max, im_max
+      write(*,'(A,I4,A)')   "[Metriplectic] PS2: ", ncluster, " Ritz in [0.9,1.1]"
+      write(*,'(A,I4,A)')   "[Metriplectic] PS2: ", neig, " Ritz values (Re, Im):"
+      do i = 1, neig
+        write(*,'(A,2ES14.5)') "[Metriplectic] PS2:   ", r_eig(i), c_eig(i)
+      enddo
+    endif
+
+    PetscCallA(KSPDestroy(ksp, ierr))
+    PetscCallA(PetscRandomDestroy(rnd, ierr))
+    PetscCallA(VecDestroy(b, ierr))
+    PetscCallA(VecDestroy(x, ierr))
+  end subroutine run_PS2
+
+
+  !> PCSHELL apply for PS2: y = P_uw^-1 x via the factored MUMPS solve
+  !! owned by ksp_Puw (single factorization; shared, not re-factored).
+  subroutine ps_puw_pc_apply(pc, x, y, ierr)
+    PC  :: pc
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call KSPSolve(g_mctx%ksp_Puw, x, y, ierr)
+    ierr = 0
+  end subroutine ps_puw_pc_apply
+
+
+  !====================================================================
+  ! PS3: production 4-var spectrum (spec Sec. 7.3, note Sec. pschecks).
+  ! Ritz of the TRUE 4-var system m_A4 under the single-pass 'PS' apply
+  ! vs the 'K4' MUMPS-LU reference apply. The K4 row's residual from 1 is
+  ! the additive model gap (kink + model mismatch, A - A_k4); the PS-minus-
+  ! K4 difference is the pure single-pass Schur-approximation cost.
+  !====================================================================
+  subroutine run_PS3(comm, my_id)
+    integer, intent(in) :: comm, my_id
+
+    KSP :: ksp
+    PC  :: pc
+    Vec :: b4, x4
+    PetscRandom :: rnd
+    PetscReal :: r_eig(60), c_eig(60)
+    PetscInt  :: neig, its
+    KSPConvergedReason :: reason
+    PetscErrorCode :: ierr
+    integer :: im, i, jmin, ps_it_save
+    real*8  :: tmp, re_min, re_max, im_max
+    character(len=2)  :: modes(2), khalf_save
+    character(len=16) :: converged_txt
+    character(len=20) :: apply_tag
+
+    modes(1) = 'PS'; modes(2) = 'K4'
+    khalf_save = g_mctx%khalf_mode
+    ps_it_save = g_mctx%ps_inner_it
+    g_mctx%ps_inner_it = 0            ! PS row = single-pass P_uw^-1
+
+    do im = 1, 2
+      g_mctx%khalf_mode = modes(im)
+
+      PetscCallA(MatCreateVecs(m_A4, x4, b4, ierr))
+      PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+      PetscCallA(VecSetRandom(b4, rnd, ierr))
+
+      PetscCallA(KSPCreate(comm, ksp, ierr))
+      PetscCallA(KSPSetOperators(ksp, m_A4, m_A4, ierr))
+      PetscCallA(KSPSetType(ksp, KSPGMRES, ierr))
+      PetscCallA(KSPGMRESSetRestart(ksp, 60, ierr))
+      PetscCallA(KSPSetTolerances(ksp, 1.d-10, 1.d-50, PETSC_CURRENT_REAL, 60, ierr))
+      PetscCallA(KSPSetComputeEigenvalues(ksp, PETSC_TRUE, ierr))
+      PetscCallA(KSPGetPC(ksp, pc, ierr))
+      PetscCallA(PCSetType(pc, PCSHELL, ierr))
+      PetscCallA(PCShellSetApply(pc, metriplectic_sweep_apply_4v, ierr))
+
+      call KSPSolve(ksp, b4, x4, ierr)
+      PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
+      PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
+      converged_txt = "not converged"
+      if (reason > 0) converged_txt = "converged"
+      PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
+
+      do i = 1, neig-1
+        jmin = i + minloc(r_eig(i:neig), 1) - 1
+        if (jmin /= i) then
+          tmp = r_eig(i); r_eig(i) = r_eig(jmin); r_eig(jmin) = tmp
+          tmp = c_eig(i); c_eig(i) = c_eig(jmin); c_eig(jmin) = tmp
+        endif
+      enddo
+      re_min = r_eig(1); re_max = r_eig(1); im_max = 0.d0
+      do i = 1, neig
+        re_max = max(re_max, r_eig(i))
+        im_max = max(im_max, abs(c_eig(i)))
+      enddo
+
+      if (modes(im) == 'PS') then
+        apply_tag = "single-pass"
+      else
+        apply_tag = "MUMPS-LU reference"
+      endif
+      if (my_id == 0) then
+        write(*,'(A,A,A,A,A)') "[Metriplectic] PS3: 4-var Ritz, apply = ", modes(im), &
+                           " (", trim(apply_tag), ")"
+        write(*,'(A,I5,A,A)')  "[Metriplectic] PS3: GMRES iterations = ", its, &
+                               ", ", trim(converged_txt)
+        write(*,'(A,3ES13.4)') "[Metriplectic] PS3: min Re, max Re, max |Im| = ", &
+                               re_min, re_max, im_max
+        write(*,'(A,I4,A)')    "[Metriplectic] PS3: ", neig, " Ritz values (Re, Im):"
+        do i = 1, neig
+          write(*,'(A,2ES14.5)') "[Metriplectic] PS3:   ", r_eig(i), c_eig(i)
+        enddo
+      endif
+
+      PetscCallA(KSPDestroy(ksp, ierr))
+      PetscCallA(PetscRandomDestroy(rnd, ierr))
+      PetscCallA(VecDestroy(b4, ierr))
+      PetscCallA(VecDestroy(x4, ierr))
+    enddo
+
+    g_mctx%khalf_mode  = khalf_save
+    g_mctx%ps_inner_it = ps_it_save
+  end subroutine run_PS3
+
+
+  !====================================================================
+  ! PS4: inner-solve cost curve (spec Sec. 7.3, note Sec. pschecks).
+  ! FGMRES(P_uw) iterations on the matrix-free S_uw to fixed relative
+  ! reductions {1e-2, 1e-4, 1e-6}, worst of 3 random RHS. Decides
+  ! single-pass vs inner-iterated production and whether the two-level
+  ! correction is critical path (esp. at eta_num = 0).
+  !====================================================================
+  subroutine run_PS4(comm, my_id)
+    integer, intent(in) :: comm, my_id
+
+    Vec :: b, x
+    PetscRandom :: rnd
+    PetscInt  :: its
+    PetscErrorCode :: ierr
+    integer :: k, it, its_worst(3), ps_it_save
+    real*8  :: ps_tol_save, thr(3)
+
+    thr(1) = 1.d-2; thr(2) = 1.d-4; thr(3) = 1.d-6
+    its_worst = 0
+    ps_it_save  = g_mctx%ps_inner_it
+    ps_tol_save = g_mctx%ps_inner_tol
+
+    PetscCallA(MatCreateVecs(g_mctx%A_pair_uw, x, b, ierr))
+    PetscCallA(PetscRandomCreate(comm, rnd, ierr))
+
+    do k = 1, 3
+      PetscCallA(VecSetRandom(b, rnd, ierr))
+      do it = 1, 3
+        call KSPSetTolerances(g_mctx%ksp_Suw, thr(it), 1.d-50, &
+                              PETSC_CURRENT_REAL, 200, ierr)
+        call KSPSolve(g_mctx%ksp_Suw, b, x, ierr)
+        PetscCallA(KSPGetIterationNumber(g_mctx%ksp_Suw, its, ierr))
+        its_worst(it) = max(its_worst(it), int(its))
+      enddo
+    enddo
+
+    if (my_id == 0) then
+      write(*,'(A,ES11.4)') "[Metriplectic] PS4: FGMRES(P_uw) on S_uw at tau =", m_tau
+      write(*,'(A,3(A,I4))') "[Metriplectic] PS4: worst its to r/r0 =", &
+        "  1e-2: ", its_worst(1), "   1e-4: ", its_worst(2), "   1e-6: ", its_worst(3)
+    endif
+
+    PetscCallA(PetscRandomDestroy(rnd, ierr))
+    PetscCallA(VecDestroy(b, ierr))
+    PetscCallA(VecDestroy(x, ierr))
+
+    ! restore the as-built inner-solver configuration
+    if (ps_it_save > 0) then
+      call KSPSetTolerances(g_mctx%ksp_Suw, ps_tol_save, PETSC_CURRENT_REAL, &
+                            PETSC_CURRENT_REAL, ps_it_save, ierr)
+    else
+      call KSPSetTolerances(g_mctx%ksp_Suw, ps_tol_save, PETSC_CURRENT_REAL, &
+                            PETSC_CURRENT_REAL, 30, ierr)
+    endif
+  end subroutine run_PS4
+
 
   !====================================================================
   ! Dynamically track physical and continuous-Schur energies of vectors
