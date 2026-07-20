@@ -48,7 +48,8 @@ module mod_petsc_pc_metriplectic_analysis
         setup_lu_ksp, setup_mass_ksp, metriplectic_build_sweep, metriplectic_refresh_Pu
   use mod_petsc_pc_metriplectic_apply, only: metriplectic_ideal_half_solve, &
         metriplectic_recover_jw, metriplectic_sweep_apply_4v, &
-        metriplectic_sweep_apply_full, metriplectic_ps_ldu_solve, mpc_sweep_order
+        metriplectic_sweep_apply_full, metriplectic_ps_ldu_solve, mpc_sweep_order, &
+        pack_2v, unpack_2v
   implicit none
   private
 
@@ -1098,67 +1099,122 @@ contains
 
 
   !====================================================================
-  ! PS1: factorization exactness (sign/layout gate; spec Sec. 7.3, note
-  ! Prop. ldu). The block-LDU apply with a TIGHT inner Schur solve must
-  ! reproduce the direct MUMPS solve of A_k4 (the model it factorizes) to
-  ! roundoff. This is the net for the P_uw and LDU sign chain, in the role
-  ! T3 played for Slice A. Any O(1) value = a sign/layout error.
+  ! PS1: sign/layout gate (spec Sec. 7.3, note Prop. ldu). Two exact
+  ! checks that do NOT depend on the inner Schur solve converging (unlike
+  ! comparing the whole LDU to A_k4^-1, which needs a tight inner solve
+  ! and is contaminated by the P_uw tail at eta_num = 0):
+  !
+  !  PS1a  static-condensation identity. For random v on (u,w), build
+  !        Z = ( -A_psij^-1 (tdt D v_u, 0) ; v ). Then EXACTLY
+  !          (A_k4 Z)_(psi,j) = 0                  [pivot + C coupling]
+  !          (A_k4 Z)_(u,w)   = S_uw v             [Chat coupling + shell]
+  !        Validates the (psi,j) pivot, both wave couplings tdt*D / tdt*Dp,
+  !        and that the S_uw shell is the true Schur of A_k4.
+  !
+  !  PS1b  end-to-end LDU residual split. res = b - A_k4 * LDU(b). The
+  !        (psi,j) rows are satisfied by steps 1&4 for ANY du, so
+  !          |res_(psi,j)|/|b|  is the WIRING gate (expect roundoff;
+  !            an O(1) value = an r_j routing or a coupling-sign error),
+  !          |res_(u,w)|/|b|    is the inner-solve residual (single-pass at
+  !            default ps_inner_it; cross-reference PS4, not a sign gate).
   !====================================================================
   subroutine run_PS1(comm, my_id)
     integer, intent(in) :: comm, my_id
 
-    Vec :: b4, x4_lu, x4_ldu
+    Vec :: v_uw, cv_psij, w_psij, z4, y4, y_uw, s_uw_v
+    Vec :: b4, x4, res4
     PetscRandom :: rnd
-    PetscReal :: dnorm, xnorm
+    PetscReal :: tdt, ncv, r_cond, r_shell, nb, ns, r_wire, r_inner
     PetscErrorCode :: ierr
-    integer :: k, ps_it_save
-    real*8  :: ps_tol_save
+    integer :: k
 
-    ! force an (essentially) exact inner Schur solve for the duration
-    ps_it_save  = g_mctx%ps_inner_it
-    ps_tol_save = g_mctx%ps_inner_tol
-    g_mctx%ps_inner_it = 200
-    call KSPSetTolerances(g_mctx%ksp_Suw, 1.d-12, 1.d-50, PETSC_CURRENT_REAL, 200, ierr)
-
-    PetscCallA(MatCreateVecs(g_mctx%A_k4, x4_lu, b4, ierr))
-    PetscCallA(VecDuplicate(b4, x4_ldu, ierr))
+    tdt = g_mctx%dt_theta * m_opz
     PetscCallA(PetscRandomCreate(comm, rnd, ierr))
 
-    if (my_id == 0) write(*,'(A)') &
-      "[Metriplectic] PS1: block-LDU (tight inner) vs A_k4 MUMPS LU, |x_LDU - x_LU|/|x_LU|"
+    ! ---- PS1a: static-condensation exactness (no iterative solve) ----
+    PetscCallA(MatCreateVecs(g_mctx%A_pair_uw,   v_uw,   y_uw,   ierr))
+    PetscCallA(VecDuplicate(v_uw, s_uw_v, ierr))
+    PetscCallA(MatCreateVecs(g_mctx%A_pair_psij, cv_psij, w_psij, ierr))
+    PetscCallA(MatCreateVecs(g_mctx%A_k4, z4, y4, ierr))
 
+    PetscCallA(VecSetRandom(v_uw, rnd, ierr))
+    call unpack_2v(v_uw, m_du, m_dw, ierr)              ! v = (v_u, v_w)
+    call MatMult(g_mctx%D_op, m_du, m_t1, ierr)         ! D v_u
+    call VecScale(m_t1, tdt, ierr)                      ! tdt D v_u = (C v)_psi
+    call VecZeroEntries(m_t2, ierr)
+    call pack_2v(m_t1, m_t2, cv_psij, ierr)            ! C v = (tdt D v_u, 0)
+    PetscCallA(VecNorm(cv_psij, NORM_2, ncv, ierr))
+    call KSPSolve(g_mctx%ksp_pair_psij, cv_psij, w_psij, ierr)  ! A_psij^-1 C v
+
+    call unpack_2v(w_psij, m_dpsi, m_dj, ierr)
+    call VecScale(m_dpsi, -1.d0, ierr)                  ! Z_psi = -(A_psij^-1 C v)_psi
+    call VecScale(m_dj,   -1.d0, ierr)
+    call pack_4v(m_dpsi, m_du, m_dj, m_dw, z4, ierr)    ! Z = (Z_psi, v_u, Z_j, v_w)
+    call MatMult(g_mctx%A_k4, z4, y4, ierr)
+    call unpack_4v(y4, m_rpsi, m_ru, m_rj, m_rw, ierr)
+
+    ! (psi,j) block should vanish; (u,w) block should equal S_uw v
+    call pack_2v(m_rpsi, m_rj, cv_psij, ierr)           ! reuse cv_psij as (y_psi,y_j)
+    PetscCallA(VecNorm(cv_psij, NORM_2, r_cond, ierr))
+    call MatMult(g_mctx%S_uw_shell, v_uw, s_uw_v, ierr)
+    call pack_2v(m_ru, m_rw, y_uw, ierr)
+    call VecAXPY(y_uw, -1.d0, s_uw_v, ierr)
+    PetscCallA(VecNorm(y_uw,   NORM_2, r_shell, ierr))
+    PetscCallA(VecNorm(s_uw_v, NORM_2, ns, ierr))
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Metriplectic] PS1a: static-condensation exactness (no inner solve)"
+      write(*,'(A,ES14.4)') "[Metriplectic] PS1a:  |(A_k4 Z)_(psi,j)| / |C v|      = ", &
+        r_cond/max(ncv,tiny(1.d0))
+      write(*,'(A,ES14.4)') "[Metriplectic] PS1a:  |(A_k4 Z)_(u,w) - S_uw v| / |S_uw v| = ", &
+        r_shell/max(ns,tiny(1.d0))
+    endif
+
+    PetscCallA(VecDestroy(v_uw, ierr));    PetscCallA(VecDestroy(y_uw, ierr))
+    PetscCallA(VecDestroy(s_uw_v, ierr));  PetscCallA(VecDestroy(cv_psij, ierr))
+    PetscCallA(VecDestroy(w_psij, ierr));  PetscCallA(VecDestroy(z4, ierr))
+    PetscCallA(VecDestroy(y4, ierr))
+
+    ! ---- PS1b: end-to-end LDU residual split (wiring vs inner solve) ----
+    PetscCallA(MatCreateVecs(g_mctx%A_k4, x4, b4, ierr))
+    PetscCallA(VecDuplicate(b4, res4, ierr))
+    if (my_id == 0) write(*,'(A)') &
+      "[Metriplectic] PS1b: LDU residual split, |res_(psi,j)|/|b| (WIRING) , |res_(u,w)|/|b| (inner)"
     do k = 1, 3
       PetscCallA(VecSetRandom(b4, rnd, ierr))
-      call KSPSolve(g_mctx%ksp_k4, b4, x4_lu, ierr)         ! A_k4^-1 b (reference)
-
       call unpack_4v(b4, m_rpsi, m_ru, m_rj, m_rw, ierr)
       call metriplectic_ps_ldu_solve(m_rpsi, m_ru, m_rj, m_rw, &
                                      m_dpsi, m_du, m_dj, m_dw)
-      call pack_4v(m_dpsi, m_du, m_dj, m_dw, x4_ldu, ierr)
+      call pack_4v(m_dpsi, m_du, m_dj, m_dw, x4, ierr)
+      call MatMult(g_mctx%A_k4, x4, res4, ierr)
+      call VecAYPX(res4, -1.d0, b4, ierr)               ! res = b - A_k4 x
+      PetscCallA(VecNorm(b4, NORM_2, nb, ierr))
 
-      call VecAXPY(x4_ldu, -1.d0, x4_lu, ierr)
-      PetscCallA(VecNorm(x4_ldu, NORM_2, dnorm, ierr))
-      PetscCallA(VecNorm(x4_lu,  NORM_2, xnorm, ierr))
-      if (my_id == 0) write(*,'(A,I2,A,ES14.4)') &
-        "[Metriplectic] PS1:  RHS ", k, "  rel. diff = ", dnorm/max(xnorm,tiny(1.d0))
+      call unpack_4v(res4, m_rpsi, m_ru, m_rj, m_rw, ierr)
+      call block_norm2(m_rpsi, m_rj, r_wire, ierr)
+      call block_norm2(m_ru,   m_rw, r_inner, ierr)
+      if (my_id == 0) write(*,'(A,I2,A,2ES14.4)') &
+        "[Metriplectic] PS1b:  RHS ", k, "  = ", &
+        r_wire/max(nb,tiny(1.d0)), r_inner/max(nb,tiny(1.d0))
     enddo
 
     PetscCallA(PetscRandomDestroy(rnd, ierr))
     PetscCallA(VecDestroy(b4, ierr))
-    PetscCallA(VecDestroy(x4_lu, ierr))
-    PetscCallA(VecDestroy(x4_ldu, ierr))
-
-    ! restore the as-built inner-solver configuration
-    g_mctx%ps_inner_it  = ps_it_save
-    g_mctx%ps_inner_tol = ps_tol_save
-    if (ps_it_save > 0) then
-      call KSPSetTolerances(g_mctx%ksp_Suw, ps_tol_save, PETSC_CURRENT_REAL, &
-                            PETSC_CURRENT_REAL, ps_it_save, ierr)
-    else
-      call KSPSetTolerances(g_mctx%ksp_Suw, ps_tol_save, PETSC_CURRENT_REAL, &
-                            PETSC_CURRENT_REAL, 30, ierr)
-    endif
+    PetscCallA(VecDestroy(x4, ierr))
+    PetscCallA(VecDestroy(res4, ierr))
   end subroutine run_PS1
+
+
+  !> 2-norm of the concatenation of two 1-var vecs: sqrt(|a|^2 + |b|^2).
+  subroutine block_norm2(a, b, nrm, ierr)
+    Vec :: a, b
+    PetscReal :: nrm
+    PetscErrorCode :: ierr
+    PetscReal :: na, nb
+    call VecNorm(a, NORM_2, na, ierr)
+    call VecNorm(b, NORM_2, nb, ierr)
+    nrm = sqrt(na*na + nb*nb)
+  end subroutine block_norm2
 
 
   !====================================================================
