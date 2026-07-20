@@ -658,7 +658,9 @@ subroutine preset_parameters
   metriplectic_analysis_nsweep = 5          ! Number of dt points in the T2 conditioning sweep
   use_metriplectic_pc          = .false.    ! Metriplectic HSS sweep PCSHELL off by default
   metriplectic_sweep_order     = 'SK'       ! Sweep order: dissipative pairs first ('SK') or ideal first ('KS')
-  metriplectic_coupled_ideal   = .true.     ! Exact coupled 2x2 K-half solve (P_u Schur path if .false.)
+  metriplectic_khalf           = 'PS'       ! K-half mode: 'PS' pair-Schur LDU, 'K4' 4-field LU, 'K2' 2x2 LU, 'PU' P_u Schur
+  metriplectic_ps_inner_it     = 0          ! Inner Schur iterations (0 = single-pass P_uw^-1)
+  metriplectic_ps_inner_tol    = 1.d-2      ! Inner Schur relative tolerance
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 
   use_mumps          = .false.              ! Use MUMPS solver

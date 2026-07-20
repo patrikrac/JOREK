@@ -50,6 +50,14 @@ module mod_petsc_pc_metriplectic_ctx
     Mat :: A_kideal           !< coupled model-Alfven K-half
                               !! [(1+z)M_psi, tdt*D; tdt*Dp, -(1+z)L_rho] (tdt = theta*dt)
 
+    !> --- Stage-D pair-Schur objects (spec Sec. 7.3; note Sec. "pschur") ---
+    Mat :: A_k4               !< 4-field model K (psi,u,j,w pack_4v order; true pair
+                              !! blocks + tdt*D/tdt*Dp coupling) -- reference/fallback LU
+    Mat :: P_uw               !< sparse Schur PC on the (u,w) pair:
+                              !! [B22 - (1+z)tau^2 W_para, B24; B42, B44] (note eq. (Puw))
+    Mat :: S_uw_shell         !< matrix-free exact Schur S_uw = A_uw - tdt^2 [Dp R^-1 D]_uu
+                              !! (one (psi,j) pair solve per mult; note eq. (Suw))
+
     !> Sweep solvers (created/refreshed by metriplectic_build_sweep)
     KSP :: ksp_pair_psij      !< MUMPS LU on A_pair_psij
     KSP :: ksp_pair_uw        !< MUMPS LU on A_pair_uw
@@ -58,17 +66,27 @@ module mod_petsc_pc_metriplectic_ctx
     KSP :: ksp_Mpsi           !< CG+Jacobi consistent-mass solve on M_psi
     KSP :: ksp_B33, ksp_B44   !< MUMPS LU, factored ONCE (constant constraint masses)
     KSP :: ksp_B55, ksp_B66   !< MUMPS LU on rho/T diagonal blocks (refreshed)
+    KSP :: ksp_k4             !< MUMPS LU on A_k4 (reference/fallback, mode 'K4')
+    KSP :: ksp_Puw            !< MUMPS LU on P_uw (mode 'PS')
+    KSP :: ksp_Suw            !< FGMRES on S_uw_shell, Pmat = P_uw (inner Schur solve)
     logical :: sweep_ready       = .false.
     logical :: sweep_once_done   = .false.  !< B33/B44 factored-once guard
     real*8  :: tau_Pu            = -1.d0    !< tau at which ksp_Pu is factored
-    logical :: ideal_coupled     = .true.   !< K-half solve: coupled 2x2 MUMPS (exact,
-                                            !! default) vs P_u Schur path (T3c tail;
-                                            !! iterative upgrade route)
+    character(len=2) :: khalf_mode = 'PS'   !< K-half solve mode (spec Sec. 7.3):
+                                            !! 'PS' pair-Schur LDU (default), 'K4'
+                                            !! coupled 4-field LU (reference/fallback),
+                                            !! 'K2' coupled 2x2 model-Alfven LU,
+                                            !! 'PU' segregated P_u Schur path
+    integer :: ps_inner_it       = 0        !< 'PS' inner Schur iterations (0 = single
+                                            !! pass P_uw^-1)
+    real*8  :: ps_inner_tol      = 1.d-2    !< 'PS' inner Schur relative tolerance
 
     !> Sweep work vectors: 2-var packed pair vecs + rho/T sized 1-var vecs
     Vec :: wv_pair_psij_1, wv_pair_psij_2
     Vec :: wv_pair_uw_1,   wv_pair_uw_2
     Vec :: wv_kid_1, wv_kid_2
+    Vec :: wv_k4_1, wv_k4_2   !< 4-var packed (mode 'K4' reference solve)
+    Vec :: wv_uw_1, wv_uw_2   !< 2-var (u,w) packed ('PS' Schur RHS/solution)
     Vec :: wv_rho_1, wv_rho_2, wv_T_1, wv_T_2
 
     !> Work vectors (1-var sized), created with the matrices

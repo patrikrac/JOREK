@@ -166,7 +166,9 @@ module phys_module
   integer :: metriplectic_analysis_nsweep !< Number of dt points in the T2 conditioning sweep
   logical :: use_metriplectic_pc          !< Use the metriplectic HSS sweep PCSHELL for the outer FGMRES (spec Sec. 6)
   character(len=2) :: metriplectic_sweep_order !< HSS sweep order: 'SK' (dissipative pairs first, default) or 'KS'
-  logical :: metriplectic_coupled_ideal   !< K-half solve: coupled 2x2 MUMPS (exact, default) vs P_u Schur path
+  character(len=2) :: metriplectic_khalf  !< K-half solve mode (spec Sec. 7.3): 'PS' pair-Schur LDU (default), 'K4' coupled 4-field LU (reference), 'K2' coupled 2x2 model-Alfven LU, 'PU' segregated P_u Schur path
+  integer :: metriplectic_ps_inner_it     !< 'PS' inner Schur FGMRES iterations (0 = single-pass P_uw^-1, default)
+  real(kind=8) :: metriplectic_ps_inner_tol !< 'PS' inner Schur relative tolerance
   logical :: eliminate_boundary_dofs !< Zero boundary-DOF rows in PC correction matrices and use elm-diagonal BC scaling in global matrix; required for physics PC Schur correction approach
   logical :: use_newton           !< Use inexact Newton method
   integer :: maxNewton            !< maximum number of Newton iterations

@@ -28,6 +28,8 @@ module mod_petsc_pc_metriplectic_apply
   public :: metriplectic_recover_rhoT
   public :: metriplectic_sweep_apply_4v
   public :: metriplectic_sweep_apply_full
+  public :: metriplectic_build_ps_shell
+  public :: metriplectic_ps_ldu_solve
   public :: pack_2v, unpack_2v, pack_4v, unpack_4v
 
   !> Active sweep order ('SK' default; 'KS' = ideal half first). Set from
@@ -42,6 +44,17 @@ module mod_petsc_pc_metriplectic_apply
   Vec :: a_rpsi, a_ru, a_rj, a_rw             ! unpacked residuals
   Vec :: a_dpsi, a_du, a_dj, a_dw             ! solution components
   Vec :: a_rrho, a_rT, a_drho, a_dT           ! rho/T components (full apply)
+
+  ! --- stage-D pair-Schur shell internals (spec Sec. 7.3) ---
+  ! Dedicated vecs: the S_uw shell mult runs inside KSPSolve(ksp_Suw),
+  ! which the LDU apply calls between its two pivot solves -- it must not
+  ! touch the a_* pool the LDU is using. The pair packed vecs
+  ! wv_pair_psij_1/2 ARE safe here (no pivot solve is in flight during
+  ! the inner Schur iteration).
+  logical :: ps_shell_ready = .false.
+  Vec :: s_xu, s_xw, s_yu, s_yw               ! (u,w) components of x / y
+  Vec :: s_t1, s_zj, s_h, s_hj                ! psi/j-space intermediates
+  Vec :: s_cu                                 ! u-space wave correction
 
 contains
 
@@ -74,11 +87,121 @@ contains
 
 
   !====================================================================
+  ! Stage-D pair-Schur infrastructure (spec Sec. 7.3; note Sec. pschur).
+  !
+  ! S_uw_shell: matrix-free exact Schur on the (u,w) pair,
+  !   S_uw = A_uw - tdt^2 [Dp (A_psij^-1)_psipsi D]_uu   (note eq. (Suw))
+  ! with tdt = theta*dt = (1+zeta)*tau; one (psi,j) pair solve per mult.
+  !
+  ! ksp_Suw: FGMRES on the shell, preconditioned by P_uw through a
+  ! PCSHELL that applies ksp_Puw (single factorization, owned by
+  ! ksp_Puw; same sharing pattern as the analysis module's pu_pc_apply).
+  !
+  ! Created ONCE; all g_mctx handles (A_pair_uw, D_op, Dp_op,
+  ! ksp_pair_psij, ksp_Puw) are dereferenced at call time, so PC rebuilds
+  ! need no shell rebuild.
+  !====================================================================
+  subroutine metriplectic_build_ps_shell(comm)
+    integer, intent(in) :: comm
+    PetscErrorCode :: ierr
+    PetscInt :: n_loc, n_glob
+    PC  :: pc
+
+    if (ps_shell_ready) return
+
+    ! dedicated work vecs (all 1-var layouts coincide, cf. ensure_work)
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_xu, ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_xw, ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_yu, ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_yw, ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_t1, ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_zj, ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_h,  ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_hj, ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, s_cu, ierr))
+
+    ! shell with the (u,w) pair layout
+    call MatGetLocalSize(g_mctx%A_pair_uw, n_loc, PETSC_NULL_INTEGER, ierr)
+    call MatGetSize(g_mctx%A_pair_uw, n_glob, PETSC_NULL_INTEGER, ierr)
+    PetscCallA(MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, &
+                              PETSC_NULL_INTEGER, g_mctx%S_uw_shell, ierr))
+    PetscCallA(MatShellSetOperation(g_mctx%S_uw_shell, MATOP_MULT, &
+                                    metriplectic_Suw_mult, ierr))
+
+    ! inner Schur solver: FGMRES(S_uw) with P_uw^-1 (via ksp_Puw) as PC
+    PetscCallA(KSPCreate(comm, g_mctx%ksp_Suw, ierr))
+    PetscCallA(KSPSetOperators(g_mctx%ksp_Suw, g_mctx%S_uw_shell, &
+                               g_mctx%S_uw_shell, ierr))
+    PetscCallA(KSPSetType(g_mctx%ksp_Suw, KSPFGMRES, ierr))
+    PetscCallA(KSPGetPC(g_mctx%ksp_Suw, pc, ierr))
+    PetscCallA(PCSetType(pc, PCSHELL, ierr))
+    PetscCallA(PCShellSetApply(pc, metriplectic_puw_pc_apply, ierr))
+    if (g_mctx%ps_inner_it > 0) then
+      call KSPSetTolerances(g_mctx%ksp_Suw, g_mctx%ps_inner_tol, &
+                            PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, &
+                            g_mctx%ps_inner_it, ierr)
+    else
+      ! single-pass production never calls ksp_Suw; this default serves
+      ! the analysis uses (PS1 tightens it explicitly)
+      call KSPSetTolerances(g_mctx%ksp_Suw, g_mctx%ps_inner_tol, &
+                            PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, &
+                            30, ierr)
+    endif
+    PetscCallA(KSPSetInitialGuessNonzero(g_mctx%ksp_Suw, PETSC_FALSE, ierr))
+
+    ps_shell_ready = .true.
+  end subroutine metriplectic_build_ps_shell
+
+
+  !--------------------------------------------------------------------
+  !> MATOP_MULT of S_uw_shell:  y = A_uw x - tdt^2 [Dp R^-1 D x_u]_u
+  !! (note eq. (Suw); R^-1 action = psi-component of one (psi,j) pair
+  !!  solve with RHS (D x_u, 0)).
+  !--------------------------------------------------------------------
+  subroutine metriplectic_Suw_mult(A, x, y, ierr)
+    use phys_module, only: time_evol_zeta
+    Mat :: A
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    real*8 :: tdt
+
+    tdt = g_mctx%dt_theta * (1.d0 + time_evol_zeta)     ! = theta*dt
+
+    call MatMult(g_mctx%A_pair_uw, x, y, ierr)          ! y = A_uw x
+    call unpack_2v(x, s_xu, s_xw, ierr)
+    call MatMult(g_mctx%D_op, s_xu, s_t1, ierr)         ! D x_u (psi space)
+    call VecZeroEntries(s_zj, ierr)
+    call pack_2v(s_t1, s_zj, g_mctx%wv_pair_psij_1, ierr)
+    call KSPSolve(g_mctx%ksp_pair_psij, g_mctx%wv_pair_psij_1, &
+                  g_mctx%wv_pair_psij_2, ierr)          ! (R^-1 D x_u, *)
+    call unpack_2v(g_mctx%wv_pair_psij_2, s_h, s_hj, ierr)
+    call MatMult(g_mctx%Dp_op, s_h, s_cu, ierr)         ! Dp R^-1 D x_u (u space)
+    call unpack_2v(y, s_yu, s_yw, ierr)
+    call VecAXPY(s_yu, -tdt*tdt, s_cu, ierr)            ! minus: note eq. (Suw)
+    call pack_2v(s_yu, s_yw, y, ierr)
+    ierr = 0
+  end subroutine metriplectic_Suw_mult
+
+
+  !--------------------------------------------------------------------
+  !> PCSHELL apply for ksp_Suw: one P_uw^-1 application via ksp_Puw
+  !! (shares the single MUMPS factorization owned by ksp_Puw).
+  !--------------------------------------------------------------------
+  subroutine metriplectic_puw_pc_apply(pc, x, y, ierr)
+    PC  :: pc
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call KSPSolve(g_mctx%ksp_Puw, x, y, ierr)
+    ierr = 0
+  end subroutine metriplectic_puw_pc_apply
+
+
+  !====================================================================
   ! Reduced K-half solve.
-  ! Default (ideal_coupled): exact coupled 2x2 MUMPS solve of the model
-  ! Alfven system A_kideal — no Schur substitution, no T3c grid-scale
-  ! tail (this fixed the intear FGMRES stall of 2026-07-16).
-  ! Schur path (ideal_coupled=.false., iterative upgrade route):
+  ! Mode 'K2': exact coupled 2x2 MUMPS solve of the model Alfven system
+  ! A_kideal — no Schur substitution, no T3c grid-scale tail (this fixed
+  ! the intear FGMRES stall of 2026-07-16).
+  ! Mode 'PU' (segregated Schur path, historical):
   !   h     = M_psi^-1 rpsi / (1+z)             [note SK step 3]
   !   RHS_u = -ru/(1+z) + tau * Dp h            [note Sec. 6: u-row negation
   !                                              flips BOTH terms -> +tau Dp h]
@@ -91,7 +214,7 @@ contains
     PetscErrorCode :: ierr
     real*8 :: opz, tau
 
-    if (g_mctx%ideal_coupled) then
+    if (g_mctx%khalf_mode == 'K2') then
       call pack_2v(rpsi, ru, g_mctx%wv_kid_1, ierr)
       call KSPSolve(g_mctx%ksp_kideal, g_mctx%wv_kid_1, g_mctx%wv_kid_2, ierr)
       call unpack_2v(g_mctx%wv_kid_2, dpsi, du, ierr)
@@ -194,13 +317,82 @@ contains
 
 
   !====================================================================
-  ! Sweep core on 1-var components (both orders; note apply sequences)
+  ! Stage-D pair-Schur block-LDU solve of the 4-field model K
+  ! (mode 'PS'; spec Sec. 7.3, note eq. (ldu)). Exact inverse of A_k4
+  ! when the Schur solve is exact (note Prop. ldu); the j-constraint row
+  ! is structurally exact for ANY du, and single-pass also satisfies the
+  ! w-constraint row exactly (note Rem. ldu-constraints).
+  !
+  !   1. pivot:      (dpsi0, dj0) = A_psij^-1 (rpsi, rj)
+  !   2. Schur RHS:  gu = ru - tdt*Dp*dpsi0 ; gw = rw      [tdt = theta*dt]
+  !   3. Schur:      (du, dw) = S_uw^-1 (gu, gw)
+  !                  [ps_inner_it = 0: one P_uw^-1; else FGMRES(ksp_Suw)]
+  !   4. back-subst: (dpsi, dj) = A_psij^-1 (rpsi - tdt*D*du, rj)
+  !
+  ! Signs: JOREK psi-row  B11 dpsi + tdt*D du + B13 dj = rpsi  and
+  ! u-row  tdt*Dp dpsi + B22 du + B24 dw = ru, matching the A_k4 nest
+  ! (assembly, spec Sec. 7.2 table) -- both correction terms enter with
+  ! MINUS on the right-hand side.
+  !====================================================================
+  subroutine metriplectic_ps_ldu_solve(rpsi, ru, rj, rw, dpsi, du, dj, dw)
+    use phys_module, only: time_evol_zeta
+    Vec :: rpsi, ru, rj, rw, dpsi, du, dj, dw
+    PetscErrorCode :: ierr
+    real*8 :: tdt
+
+    tdt = g_mctx%dt_theta * (1.d0 + time_evol_zeta)     ! = theta*dt
+    call ensure_work(ierr)
+
+    ! (1) pivot pair solve; dj0 (a_j1) is discarded
+    call pack_2v(rpsi, rj, g_mctx%wv_pair_psij_1, ierr)
+    call KSPSolve(g_mctx%ksp_pair_psij, g_mctx%wv_pair_psij_1, &
+                  g_mctx%wv_pair_psij_2, ierr)
+    call unpack_2v(g_mctx%wv_pair_psij_2, a_p1, a_j1, ierr)
+
+    ! (2) Schur RHS: gu = ru - tdt*(Dp dpsi0)            [note eq. (ldu) 2]
+    call MatMult(g_mctx%Dp_op, a_p1, a_t2, ierr)
+    call VecAYPX(a_t2, -tdt, ru, ierr)
+    call pack_2v(a_t2, rw, g_mctx%wv_uw_1, ierr)
+
+    ! (3) Schur solve                                    [note eq. (ldu) 3]
+    if (g_mctx%ps_inner_it > 0) then
+      call KSPSolve(g_mctx%ksp_Suw, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
+    else
+      call KSPSolve(g_mctx%ksp_Puw, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
+    endif
+    call unpack_2v(g_mctx%wv_uw_2, du, dw, ierr)
+
+    ! (4) back-substitution: dpsi from rpsi - tdt*(D du) [note eq. (ldu) 4]
+    call MatMult(g_mctx%D_op, du, a_t1, ierr)
+    call VecAYPX(a_t1, -tdt, rpsi, ierr)
+    call pack_2v(a_t1, rj, g_mctx%wv_pair_psij_1, ierr)
+    call KSPSolve(g_mctx%ksp_pair_psij, g_mctx%wv_pair_psij_1, &
+                  g_mctx%wv_pair_psij_2, ierr)
+    call unpack_2v(g_mctx%wv_pair_psij_2, dpsi, dj, ierr)
+  end subroutine metriplectic_ps_ldu_solve
+
+
+  !====================================================================
+  ! Sweep core on 1-var components. Mode dispatch (spec Sec. 7.3):
+  ! 'PS' pair-Schur LDU / 'K4' coupled LU reference / 'K2', 'PU' the
+  ! stage-B/C alternating sweep (both orders).
   !====================================================================
   subroutine metriplectic_sweep_core(rpsi, ru, rj, rw, dpsi, du, dj, dw)
     Vec :: rpsi, ru, rj, rw, dpsi, du, dj, dw
     PetscErrorCode :: ierr
 
     call ensure_work(ierr)
+    if (g_mctx%khalf_mode == 'PS') then
+      call metriplectic_ps_ldu_solve(rpsi, ru, rj, rw, dpsi, du, dj, dw)
+      return
+    endif
+    if (g_mctx%khalf_mode == 'K4') then
+      ! P = A_k4 (+ rho/T recovery): one coupled reference solve
+      call pack_4v(rpsi, ru, rj, rw, g_mctx%wv_k4_1, ierr)
+      call KSPSolve(g_mctx%ksp_k4, g_mctx%wv_k4_1, g_mctx%wv_k4_2, ierr)
+      call unpack_4v(g_mctx%wv_k4_2, dpsi, du, dj, dw, ierr)
+      return
+    endif
     if (mpc_sweep_order == 'KS') then
       ! P^-1 = A1^-1 M_red A2^-1: ideal first, pairs last (consume rj, rw)
       call metriplectic_ideal_half_solve(rpsi, ru, a_p1, a_u1)
