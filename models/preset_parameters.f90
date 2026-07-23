@@ -661,6 +661,7 @@ subroutine preset_parameters
   metriplectic_khalf           = 'PS'       ! K-half mode: 'PS' pair-Schur LDU, 'K4' 4-field LU, 'K2' 2x2 LU, 'PU' P_u Schur
   metriplectic_ps_inner_it     = 0          ! Inner Schur iterations (0 = single-pass P_uw^-1)
   metriplectic_ps_inner_tol    = 1.d-2      ! Inner Schur relative tolerance
+  commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 
   use_mumps          = .false.              ! Use MUMPS solver

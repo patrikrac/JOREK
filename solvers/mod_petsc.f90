@@ -471,9 +471,11 @@ contains
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
     use phys_module, only: use_physics_pc, metriplectic_analysis, &
-                           use_metriplectic_pc, metriplectic_sweep_order
+                           use_metriplectic_pc, metriplectic_sweep_order, &
+                           commutator_analysis
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
-    use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_run_analysis
+    use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_run_analysis, &
+                                                  petsc_commutator_run_analysis
     use mod_petsc_pc_metriplectic_assembly, only: metriplectic_build_sweep
     use mod_petsc_pc_metriplectic_apply, only: metriplectic_sweep_apply_full, mpc_sweep_order
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
@@ -548,6 +550,7 @@ contains
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
       endif
       if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
+      if (commutator_analysis)   call petsc_commutator_run_analysis(petsc_sys%A_aij, my_id)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
@@ -565,6 +568,7 @@ contains
       if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
       if (use_metriplectic_pc) call metriplectic_build_sweep(petsc_sys%A_aij, my_id)
       if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
+      if (commutator_analysis)   call petsc_commutator_run_analysis(petsc_sys%A_aij, my_id)
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))

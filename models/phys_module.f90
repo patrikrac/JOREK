@@ -169,6 +169,7 @@ module phys_module
   character(len=2) :: metriplectic_khalf  !< K-half solve mode (spec Sec. 7.3): 'PS' pair-Schur LDU (default), 'K4' coupled 4-field LU (reference), 'K2' coupled 2x2 model-Alfven LU, 'PU' segregated P_u Schur path
   integer :: metriplectic_ps_inner_it     !< 'PS' inner Schur FGMRES iterations (0 = single-pass P_uw^-1, default)
   real(kind=8) :: metriplectic_ps_inner_tol !< 'PS' inner Schur relative tolerance
+  logical :: commutator_analysis          !< Run commutator-operator (M_*) intertwining-defect analysis (candidates M0-M4, eps per toroidal harmonic) at first solve
   logical :: eliminate_boundary_dofs !< Zero boundary-DOF rows in PC correction matrices and use elm-diagonal BC scaling in global matrix; required for physics PC Schur correction approach
   logical :: use_newton           !< Use inexact Newton method
   integer :: maxNewton            !< maximum number of Newton iterations

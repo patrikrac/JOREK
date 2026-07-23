@@ -75,7 +75,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 metriplectic_analysis, metriplectic_analysis_nsweep, &
                 use_metriplectic_pc, metriplectic_sweep_order,      &
                 metriplectic_khalf, metriplectic_ps_inner_it,       &
-                metriplectic_ps_inner_tol,                          &
+                metriplectic_ps_inner_tol, commutator_analysis,     &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &
