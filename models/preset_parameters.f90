@@ -662,6 +662,13 @@ subroutine preset_parameters
   metriplectic_ps_inner_it     = 0          ! Inner Schur iterations (0 = single-pass P_uw^-1)
   metriplectic_ps_inner_tol    = 1.d-2      ! Inner Schur relative tolerance
   commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
+  commutator_pc                = .false.    ! Commutator-device M_* Schur as the production 'PS' K-half off by default
+  commutator_pc_mstar          = 'M1a'      ! Candidate M_* for commutator_pc (table label; 'M1a' = Eq.(35), a I + theta A)
+  commutator_pc_inner_it       = 20         ! Inner FGMRES cap on the commutator Schur shell
+  commutator_pc_inner_tol      = 1.d-6      ! Inner FGMRES relative tolerance on the commutator Schur shell
+  commutator_pc_ab             = .false.    ! A/B iteration-count diagnostic off by default
+  commutator_pc_ab_variants    = 'EXACT,M0D,M1a'  ! Ceiling, incumbent, candidate
+  commutator_pc_ab_every       = 1          ! Run the A/B every time step
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 
   use_mumps          = .false.              ! Use MUMPS solver

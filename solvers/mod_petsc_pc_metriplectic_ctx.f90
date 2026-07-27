@@ -42,6 +42,8 @@ module mod_petsc_pc_metriplectic_ctx
     !! (suffix s; independent of the analysis module's m_* handles).
     Mat :: A_pair_psij        !< 2x2 [B11 B13; B31 B33] MatNest->AIJ (S-half, psi/j pair)
     Mat :: A_pair_uw          !< 2x2 [B22 B24; B42 B44] MatNest->AIJ (S-half, u/w pair)
+    Mat :: B_11s              !< psi-row diagonal block, sweep-owned copy (commutator
+                              !! candidate M1x = the true amat_11; only when build_cm)
     Mat :: B_31s, B_33s       !< constraint row blocks (j recovery; B_33s factored once)
     Mat :: B_42s, B_44s       !< constraint row blocks (w recovery; B_44s factored once)
     Mat :: B_52s, B_55s       !< rho recovery: drho = B55^-1 (r_rho - B52 du)
@@ -80,6 +82,19 @@ module mod_petsc_pc_metriplectic_ctx
     integer :: ps_inner_it       = 0        !< 'PS' inner Schur iterations (0 = single
                                             !! pass P_uw^-1)
     real*8  :: ps_inner_tol      = 1.d-2    !< 'PS' inner Schur relative tolerance
+
+    !> --- Commutator-device M_* Schur (Slice 1; note Sec. 6.2, Eq. (39)) ---
+    !! Replaces step 3 of the PS-LDU by
+    !!   [B22 M_* - tdt^2 W_para, B24; B42 M_*, B44] (chi_u, dw) = (g_u, r_w)
+    !!   du = M_* chi_u,     M_* = Q_u^-1 A_M*
+    !! At M0 (A_M* = opz*Q_u) this is (1+zeta)*P_uw and du = opz*chi_u, i.e.
+    !! bit-identical to the ps_inner_it=0 path. The candidate binding
+    !! (coefficients, operator handles, counters) lives in the apply module
+    !! next to the shell internals, as ps_shell_ready/s_* do.
+    Mat :: S_cm_shell         !< matrix-free T_pair on the (u,w) layout
+    KSP :: ksp_Scm            !< FGMRES on S_cm_shell, PC = ksp_Puw / (1+zeta)
+    integer :: cm_inner_it    = 20       !< inner FGMRES cap
+    real*8  :: cm_inner_tol   = 1.d-6    !< inner FGMRES relative tolerance
 
     !> Sweep work vectors: 2-var packed pair vecs + rho/T sized 1-var vecs
     Vec :: wv_pair_psij_1, wv_pair_psij_2

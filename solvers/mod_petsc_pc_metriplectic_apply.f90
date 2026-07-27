@@ -18,6 +18,8 @@ module mod_petsc_pc_metriplectic_apply
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_metriplectic_ctx, only: g_mctx
+  use mod_petsc_pc_commutator_table, only: CM_NOP, CM_MAXC, CM_LABLEN, &
+        CM_OP_QR, cm_mstar_mult
   implicit none
   private
 
@@ -30,11 +32,28 @@ module mod_petsc_pc_metriplectic_apply
   public :: metriplectic_sweep_apply_full
   public :: metriplectic_build_ps_shell
   public :: metriplectic_ps_ldu_solve
+  public :: metriplectic_build_cm_shell, metriplectic_cm_bind, cm_set_variant
+  public :: cm_schur_variant, cm_ab_active, cm_counters_reset, cm_counters_get
   public :: pack_2v, unpack_2v, pack_4v, unpack_4v
 
   !> Active sweep order ('SK' default; 'KS' = ideal half first). Set from
   !! the namelist flag at PC setup; the analysis flips it for T6.
   character(len=2), public, save :: mpc_sweep_order = 'SK'
+
+  !> Which operator step 3 of the PS-LDU uses:
+  !!   'LEGACY' (default) -- untouched pre-existing behaviour, i.e. ksp_Suw
+  !!                         when ps_inner_it > 0 else ksp_Puw. Nothing that
+  !!                         does not opt in may ever leave this value.
+  !!   'M0D'              -- assembled P_uw, single pass (the incumbent)
+  !!   'EXACT'            -- exact Schur shell (the ceiling)
+  !!   any other label    -- candidate resolved against the shared table,
+  !!                         i.e. the commutator device
+  !! Never assign directly -- use cm_set_variant, which re-resolves cm_cand.
+  character(len=8), save :: cm_schur_variant = 'LEGACY'
+
+  !> Set by the A/B harness only: force the PS-LDU path irrespective of
+  !! khalf_mode, so the diagnostic can run alongside any production PC.
+  logical, save :: cm_ab_active = .false.
 
   ! --- module work vecs (1-var sized), created on first use ---
   logical :: a_work_ready = .false.
@@ -55,6 +74,26 @@ module mod_petsc_pc_metriplectic_apply
   Vec :: s_xu, s_xw, s_yu, s_yw               ! (u,w) components of x / y
   Vec :: s_t1, s_zj, s_h, s_hj                ! psi/j-space intermediates
   Vec :: s_cu                                 ! u-space wave correction
+
+  ! --- commutator-device M_* Schur internals (Slice 1) ---
+  ! Same dedicated-vec discipline as the s_* pool above: the S_cm mult runs
+  ! inside KSPSolve(ksp_Scm), called from the LDU between its pivot solves.
+  logical :: cm_shell_ready = .false.
+  Vec :: c_xu, c_xw, c_mu                     ! (u,w) split of x, M_* image
+  Vec :: c_t1, c_t2                           ! matvec scratch / A_M* image
+  Vec :: c_zero                               ! permanent zero (w-slot padding)
+  Vec :: c_pk1, c_pk2                         ! packed (u,w) work for the shell mult
+  !> Candidate binding: coefficients + operator handles for the whole table,
+  !! gathered once per PC build. cm_cand indexes the ACTIVE row.
+  real*8,  save :: cm_coef(CM_MAXC, CM_NOP) = 0.d0
+  integer, save :: cm_quop(CM_MAXC) = 0
+  character(len=CM_LABLEN), save :: cm_lab(CM_MAXC) = ' '
+  integer, save :: cm_ncand = 0
+  integer, save :: cm_cand  = 0               ! active row; 0 = unresolved
+  Mat,     save :: cm_op(CM_NOP)
+  logical, save :: cm_bound = .false.
+  !> Inner-iteration accounting for the A/B report.
+  integer, save :: cm_inner_tot = 0, cm_inner_calls = 0
 
 contains
 
@@ -194,6 +233,187 @@ contains
     call KSPSolve(g_mctx%ksp_Puw, x, y, ierr)
     ierr = 0
   end subroutine metriplectic_puw_pc_apply
+
+
+  !====================================================================
+  ! Commutator-device M_* Schur (Slice 1; note Eq. (39), Sec. 6.2).
+  !
+  ! The exact Schur term tdt^2 A_Dp B11^-1 A_D is replaced using the
+  ! intertwining relation B11^-1 A_D ~ Q_psi^-1 A_D A_M*^-1 Q_u, which
+  ! turns it into tdt^2 W_para A_M*^-1 Q_u -- no M^-1 anywhere. Folding
+  ! M_* = Q_u^-1 A_M* out to the right gives the pair operator
+  !
+  !   T_pair = [ B22 M_* - tdt^2 W_para   B24 ]
+  !            [ B42 M_*                  B44 ]
+  !
+  !   T_pair (chi_u, dw) = (g_u, r_w),      du = M_* chi_u
+  !
+  ! W_para is the continuum assembly of A_Dp Q_psi^-1 A_D, so the psi-side
+  ! Riesz map has already cancelled; Q_u^-1 survives ONLY inside B22 M_*
+  ! and B42 M_*, and is applied here as an exact MUMPS mass solve.
+  !
+  ! CONSISTENCY: at M0 (A_M* = opz*Q_u) this is exactly (1+zeta)*P_uw with
+  ! du = opz*chi_u, so the M0 candidate must reproduce the 'M0D' path to
+  ! round-off, and its inner FGMRES must converge in one iteration.
+  !====================================================================
+  subroutine metriplectic_build_cm_shell(comm)
+    integer, intent(in) :: comm
+    PetscErrorCode :: ierr
+    PetscInt :: n_loc, n_glob
+    PC  :: pc
+
+    if (cm_shell_ready) return
+
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, c_xu,  ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, c_xw,  ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, c_mu,  ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, c_t1,  ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, c_t2,  ierr))
+    PetscCallA(VecDuplicate(g_mctx%wv_psi_1, c_zero, ierr))
+    PetscCallA(VecZeroEntries(c_zero, ierr))
+    PetscCallA(MatCreateVecs(g_mctx%A_pair_uw, c_pk1, c_pk2, ierr))
+
+    call MatGetLocalSize(g_mctx%A_pair_uw, n_loc, PETSC_NULL_INTEGER, ierr)
+    call MatGetSize(g_mctx%A_pair_uw, n_glob, PETSC_NULL_INTEGER, ierr)
+    PetscCallA(MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, &
+                              PETSC_NULL_INTEGER, g_mctx%S_cm_shell, ierr))
+    PetscCallA(MatShellSetOperation(g_mctx%S_cm_shell, MATOP_MULT, &
+                                    metriplectic_Scm_mult, ierr))
+
+    ! inner solver: FGMRES(T_pair) preconditioned by P_uw^-1/(1+zeta)
+    PetscCallA(KSPCreate(comm, g_mctx%ksp_Scm, ierr))
+    PetscCallA(KSPSetOperators(g_mctx%ksp_Scm, g_mctx%S_cm_shell, &
+                               g_mctx%S_cm_shell, ierr))
+    PetscCallA(KSPSetType(g_mctx%ksp_Scm, KSPFGMRES, ierr))
+    PetscCallA(KSPGetPC(g_mctx%ksp_Scm, pc, ierr))
+    PetscCallA(PCSetType(pc, PCSHELL, ierr))
+    PetscCallA(PCShellSetApply(pc, metriplectic_cm_pc_apply, ierr))
+    call KSPSetTolerances(g_mctx%ksp_Scm, g_mctx%cm_inner_tol, &
+                          PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, &
+                          g_mctx%cm_inner_it, ierr)
+    PetscCallA(KSPSetInitialGuessNonzero(g_mctx%ksp_Scm, PETSC_FALSE, ierr))
+
+    cm_shell_ready = .true.
+  end subroutine metriplectic_build_cm_shell
+
+
+  !--------------------------------------------------------------------
+  !> Bind the shared candidate table to this PC build: gather the operator
+  !! handles from the caller-supplied blocks and resolve the active label.
+  !! Called from metriplectic_build_sweep once the sub-blocks exist.
+  !--------------------------------------------------------------------
+  subroutine metriplectic_cm_bind(B11, Q1R, QR, opz, tdt, eta, my_id)
+    use mod_petsc_pc_commutator_table, only: cm_table_build, cm_ops_gather
+    Mat,     intent(in) :: B11, Q1R, QR
+    real*8,  intent(in) :: opz, tdt, eta
+    integer, intent(in) :: my_id
+
+    call cm_ops_gather(B11, Q1R, QR, cm_op)
+    call cm_table_build(opz, tdt, eta, cm_coef, cm_quop, cm_lab, cm_ncand)
+    cm_bound = .true.
+    ! Re-resolve the currently selected variant against the fresh table
+    ! (opz/tdt/eta move with the time step, and the blocks are new copies).
+    call cm_set_variant(cm_schur_variant, my_id)
+  end subroutine metriplectic_cm_bind
+
+
+  !--------------------------------------------------------------------
+  !> Select the step-3 operator by label and resolve it against the table.
+  !! 'M0D' and 'EXACT' are not table candidates and leave cm_cand = 0,
+  !! which is exactly what the LDU dispatch keys off.
+  !--------------------------------------------------------------------
+  subroutine cm_set_variant(label, my_id)
+    use mod_petsc_pc_commutator_table, only: cm_table_lookup
+    character(len=*), intent(in) :: label
+    integer,          intent(in) :: my_id
+
+    cm_schur_variant = label
+    cm_cand = 0
+    if (trim(label) == 'M0D' .or. trim(label) == 'EXACT' &
+        .or. trim(label) == 'LEGACY') return
+    if (.not. cm_bound) return
+
+    cm_cand = cm_table_lookup(cm_lab, cm_ncand, label)
+    if (cm_cand == 0 .and. my_id == 0) then
+      write(*,'(A)') "[CommPC] WARNING: candidate '" // trim(label) // &
+        "' not in the table (building blocks not assembled?) -- using P_uw instead"
+    endif
+  end subroutine cm_set_variant
+
+
+  !--------------------------------------------------------------------
+  !> MATOP_MULT of S_cm_shell:  y = A_pair_uw (M_* x_u, x_w)
+  !!                                - tdt^2 (W_para x_u, 0)
+  !--------------------------------------------------------------------
+  subroutine metriplectic_Scm_mult(A, x, y, ierr)
+    use phys_module, only: time_evol_zeta
+    Mat :: A
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    real*8 :: tdt
+
+    tdt = g_mctx%dt_theta * (1.d0 + time_evol_zeta)     ! = theta*dt
+
+    call unpack_2v(x, c_xu, c_xw, ierr)
+    call cm_mstar_apply(c_xu, c_mu, ierr)               ! c_mu = M_* x_u
+    call pack_2v(c_mu, c_xw, c_pk1, ierr)
+    call MatMult(g_mctx%A_pair_uw, c_pk1, y, ierr)      ! A_uw (M_* x_u, x_w)
+
+    ! u-row wave term: -tdt^2 W_para x_u  (sign as in P_uw, note Sec. Puw)
+    call MatMult(g_mctx%W_para, c_xu, c_t1, ierr)
+    call pack_2v(c_t1, c_zero, c_pk2, ierr)
+    call VecAXPY(y, -tdt**2, c_pk2, ierr)
+    ierr = 0
+  end subroutine metriplectic_Scm_mult
+
+
+  !--------------------------------------------------------------------
+  !> M_* x = Q_u^-1 A_M* x, with Q_u the candidate's own mass (B33 for the
+  !! 1/R family, B44 for the R family -- Caution 5 of the note). Both are
+  !! factored once under the sweep_once_done guard, so this is one MUMPS
+  !! back-solve plus the table matvec.
+  !! c_t2 receives A_M* x; c_t1 is the table matvec scratch.
+  !--------------------------------------------------------------------
+  subroutine cm_mstar_apply(x, y, ierr)
+    Vec :: x, y
+    PetscErrorCode :: ierr
+
+    call cm_mstar_mult(cm_op, cm_coef, cm_cand, x, c_t2, c_t1, ierr)
+    if (cm_quop(cm_cand) == CM_OP_QR) then
+      call KSPSolve(g_mctx%ksp_B44, c_t2, y, ierr)
+    else
+      call KSPSolve(g_mctx%ksp_B33, c_t2, y, ierr)
+    endif
+  end subroutine cm_mstar_apply
+
+
+  !--------------------------------------------------------------------
+  !> PCSHELL apply for ksp_Scm: P_uw^-1 scaled by 1/(1+zeta), because
+  !! T_pair = (1+zeta)*P_uw at M0 -- without the scale the inner residual
+  !! reference is off by that constant.
+  !--------------------------------------------------------------------
+  subroutine metriplectic_cm_pc_apply(pc, x, y, ierr)
+    use phys_module, only: time_evol_zeta
+    PC  :: pc
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call KSPSolve(g_mctx%ksp_Puw, x, y, ierr)
+    call VecScale(y, 1.d0 / (1.d0 + time_evol_zeta), ierr)
+    ierr = 0
+  end subroutine metriplectic_cm_pc_apply
+
+
+  !> Reset / read the inner-iteration counters (A/B reporting).
+  subroutine cm_counters_reset()
+    cm_inner_tot   = 0
+    cm_inner_calls = 0
+  end subroutine cm_counters_reset
+
+  subroutine cm_counters_get(tot, calls)
+    integer, intent(out) :: tot, calls
+    tot   = cm_inner_tot
+    calls = cm_inner_calls
+  end subroutine cm_counters_get
 
 
   !====================================================================
@@ -339,6 +559,7 @@ contains
     Vec :: rpsi, ru, rj, rw, dpsi, du, dj, dw
     PetscErrorCode :: ierr
     real*8 :: tdt
+    PetscInt :: its_in
 
     tdt = g_mctx%dt_theta * (1.d0 + time_evol_zeta)     ! = theta*dt
     call ensure_work(ierr)
@@ -355,12 +576,29 @@ contains
     call pack_2v(a_t2, rw, g_mctx%wv_uw_1, ierr)
 
     ! (3) Schur solve                                    [note eq. (ldu) 3]
-    if (g_mctx%ps_inner_it > 0) then
+    !     Variant dispatch. 'LEGACY' reproduces the pre-commutator
+    !     behaviour exactly, so runs that do not opt in are unaffected.
+    !     Only the commutator branch has to undo the M_* fold afterwards.
+    if (cm_cand > 0) then
+      call KSPSolve(g_mctx%ksp_Scm, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
+      call KSPGetIterationNumber(g_mctx%ksp_Scm, its_in, ierr)
+      cm_inner_tot   = cm_inner_tot + its_in
+      cm_inner_calls = cm_inner_calls + 1
+      call unpack_2v(g_mctx%wv_uw_2, a_t1, dw, ierr)    ! a_t1 = chi_u
+      call cm_mstar_apply(a_t1, du, ierr)               ! du = M_* chi_u
+    else if (trim(cm_schur_variant) == 'EXACT') then
       call KSPSolve(g_mctx%ksp_Suw, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
-    else
+      call unpack_2v(g_mctx%wv_uw_2, du, dw, ierr)
+    else if (trim(cm_schur_variant) == 'M0D') then
       call KSPSolve(g_mctx%ksp_Puw, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
+      call unpack_2v(g_mctx%wv_uw_2, du, dw, ierr)
+    else if (g_mctx%ps_inner_it > 0) then               ! 'LEGACY'
+      call KSPSolve(g_mctx%ksp_Suw, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
+      call unpack_2v(g_mctx%wv_uw_2, du, dw, ierr)
+    else                                                ! 'LEGACY'
+      call KSPSolve(g_mctx%ksp_Puw, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
+      call unpack_2v(g_mctx%wv_uw_2, du, dw, ierr)
     endif
-    call unpack_2v(g_mctx%wv_uw_2, du, dw, ierr)
 
     ! (4) back-substitution: dpsi from rpsi - tdt*(D du) [note eq. (ldu) 4]
     call MatMult(g_mctx%D_op, du, a_t1, ierr)
@@ -382,7 +620,9 @@ contains
     PetscErrorCode :: ierr
 
     call ensure_work(ierr)
-    if (g_mctx%khalf_mode == 'PS') then
+    ! The A/B diagnostic always exercises the PS-LDU path, whatever the
+    ! production khalf_mode is -- that is what lets it run alongside any PC.
+    if (cm_ab_active .or. g_mctx%khalf_mode == 'PS') then
       call metriplectic_ps_ldu_solve(rpsi, ru, rj, rw, dpsi, du, dj, dw)
       return
     endif

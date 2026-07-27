@@ -50,12 +50,13 @@ module mod_petsc_pc_metriplectic_analysis
         metriplectic_recover_jw, metriplectic_sweep_apply_4v, &
         metriplectic_sweep_apply_full, metriplectic_ps_ldu_solve, mpc_sweep_order, &
         pack_2v, unpack_2v
-  use mod_elt_matrix_commutator, only: CM_NB, CM_ADV1, CM_ADVR, CM_COMP, CM_S1R, CM_SR
+  use mod_petsc_pc_commutator_table, only: CM_NOP, CM_MAXC, CM_LABLEN, &
+        CM_OP_QR, cm_table_build, cm_ops_gather, cm_mstar_mult, cm_blocks_ready
   implicit none
   private
 
   public :: petsc_metriplectic_run_analysis, petsc_metriplectic_track_energies
-  public :: petsc_commutator_run_analysis, petsc_commutator_assemble
+  public :: petsc_commutator_run_analysis
 
   ! --- Module state consumed by the PCSHELL apply callback ---
   Mat :: m_A4                          !< 4-var reference system (AIJ)
@@ -72,48 +73,7 @@ module mod_petsc_pc_metriplectic_analysis
   Vec :: m_rpsi, m_ru, m_rj, m_rw
   Vec :: m_h, m_dpsi, m_du, m_dj, m_dw, m_t1, m_t2
 
-  ! --- Commutator-analysis assembled building-block operators (Sec. 8.5) ---
-  Mat, save     :: cm_blk(CM_NB)  !< pure integrand blocks (ADV1/ADVR/COMP/S1R/SR)
-  logical, save :: cm_ops_ready = .false.
-
 contains
-
-  !====================================================================
-  ! Assemble the M2/M3 candidate operators (S1r 1/R stiffness, M3
-  ! conservative rho-form). Called from jorek2_main (gated by
-  ! commutator_analysis) where the element list is available; mirrors
-  ! metriplectic_assemble's create/destroy lifecycle. run_CM reads the
-  ! module-saved handle array cm_blk once cm_ops_ready is set.
-  !====================================================================
-  subroutine petsc_commutator_assemble(my_id, local_elms, n_local_elms, a_mat)
-    use construct_commutator_matrix_mod, only: commutator_create_matrices, &
-                                               construct_commutator_matrices
-    use data_structure, only: type_SP_MATRIX
-
-    integer,              intent(in) :: my_id
-    integer, pointer,     intent(in) :: local_elms(:)
-    integer,              intent(in) :: n_local_elms
-    type(type_SP_MATRIX), intent(in) :: a_mat
-
-    PetscErrorCode :: ierr
-    integer :: ib
-
-    if (cm_ops_ready) then
-      do ib = 1, CM_NB
-        PetscCallA(MatDestroy(cm_blk(ib), ierr))
-      enddo
-    endif
-    call commutator_create_matrices(a_mat, cm_blk)
-    call construct_commutator_matrices(my_id, local_elms, n_local_elms, a_mat, cm_blk)
-    ! Convert BAIJ -> AIJ so MatMult interoperates with the AIJ-extracted
-    ! A_full sub-blocks / probe vectors used in run_CM (same size layout).
-    do ib = 1, CM_NB
-      PetscCallA(MatConvert(cm_blk(ib), MATMPIAIJ, MAT_INPLACE_MATRIX, cm_blk(ib), ierr))
-    enddo
-    cm_ops_ready = .true.
-    if (my_id == 0) write(*,'(A,I0,A)') "[Commutator] ", CM_NB, " building-block operators assembled"
-  end subroutine petsc_commutator_assemble
-
 
   !====================================================================
   ! Commutator-operator (M_*) intertwining-defect analysis
@@ -140,16 +100,12 @@ contains
   ! Candidates are rows of a coefficient TABLE over the operator set
   !   {B11(=A_pp), Q1R(=B33,1/R mass), QR(=B44,R mass), ADV1, ADVR, COMP,
   !    S1R, SR},  applied matrix-free:  A_uM du = sum_iop coef(iop)*op(iop) du.
-  ! Adding a candidate is ONE table row -- no reassembly. Default table
-  ! (tdt = theta*dt; eta = central resistivity):
-  !   M0  = opz*Q1R                       (Q_u=Q1R)  mass only (incumbent)
-  !   M1x = B11 (exact A_pp)              (Q_u=Q1R)  flow op, reference (Eq.35)
-  !   M0R = opz*QR                        (Q_u=QR)   R-mass only
-  !   M1a = opz*Q1R - tdt*ADV1            (Q_u=Q1R)  assembled amat_11 (~M1x)
-  !   M3  = opz*QR - tdt*ADVR - tdt*COMP  (Q_u=QR)   conservative rho-form
-  !   M2  = M1a + eta*tdt*S1R             (Q_u=Q1R)  + resistive diffusion
-  ! M1a/M3/M2 need the assembled building blocks (cm_ops_ready); M0/M1x/M0R
-  ! use only extracted A_full blocks. The reference P always uses Q_psi=B33.
+  ! The table itself lives in mod_petsc_pc_commutator_table (cm_table_build)
+  ! and is SHARED with the commutator preconditioner, so every candidate
+  ! measured here is exactly the operator the PC would run. Adding a
+  ! candidate is ONE table row there -- no reassembly, and it acquires both
+  ! an eps and an FGMRES iteration count. The reference P always uses
+  ! Q_psi = B33 regardless of the candidate's own Q_u.
   !
   ! EPS_MIN -- fundamental lower bound on the defect over ALL M_*
   ! ------------------------------------------------------------
@@ -177,7 +133,8 @@ contains
   !   count, whereas "eps_min ~ eps(M1) -> M1 optimal" is only trustworthy if
   !   the reported mean CG its/probe sits well below CM_LS_MAXIT.
   !
-  ! Reads A_full sub-blocks + module-saved cm_blk (no metriplectic_assemble).
+  ! Reads A_full sub-blocks + the shared building blocks owned by
+  ! mod_petsc_pc_commutator_table (no metriplectic_assemble needed).
   ! NOTE on the zero-flow check: at u0=0, B11 = (1+zeta) Q holds in the
   ! interior, so eps(M1)=0 there to machine precision; boundary rows of
   ! B11 (psi Dirichlet) and B33 (j aux) differ, leaving a small boundary
@@ -193,24 +150,21 @@ contains
     integer, intent(in) :: my_id
 
     integer, parameter :: CM_NPROBE = 32          ! Hutchinson probes per harmonic
-    integer, parameter :: NOP    = 3 + CM_NB      ! op set: B11,Q1R,QR + blocks
-    integer, parameter :: OP_B11 = 1, OP_Q1R = 2, OP_QR = 3
-    integer, parameter :: MAXC   = 16             ! candidate-table capacity
     integer, parameter :: CM_LS_MAXIT = 300       ! CG cap for the eps_min LS
     real*8,  parameter :: CM_LS_RTOL  = 1.d-8     ! relative rz drop for that CG
 
-    Mat :: B11, B12, Qpsi, QuR, op(NOP)
+    Mat :: B11, B12, Qpsi, QuR, op(CM_NOP)
     KSP :: ksp_Qpsi, ksp_QuR, ksp_Qu
     Vec :: z, va, vb, vPz, vc, vt, vd, vRz, vDz, vg
     Vec :: vy, wd, ws, wq, wr, wzu, wp, wtu       ! eps_min least-squares work
     PetscErrorCode :: ierr
-    integer :: comm, h, kp, ic, iop, ib, ncand
+    integer :: comm, h, kp, ic, ncand
     integer :: nit, nit_tot, nit_max
     real*8  :: opz, zeta, tdt, nd, npp, sumP2, eps_val
     real*8  :: sumE2, ndbest, fls, eps_min, eps_best
-    real*8  :: coef(MAXC, NOP)
-    integer :: quop(MAXC)
-    character(len=4) :: lab(MAXC)
+    real*8  :: coef(CM_MAXC, CM_NOP)
+    integer :: quop(CM_MAXC)
+    character(len=CM_LABLEN) :: lab(CM_MAXC)
     real*8, allocatable :: sumD2(:)
 
     call PetscObjectGetComm(A_full, comm, ierr)
@@ -229,31 +183,10 @@ contains
     call setup_lu_ksp(Qpsi, ksp_Qpsi, comm, .false.)
     call setup_lu_ksp(QuR,  ksp_QuR,  comm, .false.)
 
-    ! --- Operator handle table op(1..NOP) ---
-    op(OP_B11) = B11
-    op(OP_Q1R) = Qpsi
-    op(OP_QR)  = QuR
-    if (cm_ops_ready) then
-      do ib = 1, CM_NB
-        op(3+ib) = cm_blk(ib)
-      enddo
-    endif
-
-    ! ============ CANDIDATE TABLE (edit rows here to try candidates) ======
-    coef = 0.d0
-    ncand = 0
-    ncand=ncand+1; lab(ncand)="M0" ; quop(ncand)=OP_Q1R; coef(ncand,OP_Q1R)=opz
-    ncand=ncand+1; lab(ncand)="M1x"; quop(ncand)=OP_Q1R; coef(ncand,OP_B11)=1.d0
-    ncand=ncand+1; lab(ncand)="M0R"; quop(ncand)=OP_QR ; coef(ncand,OP_QR )=opz
-    if (cm_ops_ready) then
-      ncand=ncand+1; lab(ncand)="M1a"; quop(ncand)=OP_Q1R
-        coef(ncand,OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt
-      ncand=ncand+1; lab(ncand)="M3" ; quop(ncand)=OP_QR
-        coef(ncand,OP_QR)=opz;  coef(ncand,3+CM_ADVR)=-tdt; coef(ncand,3+CM_COMP)=-tdt
-      ncand=ncand+1; lab(ncand)="M2" ; quop(ncand)=OP_Q1R
-        coef(ncand,OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt; coef(ncand,3+CM_S1R)=eta*tdt
-    endif
-    ! ======================================================================
+    ! --- Operator handles + candidate table (shared with the PC; the table
+    !     itself lives in mod_petsc_pc_commutator_table) ---
+    call cm_ops_gather(B11, Qpsi, QuR, op)
+    call cm_table_build(opz, tdt, eta, coef, quop, lab, ncand)
 
     allocate(sumD2(ncand))
 
@@ -261,7 +194,7 @@ contains
       write(*,'(A)') "[Commutator] ========= M_* intertwining-defect analysis ========="
       write(*,'(A,I0,A,F8.4,A,I0)') "[Commutator] probes/harmonic = ", CM_NPROBE, &
                                ",  (1+zeta) = ", opz, ",  candidates = ", ncand
-      if (.not. cm_ops_ready) write(*,'(A)') &
+      if (.not. cm_blocks_ready()) write(*,'(A)') &
         "[Commutator] NOTE: building blocks not assembled -> extracted-only candidates"
       write(*,'(A)') &
         "[Commutator] eps(n) = ||D du||_{Q_psi^-1} / ||A_pp Q_psi^-1 A_pu du||_{Q_psi^-1}"
@@ -305,15 +238,9 @@ contains
         ndbest = huge(1.d0)
         do ic = 1, ncand
           ! A_uM du = sum_iop coef(ic,iop) * op(iop) du   (matrix-free)
-          PetscCallA(VecSet(vc, 0.d0, ierr))
-          do iop = 1, NOP
-            if (coef(ic,iop) /= 0.d0) then
-              PetscCallA(MatMult(op(iop), z, vt, ierr))
-              PetscCallA(VecAXPY(vc, coef(ic,iop), vt, ierr))
-            endif
-          enddo
+          call cm_mstar_mult(op, coef, ic, z, vc, vt, ierr)
           ksp_Qu = ksp_Qpsi
-          if (quop(ic) == OP_QR) ksp_Qu = ksp_QuR
+          if (quop(ic) == CM_OP_QR) ksp_Qu = ksp_QuR
           ! R du = A_pu Q_u^-1 (A_uM du) ; D = P - R ; ||D||^2_{Q_psi^-1}
           PetscCallA(KSPSolve(ksp_Qu, vc, vd, ierr))
           PetscCallA(MatMult(B12, vd, vRz, ierr))
@@ -354,7 +281,8 @@ contains
       endif
     enddo
 
-    ! --- Cleanup (cm_blk are module-saved; not destroyed here) ---
+    ! --- Cleanup (the building blocks are owned by the table module and
+    !     shared with the PC; not destroyed here) ---
     PetscCallA(VecDestroy(z,   ierr));  PetscCallA(VecDestroy(va,  ierr))
     PetscCallA(VecDestroy(vb,  ierr));  PetscCallA(VecDestroy(vPz, ierr))
     PetscCallA(VecDestroy(vc,  ierr));  PetscCallA(VecDestroy(vt,  ierr))
