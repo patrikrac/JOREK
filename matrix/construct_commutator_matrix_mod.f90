@@ -1,19 +1,20 @@
 module construct_commutator_matrix_mod
 !----------------------------------------------------------------
-! Element-loop driver for the commutator-preconditioner analysis
-! operators S1r (1/R poloidal stiffness) and M3 (conservative rho-form).
-! Structure mirrors construct_metriplectic_matrix_mod; the 1-var matrix
-! creation is replicated privately to keep the families independent.
+! Element-loop driver for the commutator-PC building-block operators
+! (mod_elt_matrix_commutator: CM_NB pure integrand blocks). Structure
+! mirrors construct_metriplectic_matrix_mod; the 1-var matrix creation is
+! replicated privately to keep the families independent.
 !
-! BC policy: both are treated as the metriplectic SPD operators are --
-! Dirichlet identity rows when eliminate_boundary_dofs is set -- so they
-! are boundary-consistent with the extracted A_full blocks they are
-! combined with in the defect (note Sec. 8.3).
+! BC policy: the blocks are NON-mass (advection / compression / stiffness),
+! so -- like the metriplectic coupling operators -- their boundary rows are
+! ZEROED (zero_bc_rows_pc_matrix). In a candidate combo the extracted mass
+! (B33/B44) carries the boundary row, keeping the operator boundary-clean.
 !----------------------------------------------------------------
 #ifdef USE_PETSC
 #include "petsc/finclude/petsc.h"
 use petsc
 #endif
+use mod_elt_matrix_commutator, only: CM_NB
 implicit none
 private
 
@@ -73,29 +74,31 @@ contains
 #endif
 
 
-  !> Create the two 1-var operator matrices (sparsity only).
-  subroutine commutator_create_matrices(a_mat, S1r, M3)
+  !> Create the CM_NB building-block matrices (sparsity only).
+  subroutine commutator_create_matrices(a_mat, blk)
     use data_structure, only: type_SP_MATRIX
     type(type_SP_MATRIX), intent(in) :: a_mat
 #ifdef USE_PETSC
-    Mat, intent(out) :: S1r, M3
-    call create_1v_matrix(S1r, a_mat)
-    call create_1v_matrix(M3,  a_mat)
+    Mat, intent(out) :: blk(CM_NB)
+    integer :: ib
+    do ib = 1, CM_NB
+      call create_1v_matrix(blk(ib), a_mat)
+    enddo
 #else
-    integer, intent(out) :: S1r, M3
-    S1r = 0; M3 = 0
+    integer, intent(out) :: blk(CM_NB)
+    blk = 0
 #endif
   end subroutine commutator_create_matrices
 
 
-  subroutine construct_commutator_matrices(my_id, local_elms, n_local_elms, a_mat, S1r, M3)
+  subroutine construct_commutator_matrices(my_id, local_elms, n_local_elms, a_mat, blk)
 
-    use mod_elt_matrix_commutator
+    use mod_elt_matrix_commutator, only: element_matrix_commutator, CM_NB
     use mod_parameters,  only: n_tor, n_degrees, n_vertex_max, var_u
     use data_structure,  only: type_SP_MATRIX, type_element, type_node
     use nodes_elements
     use phys_module,     only: eliminate_boundary_dofs
-    use construct_pc_matrix_mod, only: apply_dirichlet_bnd
+    use construct_pc_matrix_mod, only: zero_bc_rows_pc_matrix
     use omp_lib
 
     implicit none
@@ -105,9 +108,9 @@ contains
     integer,              intent(in) :: n_local_elms
     type(type_SP_MATRIX), intent(in) :: a_mat
 #ifdef USE_PETSC
-    Mat, intent(inout) :: S1r, M3
+    Mat, intent(inout) :: blk(CM_NB)
 #else
-    integer, intent(inout) :: S1r, M3
+    integer, intent(inout) :: blk(CM_NB)
 #endif
 
     integer :: my_ind_min, my_ind_max
@@ -118,12 +121,11 @@ contains
     type(type_node),    allocatable :: nodes_thr(:,:)
     integer,            allocatable :: node_out_thr(:,:)
 
-    real*8, allocatable :: ELM_S1r_thr(:,:,:)
-    real*8, allocatable :: ELM_M3_thr (:,:,:)
+    real*8, allocatable :: ELM_blk_thr(:,:,:,:)   ! (D1V, D1V, CM_NB, nthreads)
     real*8, allocatable :: buf1v_thr(:,:)
 
     integer :: nthreads, omp_tid
-    integer :: ife, ielm, iv, inode
+    integer :: ife, ielm, iv, inode, ib
     integer :: i, i_order, k, k_order
     integer :: index_node1, index_node2
     integer :: j, l, idx_ij, idx_kl
@@ -156,19 +158,18 @@ contains
     allocate(element_thr  (nthreads))
     allocate(nodes_thr    (n_vertex_max, nthreads))
     allocate(node_out_thr (n_vertex_max, nthreads))
-    allocate(ELM_S1r_thr (D1V_CM, D1V_CM, nthreads))
-    allocate(ELM_M3_thr  (D1V_CM, D1V_CM, nthreads))
-    allocate(buf1v_thr   (bs1*bs1, nthreads))
+    allocate(ELM_blk_thr  (D1V_CM, D1V_CM, CM_NB, nthreads))
+    allocate(buf1v_thr    (bs1*bs1, nthreads))
 
     !$omp parallel &
     !$omp   default(shared) &
     !$omp   shared(n_local_elms, local_elms, element_list, node_list, a_mat, my_ind_min, my_ind_max, bs1, &
-    !$omp          element_thr, nodes_thr, node_out_thr, ELM_S1r_thr, ELM_M3_thr, buf1v_thr &
+    !$omp          element_thr, nodes_thr, node_out_thr, ELM_blk_thr, buf1v_thr &
 #ifdef USE_PETSC
-    !$omp          , S1r, M3 &
+    !$omp          , blk &
 #endif
     !$omp         ) &
-    !$omp   private(ife, ielm, iv, inode, omp_tid, &
+    !$omp   private(ife, ielm, iv, inode, omp_tid, ib, &
     !$omp           i, i_order, k, k_order, index_node1, index_node2, &
     !$omp           j, l, idx_ij, idx_kl &
 #ifdef USE_PETSC
@@ -194,7 +195,7 @@ contains
       enddo
 
       call element_matrix_commutator(element_thr(omp_tid), nodes_thr(:,omp_tid), &
-                                     ELM_S1r_thr(:,:,omp_tid), ELM_M3_thr(:,:,omp_tid))
+                                     ELM_blk_thr(:,:,:,omp_tid))
 
 #ifdef USE_PETSC
       do i = 1, n_vertex_max
@@ -210,33 +211,20 @@ contains
               index_node2 = node_list%node(node_out_thr(k,omp_tid))%index(k_order)
               idxn(1) = index_node2 - 1
 
-              ! --- S1r ---
-              buf1v_thr(:,omp_tid) = 0.d0
-              do j = 1, bs1
-                idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
-                do l = 1, bs1
-                  idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
-                  buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_S1r_thr(idx_ij, idx_kl, omp_tid)
+              do ib = 1, CM_NB
+                buf1v_thr(:,omp_tid) = 0.d0
+                do j = 1, bs1
+                  idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+                  do l = 1, bs1
+                    idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                    buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_blk_thr(idx_ij, idx_kl, ib, omp_tid)
+                  enddo
                 enddo
+                !$omp critical
+                PetscCallA(MatSetValuesBlocked(blk(ib), 1, idxm, 1, idxn, &
+                                         buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+                !$omp end critical
               enddo
-              !$omp critical
-              PetscCallA(MatSetValuesBlocked(S1r, 1, idxm, 1, idxn, &
-                                       buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
-              !$omp end critical
-
-              ! --- M3 ---
-              buf1v_thr(:,omp_tid) = 0.d0
-              do j = 1, bs1
-                idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
-                do l = 1, bs1
-                  idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
-                  buf1v_thr((j-1)*bs1+l, omp_tid) = ELM_M3_thr(idx_ij, idx_kl, omp_tid)
-                enddo
-              enddo
-              !$omp critical
-              PetscCallA(MatSetValuesBlocked(M3, 1, idxm, 1, idxn, &
-                                       buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
-              !$omp end critical
 
             enddo  ! k_order
           enddo    ! k
@@ -250,18 +238,19 @@ contains
     !$omp end parallel
 
     deallocate(element_thr, nodes_thr, node_out_thr)
-    deallocate(ELM_S1r_thr, ELM_M3_thr, buf1v_thr)
+    deallocate(ELM_blk_thr, buf1v_thr)
 
 #ifdef USE_PETSC
-    PetscCallA(MatAssemblyBegin(S1r, MAT_FINAL_ASSEMBLY, ierr))
-    PetscCallA(MatAssemblyBegin(M3,  MAT_FINAL_ASSEMBLY, ierr))
-    PetscCallA(MatAssemblyEnd  (S1r, MAT_FINAL_ASSEMBLY, ierr))
-    PetscCallA(MatAssemblyEnd  (M3,  MAT_FINAL_ASSEMBLY, ierr))
-
-    ! Dirichlet identity rows on BC dofs (boundary-consistent with A_full).
+    do ib = 1, CM_NB
+      PetscCallA(MatAssemblyBegin(blk(ib), MAT_FINAL_ASSEMBLY, ierr))
+      PetscCallA(MatAssemblyEnd  (blk(ib), MAT_FINAL_ASSEMBLY, ierr))
+    enddo
+    ! Non-mass blocks: zero the BC rows so the extracted mass carries the
+    ! boundary in candidate combos (as the metriplectic coupling operators).
     if (eliminate_boundary_dofs) then
-      call apply_dirichlet_bnd(S1r, var_u, local_elms, n_local_elms, my_ind_min, my_ind_max, symmetric=.true.)
-      call apply_dirichlet_bnd(M3,  var_u, local_elms, n_local_elms, my_ind_min, my_ind_max, symmetric=.true.)
+      do ib = 1, CM_NB
+        call zero_bc_rows_pc_matrix(blk(ib), var_u, local_elms, n_local_elms, my_ind_min, my_ind_max)
+      enddo
     endif
 #endif
 

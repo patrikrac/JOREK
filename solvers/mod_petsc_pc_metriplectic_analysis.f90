@@ -50,6 +50,7 @@ module mod_petsc_pc_metriplectic_analysis
         metriplectic_recover_jw, metriplectic_sweep_apply_4v, &
         metriplectic_sweep_apply_full, metriplectic_ps_ldu_solve, mpc_sweep_order, &
         pack_2v, unpack_2v
+  use mod_elt_matrix_commutator, only: CM_NB, CM_ADV1, CM_ADVR, CM_COMP, CM_S1R, CM_SR
   implicit none
   private
 
@@ -71,9 +72,8 @@ module mod_petsc_pc_metriplectic_analysis
   Vec :: m_rpsi, m_ru, m_rj, m_rw
   Vec :: m_h, m_dpsi, m_du, m_dj, m_dw, m_t1, m_t2
 
-  ! --- Commutator-analysis assembled operators (Sec. 8.5 candidates M2-M4) ---
-  Mat, save    :: cm_S1r          !< 1/R poloidal stiffness (M2 diffusion, M4 basis)
-  Mat, save    :: cm_M3           !< conservative rho-form clone of amat_55 (M3)
+  ! --- Commutator-analysis assembled building-block operators (Sec. 8.5) ---
+  Mat, save     :: cm_blk(CM_NB)  !< pure integrand blocks (ADV1/ADVR/COMP/S1R/SR)
   logical, save :: cm_ops_ready = .false.
 
 contains
@@ -83,7 +83,7 @@ contains
   ! conservative rho-form). Called from jorek2_main (gated by
   ! commutator_analysis) where the element list is available; mirrors
   ! metriplectic_assemble's create/destroy lifecycle. run_CM reads the
-  ! module-saved handles cm_S1r, cm_M3 once cm_ops_ready is set.
+  ! module-saved handle array cm_blk once cm_ops_ready is set.
   !====================================================================
   subroutine petsc_commutator_assemble(my_id, local_elms, n_local_elms, a_mat)
     use construct_commutator_matrix_mod, only: commutator_create_matrices, &
@@ -96,19 +96,22 @@ contains
     type(type_SP_MATRIX), intent(in) :: a_mat
 
     PetscErrorCode :: ierr
+    integer :: ib
 
     if (cm_ops_ready) then
-      PetscCallA(MatDestroy(cm_S1r, ierr))
-      PetscCallA(MatDestroy(cm_M3,  ierr))
+      do ib = 1, CM_NB
+        PetscCallA(MatDestroy(cm_blk(ib), ierr))
+      enddo
     endif
-    call commutator_create_matrices(a_mat, cm_S1r, cm_M3)
-    call construct_commutator_matrices(my_id, local_elms, n_local_elms, a_mat, cm_S1r, cm_M3)
+    call commutator_create_matrices(a_mat, cm_blk)
+    call construct_commutator_matrices(my_id, local_elms, n_local_elms, a_mat, cm_blk)
     ! Convert BAIJ -> AIJ so MatMult interoperates with the AIJ-extracted
     ! A_full sub-blocks / probe vectors used in run_CM (same size layout).
-    PetscCallA(MatConvert(cm_S1r, MATMPIAIJ, MAT_INPLACE_MATRIX, cm_S1r, ierr))
-    PetscCallA(MatConvert(cm_M3,  MATMPIAIJ, MAT_INPLACE_MATRIX, cm_M3,  ierr))
+    do ib = 1, CM_NB
+      PetscCallA(MatConvert(cm_blk(ib), MATMPIAIJ, MAT_INPLACE_MATRIX, cm_blk(ib), ierr))
+    enddo
     cm_ops_ready = .true.
-    if (my_id == 0) write(*,'(A)') "[Commutator] candidate operators S1r, M3 assembled"
+    if (my_id == 0) write(*,'(A,I0,A)') "[Commutator] ", CM_NB, " building-block operators assembled"
   end subroutine petsc_commutator_assemble
 
 
@@ -134,17 +137,21 @@ contains
   ! restricted to that harmonic (Hutchinson relative-Frobenius estimate);
   ! the same probes are used for every candidate for a fair comparison.
   !
-  ! Candidate ladder (note Table 1):
-  !   M0 : A_uM = (1+zeta) Q_psi       -- small-flow incumbent (mass only)
-  !   M1 : A_uM = B11 (= a I+theta A)  -- derived flow operator (Eq. 35)
-  !   M2 : A_uM = B11 + cM2*S1r        -- PCD-style diffusion (S1r = 1/R stiffness)
-  !   M3 : A_uM = conservative rho-form (amat_55 clone; R-mass Q_u = amat_44)
-  !   M4 : A_uM = c0 Q + c1(B11-opz Q) + c2 S1r  -- probe least-squares fit
-  ! M0/M1 need no assembly (A_full sub-blocks); M2-M4 use the assembled
-  ! S1r/M3 operators (petsc_commutator_assemble; only if cm_ops_ready).
-  ! M0/M1/M2/M4 pair with Q_u = Q_psi (1/R); M3 pairs with Q_u = amat_44 (R).
+  ! Candidates are rows of a coefficient TABLE over the operator set
+  !   {B11(=A_pp), Q1R(=B33,1/R mass), QR(=B44,R mass), ADV1, ADVR, COMP,
+  !    S1R, SR},  applied matrix-free:  A_uM du = sum_iop coef(iop)*op(iop) du.
+  ! Adding a candidate is ONE table row -- no reassembly. Default table
+  ! (tdt = theta*dt; eta = central resistivity):
+  !   M0  = opz*Q1R                       (Q_u=Q1R)  mass only (incumbent)
+  !   M1x = B11 (exact A_pp)              (Q_u=Q1R)  flow op, reference (Eq.35)
+  !   M0R = opz*QR                        (Q_u=QR)   R-mass only
+  !   M1a = opz*Q1R - tdt*ADV1            (Q_u=Q1R)  assembled amat_11 (~M1x)
+  !   M3  = opz*QR - tdt*ADVR - tdt*COMP  (Q_u=QR)   conservative rho-form
+  !   M2  = M1a + eta*tdt*S1R             (Q_u=Q1R)  + resistive diffusion
+  ! M1a/M3/M2 need the assembled building blocks (cm_ops_ready); M0/M1x/M0R
+  ! use only extracted A_full blocks. The reference P always uses Q_psi=B33.
   !
-  ! Reads A_full sub-blocks + module-saved cm_S1r/cm_M3 (no metriplectic_assemble).
+  ! Reads A_full sub-blocks + module-saved cm_blk (no metriplectic_assemble).
   ! NOTE on the zero-flow check: at u0=0, B11 = (1+zeta) Q holds in the
   ! interior, so eps(M1)=0 there to machine precision; boundary rows of
   ! B11 (psi Dirichlet) and B33 (j aux) differ, leaving a small boundary
@@ -154,56 +161,80 @@ contains
   !====================================================================
   subroutine petsc_commutator_run_analysis(A_full, my_id)
     use mod_parameters, only: n_tor, var_psi, var_u, var_zj, var_w
-    use phys_module,    only: mode, time_evol_theta, time_evol_zeta, tstep, tstep_prev
+    use phys_module,    only: mode, time_evol_theta, time_evol_zeta, tstep, tstep_prev, eta
 
     Mat,     intent(in) :: A_full
     integer, intent(in) :: my_id
 
-    integer, parameter :: CM_NPROBE = 32       ! Hutchinson probes per harmonic
+    integer, parameter :: CM_NPROBE = 32          ! Hutchinson probes per harmonic
+    integer, parameter :: NOP    = 3 + CM_NB      ! op set: B11,Q1R,QR + blocks
+    integer, parameter :: OP_B11 = 1, OP_Q1R = 2, OP_QR = 3
+    integer, parameter :: MAXC   = 16             ! candidate-table capacity
 
-    Mat :: B11, B12, Qpsi, QuR
+    Mat :: B11, B12, Qpsi, QuR, op(NOP)
     KSP :: ksp_Qpsi, ksp_QuR, ksp_Qu
     Vec :: z, va, vb, vPz, vc, vt, vd, vRz, vDz, vg
     PetscErrorCode :: ierr
-    integer :: comm, h, kp, ic, ncand
-    real*8  :: opz, zeta, cM2, nd, npp, sumP2, eps_val
-    real*8  :: c4(0:2)
+    integer :: comm, h, kp, ic, iop, ib, ncand
+    real*8  :: opz, zeta, tdt, nd, npp, sumP2, eps_val
+    real*8  :: coef(MAXC, NOP)
+    integer :: quop(MAXC)
+    character(len=4) :: lab(MAXC)
     real*8, allocatable :: sumD2(:)
-    character(len=4), allocatable :: clabel(:)
 
     call PetscObjectGetComm(A_full, comm, ierr)
     zeta = time_evol_zeta * 2.d0 * tstep / (tstep + tstep_prev)
     opz  = 1.d0 + zeta
-    cM2  = time_evol_theta * tstep          ! M2 diffusion coeff (eta_k = 1, representative)
+    tdt  = time_evol_theta * tstep
 
-    ncand = 2
-    if (cm_ops_ready) ncand = 5
-    allocate(sumD2(ncand), clabel(ncand))
-    clabel(1) = "M0"; clabel(2) = "M1"
-    if (ncand == 5) then
-      clabel(3) = "M2"; clabel(4) = "M3"; clabel(5) = "M4"
+    ! --- Index sets + sub-blocks: A_pp, A_pu, 1/R mass (B33), R mass (B44) ---
+    if (.not. g_mctx%is_created) call create_index_sets(A_full, comm)
+    call extract_block(A_full, var_psi, var_psi, B11)
+    call extract_block(A_full, var_psi, var_u,   B12)
+    call extract_block(A_full, var_zj,  var_zj,  Qpsi)
+    call extract_block(A_full, var_w,   var_w,   QuR)
+
+    ! --- Full mass factorizations (MUMPS LU; no lumping) ---
+    call setup_lu_ksp(Qpsi, ksp_Qpsi, comm, .false.)
+    call setup_lu_ksp(QuR,  ksp_QuR,  comm, .false.)
+
+    ! --- Operator handle table op(1..NOP) ---
+    op(OP_B11) = B11
+    op(OP_Q1R) = Qpsi
+    op(OP_QR)  = QuR
+    if (cm_ops_ready) then
+      do ib = 1, CM_NB
+        op(3+ib) = cm_blk(ib)
+      enddo
     endif
+
+    ! ============ CANDIDATE TABLE (edit rows here to try candidates) ======
+    coef = 0.d0
+    ncand = 0
+    ncand=ncand+1; lab(ncand)="M0" ; quop(ncand)=OP_Q1R; coef(ncand,OP_Q1R)=opz
+    ncand=ncand+1; lab(ncand)="M1x"; quop(ncand)=OP_Q1R; coef(ncand,OP_B11)=1.d0
+    ncand=ncand+1; lab(ncand)="M0R"; quop(ncand)=OP_QR ; coef(ncand,OP_QR )=opz
+    if (cm_ops_ready) then
+      ncand=ncand+1; lab(ncand)="M1a"; quop(ncand)=OP_Q1R
+        coef(ncand,OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt
+      ncand=ncand+1; lab(ncand)="M3" ; quop(ncand)=OP_QR
+        coef(ncand,OP_QR)=opz;  coef(ncand,3+CM_ADVR)=-tdt; coef(ncand,3+CM_COMP)=-tdt
+      ncand=ncand+1; lab(ncand)="M2" ; quop(ncand)=OP_Q1R
+        coef(ncand,OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt; coef(ncand,3+CM_S1R)=eta*tdt
+    endif
+    ! ======================================================================
+
+    allocate(sumD2(ncand))
 
     if (my_id == 0) then
       write(*,'(A)') "[Commutator] ========= M_* intertwining-defect analysis ========="
       write(*,'(A,I0,A,F8.4,A,I0)') "[Commutator] probes/harmonic = ", CM_NPROBE, &
                                ",  (1+zeta) = ", opz, ",  candidates = ", ncand
       if (.not. cm_ops_ready) write(*,'(A)') &
-        "[Commutator] NOTE: S1r/M3 not assembled -> only M0,M1 evaluated"
+        "[Commutator] NOTE: building blocks not assembled -> extracted-only candidates"
+      write(*,'(A)') &
+        "[Commutator] eps(n) = ||D du||_{Q_psi^-1} / ||A_pp Q_psi^-1 A_pu du||_{Q_psi^-1}"
     endif
-
-    ! --- Variable index sets on the full Jacobian layout (shared) ---
-    if (.not. g_mctx%is_created) call create_index_sets(A_full, comm)
-
-    ! --- Sub-blocks: A_pp, A_pu, Q_psi (amat_33, 1/R mass), Q_u^R (amat_44, R mass) ---
-    call extract_block(A_full, var_psi, var_psi, B11)
-    call extract_block(A_full, var_psi, var_u,   B12)
-    call extract_block(A_full, var_zj,  var_zj,  Qpsi)
-    call extract_block(A_full, var_w,   var_w,   QuR)
-
-    ! --- Full factorizations of the masses (MUMPS LU; no lumping) ---
-    call setup_lu_ksp(Qpsi, ksp_Qpsi, comm, .false.)
-    call setup_lu_ksp(QuR,  ksp_QuR,  comm, .false.)
 
     ! --- Work vectors (all size n_var_dofs) ---
     PetscCallA(MatCreateVecs(B12, z, va, ierr))
@@ -216,20 +247,13 @@ contains
     PetscCallA(VecDuplicate(va, vDz, ierr))
     PetscCallA(VecDuplicate(va, vg,  ierr))
 
-    ! --- M4 coefficients: probe least-squares over basis {Qpsi, B11-opz*Qpsi, S1r} ---
-    c4 = 0.d0
-    if (ncand == 5) &
-      call cm_fit_m4(B11, B12, Qpsi, cm_S1r, ksp_Qpsi, opz, n_tor, CM_NPROBE, my_id, c4)
-
     ! --- eps(n) per toroidal harmonic; shared probes across candidates ---
-    if (my_id == 0) write(*,'(A)') &
-      "[Commutator] eps(n) = ||D du||_{Q_psi^-1} / ||A_pp Q_psi^-1 A_pu du||_{Q_psi^-1}"
     do h = 1, n_tor
       sumP2 = 0.d0
       sumD2 = 0.d0
       do kp = 1, CM_NPROBE
         call cm_probe_fill(z, h, n_tor)
-        ! P du = A_pp Q_psi^-1 (A_pu du)  [candidate-independent, shared]
+        ! P du = A_pp Q_psi^-1 (A_pu du)   [candidate-independent, shared]
         PetscCallA(MatMult(B12, z, va, ierr))
         PetscCallA(KSPSolve(ksp_Qpsi, va, vb, ierr))
         PetscCallA(MatMult(B11, vb, vPz, ierr))
@@ -237,28 +261,16 @@ contains
         PetscCallA(VecDot(vPz, vg, npp, ierr))
         sumP2 = sumP2 + npp
         do ic = 1, ncand
+          ! A_uM du = sum_iop coef(ic,iop) * op(iop) du   (matrix-free)
+          PetscCallA(VecSet(vc, 0.d0, ierr))
+          do iop = 1, NOP
+            if (coef(ic,iop) /= 0.d0) then
+              PetscCallA(MatMult(op(iop), z, vt, ierr))
+              PetscCallA(VecAXPY(vc, coef(ic,iop), vt, ierr))
+            endif
+          enddo
           ksp_Qu = ksp_Qpsi
-          select case (ic)
-          case (1)  ! M0 : (1+zeta) Q_psi
-            PetscCallA(MatMult(Qpsi, z, vc, ierr))
-            PetscCallA(VecScale(vc, opz, ierr))
-          case (2)  ! M1 : B11
-            PetscCallA(MatMult(B11, z, vc, ierr))
-          case (3)  ! M2 : B11 + cM2 * S1r
-            PetscCallA(MatMult(B11, z, vc, ierr))
-            PetscCallA(MatMult(cm_S1r, z, vt, ierr))
-            PetscCallA(VecAXPY(vc, cM2, vt, ierr))
-          case (4)  ! M3 : conservative rho-form (R-weighted -> Q_u = amat_44)
-            PetscCallA(MatMult(cm_M3, z, vc, ierr))
-            ksp_Qu = ksp_QuR
-          case (5)  ! M4 : (c0-opz*c1) Qpsi + c1 B11 + c2 S1r
-            PetscCallA(MatMult(Qpsi, z, vc, ierr))
-            PetscCallA(VecScale(vc, c4(0) - opz*c4(1), ierr))
-            PetscCallA(MatMult(B11, z, vt, ierr))
-            PetscCallA(VecAXPY(vc, c4(1), vt, ierr))
-            PetscCallA(MatMult(cm_S1r, z, vt, ierr))
-            PetscCallA(VecAXPY(vc, c4(2), vt, ierr))
-          end select
+          if (quop(ic) == OP_QR) ksp_Qu = ksp_QuR
           ! R du = A_pu Q_u^-1 (A_uM du) ; D = P - R ; ||D||^2_{Q_psi^-1}
           PetscCallA(KSPSolve(ksp_Qu, vc, vd, ierr))
           PetscCallA(MatMult(B12, vd, vRz, ierr))
@@ -272,16 +284,13 @@ contains
       if (my_id == 0) then
         do ic = 1, ncand
           eps_val = sqrt(max(sumD2(ic), 0.d0) / max(sumP2, tiny(1.d0)))
-          write(*,'(A,A,A,I4,A,ES13.5)') "[Commutator] ", trim(clabel(ic)), &
+          write(*,'(A,A,A,I4,A,ES13.5)') "[Commutator] ", trim(lab(ic)), &
             ":   n = ", mode(h), "   eps = ", eps_val
         enddo
       endif
     enddo
-    if ((my_id == 0) .and. (ncand == 5)) &
-      write(*,'(A,3ES12.4)') "[Commutator] M4 fitted coeffs {Qpsi, B11-opz*Qpsi, S1r} = ", &
-        c4(0), c4(1), c4(2)
 
-    ! --- Cleanup ---
+    ! --- Cleanup (cm_blk are module-saved; not destroyed here) ---
     PetscCallA(VecDestroy(z,   ierr));  PetscCallA(VecDestroy(va,  ierr))
     PetscCallA(VecDestroy(vb,  ierr));  PetscCallA(VecDestroy(vPz, ierr))
     PetscCallA(VecDestroy(vc,  ierr));  PetscCallA(VecDestroy(vt,  ierr))
@@ -293,7 +302,7 @@ contains
     PetscCallA(MatDestroy(B12,  ierr))
     PetscCallA(MatDestroy(Qpsi, ierr))
     PetscCallA(MatDestroy(QuR,  ierr))
-    deallocate(sumD2, clabel)
+    deallocate(sumD2)
     if (my_id == 0) write(*,'(A)') "[Commutator] ================ analysis complete ================"
   end subroutine petsc_commutator_run_analysis
 
@@ -313,8 +322,9 @@ contains
 
     Vec :: z, t1, t2, g0, g1, g2, pP, s0, s1, s2, sp
     PetscErrorCode :: ierr
-    integer :: h, kp, a
+    integer :: h, kp, a, b
     real*8  :: Gram(0:2,0:2), rhs(0:2), val, gmax, det
+    real*8  :: Gn(0:2,0:2), rn(0:2), dn(0:2), nrm(0:2)
 
     PetscCallA(MatCreateVecs(B12, z, t1, ierr))
     PetscCallA(VecDuplicate(t1, t2, ierr))
@@ -364,14 +374,47 @@ contains
       enddo
     enddo
 
-    ! Symmetrize + small Tikhonov ridge, then 3x3 solve.
+    ! Symmetrize.
     Gram(1,0) = Gram(0,1); Gram(2,0) = Gram(0,2); Gram(2,1) = Gram(1,2)
-    gmax = max(Gram(0,0), max(Gram(1,1), Gram(2,2)))
+    ! Column-scale by ||g_k||_{Qpsi^-1} = sqrt(Gram(k,k)) before solving:
+    ! the basis operators span ~1/h^2 in magnitude (mass vs stiffness S1r),
+    ! so the raw normal equations are catastrophically ill-conditioned. A
+    ! degenerate column (e.g. the B11-opz*Qpsi advection basis at near-zero
+    ! flow) is dropped (coefficient 0). d solves the normalized system;
+    ! c_k = d_k / nrm(k).
     do a = 0, 2
-      Gram(a,a) = Gram(a,a) + 1.d-10 * max(gmax, tiny(1.d0))
+      nrm(a) = sqrt(max(Gram(a,a), 0.d0))
     enddo
-    call cm_solve3(Gram, rhs, c4, det)
-    if (my_id == 0) write(*,'(A,ES12.4)') "[Commutator] M4 fit: Gram det = ", det
+    gmax = max(nrm(0), max(nrm(1), nrm(2)))
+    do a = 0, 2
+      if (nrm(a) < 1.d-13 * max(gmax, tiny(1.d0))) nrm(a) = 0.d0
+    enddo
+    do a = 0, 2
+      do b = 0, 2
+        if (nrm(a) > 0.d0 .and. nrm(b) > 0.d0) then
+          Gn(a,b) = Gram(a,b) / (nrm(a)*nrm(b))
+        else
+          Gn(a,b) = merge(1.d0, 0.d0, a == b)
+        endif
+      enddo
+      if (nrm(a) > 0.d0) then
+        rn(a) = rhs(a) / nrm(a)
+      else
+        rn(a) = 0.d0
+      endif
+    enddo
+    do a = 0, 2
+      Gn(a,a) = Gn(a,a) + 1.d-12       ! ridge on the O(1) normalized Gram
+    enddo
+    call cm_solve3(Gn, rn, dn, det)
+    do a = 0, 2
+      if (nrm(a) > 0.d0) then
+        c4(a) = dn(a) / nrm(a)
+      else
+        c4(a) = 0.d0
+      endif
+    enddo
+    if (my_id == 0) write(*,'(A,ES12.4)') "[Commutator] M4 fit: normalized Gram det = ", det
 
     PetscCallA(VecDestroy(z,  ierr));  PetscCallA(VecDestroy(t1, ierr))
     PetscCallA(VecDestroy(t2, ierr));  PetscCallA(VecDestroy(g0, ierr))

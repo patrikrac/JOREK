@@ -1,35 +1,40 @@
 module mod_elt_matrix_commutator
 !----------------------------------------------------------------
-! Element-level operators for the commutator-preconditioner analysis
-! (note: JOREK_commutator_preconditioner_baseline, Table 1 / Sec. 8.5).
+! Element-level BUILDING-BLOCK operators for the commutator-PC
+! candidate framework (note JOREK_commutator_preconditioner_baseline,
+! Sec. 8.5). Each block is a pure integrand (NO time/opz/eta factors --
+! those live in the candidate coefficient table in the analysis module),
+! a 1-var mode-space operator on the shared Bezier basis:
 !
-! Assembles TWO 1-var mode-space element matrices, clones of model199
-! diagonal kernels with the field variable replaced by the trial u:
+!   CM_ADV1 : v (u_s u0_t - u_t u0_s)            E x B advection, amat_11 form
+!   CM_ADVR : v R^2 (u_s u0_t - u_t u0_s)        E x B advection, amat_55 form
+!   CM_COMP : v 2R u u0_y xjac                   compression, amat_55 form
+!   CM_S1R  : (grad v . grad u) / R xjac         1/R poloidal stiffness
+!   CM_SR   : (grad v . grad u) R xjac           R   poloidal stiffness
 !
-!   ELM_S1r : 1/R-weighted poloidal stiffness  (v_x u_x + v_y u_y)/R
-!             -- the candidate-M2 diffusion piece and the M4 basis
-!             stiffness (note Table 1, listing M2).
-!   ELM_M3  : conservative rho-form clone of amat_55 (mass + E x B
-!             conservative advection, diffusion dropped), R-weighted:
-!               v u R (1+zeta)
-!             - v R^2 (u_s u0_t - u_t u0_s) theta dt        (bracket)
-!             - v 2 R u u0_y xjac theta dt                  (compression)
-!             (note Table 1, listing M3; pairs with R-mass Q_u = amat_44).
+! Candidates are linear combinations of these blocks together with the
+! extracted A_full masses (B33 = 1/R, B44 = R) and B11 = A_pp; e.g.
+!   M1  = opz*B33 - (theta dt)*ADV1
+!   M3  = opz*B44 - (theta dt)*ADVR - (theta dt)*COMP
+!   M2  = M1 + eta*(theta dt)*S1R
+! so a NEW candidate is just a new coefficient row -- no re-assembly.
 !
-! Both operators are p-channel only (no d_phi on trial/test): S1r has no
-! background dependence (toroidally diagonal); M3's only phi-coupling is
-! through the background flow u0 across planes, captured by the FFT of the
-! plane-wise integrand -- exactly as amat_55's p-channel is assembled.
-!
-! Structure, geometry and FFT reconstruction follow
-! mod_elt_matrix_metriplectic (first derivatives only; the 0.5 factor is
-! the FFT normalisation, matching element_matrix_fft). Coefficient
-! conventions (zeta = time_evol_zeta*2*dt/(dt+dt_prev), theta, dt) match
-! models/model199/mod_elt_matrix_fft.f90 so the operators are directly
-! comparable to the extracted A_full blocks.
+! All blocks are p-channel only (advection/compression pick up toroidal
+! mode coupling through the background flow u0 across planes, via the FFT
+! of the plane-wise integrand -- exactly as amat_55's p-channel). Geometry
+! and FFT machinery follow mod_elt_matrix_metriplectic (first derivatives
+! only; 0.5 = FFT normalisation, matching element_matrix_fft).
 !----------------------------------------------------------------
 implicit none
 public :: element_matrix_commutator
+public :: CM_NB, CM_ADV1, CM_ADVR, CM_COMP, CM_S1R, CM_SR
+
+integer, parameter :: CM_NB   = 5   !< number of assembled building blocks
+integer, parameter :: CM_ADV1 = 1
+integer, parameter :: CM_ADVR = 2
+integer, parameter :: CM_COMP = 3
+integer, parameter :: CM_S1R  = 4
+integer, parameter :: CM_SR   = 5
 
 type :: type_fct_vals_cm
   real*8 :: v, v_x, v_y, v_s, v_t
@@ -37,13 +42,13 @@ end type type_fct_vals_cm
 
 contains
 
-subroutine element_matrix_commutator(element, nodes, ELM_S1r, ELM_M3)
+subroutine element_matrix_commutator(element, nodes, ELM_blk)
 
   use mod_parameters
   use data_structure, only: type_element, type_node
   use gauss
   use basis_at_gaussian
-  use phys_module, only: fftw_plan, time_evol_theta, time_evol_zeta, tstep, tstep_prev
+  use phys_module, only: fftw_plan
   use mod_elt_matrix_elliptic, only: scatter_fft_to_elm
 
   implicit none
@@ -54,10 +59,10 @@ subroutine element_matrix_commutator(element, nodes, ELM_S1r, ELM_M3)
 #define N1V  (n_vertex_max*n_degrees)
 #define D1V  (n_tor*n_vertex_max*n_degrees)
 
-  real*8, dimension(D1V, D1V), intent(out) :: ELM_S1r, ELM_M3
+  real*8, dimension(D1V, D1V, CM_NB), intent(out) :: ELM_blk
 
-  ! Plane-workspace accumulators (p channel)
-  real*8, dimension(n_plane, N1V, N1V) :: ELM_p_S1r, ELM_p_M3
+  ! Plane-workspace accumulators (p channel), one per block
+  real*8, dimension(n_plane, N1V, N1V, CM_NB) :: ELM_p
 
   ! Geometry at Gauss points (first derivatives only)
   real*8, dimension(n_gauss,n_gauss) :: x_g, x_s, x_t
@@ -66,30 +71,22 @@ subroutine element_matrix_commutator(element, nodes, ELM_S1r, ELM_M3)
   ! Background flow potential u0: s,t derivatives at Gauss points/planes
   real*8, dimension(n_plane, n_var, n_gauss, n_gauss) :: eq_s, eq_t
 
-  integer :: i, j, k, l, ms, mt, mp, in
+  integer :: i, j, k, l, ms, mt, mp, in, ib
   integer :: idx_ij, idx_kl
 
   real*8 :: wst, xjac, BigR
-  real*8 :: theta, zeta, opz
-  real*8 :: u0_s, u0_t, u0_y
+  real*8 :: u0_s, u0_t, u0_y, brk
   type(type_fct_vals_cm) :: v_fct, u_fct
-
-  real*8 :: amat_S1r, amat_M3
 
   ! FFT workspace
   real*8     :: in_fft(1:n_plane)
   complex*16 :: out_fft(1:n_plane)
 
-  theta = time_evol_theta
-  zeta  = time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
-  opz   = 1.d0 + zeta
-
-  ELM_S1r = 0.d0; ELM_M3 = 0.d0
-  ELM_p_S1r = 0.d0; ELM_p_M3 = 0.d0
+  ELM_blk = 0.d0
+  ELM_p   = 0.d0
 
   !-----------------------------------------------------------------
   ! Geometry and background (u0) s,t derivatives at Gauss points
-  ! (pattern: mod_elt_matrix_metriplectic :144-175, first order only)
   !-----------------------------------------------------------------
   x_g = 0.d0; x_s = 0.d0; x_t = 0.d0
   y_g = 0.d0; y_s = 0.d0; y_t = 0.d0
@@ -130,9 +127,6 @@ subroutine element_matrix_commutator(element, nodes, ELM_S1r, ELM_M3)
 
       do mp = 1, n_plane
 
-        ! Background flow potential derivatives (u0 = var_u):
-        !   u0_s, u0_t : computational-coord derivatives (bracket)
-        !   u0_y       : Cartesian d/dZ (compression term)
         u0_s = eq_s(mp,var_u,ms,mt)
         u0_t = eq_t(mp,var_u,ms,mt)
         u0_y = ( - x_t(ms,mt) * u0_s + x_s(ms,mt) * u0_t ) / xjac
@@ -159,17 +153,18 @@ subroutine element_matrix_commutator(element, nodes, ELM_S1r, ELM_M3)
                 u_fct%v_x = (   y_t(ms,mt) * H_s(k,l,ms,mt) - y_s(ms,mt) * H_t(k,l,ms,mt) ) * element%size(k,l) / xjac
                 u_fct%v_y = ( - x_t(ms,mt) * H_s(k,l,ms,mt) + x_s(ms,mt) * H_t(k,l,ms,mt) ) * element%size(k,l) / xjac
 
-                ! --- S1r: (1/R) grad(v).grad(u) ---
-                amat_S1r = (v_fct%v_x*u_fct%v_x + v_fct%v_y*u_fct%v_y) / BigR * xjac
+                brk = u_fct%v_s * u0_t - u_fct%v_t * u0_s          ! [u, u0] * xjac (computational bracket)
 
-                ! --- M3: R-mass (1+zeta) + conservative E x B advection
-                !     (clone of amat_55, rho -> trial u, diffusion dropped) ---
-                amat_M3 =   v_fct%v * u_fct%v * BigR * opz * xjac                                          &
-                          - v_fct%v * BigR**2 * ( u_fct%v_s * u0_t - u_fct%v_t * u0_s )   * theta * tstep   &
-                          - v_fct%v * 2.d0 * BigR * u_fct%v * u0_y                * xjac  * theta * tstep
-
-                ELM_p_S1r(mp, idx_ij, idx_kl) = ELM_p_S1r(mp, idx_ij, idx_kl) + wst * amat_S1r
-                ELM_p_M3 (mp, idx_ij, idx_kl) = ELM_p_M3 (mp, idx_ij, idx_kl) + wst * amat_M3
+                ELM_p(mp,idx_ij,idx_kl,CM_ADV1) = ELM_p(mp,idx_ij,idx_kl,CM_ADV1) &
+                  + wst * ( v_fct%v * brk )
+                ELM_p(mp,idx_ij,idx_kl,CM_ADVR) = ELM_p(mp,idx_ij,idx_kl,CM_ADVR) &
+                  + wst * ( v_fct%v * BigR**2 * brk )
+                ELM_p(mp,idx_ij,idx_kl,CM_COMP) = ELM_p(mp,idx_ij,idx_kl,CM_COMP) &
+                  + wst * ( v_fct%v * 2.d0 * BigR * u_fct%v * u0_y * xjac )
+                ELM_p(mp,idx_ij,idx_kl,CM_S1R) = ELM_p(mp,idx_ij,idx_kl,CM_S1R) &
+                  + wst * ( (v_fct%v_x*u_fct%v_x + v_fct%v_y*u_fct%v_y) / BigR * xjac )
+                ELM_p(mp,idx_ij,idx_kl,CM_SR) = ELM_p(mp,idx_ij,idx_kl,CM_SR) &
+                  + wst * ( (v_fct%v_x*u_fct%v_x + v_fct%v_y*u_fct%v_y) * BigR * xjac )
 
               enddo  ! l
             enddo    ! k
@@ -182,26 +177,18 @@ subroutine element_matrix_commutator(element, nodes, ELM_S1r, ELM_M3)
   !-----------------------------------------------------------------
   ! FFT reconstruction (p channel only); 0.5 = FFT normalisation
   !-----------------------------------------------------------------
-  do i = 1, N1V
-    do j = 1, N1V
-
-      in_fft = ELM_p_S1r(1:n_plane, i, j)
+  do ib = 1, CM_NB
+    do i = 1, N1V
+      do j = 1, N1V
+        in_fft = ELM_p(1:n_plane, i, j, ib)
 #ifdef USE_FFTW
-      call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+        call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
 #endif
-      call scatter_fft_to_elm(out_fft, i, j, ELM_S1r, D1V)
-
-      in_fft = ELM_p_M3(1:n_plane, i, j)
-#ifdef USE_FFTW
-      call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#endif
-      call scatter_fft_to_elm(out_fft, i, j, ELM_M3, D1V)
-
+        call scatter_fft_to_elm(out_fft, i, j, ELM_blk(:,:,ib), D1V)
+      enddo
     enddo
+    ELM_blk(:,:,ib) = 0.5d0 * ELM_blk(:,:,ib)
   enddo
-
-  ELM_S1r = 0.5d0 * ELM_S1r
-  ELM_M3  = 0.5d0 * ELM_M3
 
 end subroutine element_matrix_commutator
 
