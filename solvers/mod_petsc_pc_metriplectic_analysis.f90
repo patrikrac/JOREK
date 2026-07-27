@@ -151,6 +151,32 @@ contains
   ! M1a/M3/M2 need the assembled building blocks (cm_ops_ready); M0/M1x/M0R
   ! use only extracted A_full blocks. The reference P always uses Q_psi=B33.
   !
+  ! EPS_MIN -- fundamental lower bound on the defect over ALL M_*
+  ! ------------------------------------------------------------
+  !   eps_min = ||(I-P) C||_{Q_psi^-1} / ||C||_{Q_psi^-1},
+  !   C = A_pp Q_psi^-1 A_pu S  (S = the probe set, columns = test vectors),
+  !   P = the Q_psi^-1-orthogonal projector onto range(A_pu).  Equivalently,
+  !   as implemented (column by column, Y unconstrained):
+  !       eps_min^2 = min_Y ||C - A_pu Y||^2_{Q_psi^-1} / ||C||^2_{Q_psi^-1}.
+  !   Y plays the role of Q_u^-1 A_uM S, so NO structure whatsoever is imposed
+  !   on M_*: eps(M_*) >= eps_min for EVERY candidate, local or nonlocal.
+  !   eps_min = 0 iff range(A_pp Q^-1 A_pu S) is contained in range(A_pu); it
+  !   measures the non-surjectivity of the parallel gradient G = R^2 B.grad,
+  !   i.e. the part of M U that U = theta G cannot produce at all.
+  !     eps_min ~ eps(M1)   -> M1 is essentially optimal; stop searching forms
+  !     eps_min << eps(M1)  -> headroom exists; a better M_* is worth hunting
+  !   NORM: Q_psi^-1, the SAME norm as eps(M_*) above (not the Q_psi norm of
+  !   the abstract statement) -- that is what makes eps_min <= eps(M_*) an
+  !   exact checkable identity instead of a norm-dependent near-miss.  The
+  !   per-probe LS is warm-started from the best candidate's y, and CG
+  !   minimises exactly that LS objective, so the bound holds by construction
+  !   (not by luck) even if the CG is stopped early.
+  !   READING IT: an under-converged CG can only OVERstate the residual, so the
+  !   printed eps_min is an UPPER bound on the true lower bound.  Hence
+  !   "eps_min << eps(M1) -> headroom" is a rigorous verdict at any iteration
+  !   count, whereas "eps_min ~ eps(M1) -> M1 optimal" is only trustworthy if
+  !   the reported mean CG its/probe sits well below CM_LS_MAXIT.
+  !
   ! Reads A_full sub-blocks + module-saved cm_blk (no metriplectic_assemble).
   ! NOTE on the zero-flow check: at u0=0, B11 = (1+zeta) Q holds in the
   ! interior, so eps(M1)=0 there to machine precision; boundary rows of
@@ -170,13 +196,18 @@ contains
     integer, parameter :: NOP    = 3 + CM_NB      ! op set: B11,Q1R,QR + blocks
     integer, parameter :: OP_B11 = 1, OP_Q1R = 2, OP_QR = 3
     integer, parameter :: MAXC   = 16             ! candidate-table capacity
+    integer, parameter :: CM_LS_MAXIT = 300       ! CG cap for the eps_min LS
+    real*8,  parameter :: CM_LS_RTOL  = 1.d-8     ! relative rz drop for that CG
 
     Mat :: B11, B12, Qpsi, QuR, op(NOP)
     KSP :: ksp_Qpsi, ksp_QuR, ksp_Qu
     Vec :: z, va, vb, vPz, vc, vt, vd, vRz, vDz, vg
+    Vec :: vy, wd, ws, wq, wr, wzu, wp, wtu       ! eps_min least-squares work
     PetscErrorCode :: ierr
     integer :: comm, h, kp, ic, iop, ib, ncand
+    integer :: nit, nit_tot, nit_max
     real*8  :: opz, zeta, tdt, nd, npp, sumP2, eps_val
+    real*8  :: sumE2, ndbest, fls, eps_min, eps_best
     real*8  :: coef(MAXC, NOP)
     integer :: quop(MAXC)
     character(len=4) :: lab(MAXC)
@@ -234,6 +265,9 @@ contains
         "[Commutator] NOTE: building blocks not assembled -> extracted-only candidates"
       write(*,'(A)') &
         "[Commutator] eps(n) = ||D du||_{Q_psi^-1} / ||A_pp Q_psi^-1 A_pu du||_{Q_psi^-1}"
+      write(*,'(A,I0,A,ES8.1,A)') &
+        "[Commutator] EPSMIN = lower bound over ALL M_* (unconstrained LS onto " // &
+        "range(A_pu); CG maxit = ", CM_LS_MAXIT, ", rtol = ", CM_LS_RTOL, ")"
     endif
 
     ! --- Work vectors (all size n_var_dofs) ---
@@ -246,11 +280,19 @@ contains
     PetscCallA(VecDuplicate(va, vRz, ierr))
     PetscCallA(VecDuplicate(va, vDz, ierr))
     PetscCallA(VecDuplicate(va, vg,  ierr))
+    PetscCallA(VecDuplicate(va, vy,  ierr));  PetscCallA(VecDuplicate(va, wd,  ierr))
+    PetscCallA(VecDuplicate(va, ws,  ierr));  PetscCallA(VecDuplicate(va, wq,  ierr))
+    PetscCallA(VecDuplicate(va, wr,  ierr));  PetscCallA(VecDuplicate(va, wzu, ierr))
+    PetscCallA(VecDuplicate(va, wp,  ierr));  PetscCallA(VecDuplicate(va, wtu, ierr))
+    PetscCallA(VecSet(vy, 0.d0, ierr))        ! defined even if no candidate wins
 
     ! --- eps(n) per toroidal harmonic; shared probes across candidates ---
     do h = 1, n_tor
-      sumP2 = 0.d0
-      sumD2 = 0.d0
+      sumP2   = 0.d0
+      sumD2   = 0.d0
+      sumE2   = 0.d0
+      nit_tot = 0
+      nit_max = 0
       do kp = 1, CM_NPROBE
         call cm_probe_fill(z, h, n_tor)
         ! P du = A_pp Q_psi^-1 (A_pu du)   [candidate-independent, shared]
@@ -259,7 +301,8 @@ contains
         PetscCallA(MatMult(B11, vb, vPz, ierr))
         PetscCallA(KSPSolve(ksp_Qpsi, vPz, vg, ierr))
         PetscCallA(VecDot(vPz, vg, npp, ierr))
-        sumP2 = sumP2 + npp
+        sumP2  = sumP2 + npp
+        ndbest = huge(1.d0)
         do ic = 1, ncand
           ! A_uM du = sum_iop coef(ic,iop) * op(iop) du   (matrix-free)
           PetscCallA(VecSet(vc, 0.d0, ierr))
@@ -279,14 +322,35 @@ contains
           PetscCallA(KSPSolve(ksp_Qpsi, vDz, vg, ierr))
           PetscCallA(VecDot(vDz, vg, nd, ierr))
           sumD2(ic) = sumD2(ic) + nd
+          ! vd IS the y of the LS parametrisation D = P du - A_pu y; keep the
+          ! best candidate's as the warm start so eps_min <= min_ic eps(ic)
+          ! holds per probe by construction.
+          if (nd < ndbest) then
+            ndbest = nd
+            PetscCallA(VecCopy(vd, vy, ierr))
+          endif
         enddo
+        ! --- eps_min contribution: min over ALL y of ||P du - A_pu y||^2 ---
+        call cm_ls_min(B12, ksp_Qpsi, ksp_Qpsi, vPz, vy, CM_LS_MAXIT, CM_LS_RTOL, &
+                       wd, ws, wq, wr, wzu, wp, wtu, fls, nit)
+        sumE2   = sumE2 + fls
+        nit_tot = nit_tot + nit
+        nit_max = max(nit_max, nit)
       enddo
       if (my_id == 0) then
+        eps_best = huge(1.d0)
         do ic = 1, ncand
           eps_val = sqrt(max(sumD2(ic), 0.d0) / max(sumP2, tiny(1.d0)))
+          eps_best = min(eps_best, eps_val)
           write(*,'(A,A,A,I4,A,ES13.5)') "[Commutator] ", trim(lab(ic)), &
             ":   n = ", mode(h), "   eps = ", eps_val
         enddo
+        eps_min = sqrt(max(sumE2, 0.d0) / max(sumP2, tiny(1.d0)))
+        write(*,'(A,I4,A,ES13.5,A,F7.3)') "[Commutator] EPSMIN:   n = ", mode(h), &
+          "   eps = ", eps_min, "   eps_min/eps_best = ", &
+          eps_min / max(eps_best, tiny(1.d0))
+        write(*,'(A,I0,A,I0)') "[Commutator]           LS CG its: mean/probe = ", &
+          nint(dble(nit_tot) / dble(CM_NPROBE)), " ,  max = ", nit_max
       endif
     enddo
 
@@ -296,6 +360,10 @@ contains
     PetscCallA(VecDestroy(vc,  ierr));  PetscCallA(VecDestroy(vt,  ierr))
     PetscCallA(VecDestroy(vd,  ierr));  PetscCallA(VecDestroy(vRz, ierr))
     PetscCallA(VecDestroy(vDz, ierr));  PetscCallA(VecDestroy(vg,  ierr))
+    PetscCallA(VecDestroy(vy,  ierr));  PetscCallA(VecDestroy(wd,  ierr))
+    PetscCallA(VecDestroy(ws,  ierr));  PetscCallA(VecDestroy(wq,  ierr))
+    PetscCallA(VecDestroy(wr,  ierr));  PetscCallA(VecDestroy(wzu, ierr))
+    PetscCallA(VecDestroy(wp,  ierr));  PetscCallA(VecDestroy(wtu, ierr))
     PetscCallA(KSPDestroy(ksp_Qpsi, ierr))
     PetscCallA(KSPDestroy(ksp_QuR,  ierr))
     PetscCallA(MatDestroy(B11,  ierr))
@@ -305,6 +373,89 @@ contains
     deallocate(sumD2)
     if (my_id == 0) write(*,'(A)') "[Commutator] ================ analysis complete ================"
   end subroutine petsc_commutator_run_analysis
+
+
+  !--------------------------------------------------------------------
+  !> One column of the eps_min least-squares problem:
+  !!     f = min_y || c - A_pu y ||^2_{Qp^-1},   y UNCONSTRAINED.
+  !!
+  !! Solved by mass-preconditioned CG on the normal equations
+  !!     N y = b,   N = A_pu^T Qp^-1 A_pu,   b = A_pu^T Qp^-1 c,
+  !! preconditioned by the u-space mass (ksp_Qu).  CG minimises exactly the
+  !! LS objective f(y) over the Krylov space, so with y entering as the best
+  !! candidate's y (warm start) the returned f is monotonically <= that
+  !! candidate's defect -- this is what makes eps_min <= eps(M_*) hold by
+  !! construction rather than by luck, even under an early CG stop.  Chosen
+  !! over LSQR/LSMR for exactly that warm-start property; the squared
+  !! conditioning is harmless here because we only need ~3 digits of a
+  !! residual NORM, and f is re-measured honestly at exit (below).
+  !!
+  !! N is singular -- null(N) = null(A_pu) = the field-line-constant modes
+  !! that G = R^2 B.grad annihilates -- but the system is consistent, since
+  !! b lies in range(A_pu^T) by construction.  Null-space growth in y is
+  !! harmless for the objective (A_pu kills it), and the final f is recomputed
+  !! from d = c - A_pu y rather than from a recursion, so no drift enters the
+  !! measurement.  The warm-start value is kept if CG failed to improve on it.
+  !!
+  !! Work vectors come from the caller (psi-space wd/ws/wq, u-space wr/wz/wp/wt)
+  !! to avoid create/destroy churn inside the probe loop.  Costs 2 mass
+  !! backsolves + 1 MatMult + 1 MatMultTranspose per iteration.
+  !--------------------------------------------------------------------
+  subroutine cm_ls_min(A_pu, ksp_Qp, ksp_Qu, c, y, maxit, rtol, &
+                       wd, ws, wq, wr, wz, wp, wt, f, nit)
+    Mat,     intent(in)    :: A_pu
+    KSP,     intent(in)    :: ksp_Qp, ksp_Qu
+    Vec,     intent(in)    :: c
+    Vec,     intent(inout) :: y
+    integer, intent(in)    :: maxit
+    real*8,  intent(in)    :: rtol
+    Vec,     intent(inout) :: wd, ws, wq, wr, wz, wp, wt
+    real*8,  intent(out)   :: f
+    integer, intent(out)   :: nit
+
+    PetscErrorCode :: ierr
+    integer :: it
+    real*8  :: f0, rz, rz0, rznew, pNp, alpha, beta
+
+    ! d = c - A_pu y ;  s = Qp^-1 d ;  f0 = ||d||^2_{Qp^-1}  (warm-start value)
+    PetscCallA(MatMult(A_pu, y, wd, ierr))
+    PetscCallA(VecAYPX(wd, -1.d0, c, ierr))
+    PetscCallA(KSPSolve(ksp_Qp, wd, ws, ierr))
+    PetscCallA(VecDot(wd, ws, f0, ierr))
+
+    ! r = A_pu^T Qp^-1 d ;  z = Qu^-1 r ;  p = z
+    PetscCallA(MatMultTranspose(A_pu, ws, wr, ierr))
+    PetscCallA(KSPSolve(ksp_Qu, wr, wz, ierr))
+    PetscCallA(VecCopy(wz, wp, ierr))
+    PetscCallA(VecDot(wr, wz, rz, ierr))
+    rz0 = rz
+    nit = 0
+
+    do it = 1, maxit
+      if (rz <= 0.d0 .or. rz <= rtol*rtol*rz0) exit
+      PetscCallA(MatMult(A_pu, wp, wq, ierr))
+      PetscCallA(KSPSolve(ksp_Qp, wq, ws, ierr))
+      PetscCallA(VecDot(wq, ws, pNp, ierr))
+      if (pNp <= 0.d0) exit                     ! p hit null(A_pu)
+      alpha = rz / pNp
+      PetscCallA(VecAXPY(y, alpha, wp, ierr))
+      PetscCallA(MatMultTranspose(A_pu, ws, wt, ierr))
+      PetscCallA(VecAXPY(wr, -alpha, wt, ierr))
+      PetscCallA(KSPSolve(ksp_Qu, wr, wz, ierr))
+      PetscCallA(VecDot(wr, wz, rznew, ierr))
+      beta = rznew / rz
+      PetscCallA(VecAYPX(wp, beta, wz, ierr))
+      rz  = rznew
+      nit = it
+    enddo
+
+    ! Honest re-measurement of the objective at the final y.
+    PetscCallA(MatMult(A_pu, y, wd, ierr))
+    PetscCallA(VecAYPX(wd, -1.d0, c, ierr))
+    PetscCallA(KSPSolve(ksp_Qp, wd, ws, ierr))
+    PetscCallA(VecDot(wd, ws, f, ierr))
+    if (.not. (f <= f0)) f = f0                 ! also traps NaN
+  end subroutine cm_ls_min
 
 
   !--------------------------------------------------------------------
