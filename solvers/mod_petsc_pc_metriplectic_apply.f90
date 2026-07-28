@@ -77,7 +77,7 @@ module mod_petsc_pc_metriplectic_apply
 
   ! --- commutator-device M_* Schur internals (Slice 1) ---
   ! Same dedicated-vec discipline as the s_* pool above: the S_cm mult runs
-  ! inside KSPSolve(ksp_Scm), called from the LDU between its pivot solves.
+  ! inside MatComputeOperator, called from the LDU's variant setup.
   logical :: cm_shell_ready = .false.
   Vec :: c_xu, c_xw, c_mu                     ! (u,w) split of x, M_* image
   Vec :: c_t1, c_t2                           ! matvec scratch / A_M* image
@@ -92,7 +92,13 @@ module mod_petsc_pc_metriplectic_apply
   integer, save :: cm_cand  = 0               ! active row; 0 = unresolved
   Mat,     save :: cm_op(CM_NOP)
   logical, save :: cm_bound = .false.
-  !> Inner-iteration accounting for the A/B report.
+  !> Label the explicit T_cm currently corresponds to ('' = none/invalid).
+  character(len=8), save :: cm_exp_label = ' '
+  !> Hard cap on the (u,w) pair dimension for the explicit path. T_cm is
+  !! dense, so this bounds memory at ~ (8 * MAXDIM^2) bytes.
+  integer, parameter :: CM_EXP_MAXDIM = 20000
+  !> Inner-iteration accounting for the A/B report. With the explicit path
+  !! there is no inner solve, so these stay zero and the report prints '--'.
   integer, save :: cm_inner_tot = 0, cm_inner_calls = 0
 
 contains
@@ -254,13 +260,17 @@ contains
   !
   ! CONSISTENCY: at M0 (A_M* = opz*Q_u) this is exactly (1+zeta)*P_uw with
   ! du = opz*chi_u, so the M0 candidate must reproduce the 'M0D' path to
-  ! round-off, and its inner FGMRES must converge in one iteration.
+  ! round-off -- now via a completely different route (explicit assembly +
+  ! LU rather than a one-iteration Krylov solve), which makes it a much
+  ! stronger check of the T_pair algebra.
+  !
+  ! The shell exists only to be materialized by cm_build_explicit; it is
+  ! never handed to a Krylov method.
   !====================================================================
   subroutine metriplectic_build_cm_shell(comm)
     integer, intent(in) :: comm
     PetscErrorCode :: ierr
     PetscInt :: n_loc, n_glob
-    PC  :: pc
 
     if (cm_shell_ready) return
 
@@ -280,21 +290,73 @@ contains
     PetscCallA(MatShellSetOperation(g_mctx%S_cm_shell, MATOP_MULT, &
                                     metriplectic_Scm_mult, ierr))
 
-    ! inner solver: FGMRES(T_pair) preconditioned by P_uw^-1/(1+zeta)
-    PetscCallA(KSPCreate(comm, g_mctx%ksp_Scm, ierr))
-    PetscCallA(KSPSetOperators(g_mctx%ksp_Scm, g_mctx%S_cm_shell, &
-                               g_mctx%S_cm_shell, ierr))
-    PetscCallA(KSPSetType(g_mctx%ksp_Scm, KSPFGMRES, ierr))
-    PetscCallA(KSPGetPC(g_mctx%ksp_Scm, pc, ierr))
-    PetscCallA(PCSetType(pc, PCSHELL, ierr))
-    PetscCallA(PCShellSetApply(pc, metriplectic_cm_pc_apply, ierr))
-    call KSPSetTolerances(g_mctx%ksp_Scm, g_mctx%cm_inner_tol, &
-                          PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, &
-                          g_mctx%cm_inner_it, ierr)
-    PetscCallA(KSPSetInitialGuessNonzero(g_mctx%ksp_Scm, PETSC_FALSE, ierr))
-
     cm_shell_ready = .true.
   end subroutine metriplectic_build_cm_shell
+
+
+  !--------------------------------------------------------------------
+  !> Materialize T_pair for the active candidate and LU-factor it, so
+  !! step 3 solves it EXACTLY and the measured outer counts carry no
+  !! inner-solver artifact.
+  !!
+  !! Cost: one shell application per column (each carrying a B33 MUMPS
+  !! back-solve) and a dense n x n result, because M_* = B33^-1 A_M* is
+  !! dense. Diagnostic only -- hence the hard size guard.
+  !!
+  !! Rebuilt when the active label changes (the A/B cycles variants) or
+  !! when metriplectic_cm_bind invalidates the cache on a PC rebuild.
+  !! MATDENSE first, then convert: assembling a dense operator straight
+  !! into MATAIJ would reallocate on every row.
+  !--------------------------------------------------------------------
+  subroutine cm_build_explicit(my_id)
+    integer, intent(in) :: my_id
+    PetscErrorCode :: ierr
+    PetscInt :: n_glob
+    integer :: comm
+    PC :: pc
+
+    if (cm_cand <= 0) return                              ! M0D / EXACT / LEGACY
+    if (trim(cm_exp_label) == trim(cm_schur_variant)) return
+
+    PetscCallA(MatGetSize(g_mctx%A_pair_uw, n_glob, PETSC_NULL_INTEGER, ierr))
+    if (n_glob > CM_EXP_MAXDIM) then
+      if (my_id == 0) then
+        write(*,'(A,I0,A,I0,A)') "[CommPC] ERROR: explicit T_pair would be a dense ", &
+          n_glob, " x ", n_glob, " operator"
+        write(*,'(A,I0,A)') "[CommPC] the commutator Schur path is DIAGNOSTIC ONLY " // &
+          "(small meshes); CM_EXP_MAXDIM = ", CM_EXP_MAXDIM, &
+          ". Use a coarser grid, or run only the 'EXACT'/'M0D' variants."
+      endif
+      error stop "commutator explicit T_pair too large"
+    endif
+
+    if (g_mctx%Tcm_ready) then
+      PetscCallA(KSPDestroy(g_mctx%ksp_Tcm, ierr))
+      PetscCallA(MatDestroy(g_mctx%T_cm,    ierr))
+      g_mctx%Tcm_ready = .false.
+    endif
+
+    PetscCallA(MatComputeOperator(g_mctx%S_cm_shell, MATDENSE, g_mctx%T_cm, ierr))
+    PetscCallA(MatConvert(g_mctx%T_cm, MATMPIAIJ, MAT_INPLACE_MATRIX, g_mctx%T_cm, ierr))
+
+    ! MUMPS LU. Cannot reuse the assembly module's setup_lu_ksp: that module
+    ! already uses THIS one (metriplectic_build_ps_shell), so the dependency
+    ! may not be reversed.
+    call PetscObjectGetComm(g_mctx%T_cm, comm, ierr)
+    PetscCallA(KSPCreate(comm, g_mctx%ksp_Tcm, ierr))
+    PetscCallA(KSPSetOperators(g_mctx%ksp_Tcm, g_mctx%T_cm, g_mctx%T_cm, ierr))
+    PetscCallA(KSPSetType(g_mctx%ksp_Tcm, KSPPREONLY, ierr))
+    PetscCallA(KSPGetPC(g_mctx%ksp_Tcm, pc, ierr))
+    PetscCallA(PCSetType(pc, PCLU, ierr))
+    PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
+    PetscCallA(KSPSetUp(g_mctx%ksp_Tcm, ierr))
+
+    g_mctx%Tcm_ready = .true.
+    cm_exp_label = cm_schur_variant
+    if (my_id == 0) write(*,'(A,A,A,I0,A)') &
+      "[CommPC] explicit T_pair(", trim(cm_schur_variant), ") built and factored (n = ", &
+      n_glob, ")"
+  end subroutine cm_build_explicit
 
 
   !--------------------------------------------------------------------
@@ -311,8 +373,10 @@ contains
     call cm_ops_gather(B11, Q1R, QR, cm_op)
     call cm_table_build(opz, tdt, eta, cm_coef, cm_quop, cm_lab, cm_ncand)
     cm_bound = .true.
-    ! Re-resolve the currently selected variant against the fresh table
-    ! (opz/tdt/eta move with the time step, and the blocks are new copies).
+    ! The blocks are fresh copies and opz/tdt/eta have moved with the time
+    ! step, so any previously materialized T_cm is stale.
+    cm_exp_label = ' '
+    ! Re-resolve the currently selected variant against the fresh table.
     call cm_set_variant(cm_schur_variant, my_id)
   end subroutine metriplectic_cm_bind
 
@@ -337,7 +401,11 @@ contains
     if (cm_cand == 0 .and. my_id == 0) then
       write(*,'(A)') "[CommPC] WARNING: candidate '" // trim(label) // &
         "' not in the table (building blocks not assembled?) -- using P_uw instead"
+      return
     endif
+    ! Materialize + factor T_pair for this candidate (no-op if already built
+    ! for this label and this PC build).
+    call cm_build_explicit(my_id)
   end subroutine cm_set_variant
 
 
@@ -385,22 +453,6 @@ contains
       call KSPSolve(g_mctx%ksp_B33, c_t2, y, ierr)
     endif
   end subroutine cm_mstar_apply
-
-
-  !--------------------------------------------------------------------
-  !> PCSHELL apply for ksp_Scm: P_uw^-1 scaled by 1/(1+zeta), because
-  !! T_pair = (1+zeta)*P_uw at M0 -- without the scale the inner residual
-  !! reference is off by that constant.
-  !--------------------------------------------------------------------
-  subroutine metriplectic_cm_pc_apply(pc, x, y, ierr)
-    use phys_module, only: time_evol_zeta
-    PC  :: pc
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call KSPSolve(g_mctx%ksp_Puw, x, y, ierr)
-    call VecScale(y, 1.d0 / (1.d0 + time_evol_zeta), ierr)
-    ierr = 0
-  end subroutine metriplectic_cm_pc_apply
 
 
   !> Reset / read the inner-iteration counters (A/B reporting).
@@ -559,7 +611,6 @@ contains
     Vec :: rpsi, ru, rj, rw, dpsi, du, dj, dw
     PetscErrorCode :: ierr
     real*8 :: tdt
-    PetscInt :: its_in
 
     tdt = g_mctx%dt_theta * (1.d0 + time_evol_zeta)     ! = theta*dt
     call ensure_work(ierr)
@@ -580,10 +631,8 @@ contains
     !     behaviour exactly, so runs that do not opt in are unaffected.
     !     Only the commutator branch has to undo the M_* fold afterwards.
     if (cm_cand > 0) then
-      call KSPSolve(g_mctx%ksp_Scm, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
-      call KSPGetIterationNumber(g_mctx%ksp_Scm, its_in, ierr)
-      cm_inner_tot   = cm_inner_tot + its_in
-      cm_inner_calls = cm_inner_calls + 1
+      ! T_pair solved EXACTLY (explicit + LU), so no inner-solver artifact
+      call KSPSolve(g_mctx%ksp_Tcm, g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr)
       call unpack_2v(g_mctx%wv_uw_2, a_t1, dw, ierr)    ! a_t1 = chi_u
       call cm_mstar_apply(a_t1, du, ierr)               ! du = M_* chi_u
     else if (trim(cm_schur_variant) == 'EXACT') then

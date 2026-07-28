@@ -279,8 +279,7 @@ contains
                               metriplectic_khalf, metriplectic_ps_inner_it, &
                               metriplectic_ps_inner_tol, eta, &
                               commutator_pc, commutator_pc_ab, &
-                              commutator_pc_mstar, commutator_pc_inner_it, &
-                              commutator_pc_inner_tol
+                              commutator_pc_mstar
     use mod_petsc_pc_metriplectic_apply, only: metriplectic_build_ps_shell, &
                               metriplectic_build_cm_shell, metriplectic_cm_bind
 
@@ -497,10 +496,9 @@ contains
 
     ! --- commutator-device M_* Schur: shell once, candidate table rebound
     !     every build (the extracted blocks are fresh, and opz/tdt/eta may
-    !     have moved with the time step) ---
+    !     have moved with the time step). cm_bind also invalidates and
+    !     re-materializes the explicit T_pair for the active candidate. ---
     if (build_cm) then
-      g_mctx%cm_inner_it  = commutator_pc_inner_it
-      g_mctx%cm_inner_tol = commutator_pc_inner_tol
       call metriplectic_build_cm_shell(comm)
       call metriplectic_cm_bind(g_mctx%B_11s, g_mctx%B_33s, g_mctx%B_44s, &
                                 opz, tdt, eta, my_id)
@@ -514,10 +512,9 @@ contains
 
     g_mctx%sweep_ready = .true.
     if (my_id == 0 .and. build_cm) then
-      write(*,'(A,A,A,I0,A,ES8.1,A)') &
+      write(*,'(A,A,A)') &
         "[CommPC] commutator Schur ready: M_* = ", trim(commutator_pc_mstar), &
-        "  (inner FGMRES cap ", commutator_pc_inner_it, ", rtol ", &
-        commutator_pc_inner_tol, ")"
+        "  (T_pair materialized + LU-factored: DIAGNOSTIC, small meshes only)"
       if (commutator_pc_ab) write(*,'(A)') &
         "[CommPC] A/B diagnostic active on a dedicated KSP -- production solve unaffected"
     endif

@@ -172,8 +172,6 @@ module phys_module
   logical :: commutator_analysis          !< Run commutator-operator (M_*) intertwining-defect analysis (candidates M0-M4, eps per toroidal harmonic) at first solve
   logical :: commutator_pc                !< PRODUCTION: use the commutator-device M_* Schur in the 'PS' K-half (requires use_metriplectic_pc + metriplectic_khalf='PS')
   character(len=4) :: commutator_pc_mstar !< Candidate M_* used by commutator_pc (table label: 'M0','M1a','M2','M3',...)
-  integer :: commutator_pc_inner_it       !< Inner FGMRES iteration cap on the commutator Schur shell
-  real(kind=8) :: commutator_pc_inner_tol !< Inner FGMRES relative tolerance on the commutator Schur shell
   logical :: commutator_pc_ab             !< DIAGNOSTIC: measure outer FGMRES its per M_* variant on a dedicated KSP, alongside ANY production PC (does not perturb the production solve)
   character(len=64) :: commutator_pc_ab_variants !< Comma-separated A/B variant list, e.g. 'EXACT,M0D,M1a' ('EXACT' = exact Schur ceiling, 'M0D' = direct P_uw incumbent, else a table label)
   integer :: commutator_pc_ab_every       !< Run the A/B every N time steps (1 = every step)

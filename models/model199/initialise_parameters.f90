@@ -77,7 +77,6 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 metriplectic_khalf, metriplectic_ps_inner_it,       &
                 metriplectic_ps_inner_tol, commutator_analysis,     &
                 commutator_pc, commutator_pc_mstar,                 &
-                commutator_pc_inner_it, commutator_pc_inner_tol,    &
                 commutator_pc_ab, commutator_pc_ab_variants,        &
                 commutator_pc_ab_every,                             &
                 eliminate_boundary_dofs,                            &

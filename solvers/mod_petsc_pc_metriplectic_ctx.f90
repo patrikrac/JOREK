@@ -91,10 +91,16 @@ module mod_petsc_pc_metriplectic_ctx
     !! bit-identical to the ps_inner_it=0 path. The candidate binding
     !! (coefficients, operator handles, counters) lives in the apply module
     !! next to the shell internals, as ps_shell_ready/s_* do.
+    !!
+    !! T_pair is solved EXACTLY: the shell is materialized column-by-column
+    !! (MatComputeOperator) and LU-factored, so the measured iteration counts
+    !! carry no inner-solver artifact. M_* = B33^-1 A_M* is dense, hence so is
+    !! T_cm -- O(n) shell applies to build, O(n^2) to store. DIAGNOSTIC ONLY,
+    !! small meshes; guarded by CM_EXP_MAXDIM in the apply module.
     Mat :: S_cm_shell         !< matrix-free T_pair on the (u,w) layout
-    KSP :: ksp_Scm            !< FGMRES on S_cm_shell, PC = ksp_Puw / (1+zeta)
-    integer :: cm_inner_it    = 20       !< inner FGMRES cap
-    real*8  :: cm_inner_tol   = 1.d-6    !< inner FGMRES relative tolerance
+    Mat :: T_cm               !< explicit T_pair (MatComputeOperator -> AIJ)
+    KSP :: ksp_Tcm            !< MUMPS LU on T_cm
+    logical :: Tcm_ready = .false.
 
     !> Sweep work vectors: 2-var packed pair vecs + rho/T sized 1-var vecs
     Vec :: wv_pair_psij_1, wv_pair_psij_2
