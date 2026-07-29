@@ -227,7 +227,7 @@ module mod_sparse
                                                 solver%iter_gmres, solver%step_success)
         call petsc_recover_solution(solver%petsc_sys, sol_vec)
         if (present(mhd_sim)) then
-          call petsc_metriplectic_pack_and_track(solver%petsc_sys, mhd_sim, mhd_sim%time, mhd_sim%es%istep, mhd_sim%my_id)
+          call petsc_metriplectic_pack_and_track(solver%petsc_sys, mhd_sim, mhd_sim%time, solver%index_now, mhd_sim%my_id)
         endif
       else
 #endif
@@ -252,7 +252,7 @@ module mod_sparse
                                               solver%iter_gmres, solver%step_success)
       call petsc_recover_solution(solver%petsc_sys, sol_vec)
       if (present(mhd_sim)) then
-        call petsc_metriplectic_pack_and_track(solver%petsc_sys, mhd_sim, mhd_sim%time, mhd_sim%es%istep, mhd_sim%my_id)
+        call petsc_metriplectic_pack_and_track(solver%petsc_sys, mhd_sim, mhd_sim%time, solver%index_now, mhd_sim%my_id)
       endif
 #else
       if (.not.solver%pc%initialized) then

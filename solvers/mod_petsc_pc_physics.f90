@@ -109,14 +109,10 @@ contains
     end block
 
     first_time = .not. g_ctx%reduced_ready
-    use_reassembled = physics_pc_reassemble
+    use_reassembled = physics_pc_reassemble ! Phased out
 
     if (my_id == 0) then
-      if (use_reassembled) then
-        write(*,'(A)') "[Physics PC] Building reduced 4x4 system (reassembled diagonal blocks)..."
-      else
-        write(*,'(A)') "[Physics PC] Building reduced 4x4 system (extracted blocks)..."
-      endif
+      write(*,'(A)') "[Physics PC] Building reduced 4x4 system (extracted blocks)..."
     endif
 
     ! --- Step 1: Create index sets (first time only) ---
@@ -125,12 +121,7 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Index sets created"
     endif
 
-    ! --- Step 1b: Assemble simplified diagonal blocks if requested ---
-    if (use_reassembled) then
-      call petsc_assemble_pc_diagonal_matrices(A_full, comm, my_id)
-    endif
-
-    ! --- Step 2: Extract sub-blocks from full system ---
+    ! --- Extract sub-blocks from full system ---
     ! Diagonal blocks of the constraint equations
     call extract_sub_block(A_full, var_zj, var_zj, g_ctx%B_33, first_time)
     call extract_sub_block(A_full, var_w,  var_w,  g_ctx%B_44, first_time)
@@ -146,18 +137,10 @@ contains
     call extract_sub_block(A_full, var_T,   var_zj, g_ctx%B_63, first_time)
 
     ! Diagonal blocks of the 4x4 system (only extract if not reassembling)
-    if (.not. use_reassembled) then
-      call extract_sub_block(A_full, var_psi, var_psi, g_ctx%B_11, first_time)
-      call extract_sub_block(A_full, var_u,   var_u,   g_ctx%B_22, first_time)
-      call extract_sub_block(A_full, var_rho, var_rho, g_ctx%B_55, first_time)
-      call extract_sub_block(A_full, var_T,   var_T,   g_ctx%B_66, first_time)
-    else if (debug_physics_pc) then
-      ! In debug mode, extract anyway to compare norms
-      call extract_sub_block(A_full, var_psi, var_psi, g_ctx%B_11, first_time)
-      call extract_sub_block(A_full, var_u,   var_u,   g_ctx%B_22, first_time)
-      call extract_sub_block(A_full, var_rho, var_rho, g_ctx%B_55, first_time)
-      call extract_sub_block(A_full, var_T,   var_T,   g_ctx%B_66, first_time)
-    endif
+    call extract_sub_block(A_full, var_psi, var_psi, g_ctx%B_11, first_time)
+    call extract_sub_block(A_full, var_u,   var_u,   g_ctx%B_22, first_time)
+    call extract_sub_block(A_full, var_rho, var_rho, g_ctx%B_55, first_time)
+    call extract_sub_block(A_full, var_T,   var_T,   g_ctx%B_66, first_time)
 
     ! Off-diagonal blocks of the 4x4 system (always needed for coupled mode)
     call extract_sub_block(A_full, var_psi, var_u,   g_ctx%B_12, first_time)
@@ -170,11 +153,94 @@ contains
     call extract_sub_block(A_full, var_T,   var_psi, g_ctx%B_61, first_time)
     call extract_sub_block(A_full, var_T,   var_u,   g_ctx%B_62, first_time)
 
-    if (use_reassembled) then
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   Sub-blocks extracted (17 off-diag/constraint)"
-    else
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   Sub-blocks extracted (21 blocks)"
-    endif
+
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   Sub-blocks extracted (21 blocks)"
+
+    ! Temporary diagnostic print: Block norms 
+    ! call MatNorm(g_ctx%B_11, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_11||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_11, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_11||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_12, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_12||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_12, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_12||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_13, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_13||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_13, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_13||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_16, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_16||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_16, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_16||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_21, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_21||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_21, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_21||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_22, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_22||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_22, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_22||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_23, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_23||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_23, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_23||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_24, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_24||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_24, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_24||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_25, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_25||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_25, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_25||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_26, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_26||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_26, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_26||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_31, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_31||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_31, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_31||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_33, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_33||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_33, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_33||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_42, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_42||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_42, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_42||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_44, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_44||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_44, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_44||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_51, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_51||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_51, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_51||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_52, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_52||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_52, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_52||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_55, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_55||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_55, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_55||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_61, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_61||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_61, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_61||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_62, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_62||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_62, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_62||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_63, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_63||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_63, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_63||_∞ = ", norm_val
+    ! call MatNorm(g_ctx%B_66, NORM_FROBENIUS, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_66||_F = ", norm_val
+    ! call MatNorm(g_ctx%B_66, NORM_INFINITY, norm_val, ierr)
+    ! if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_66||_∞ = ", norm_val
 
     ! --- Step 3: Compute mass matrix inverse ---
     if (physics_pc_block_inv) then
@@ -210,27 +276,9 @@ contains
       end if
     endif
 
-    ! --- Debug: compare reassembled vs extracted norms ---
-    if (use_reassembled .and. debug_physics_pc) then
-      call MatNorm(g_ctx%B_11, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_11 (extracted)||_F = ", norm_val
-      call MatNorm(g_ctx%R_11, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_11 (reassembled)||_F = ", norm_val
-      call MatNorm(g_ctx%B_22, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_22 (extracted)||_F = ", norm_val
-      call MatNorm(g_ctx%R_22, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_22 (reassembled)||_F = ", norm_val
-      call MatNorm(g_ctx%B_55, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_55 (extracted)||_F = ", norm_val
-      call MatNorm(g_ctx%R_55, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_55 (reassembled)||_F = ", norm_val
-      call MatNorm(g_ctx%B_66, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||B_66 (extracted)||_F = ", norm_val
-      call MatNorm(g_ctx%R_66, NORM_FROBENIUS, norm_val, ierr)
-      if (my_id == 0) write(*,'(A,ES12.4)') "[Physics PC]   ||R_66 (reassembled)||_F = ", norm_val
-    endif
 
-    ! --- Step 4a: Set up KSPs for elliptic constraint mass matrices ---
+
+    ! --- Set up KSPs for elliptic constraint mass matrices ---
     ! (Must be done before Schur correction so MUMPS factorization is available)
     call setup_constraint_mass_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time, "Mj constraint-mass KSP")
     call setup_constraint_mass_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time, "Mw constraint-mass KSP")
@@ -239,17 +287,11 @@ contains
     ! --- Step 4b: Form Schur-corrected blocks ---
     if (physics_pc_block_inv) then
       ! Use per-node block-diagonal Mat inverse: Atilde = B_diag - B_coupling * Dinv * B_constraint
-      if (use_reassembled) then
-        call compute_schur_corrected_block(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
-                                           g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
-        call compute_schur_corrected_block(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
-                                           g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
-      else
-        call compute_schur_corrected_block(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
-                                           g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
-        call compute_schur_corrected_block(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
-                                           g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
-      endif
+      call compute_schur_corrected_block(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
+                                          g_ctx%Dinv_Mj, g_ctx%Atilde_11, first_time)
+      call compute_schur_corrected_block(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
+                                          g_ctx%Dinv_Mw, g_ctx%Atilde_22, first_time)
+
       ! Off-diagonal Schur corrections via Mat inverse (same Dinv_Mj)
       call compute_schur_corrected_block(g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, &
                                          g_ctx%Dinv_Mj, g_ctx%Atilde_21, first_time)
@@ -258,19 +300,13 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks (per-node block M^{-1})"
     else
       ! Use element-assembled / scalar diagonal paths
-      if (use_reassembled) then
-        call compute_schur_corrected_block_psi(g_ctx%R_11, g_ctx%B_13, g_ctx%B_31, &
-                                            g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-        call compute_schur_corrected_block_u(g_ctx%R_22, g_ctx%B_24, g_ctx%B_42, &
-                                            g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
-      else
-        call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
-                                            g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
-        !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%Atilde_11, first_time)
-        call compute_schur_corrected_block_u(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
-                                            g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
-        !call compute_schur_corrected_block_exact( g_ctx%B_44, g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, g_ctx%Atilde_22, first_time)
-      endif
+      call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, &
+                                          g_ctx%diag_Mj_inv, g_ctx%Atilde_11, first_time)
+      !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%Atilde_11, first_time)
+      call compute_schur_corrected_block_u(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, &
+                                          g_ctx%diag_Mw_inv, g_ctx%Atilde_22, first_time)
+      !call compute_schur_corrected_block_exact( g_ctx%B_44, g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, g_ctx%Atilde_22, first_time)
+
       ! Off-diagonal Schur corrections from element-assembled K_21 / K_61
       call compute_schur_corrected_block_21(g_ctx%B_21, g_ctx%Atilde_21, first_time)
       !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, g_ctx%Atilde_21, first_time)
@@ -296,7 +332,12 @@ contains
     !     and measure sigma(S_PBP_diag^-1 S_u). Skips the Stage-1 S_u->S_PBP overwrite.
     verify_spbp_spectrum = .false.
 
+     !call compute_full_momentum_schur_exact(g_ctx%S_u, first_time)
+
     if (verify_spbp_spectrum) then
+      ! Convert spectrum of the full matrix
+      call petsc_mat_convert_spectrum(A_full, "A_full", .false.)
+
       ! Exact reference: full momentum Schur (channels A+B+C), held fixed across arms.
       call compute_full_momentum_schur_exact(g_ctx%S_u, first_time)
       call petsc_mat_convert_spectrum(g_ctx%S_u, "S_u_exact", .false.)
@@ -351,59 +392,54 @@ contains
       !call petsc_mat_convert_spectrum(B_tmp, "S_prec", .false.)
     endif
 
-    if (verify_spbp_spectrum) then
-      ! --- Slice 1 offline verification: measure the element-assembled S_PBP
-      !     against the exact full momentum Schur S_u. Writes eigenvalue .dat
-      !     files for offline Julia clustering analysis. ---
-      ! SPD check of the assembled candidate S_PBP (symmetric -> DSYEVD; writes
-      ! S_PBP_sym_dense_spectrum.dat with all-real eigenvalues).
-      call petsc_mat_convert_spectrum(g_ctx%S_PBP, "S_PBP", .true.)
-
-      ! sigma(S_PBP^-1 S_u): B_tmp = S_PBP^-1 S_u, then full spectrum (complex).
-      ! B_tmp is a transient local (not SAVEd): pass .true. so the builder always
-      ! MatCreates fresh (never MatDestroys an uninitialized handle on a rebuild);
-      ! we destroy it ourselves right after taking its spectrum.
-      call compute_explicit_preconditioned_matrix(g_ctx%S_PBP, g_ctx%S_u, B_tmp, .true.)
-      call petsc_mat_convert_spectrum(B_tmp, "S_prec", .false.)
-      call MatDestroy(B_tmp, ierr)
-
-      ! Magnitude reference (NOT expected to be zero): ||S_u - S_PBP||_F.
-      ! petsc_mat_diff_norm duplicates the FIRST arg and MatAXPYs the second with
-      ! SAME_NONZERO_PATTERN, so the DENSE matrix (S_u, probed) must be first and
-      ! the sparse one (S_PBP) second -- matches construction precedent
-      ! petsc_mat_diff_norm(A_exact, A_reduced_4x4). Reuses norm_val.
-      call petsc_mat_diff_norm(g_ctx%S_u, g_ctx%S_PBP, "S_u_vs_S_PBP", norm_val)
-
-      ! NOTE: deliberately NO MatCopy(S_u -> S_PBP) here -- the assembled S_PBP
-      ! must survive for the measurement; the production apply path is not
-      ! exercised in this verification configuration.
-    else
-      ! Stage-1: overwrite the element-assembled S_PBP with the exact S_u so the
-      ! existing predictor-corrector apply (via ksp_S_PBP) uses the exact Schur.
-      ! NOTE: S_PBP is block-size-1 BAIJ (petsc_create_pc_matrix) while S_u is MPIAIJ
-      !   from probing; their row layouts differ in origin. If this MatCopy errors at
-      !   runtime (type/layout mismatch), the fallback is to delete this line and instead
-      !   rebind the KSP operator in assemble_monolithic_4x4 where ksp_S_PBP is created:
-      !   change `KSPSetOperators(ksp_S_PBP, S_PBP, S_PBP)` to
-      !   `KSPSetOperators(ksp_S_PBP, g_ctx%S_u, g_ctx%S_u)`.
-      !call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
-    endif
+    !call MatCopy(g_ctx%S_u, g_ctx%S_PBP, DIFFERENT_NONZERO_PATTERN, ierr)
 
     ! --- Step 5: Set up solver(s) ---
     if (physics_pc_monolithic .or. physics_pc_multi_step) then
       ! When probe_exact=.true., monolithic only builds A_approx for the diagnostic;
       ! the KSP is owned entirely by assemble_probed_exact_4x4 (avoids stale-factor issues).
-      call assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, physics_pc_probe_exact)
+      if (physics_pc_monolithic) call assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, physics_pc_probe_exact)
+      
+      ! ! Sub-block KSPs needed by the three-step (multi_step) apply:
+      ! !   ksp_psi (Atilde_11)  -> magnetic predictor
+      ! !   ksp_rho (B_55)       -> transport correction (rho)
+      ! !   ksp_T   (B_66)       -> transport correction (T)
+      ! ! Set up unconditionally: cheap, reused, keeps control flow simple.
+      ! call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time, "psi predictor KSP (Atilde_11)")
+      ! call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time, "rho-block KSP")
+      ! call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time, "T-block KSP")
+      ! g_ctx%ksp_created = .true.
 
-      ! Sub-block KSPs needed by the three-step (multi_step) apply:
-      !   ksp_psi (Atilde_11)  -> magnetic predictor
-      !   ksp_rho (B_55)       -> transport correction (rho)
-      !   ksp_T   (B_66)       -> transport correction (T)
-      ! Set up unconditionally: cheap, reused, keeps control flow simple.
-      call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time, "psi predictor KSP (Atilde_11)")
-      call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time, "rho-block KSP")
-      call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time, "T-block KSP")
-      g_ctx%ksp_created = .true.
+      !       ! Build K_A (psi,u) 2x2 MatNest from refs to existing Atilde_*/B_12.
+      ! block
+      !   Mat :: mats_nest_A(4)
+      !   if (.not. first_time) call MatDestroy(g_ctx%K_A_block, ierr)
+      !   mats_nest_A(1) = g_ctx%Atilde_11
+      !   mats_nest_A(2) = g_ctx%B_12
+      !   mats_nest_A(3) = g_ctx%Atilde_21
+      !   mats_nest_A(4) = g_ctx%Atilde_22
+      !   call MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, &
+      !                      mats_nest_A, g_ctx%K_A_block, ierr)
+      ! end block
+
+      ! ! Convert the K_A MatNest to MPIAIJ for the Alfven block solver.
+      ! if (.not. first_time) call MatDestroy(g_ctx%K_A_aij, ierr)
+      ! call MatConvert(g_ctx%K_A_block, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_A_aij, ierr)
+
+      ! ! K_A (psi,u): switchable solver (direct LU/MUMPS or toroidal mode-split PC)
+      ! ! via ALFVEN_BLOCK_SOLVER.
+      ! call setup_alfven_block_ksp(g_ctx%ksp_block_A, g_ctx%K_A_aij, comm, first_time, &
+      !                             "Alfven (psi,u)-block KSP")
+                                  
+      ! !if (physics_pc_multi_step) call setup_block_ksp(g_ctx%ksp_S_PBP, g_ctx%S_u, comm, first_time, "S_PBP KSP")
+      ! !if (physics_pc_multi_step) g_ctx%ksp_S_PBP_created = .true.
+
+      ! if (.not. g_ctx%sub_blocks_setup_done) then
+      !   call MatCreateVecs(g_ctx%K_A_aij, g_ctx%rhs_A, g_ctx%sol_A, ierr)
+      !   call MatCreateVecs(g_ctx%B_55,    g_ctx%tmp_rho, PETSC_NULL_VEC, ierr)
+      !   call MatCreateVecs(g_ctx%B_66,    g_ctx%tmp_T,   PETSC_NULL_VEC, ierr)
+      !   g_ctx%sub_blocks_setup_done = .true.
+      ! endif
 
       ! Stage-1 verification: confirm the segregated (Atilde_11, exact S_u) solve of the
       ! 2x2 Alfven block reproduces the direct A_alfven MUMPS solve to machine precision.
@@ -412,16 +448,10 @@ contains
         call verify_alfven_2x2_segregated(comm, my_id)
       endif
 
-      if (debug_physics_pc) then
-        !call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false.)
-        !call petsc_test_pc_matrix(g_ctx%A_reduced_4x4, "A_reduced_4x4", .false., my_id)
-        !call petsc_test_pc_matrix(g_ctx%M_hydro, "M_hydro", .false., my_id)
-        !call petsc_test_pc_matrix(g_ctx%A_alfven, "A_alfven_2x2", .false., my_id)
-      endif
-
       if (physics_pc_probe_exact) then
         call assemble_probed_exact_4x4(use_reassembled, comm, first_time, my_id)
-       ! call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_exact_4x4", .false.)
+        call petsc_mat_convert_spectrum(g_ctx%A_reduced_4x4, "A_exact_4x4_eq", .false.)
+        call petsc_mat_convert_spectrum(A_full, "A_full_eq", .false.)
       endif
 
     else if (physics_pc_sub_blocks) then

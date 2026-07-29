@@ -15,8 +15,8 @@ module mod_petsc_pc_physics_construction
   integer, parameter :: ALFVEN_SOLVER_DIRECT   = 1   ! PREONLY + LU + MUMPS (default)
   integer, parameter :: ALFVEN_SOLVER_TOROIDAL = 2   ! GMRES + toroidal mode-split PC
   integer, parameter :: ALFVEN_SOLVER_TOROIDAL_EXACT = 3   ! GMRES on EXACT Schur shell + toroidal PC from approx K_A_aij
-  integer, parameter :: ALFVEN_BLOCK_SOLVER    = ALFVEN_SOLVER_DIRECT
-  integer, parameter :: ALFVEN_TOROIDAL_MAXITS = 5   ! outer GMRES iters (TOROIDAL only)
+  integer, parameter :: ALFVEN_BLOCK_SOLVER = ALFVEN_SOLVER_DIRECT
+  integer, parameter :: ALFVEN_TOROIDAL_MAXITS = 4   ! outer GMRES iters (TOROIDAL only)
 
   public :: create_variable_index_sets
   public :: extract_sub_block
@@ -670,7 +670,7 @@ contains
 
     ! Toggle: .true. builds the full S_u (A+B+C); .false. recovers the old
     ! A+B-only reference. Flip and re-run to measure Channel C per arm (H5).
-    logical, parameter :: include_channel_C = .true.
+    logical, parameter :: include_channel_C = .false.
 
     KSP            :: ksp_psi_l, ksp_rho_l, ksp_T_l
     PC             :: pc_l
@@ -1260,7 +1260,7 @@ contains
         ! fieldsplit drops, at a fraction of a full direct factorization.
         call KSPSetType(ksp_block, KSPGMRES, ierr)
         call KSPGMRESSetRestart(ksp_block, ALFVEN_TOROIDAL_MAXITS, ierr)
-        rtol   = 1.0d-50   ! effectively disabled: hard-stop at ALFVEN_TOROIDAL_MAXITS iters
+        rtol   = 1.0d-4   ! effectively disabled: hard-stop at ALFVEN_TOROIDAL_MAXITS iters
         abstol = 1.0d-50
         dtol   = 1.0d4
         call KSPSetTolerances(ksp_block, rtol, abstol, dtol, ALFVEN_TOROIDAL_MAXITS, ierr)
@@ -1293,7 +1293,7 @@ contains
         call KSPSetOperators(ksp_block, g_ctx%K_A_exact_shell, B_block, ierr)
         call KSPSetType(ksp_block, KSPGMRES, ierr)
         call KSPGMRESSetRestart(ksp_block, ALFVEN_TOROIDAL_MAXITS, ierr)
-        rtol   = 1.0d-50
+        rtol   = 1.0d-4
         abstol = 1.0d-50
         dtol   = 1.0d4
         call KSPSetTolerances(ksp_block, rtol, abstol, dtol, ALFVEN_TOROIDAL_MAXITS, ierr)
@@ -1388,7 +1388,7 @@ contains
     ! Set a loose relative tolerance (e.g., 1.0d-2 = 1% error reduction)
     ! so it can exit early if it converges in 3-4 iterations.
     ! Otherwise, it will hard-stop at 'max_its'.
-    rtol   = 1.0d-2  
+    rtol   = 1.0d-3  
     abstol = 1.0d-50 ! Ignore absolute tolerance
     dtol   = 1.0d4   ! Divergence tolerance
     call KSPSetTolerances(ksp_block, rtol, abstol, dtol, max_its, ierr)
@@ -1432,7 +1432,7 @@ contains
     call KSPGMRESSetRestart(ksp_block, max_its, ierr)
     
     ! 2. Set tolerances and max iterations
-    rtol   = 1.0d-2  
+    rtol   = 1.0d-3  
     abstol = 1.0d-50 
     dtol   = 1.0d4   
     call KSPSetTolerances(ksp_block, rtol, abstol, dtol, max_its, ierr)
@@ -1482,9 +1482,12 @@ contains
     logical, intent(in) :: first_time
     character(len=*), intent(in), optional :: label
 
-    call setup_block_ksp_hypre_amg_krylov(ksp_block, B_block, comm, first_time, 3)
+    !call setup_block_ksp_hypre_amg_krylov(ksp_block, B_block, comm, first_time, 3)
+    !call setup_block_ksp_amg_krylov(ksp_block, B_block, comm, first_time, 5)
+    call setup_block_ksp(ksp_block, B_block, comm, first_time)
 
-    if (present(label)) call pc_print_block_setup(comm, label, "GMRES(3) + Hypre BoomerAMG")
+    ! if (present(label)) call pc_print_block_setup(comm, label, "GMRES(5)+GAMG")
+    if (present(label)) call pc_print_block_setup(comm, label, "MUMPS")
   end subroutine setup_rho_block_ksp
 
   !--------------------------------------------------------------------
@@ -1502,9 +1505,12 @@ contains
     logical, intent(in) :: first_time
     character(len=*), intent(in), optional :: label
 
-    call setup_block_ksp_hypre_amg_krylov(ksp_block, B_block, comm, first_time, 3)
+    !call setup_block_ksp_hypre_amg_krylov(ksp_block, B_block, comm, first_time, 3)
+    !call setup_block_ksp_amg_krylov(ksp_block, B_block, comm, first_time, 5)
+    call setup_block_ksp(ksp_block, B_block, comm, first_time)
 
-    if (present(label)) call pc_print_block_setup(comm, label, "GMRES(3) + Hypre BoomerAMG")
+    !if (present(label)) call pc_print_block_setup(comm, label, "GMRES(5)+GAMG")
+    if (present(label)) call pc_print_block_setup(comm, label, "MUMPS")
   end subroutine setup_T_block_ksp
 
   !--------------------------------------------------------------------

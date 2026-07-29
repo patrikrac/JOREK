@@ -149,7 +149,7 @@ module mod_petsc_pc_physics_ctx
     Vec     :: spbpd_zT,   spbpd_yT           !< T-sized scratch   (channels B/C)
     Vec     :: spbpd_ru                       !< u-sized channel accumulator scratch
     Vec     :: spbpd_relax                    !< psi-sized per-harmonic TOROIDAL resistive relaxation factor
-    logical :: spbpd_use_toroidal_relax = .true.  !< toggle: apply spbpd_relax to ypsi
+    logical :: spbpd_use_toroidal_relax = .false.  !< toggle: apply spbpd_relax to ypsi
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx

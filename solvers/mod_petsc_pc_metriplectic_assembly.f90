@@ -22,7 +22,7 @@ module mod_petsc_pc_metriplectic_assembly
   ! --- TEMPORARY diagnostic: per-block stiffness-norm log (note Sec.
   ! "Coefficient table"). Flip to .false. to disable; delete this block
   ! and its call site in metriplectic_build_sweep once no longer needed. ---
-  logical, parameter :: LOG_STIFFNESS_METRICS = .true.
+  logical, parameter :: LOG_STIFFNESS_METRICS_SWITCH = .true.
   character(len=*), parameter :: STIFFNESS_LOG_FILE = 'metriplectic_stiffness.dat'
   logical, save :: g_stiffness_header_written = .false.
 
@@ -144,7 +144,7 @@ contains
     ! TEMPORARY diagnostic: fires here (not in metriplectic_build_sweep) so
     ! it also covers the analysis-only path (use_metriplectic_pc=.false.,
     ! metriplectic_analysis=.true.), which never calls build_sweep.
-    if (LOG_STIFFNESS_METRICS) &
+    if (LOG_STIFFNESS_METRICS_SWITCH) &
       call log_stiffness_metrics(my_id, 1.d0 + time_evol_zeta, &
                                  g_mctx%dt_theta * (1.d0 + time_evol_zeta))
   end subroutine metriplectic_assemble
@@ -534,6 +534,8 @@ contains
           "[Metriplectic] sweep built (pair solves + P_u Schur K-half); tau = ", g_mctx%dt_theta
       end select
     endif
+
+    if (LOG_STIFFNESS_METRICS_SWITCH) call log_stiffness_metrics(my_id, opz, tdt)
   end subroutine metriplectic_build_sweep
 
 

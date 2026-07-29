@@ -620,6 +620,7 @@ contains
     else
       ! solve_only: update A for mat-vec products but reuse PC factorization
       if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
+      if (commutator_analysis)   call petsc_commutator_run_analysis(petsc_sys%A_aij, my_id)
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
@@ -1010,7 +1011,7 @@ contains
   ! Wrapper to pack the JOREK state vector and call the energy tracking
   !====================================================================
   subroutine petsc_metriplectic_pack_and_track(petsc_sys, mhd_sim, time, istep, my_id)
-    use data_structure, only: type_MHD_SIM
+    use mod_simulation_data, only: type_MHD_SIM
     use mod_parameters, only: n_var, n_tor, n_degrees
     use phys_module, only: keep_n0_const, treat_axis, metriplectic_analysis
     use mod_axis_treatment, only: new_to_old_dofs_on_the_axis
