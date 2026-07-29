@@ -457,6 +457,7 @@ contains
     if (my_id .eq. 0) print *, "Solving the system using PETSc"
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b, petsc_sys%x, ierr))
     PetscCallA(KSPDestroy(petsc_sys%ksp, ierr))
+    petsc_sys%ksp_ready = .false.
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
@@ -624,7 +625,9 @@ contains
 
     PetscCallA(VecGetArray(x_seq, x_arr, ierr))
 
-    sol_vec%val(:) = x_arr(:)
+    if (associated(sol_vec%val)) then
+      sol_vec%val(1:sol_vec%n) = x_arr(1:sol_vec%n)
+    end if
 
     PetscCallA(VecRestoreArray(x_seq, x_arr, ierr))
 
@@ -659,6 +662,7 @@ contains
     n_global = a_mat%ng
 
     call MatCreate(comm, petsc_sys%A, ierr)
+
     if (n_cpu .eq. 1) then
       n_local = a_mat%ng
       call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
@@ -675,7 +679,8 @@ contains
     else
       call MatSetSizes(petsc_sys%A, PETSC_DECIDE, PETSC_DECIDE, n_global, n_global, ierr)
       call MatSetType(petsc_sys%A, MATAIJ, ierr)
-      call MatSetUp(petsc_sys%A, ierr)   ! dynamic allocation; assembly is rank-0 only, perf secondary
+      call MatMPIAIJSetPreallocation(petsc_sys%A, n_global, PETSC_NULL_INTEGER_ARRAY, &
+                                      n_global, PETSC_NULL_INTEGER_ARRAY, ierr)
     endif
 
     call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
@@ -764,7 +769,7 @@ contains
   ! Wrapper to pack the JOREK state vector and call the energy tracking
   !====================================================================
   subroutine petsc_metriplectic_pack_and_track(petsc_sys, mhd_sim, time, istep, my_id)
-    use data_structure, only: type_MHD_SIM
+    use mod_simulation_data, only: type_MHD_SIM
     use mod_parameters, only: n_var, n_tor, n_degrees
     use phys_module, only: keep_n0_const, treat_axis, metriplectic_analysis
     use mod_axis_treatment, only: new_to_old_dofs_on_the_axis

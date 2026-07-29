@@ -123,15 +123,12 @@ contains
     ! shell with the (u,w) pair layout
     call MatGetLocalSize(g_mctx%A_pair_uw, n_loc, PETSC_NULL_INTEGER, ierr)
     call MatGetSize(g_mctx%A_pair_uw, n_glob, PETSC_NULL_INTEGER, ierr)
-    PetscCallA(MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, &
-                              PETSC_NULL_INTEGER, g_mctx%S_uw_shell, ierr))
-    PetscCallA(MatShellSetOperation(g_mctx%S_uw_shell, MATOP_MULT, &
-                                    metriplectic_Suw_mult, ierr))
+    PetscCallA(MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, PETSC_NULL_INTEGER, g_mctx%S_uw_shell, ierr))
+    PetscCallA(MatShellSetOperation(g_mctx%S_uw_shell, MATOP_MULT, metriplectic_Suw_mult, ierr))
 
     ! inner Schur solver: FGMRES(S_uw) with P_uw^-1 (via ksp_Puw) as PC
     PetscCallA(KSPCreate(comm, g_mctx%ksp_Suw, ierr))
-    PetscCallA(KSPSetOperators(g_mctx%ksp_Suw, g_mctx%S_uw_shell, &
-                               g_mctx%S_uw_shell, ierr))
+    PetscCallA(KSPSetOperators(g_mctx%ksp_Suw, g_mctx%S_uw_shell, g_mctx%S_uw_shell, ierr))
     PetscCallA(KSPSetType(g_mctx%ksp_Suw, KSPFGMRES, ierr))
     PetscCallA(KSPGetPC(g_mctx%ksp_Suw, pc, ierr))
     PetscCallA(PCSetType(pc, PCSHELL, ierr))
@@ -478,15 +475,15 @@ contains
     call VecGetLocalSize(x_full, n_local, ierr)
     bs = n_var * n_tor
     n_block_local = n_local / bs
-    call VecGetArrayReadF90(x_full, ax, ierr)
-    call VecGetArrayF90(x_sub, as, ierr)
+    call VecGetArrayRead(x_full, ax, ierr)
+    call VecGetArray(x_sub, as, ierr)
     do i = 0, n_block_local - 1
       do m = 1, n_tor
         as(i*n_tor + m) = ax(i*bs + (v-1)*n_tor + m)
       enddo
     enddo
-    call VecRestoreArrayReadF90(x_full, ax, ierr)
-    call VecRestoreArrayF90(x_sub, as, ierr)
+    call VecRestoreArrayRead(x_full, ax, ierr)
+    call VecRestoreArray(x_sub, as, ierr)
   end subroutine copy_var_out
 
   subroutine copy_var_in(y_full, v, y_sub, ierr)
@@ -501,15 +498,15 @@ contains
     call VecGetLocalSize(y_full, n_local, ierr)
     bs = n_var * n_tor
     n_block_local = n_local / bs
-    call VecGetArrayF90(y_full, ay, ierr)
-    call VecGetArrayReadF90(y_sub, as, ierr)
+    call VecGetArray(y_full, ay, ierr)
+    call VecGetArrayRead(y_sub, as, ierr)
     do i = 0, n_block_local - 1
       do m = 1, n_tor
         ay(i*bs + (v-1)*n_tor + m) = as(i*n_tor + m)
       enddo
     enddo
-    call VecRestoreArrayF90(y_full, ay, ierr)
-    call VecRestoreArrayReadF90(y_sub, as, ierr)
+    call VecRestoreArray(y_full, ay, ierr)
+    call VecRestoreArrayRead(y_sub, as, ierr)
   end subroutine copy_var_in
 
 
@@ -524,12 +521,12 @@ contains
     PetscInt :: n1, n2
 
     call VecGetLocalSize(x1, n1, ierr); call VecGetLocalSize(x2, n2, ierr)
-    call VecGetArrayReadF90(x1, a1, ierr); call VecGetArrayReadF90(x2, a2, ierr)
-    call VecGetArrayF90(y, ay, ierr)
+    call VecGetArrayRead(x1, a1, ierr); call VecGetArrayRead(x2, a2, ierr)
+    call VecGetArray(y, ay, ierr)
     ay(1:n1)       = a1(1:n1)
     ay(n1+1:n1+n2) = a2(1:n2)
-    call VecRestoreArrayReadF90(x1, a1, ierr); call VecRestoreArrayReadF90(x2, a2, ierr)
-    call VecRestoreArrayF90(y, ay, ierr)
+    call VecRestoreArrayRead(x1, a1, ierr); call VecRestoreArrayRead(x2, a2, ierr)
+    call VecRestoreArray(y, ay, ierr)
   end subroutine pack_2v
 
   subroutine unpack_2v(x, y1, y2, ierr)
@@ -539,12 +536,12 @@ contains
     PetscInt :: n1, n2
 
     call VecGetLocalSize(y1, n1, ierr); call VecGetLocalSize(y2, n2, ierr)
-    call VecGetArrayReadF90(x, ax, ierr)
-    call VecGetArrayF90(y1, a1, ierr); call VecGetArrayF90(y2, a2, ierr)
+    call VecGetArrayRead(x, ax, ierr)
+    call VecGetArray(y1, a1, ierr); call VecGetArray(y2, a2, ierr)
     a1(1:n1) = ax(1:n1)
     a2(1:n2) = ax(n1+1:n1+n2)
-    call VecRestoreArrayReadF90(x, ax, ierr)
-    call VecRestoreArrayF90(y1, a1, ierr); call VecRestoreArrayF90(y2, a2, ierr)
+    call VecRestoreArrayRead(x, ax, ierr)
+    call VecRestoreArray(y1, a1, ierr); call VecRestoreArray(y2, a2, ierr)
   end subroutine unpack_2v
 
   subroutine pack_4v(x1, x2, x3, x4, y, ierr)
@@ -555,16 +552,16 @@ contains
 
     call VecGetLocalSize(x1, n1, ierr); call VecGetLocalSize(x2, n2, ierr)
     call VecGetLocalSize(x3, n3, ierr); call VecGetLocalSize(x4, n4, ierr)
-    call VecGetArrayReadF90(x1, a1, ierr); call VecGetArrayReadF90(x2, a2, ierr)
-    call VecGetArrayReadF90(x3, a3, ierr); call VecGetArrayReadF90(x4, a4, ierr)
-    call VecGetArrayF90(y, ay, ierr)
+    call VecGetArrayRead(x1, a1, ierr); call VecGetArrayRead(x2, a2, ierr)
+    call VecGetArrayRead(x3, a3, ierr); call VecGetArrayRead(x4, a4, ierr)
+    call VecGetArray(y, ay, ierr)
     ay(1:n1)                   = a1(1:n1)
     ay(n1+1:n1+n2)             = a2(1:n2)
     ay(n1+n2+1:n1+n2+n3)       = a3(1:n3)
     ay(n1+n2+n3+1:n1+n2+n3+n4) = a4(1:n4)
-    call VecRestoreArrayReadF90(x1, a1, ierr); call VecRestoreArrayReadF90(x2, a2, ierr)
-    call VecRestoreArrayReadF90(x3, a3, ierr); call VecRestoreArrayReadF90(x4, a4, ierr)
-    call VecRestoreArrayF90(y, ay, ierr)
+    call VecRestoreArrayRead(x1, a1, ierr); call VecRestoreArrayRead(x2, a2, ierr)
+    call VecRestoreArrayRead(x3, a3, ierr); call VecRestoreArrayRead(x4, a4, ierr)
+    call VecRestoreArray(y, ay, ierr)
   end subroutine pack_4v
 
   subroutine unpack_4v(x, y1, y2, y3, y4, ierr)
@@ -575,16 +572,16 @@ contains
 
     call VecGetLocalSize(y1, n1, ierr); call VecGetLocalSize(y2, n2, ierr)
     call VecGetLocalSize(y3, n3, ierr); call VecGetLocalSize(y4, n4, ierr)
-    call VecGetArrayReadF90(x, ax, ierr)
-    call VecGetArrayF90(y1, a1, ierr); call VecGetArrayF90(y2, a2, ierr)
-    call VecGetArrayF90(y3, a3, ierr); call VecGetArrayF90(y4, a4, ierr)
+    call VecGetArrayRead(x, ax, ierr)
+    call VecGetArray(y1, a1, ierr); call VecGetArray(y2, a2, ierr)
+    call VecGetArray(y3, a3, ierr); call VecGetArray(y4, a4, ierr)
     a1(1:n1) = ax(1:n1)
     a2(1:n2) = ax(n1+1:n1+n2)
     a3(1:n3) = ax(n1+n2+1:n1+n2+n3)
     a4(1:n4) = ax(n1+n2+n3+1:n1+n2+n3+n4)
-    call VecRestoreArrayReadF90(x, ax, ierr)
-    call VecRestoreArrayF90(y1, a1, ierr); call VecRestoreArrayF90(y2, a2, ierr)
-    call VecRestoreArrayF90(y3, a3, ierr); call VecRestoreArrayF90(y4, a4, ierr)
+    call VecRestoreArrayRead(x, ax, ierr)
+    call VecRestoreArray(y1, a1, ierr); call VecRestoreArray(y2, a2, ierr)
+    call VecRestoreArray(y3, a3, ierr); call VecRestoreArray(y4, a4, ierr)
   end subroutine unpack_4v
 
 #endif

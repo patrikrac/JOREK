@@ -136,7 +136,7 @@ contains
     mats_nest( 5) = B21;  mats_nest( 6) = B22;  mats_nest( 7) = B23;  mats_nest( 8) = B24
     mats_nest( 9) = B31;  mats_nest(11) = B33
     mats_nest(14) = B42;  mats_nest(16) = B44
-    PetscCallA(MatCreateNest(comm, 4, PETSC_NULL_IS, 4, PETSC_NULL_IS, mats_nest, A_nest, ierr))
+    PetscCallA(MatCreateNest(comm, 4, PETSC_NULL_IS_ARRAY, 4, PETSC_NULL_IS_ARRAY, mats_nest, A_nest, ierr))
     PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, m_A4, ierr))
     PetscCallA(MatDestroy(A_nest, ierr))
 
@@ -252,16 +252,16 @@ contains
 
     call VecGetLocalSize(x1, n1, ierr); call VecGetLocalSize(x2, n2, ierr)
     call VecGetLocalSize(x3, n3, ierr); call VecGetLocalSize(x4, n4, ierr)
-    call VecGetArrayReadF90(x1, a1, ierr); call VecGetArrayReadF90(x2, a2, ierr)
-    call VecGetArrayReadF90(x3, a3, ierr); call VecGetArrayReadF90(x4, a4, ierr)
-    call VecGetArrayF90(y, ay, ierr)
+    call VecGetArrayRead(x1, a1, ierr); call VecGetArrayRead(x2, a2, ierr)
+    call VecGetArrayRead(x3, a3, ierr); call VecGetArrayRead(x4, a4, ierr)
+    call VecGetArray(y, ay, ierr)
     ay(1:n1)                   = a1(1:n1)
     ay(n1+1:n1+n2)             = a2(1:n2)
     ay(n1+n2+1:n1+n2+n3)       = a3(1:n3)
     ay(n1+n2+n3+1:n1+n2+n3+n4) = a4(1:n4)
-    call VecRestoreArrayReadF90(x1, a1, ierr); call VecRestoreArrayReadF90(x2, a2, ierr)
-    call VecRestoreArrayReadF90(x3, a3, ierr); call VecRestoreArrayReadF90(x4, a4, ierr)
-    call VecRestoreArrayF90(y, ay, ierr)
+    call VecRestoreArrayRead(x1, a1, ierr); call VecRestoreArrayRead(x2, a2, ierr)
+    call VecRestoreArrayRead(x3, a3, ierr); call VecRestoreArrayRead(x4, a4, ierr)
+    call VecRestoreArray(y, ay, ierr)
   end subroutine pack_4v
 
   subroutine unpack_4v(x, y1, y2, y3, y4, ierr)
@@ -271,16 +271,16 @@ contains
     PetscInt :: n1, n2, n3, n4
     call VecGetLocalSize(y1, n1, ierr); call VecGetLocalSize(y2, n2, ierr)
     call VecGetLocalSize(y3, n3, ierr); call VecGetLocalSize(y4, n4, ierr)
-    call VecGetArrayReadF90(x, ax, ierr)
-    call VecGetArrayF90(y1, a1, ierr); call VecGetArrayF90(y2, a2, ierr)
-    call VecGetArrayF90(y3, a3, ierr); call VecGetArrayF90(y4, a4, ierr)
+    call VecGetArrayRead(x, ax, ierr)
+    call VecGetArray(y1, a1, ierr); call VecGetArray(y2, a2, ierr)
+    call VecGetArray(y3, a3, ierr); call VecGetArray(y4, a4, ierr)
     a1(1:n1) = ax(1:n1)
     a2(1:n2) = ax(n1+1:n1+n2)
     a3(1:n3) = ax(n1+n2+1:n1+n2+n3)
     a4(1:n4) = ax(n1+n2+n3+1:n1+n2+n3+n4)
-    call VecRestoreArrayReadF90(x, ax, ierr)
-    call VecRestoreArrayF90(y1, a1, ierr); call VecRestoreArrayF90(y2, a2, ierr)
-    call VecRestoreArrayF90(y3, a3, ierr); call VecRestoreArrayF90(y4, a4, ierr)
+    call VecRestoreArrayRead(x, ax, ierr)
+    call VecRestoreArray(y1, a1, ierr); call VecRestoreArray(y2, a2, ierr)
+    call VecRestoreArray(y3, a3, ierr); call VecRestoreArray(y4, a4, ierr)
   end subroutine unpack_4v
 
 
@@ -399,7 +399,7 @@ contains
       if (ierr == 0) then
         call KSPGetConvergedReason(ksp_chol, reason, ierr)
         if (ierr == 0) then
-          if (reason > 0) spd_verdict = "PASS"
+          if (reason%v > 0) spd_verdict = "PASS"
         endif
       endif
       call KSPDestroy(ksp_chol, ierr)
@@ -536,7 +536,7 @@ contains
     mats_nest( 5) = Dp_s;    mats_nest( 6) = Lrho_s
     mats_nest( 9) = m_B31;   mats_nest(11) = m_B33
     mats_nest(14) = m_B42;   mats_nest(16) = m_B44
-    PetscCallA(MatCreateNest(comm, 4, PETSC_NULL_IS, 4, PETSC_NULL_IS, mats_nest, A_nest, ierr))
+    PetscCallA(MatCreateNest(comm, 4, PETSC_NULL_IS_ARRAY, 4, PETSC_NULL_IS_ARRAY, mats_nest, A_nest, ierr))
     PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, A_id, ierr))
     PetscCallA(MatDestroy(A_nest, ierr))
 
@@ -641,7 +641,7 @@ contains
     PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
     PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
     converged_txt = "not converged"
-    if (reason > 0) converged_txt = "converged"
+    if (reason%v > 0) converged_txt = "converged"
     PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
 
     do i = 1, neig-1
@@ -820,7 +820,7 @@ contains
       PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
       PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
       converged_txt = "not converged"
-      if (reason > 0) converged_txt = "converged"
+      if (reason%v > 0) converged_txt = "converged"
       PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
 
       ! Sort Ritz values by real part (selection sort; neig <= 60)
@@ -983,7 +983,7 @@ contains
       PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
       PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
       converged_txt = "not converged"
-      if (reason > 0) converged_txt = "converged"
+      if (reason%v > 0) converged_txt = "converged"
       PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
 
       do i = 1, neig-1
@@ -1062,7 +1062,7 @@ contains
     PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
     PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
     converged_txt = "not converged"
-    if (reason > 0) converged_txt = "converged"
+    if (reason%v > 0) converged_txt = "converged"
     PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
 
     do i = 1, neig-1
@@ -1259,7 +1259,7 @@ contains
     PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
     PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
     converged_txt = "not converged"
-    if (reason > 0) converged_txt = "converged"
+    if (reason%v > 0) converged_txt = "converged"
     PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
 
     do i = 1, neig-1
@@ -1361,7 +1361,7 @@ contains
       PetscCallA(KSPGetIterationNumber(ksp, its, ierr))
       PetscCallA(KSPGetConvergedReason(ksp, reason, ierr))
       converged_txt = "not converged"
-      if (reason > 0) converged_txt = "converged"
+      if (reason%v > 0) converged_txt = "converged"
       PetscCallA(KSPComputeEigenvalues(ksp, 60, r_eig, c_eig, neig, ierr))
 
       do i = 1, neig-1

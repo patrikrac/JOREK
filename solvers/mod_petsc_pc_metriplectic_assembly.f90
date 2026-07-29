@@ -22,7 +22,7 @@ module mod_petsc_pc_metriplectic_assembly
   ! --- TEMPORARY diagnostic: per-block stiffness-norm log (note Sec.
   ! "Coefficient table"). Flip to .false. to disable; delete this block
   ! and its call site in metriplectic_build_sweep once no longer needed. ---
-  logical, parameter :: LOG_STIFFNESS_METRICS = .true.
+  logical, parameter :: ENABLE_STIFFNESS_LOG = .true.
   character(len=*), parameter :: STIFFNESS_LOG_FILE = 'metriplectic_stiffness.dat'
   logical, save :: g_stiffness_header_written = .false.
 
@@ -144,7 +144,7 @@ contains
     ! TEMPORARY diagnostic: fires here (not in metriplectic_build_sweep) so
     ! it also covers the analysis-only path (use_metriplectic_pc=.false.,
     ! metriplectic_analysis=.true.), which never calls build_sweep.
-    if (LOG_STIFFNESS_METRICS) &
+    if (ENABLE_STIFFNESS_LOG) &
       call log_stiffness_metrics(my_id, 1.d0 + time_evol_zeta, &
                                  g_mctx%dt_theta * (1.d0 + time_evol_zeta))
   end subroutine metriplectic_assemble
@@ -164,8 +164,7 @@ contains
       PetscCallA(MatDestroy(g_mctx%P_u, ierr))
     endif
     PetscCallA(MatDuplicate(g_mctx%L_rho, MAT_COPY_VALUES, g_mctx%P_u, ierr))
-    PetscCallA(MatAXPY(g_mctx%P_u, dt_theta_in**2, g_mctx%W_para, &
-                       DIFFERENT_NONZERO_PATTERN, ierr))
+    PetscCallA(MatAXPY(g_mctx%P_u, dt_theta_in**2, g_mctx%W_para, DIFFERENT_NONZERO_PATTERN, ierr))
     g_mctx%P_u_created = .true.
   end subroutine metriplectic_compose_P_u
 
@@ -204,8 +203,7 @@ contains
           indices(k) = rstart + i * block_size + (v-1) * n_tor + m
         enddo
       enddo
-      PetscCallA(ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, &
-                                 g_mctx%is_var(v), ierr))
+      PetscCallA(ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, g_mctx%is_var(v), ierr))
     enddo
     deallocate(indices)
     g_mctx%is_created = .true.
@@ -217,8 +215,7 @@ contains
     integer, intent(in) :: eq_row, var_col
     Mat, intent(out)    :: B
     PetscErrorCode :: ierr
-    PetscCallA(MatCreateSubMatrix(A_full, g_mctx%is_var(eq_row), g_mctx%is_var(var_col), &
-                                  MAT_INITIAL_MATRIX, B, ierr))
+    PetscCallA(MatCreateSubMatrix(A_full, g_mctx%is_var(eq_row), g_mctx%is_var(var_col), MAT_INITIAL_MATRIX, B, ierr))
   end subroutine extract_block
 
 
@@ -364,13 +361,13 @@ contains
     mats2 = PETSC_NULL_MAT
     mats2(1) = B11;           mats2(2) = B13
     mats2(3) = g_mctx%B_31s;  mats2(4) = g_mctx%B_33s
-    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, mats2, A_nest, ierr))
+    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats2, A_nest, ierr))
     PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_mctx%A_pair_psij, ierr))
     PetscCallA(MatDestroy(A_nest, ierr))
 
     mats2(1) = B22;           mats2(2) = B24
     mats2(3) = g_mctx%B_42s;  mats2(4) = g_mctx%B_44s
-    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, mats2, A_nest, ierr))
+    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats2, A_nest, ierr))
     PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_mctx%A_pair_uw, ierr))
     PetscCallA(MatDestroy(A_nest, ierr))
     ! (B11/B13/B22/B24 stay alive: A_k4 and P_uw below reuse them)
@@ -392,7 +389,7 @@ contains
       PetscCallA(MatScale(Ls, -opz, ierr))
       mats2(1) = Mps;  mats2(2) = Ds
       mats2(3) = Dps;  mats2(4) = Ls
-      PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, mats2, A_nest, ierr))
+      PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats2, A_nest, ierr))
       PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_mctx%A_kideal, ierr))
       PetscCallA(MatDestroy(A_nest, ierr))
       PetscCallA(MatDestroy(Mps, ierr)); PetscCallA(MatDestroy(Ls, ierr))
@@ -409,7 +406,7 @@ contains
       mats4( 8) = B24
       mats4( 9) = g_mctx%B_31s;  mats4(11) = g_mctx%B_33s
       mats4(14) = g_mctx%B_42s;  mats4(16) = g_mctx%B_44s
-      PetscCallA(MatCreateNest(comm, 4, PETSC_NULL_IS, 4, PETSC_NULL_IS, mats4, A_nest, ierr))
+      PetscCallA(MatCreateNest(comm, 4, PETSC_NULL_IS_ARRAY, 4, PETSC_NULL_IS_ARRAY, mats4, A_nest, ierr))
       PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_mctx%A_k4, ierr))
       PetscCallA(MatDestroy(A_nest, ierr))
     endif
@@ -422,12 +419,11 @@ contains
     if (build_ps) then
       PetscCallA(MatDuplicate(B22, MAT_COPY_VALUES, B22c, ierr))
       PetscCallA(MatConvert(g_mctx%W_para, MATMPIAIJ, MAT_INITIAL_MATRIX, Wp_aij, ierr))
-      PetscCallA(MatAXPY(B22c, -opz*g_mctx%dt_theta**2, Wp_aij, &
-                         DIFFERENT_NONZERO_PATTERN, ierr))
+      PetscCallA(MatAXPY(B22c, -opz*g_mctx%dt_theta**2, Wp_aij, DIFFERENT_NONZERO_PATTERN, ierr))
       PetscCallA(MatDestroy(Wp_aij, ierr))
       mats2(1) = B22c;          mats2(2) = B24
       mats2(3) = g_mctx%B_42s;  mats2(4) = g_mctx%B_44s
-      PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS, 2, PETSC_NULL_IS, mats2, A_nest, ierr))
+      PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats2, A_nest, ierr))
       PetscCallA(MatConvert(A_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_mctx%P_uw, ierr))
       PetscCallA(MatDestroy(A_nest, ierr))
       PetscCallA(MatDestroy(B22c, ierr))
@@ -455,12 +451,9 @@ contains
     if (.not. g_mctx%sweep_once_done) then
       call setup_lu_ksp(g_mctx%B_33s, g_mctx%ksp_B33, comm, symmetric=.false.)
       call setup_lu_ksp(g_mctx%B_44s, g_mctx%ksp_B44, comm, symmetric=.false.)
-      PetscCallA(MatCreateVecs(g_mctx%A_pair_psij, g_mctx%wv_pair_psij_1, &
-                               g_mctx%wv_pair_psij_2, ierr))
-      PetscCallA(MatCreateVecs(g_mctx%A_pair_uw,   g_mctx%wv_pair_uw_1, &
-                               g_mctx%wv_pair_uw_2, ierr))
-      PetscCallA(MatCreateVecs(g_mctx%A_pair_uw,   g_mctx%wv_uw_1, &
-                               g_mctx%wv_uw_2, ierr))
+      PetscCallA(MatCreateVecs(g_mctx%A_pair_psij, g_mctx%wv_pair_psij_1, g_mctx%wv_pair_psij_2, ierr))
+      PetscCallA(MatCreateVecs(g_mctx%A_pair_uw,   g_mctx%wv_pair_uw_1, g_mctx%wv_pair_uw_2, ierr))
+      PetscCallA(MatCreateVecs(g_mctx%A_pair_uw,   g_mctx%wv_uw_1, g_mctx%wv_uw_2, ierr))
       if (build_k2) then
         PetscCallA(MatCreateVecs(g_mctx%A_kideal, g_mctx%wv_kid_1, g_mctx%wv_kid_2, ierr))
       endif

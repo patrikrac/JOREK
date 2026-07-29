@@ -175,8 +175,7 @@ subroutine construct_metriplectic_matrices(my_id, local_elms, n_local_elms, a_ma
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(M_psi, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(M_psi, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- D_op ---
@@ -189,8 +188,7 @@ subroutine construct_metriplectic_matrices(my_id, local_elms, n_local_elms, a_ma
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(D_op, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(D_op, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Dp_op ---
@@ -203,8 +201,7 @@ subroutine construct_metriplectic_matrices(my_id, local_elms, n_local_elms, a_ma
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(Dp_op, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(Dp_op, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Dp_struct ---
@@ -217,8 +214,7 @@ subroutine construct_metriplectic_matrices(my_id, local_elms, n_local_elms, a_ma
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(Dp_struct, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(Dp_struct, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- L_rho ---
@@ -231,8 +227,7 @@ subroutine construct_metriplectic_matrices(my_id, local_elms, n_local_elms, a_ma
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(L_rho, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(L_rho, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- W_para ---
@@ -245,8 +240,7 @@ subroutine construct_metriplectic_matrices(my_id, local_elms, n_local_elms, a_ma
               enddo
             enddo
             !$omp critical
-            PetscCallA(MatSetValuesBlocked(W_para, 1, idxm, 1, idxn, &
-                                     buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(W_para, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
           enddo  ! k_order
