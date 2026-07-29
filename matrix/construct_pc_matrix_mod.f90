@@ -182,6 +182,7 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
             enddo
             !$omp critical
             PetscCallA(MatSetValuesBlocked(A_j, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(A_j, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for A_w ---
@@ -1133,17 +1134,7 @@ subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
   ! --- Zero the matrix rows and set the eliminated diagonal ---
   ! Default 1.0d0 ensures the standalone matrix is non-singular.
   ! PETSC_NULL_VEC tells PETSc not to touch the RHS or Solution vectors.
-  dv = 1.0d0
-  if (present(diag_value)) dv = diag_value
-  if (present(symmetric)) then
-    if (symmetric) then
-      PetscCallA(MatZeroRowsColumns(pc_mat, n_rows_to_zero, rows_to_zero, dv, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
-    else
-      PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, dv, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
-    endif
-  else
-    PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, dv, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
-  endif
+  PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
 
   deallocate(rows_to_zero)
 #endif
