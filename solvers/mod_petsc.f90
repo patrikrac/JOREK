@@ -298,127 +298,6 @@ contains
   end subroutine petsc_update_initial_guess
 
 
-  subroutine petsc_print_matrix_info(petsc_sys)
-    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    PetscErrorCode :: ierr
-    integer ::  my_id, comm, mpierr
-    logical :: speaker
-    PetscInt :: M, N
-    MatInfo :: info
-    PetscReal :: norm
-    PetscBool :: flg
-
-    call PetscObjectGetComm(petsc_sys%A, comm, ierr)
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-
-    speaker = (my_id .eq. 0)
-
-    if (speaker) print *, "Start PETSC Matrix info ---"
-    call MatGetSize(petsc_sys%A, M, N, ierr)
-    if (speaker) print *, "Matrix size M = ", M, " ; N = ", N
-    call MatGetInfo(petsc_sys%A, MAT_GLOBAL_SUM, info, ierr)
-    if (speaker) then
-       print "(A, I0)", " NNZ used = ", int(info%nz_used)
-       print "(A, I0)", " NNZ stored = ", int(info%nz_allocated)
-    endif
-
-    if (speaker) print *, "End PETSC Matrix info ---"
-
-  end subroutine petsc_print_matrix_info
-
-
-  subroutine petsc_test_matv(petsc_sys, a_mat)
-    use data_structure, only: type_SP_MATRIX
-    use mod_matv, only: bcsr_matv
-
-    type(type_PETSC_SYSTEM), intent(in) :: petsc_sys
-    type(type_SP_MATRIX), intent(in) :: a_mat
-    PetscErrorCode :: ierr
-    integer :: comm, my_id, mpi_err
-    integer :: i
-    real*8, allocatable :: x_global(:)
-    real*8, allocatable :: y_jorek(:)
-    real*8 :: jorek_sum_sq, jorek_norm, petsc_norm
-    Vec :: x, y_petsc
-    PetscInt :: i_start, i_end, n_local
-    PetscScalar, pointer :: x_arr(:)
-    PetscLogDouble :: t1, t2, t3, t4
-
-    comm = a_mat%comm
-
-    allocate(x_global(a_mat%ng))
-    allocate(y_jorek(a_mat%ng))
-
-    call MPI_Comm_rank(MPI_COMM_WORLD, my_id, mpi_err)
-
-    if (my_id .eq. 0) then
-      call random_seed()
-      call random_number(x_global)
-      x_global = x_global * 1e-3
-    endif
-
-    call MPI_Bcast(x_global, a_mat%ng, MPI_DOUBLE_PRECISION, 0, comm, mpi_err)
-
-    if (my_id .eq.0) then
-      jorek_sum_sq = 0.0d0
-      do i = 1,a_mat%ng
-        jorek_sum_sq = jorek_sum_sq + (x_global(i))**2
-      enddo
-      jorek_norm = sqrt(jorek_sum_sq)
-      print *, "JOREK Manual Norm (x): ", jorek_norm
-    endif
-
-
-    call MatCreateVecs(petsc_sys%A, x, PETSC_NULL_VEC, ierr)
-    call VecGetOwnershipRange(x, i_start, i_end, ierr)
-    n_local = i_end - i_start
-    call VecGetArray(x, x_arr, ierr)
-    do i = 1, n_local
-      x_arr(i) = x_global(i_start + i)  ! i_start+1 to i_end maps to x_global indices
-    enddo
-    call VecRestoreArray(x, x_arr, ierr)
-    call VecAssemblyBegin(x, ierr)
-    call VecAssemblyEnd(x, ierr)
-
-    call VecNorm(x, NORM_2, petsc_norm, ierr)
-    if (my_id .eq.0) print *, "PETSc Norm (x): ", petsc_norm
-
-    call MatCreateVecs(petsc_sys%A, PETSC_NULL_VEC, y_petsc, ierr)
-    call PetscTime(t1, ierr)
-    PetscCallA(MatMult(petsc_sys%A, x, y_petsc, ierr))
-    call PetscTime(t2, ierr)
-
-    call PetscTime(t3, ierr)
-    call bcsr_matv(a_mat, x_global, y_jorek)
-    call PetscTime(t4, ierr)
-
-    if (my_id .eq.0) then
-      jorek_sum_sq = 0.0d0
-      do i = 1,a_mat%ng
-        jorek_sum_sq = jorek_sum_sq + (y_jorek(i))**2
-      enddo
-      jorek_norm = sqrt(jorek_sum_sq)
-    endif
-
-    call VecNorm(y_petsc, NORM_2, petsc_norm, ierr)
-
-    if (my_id .eq. 0) then
-      print *, ""
-      print *, "===== MATVEC COMPARISON ====="
-      print *, "PETSc MatMult time: ", t2-t1
-      print *, "JOREK MatVec time:  ", t4-t3
-      print *, ""
-
-      print *, "JOREK Norm: ", jorek_norm
-      print *, "PETSc norm: ", petsc_norm
-    endif
-
-    deallocate(x_global, y_jorek)
-    call VecDestroy(x, ierr)
-    call VecDestroy(y_petsc, ierr)
-  end subroutine petsc_test_matv
-
-
   subroutine petsc_solve_and_retrieve(petsc_sys)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
 
@@ -573,7 +452,7 @@ contains
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
     n_iter    = its
-    converged = (reason%v > 0)
+    converged = (reason > 0)
 
     if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
 
