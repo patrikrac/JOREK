@@ -169,6 +169,12 @@ module phys_module
   character(len=2) :: metriplectic_khalf  !< K-half solve mode (spec Sec. 7.3): 'PS' pair-Schur LDU (default), 'K4' coupled 4-field LU (reference), 'K2' coupled 2x2 model-Alfven LU, 'PU' segregated P_u Schur path
   integer :: metriplectic_ps_inner_it     !< 'PS' inner Schur FGMRES iterations (0 = single-pass P_uw^-1, default)
   real(kind=8) :: metriplectic_ps_inner_tol !< 'PS' inner Schur relative tolerance
+  logical :: commutator_analysis          !< Run commutator-operator (M_*) intertwining-defect analysis (candidates M0-M4, eps per toroidal harmonic) at first solve
+  logical :: commutator_pc                !< PRODUCTION: use the commutator-device M_* Schur in the 'PS' K-half (requires use_metriplectic_pc + metriplectic_khalf='PS')
+  character(len=4) :: commutator_pc_mstar !< Candidate M_* used by commutator_pc (table label: 'M0','M1a','M2','M3',...)
+  logical :: commutator_pc_ab             !< DIAGNOSTIC: measure outer FGMRES its per M_* variant on a dedicated KSP, alongside ANY production PC (does not perturb the production solve)
+  character(len=64) :: commutator_pc_ab_variants !< Comma-separated A/B variant list, e.g. 'EXACT,M0D,M1a' ('EXACT' = exact Schur ceiling, 'M0D' = direct P_uw incumbent, else a table label)
+  integer :: commutator_pc_ab_every       !< Run the A/B every N time steps (1 = every step)
   logical :: eliminate_boundary_dofs !< Zero boundary-DOF rows in PC correction matrices and use elm-diagonal BC scaling in global matrix; required for physics PC Schur correction approach
   logical :: use_newton           !< Use inexact Newton method
   integer :: maxNewton            !< maximum number of Newton iterations

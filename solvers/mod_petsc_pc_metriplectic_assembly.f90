@@ -274,8 +274,11 @@ contains
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
     use phys_module,    only: time_evol_zeta, metriplectic_analysis, &
                               metriplectic_khalf, metriplectic_ps_inner_it, &
-                              metriplectic_ps_inner_tol
-    use mod_petsc_pc_metriplectic_apply, only: metriplectic_build_ps_shell
+                              metriplectic_ps_inner_tol, eta, &
+                              commutator_pc, commutator_pc_ab, &
+                              commutator_pc_mstar
+    use mod_petsc_pc_metriplectic_apply, only: metriplectic_build_ps_shell, &
+                              metriplectic_build_cm_shell, metriplectic_cm_bind
 
     Mat,     intent(in) :: A_full
     integer, intent(in) :: my_id
@@ -287,7 +290,7 @@ contains
     PetscErrorCode :: ierr
     integer :: comm
     real*8 :: tdt, opz
-    logical :: build_k2, build_k4, build_ps, build_uw_lu
+    logical :: build_k2, build_k4, build_ps, build_uw_lu, build_cm
 
     call PetscObjectGetComm(A_full, comm, ierr)
     if (.not. g_mctx%is_created) call create_index_sets(A_full, comm)
@@ -302,9 +305,16 @@ contains
     ! The (psi,j) pair LU is unconditional (PS pivot / S-half / analysis);
     ! the (u,w) pair MATRIX is unconditional (P_uw true blocks + S_uw
     ! mult), its LU only where diss_half_solve runs.
+    ! The commutator Schur needs the full PS object set (P_uw as its inner
+    ! PC, the (psi,j) pair for the pivot), so build_cm forces build_ps on.
+    ! khalf_mode is deliberately NOT touched: the A/B diagnostic runs
+    ! alongside whatever production mode is selected, forcing the PS path
+    ! for itself via cm_ab_active instead.
+    build_cm    = commutator_pc .or. commutator_pc_ab
     build_k2    = (g_mctx%khalf_mode == 'K2') .or. metriplectic_analysis
     build_k4    = (g_mctx%khalf_mode == 'K4') .or. metriplectic_analysis
-    build_ps    = (g_mctx%khalf_mode == 'PS') .or. metriplectic_analysis
+    build_ps    = (g_mctx%khalf_mode == 'PS') .or. metriplectic_analysis &
+                  .or. build_cm
     build_uw_lu = (g_mctx%khalf_mode == 'K2') .or. &
                   (g_mctx%khalf_mode == 'PU') .or. metriplectic_analysis
 
@@ -332,6 +342,9 @@ contains
       PetscCallA(KSPDestroy(g_mctx%ksp_Mpsi,      ierr))
       PetscCallA(MatDestroy(g_mctx%A_pair_psij, ierr))
       PetscCallA(MatDestroy(g_mctx%A_pair_uw,   ierr))
+      if (build_cm) then
+        PetscCallA(MatDestroy(g_mctx%B_11s, ierr))
+      endif
       PetscCallA(MatDestroy(g_mctx%B_31s, ierr))
       PetscCallA(MatDestroy(g_mctx%B_42s, ierr))
       PetscCallA(MatDestroy(g_mctx%B_52s, ierr))
@@ -355,6 +368,11 @@ contains
     if (.not. g_mctx%sweep_once_done) then
       call extract_block(A_full, var_zj, var_zj, g_mctx%B_33s)
       call extract_block(A_full, var_w,  var_w,  g_mctx%B_44s)
+    endif
+    ! Own copy of amat_11 for the commutator table (candidate M1x); the
+    ! local B11 above is destroyed once the pair/P_uw matrices are built.
+    if (build_cm) then
+      call extract_block(A_full, var_psi, var_psi, g_mctx%B_11s)
     endif
 
     ! --- coupled pair matrices (2x2 nest -> AIJ; the mixed form) ---
@@ -469,6 +487,16 @@ contains
     !     the current g_mctx handles at call time, so no rebuild needed) ---
     if (build_ps) call metriplectic_build_ps_shell(comm)
 
+    ! --- commutator-device M_* Schur: shell once, candidate table rebound
+    !     every build (the extracted blocks are fresh, and opz/tdt/eta may
+    !     have moved with the time step). cm_bind also invalidates and
+    !     re-materializes the explicit T_pair for the active candidate. ---
+    if (build_cm) then
+      call metriplectic_build_cm_shell(comm)
+      call metriplectic_cm_bind(g_mctx%B_11s, g_mctx%B_33s, g_mctx%B_44s, &
+                                opz, tdt, eta, my_id)
+    endif
+
     ! --- P_u composed and factored at the run's tau (needed by the Schur
     !     K-half path and the analysis checks; skipped in pure coupled runs) ---
     if ((g_mctx%khalf_mode == 'PU') .or. metriplectic_analysis) then
@@ -476,6 +504,13 @@ contains
     endif
 
     g_mctx%sweep_ready = .true.
+    if (my_id == 0 .and. build_cm) then
+      write(*,'(A,A,A)') &
+        "[CommPC] commutator Schur ready: M_* = ", trim(commutator_pc_mstar), &
+        "  (T_pair materialized + LU-factored: DIAGNOSTIC, small meshes only)"
+      if (commutator_pc_ab) write(*,'(A)') &
+        "[CommPC] A/B diagnostic active on a dedicated KSP -- production solve unaffected"
+    endif
     if (my_id == 0) then
       select case (g_mctx%khalf_mode)
       case ('PS')
@@ -492,6 +527,8 @@ contains
           "[Metriplectic] sweep built (pair solves + P_u Schur K-half); tau = ", g_mctx%dt_theta
       end select
     endif
+
+    if (ENABLE_STIFFNESS_LOG) call log_stiffness_metrics(my_id, opz, tdt)
   end subroutine metriplectic_build_sweep
 
 
