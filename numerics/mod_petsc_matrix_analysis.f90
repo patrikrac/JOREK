@@ -67,23 +67,23 @@ contains
     MatInfo        :: info
     integer        :: comm, my_id, mpierr
 
-    call PetscObjectGetComm(A, comm, ierr)
-    call MPI_Comm_rank(comm, my_id, mpierr)
+    ! call PetscObjectGetComm(A, comm, ierr)
+    ! call MPI_Comm_rank(comm, my_id, mpierr)
 
-    call MatGetSize(A, M, N, ierr)
-    call MatGetBlockSize(A, bs, ierr)
-    call MatGetInfo(A, MAT_GLOBAL_SUM, info, ierr)
+    ! call MatGetSize(A, M, N, ierr)
+    ! call MatGetBlockSize(A, bs, ierr)
+    ! call MatGetInfo(A, MAT_GLOBAL_SUM, info, ierr)
 
-    if (my_id == 0) then
-      write(*,'(A,A)')        "[MatInfo] ", trim(label)
-      write(*,'(A,I0,A,I0)')  "  Global size : ", M, " x ", N
-      write(*,'(A,I0)')       "  Block size  : ", bs
-      write(*,'(A,I0)')       "  NNZ used    : ", int(info%nz_used)
-      write(*,'(A,I0)')       "  NNZ alloc   : ", int(info%nz_allocated)
-      ! memory is not populated for distributed (MPIBAIJ) matrix types
-      if (info%memory > 0) &
-        write(*,'(A,ES12.4)') "  Memory (B)  : ", info%memory
-    endif
+    ! if (my_id == 0) then
+    !   write(*,'(A,A)')        "[MatInfo] ", trim(label)
+    !   write(*,'(A,I0,A,I0)')  "  Global size : ", M, " x ", N
+    !   write(*,'(A,I0)')       "  Block size  : ", bs
+    !   write(*,'(A,I0)')       "  NNZ used    : ", int(info%nz_used)
+    !   write(*,'(A,I0)')       "  NNZ alloc   : ", int(info%nz_allocated)
+    !   ! memory is not populated for distributed (MPIBAIJ) matrix types
+    !   if (info%memory > 0) &
+    !     write(*,'(A,ES12.4)') "  Memory (B)  : ", info%memory
+    ! endif
   end subroutine petsc_mat_print_info
 
 
