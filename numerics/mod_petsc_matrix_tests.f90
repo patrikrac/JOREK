@@ -233,7 +233,6 @@ contains
     IS   :: is_axis, is_bulk
     Vec  :: x_sol
     MatNullSpace       :: nullsp
-    KSPConvergedReason :: reason
     PetscInt   :: its, bs, n_total, n_ax, n_bk, nsplit
     PetscReal  :: rnorm, err_norm, ref_norm
     PetscErrorCode :: ierr
@@ -429,7 +428,6 @@ contains
     call system_clock(count=cc1)
     t_elapsed = real(cc1 - cc0) / real(cr)
 
-    call KSPGetConvergedReason(ksp, reason, ierr)
     call KSPGetIterationNumber(ksp, its, ierr)
     call KSPGetResidualNorm(ksp, rnorm, ierr)
 
@@ -443,8 +441,7 @@ contains
         "  ", trim(solver_name), "  its=", its, &
         "  |r|=", rnorm, "  rel_err=", err_norm/ref_norm, &
         "  t=", t_elapsed, "s"
-      if (reason%v < 0) &
-        write(*,'(A,I0)') "    WARNING: KSP diverged, reason=", reason%v
+      call KSPConvergedReasonView(ksp, PETSC_VIEWER_STDOUT_WORLD, ierr)
     endif
 
     call VecDestroy(x_sol, ierr)
