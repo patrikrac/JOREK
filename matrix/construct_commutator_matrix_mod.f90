@@ -221,8 +221,7 @@ contains
                   enddo
                 enddo
                 !$omp critical
-                PetscCallA(MatSetValuesBlocked(blk(ib), 1, idxm, 1, idxn, &
-                                         buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+                PetscCallA(MatSetValuesBlocked(blk(ib), 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
                 !$omp end critical
               enddo
 
