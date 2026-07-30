@@ -282,10 +282,8 @@ contains
 
     call MatGetLocalSize(g_mctx%A_pair_uw, n_loc, PETSC_NULL_INTEGER, ierr)
     call MatGetSize(g_mctx%A_pair_uw, n_glob, PETSC_NULL_INTEGER, ierr)
-    PetscCallA(MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, &
-                              PETSC_NULL_INTEGER, g_mctx%S_cm_shell, ierr))
-    PetscCallA(MatShellSetOperation(g_mctx%S_cm_shell, MATOP_MULT, &
-                                    metriplectic_Scm_mult, ierr))
+    PetscCallA(MatCreateShell(comm, n_loc, n_loc, n_glob, n_glob, PETSC_NULL_INTEGER, g_mctx%S_cm_shell, ierr))
+    PetscCallA(MatShellSetOperation(g_mctx%S_cm_shell, MATOP_MULT, metriplectic_Scm_mult, ierr))
 
     cm_shell_ready = .true.
   end subroutine metriplectic_build_cm_shell

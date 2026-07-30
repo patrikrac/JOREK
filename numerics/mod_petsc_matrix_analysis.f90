@@ -287,18 +287,18 @@ contains
       call MatDenseGetLDA(Adense, lda, ierr)
       if (int(lda) == n_int) then
         ! No lda padding: pass PETSc's internal buffer directly — avoids a second N² allocation.
-        call MatDenseGetArrayF90(Adense, dense_arr, ierr)
+        call MatDenseGetArray(Adense, dense_arr, ierr)
         call lapack_eig_dense(dense_arr, n_int, symmetric, eig_r, eig_i, info)
-        call MatDenseRestoreArrayF90(Adense, dense_arr, ierr)
+        call MatDenseRestoreArray(Adense, dense_arr, ierr)
         call MatDestroy(Adense, ierr)
       else
         ! lda padding present (uncommon): copy column by column, then free Adense before LAPACK.
         allocate(A_copy(n_int, n_int))
-        call MatDenseGetArrayF90(Adense, dense_arr, ierr)
+        call MatDenseGetArray(Adense, dense_arr, ierr)
         do j = 1, n_int
           A_copy(:, j) = real(dense_arr(1:n_int, j), kind=8)
         enddo
-        call MatDenseRestoreArrayF90(Adense, dense_arr, ierr)
+        call MatDenseRestoreArray(Adense, dense_arr, ierr)
         call MatDestroy(Adense, ierr)
         call lapack_eig_dense(A_copy, n_int, symmetric, eig_r, eig_i, info)
         deallocate(A_copy)

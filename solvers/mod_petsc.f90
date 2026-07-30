@@ -526,7 +526,7 @@ contains
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
     n_iter    = its
-    converged = (reason > 0)
+    converged = (reason%v > 0)
 
     if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
 
@@ -641,8 +641,7 @@ contains
     ! rather than the exact Schur. Tighten it for the A/B window only and
     ! restore afterwards, so production behaviour is untouched.
     PetscCallA(KSPGetTolerances(g_mctx%ksp_Suw, s_rtol, s_atol, s_dtol, s_maxit, ierr))
-    PetscCallA(KSPSetTolerances(g_mctx%ksp_Suw, 1.d-10, PETSC_CURRENT_REAL, &
-                                PETSC_CURRENT_REAL, 200, ierr))
+    PetscCallA(KSPSetTolerances(g_mctx%ksp_Suw, 1.d-10, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, 200, ierr))
 
     do iv = 1, ab_nv
       call cm_set_variant(ab_lab(iv), my_id)
@@ -653,7 +652,7 @@ contains
       PetscCallA(KSPGetConvergedReason(petsc_sys%ksp_ab, reason, ierr))
       call cm_counters_get(itot, icalls)
       ab_its(iv)   = its
-      ab_conv(iv)  = (reason > 0)
+      ab_conv(iv)  = (reason%v > 0)
       if (icalls > 0) then
         ab_inner(iv) = dble(itot) / dble(icalls)
       else

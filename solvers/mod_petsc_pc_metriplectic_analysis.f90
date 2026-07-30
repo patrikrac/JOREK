@@ -545,7 +545,7 @@ contains
     PetscCallA(VecGetOwnershipRange(z, lo, hi, ierr))
     nloc = hi - lo
     n_block_local = nloc / n_tor
-    call VecGetArrayF90(z, arr, ierr)
+    call VecGetArray(z, arr, ierr)
     do i = 0, n_block_local - 1
       call random_number(r)
       if (r >= 0.5d0) then
@@ -554,7 +554,7 @@ contains
         arr(i*n_tor + (h-1) + 1) = -1.d0
       endif
     enddo
-    call VecRestoreArrayF90(z, arr, ierr)
+    call VecRestoreArray(z, arr, ierr)
   end subroutine cm_probe_fill
 
 
