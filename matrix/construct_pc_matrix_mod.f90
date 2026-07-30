@@ -182,6 +182,7 @@ subroutine construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat
             enddo
             !$omp critical
             PetscCallA(MatSetValuesBlocked(A_j, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
+            PetscCallA(MatSetValuesBlocked(A_j, 1, idxm, 1, idxn, buf1v_thr(:,omp_tid), ADD_VALUES, ierr))
             !$omp end critical
 
             ! --- Extract and insert 1-var block for A_w ---
@@ -1029,7 +1030,7 @@ end subroutine zero_bc_rows_pc_matrix
 
 
 subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
-                               my_ind_min, my_ind_max)
+                               my_ind_min, my_ind_max, symmetric, diag_value)
 
   use mod_parameters,   only: n_tor, n_vertex_max, n_order
   use nodes_elements,   only: node_list, element_list
@@ -1046,7 +1047,16 @@ subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
   integer, intent(in) :: local_elms(:)
   integer, intent(in) :: n_local_elms
   integer, intent(in) :: my_ind_min, my_ind_max
+  !> Optional: eliminate rows AND columns (MatZeroRowsColumns) so a
+  !! symmetric operator stays exactly symmetric after BC application.
+  logical, intent(in), optional :: symmetric
+  !> Optional: value placed on the eliminated diagonal (default 1.0).
+  !! Use 0.0 for operators that enter additive compositions whose other
+  !! member already carries the unit Dirichlet diagonal (e.g. W_para in
+  !! P_u = L_rho + tau^2 W_para).
+  real*8,  intent(in), optional :: diag_value
 
+  real*8  :: dv
   integer :: i, in, iv, inode, ielm
   integer :: index_node, index_tmp, kk, ll, iv_dir
   integer :: node_indices((n_order+1)/2, (n_order+1)/2)
@@ -1121,8 +1131,8 @@ subroutine apply_dirichlet_bnd(pc_mat, var_index, local_elms, n_local_elms, &
     enddo    ! iv
   enddo      ! i
 
-  ! --- Zero the matrix rows and set diagonal to 1.0 ---
-  ! 1.0d0 ensures the standalone matrix is non-singular.
+  ! --- Zero the matrix rows and set the eliminated diagonal ---
+  ! Default 1.0d0 ensures the standalone matrix is non-singular.
   ! PETSC_NULL_VEC tells PETSc not to touch the RHS or Solution vectors.
   PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 1.0d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
 

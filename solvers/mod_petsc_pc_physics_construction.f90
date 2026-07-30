@@ -497,7 +497,7 @@ contains
     PetscErrorCode :: ierr
     PetscInt       :: N_global, m_local, n_local
     integer        :: n, j, my_id, mpierr
-    MPI_Comm       :: comm
+    integer       :: comm
 
     PetscScalar, pointer  :: arr(:)
     real*8, allocatable   :: S_dense(:,:)
@@ -680,7 +680,7 @@ contains
     PetscErrorCode :: ierr
     PetscInt       :: N_global, m_local, n_local
     integer        :: n, j, my_id, mpierr
-    MPI_Comm       :: comm
+    integer       :: comm
     PetscScalar, pointer  :: arr(:)
     real*8, allocatable   :: S_dense(:,:)
     PetscInt, allocatable :: row_idxs(:)
@@ -844,7 +844,7 @@ contains
     PetscErrorCode :: ierr
     PetscInt       :: N_global, m_local, n_local
     integer        :: n, j, my_id, mpierr
-    MPI_Comm       :: comm
+    integer       :: comm
 
     PetscScalar, pointer  :: arr(:)
     real*8, allocatable   :: B_dense(:,:)
@@ -1171,7 +1171,7 @@ contains
     PetscErrorCode :: ierr
     PetscInt       :: N_global, m_local, n_local
     integer        :: n, j, my_id, mpierr
-    MPI_Comm       :: comm
+    integer       :: comm
     PetscScalar, pointer  :: arr(:)
     real*8, allocatable   :: S_dense(:,:)
     PetscInt, allocatable :: row_idxs(:)

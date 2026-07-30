@@ -336,6 +336,7 @@ contains
     if (my_id .eq. 0) print *, "Solving the system using PETSc"
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b, petsc_sys%x, ierr))
     PetscCallA(KSPDestroy(petsc_sys%ksp, ierr))
+    petsc_sys%ksp_ready = .false.
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
@@ -349,8 +350,12 @@ contains
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
-    use phys_module, only: use_physics_pc
+    use phys_module, only: use_physics_pc, metriplectic_analysis, &
+                           use_metriplectic_pc, metriplectic_sweep_order
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
+    use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_run_analysis
+    use mod_petsc_pc_metriplectic_assembly, only: metriplectic_build_sweep
+    use mod_petsc_pc_metriplectic_apply, only: metriplectic_sweep_apply_full, mpc_sweep_order
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -358,6 +363,7 @@ contains
 
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
+    PC :: pc_shell
     KSPConvergedReason :: reason
     PetscLogDouble :: t1, t2
     PetscLogDouble :: ts1, ts2
@@ -393,8 +399,17 @@ contains
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
 
+      if (use_physics_pc .and. use_metriplectic_pc) then
+        if (my_id .eq. 0) write(*,*) &
+          "[PETSc] ERROR: use_physics_pc and use_metriplectic_pc are mutually exclusive"
+        error stop "conflicting PC selection"
+      endif
       if (use_physics_pc) then
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + Physics PCSHELL"
+      else if (use_metriplectic_pc) then
+        if (my_id .eq. 0) write(*,*) &
+          "[PETSc] setup: FGMRES + Metriplectic HSS sweep PCSHELL (order " // &
+          metriplectic_sweep_order // ")"
       else
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + PCFIELDSPLIT + MUMPS"
       endif
@@ -403,9 +418,16 @@ contains
       if (use_physics_pc) then
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_PHYSICS)
         call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
+      else if (use_metriplectic_pc) then
+        mpc_sweep_order = metriplectic_sweep_order
+        PetscCallA(KSPGetPC(petsc_sys%ksp, pc_shell, ierr))
+        PetscCallA(PCSetType(pc_shell, PCSHELL, ierr))
+        PetscCallA(PCShellSetApply(pc_shell, metriplectic_sweep_apply_full, ierr))
+        call metriplectic_build_sweep(petsc_sys%A_aij, my_id)
       else
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
       endif
+      if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
@@ -421,6 +443,8 @@ contains
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
+      if (use_metriplectic_pc) call metriplectic_build_sweep(petsc_sys%A_aij, my_id)
+      if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
@@ -480,7 +504,9 @@ contains
 
     PetscCallA(VecGetArray(x_seq, x_arr, ierr))
 
-    sol_vec%val(:) = x_arr(:)
+    if (associated(sol_vec%val)) then
+      sol_vec%val(1:sol_vec%n) = x_arr(1:sol_vec%n)
+    end if
 
     PetscCallA(VecRestoreArray(x_seq, x_arr, ierr))
 
@@ -515,6 +541,7 @@ contains
     n_global = a_mat%ng
 
     call MatCreate(comm, petsc_sys%A, ierr)
+
     if (n_cpu .eq. 1) then
       n_local = a_mat%ng
       call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
@@ -531,7 +558,8 @@ contains
     else
       call MatSetSizes(petsc_sys%A, PETSC_DECIDE, PETSC_DECIDE, n_global, n_global, ierr)
       call MatSetType(petsc_sys%A, MATAIJ, ierr)
-      call MatSetUp(petsc_sys%A, ierr)   ! dynamic allocation; assembly is rank-0 only, perf secondary
+      call MatMPIAIJSetPreallocation(petsc_sys%A, n_global, PETSC_NULL_INTEGER_ARRAY, &
+                                      n_global, PETSC_NULL_INTEGER_ARRAY, ierr)
     endif
 
     call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
@@ -615,6 +643,70 @@ contains
       petsc_sys%initialized = .false.
     endif
   end subroutine petsc_cleanup
+
+  !====================================================================
+  ! Wrapper to pack the JOREK state vector and call the energy tracking
+  !====================================================================
+  subroutine petsc_metriplectic_pack_and_track(petsc_sys, mhd_sim, time, istep, my_id)
+    use mod_simulation_data, only: type_MHD_SIM
+    use mod_parameters, only: n_var, n_tor, n_degrees
+    use phys_module, only: keep_n0_const, treat_axis, metriplectic_analysis
+    use mod_axis_treatment, only: new_to_old_dofs_on_the_axis
+    use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_track_energies
+    
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_MHD_SIM),      intent(in)    :: mhd_sim
+    real*8,                  intent(in)    :: time
+    integer,                 intent(in)    :: istep
+    integer,                 intent(in)    :: my_id
+
+    Vec :: X_global
+    PetscErrorCode :: ierr
+    integer :: i, j, k, in_tor, index_node, idx, i_tor_min
+    PetscInt :: petsc_idx
+    real*8 :: val
+
+    if (.not. metriplectic_analysis) return
+    if (.not. petsc_sys%initialized) return
+
+    ! Create a vector with the same layout as the Newton increment
+    PetscCallA(VecDuplicate(petsc_sys%x, X_global, ierr))
+    PetscCallA(VecSet(X_global, 0.0d0, ierr))
+
+    i_tor_min = 1
+    if ( keep_n0_const ) i_tor_min = 2
+
+    do i = 1, mhd_sim%node_list%n_nodes
+      if (.not. mhd_sim%node_list%node(i)%constrained) then
+        ! We do not currently handle axis unpacking because the tracking 
+        ! is primarily to evaluate energies in the bulk, and axis nodes
+        ! require the old-to-new DOF transformation.
+        if (treat_axis .and. mhd_sim%node_list%node(i)%axis_node) cycle
+
+        do j = 1, n_degrees
+          index_node = mhd_sim%node_list%node(i)%index(j)
+          do k = 1, n_var
+            do in_tor = i_tor_min, n_tor
+              idx = n_tor*n_var * (index_node - 1) + n_tor*(k-1) + in_tor
+              if (idx > 0) then
+                petsc_idx = idx - 1 ! PETSc uses 0-based indexing
+                val = mhd_sim%node_list%node(i)%values(in_tor,j,k)
+                PetscCallA(VecSetValue(X_global, petsc_idx, val, INSERT_VALUES, ierr))
+              endif
+            enddo
+          enddo
+        enddo
+      endif
+    enddo
+
+    PetscCallA(VecAssemblyBegin(X_global, ierr))
+    PetscCallA(VecAssemblyEnd(X_global, ierr))
+
+    ! Call the actual tracking subroutine
+    call petsc_metriplectic_track_energies(time, istep, X_global, petsc_sys%x_aij, my_id)
+
+    PetscCallA(VecDestroy(X_global, ierr))
+  end subroutine petsc_metriplectic_pack_and_track
 
 #endif
 end module mod_petsc

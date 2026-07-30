@@ -96,6 +96,7 @@ program JOREK2
 
 #ifdef USE_PETSC
     use mod_petsc_pc_physics, only: petsc_assemble_pc_matrices, petsc_physics_pc_build_reduced
+    use mod_petsc_pc_metriplectic_assembly, only: metriplectic_assemble
     use mod_petsc, only: petsc_initialize, petsc_finalize, petsc_print_version
 #endif
 
@@ -762,6 +763,8 @@ write(*,*) "n elements:", element_list%n_elements
     
 #ifdef USE_PETSC
     if (use_physics_pc) call petsc_assemble_pc_matrices(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
+    if (metriplectic_analysis .or. use_metriplectic_pc) &
+      call metriplectic_assemble(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
 #endif
 
 #ifdef SAVEMATRIX

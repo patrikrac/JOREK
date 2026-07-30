@@ -649,10 +649,18 @@ subroutine preset_parameters
   physics_pc_monolithic = .false.            ! Monolithic 4x4 solve (stage-one Schur test)
   physics_pc_multi_step  = .false.           ! Three-step predictor-corrector apply (requires physics_pc_monolithic)
   physics_pc_multi_step_symmetric = .false.   ! Backward corrector for B_16/B_25/B_26 in multi_step
+  physics_pc_wave_schur  = .false.           ! New wave-Schur block-LDU pred-corr (multi_step sub-mode)
   physics_pc_sub_blocks      = .false.       ! 2x2 super-block PC: (psi,u) + (rho,T)
   physics_pc_sub_blocks_mode = 1             ! 1=Jacobi (default), 2=GS-forward, 3=GS-symmetric
   physics_pc_probe_exact = .false.           ! Probe exact 4x4 Schur complement via N mat-vec products (small problems only)
   physics_pc_block_inv  = .false.           ! Per-node 4x4 block-diagonal mass inverse for Schur correction
+  metriplectic_analysis        = .false.    ! Metriplectic PC Slice-A analysis (T1-T5a) off by default
+  metriplectic_analysis_nsweep = 5          ! Number of dt points in the T2 conditioning sweep
+  use_metriplectic_pc          = .false.    ! Metriplectic HSS sweep PCSHELL off by default
+  metriplectic_sweep_order     = 'SK'       ! Sweep order: dissipative pairs first ('SK') or ideal first ('KS')
+  metriplectic_khalf           = 'PS'       ! K-half mode: 'PS' pair-Schur LDU, 'K4' 4-field LU, 'K2' 2x2 LU, 'PU' P_u Schur
+  metriplectic_ps_inner_it     = 0          ! Inner Schur iterations (0 = single-pass P_uw^-1)
+  metriplectic_ps_inner_tol    = 1.d-2      ! Inner Schur relative tolerance
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 
   use_mumps          = .false.              ! Use MUMPS solver
