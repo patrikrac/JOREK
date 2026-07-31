@@ -75,7 +75,6 @@ contains
 
     PetscCallA(PCSetUp(pc, ierr))
     PetscCallA(KSPSetUp(ksp, ierr))
-    allocate(subksp_array(n_split))
     PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
     do i = 1, n_split
       PetscCallA(KSPSetType(subksp_array(i), KSPPREONLY, ierr))
@@ -89,7 +88,7 @@ contains
       PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
       PetscCallA(MatMumpsSetIcntl(F, 22, 1,  ierr))   ! out-of-core processing
     enddo
-    deallocate(subksp_array)
+    PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
   end subroutine petsc_setup_toroidal_harmonic_pc
 
   !> Set up a PCFIELDSPLIT preconditioner grouped by toroidal mode families
