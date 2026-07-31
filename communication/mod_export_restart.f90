@@ -267,7 +267,7 @@ subroutine export_binary_restart(node_list,element_list,filename,aux_node_list)
   end if
    
   ! save Revision control
-  write(version_control,'(A)') trim(adjustl(RCS_VERSION))
+  version_control = trim(adjustl(RCS_VERSION))
   write(21) version_control
 
   ! save parameters
@@ -575,8 +575,7 @@ subroutine export_hdf5_restart(node_list,element_list,filename,aux_node_list)
   call HDF5_integer_saving(file_id,rst_hdf5_version,'rst_hdf5_version'//char(0)) 
 
   ! -> Save version of revision control system
-  write(version_control,'(A)') trim(adjustl(RCS_VERSION))
-  version_control = trim(adjustl(version_control))
+  version_control = trim(adjustl(RCS_VERSION))
   call HDF5_char_saving(file_id,version_control,"RCS_version"//char(0))
 
   ! -> Save parameters

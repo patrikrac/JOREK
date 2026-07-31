@@ -559,8 +559,7 @@ if (ierr.ne.0) then
 end if
   
 ! -> Save version of revision control system
-write(version_control,'(A)') trim(adjustl(RCS_VERSION))
-version_control = trim(adjustl(version_control))
+version_control = trim(adjustl(RCS_VERSION))
 call HDF5_char_saving(file_id,version_control,"RCS_version"//char(0))
 
 ! -> Save parameters
