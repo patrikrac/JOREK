@@ -21,11 +21,18 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   integer :: n
   type(type_SP_SOLVER)  :: solver
   
-  real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0
+  real(kind=8) :: atol, rtol, gamma, delta, rho, scale_norm
   real(kind=8) :: norm_p, norm_p_new
   integer :: totit, maxit, restart, nrit, it, ldh, k, j
-  integer :: n_ortho 
-  logical :: no_conv, GSC=.false., GSM=.false., GSCI=.true., GSMI=.false.
+  integer :: n_ortho
+  logical :: no_conv, breakdown
+  logical :: GSC=.false., GSM=.false., GSCI=.true., GSMI=.false.
+  !> .true.  : right preconditioning, A M^-1 y = b -> minimises the TRUE residual ||b-Ax||
+  !> .false. : left  preconditioning, M^-1 A x = M^-1 b -> minimises ||M^-1 (b-Ax)||
+  !>           (this is what the legacy dpackgmres driver does, icntl(4)=1)
+  logical :: right_prec=.true.
+  !> Relative threshold below which h_{j+1,j} is treated as a (happy) breakdown
+  real(kind=8), parameter :: bd_tol = 1.d-14
   real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, b_prec, b_, s_
 
   integer :: my_id, my_id_n, n_cpu, ierr
@@ -56,8 +63,22 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
   ldh = restart+1
 
-  no_conv = .true.
-  totit = 0;  
+  ! --- Reference norm for the relative stopping criterion ---
+  !     The caller (mod_sparse) hands us x0 = M^-1 b, i.e. an already good initial guess, so
+  !     ||r0|| is tiny and normalising by it would impose a far stricter test than the legacy
+  !     dpackgmres driver, which measures the backward error against the right hand side.
+  !     Normalise against ||b|| (right prec.) resp. ||M^-1 b|| (left prec.) instead.
+  if (right_prec) then
+    scale_norm = dnrm2(n, b(1:n), 1)
+  else
+    call prec(solver, b(1:n), b_prec(1:n), n, MPI_GLOB, MPI_COMM_N)
+    scale_norm = dnrm2(n, b_prec(1:n), 1)
+  endif
+  if (scale_norm .le. 0.d0) scale_norm = 1.d0
+
+  no_conv   = .true.
+  breakdown = .false.
+  totit = 0
 
   do while (no_conv)
     ! --- v_1 = A * x ---
@@ -66,10 +87,15 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     ! --- v_1 = b - A * x (True residual) ---
     call daxpby(n, 1.d0, b(1:n), 1, -1.d0, V(1:n), 1)
 
+    ! --- Left preconditioning: v_1 = M^-1 (b - A * x) ---
+    if (.not. right_prec) then
+      call dcopy(n, V(1), 1, b_prec(1), 1)
+      call prec(solver, b_prec(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
+    endif
+
     ! --- rho = ||v_1||_2 ---
     rho = dnrm2(n, V(1:n), 1)
-    if (totit .eq. 0) rho0 = rho
-    if ((rho/rho0 < rtol) .or. (rho < atol)) then
+    if ((rho/scale_norm < rtol) .or. (rho < atol)) then
       no_conv = .false.
       exit
     endif
@@ -79,17 +105,28 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     b_(2:restart+1) = 0.d0
     nrit = restart-1
     if (my_id.eq.0) then
-      write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/rho0
+      write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm
       write(*, "(A)") "[GMRES] --- Restart ---"
     endif
 
     do it = 1, restart
       totit = totit +1
-      ! --- b_prec = M^-1 * v_j --- 
-      call prec(solver, V((it-1)*n+1:it*n), b_prec(1:n), n, MPI_GLOB, MPI_COMM_N)
+      if (right_prec) then
+        ! --- b_prec = M^-1 * v_j ---
+        call prec(solver, V((it-1)*n+1:it*n), b_prec(1:n), n, MPI_GLOB, MPI_COMM_N)
 
-      ! --- v_j+1 = A * b_prec = A * M^-1 * v_j --- 
-      call bcsr_matv(a_mat, b_prec(1:n), V(it*n+1:(it+1)*n))
+        ! --- v_j+1 = A * b_prec = A * M^-1 * v_j ---
+        call bcsr_matv(a_mat, b_prec(1:n), V(it*n+1:(it+1)*n))
+      else
+        ! --- b_prec = A * v_j ---
+        call bcsr_matv(a_mat, V((it-1)*n+1:it*n), b_prec(1:n))
+
+        ! --- v_j+1 = M^-1 * b_prec = M^-1 * A * v_j ---
+        call prec(solver, b_prec(1:n), V(it*n+1:(it+1)*n), n, MPI_GLOB, MPI_COMM_N)
+      endif
+
+      ! --- Norm of the un-orthogonalized vector (reference for the breakdown test) ---
+      norm_p = dnrm2(n, V(it*n+1), 1)
 
       ! --- Orthogonalization ---
       if (GSC) then ! Gram-Schmidt Classical
@@ -100,8 +137,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
           hess(k+(it-1)*ldh) = ddot(n, V((k-1)*n+1), 1, V(it*n+1), 1)
           call daxpy(n, -hess(k+(it-1)*ldh), V((k-1)*n+1), 1, V(it*n+1), 1)
         enddo
-      elseif (GSCI) then ! Gram-Schmidt Classical Iterative 
-        norm_p = dnrm2(n, V(it*n+1), 1)
+      elseif (GSCI) then ! Gram-Schmidt Classical Iterative
         hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
         do j=1,n_ortho
           call dgemv('C', n, it, 1.d0, V(1), n, V(it*n+1), 1, 0.d0, s_(1), 1)
@@ -112,7 +148,6 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
           norm_p = norm_p_new
         enddo
       elseif (GSMI) then ! Gram-Schmidt Modified Iterative
-        norm_p = dnrm2(n, V(it*n+1), 1)
         hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
         do j=1,n_ortho
           do k=1,it
@@ -127,8 +162,17 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       endif
       ! --- h_j+1,j = ||v_j+1||_2 ---
       hess(it+(it-1)*ldh+1) = dnrm2(n, V(it*n+1), 1)
-      ! --- v_j+1 = v_j+1 / h_j+1,j --- 
-      call dscal(n, 1./hess(it+(it-1)*ldh+1), V(it*n+1), 1)
+      ! --- Breakdown test: the new direction has been fully cancelled by the orthogonalization,
+      !     i.e. the exact solution already lies in the current Krylov subspace. Normalising here
+      !     would divide by (almost) zero and poison the whole basis with Inf/NaN.
+      if (hess(it+(it-1)*ldh+1) .le. bd_tol*max(norm_p, atol)) then
+        hess(it+(it-1)*ldh+1) = 0.d0
+        V(it*n+1:(it+1)*n) = 0.d0
+        breakdown = .true.
+      else
+        ! --- v_j+1 = v_j+1 / h_j+1,j ---
+        call dscal(n, 1.d0/hess(it+(it-1)*ldh+1), V(it*n+1), 1)
+      endif
       ! --- Givens Rotation ---
       do k = 1, it-1
         gamma = givens_c(k)*hess(k+(it-1)*ldh) + givens_s(k)*hess(k+(it-1)*ldh+1)
@@ -136,30 +180,46 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
         hess(k+(it-1)*ldh) = gamma
       enddo
       delta = sqrt(abs(hess(it+(it-1)*ldh))**2 + hess(it+(it-1)*ldh+1)**2);
-      givens_c(it) = hess(it+(it-1)*ldh) / delta
-      givens_s(it) = hess(it+(it-1)*ldh+1) / delta
+      if (delta .le. 0.d0) then
+        ! Hard breakdown: the whole column vanished, no further progress is possible.
+        givens_c(it) = 1.d0
+        givens_s(it) = 0.d0
+        breakdown = .true.
+      else
+        givens_c(it) = hess(it+(it-1)*ldh) / delta
+        givens_s(it) = hess(it+(it-1)*ldh+1) / delta
+      endif
       hess(it+(it-1)*ldh) = givens_c(it)*hess(it+(it-1)*ldh) + givens_s(it)*hess(it+(it-1)*ldh+1)
       b_(it+1) = -givens_s(it)*b_(it)
       b_(it) = givens_c(it)*b_(it)
       rho = abs(b_(it+1))
-      if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/rho0
-      if ((rho < atol).or.(rho/rho0 < rtol).or.(totit >= maxit)) then
+      if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm
+      if ((rho < atol).or.(rho/scale_norm < rtol).or.(totit >= maxit).or.breakdown) then
         no_conv = .false.
         nrit = it-1
-        solver%iter_gmres = totit
         exit
       endif
 
     enddo
     ! --- Solve upper triangular system b_ = H \ b_ ---
     call dtrsv('U', 'N', 'N', nrit+1, hess, ldh, b_, 1)
-    ! --- Form z = V * b_ --- 
-    call dgemv('N', n, nrit+1, 1.d0, V(1), n, b_(1), 1, 0.d0, b_prec(1:n), 1)
-    ! --- Update solution x = x + M^-1 * z ---
-    call prec(solver, b_prec(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
-    call daxpy(n, 1.d0, V(1:n), 1, x(1:n), 1)
+    if (right_prec) then
+      ! --- Form z = V * b_ ---
+      call dgemv('N', n, nrit+1, 1.d0, V(1), n, b_(1), 1, 0.d0, b_prec(1:n), 1)
+      ! --- Update solution x = x + M^-1 * z ---
+      call prec(solver, b_prec(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
+      call daxpy(n, 1.d0, V(1:n), 1, x(1:n), 1)
+    else
+      ! --- Update solution x = x + V * b_ ---
+      call dgemv('N', n, nrit+1, 1.d0, V(1), n, b_(1), 1, 1.d0, x(1:n), 1)
+    endif
 
   enddo
+
+  ! --- Report the iteration count on EVERY exit path. The caller derives step_success from
+  !     (iter_gmres < iter_max) and pre-sets iter_gmres = iter_max, so leaving it untouched
+  !     after a successful solve would be reported as a failed step.
+  solver%iter_gmres = totit
 
   deallocate(givens_c,givens_s,b_,hess,V,b_prec)
   if (GSCI .or. GSMI) deallocate(s_) 
