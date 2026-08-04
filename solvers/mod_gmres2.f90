@@ -10,7 +10,7 @@ module mod_gmres2
   public :: gmres2_driver
 contains
 
-!> solve a_mat x=b using iterative GMRES method with left preconditioning
+!> solve a_mat x=b using iterative GMRES method with right preconditioning
 subroutine gmres2_driver(a_mat,b,x,n,solver)
   use mod_sparse_data, only: type_SP_SOLVER
   use data_structure,  only: type_SP_MATRIX
@@ -55,9 +55,6 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   givens_s(1:restart) = 0.
 
   ldh = restart+1
-  call dcopy(n, b, 1, b_prec, 1)
-  ! --- b = M^-1 b --- 
-  call prec(solver, b_prec, b_prec, n, MPI_GLOB, MPI_COMM_N)
 
   no_conv = .true.
   totit = 0;  
@@ -65,12 +62,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   do while (no_conv)
     ! --- v_1 = A * x ---
     call bcsr_matv(a_mat, x, V(1:n))
-    
-    ! --- v_1 = M^-1 v_1 ---
-    call prec(solver, V(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
 
-    ! --- v_1 = b - v_1 (Preconditioned residual) ---
-    call daxpby(n, 1.d0, b_prec(1:n), 1, -1.d0, V(1:n), 1)
+    ! --- v_1 = b - A * x (True residual) ---
+    call daxpby(n, 1.d0, b(1:n), 1, -1.d0, V(1:n), 1)
 
     ! --- rho = ||v_1||_2 ---
     rho = dnrm2(n, V(1:n), 1)
@@ -91,11 +85,11 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
     do it = 1, restart
       totit = totit +1
-      ! --- v_j+1 = A * v_j --- 
-      call bcsr_matv(a_mat, V((it-1)*n+1:it*n), V(it*n+1: (it+1)*n))
-      
-      ! --- v_j+1 = M^-1 v_j+1 --- 
-      call prec(solver, V(it*n+1:it*n+n), V(it*n+1:it*n+n), n, MPI_GLOB, MPI_COMM_N)
+      ! --- b_prec = M^-1 * v_j --- 
+      call prec(solver, V((it-1)*n+1:it*n), b_prec(1:n), n, MPI_GLOB, MPI_COMM_N)
+
+      ! --- v_j+1 = A * b_prec = A * M^-1 * v_j --- 
+      call bcsr_matv(a_mat, b_prec(1:n), V(it*n+1:(it+1)*n))
 
       ! --- Orthogonalization ---
       if (GSC) then ! Gram-Schmidt Classical
@@ -159,8 +153,11 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     enddo
     ! --- Solve upper triangular system b_ = H \ b_ ---
     call dtrsv('U', 'N', 'N', nrit+1, hess, ldh, b_, 1)
-    ! --- Update the solution x = x + V * b_ --- 
-    call dgemv('N', n, nrit+1, 1.d0, V(1), n, b_(1), 1, 1.d0, x, 1)
+    ! --- Form z = V * b_ --- 
+    call dgemv('N', n, nrit+1, 1.d0, V(1), n, b_(1), 1, 0.d0, b_prec(1:n), 1)
+    ! --- Update solution x = x + M^-1 * z ---
+    call prec(solver, b_prec(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
+    call daxpy(n, 1.d0, V(1:n), 1, x(1:n), 1)
 
   enddo
 
