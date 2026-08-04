@@ -21,7 +21,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   integer :: n
   type(type_SP_SOLVER)  :: solver
   
-  real(kind=8) :: atol, rtol, gamma, delta, rho, scale_norm
+  real(kind=8) :: atol, rtol, gamma, delta, rho, rho0, scale_norm, res_target
   real(kind=8) :: norm_p, norm_p_new
   integer :: totit, maxit, restart, nrit, it, ldh, k, j
   integer :: n_ortho
@@ -32,6 +32,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   logical :: right_prec=.true.
   !> Relative threshold below which h_{j+1,j} is treated as a (happy) breakdown
   real(kind=8), parameter :: bd_tol = 1.d-14
+  !> Smallest relative residual ||r||/||b|| that is attainable in double precision. The
+  !> convergence target is never set below this, otherwise we chase round-off until iter_max.
+  real(kind=8), parameter :: res_floor = 1.d-14
   real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, b_prec, b_, s_
 
   integer :: my_id, my_id_n, n_cpu, ierr
@@ -75,6 +78,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   breakdown = .false.
   totit = 0
 
+  rho0       = 0.d0
+  res_target = 0.d0
+
   do while (no_conv)
     ! --- v_1 = A * x ---
     call bcsr_matv(a_mat, x, V(1:n))
@@ -90,7 +96,14 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
     ! --- rho = ||v_1||_2 ---
     rho = dnrm2(n, V(1:n), 1)
-    if ((rho/scale_norm < rtol) .or. (rho < atol)) then
+
+    ! --- Convergence target ---
+    if (totit .eq. 0) then
+      rho0 = rho
+      res_target = max(rtol*rho0, res_floor*scale_norm)
+    endif
+
+    if ((rho .le. res_target) .or. (rho < atol)) then
       no_conv = .false.
       exit
     endif
@@ -100,7 +113,8 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     b_(2:restart+1) = 0.d0
     nrit = restart-1
     if (my_id.eq.0) then
-      write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm
+      write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6, X, A, X, ES14.6)") &
+        "[GMRES] iteration", totit, "res =", rho, "res/res0 =", rho/rho0, "res/rhs =", rho/scale_norm
       write(*, "(A)") "[GMRES] --- Restart ---"
     endif
 
@@ -186,8 +200,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       b_(it+1) = -givens_s(it)*b_(it)
       b_(it) = givens_c(it)*b_(it)
       rho = abs(b_(it+1))
-      if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm
-      if ((rho < atol).or.(rho/scale_norm < rtol).or.(totit >= maxit).or.breakdown) then
+      if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6, X, A, X, ES14.6)") &
+        "[GMRES] iteration", totit, "res =", rho, "res/res0 =", rho/rho0, "res/rhs =", rho/scale_norm
+      if ((rho .le. res_target).or.(rho < atol).or.(totit >= maxit).or.breakdown) then
         no_conv = .false.
         nrit = it-1
         exit
