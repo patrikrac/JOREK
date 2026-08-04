@@ -10,7 +10,7 @@ module mod_gmres2
   public :: gmres2_driver
 contains
 
-!> solve a_mat x=b using iterative GMRES method with right preconditioning
+!> solve a_mat x=b using iterative GMRES method with right (or left) preconditioning
 subroutine gmres2_driver(a_mat,b,x,n,solver)
   use mod_sparse_data, only: type_SP_SOLVER
   use data_structure,  only: type_SP_MATRIX
@@ -29,7 +29,6 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   logical :: GSC=.false., GSM=.false., GSCI=.true., GSMI=.false.
   !> .true.  : right preconditioning, A M^-1 y = b -> minimises the TRUE residual ||b-Ax||
   !> .false. : left  preconditioning, M^-1 A x = M^-1 b -> minimises ||M^-1 (b-Ax)||
-  !>           (this is what the legacy dpackgmres driver does, icntl(4)=1)
   logical :: right_prec=.true.
   !> Relative threshold below which h_{j+1,j} is treated as a (happy) breakdown
   real(kind=8), parameter :: bd_tol = 1.d-14
@@ -64,10 +63,6 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   ldh = restart+1
 
   ! --- Reference norm for the relative stopping criterion ---
-  !     The caller (mod_sparse) hands us x0 = M^-1 b, i.e. an already good initial guess, so
-  !     ||r0|| is tiny and normalising by it would impose a far stricter test than the legacy
-  !     dpackgmres driver, which measures the backward error against the right hand side.
-  !     Normalise against ||b|| (right prec.) resp. ||M^-1 b|| (left prec.) instead.
   if (right_prec) then
     scale_norm = dnrm2(n, b(1:n), 1)
   else
@@ -162,9 +157,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       endif
       ! --- h_j+1,j = ||v_j+1||_2 ---
       hess(it+(it-1)*ldh+1) = dnrm2(n, V(it*n+1), 1)
-      ! --- Breakdown test: the new direction has been fully cancelled by the orthogonalization,
-      !     i.e. the exact solution already lies in the current Krylov subspace. Normalising here
-      !     would divide by (almost) zero and poison the whole basis with Inf/NaN.
+      ! --- Breakdown test ---
       if (hess(it+(it-1)*ldh+1) .le. bd_tol*max(norm_p, atol)) then
         hess(it+(it-1)*ldh+1) = 0.d0
         V(it*n+1:(it+1)*n) = 0.d0
@@ -216,9 +209,6 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
   enddo
 
-  ! --- Report the iteration count on EVERY exit path. The caller derives step_success from
-  !     (iter_gmres < iter_max) and pre-sets iter_gmres = iter_max, so leaving it untouched
-  !     after a successful solve would be reported as a failed step.
   solver%iter_gmres = totit
 
   deallocate(givens_c,givens_s,b_,hess,V,b_prec)
