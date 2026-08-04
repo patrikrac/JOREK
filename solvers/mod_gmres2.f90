@@ -21,7 +21,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   integer :: n
   type(type_SP_SOLVER)  :: solver
   
-  real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0
+  real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0, bnrm, scale_norm
   real(kind=8) :: norm_p, norm_p_new
   integer :: totit, maxit, restart, nrit, it, ldh, k, j
   integer :: n_ortho 
@@ -56,6 +56,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
   ldh = restart+1
 
+  bnrm = dnrm2(n, b, 1)
+  if (bnrm == 0.d0) bnrm = 1.d0
+
   no_conv = .true.
   totit = 0;  
 
@@ -68,8 +71,11 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
     ! --- rho = ||v_1||_2 ---
     rho = dnrm2(n, V(1:n), 1)
-    if (totit .eq. 0) rho0 = rho
-    if ((rho/rho0 < rtol) .or. (rho < atol)) then
+    if (totit .eq. 0) then
+      rho0 = rho
+      scale_norm = max(rho0, bnrm)
+    endif
+    if ((rho/scale_norm < rtol) .or. (rho < atol)) then
       no_conv = .false.
       exit
     endif
@@ -79,7 +85,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     b_(2:restart+1) = 0.d0
     nrit = restart-1
     if (my_id.eq.0) then
-      write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/rho0
+      write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm
       write(*, "(A)") "[GMRES] --- Restart ---"
     endif
 
@@ -142,8 +148,8 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       b_(it+1) = -givens_s(it)*b_(it)
       b_(it) = givens_c(it)*b_(it)
       rho = abs(b_(it+1))
-      if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/rho0
-      if ((rho < atol).or.(rho/rho0 < rtol).or.(totit >= maxit)) then
+      if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm
+      if ((rho < atol).or.(rho/scale_norm < rtol).or.(totit >= maxit)) then
         no_conv = .false.
         nrit = it-1
         solver%iter_gmres = totit
