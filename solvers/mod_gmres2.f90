@@ -22,7 +22,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   type(type_SP_SOLVER)  :: solver
   
   real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0
-  real(kind=8) :: norm_p
+  real(kind=8) :: norm_p, norm_p_new
   integer :: totit, maxit, restart, nrit, it, ldh, k, j
   integer :: n_ortho 
   logical :: no_conv, GSC=.false., GSM=.false., GSCI=.true., GSMI=.false.
@@ -113,7 +113,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
           call dgemv('C', n, it, 1.d0, V(1), n, V(it*n+1), 1, 0.d0, s_(1), 1)
           call dgemv('N', n, it, -1.d0, V(1), n, s_(1), 1, 1.d0, V(it*n+1), 1)
           call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
-          if (2.d0 * dnrm2(n, V(it*n+1), 1) .gt. norm_p) exit ! Stopping criterion for iterative GS methods
+          norm_p_new = dnrm2(n, V(it*n+1), 1)
+          if (2.d0 * norm_p_new .gt. norm_p) exit ! Stopping criterion for iterative GS methods
+          norm_p = norm_p_new
         enddo
       elseif (GSMI) then ! Gram-Schmidt Modified Iterative
         norm_p = dnrm2(n, V(it*n+1), 1)
@@ -124,7 +126,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
             call daxpy(n, -s_(k), V((k-1)*n+1), 1, V(it*n+1), 1)
           enddo
           call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
-          if (2.d0 * dnrm2(n, V(it*n+1), 1) .gt. norm_p) exit ! Stopping criterion for iterative GS methods
+          norm_p_new = dnrm2(n, V(it*n+1), 1)
+          if (2.d0 * norm_p_new .gt. norm_p) exit ! Stopping criterion for iterative GS methods
+          norm_p = norm_p_new
         enddo
       endif
       ! --- h_j+1,j = ||v_j+1||_2 ---
