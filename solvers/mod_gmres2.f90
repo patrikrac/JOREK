@@ -22,6 +22,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   type(type_SP_SOLVER)  :: solver
   
   real(kind=8) :: atol, rtol, gamma, delta, rho, rho0=0.0, bnrm, scale_norm
+  real(kind=8) :: anrm2_loc, anrm2_glob, anrm, xnrm, nbe, nbe_denom
   real(kind=8) :: norm_p, norm_p_new
   integer :: totit, maxit, restart, nrit, it, ldh, k, j
   integer :: n_ortho 
@@ -56,8 +57,15 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
   ldh = restart+1
 
+  ! --- Compute RHS norm ||b||_2 ---
   bnrm = dnrm2(n, b, 1)
   if (bnrm == 0.d0) bnrm = 1.d0
+
+  ! --- Compute global matrix Frobenius norm ||A||_F ---
+  anrm2_loc = dnrm2(int(a_mat%nnz), a_mat%val, 1)**2
+  call MPI_Allreduce(anrm2_loc, anrm2_glob, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_GLOB, ierr)
+  anrm = sqrt(anrm2_glob)
+  if (anrm == 0.d0) anrm = 1.d0
 
   no_conv = .true.
   totit = 0;  
@@ -69,13 +77,20 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     ! --- v_1 = b - A * x (True residual) ---
     call daxpby(n, 1.d0, b(1:n), 1, -1.d0, V(1:n), 1)
 
+    ! --- Denominator for Normwise Backward Error: ||A||_F * ||x||_2 + ||b||_2 ---
+    xnrm = dnrm2(n, x, 1)
+    nbe_denom = anrm * xnrm + bnrm
+
     ! --- rho = ||v_1||_2 ---
     rho = dnrm2(n, V(1:n), 1)
+
+    ! --- Normwise Backward Error: NBE = ||r||_2 / (||A||_F * ||x||_2 + ||b||_2) ---
+    nbe = rho / nbe_denom
     if (totit .eq. 0) then
       rho0 = rho
       scale_norm = max(rho0, bnrm)
     endif
-    if ((rho/scale_norm < rtol) .or. (rho < atol)) then
+    if ((rho/scale_norm < rtol) .or. (nbe < rtol) .or. (rho < atol)) then
       no_conv = .false.
       exit
     endif
@@ -85,7 +100,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     b_(2:restart+1) = 0.d0
     nrit = restart-1
     if (my_id.eq.0) then
-      write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm
+      write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm, "nbe =", nbe
       write(*, "(A)") "[GMRES] --- Restart ---"
     endif
 
@@ -148,8 +163,10 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       b_(it+1) = -givens_s(it)*b_(it)
       b_(it) = givens_c(it)*b_(it)
       rho = abs(b_(it+1))
-      if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm
-      if ((rho < atol).or.(rho/scale_norm < rtol).or.(totit >= maxit)) then
+      ! --- Normwise Backward Error ---
+      nbe = rho / nbe_denom
+      if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6, X, A, X, ES14.6)") "[GMRES] iteration", totit, "res =", rho, "rel.res =", rho/scale_norm, "nbe =", nbe
+      if ((rho < atol).or.(rho/scale_norm < rtol).or.(nbe < rtol).or.(totit >= maxit)) then
         no_conv = .false.
         nrit = it-1
         solver%iter_gmres = totit
