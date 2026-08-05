@@ -48,8 +48,7 @@ module mod_sparse
                          petsc_update_initial_guess, &
                          petsc_solve_iterative_and_retrieve, petsc_recover_solution, &
                          petsc_solve_and_retrieve, petsc_equilibrium_assemble, &
-                         petsc_equilibrium_rhs, petsc_cleanup, &
-                         petsc_metriplectic_pack_and_track
+                         petsc_equilibrium_rhs, petsc_cleanup
 #endif
 
     implicit none
@@ -226,9 +225,6 @@ module mod_sparse
         call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
                                                 solver%iter_gmres, solver%step_success)
         call petsc_recover_solution(solver%petsc_sys, sol_vec)
-        if (present(mhd_sim)) then
-          call petsc_metriplectic_pack_and_track(solver%petsc_sys, mhd_sim, mhd_sim%time, solver%istep, mhd_sim%my_id)
-        endif
       else
 #endif
 
@@ -251,9 +247,6 @@ module mod_sparse
       call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
                                               solver%iter_gmres, solver%step_success)
       call petsc_recover_solution(solver%petsc_sys, sol_vec)
-      if (present(mhd_sim)) then
-        call petsc_metriplectic_pack_and_track(solver%petsc_sys, mhd_sim, mhd_sim%time, solver%istep, mhd_sim%my_id)
-      endif
 #else
       if (.not.solver%pc%initialized) then
         call initialize_preconditioner(solver%pc,a_mat%comm)

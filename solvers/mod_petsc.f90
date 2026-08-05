@@ -18,26 +18,12 @@ module mod_petsc
     Vec  :: x, b           ! BAIJ solution/RHS vectors
     Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (persistent)
     KSP  :: ksp            ! Krylov solver context (persistent)
-    KSP  :: ksp_ab         ! commutator A/B diagnostic solver (own PC, zero guess)
-    Vec  :: x_ab           ! throwaway solution for the A/B solves
     logical :: initialized   = .false.  ! A, x, b created
     logical :: owns_A        = .false.  ! .true. when A was created by petsc_init_system (old path)
     logical :: ksp_ready     = .false.  ! KSP, A_aij, PC setup + factored
-    logical :: ab_ready      = .false.  ! ksp_ab/x_ab created
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
   end type type_PETSC_SYSTEM
-
-  ! --- commutator A/B diagnostic state (Slice 1) ---
-  integer, parameter :: AB_MAXV = 8
-  integer,          save :: ab_nv = 0
-  character(len=8), save :: ab_lab(AB_MAXV) = ' '
-  integer,          save :: ab_its(AB_MAXV) = 0
-  logical,          save :: ab_conv(AB_MAXV) = .false.
-  real*8,           save :: ab_inner(AB_MAXV) = 0.d0
-  logical,          save :: ab_have_row = .false.
-  logical,          save :: ab_header_written = .false.
-  character(len=*), parameter :: AB_LOG_FILE = 'commutator_pc_iters.dat'
 
 
 contains
@@ -364,16 +350,9 @@ contains
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
-    use phys_module, only: use_physics_pc, metriplectic_analysis, &
-                           use_metriplectic_pc, metriplectic_sweep_order, &
-                           commutator_analysis, commutator_pc, commutator_pc_ab, &
-                           metriplectic_khalf, commutator_pc_mstar
+    use phys_module, only: use_physics_pc, commutator_analysis
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
-    use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_run_analysis, &
-                                                  petsc_commutator_run_analysis
-    use mod_petsc_pc_metriplectic_assembly, only: metriplectic_build_sweep
-    use mod_petsc_pc_metriplectic_apply, only: metriplectic_sweep_apply_full, &
-                                               mpc_sweep_order, cm_set_variant
+    use mod_petsc_pc_commutator_analysis, only: petsc_commutator_run_analysis
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -417,30 +396,8 @@ contains
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
 
-      if (use_physics_pc .and. use_metriplectic_pc) then
-        if (my_id .eq. 0) write(*,*) &
-          "[PETSc] ERROR: use_physics_pc and use_metriplectic_pc are mutually exclusive"
-        error stop "conflicting PC selection"
-      endif
-      ! commutator_pc replaces step 3 of the metriplectic 'PS' K-half, so it
-      ! only means anything when that PC is the one being applied. The A/B
-      ! diagnostic (commutator_pc_ab) carries no such constraint: it runs on
-      ! its own KSP alongside whatever PC is selected.
-      if (commutator_pc .and. .not. (use_metriplectic_pc .and. metriplectic_khalf == 'PS')) then
-        if (my_id .eq. 0) write(*,*) &
-          "[PETSc] ERROR: commutator_pc requires use_metriplectic_pc=.true. and " // &
-          "metriplectic_khalf='PS' (use commutator_pc_ab for a standalone diagnostic)"
-        error stop "invalid commutator_pc configuration"
-      endif
-      ! Selected before build_sweep below, whose cm_bind re-resolves it
-      ! against the freshly built table.
-      if (commutator_pc) call cm_set_variant(commutator_pc_mstar, my_id)
       if (use_physics_pc) then
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + Physics PCSHELL"
-      else if (use_metriplectic_pc) then
-        if (my_id .eq. 0) write(*,*) &
-          "[PETSc] setup: FGMRES + Metriplectic HSS sweep PCSHELL (order " // &
-          metriplectic_sweep_order // ")"
       else
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + PCFIELDSPLIT + MUMPS"
       endif
@@ -449,22 +406,9 @@ contains
       if (use_physics_pc) then
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_PHYSICS)
         call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
-      else if (use_metriplectic_pc) then
-        mpc_sweep_order = metriplectic_sweep_order
-        PetscCallA(KSPGetPC(petsc_sys%ksp, pc_shell, ierr))
-        PetscCallA(PCSetType(pc_shell, PCSHELL, ierr))
-        PetscCallA(PCShellSetApply(pc_shell, metriplectic_sweep_apply_full, ierr))
-        call metriplectic_build_sweep(petsc_sys%A_aij, my_id)
       else
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
       endif
-      ! Diagnostic needs the metriplectic objects even when another PC is
-      ! in production (build_sweep is idempotent, so the metriplectic branch
-      ! above already covered its own case).
-      if (commutator_pc_ab .and. .not. use_metriplectic_pc) &
-        call metriplectic_build_sweep(petsc_sys%A_aij, my_id)
-      if (commutator_pc_ab) call petsc_commutator_ab_setup(petsc_sys, comm)
-      if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
       if (commutator_analysis)   call petsc_commutator_run_analysis(petsc_sys%A_aij, my_id)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
@@ -481,17 +425,10 @@ contains
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
-      if (use_metriplectic_pc .or. commutator_pc_ab) &
-        call metriplectic_build_sweep(petsc_sys%A_aij, my_id)
-      if (metriplectic_analysis) call petsc_metriplectic_run_analysis(petsc_sys%A_aij, my_id)
       if (commutator_analysis)   call petsc_commutator_run_analysis(petsc_sys%A_aij, my_id)
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
-      if (petsc_sys%ab_ready) then
-        PetscCallA(KSPSetOperators(petsc_sys%ksp_ab, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
-        PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp_ab, PETSC_FALSE, ierr))
-      endif
 
       PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
@@ -510,11 +447,6 @@ contains
     PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
     PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for FGMRES
 
-    ! Commutator A/B: extra solves on the dedicated KSP, before the real one.
-    ! Touches neither petsc_sys%ksp nor x_aij, so the production solve below
-    ! is bit-identical to a run with the diagnostic off.
-    if (commutator_pc_ab) call petsc_commutator_ab_run(petsc_sys, my_id)
-
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
@@ -530,201 +462,10 @@ contains
 
     if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
 
-    ! A/B report is emitted here so the (warm-started) production count can
-    ! be shown next to the zero-start variant counts.
-    if (commutator_pc_ab) call petsc_commutator_ab_report(my_id, n_iter)
-
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
     if (my_id .eq.0) write(*,'(A,ES12.4)') "[PETSc] solution norm: ", petsc_norm
   end subroutine petsc_solve_iterative_and_retrieve
-
-
-  !====================================================================
-  ! Commutator-device A/B diagnostic (Slice 1).
-  !
-  ! Measures outer FGMRES iterations for a list of Schur variants on a
-  ! DEDICATED KSP, so it can run alongside any production preconditioner
-  ! (PCFIELDSPLIT+MUMPS, physics PC, metriplectic PC) without perturbing
-  ! the production solve. All variants use a zero initial guess and the
-  ! same tolerances, which is what makes their counts comparable to each
-  ! other; the production count is warm-started and is reported separately
-  ! for reference only.
-  !
-  ! Variants: 'EXACT' = exact Schur shell (the ceiling any Schur
-  ! approximation is chasing), 'M0D' = assembled P_uw single pass (today's
-  ! incumbent), any other label = a candidate row of the shared table.
-  !====================================================================
-  subroutine petsc_commutator_ab_setup(petsc_sys, comm)
-    use phys_module, only: commutator_pc_ab_variants
-    use mod_petsc_pc_metriplectic_apply, only: metriplectic_sweep_apply_full
-    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    integer, intent(in) :: comm
-
-    PetscErrorCode :: ierr
-    PC :: pc
-
-    if (petsc_sys%ab_ready) return
-
-    call ab_parse_variants(commutator_pc_ab_variants)
-
-    PetscCallA(KSPCreate(comm, petsc_sys%ksp_ab, ierr))
-    PetscCallA(KSPSetOperators(petsc_sys%ksp_ab, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
-    PetscCallA(KSPSetType(petsc_sys%ksp_ab, KSPFGMRES, ierr))
-    PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp_ab, 40, ierr))
-    ! identical stopping criterion to production (see the setup branch)
-    PetscCallA(KSPSetTolerances(petsc_sys%ksp_ab, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
-    PetscCallA(KSPSetInitialGuessNonzero(petsc_sys%ksp_ab, PETSC_FALSE, ierr))
-    ! no KSPMonitorSet: the diagnostic must not triple the residual output
-    PetscCallA(KSPGetPC(petsc_sys%ksp_ab, pc, ierr))
-    PetscCallA(PCSetType(pc, PCSHELL, ierr))
-    PetscCallA(PCShellSetApply(pc, metriplectic_sweep_apply_full, ierr))
-    PetscCallA(VecDuplicate(petsc_sys%x_aij, petsc_sys%x_ab, ierr))
-
-    petsc_sys%ab_ready = .true.
-  end subroutine petsc_commutator_ab_setup
-
-
-  !> Split the comma-separated namelist string into variant labels.
-  subroutine ab_parse_variants(str)
-    character(len=*), intent(in) :: str
-    integer :: i, j, n
-
-    ab_nv = 0
-    i = 1
-    n = len_trim(str)
-    do while (i <= n .and. ab_nv < AB_MAXV)
-      j = index(str(i:n), ',')
-      if (j == 0) then
-        j = n + 1
-      else
-        j = i + j - 1
-      endif
-      if (len_trim(adjustl(str(i:j-1))) > 0) then
-        ab_nv = ab_nv + 1
-        ab_lab(ab_nv) = trim(adjustl(str(i:j-1)))
-      endif
-      i = j + 1
-    enddo
-  end subroutine ab_parse_variants
-
-
-  subroutine petsc_commutator_ab_run(petsc_sys, my_id)
-    use phys_module, only: commutator_pc_ab_every, index_now
-    use mod_petsc_pc_metriplectic_ctx, only: g_mctx
-    use mod_petsc_pc_metriplectic_apply, only: cm_schur_variant, cm_ab_active, &
-                                               cm_set_variant, cm_counters_reset, &
-                                               cm_counters_get
-    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    integer, intent(in) :: my_id
-
-    PetscErrorCode :: ierr
-    KSPConvergedReason :: reason
-    PetscInt :: its
-    integer :: iv, itot, icalls
-    character(len=8) :: saved_variant
-    PetscReal :: s_rtol, s_atol, s_dtol
-    PetscInt  :: s_maxit
-
-    ab_have_row = .false.
-    if (.not. petsc_sys%ab_ready) return
-    if (commutator_pc_ab_every > 1) then
-      if (mod(index_now, commutator_pc_ab_every) /= 0) return
-    endif
-
-    saved_variant = cm_schur_variant
-    cm_ab_active  = .true.                 ! force the PS-LDU path in the sweep
-
-    ! The 'EXACT' variant reuses ksp_Suw, whose production tolerance is
-    ! metriplectic_ps_inner_tol (1e-2 by default, and maxits=30 when
-    ! ps_inner_it=0). That would make the "ceiling" a loose approximation
-    ! rather than the exact Schur. Tighten it for the A/B window only and
-    ! restore afterwards, so production behaviour is untouched.
-    PetscCallA(KSPGetTolerances(g_mctx%ksp_Suw, s_rtol, s_atol, s_dtol, s_maxit, ierr))
-    PetscCallA(KSPSetTolerances(g_mctx%ksp_Suw, 1.d-10, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, 200, ierr))
-
-    do iv = 1, ab_nv
-      call cm_set_variant(ab_lab(iv), my_id)
-      call cm_counters_reset()
-      PetscCallA(VecZeroEntries(petsc_sys%x_ab, ierr))
-      PetscCallA(KSPSolve(petsc_sys%ksp_ab, petsc_sys%b_aij, petsc_sys%x_ab, ierr))
-      PetscCallA(KSPGetIterationNumber(petsc_sys%ksp_ab, its, ierr))
-      PetscCallA(KSPGetConvergedReason(petsc_sys%ksp_ab, reason, ierr))
-      call cm_counters_get(itot, icalls)
-      ab_its(iv)   = its
-      ab_conv(iv)  = (reason%v > 0)
-      if (icalls > 0) then
-        ab_inner(iv) = dble(itot) / dble(icalls)
-      else
-        ab_inner(iv) = -1.d0               ! variant has no inner solve
-      endif
-    enddo
-
-    PetscCallA(KSPSetTolerances(g_mctx%ksp_Suw, s_rtol, s_atol, s_dtol, s_maxit, ierr))
-    cm_ab_active = .false.
-    call cm_set_variant(saved_variant, my_id)   ! restore the production choice
-    ab_have_row  = .true.
-  end subroutine petsc_commutator_ab_run
-
-
-  subroutine petsc_commutator_ab_report(my_id, prod_its)
-    use phys_module, only: index_now, t_now, tstep
-    integer, intent(in) :: my_id, prod_its
-
-    integer :: iv, u, ios
-    character(len=16) :: inner_str
-
-    if (.not. ab_have_row) return
-    if (my_id /= 0) return
-
-    write(*,'(A,I8,A,ES12.4,A,ES12.4)') "[CommPC] step ", index_now, &
-      "  t = ", t_now, "  dt = ", tstep
-    write(*,'(A)') "[CommPC]   variant    outer   inner/apply   converged"
-    do iv = 1, ab_nv
-      if (ab_inner(iv) < 0.d0) then
-        inner_str = '        --'
-      else
-        write(inner_str,'(F10.2)') ab_inner(iv)
-      endif
-      write(*,'(A,A8,3X,I6,3X,A10,6X,L1)') "[CommPC]  ", trim(ab_lab(iv)), &
-        ab_its(iv), trim(inner_str), ab_conv(iv)
-    enddo
-    write(*,'(A,I0,A)') "[CommPC]   (production PC: ", prod_its, &
-      " its, warm-started -- not zero-start comparable)"
-
-    if (.not. ab_header_written) then
-      open(newunit=u, file=AB_LOG_FILE, status='replace', action='write', iostat=ios)
-      if (ios == 0) then
-        write(u,'(A)') '# step  time  dt  prod_its  ' // &
-                       '[ per variant: its  inner_per_apply  converged ]'
-        write(u,'(A)') '# variants: ' // trim(ab_join_labels())
-        close(u)
-      endif
-      ab_header_written = .true.
-    endif
-
-    open(newunit=u, file=AB_LOG_FILE, status='old', position='append', &
-         action='write', iostat=ios)
-    if (ios == 0) then
-      write(u,'(I8,1X,ES14.6,1X,ES14.6,1X,I6)',advance='no') &
-        index_now, t_now, tstep, prod_its
-      do iv = 1, ab_nv
-        write(u,'(1X,I6,1X,F10.3,1X,L2)',advance='no') &
-          ab_its(iv), ab_inner(iv), ab_conv(iv)
-      enddo
-      write(u,'(A)') ''
-      close(u)
-    endif
-  end subroutine petsc_commutator_ab_report
-
-
-  character(len=128) function ab_join_labels()
-    integer :: iv
-    ab_join_labels = ''
-    do iv = 1, ab_nv
-      ab_join_labels = trim(ab_join_labels) // ' ' // trim(ab_lab(iv))
-    enddo
-  end function ab_join_labels
 
 
   subroutine petsc_recover_solution(petsc_sys, sol_vec)
@@ -867,11 +608,6 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     PetscErrorCode :: ierr
 
-    if (petsc_sys%ab_ready) then
-      call KSPDestroy(petsc_sys%ksp_ab, ierr)
-      call VecDestroy(petsc_sys%x_ab, ierr)
-      petsc_sys%ab_ready = .false.
-    endif
     if (petsc_sys%ksp_ready) then
       call KSPDestroy(petsc_sys%ksp, ierr)
       call MatDestroy(petsc_sys%A_aij, ierr)
@@ -890,69 +626,6 @@ contains
     endif
   end subroutine petsc_cleanup
 
-  !====================================================================
-  ! Wrapper to pack the JOREK state vector and call the energy tracking
-  !====================================================================
-  subroutine petsc_metriplectic_pack_and_track(petsc_sys, mhd_sim, time, istep, my_id)
-    use mod_simulation_data, only: type_MHD_SIM
-    use mod_parameters, only: n_var, n_tor, n_degrees
-    use phys_module, only: keep_n0_const, treat_axis, metriplectic_analysis
-    use mod_axis_treatment, only: new_to_old_dofs_on_the_axis
-    use mod_petsc_pc_metriplectic_analysis, only: petsc_metriplectic_track_energies
-    
-    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    type(type_MHD_SIM),      intent(in)    :: mhd_sim
-    real*8,                  intent(in)    :: time
-    integer,                 intent(in)    :: istep
-    integer,                 intent(in)    :: my_id
-
-    Vec :: X_global
-    PetscErrorCode :: ierr
-    integer :: i, j, k, in_tor, index_node, idx, i_tor_min
-    PetscInt :: petsc_idx
-    real*8 :: val
-
-    if (.not. metriplectic_analysis) return
-    if (.not. petsc_sys%initialized) return
-
-    ! Create a vector with the same layout as the Newton increment
-    PetscCallA(VecDuplicate(petsc_sys%x, X_global, ierr))
-    PetscCallA(VecSet(X_global, 0.0d0, ierr))
-
-    i_tor_min = 1
-    if ( keep_n0_const ) i_tor_min = 2
-
-    do i = 1, mhd_sim%node_list%n_nodes
-      if (.not. mhd_sim%node_list%node(i)%constrained) then
-        ! We do not currently handle axis unpacking because the tracking 
-        ! is primarily to evaluate energies in the bulk, and axis nodes
-        ! require the old-to-new DOF transformation.
-        if (treat_axis .and. mhd_sim%node_list%node(i)%axis_node) cycle
-
-        do j = 1, n_degrees
-          index_node = mhd_sim%node_list%node(i)%index(j)
-          do k = 1, n_var
-            do in_tor = i_tor_min, n_tor
-              idx = n_tor*n_var * (index_node - 1) + n_tor*(k-1) + in_tor
-              if (idx > 0) then
-                petsc_idx = idx - 1 ! PETSc uses 0-based indexing
-                val = mhd_sim%node_list%node(i)%values(in_tor,j,k)
-                PetscCallA(VecSetValue(X_global, petsc_idx, val, INSERT_VALUES, ierr))
-              endif
-            enddo
-          enddo
-        enddo
-      endif
-    enddo
-
-    PetscCallA(VecAssemblyBegin(X_global, ierr))
-    PetscCallA(VecAssemblyEnd(X_global, ierr))
-
-    ! Call the actual tracking subroutine
-    call petsc_metriplectic_track_energies(time, istep, X_global, petsc_sys%x_aij, my_id)
-
-    PetscCallA(VecDestroy(X_global, ierr))
-  end subroutine petsc_metriplectic_pack_and_track
 
 #endif
 end module mod_petsc

@@ -654,19 +654,7 @@ subroutine preset_parameters
   physics_pc_sub_blocks_mode = 1             ! 1=Jacobi (default), 2=GS-forward, 3=GS-symmetric
   physics_pc_probe_exact = .false.           ! Probe exact 4x4 Schur complement via N mat-vec products (small problems only)
   physics_pc_block_inv  = .false.           ! Per-node 4x4 block-diagonal mass inverse for Schur correction
-  metriplectic_analysis        = .false.    ! Metriplectic PC Slice-A analysis (T1-T5a) off by default
-  metriplectic_analysis_nsweep = 5          ! Number of dt points in the T2 conditioning sweep
-  use_metriplectic_pc          = .false.    ! Metriplectic HSS sweep PCSHELL off by default
-  metriplectic_sweep_order     = 'SK'       ! Sweep order: dissipative pairs first ('SK') or ideal first ('KS')
-  metriplectic_khalf           = 'PS'       ! K-half mode: 'PS' pair-Schur LDU, 'K4' 4-field LU, 'K2' 2x2 LU, 'PU' P_u Schur
-  metriplectic_ps_inner_it     = 0          ! Inner Schur iterations (0 = single-pass P_uw^-1)
-  metriplectic_ps_inner_tol    = 1.d-2      ! Inner Schur relative tolerance
   commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
-  commutator_pc                = .false.    ! Commutator-device M_* Schur as the production 'PS' K-half off by default
-  commutator_pc_mstar          = 'M1a'      ! Candidate M_* for commutator_pc (table label; 'M1a' = Eq.(35), a I + theta A)
-  commutator_pc_ab             = .false.    ! A/B iteration-count diagnostic off by default
-  commutator_pc_ab_variants    = 'EXACT,M0D,M1a'  ! Ceiling, incumbent, candidate
-  commutator_pc_ab_every       = 1          ! Run the A/B every time step
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 
   use_mumps          = .false.              ! Use MUMPS solver
