@@ -1,13 +1,12 @@
 module construct_commutator_matrix_mod
 !----------------------------------------------------------------
-! Element-loop driver for the commutator-PC building-block operators
-! (mod_elt_matrix_commutator: CM_NB pure integrand blocks). Structure
-! mirrors construct_metriplectic_matrix_mod; the 1-var matrix creation is
-! replicated privately to keep the families independent.
+! Element-loop driver for the commutator building-block operators
+! (mod_elt_matrix_commutator: CM_NB pure integrand blocks). The 1-var
+! matrix creation is replicated privately to keep this family independent.
 !
 ! BC policy: the blocks are NON-mass (advection / compression / stiffness),
-! so -- like the metriplectic coupling operators -- their boundary rows are
-! ZEROED (zero_bc_rows_pc_matrix). In a candidate combo the extracted mass
+! so their boundary rows are ZEROED (zero_bc_rows_pc_matrix). In a
+! candidate combo the extracted mass
 ! (B33/B44) carries the boundary row, keeping the operator boundary-clean.
 !----------------------------------------------------------------
 #ifdef USE_PETSC
@@ -25,7 +24,6 @@ contains
 
 #ifdef USE_PETSC
   !> Create one 1-var MPIBAIJ matrix with sparsity derived from a_mat
-  !! (replicated from mod_petsc_pc_metriplectic_assembly::create_1v_matrix).
   subroutine create_1v_matrix(petsc_A, a_mat)
     use data_structure, only: type_SP_MATRIX
     use mod_parameters, only: n_var
@@ -245,7 +243,7 @@ contains
       PetscCallA(MatAssemblyEnd  (blk(ib), MAT_FINAL_ASSEMBLY, ierr))
     enddo
     ! Non-mass blocks: zero the BC rows so the extracted mass carries the
-    ! boundary in candidate combos (as the metriplectic coupling operators).
+    ! boundary in candidate combos.
     if (eliminate_boundary_dofs) then
       do ib = 1, CM_NB
         call zero_bc_rows_pc_matrix(blk(ib), var_u, local_elms, n_local_elms, my_ind_min, my_ind_max)

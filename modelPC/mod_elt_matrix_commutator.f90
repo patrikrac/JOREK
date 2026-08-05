@@ -22,8 +22,8 @@ module mod_elt_matrix_commutator
 ! All blocks are p-channel only (advection/compression pick up toroidal
 ! mode coupling through the background flow u0 across planes, via the FFT
 ! of the plane-wise integrand -- exactly as amat_55's p-channel). Geometry
-! and FFT machinery follow mod_elt_matrix_metriplectic (first derivatives
-! only; 0.5 = FFT normalisation, matching element_matrix_fft).
+! and FFT machinery use first derivatives only; 0.5 = FFT normalisation,
+! matching element_matrix_fft.
 !----------------------------------------------------------------
 implicit none
 public :: element_matrix_commutator

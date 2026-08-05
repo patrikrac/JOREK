@@ -3,12 +3,10 @@ module mod_petsc_pc_commutator_table
 ! Candidate table for the commutator-device operator M_*
 ! (note JOREK_commutator_preconditioner_baseline, Sec. 8.5, Table 1).
 !
-! SINGLE SOURCE OF TRUTH: both the offline intertwining-defect analysis
-! (petsc_commutator_run_analysis, eps per toroidal harmonic) and the
-! production/diagnostic preconditioner (the commutator Schur shell in
-! mod_petsc_pc_metriplectic_apply) read their candidates from here, so a
-! new candidate is ONE table row and immediately acquires both an eps and
-! an FGMRES iteration count for the same object.
+! SINGLE SOURCE OF TRUTH for the candidates: the offline intertwining-defect
+! analysis (petsc_commutator_run_analysis in
+! mod_petsc_pc_commutator_analysis, eps per toroidal harmonic) reads them
+! from here, so adding a candidate is ONE table row.
 !
 ! A candidate is a linear combination over the operator set
 !   1 = B11  (amat_11, = a I + theta A, inertia + ExB advection)
@@ -36,12 +34,9 @@ module mod_petsc_pc_commutator_table
 ! assembly per matrix construction, shared by every consumer).
 !
 ! TIME-FACTOR CONVENTION: opz and tdt are ARGUMENTS, not read from
-! phys_module, because the two consumers currently disagree --
-! petsc_commutator_run_analysis uses the variable-step Gears value
-! zeta = time_evol_zeta*2*tstep/(tstep+tstep_prev), while
-! metriplectic_build_sweep uses plain opz = 1 + time_evol_zeta. Each
-! caller passes its own so neither changes behaviour; see the open item in
-! the Slice-1 plan.
+! phys_module, so each caller supplies its own convention.
+! petsc_commutator_run_analysis passes the variable-step Gears value
+! zeta = time_evol_zeta*2*tstep/(tstep+tstep_prev).
 !----------------------------------------------------------------
 #ifdef USE_PETSC
   use mpi_mod
@@ -79,9 +74,7 @@ contains
 
   !====================================================================
   ! Assemble the building-block operators. Called from jorek2_main (where
-  ! the element list is available), gated by commutator_analysis /
-  ! commutator_pc / commutator_pc_ab. Mirrors metriplectic_assemble's
-  ! create/destroy lifecycle.
+  ! the element list is available), gated by commutator_analysis.
   !====================================================================
   subroutine petsc_commutator_assemble(my_id, local_elms, n_local_elms, a_mat)
     use construct_commutator_matrix_mod, only: commutator_create_matrices, &
