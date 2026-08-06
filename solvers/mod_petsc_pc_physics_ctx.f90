@@ -24,15 +24,6 @@ module mod_petsc_pc_physics_ctx
     IS :: is_var(6)
     logical :: is_created = .false.
 
-    !> Lumped mass inverse vectors (1-var layout from extracted sub-blocks)
-    Vec :: diag_Mj_inv, diag_Mw_inv
-
-    !> Block diagonal inverse matrices (BAIJ, block_size = n_tor)
-    !! Computed via MatInvertBlockDiagonalMat from B_33/B_44
-    Mat :: Dinv_Mj, Dinv_Mw
-    logical :: dinv_created   = .false.
-    logical :: dinv_created_w = .false.
-
     !> Sub-blocks extracted from the full system AIJ matrix.
     !! Naming: B_ij = block at (equation i, variable j).
     !! Coupling blocks for Schur corrections (TO j,w from other eqs):
@@ -48,10 +39,6 @@ module mod_petsc_pc_physics_ctx
     Mat :: B_21, B_25, B_26            ! row u
     Mat :: B_51, B_52                  ! row rho
     Mat :: B_61, B_62                  ! row T
-
-    !> Reassembled diagonal blocks (simplified integrands, used when physics_pc_reassemble = .true.)
-    Mat :: R_11, R_22, R_55, R_66
-    logical :: reassembled_ready = .false.
 
     !> Schur-corrected blocks:
     !! Diagonal:

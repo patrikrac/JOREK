@@ -9,7 +9,6 @@ module mod_petsc_pc_physics_element
 
   public :: petsc_create_pc_matrices
   public :: petsc_assemble_pc_matrices
-  public :: petsc_assemble_pc_diagonal_matrices
   public :: petsc_update_physics_pc_ctx 
   public :: petsc_test_pc_matrix
 
@@ -132,115 +131,6 @@ contains
     g_ctx%matrices_ready = .true.
   end subroutine petsc_assemble_pc_matrices
 
-
-  !> Assemble the four simplified diagonal PC sub-matrices (R_11, R_22, R_55, R_66).
-  !! Self-contained: derives ownership from A_full and local elements from global mesh data.
-  !! Called from petsc_physics_pc_build_reduced when physics_pc_reassemble = .true.
-  subroutine petsc_assemble_pc_diagonal_matrices(A_full, comm, my_id)
-    use construct_pc_matrix_mod, only: construct_pc_diagonal_matrices
-    use mod_parameters, only: n_var, n_tor, n_degrees, n_vertex_max
-    use nodes_elements
-
-    Mat, intent(in) :: A_full
-    integer, intent(in) :: comm, my_id
-
-    PetscErrorCode :: ierr
-    PetscInt :: rstart, rend, block_size, n_block_local
-    PetscInt :: n_local_1v, n_global_1v
-    integer :: my_ind_min, my_ind_max
-    integer :: ielm, iv, inode, i_order, idx
-    logical :: first_assembly
-
-    ! Local element list (computed from mesh + ownership)
-    integer, allocatable :: local_elms(:)
-    integer :: n_local_elms, n_elements
-
-    first_assembly = .not. g_ctx%reassembled_ready
-
-    ! --- Derive node ownership from PETSc matrix ---
-    call MatGetOwnershipRange(A_full, rstart, rend, ierr)
-    block_size    = n_var * n_tor
-    n_block_local = (rend - rstart) / block_size
-    my_ind_min    = rstart / block_size + 1   ! 1-based node index
-    my_ind_max    = my_ind_min + n_block_local - 1
-
-    ! --- Compute local element list ---
-    n_elements = element_list%n_elements
-    allocate(local_elms(n_elements))
-    n_local_elms = 0
-    element_loop: do ielm = 1, n_elements
-      do iv = 1, n_vertex_max
-        inode = element_list%element(ielm)%vertex(iv)
-        do i_order = 1, n_degrees
-          idx = node_list%node(inode)%index(i_order)
-          if (idx >= my_ind_min .and. idx <= my_ind_max) then
-            n_local_elms = n_local_elms + 1
-            local_elms(n_local_elms) = ielm
-            cycle element_loop
-          endif
-        enddo
-      enddo
-    enddo element_loop
-
-    ! --- Destroy old matrices on rebuild (they were converted to AIJ after first assembly,
-    !     so we must recreate as BAIJ for MatSetValuesBlocked in the assembly loop) ---
-    if (.not. first_assembly) then
-      call MatDestroy(g_ctx%R_11, ierr)
-      call MatDestroy(g_ctx%R_22, ierr)
-      call MatDestroy(g_ctx%R_55, ierr)
-      call MatDestroy(g_ctx%R_66, ierr)
-    endif
-
-    ! --- Create fresh 1-var BAIJ matrices ---
-    n_local_1v  = n_block_local * n_tor
-    n_global_1v = PETSC_DETERMINE
-    call MatCreate(comm, g_ctx%R_11, ierr)
-    call MatSetSizes(g_ctx%R_11, n_local_1v, n_local_1v, n_global_1v, n_global_1v, ierr)
-    call MatSetType(g_ctx%R_11, MATMPIBAIJ, ierr)
-    call MatSetBlockSize(g_ctx%R_11, n_tor, ierr)
-    call MatMPIBAIJSetPreallocation(g_ctx%R_11, n_tor, 20, PETSC_NULL_INTEGER_ARRAY, 20, PETSC_NULL_INTEGER_ARRAY, ierr)
-
-    call MatCreate(comm, g_ctx%R_22, ierr)
-    call MatSetSizes(g_ctx%R_22, n_local_1v, n_local_1v, n_global_1v, n_global_1v, ierr)
-    call MatSetType(g_ctx%R_22, MATMPIBAIJ, ierr)
-    call MatSetBlockSize(g_ctx%R_22, n_tor, ierr)
-    call MatMPIBAIJSetPreallocation(g_ctx%R_22, n_tor, 20, PETSC_NULL_INTEGER_ARRAY, 20, PETSC_NULL_INTEGER_ARRAY, ierr)
-
-    call MatCreate(comm, g_ctx%R_55, ierr)
-    call MatSetSizes(g_ctx%R_55, n_local_1v, n_local_1v, n_global_1v, n_global_1v, ierr)
-    call MatSetType(g_ctx%R_55, MATMPIBAIJ, ierr)
-    call MatSetBlockSize(g_ctx%R_55, n_tor, ierr)
-    call MatMPIBAIJSetPreallocation(g_ctx%R_55, n_tor, 20, PETSC_NULL_INTEGER_ARRAY, 20, PETSC_NULL_INTEGER_ARRAY, ierr)
-
-    call MatCreate(comm, g_ctx%R_66, ierr)
-    call MatSetSizes(g_ctx%R_66, n_local_1v, n_local_1v, n_global_1v, n_global_1v, ierr)
-    call MatSetType(g_ctx%R_66, MATMPIBAIJ, ierr)
-    call MatSetBlockSize(g_ctx%R_66, n_tor, ierr)
-    call MatMPIBAIJSetPreallocation(g_ctx%R_66, n_tor, 20, PETSC_NULL_INTEGER_ARRAY, 20, PETSC_NULL_INTEGER_ARRAY, ierr)
-
-    ! Allow new nonzero entries (conservative pre-allocation may undercount)
-    call MatSetOption(g_ctx%R_11, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
-    call MatSetOption(g_ctx%R_22, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
-    call MatSetOption(g_ctx%R_55, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
-    call MatSetOption(g_ctx%R_66, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
-
-    ! --- Element-level assembly ---
-    call construct_pc_diagonal_matrices(my_id, local_elms(1:n_local_elms), n_local_elms, &
-                                         my_ind_min, my_ind_max, &
-                                         g_ctx%R_11, g_ctx%R_22, g_ctx%R_55, g_ctx%R_66)
-
-    deallocate(local_elms)
-
-    ! Convert BAIJ to AIJ for compatibility with extracted sub-blocks in Schur correction
-    call MatConvert(g_ctx%R_11, MATMPIAIJ, MAT_INPLACE_MATRIX, g_ctx%R_11, ierr)
-    call MatConvert(g_ctx%R_22, MATMPIAIJ, MAT_INPLACE_MATRIX, g_ctx%R_22, ierr)
-    call MatConvert(g_ctx%R_55, MATMPIAIJ, MAT_INPLACE_MATRIX, g_ctx%R_55, ierr)
-    call MatConvert(g_ctx%R_66, MATMPIAIJ, MAT_INPLACE_MATRIX, g_ctx%R_66, ierr)
-
-    g_ctx%reassembled_ready = .true.
-
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Diagonal blocks reassembled (R_11, R_22, R_55, R_66)"
-  end subroutine petsc_assemble_pc_diagonal_matrices
 
 
   !> Refresh the module-level context after a matrix rebuild.

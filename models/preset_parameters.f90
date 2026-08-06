@@ -645,7 +645,6 @@ subroutine preset_parameters
   
   use_physics_pc     = .false.              ! Use physics-based block PCSHELL preconditioner
   debug_physics_pc   = .false.              ! Print PC matrix analysis after first assembly
-  physics_pc_reassemble = .false.            ! Reassemble diagonal blocks from simplified integrands
   physics_pc_monolithic = .false.            ! Monolithic 4x4 solve (stage-one Schur test)
   physics_pc_multi_step  = .false.           ! Three-step predictor-corrector apply (requires physics_pc_monolithic)
   physics_pc_multi_step_symmetric = .false.   ! Backward corrector for B_16/B_25/B_26 in multi_step
@@ -653,7 +652,7 @@ subroutine preset_parameters
   physics_pc_sub_blocks      = .false.       ! 2x2 super-block PC: (psi,u) + (rho,T)
   physics_pc_sub_blocks_mode = 1             ! 1=Jacobi (default), 2=GS-forward, 3=GS-symmetric
   physics_pc_probe_exact = .false.           ! Probe exact 4x4 Schur complement via N mat-vec products (small problems only)
-  physics_pc_block_inv  = .false.           ! Per-node 4x4 block-diagonal mass inverse for Schur correction
+  physics_pc_verify_spbp = .false.          ! Offline S_PBP spectrum diagnostic (expensive; own flag, not debug_physics_pc)
   commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 

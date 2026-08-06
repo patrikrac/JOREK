@@ -73,6 +73,12 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 bc_natural_open,                                    &
                 use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
                 commutator_analysis,                                &
+                use_physics_pc, debug_physics_pc,                   &
+                physics_pc_monolithic, physics_pc_multi_step,       &
+                physics_pc_multi_step_symmetric,                    &
+                physics_pc_wave_schur, physics_pc_sub_blocks,       &
+                physics_pc_sub_blocks_mode, physics_pc_probe_exact, &
+                physics_pc_verify_spbp,                             &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &

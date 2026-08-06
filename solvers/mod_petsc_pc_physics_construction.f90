@@ -20,9 +20,6 @@ module mod_petsc_pc_physics_construction
 
   public :: create_variable_index_sets
   public :: extract_sub_block
-  public :: compute_diag_mass_inverse
-  public :: compute_per_node_block_inverse
-  public :: compute_schur_corrected_block
   public :: compute_schur_corrected_block_psi
   public :: compute_schur_corrected_block_u
   public :: compute_schur_corrected_block_21
@@ -137,234 +134,16 @@ contains
   end subroutine extract_sub_block
 
 
-  !--------------------------------------------------------------------
-  !> Compute diagnonal mass inverse from diagonal blocks B_33 and B_44.
-  !! diag_M_inv = 1 / diag(B)
-  !--------------------------------------------------------------------
-  subroutine compute_diag_mass_inverse(B, diag_M_inv, first_time)
-    Mat, intent(in)    :: B
-    Vec, intent(inout) :: diag_M_inv
-    logical, intent(in) :: first_time
 
-    PetscErrorCode :: ierr
-
-    if (first_time) then
-      PetscCallA(MatCreateVecs(B, PETSC_NULL_VEC, diag_M_inv, ierr))
-    endif
-    !PetscCallA(MatGetRowSum(B, diag_M_inv, ierr))
-    PetscCallA(MatGetDiagonal(B, diag_M_inv, ierr))
-    PetscCallA(VecReciprocal(diag_M_inv, ierr))
-  end subroutine compute_diag_mass_inverse
-
-  !--------------------------------------------------------------------
-  !> Compute per-node full block-diagonal inverse of a 1-var AIJ mass matrix.
-  !!
-  !! For each interior node, the full (n_degrees*n_tor)^2 block is extracted
-  !! and inverted with LAPACK dgesv in one call. Axis nodes are grouped: all
-  !! unique DOFs across axis nodes are collected and their combined
-  !! (n_axis_dofs*n_tor)^2 block is inverted as a single unit. This handles
-  !! both treat_axis (all axis nodes share the same 4 DOFs) and
-  !! force_central_node (axis nodes share only DOF 1, distinct DOFs 2-4).
-  !!
-  !! Row indices are built in DOF-major order: all n_tor harmonics for DOF 1,
-  !! then all n_tor harmonics for DOF 2, etc.
-  !!
-  !! MatGetValues fills row-major into Fortran column-major memory, yielding
-  !! the transpose of the actual block. dgesv solves the transposed system,
-  !! and MatSetValues re-transposes — giving the correct block inverse.
-  !--------------------------------------------------------------------
-  subroutine compute_per_node_block_inverse(B_mass, Dinv, dinv_created)
-    use mod_parameters, only: n_tor, n_degrees, n_vertex_max
-    use nodes_elements
-
-    Mat, intent(in)      :: B_mass
-    Mat, intent(inout)   :: Dinv
-    logical, intent(inout) :: dinv_created
-
-    PetscErrorCode :: ierr
-    PetscInt :: rstart, rend, nrows_local, ncols_local, nrows_global, ncols_global
-    integer :: my_ind_min, my_ind_max, n_block_local
-    integer :: ielm, iv, inode, j, d, cnt, n_elements
-    integer :: k0, local_blk, block_n, n_axis_dofs
-    integer :: info, comm
-    logical, allocatable :: visited(:), in_axis_set(:)
-    integer, allocatable :: axis_dof_list(:), ipiv_blk(:)
-    PetscInt, allocatable :: rows_node(:), axis_rows(:)
-    PetscScalar, allocatable :: blk(:), rhs_blk(:), diag_save_blk(:)
-
-    external :: dgesv
-
-    call MatGetOwnershipRange(B_mass, rstart, rend, ierr)
-    n_block_local = int((rend - rstart) / n_tor)
-    my_ind_min    = int(rstart / n_tor) + 1
-    my_ind_max    = my_ind_min + n_block_local - 1
-
-    if (.not. dinv_created) then
-      call MatGetLocalSize(B_mass, nrows_local, ncols_local, ierr)
-      call MatGetSize(B_mass, nrows_global, ncols_global, ierr)
-      call PetscObjectGetComm(B_mass, comm, ierr)
-      call MatCreate(comm, Dinv, ierr)
-      call MatSetSizes(Dinv, nrows_local, ncols_local, nrows_global, ncols_global, ierr)
-      call MatSetType(Dinv, MATMPIAIJ, ierr)
-      ! Hint: n_degrees*n_tor nonzeros per row (axis rows may have more, allowed by PETSC_FALSE)
-      call MatMPIAIJSetPreallocation(Dinv, n_degrees*n_tor, PETSC_NULL_INTEGER_ARRAY, &
-                                     0, PETSC_NULL_INTEGER_ARRAY, ierr)
-      call MatSetOption(Dinv, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
-      dinv_created = .true.
-    else
-      call MatZeroEntries(Dinv, ierr)
-    endif
-
-    n_elements = element_list%n_elements
-
-    !--- Pass 0: collect unique axis DOFs owned by this rank ---
-    allocate(in_axis_set(n_block_local))
-    in_axis_set = .false.
-    n_axis_dofs = 0
-    do ielm = 1, n_elements
-      do iv = 1, n_vertex_max
-        inode = element_list%element(ielm)%vertex(iv)
-        if (.not. node_list%node(inode)%axis_node) cycle
-        do j = 1, n_degrees
-          d = node_list%node(inode)%index(j)
-          if (d < my_ind_min .or. d > my_ind_max) cycle
-          if (in_axis_set(d - my_ind_min + 1)) cycle
-          in_axis_set(d - my_ind_min + 1) = .true.
-          n_axis_dofs = n_axis_dofs + 1
-        end do
-      end do
-    end do
-    allocate(axis_dof_list(max(1, n_axis_dofs)))
-    cnt = 0
-    do d = my_ind_min, my_ind_max
-      if (in_axis_set(d - my_ind_min + 1)) then
-        cnt = cnt + 1
-        axis_dof_list(cnt) = d
-      end if
-    end do
-    deallocate(in_axis_set)
-
-    !--- Pass 1: interior nodes ---
-    allocate(visited(0:n_block_local-1))
-    visited = .false.
-    block_n = n_degrees * n_tor
-    allocate(rows_node(block_n), blk(block_n*block_n), rhs_blk(block_n*block_n))
-    allocate(diag_save_blk(block_n), ipiv_blk(block_n))
-
-    do ielm = 1, n_elements
-      do iv = 1, n_vertex_max
-        inode = element_list%element(ielm)%vertex(iv)
-        if (node_list%node(inode)%axis_node) cycle
-        k0 = node_list%node(inode)%index(1)
-        if (k0 < my_ind_min .or. k0 + n_degrees - 1 > my_ind_max) cycle
-        local_blk = k0 - my_ind_min
-        if (visited(local_blk)) cycle
-        visited(local_blk) = .true.
-
-        ! Row indices: DOF-major (all n_tor harmonics for DOF j, then DOF j+1, ...)
-        do j = 1, n_degrees
-          d = node_list%node(inode)%index(j)
-          do cnt = 0, n_tor - 1
-            rows_node((j-1)*n_tor + cnt + 1) = (d - 1) * n_tor + cnt
-          end do
-        end do
-
-        call MatGetValues(B_mass, block_n, rows_node, block_n, rows_node, blk, ierr)
-        do j = 1, block_n
-          diag_save_blk(j) = blk((j-1)*block_n + j)
-        end do
-        rhs_blk = 0.d0
-        do j = 1, block_n; rhs_blk((j-1)*block_n + j) = 1.d0; end do
-        call dgesv(block_n, block_n, blk, block_n, ipiv_blk, rhs_blk, block_n, info)
-        if (info /= 0) then
-          rhs_blk = 0.d0
-          do j = 1, block_n
-            if (abs(diag_save_blk(j)) > 0.d0) rhs_blk((j-1)*block_n + j) = 1.d0 / diag_save_blk(j)
-          end do
-        end if
-        call MatSetValues(Dinv, block_n, rows_node, block_n, rows_node, rhs_blk, INSERT_VALUES, ierr)
-      end do
-    end do
-    deallocate(visited, rows_node, blk, rhs_blk, diag_save_blk, ipiv_blk)
-
-    !--- Pass 2: axis node group ---
-    if (n_axis_dofs > 0) then
-      block_n = n_axis_dofs * n_tor
-      allocate(axis_rows(block_n), blk(block_n*block_n), rhs_blk(block_n*block_n))
-      allocate(diag_save_blk(block_n), ipiv_blk(block_n))
-
-      do d = 1, n_axis_dofs
-        do cnt = 0, n_tor - 1
-          axis_rows((d-1)*n_tor + cnt + 1) = (axis_dof_list(d) - 1) * n_tor + cnt
-        end do
-      end do
-
-      call MatGetValues(B_mass, block_n, axis_rows, block_n, axis_rows, blk, ierr)
-      do j = 1, block_n
-        diag_save_blk(j) = blk((j-1)*block_n + j)
-      end do
-      rhs_blk = 0.d0
-      do j = 1, block_n; rhs_blk((j-1)*block_n + j) = 1.d0; end do
-      call dgesv(block_n, block_n, blk, block_n, ipiv_blk, rhs_blk, block_n, info)
-      if (info /= 0) then
-        rhs_blk = 0.d0
-        do j = 1, block_n
-          if (abs(diag_save_blk(j)) > 0.d0) rhs_blk((j-1)*block_n + j) = 1.d0 / diag_save_blk(j)
-        end do
-      end if
-      call MatSetValues(Dinv, block_n, axis_rows, block_n, axis_rows, rhs_blk, INSERT_VALUES, ierr)
-      deallocate(axis_rows, blk, rhs_blk, diag_save_blk, ipiv_blk)
-    end if
-
-    deallocate(axis_dof_list)
-
-    call MatAssemblyBegin(Dinv, MAT_FINAL_ASSEMBLY, ierr)
-    call MatAssemblyEnd(Dinv, MAT_FINAL_ASSEMBLY, ierr)
-  end subroutine compute_per_node_block_inverse
 
 
   !--------------------------------------------------------------------
-  !> Compute a Schur-corrected diagonal block using diagonal mass inverse:
-  !! Atilde = B_diag - B_coupling * diag(M_inv) * B_constraint
-  !!
-  !! Steps:
-  !!   1. B_scaled = diag(M_inv) * B_constraint  (scale rows)
-  !!   2. C = B_coupling * B_scaled               (mat-mat product)
-  !!   3. Atilde = B_diag - C                     (subtract)
+  !> Atilde_11 = B_11 - K_psi_correction, using the element-assembled Schur
+  !! correction (mod_elt_matrix_elliptic), not a mass-inverse approximation.
   !--------------------------------------------------------------------
-  subroutine compute_schur_corrected_block_diag(B_diag, B_coupling, B_constraint, &
-                                            diag_M_inv, Atilde, first_time)
-    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
-    Vec, intent(in)    :: diag_M_inv
-    Mat, intent(inout) :: Atilde
-    logical, intent(in) :: first_time
+  subroutine compute_schur_corrected_block_psi(B_diag, Atilde, first_time)
 
-    Mat :: B_scaled, C
-    PetscErrorCode :: ierr
-
-    ! B_scaled = diag(M_inv) * B_constraint  (left-scale rows)
-    call MatDuplicate(B_constraint, MAT_COPY_VALUES, B_scaled, ierr)
-    call MatDiagonalScale(B_scaled, diag_M_inv, PETSC_NULL_VEC, ierr)
-
-    ! C = B_coupling * B_scaled
-    call MatMatMult(B_coupling, B_scaled, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C, ierr)
-
-    ! Atilde = B_diag - C
-    ! Always destroy and recreate: sparsity pattern may change between rebuilds
-    if (.not. first_time) call MatDestroy(Atilde, ierr)
-    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
-    call MatAXPY(Atilde, -1.0d0, C, DIFFERENT_NONZERO_PATTERN, ierr)
-
-    call MatDestroy(B_scaled, ierr)
-    call MatDestroy(C, ierr)
-  end subroutine compute_schur_corrected_block_diag
-
-
-  subroutine compute_schur_corrected_block_psi(B_diag, B_coupling, B_constraint, &
-                                            diag_M_inv, Atilde, first_time)
-
-    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
-    Vec, intent(in)    :: diag_M_inv
+    Mat, intent(in)    :: B_diag
     Mat, intent(inout) :: Atilde
     logical, intent(in) :: first_time
 
@@ -381,11 +160,13 @@ contains
   end subroutine compute_schur_corrected_block_psi
 
 
-  subroutine compute_schur_corrected_block_u(B_diag, B_coupling, B_constraint, &
-                                            diag_M_inv, Atilde, first_time)
+  !--------------------------------------------------------------------
+  !> Atilde_22 = B_22 - K_u_correction, using the element-assembled Schur
+  !! correction (mod_elt_matrix_elliptic), not a mass-inverse approximation.
+  !--------------------------------------------------------------------
+  subroutine compute_schur_corrected_block_u(B_diag, Atilde, first_time)
 
-    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
-    Vec, intent(in)    :: diag_M_inv
+    Mat, intent(in)    :: B_diag
     Mat, intent(inout) :: Atilde
     logical, intent(in) :: first_time
 
@@ -441,38 +222,6 @@ contains
 
   !--------------------------------------------------------------------
   !> Compute a Schur-corrected diagonal block using block diagonal inverse:
-  !! Atilde = B_diag - B_coupling * Dinv * B_constraint
-  !!
-  !! Steps:
-  !!   1. B_scaled = Dinv * B_constraint            (mat-mat product)
-  !!   2. C = B_coupling * B_scaled                 (mat-mat product)
-  !!   3. Atilde = B_diag - C                       (subtract)
-  !--------------------------------------------------------------------
-  subroutine compute_schur_corrected_block(B_diag, B_coupling, B_constraint, &
-                                            Dinv, Atilde, first_time)
-    Mat, intent(in)    :: B_diag, B_coupling, B_constraint
-    Mat, intent(in)    :: Dinv
-    Mat, intent(inout) :: Atilde
-    logical, intent(in) :: first_time
-
-    Mat :: B_scaled, C
-    PetscErrorCode :: ierr
-
-    ! B_scaled = Dinv * B_constraint  (block-diagonal mat-mat product)
-    call MatMatMult(Dinv, B_constraint, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, B_scaled, ierr)
-
-    ! C = B_coupling * B_scaled
-    call MatMatMult(B_coupling, B_scaled, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, C, ierr)
-
-    ! Atilde = B_diag - C
-    ! Always destroy and recreate: sparsity pattern may change between rebuilds
-    if (.not. first_time) call MatDestroy(Atilde, ierr)
-    call MatDuplicate(B_diag, MAT_COPY_VALUES, Atilde, ierr)
-    call MatAXPY(Atilde, -1.0d0, C, DIFFERENT_NONZERO_PATTERN, ierr)
-
-    call MatDestroy(B_scaled, ierr)
-    call MatDestroy(C, ierr)
-  end subroutine compute_schur_corrected_block
 
 
 !--------------------------------------------------------------------
@@ -1315,43 +1064,6 @@ contains
   end subroutine setup_alfven_block_ksp
 
   !--------------------------------------------------------------------
-  !> Set up a sub-KSP for a diagonal block: PREONLY + GAMG (1 V-Cycle).
-  !--------------------------------------------------------------------
-  subroutine setup_block_ksp_amg(ksp_block, B_block, comm, first_time)
-    implicit none
-
-    KSP, intent(inout)  :: ksp_block
-    Mat, intent(in)     :: B_block
-    integer, intent(in) :: comm
-    logical, intent(in) :: first_time
-
-    PC :: pc
-    PetscErrorCode :: ierr
-
-    if (first_time) then
-      call KSPCreate(comm, ksp_block, ierr)
-    endif
-    
-    call KSPSetOperators(ksp_block, B_block, B_block, ierr)
-    
-    ! PREONLY means "just apply the preconditioner once". 
-    ! For an AMG preconditioner, this results in exactly one V-cycle.
-    call KSPSetType(ksp_block, KSPPREONLY, ierr)
-    
-    call KSPGetPC(ksp_block, pc, ierr)
-    
-    ! Set the preconditioner to PETSc's native Algebraic Multigrid (GAMG)
-    call PCSetType(pc, PCGAMG, ierr)
-    
-    ! (Optional but recommended) Explicitly set it to use Smoothed Aggregation.
-    ! Smoothed Aggregation is much better for block/non-M-matrices than classical AMG.
-    call PCGAMGSetType(pc, PCGAMGAGG, ierr)
-    
-    call KSPSetUp(ksp_block, ierr)
-    
-  end subroutine setup_block_ksp_amg
-
-  !--------------------------------------------------------------------
   !> Set up a sub-KSP for a diagonal block: GMRES + GAMG (3-10 iters)
   !--------------------------------------------------------------------
   subroutine setup_block_ksp_amg_krylov(ksp_block, B_block, comm, first_time, max_its)
@@ -1514,9 +1226,9 @@ contains
   !> Assemble the monolithic 4x4 reduced system via MatCreateNest +
   !! MatConvert, and set up a single KSP (PREONLY+LU+MUMPS).
   !--------------------------------------------------------------------
-  subroutine assemble_monolithic_4x4(use_reassembled, comm, first_time, my_id, skip_ksp_setup)
+  subroutine assemble_monolithic_4x4(comm, first_time, my_id, skip_ksp_setup)
      use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate
-    logical, intent(in) :: use_reassembled, first_time, skip_ksp_setup
+    logical, intent(in) :: first_time, skip_ksp_setup
     integer, intent(in) :: comm, my_id
 
     Mat :: mats_nest(16), A_nest   ! 1D row-major: (row0,col0), (row0,col1), ...
@@ -1530,14 +1242,8 @@ contains
     Mat :: mats_nest_hydro(9), A_nest_hydro
     Mat :: mats_nest_alfven(4), A_nest_alfven, A_alfven_2x2
 
-    ! Choose diagonal blocks B_55/B_66 or R_55/R_66
-    if (use_reassembled) then
-      diag_55 = g_ctx%R_55
-      diag_66 = g_ctx%R_66
-    else
-      diag_55 = g_ctx%B_55
-      diag_66 = g_ctx%B_66
-    endif
+    diag_55 = g_ctx%B_55
+    diag_66 = g_ctx%B_66
 
     ! Populate nest in row-major order (PETSc Fortran convention for MatCreateNest)
     ! Row 1 (psi): Atilde_11  B_12        0          B_16
@@ -1721,10 +1427,10 @@ contains
   !! Must be called AFTER assemble_monolithic_4x4 so that ksp_reduced
   !! and g_ctx%A_reduced_4x4 (the approximate baseline) already exist.
   !--------------------------------------------------------------------
-  subroutine assemble_probed_exact_4x4(use_reassembled, comm, first_time, my_id)
+  subroutine assemble_probed_exact_4x4(comm, first_time, my_id)
     use mod_petsc_matrix_analysis, only: petsc_mat_diff_norm
     implicit none
-    logical, intent(in) :: use_reassembled, first_time
+    logical, intent(in) :: first_time
     integer, intent(in) :: comm, my_id
 
     Vec            :: e_j, z, temp, r_blk, scratch, r_seq
@@ -1748,14 +1454,8 @@ contains
     n4  = 4 * n
     n4p = n4
 
-    ! Choose reassembled or extracted diagonal blocks for ρ and T
-    if (use_reassembled) then
-      diag_55 = g_ctx%R_55
-      diag_66 = g_ctx%R_66
-    else
-      diag_55 = g_ctx%B_55
-      diag_66 = g_ctx%B_66
-    endif
+    diag_55 = g_ctx%B_55
+    diag_66 = g_ctx%B_66
 
     ! Local work vectors — work_1..5 not yet allocated at build time
     call MatCreateVecs(g_ctx%B_11, e_j, PETSC_NULL_VEC, ierr)

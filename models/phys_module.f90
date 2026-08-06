@@ -153,7 +153,6 @@ module phys_module
   real*8  :: pastix_pivot         !< Pastix epsilon for magnitude control (pivot threshold)
   logical :: use_physics_pc       !< Use physics-based block PCSHELL preconditioner
   logical :: debug_physics_pc     !< Print PC matrix analysis (norms, eigenvalues) after first assembly
-  logical :: physics_pc_reassemble !< Reassemble diagonal blocks from simplified integrands instead of extracting from full matrix
   logical :: physics_pc_monolithic  !< Monolithic 4x4 solve (stage-one Schur elimination test)
   logical :: physics_pc_multi_step  !< Three-step predictor-corrector apply (hydro -> mag. predictor -> Alfven corrector -> transport)
   logical :: physics_pc_multi_step_symmetric  !< Add backward K_alpha,beta corrector to the segregated multi_step apply
@@ -161,7 +160,7 @@ module phys_module
   logical :: physics_pc_sub_blocks       !< 2x2 super-block PC: (psi,u) Alfven + (rho,T) transport
   integer :: physics_pc_sub_blocks_mode  !< Apply variant: 1=Jacobi, 2=GS-forward, 3=GS-symmetric
   logical :: physics_pc_probe_exact !< Probe exact 4x4 Schur complement via basis-vector applications (small problems only)
-  logical :: physics_pc_block_inv  !< Invert per-node 4x4 blocks of B_33/B_44 for Schur correction (better than scalar diagonal)
+  logical :: physics_pc_verify_spbp !< Offline S_PBP diagnostic: build full momentum Schur S_u and measure sigma(S_PBP_diag^-1 S_u) (expensive)
   logical :: commutator_analysis          !< Run commutator-operator (M_*) intertwining-defect analysis (candidates M0-M4, eps per toroidal harmonic) at first solve
   logical :: eliminate_boundary_dofs !< Zero boundary-DOF rows in PC correction matrices and use elm-diagonal BC scaling in global matrix; required for physics PC Schur correction approach
   logical :: use_newton           !< Use inexact Newton method
