@@ -13,7 +13,8 @@ module mod_petsc_pc_commutator_table
 !   2 = Q1R  (amat_33, 1/R scalar mass)   <- the psi/u/j Riesz map
 !   3 = QR   (amat_44, R scalar mass)
 !   3+ib    (ib = 1..CM_NB) the assembled building blocks of
-!           mod_elt_matrix_commutator: ADV1, ADVR, COMP, S1R, SR
+!           mod_elt_matrix_commutator: ADV1, ADVR, COMP, S1R, SR,
+!                                      ES1R, EG1R
 ! together with a choice quop(ic) of WHICH mass plays the u-space Riesz
 ! map Q_u for that candidate, so that
 !
@@ -43,7 +44,7 @@ module mod_petsc_pc_commutator_table
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_elt_matrix_commutator, only: CM_NB, CM_ADV1, CM_ADVR, CM_COMP, &
-                                       CM_S1R, CM_SR
+                                       CM_S1R, CM_SR, CM_ES1R, CM_EG1R
   implicit none
   private
 
@@ -140,6 +141,9 @@ contains
   !                                        amat_11 (~M1x, exact at u0=0)
   !   M3  = opz*QR - tdt*ADVR - tdt*COMP   (Q_u=QR)   conservative rho-form
   !   M2  = M1a + eta*tdt*S1R              (Q_u=Q1R)  + resistive diffusion
+  !   M2e = M1a + eta*tdt*ES1R             (Q_u=Q1R)  + Spitzer-SHAPED
+  !                                        resistive diffusion (= M2 when
+  !                                        eta_T_dependent is off)
   !
   ! M1a/M3/M2 need the assembled blocks; M0/M1x/M0R do not.
   !
@@ -170,6 +174,44 @@ contains
         coef(ncand,CM_OP_QR)=opz;  coef(ncand,3+CM_ADVR)=-tdt; coef(ncand,3+CM_COMP)=-tdt
       ncand=ncand+1; lab(ncand)="M2" ; quop(ncand)=CM_OP_Q1R
         coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt; coef(ncand,3+CM_S1R)=eta*tdt
+      ! M2 uses the CONSTANT eta, but the substituted resistive term in
+      ! P_full's D_psi carries the Spitzer eta_T(T0) = eta*(T0/T_0)^-1.5,
+      ! which on a pedestal case varies by ~1e3 between axis and cold edge.
+      ! These scaled variants separate "wrong constant" from "wrong operator
+      ! form": if some alpha collapses the defect, a scalar suffices; if the
+      ! defect plateaus, the spatial weight is required.
+      ncand=ncand+1; lab(ncand)="M2b"; quop(ncand)=CM_OP_Q1R
+        coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt; coef(ncand,3+CM_S1R)=1.d1*eta*tdt
+      ncand=ncand+1; lab(ncand)="M2c"; quop(ncand)=CM_OP_Q1R
+        coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt; coef(ncand,3+CM_S1R)=1.d2*eta*tdt
+      ncand=ncand+1; lab(ncand)="M2d"; quop(ncand)=CM_OP_Q1R
+        coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt; coef(ncand,3+CM_S1R)=1.d3*eta*tdt
+      ! --- Spitzer-shaped resistive diffusion --------------------------
+      ! The substituted resistive term of P_full's D_psi integrates by parts
+      ! into eta_T*stiffness PLUS a grad(eta_T) first-order term (see the
+      ! header of mod_elt_matrix_commutator). All three of the following take
+      ! the same coefficient eta*tdt as M2 and reduce to M2 exactly when
+      ! eta_T_dependent is off (ES1R -> S1R, EG1R -> 0).
+      !   M2e = stiffness half only     -- diagnostic: expected to be WORSE
+      !         than M2 (measured 3.90 vs 2.70), because the omitted
+      !         grad(eta_T) piece is comparable in a pedestal layer.
+      !   M2g = BOTH halves             -- the actual target operator.
+      !   M2h = grad(eta_T) half only   -- diagnostic: isolates its weight.
+      ncand=ncand+1; lab(ncand)="M2e" ; quop(ncand)=CM_OP_Q1R
+        coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt; coef(ncand,3+CM_ES1R)=eta*tdt
+      ncand=ncand+1; lab(ncand)="M2g" ; quop(ncand)=CM_OP_Q1R
+        coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt
+        coef(ncand,3+CM_ES1R)=eta*tdt; coef(ncand,3+CM_EG1R)=eta*tdt
+      ncand=ncand+1; lab(ncand)="M2h" ; quop(ncand)=CM_OP_Q1R
+        coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt; coef(ncand,3+CM_EG1R)=eta*tdt
+      ! alpha bracket on the full pair, to confirm alpha = 1 is optimal once
+      ! the operator FORM is right (with S1R alone the sweep was flat).
+      ncand=ncand+1; lab(ncand)="M2ga"; quop(ncand)=CM_OP_Q1R
+        coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt
+        coef(ncand,3+CM_ES1R)=0.5d0*eta*tdt; coef(ncand,3+CM_EG1R)=0.5d0*eta*tdt
+      ncand=ncand+1; lab(ncand)="M2gb"; quop(ncand)=CM_OP_Q1R
+        coef(ncand,CM_OP_Q1R)=opz; coef(ncand,3+CM_ADV1)=-tdt
+        coef(ncand,3+CM_ES1R)=2.d0*eta*tdt; coef(ncand,3+CM_EG1R)=2.d0*eta*tdt
     endif
   end subroutine cm_table_build
 

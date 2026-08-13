@@ -16,7 +16,8 @@ module mod_petsc_pc_physics
        setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
        setup_alfven_block_ksp, setup_rho_block_ksp, setup_T_block_ksp, &
        assemble_monolithic_4x4, assemble_probed_exact_4x4, &
-       verify_alfven_2x2_segregated
+       verify_alfven_2x2_segregated, verify_reduced_pde_operator, &
+       verify_schur_factorization_4x4, verify_schur_approx_4x4
   use mod_petsc_pc_physics_element, only: &
        petsc_create_pc_matrices, petsc_assemble_pc_matrices, &
        petsc_update_physics_pc_ctx, petsc_test_pc_matrix
@@ -56,7 +57,9 @@ contains
     use mod_parameters, only: n_var, n_tor, n_degrees, var_psi, var_u, var_zj, var_w, var_rho, var_T
     use phys_module, only: debug_physics_pc, physics_pc_monolithic, &
                            physics_pc_multi_step, physics_pc_probe_exact, &
-                           physics_pc_sub_blocks, physics_pc_verify_spbp
+                           physics_pc_sub_blocks, physics_pc_verify_spbp, &
+                           physics_pc_verify_reduced, physics_pc_verify_schur, &
+                           physics_pc_schur_approx
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate, &
                                          petsc_mat_diff_norm
 
@@ -451,6 +454,13 @@ contains
     g_ctx%comm = comm
 
     if (my_id == 0) write(*,'(A)') "[Physics PC] Reduced system ready."
+
+    ! --- Milestone-1 diagnostic: compare P_full against the exact condensation.
+    !     Expensive (O(N) MUMPS solves per corrected block); the run continues
+    !     afterwards, matching the physics_pc_verify_spbp convention.
+    if (physics_pc_verify_reduced) call verify_reduced_pde_operator(A_full, comm, my_id)
+    if (physics_pc_verify_schur)   call verify_schur_factorization_4x4(comm, my_id)
+    if (physics_pc_schur_approx)   call verify_schur_approx_4x4(comm, my_id)
   end subroutine petsc_physics_pc_build_reduced
 
 

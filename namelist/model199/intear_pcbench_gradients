@@ -1,0 +1,175 @@
+! =====================================================================
+!  intear_pcbench_gradients
+!  Preconditioner-development benchmark case (docs/physics_pc).
+!
+!  Derived from `intear`.  Purpose: exercise the three "group-psi"
+!  couplings of the reduced PDE operator P_full, which are identically
+!  negligible in `intear` itself and therefore make Milestone 3
+!  (the arrow approximation) untestable there.
+!
+!  All three blocks are weighted by EQUILIBRIUM GRADIENTS:
+!    L_rho_psi ~ (D_par  - D_perp) * grad(rho_0)
+!    L_T_psi   ~ (ZK_par - ZK_perp) * grad(T_0)
+!    U_psi_T   ~ d(eta)/dT * j_0
+!  so the changes relative to `intear` are exactly:
+!    - D_par  0 -> 1        (was structurally zero: block vanished)
+!    - rho profile given a gradient AND an edge barrier
+!      (rho_coef(1) 0 -> -0.4; barrier moved from psi_n=5 to 0.90,
+!       width 1 -> 0.05, i.e. the barrier is now INSIDE the domain)
+!    - T profile: same barrier treatment, T_0 1e-6 -> 1e-4
+!    - eta 1e-6 -> 1e-4     (raises U_psi_T and the resistive part of D_psi)
+!    - D_perp, ZK_perp 1e-7 -> 1e-6
+!
+!  Note on the barrier: in `intear`, T_coef(5)=rho_coef(5)=5.0 places the
+!  tanh pedestal at psi_n = 5, far outside the plasma, so it is inactive
+!  and the profiles are effectively flat (rho exactly flat).  Moving it to
+!  0.90 with width 0.05 turns it on.
+!
+!  Measured effect on the interior block norms ||S_int||_F (843 DOF mesh
+!  below, one MHD solve from equilibrium):
+!
+!    block         intear      this case     factor
+!    U_psi_T       8.3e-06     2.0e+02       2.4e+07
+!    L_rho_psi     3.2e-20     4.2e+02       1.3e+22
+!    L_T_psi       3.7e-04     4.8e-02       1.3e+02
+!
+!  The mesh is deliberately COARSE (11x8 / 9x8, 843 DOFs per variable)
+!  so that the O(N) probing in the Milestone-1 verification harness and
+!  the exact MUMPS solves in the operator comparison stay cheap.  Refine
+!  n_radial/n_pol/n_flux/n_tht for scaling studies.
+!
+!  Run on 1 MPI rank: the physics PC apply path fails for np > 1
+!  (pre-existing, independent of this work).
+! =====================================================================
+
+&in1
+
+ restart = .f.
+ regrid  = .f.
+ refinement=.false.
+ tstep   = 1000.
+ nstep   = 1
+
+ nout = 1
+
+ fbnd(1)   = 2.
+ fbnd(2:4) = 0.
+ mf        = 0
+
+ ellip  = 1.
+ tria_u = 0.
+ tria_l = 0.
+ quad_u = -0.
+ quad_l = -0.
+
+ freeboundary = .f.
+
+ xampl  = +0.
+ xsig   = 0.6
+ xwidth = 1.5
+ xtheta = 4.7
+ xshift = 0.0
+ xpoint = .f.
+
+ R_begin = 2.9
+ R_end   = 3.1
+ Z_begin = -0.1
+ Z_end   = 0.1
+
+ R_geo = 10.0
+ Z_geo = 0.
+
+ F0    = 10.0
+
+ amin     = 1.
+
+ n_R      = 0
+ n_Z      = 0
+ n_radial = 11
+ n_pol    = 8
+
+ n_flux   = 9
+ n_tht    = 8
+ n_open   = 0
+ n_leg    = 0
+ n_private = 0
+
+ eta   = 1.d-4
+ visco = 1.d-7
+
+ eta_num = 0.d-10
+ visco_num = 0.d0
+
+ D_par  = 1.d0
+ D_perp = 1.d-6
+
+ ZK_par  = 1.d0
+ ZK_perp = 1.d-6
+
+ FF_0 = 1.173
+ FF_1 = 0.
+ FF_coef(1)  = -1.0
+ FF_coef(2)  = 0.d0
+ FF_coef(3)  = 0.d0
+ FF_coef(4)  = 0.03d0
+ FF_coef(5)  = 5.0d0
+ FF_coef(6)  = 1.d0
+ FF_coef(7)  = 10.d0
+ FF_coef(8)  = 1.d0
+
+ heatsource     = 0.d0
+ particlesource = 0.d0
+
+ T_0 = 1.d-4
+ T_1 = 1.d-6
+ T_coef(1) = -0.6d0
+ T_coef(2) = +0.0d0
+ T_coef(3) = 0.d0
+ T_coef(4) = 0.05d0
+ T_coef(5) = 0.90d0
+
+ rho_0 = 1.
+ rho_1 = 0.2
+ rho_coef(1)  = -0.4d0
+ rho_coef(2)  =  0.0
+ rho_coef(3)  =  0.0
+ rho_coef(4)  = 0.05d0
+ rho_coef(5)  = 0.90d0
+
+ iter_precon = 22
+ gmres_m = 20
+ gmres_4 = 1.d0
+ gmres_max_iter = 200
+ gmres_tol = 1.d-8
+
+! --- physics PC -------------------------------------------------------
+! physics_pc_reduced_pde     .t. -> reduced solve uses P_full
+!                            .f. -> extracted blocks + algebraic Schur
+! physics_pc_drop_psi_coupling .t. -> arrow structure (Milestone 3)
+! physics_pc_verify_reduced  .t. -> run the Milestone-1 block harness
+! Eliminate the Dirichlet DOFs (row+column zeroed, representative diagonal)
+! instead of the 1e12 ZBIG penalty. Strongly preferred for this study: the
+! penalty rows otherwise dominate every operator norm, and -- measured --
+! the ZBIG treatment inflates ||D_psi-(1+zeta)Q|| from 2.8 to 184 by keeping
+! the cold-edge Spitzer eta_T blow-up in the boundary columns.
+ eliminate_boundary_dofs      = .t.
+
+ use_physics_pc               = .t.
+ debug_physics_pc             = .f.
+ physics_pc_monolithic        = .t.
+ physics_pc_reduced_pde       = .t.
+ physics_pc_drop_psi_coupling = .f.
+ physics_pc_verify_reduced    = .f.
+
+! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
+ use_strumpack     = .f.
+ use_strumpack_eq  = .f.
+ use_strumpack_prj = .f.
+ use_mumps         = .f.
+ use_mumps_eq      = .f.
+ use_mumps_prj     = .f.
+ use_pastix        = .f.
+ use_pastix_eq     = .f.
+ use_pastix_prj    = .f.
+ use_petsc_eq      = .t.
+/

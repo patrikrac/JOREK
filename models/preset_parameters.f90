@@ -653,6 +653,12 @@ subroutine preset_parameters
   physics_pc_sub_blocks_mode = 1             ! 1=Jacobi (default), 2=GS-forward, 3=GS-symmetric
   physics_pc_probe_exact = .false.           ! Probe exact 4x4 Schur complement via N mat-vec products (small problems only)
   physics_pc_verify_spbp = .false.          ! Offline S_PBP spectrum diagnostic (expensive; own flag, not debug_physics_pc)
+  physics_pc_reduced_pde = .false.          ! Assemble the reduced 4-var PDE operator P_full (Milestone 1)
+  physics_pc_drop_psi_coupling = .false.    ! Drop U_psi_T, L_T_psi, L_rho_psi from P_full -> arrow structure (Milestone 3)
+  physics_pc_verify_reduced = .false.       ! Verify P_full against the probed exact condensed 4x4, then stop
+  physics_pc_verify_schur   = .false.       ! Stage 4.1: verify the exact Schur factorization of P_full
+  physics_pc_schur_approx   = .false.       ! Stage 4.2: small-flow and commutator M_* approximations of S_u
+  physics_pc_schur_assemble = .false.       ! Stage 4.4/Workstream A: sparse assembled Shat_ass with lumped mass inverses
   commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 

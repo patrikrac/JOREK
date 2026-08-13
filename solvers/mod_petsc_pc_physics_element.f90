@@ -88,15 +88,21 @@ contains
 
 
   !> Assemble the four elliptic PC sub-matrices from element-level data.
-  subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat)
+  !!
+  !! When physics_pc_reduced_pde is set, also assembles P_full -- the reduced
+  !! 4-variable PDE operator of Milestone 1 (docs/physics_pc). P_full needs the
+  !! equilibrium state, which is why mhd_sim is threaded down to here.
+  subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
     use construct_pc_matrix_mod
     use data_structure,  only: type_SP_MATRIX
-    use phys_module,     only: debug_physics_pc
+    use mod_simulation_data, only: type_MHD_SIM
+    use phys_module,     only: debug_physics_pc, physics_pc_reduced_pde
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
     integer,              intent(in) :: n_local_elms
     type(type_SP_MATRIX), intent(in) :: a_mat
+    type(type_MHD_SIM),   intent(in) :: mhd_sim
     PetscErrorCode :: ierr
     logical        :: first_assembly
 
@@ -129,6 +135,22 @@ contains
     g_ctx%correction_21_ready   = .true.
     g_ctx%correction_61_ready   = .true.
     g_ctx%matrices_ready = .true.
+
+    ! --- Milestone 1: the reduced PDE operator P_full ---
+    if (physics_pc_reduced_pde) then
+      if (.not. g_ctx%p_full_ready) then
+        call petsc_create_pc_matrix(g_ctx%P_full_pde, a_mat, 4)
+      else
+        PetscCallA(MatDestroy(g_ctx%P_full_pde, ierr))
+        call petsc_create_pc_matrix(g_ctx%P_full_pde, a_mat, 4)
+      endif
+
+      call construct_reduced_pde_matrix(my_id, local_elms, n_local_elms, a_mat, &
+                                        mhd_sim, g_ctx%P_full_pde)
+      g_ctx%p_full_ready = .true.
+
+      if (my_id .eq. 0) write(*,'(A)') "[Physics PC]   P_full (reduced PDE operator) assembled"
+    endif
   end subroutine petsc_assemble_pc_matrices
 
 

@@ -70,6 +70,21 @@ module mod_petsc_pc_physics_ctx
     !> Work vectors (1-var size) — allocated once, reused in every apply
     Vec :: work_1, work_2, work_3, work_4, work_5
 
+    !> P_full: the reduced 4-variable PDE operator assembled from
+    !! pc_elt_matrix_reduced_fft by substituting j = J(psi), w = W(u) at the
+    !! continuous level (Milestone 1 of docs/physics_pc). Distinct from
+    !! A_reduced_4x4, which is built from blocks EXTRACTED out of the assembled
+    !! mixed Jacobian plus algebraic Schur corrections.
+    Mat :: P_full_pde
+    logical :: p_full_ready = .false.
+
+    !> P_full_pde permuted into the variable-block-contiguous layout that
+    !! A_reduced_4x4 and is_reduced use, so it can be dropped into ksp_reduced
+    !! as a direct replacement (Milestone 2). P_full_pde itself is BAIJ with
+    !! node-major/variable/toroidal interleaving; the two orderings differ.
+    Mat :: P_full_perm
+    logical :: p_full_perm_ready = .false.
+
     !> Monolithic 4x4 reduced system (stage-one test mode)
     Mat :: A_reduced_4x4
     KSP :: ksp_reduced

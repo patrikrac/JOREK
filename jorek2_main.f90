@@ -762,7 +762,7 @@ write(*,*) "n elements:", element_list%n_elements
     if (my_id.eq.0) write(*,FMT_TIMING) my_id, '# Elapsed time construct global matrix: ',tsecond
     
 #ifdef USE_PETSC
-    if (use_physics_pc) call petsc_assemble_pc_matrices(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
+    if (use_physics_pc) call petsc_assemble_pc_matrices(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat, mhd_sim)
     if (commutator_analysis) &
       call petsc_commutator_assemble(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
 #endif

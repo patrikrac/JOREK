@@ -161,6 +161,12 @@ module phys_module
   integer :: physics_pc_sub_blocks_mode  !< Apply variant: 1=Jacobi, 2=GS-forward, 3=GS-symmetric
   logical :: physics_pc_probe_exact !< Probe exact 4x4 Schur complement via basis-vector applications (small problems only)
   logical :: physics_pc_verify_spbp !< Offline S_PBP diagnostic: build full momentum Schur S_u and measure sigma(S_PBP_diag^-1 S_u) (expensive)
+  logical :: physics_pc_reduced_pde  !< Assemble P_full (the reduced 4-var PDE operator from substituting j=J(psi), w=W(u) at the continuous level) AND use it as the reduced-solve operator in place of the extracted-block algebraic Schur (Milestones 1-2)
+  logical :: physics_pc_drop_psi_coupling !< Drop the three group-psi couplings (U_psi_T, L_T_psi, L_rho_psi) from P_full, giving the arrow structure (Milestone 3)
+  logical :: physics_pc_verify_reduced !< Compare P_full against the probed exact condensed 4x4, block-by-block and by spectral band (diagnostic; run continues afterwards)
+  logical :: physics_pc_verify_schur   !< Milestone 4 Stage 4.1: verify the exact Schur factorization of P_full (exact S_u by probing + direct inversion; diagnostic, run continues)
+  logical :: physics_pc_schur_approx   !< Milestone 4 Stage 4.2: compare approximate Schur complements (small-flow limit M0 and commutator-device M_* candidates) against the exact S_u of P_full
+  logical :: physics_pc_schur_assemble !< Milestone 4 Stage 4.4 (Workstream A): also build the SPARSE assembled Schur complement Shat_ass = D_uu Q_u^-1 A_uM - L_up Q^-1 U_pu (lumped mass inverses) for each M_* candidate, and compare it against the probed dense Shat. Requires physics_pc_schur_approx.
   logical :: commutator_analysis          !< Run commutator-operator (M_*) intertwining-defect analysis (candidates M0-M4, eps per toroidal harmonic) at first solve
   logical :: eliminate_boundary_dofs !< Zero boundary-DOF rows in PC correction matrices and use elm-diagonal BC scaling in global matrix; required for physics PC Schur correction approach
   logical :: use_newton           !< Use inexact Newton method

@@ -1,0 +1,191 @@
+! =====================================================================
+!  inxflow_circ_pcbench
+!  Peeling-ballooning benchmark case for the physics PC (docs/physics_pc).
+!
+!  Second physics case for Stage 4.2b.  Everything measured so far comes
+!  from `intear_pcbench_gradients`: a 2/1 tearing mode, weak flow, n = 1,
+!  very large aspect ratio, low beta.  This is the opposite corner: a
+!  ballooning-unstable pedestal at n = 6, run at tstep = 3.
+!
+!  Derived from `namelist/model303/inxflow`, the peeling-ballooning case of
+!  the JOREK howto "running JOREK for the first time", with the geometry
+!  made CIRCULAR (no X-point) and the namelist reduced to what model199
+!  accepts.
+!
+!  Changes relative to model303/inxflow:
+!    - CIRCULAR LIMITER geometry:
+!        ellip 1.7 -> 1.,  quad_l -0.4 -> 0.,  xpoint .t. -> .f.,
+!        xampl 0.22 -> 0.,  n_open/n_leg/n_private 15/15/9 -> 0/0/0
+!      A diverted mesh would also put `eliminate_boundary_dofs` -- which
+!      every measurement in this study depends on -- on open field lines,
+!      where it is untested.
+!    - model303-only entries dropped (visco_par, wall_resistivity_fact, ...)
+!    - the solver / physics-PC tail added (see bottom)
+!
+!  --- Compile-time settings -------------------------------------------
+!  n_tor / n_period / n_plane are in models/mod_settings.f90, NOT here.
+!  Two separate builds, exactly as the howto does it (util/config.sh):
+!    stage 1, axisymmetric :  ./util/config.sh model=199 n_tor=1 n_period=1 n_plane=1
+!    stage 2, ballooning   :  ./util/config.sh model=199 n_tor=3 n_period=6 n_plane=4
+!  det_modes.f90 then gives harmonics n = 0 and n = 6 in stage 2.
+!
+!  --- Workflow (from the howto) ---------------------------------------
+!  Stage 1 MUST ramp the time step.  Starting straight at tstep = 3 makes
+!  the startup transient blow the run up within ~20 steps (measured):
+!
+!    ./util/setinput.sh inxflow_circ_pcbench \
+!        tstep_n=1.d-3,1.d-2,1.d-1,1.d0,3.d0 nstep_n=10,10,10,10,10 \
+!        restart=.f. nout=5
+!    mpirun -n 1 ./jorek_model199_ntor1 < inxflow_circ_pcbench
+!
+!  Stage 2, non-axisymmetric (new harmonics seeded at 1e-10 * the
+!  axisymmetric rho and T by mod_import_restart.f90):
+!
+!    ./util/setinput.sh inxflow_circ_pcbench tstep_n=3.d0 nstep_n=500 restart=.t.
+!    mpirun -n 1 ./jorek_model199 < inxflow_circ_pcbench
+!
+!  Stage 3, PC diagnostics: restart=.t., nstep=1, use_physics_pc=.t.
+!
+!  Run on 1 MPI rank: the physics PC apply path fails for np > 1
+!  (pre-existing, independent of this work).
+! =====================================================================
+
+&in1
+
+ restart = .f.
+ regrid  = .f.
+
+ tstep_n   = 1.d-3,1.d-2,1.d-1,1.d0,3.d0
+ nstep_n   = 10,10,10,10,10
+
+ nout = 5
+
+ freeboundary = .f.
+
+ fbnd(1)   = 2.
+ fbnd(2:4) = 0.
+ mf        = 0
+
+! --- circular limiter geometry ---------------------------------------
+ ellip  = 1.
+ tria_u = 0.
+ tria_l = 0.
+ quad_u = 0.
+ quad_l = 0.
+
+ xpoint = .f.
+ xampl  = 0.
+ xsig   = 0.6
+ xwidth = 1.5
+ xtheta = 4.7
+ xshift = 0.0
+
+ R_begin = 2.9
+ R_end   = 3.1
+ Z_begin = -0.1
+ Z_end   = 0.1
+
+ R_geo = 3.0
+ Z_geo = 0.
+ amin  = 1.
+
+ F0    = 3.0
+
+ n_R      = 0
+ n_Z      = 0
+ n_radial = 81
+ n_pol    = 128
+
+ n_flux    = 40
+ n_tht     = 64
+ n_open    = 0
+ n_leg     = 0
+ n_private = 0
+
+ eta   = 2.d-6
+ visco = 4.d-6
+
+! numerical resistivity is required for this case
+ eta_num = 3.d-10
+
+ D_par     = 0.d0
+ D_perp(1) = 1.d-5
+ D_perp(2) = 0.85d0
+ D_perp(3) = 0.d0
+ D_perp(4) = 0.01d0
+ D_perp(5) = 0.92d0
+
+ ZK_par     = 10.d0
+ ZK_perp(1) = 1.d-5
+ ZK_perp(2) = 0.85d0
+ ZK_perp(3) = 0.d0
+ ZK_perp(4) = 0.01d0
+ ZK_perp(5) = 0.92d0
+
+ FF_0 = 1.6
+ FF_1 = 0.
+ FF_coef(1)  = -1.0
+ FF_coef(2)  = 0.d0
+ FF_coef(3)  = 0.d0
+ FF_coef(4)  = 0.03d0
+ FF_coef(5)  = 1.0d0
+ FF_coef(6)  = -0.06d0
+ FF_coef(7)  = 0.90d0
+ FF_coef(8)  = 0.07d0
+
+ heatsource     = 1.d-7
+ particlesource = 5.d-6
+
+ T_0 = 1.5d-2
+ T_1 = 3.d-4
+ T_coef(1) = -0.66d0
+ T_coef(2) = +0.0d0
+ T_coef(3) = 0.d0
+ T_coef(4) = 0.08d0
+ T_coef(5) = 0.94d0
+
+ rho_0 = 1.
+ rho_1 = 0.01
+ rho_coef(1)  =  0.0
+ rho_coef(2)  =  0.0
+ rho_coef(3)  =  0.0
+ rho_coef(4)  =  0.08
+ rho_coef(5)  =  0.94d0
+
+ iter_precon    = 22
+ gmres_m        = 20
+ gmres_4        = 1.d0
+ gmres_max_iter = 200
+ gmres_tol      = 1.d-8
+
+! --- physics PC -------------------------------------------------------
+! Eliminate the Dirichlet DOFs (row+column zeroed, representative diagonal)
+! instead of the 1e12 ZBIG penalty.  Wanted for the PC study: the penalty
+! rows otherwise dominate every operator norm.
+!
+! CAUTION: this flag is ours, it is in no stock JOREK case, and it is applied
+! to the MAIN system matrix (matrix/construct_matrix_mod.f90:474-748), not
+! only to the PC matrices -- so it changes the boundary condition of the
+! physics solve.  Keep it OFF for the stage-1/stage-2 physics runs and turn
+! it on only for the stage-3 diagnostics.
+ eliminate_boundary_dofs      = .f.
+
+ use_physics_pc               = .f.
+ debug_physics_pc             = .f.
+ physics_pc_monolithic        = .t.
+ physics_pc_reduced_pde       = .t.
+ physics_pc_drop_psi_coupling = .f.
+ physics_pc_verify_reduced    = .f.
+
+! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
+ use_strumpack     = .f.
+ use_strumpack_eq  = .f.
+ use_strumpack_prj = .f.
+ use_mumps         = .f.
+ use_mumps_eq      = .f.
+ use_mumps_prj     = .f.
+ use_pastix        = .f.
+ use_pastix_eq     = .f.
+ use_pastix_prj    = .f.
+ use_petsc_eq      = .t.
+/

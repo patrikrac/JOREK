@@ -79,6 +79,12 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 physics_pc_wave_schur, physics_pc_sub_blocks,       &
                 physics_pc_sub_blocks_mode, physics_pc_probe_exact, &
                 physics_pc_verify_spbp,                             &
+                physics_pc_reduced_pde,                             &
+                physics_pc_drop_psi_coupling,                       &
+                physics_pc_verify_reduced,                          &
+                physics_pc_verify_schur,                            &
+                physics_pc_schur_approx,                            &
+                physics_pc_schur_assemble,                          &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &
