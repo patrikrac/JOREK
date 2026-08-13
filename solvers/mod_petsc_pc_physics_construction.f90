@@ -2858,12 +2858,13 @@ contains
     Mat :: R_ex
     !--- Workstream A (sparse assembled Schur complement) ---------------
     Mat :: S_ass, T1_a, T2_a, Dsc, Lsc, Shat_a
+    Mat :: G_u, G_p, Qi_u, Qi_p, Pat_u, Pat_p
     KSP :: ksp_Qu
     Vec :: ones_p, lq_u, lq_p, ax, ay, az, aw
     !  Second index selects how the two interior mass inverses -- Q_u^-1 in
     !  D_uu Q_u^-1 A_uM, and Q^-1 in L_up Q^-1 U_pu -- are approximated.
     !  Variants 3 and 4 keep ONE of them exact to attribute the damage.
-    integer, parameter :: NLUMP = 5
+    integer, parameter :: NLUMP = 8
     real*8  :: rassm(CM_MAXC+2,NLUMP)   !< ||Shat_eff - S_u|| / ||S_u||, interior
     real*8  :: rasscons(CM_MAXC+2,NLUMP)!< algebra check vs the operator-form Shat
     real*8  :: fillr(CM_MAXC+2,NLUMP)   !< nnz(S_ass) / nnz(D_uu); -1 if not assemblable
@@ -2875,7 +2876,10 @@ contains
          "diagonal / diagonal   ", &
          "EXACT    / diagonal   ", &
          "diagonal / EXACT      ", &
-         "Neumann-2/ diagonal   " /)
+         "Neumann-2/ diagonal   ", &
+         "NONE     / NONE       ", &
+         "FSAI-0   / FSAI-0     ", &
+         "FSAI-1   / FSAI-1     " /)
     PetscInt :: n1, n3, ntot, k
     PetscInt, allocatable :: idx(:), rows(:)
     PetscInt :: colidx(1), nits
@@ -3440,7 +3444,7 @@ contains
     subroutine build_shat_assembled(mode, ilmp)
       integer, intent(in) :: mode
       integer, intent(in) :: ilmp   !< 1 = row-sum lumping, 2 = diagonal extraction
-      integer :: kk, iop, itry, mu, mp
+      integer :: kk, iop, itry, mu, mp, nfl
       logical :: sparse_ok
       KSPConvergedReason :: kreason
       PetscReal :: rn, rd, racc
@@ -3524,7 +3528,10 @@ contains
         case (2) ; mu = 2 ; mp = 2
         case (3) ; mu = 0 ; mp = 2
         case (4) ; mu = 2 ; mp = 0
-        case default ; mu = 3 ; mp = 2
+        case (5) ; mu = 3 ; mp = 2
+        case (6) ; mu = 4 ; mp = 4
+        case (7) ; mu = 5 ; mp = 5
+        case default ; mu = 6 ; mp = 6
       end select
 
       call VecDuplicate(ax, lq_u, ierr)
@@ -3540,6 +3547,38 @@ contains
         call MatMult(op(CM_OP_Q1R), ones_p, lq_p, ierr)
       else
         call MatGetDiagonal(op(CM_OP_Q1R), lq_p, ierr)
+      endif
+
+      ! FSAI factors, built once per (candidate, variant). Qi_* = G^T G.
+      if (mu == 5 .or. mu == 6) then
+        if (mu == 6) then
+          call MatMatMult(op(quop(mode)), op(quop(mode)), MAT_INITIAL_MATRIX, &
+                          PETSC_DEFAULT_REAL, Pat_u, ierr)
+        else
+          Pat_u = op(quop(mode))
+        endif
+        call build_fsai(op(quop(mode)), Pat_u, n1, comm, G_u, nfl)
+        call MatTransposeMatMult(G_u, G_u, MAT_INITIAL_MATRIX, &
+                                 PETSC_DEFAULT_REAL, Qi_u, ierr)
+        if (my_id == 0 .and. mode == 1) then
+          call MatGetInfo(Qi_u, MAT_LOCAL, minfo, ierr)
+          nzS = minfo%nz_used
+          call MatGetInfo(op(quop(mode)), MAT_LOCAL, minfo, ierr)
+          write(*,'(A,F8.2,A,I0)') &
+            "[Stage 4.2] FSAI(Q_u) nnz(G^T G)/nnz(Q_u) = ", &
+            nzS / max(minfo%nz_used, 1.d0), " , identity-fallback rows = ", nfl
+        endif
+      endif
+      if (mp == 5 .or. mp == 6) then
+        if (mp == 6) then
+          call MatMatMult(op(CM_OP_Q1R), op(CM_OP_Q1R), MAT_INITIAL_MATRIX, &
+                          PETSC_DEFAULT_REAL, Pat_p, ierr)
+        else
+          Pat_p = op(CM_OP_Q1R)
+        endif
+        call build_fsai(op(CM_OP_Q1R), Pat_p, n1, comm, G_p, nfl)
+        call MatTransposeMatMult(G_p, G_p, MAT_INITIAL_MATRIX, &
+                                 PETSC_DEFAULT_REAL, Qi_p, ierr)
       endif
       ! Scale the floor by the operator's own magnitude: an absolute 1e-300
       ! test cannot tell a genuinely zeroed boundary row from a derivative
@@ -3573,15 +3612,27 @@ contains
       ! S_ass is a genuine sparse matrix only when BOTH inverses are diagonal.
       ! Variants 3/4 keep one exact, so they exist as an operator only and
       ! report no fill -- they are attribution experiments, not candidates.
-      sparse_ok = ((mu == 1 .or. mu == 2) .and. mp > 0)
+      ! Sparse assembly is possible whenever BOTH inverses are themselves
+      ! sparse matrices: a diagonal (1,2), nothing at all (4), or FSAI (5).
+      sparse_ok = (mu >= 1 .and. mu /= 3) .and. (mp >= 1 .and. mp /= 3)
       if (sparse_ok) then
-        ! T1 = (D_uu diag(1/mass(Q_u))) A_uM
+        ! T1 = (D_uu Q_u^-1) A_uM
         call MatDuplicate(D_uu, MAT_COPY_VALUES, Dsc, ierr)
-        call MatDiagonalScale(Dsc, PETSC_NULL_VEC, lq_u, ierr)
+        if (mu == 5 .or. mu == 6) then
+          call MatDestroy(Dsc, ierr)
+          call MatMatMult(D_uu, Qi_u, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, Dsc, ierr)
+        else if (mu /= 4) then
+          call MatDiagonalScale(Dsc, PETSC_NULL_VEC, lq_u, ierr)
+        endif
         call MatMatMult(Dsc, A_uM, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, T1_a, ierr)
-        ! T2 = (L_up diag(1/mass(Q))) U_pu
+        ! T2 = (L_up Q^-1) U_pu
         call MatDuplicate(L_up, MAT_COPY_VALUES, Lsc, ierr)
-        call MatDiagonalScale(Lsc, PETSC_NULL_VEC, lq_p, ierr)
+        if (mp == 5 .or. mp == 6) then
+          call MatDestroy(Lsc, ierr)
+          call MatMatMult(L_up, Qi_p, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, Lsc, ierr)
+        else if (mp /= 4) then
+          call MatDiagonalScale(Lsc, PETSC_NULL_VEC, lq_p, ierr)
+        endif
         call MatMatMult(Lsc, U_pu, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, T2_a, ierr)
 
         call MatDuplicate(T1_a, MAT_COPY_VALUES, S_ass, ierr)
@@ -3617,6 +3668,10 @@ contains
         call MatMult(A_uM, az, cv_t, ierr)
         if (mu == 0) then
           call KSPSolve(ksp_Qu, cv_t, cv_w, ierr)
+        else if (mu == 4) then
+          call VecCopy(cv_t, cv_w, ierr)                  ! no mass inverse
+        else if (mu == 5 .or. mu == 6) then
+          call MatMult(Qi_u, cv_t, cv_w, ierr)            ! FSAI
         else if (mu == 3) then
           ! Q_u^-1 r  by npoly steps of diagonally-preconditioned Richardson
           ! (a Neumann series in D^-1 Q_u). Still a POLYNOMIAL in Q_u, hence
@@ -3635,6 +3690,10 @@ contains
         call MatMult(U_pu, az, cv_t, ierr)
         if (mp == 0) then
           call KSPSolve(ksp_Q, cv_t, cv_q, ierr)
+        else if (mp == 4) then
+          call VecCopy(cv_t, cv_q, ierr)                  ! no mass inverse
+        else if (mp == 5 .or. mp == 6) then
+          call MatMult(Qi_p, cv_t, cv_q, ierr)            ! FSAI
         else
           call VecPointwiseMult(cv_q, cv_t, lq_p, ierr)
         endif
@@ -3687,6 +3746,16 @@ contains
       call VecDestroy(ones_p, ierr)
       call VecDestroy(lq_u, ierr)
       call VecDestroy(lq_p, ierr)
+      if (mu == 5 .or. mu == 6) then
+        call MatDestroy(G_u, ierr)
+        call MatDestroy(Qi_u, ierr)
+        if (mu == 6) call MatDestroy(Pat_u, ierr)
+      endif
+      if (mp == 5 .or. mp == 6) then
+        call MatDestroy(G_p, ierr)
+        call MatDestroy(Qi_p, ierr)
+        if (mp == 6) call MatDestroy(Pat_p, ierr)
+      endif
       call VecDestroy(ax, ierr)
       call VecDestroy(ay, ierr)
       call VecDestroy(az, ierr)
@@ -3698,6 +3767,105 @@ contains
 
   end subroutine verify_schur_approx_4x4
 
+
+
+  !--------------------------------------------------------------------
+  !> Factorized sparse approximate inverse (Kolotilina-Yeremin) of an SPD
+  !! matrix A:   A^-1  ~  G^T G,  G lower triangular on the pattern of
+  !! tril(A).
+  !!
+  !! Why this and not a diagonal: the inverse of a banded SPD matrix decays
+  !! exponentially away from the diagonal (Demko-Moss-Smith), so a sparse
+  !! factor with the bandwidth of A already captures most of A^-1. A
+  !! diagonal is the zero-bandwidth member of that family, which is exactly
+  !! why it fails on a C1 Bezier mass matrix while FSAI need not.
+  !!
+  !! Row i solves the small SPD system  A[J,J] g = e_last,  J = {j <= i in
+  !! the pattern}, then scales g by 1/sqrt(g_i). Rows are independent.
+  !--------------------------------------------------------------------
+  subroutine build_fsai(A, P, n, comm, G, nfail)
+    Mat, intent(in)  :: A
+    Mat, intent(in)  :: P   !< supplies the SPARSITY PATTERN (A itself = level 0,
+                            !< A*A = level 1, ...); values always come from A
+    PetscInt, intent(in) :: n
+    integer, intent(in)  :: comm
+    Mat, intent(out) :: G
+    integer, intent(out) :: nfail   !< rows that fell back to the identity
+
+    PetscInt :: i, k, m, ncols
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    PetscInt, allocatable :: jj(:), rcnt(:)
+    real*8, allocatable :: asub(:,:), rhs(:)
+    integer, allocatable :: ipiv(:)
+    integer :: info
+    character(len=64) :: mtype
+    PetscErrorCode :: ierr
+    external :: dgesv
+
+    allocate(rcnt(n))
+    do i = 0, n-1
+      call MatGetRow(P, i, ncols, PETSC_NULL_INTEGER_POINTER, &
+                     PETSC_NULL_SCALAR_POINTER, ierr)
+      rcnt(i+1) = ncols
+      call MatRestoreRow(P, i, ncols, PETSC_NULL_INTEGER_POINTER, &
+                         PETSC_NULL_SCALAR_POINTER, ierr)
+    enddo
+
+    ! Match A's type exactly: the blocks this multiplies are MPIAIJ even on
+    ! one rank, and PETSc has no mixed MPIAIJ*SEQAIJ product.
+    call MatGetType(A, mtype, ierr)
+    call MatCreate(comm, G, ierr)
+    call MatSetSizes(G, n, n, n, n, ierr)
+    call MatSetType(G, mtype, ierr)
+    call MatSeqAIJSetPreallocation(G, PETSC_DEFAULT_INTEGER, rcnt, ierr)
+    call MatMPIAIJSetPreallocation(G, PETSC_DEFAULT_INTEGER, rcnt, &
+                                   PETSC_DEFAULT_INTEGER, PETSC_NULL_INTEGER_ARRAY, ierr)
+    call MatSetOption(G, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+
+    nfail = 0
+    do i = 0, n-1
+      call MatGetRow(P, i, ncols, cols, vals, ierr)
+      m = 0
+      allocate(jj(ncols))
+      do k = 1, ncols
+        if (cols(k) <= i) then
+          m = m + 1
+          jj(m) = cols(k)
+        endif
+      enddo
+      call MatRestoreRow(P, i, ncols, cols, vals, ierr)
+
+      if (m < 1) then
+        call MatSetValue(G, i, i, 1.0d0, INSERT_VALUES, ierr)
+        nfail = nfail + 1
+        deallocate(jj)
+        cycle
+      endif
+
+      ! MatGetRow returns columns in ascending order, so jj(m) == i.
+      allocate(asub(m,m), rhs(m), ipiv(m))
+      call MatGetValues(A, m, jj(1:m), m, jj(1:m), asub, ierr)
+      rhs      = 0.0d0
+      rhs(m)   = 1.0d0
+      call dgesv(m, 1, asub, m, ipiv, rhs, m, info)
+
+      if (info /= 0 .or. rhs(m) <= 0.0d0) then
+        ! singular row (a zeroed Dirichlet row) -- fall back to identity
+        call MatSetValue(G, i, i, 1.0d0, INSERT_VALUES, ierr)
+        nfail = nfail + 1
+      else
+        rhs = rhs / sqrt(rhs(m))
+        call MatSetValues(G, 1, (/ i /), m, jj(1:m), rhs, INSERT_VALUES, ierr)
+      endif
+      deallocate(asub, rhs, ipiv, jj)
+    enddo
+
+    call MatAssemblyBegin(G, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(G, MAT_FINAL_ASSEMBLY, ierr)
+    deallocate(rcnt)
+
+  end subroutine build_fsai
 
 
   !--------------------------------------------------------------------
