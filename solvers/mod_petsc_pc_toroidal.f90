@@ -88,7 +88,7 @@ contains
       PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (METIS)
       PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
       PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
-      PetscCallA(MatMumpsSetIcntl(F, 22, 1,  ierr))   ! out-of-core processing
+      PetscCallA(MatMumpsSetIcntl(F, 22, 0,  ierr))  ! 0 = in-core factorization
       PetscCallA(KSPSetUp(subksp_array(i), ierr))
     enddo
     PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))

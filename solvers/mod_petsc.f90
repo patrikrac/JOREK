@@ -333,7 +333,7 @@ contains
     PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))  ! fill-reducing ordering
     PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))  ! workspace expansion %
     PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))  ! numerical scaling (auto)
-    PetscCallA(MatMumpsSetIcntl(F, 22, 1,  ierr))  ! out-of-core processing
+    PetscCallA(MatMumpsSetIcntl(F, 22, 0,  ierr))  ! 0 = in-core factorization
 
     PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
     petsc_sys%ksp_ready = .true.
