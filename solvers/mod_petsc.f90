@@ -216,7 +216,7 @@ contains
         c_global = a_mat%jcn((k-1)*block_size2 + 1)
         idxn(1) = c_global / block_size
         val_ptr_start = (k - 1) * block_size2 + 1
-        val_ptr_end   = val_ptr_start + block_size2
+        val_ptr_end   = val_ptr_start + block_size2 - 1
         vals_petsc(1:block_size2) = a_mat%val(val_ptr_start : val_ptr_end)
         PetscCallA(MatSetValuesBlocked(petsc_sys%A, 1, idxm, 1, idxn, vals_petsc, INSERT_VALUES, ierr))
       enddo
