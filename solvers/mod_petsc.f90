@@ -259,125 +259,44 @@ contains
   end subroutine petsc_update_rhs
 
 
-  subroutine petsc_print_matrix_info(petsc_sys)
-    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    PetscErrorCode :: ierr
-    integer ::  my_id, comm, mpierr
-    logical :: speaker
-    PetscInt :: M, N
-    MatInfo :: info(MAT_INFO_SIZE)
-    PetscReal :: norm
-    PetscBool :: flg
+  !> Load an initial guess into petsc_sys%x from the JOREK sol_vec (the previous
+  !! time-step increment). Mirrors petsc_update_rhs ownership slicing so that x
+  !! and b share the same global layout. If sol_vec is not yet allocated (e.g. the
+  !! first step of a fresh, non-restart run) the guess degrades to zero, reproducing
+  !! the standard zero-start. Used together with KSPSetInitialGuessNonzero.
+  subroutine petsc_update_initial_guess(petsc_sys, sol_vec)
+    use data_structure, only: type_RHS
 
-    call PetscObjectGetComm(petsc_sys%A, comm, ierr)
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_RHS), intent(in) :: sol_vec
+
+    integer :: i, my_id, mpierr, comm
+    PetscInt :: i_start, i_end, n_local
+    PetscInt, allocatable :: indices_petsc(:)
+    PetscErrorCode :: ierr
+
+    if (.not. associated(sol_vec%val)) then
+      PetscCallA(VecSet(petsc_sys%x, 0.0d0, ierr))
+      return
+    endif
+
+    PetscCallA(PetscObjectGetComm(petsc_sys%x, comm, ierr))
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
-    speaker = (my_id .eq. 0)
-
-    if (speaker) print *, "Start PETSC Matrix info ---"
-    call MatGetSize(petsc_sys%A, M, N, ierr)
-    if (speaker) print *, "Matrix size M = ", M, " ; N = ", N
-    call MatGetInfo(petsc_sys%A, MAT_GLOBAL_SUM, info, ierr)
-    if (speaker) then
-       print "(A, I0)", " NNZ used = ", int(info(MAT_INFO_NZ_USED))
-       print "(A, I0)", " NNZ stored = ", int(info(MAT_INFO_NZ_ALLOCATED))
-    endif
-
-    if (speaker) print *, "End PETSC Matrix info ---"
-
-  end subroutine petsc_print_matrix_info
-
-
-  subroutine petsc_test_matv(petsc_sys, a_mat)
-    use data_structure, only: type_SP_MATRIX
-    use mod_matv, only: bcsr_matv
-
-    type(type_PETSC_SYSTEM), intent(in) :: petsc_sys
-    type(type_SP_MATRIX), intent(in) :: a_mat
-    PetscErrorCode :: ierr
-    integer :: comm, my_id, mpi_err
-    integer :: i
-    real*8, allocatable :: x_global(:)
-    real*8, allocatable :: y_jorek(:)
-    real*8 :: jorek_sum_sq, jorek_norm, petsc_norm
-    Vec :: x, y_petsc
-    PetscInt :: i_start, i_end, n_local
-    PetscScalar, pointer :: x_arr(:)
-    PetscLogDouble :: t1, t2, t3, t4
-
-    comm = a_mat%comm
-
-    allocate(x_global(a_mat%ng))
-    allocate(y_jorek(a_mat%ng))
-
-    call MPI_Comm_rank(MPI_COMM_WORLD, my_id, mpi_err)
-
-    if (my_id .eq. 0) then
-      call random_seed()
-      call random_number(x_global)
-      x_global = x_global * 1e-3
-    endif
-
-    call MPI_Bcast(x_global, a_mat%ng, MPI_DOUBLE_PRECISION, 0, comm, mpi_err)
-
-    if (my_id .eq.0) then
-      jorek_sum_sq = 0.0d0
-      do i = 1,a_mat%ng
-        jorek_sum_sq = jorek_sum_sq + (x_global(i))**2
-      enddo
-      jorek_norm = sqrt(jorek_sum_sq)
-      print *, "JOREK Manual Norm (x): ", jorek_norm
-    endif
-
-
-    call MatCreateVecs(petsc_sys%A, x, PETSC_NULL_VEC, ierr)
-    call VecGetOwnershipRange(x, i_start, i_end, ierr)
+    PetscCallA(VecGetOwnershipRange(petsc_sys%x, i_start, i_end, ierr))
     n_local = i_end - i_start
-    call VecGetArray(x, x_arr, ierr)
+
+    allocate(indices_petsc(n_local))
     do i = 1, n_local
-      x_arr(i) = x_global(i_start + i)  ! i_start+1 to i_end maps to x_global indices
-    enddo
-    call VecRestoreArray(x, x_arr, ierr)
-    call VecAssemblyBegin(x, ierr)
-    call VecAssemblyEnd(x, ierr)
+      indices_petsc(i) = i_start + (i - 1)
+    end do
 
-    call VecNorm(x, NORM_2, petsc_norm, ierr)
-    if (my_id .eq.0) print *, "PETSc Norm (x): ", petsc_norm
+    PetscCallA(VecSetValues(petsc_sys%x, n_local, indices_petsc, sol_vec%val(i_start+1:i_end), INSERT_VALUES, ierr))
+    PetscCallA(VecAssemblyBegin(petsc_sys%x, ierr))
+    PetscCallA(VecAssemblyEnd(petsc_sys%x, ierr))
+    deallocate(indices_petsc)
 
-    call MatCreateVecs(petsc_sys%A, PETSC_NULL_VEC, y_petsc, ierr)
-    call PetscTime(t1, ierr)
-    PetscCallA(MatMult(petsc_sys%A, x, y_petsc, ierr))
-    call PetscTime(t2, ierr)
-
-    call PetscTime(t3, ierr)
-    call bcsr_matv(a_mat, x_global, y_jorek)
-    call PetscTime(t4, ierr)
-
-    if (my_id .eq.0) then
-      jorek_sum_sq = 0.0d0
-      do i = 1,a_mat%ng
-        jorek_sum_sq = jorek_sum_sq + (y_jorek(i))**2
-      enddo
-      jorek_norm = sqrt(jorek_sum_sq)
-    endif
-
-    call VecNorm(y_petsc, NORM_2, petsc_norm, ierr)
-
-    if (my_id .eq. 0) then
-      print *, ""
-      print *, "===== MATVEC COMPARISON ====="
-      print *, "PETSc MatMult time: ", t2-t1
-      print *, "JOREK MatVec time:  ", t4-t3
-      print *, ""
-
-      print *, "JOREK Norm: ", jorek_norm
-      print *, "PETSc norm: ", petsc_norm
-    endif
-
-    deallocate(x_global, y_jorek)
-    call VecDestroy(x, ierr)
-    call VecDestroy(y_petsc, ierr)
-  end subroutine petsc_test_matv
+  end subroutine petsc_update_initial_guess
 
 
   subroutine petsc_solve_and_retrieve(petsc_sys)
@@ -390,16 +309,11 @@ contains
     PC :: pc ! Maybe should be part of petsc_sys in the future
     PetscViewerAndFormat :: vf
     KSPConvergedReason :: reason
-    Mat :: A_aij, F
-    Vec :: b_aij, x_aij
+    Mat :: F
     KSPType :: ksp_type
 
     PetscCallA(PetscObjectGetComm(petsc_sys%A, comm, ierr))
     call MPI_COMM_RANK(comm, my_id, mpierr)
-
-    !PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, A_aij, ierr))
-    !PetscCallA(MatCreateVecs(A_aij, x_aij, b_aij, ierr))
-    !PetscCallA(VecCopy(petsc_sys%b, b_aij, ierr))
 
     PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
     PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A, petsc_sys%A, ierr))
@@ -407,52 +321,30 @@ contains
     PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
     PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
 
-    ! PetscCallA(KSPSetType(petsc_sys%ksp, KSPDGMRES, ierr))
     PetscCallA(KSPSetType(petsc_sys%ksp, KSPPREONLY, ierr))
-    !PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
-    ! Set the preconditioner
+    ! Set the preconditioner: LU via MUMPS
     PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
-    ! --- Additive Schwarz
-    !PetscCallA(PCSetType(pc, PCASM, ierr)) ! Set additive Schwarz method
-    !PetscCallA(PCASMSetTotalSubdomains(pc, 5, PETSC_NULL_IS, PETSC_NULL_IS, ierr))
-    !PetscCallA(PCASMSetOverlap(pc, 2, ierr))
-    !PetscCallA(PCASMSetType(pc, PC_ASM_BASIC, ierr)) ! Set type of restriction/interpolation
-    ! --- AMG
-    !PetscCallA(PCSetType(pc, PCGAMG, ierr))
-    !PetscCallA(PCGAMGSetThreshold(pc, [0.1], 1, ierr))
-    !PetscCallA(PCGAMGSetAggressiveLevels(pc, 1, ierr))
-    ! --- LU
     PetscCallA(PCSetType(pc, PCLU, ierr))
     PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
-
-    !PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
-
-    PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
 
     PetscCallA(PCFactorSetMatOrderingType(pc,MATORDERINGND,ierr))
     PetscCallA(PCFactorGetMatrix(pc, F, ierr))
     PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))  ! fill-reducing ordering
     PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))  ! workspace expansion %
     PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))  ! numerical scaling (auto)
-    PetscCallA(MatMumpsSetIcntl(F, 21, 1, ierr))
+    PetscCallA(MatMumpsSetIcntl(F, 22, 1,  ierr))  ! out-of-core processing
 
     PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+    petsc_sys%ksp_ready = .true.
 
     PetscCallA(KSPGetType(petsc_sys%ksp, ksp_type, ierr))
     if (my_id == 0) print *, "KSP type:", ksp_type
 
-    ! Set the maximum iterations of the linear system
-    PetscCallA(KSPSetTolerances(petsc_sys%ksp, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, 400, ierr))
-    PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
-
     if (my_id .eq. 0) print *, "Solving the system using PETSc"
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b, petsc_sys%x, ierr))
     PetscCallA(KSPDestroy(petsc_sys%ksp, ierr))
-    !PetscCallA(MatDestroy(A_aij, ierr))
-    !PetscCallA(VecCopy(x_aij, petsc_sys%x, ierr))
-    !PetscCallA(VecDestroy(b_aij, ierr))
-    !PetscCallA(VecDestroy(x_aij, ierr))
+    petsc_sys%ksp_ready = .false.
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
@@ -475,6 +367,7 @@ contains
     integer :: comm, my_id, mpierr
     KSPConvergedReason :: reason
     PetscLogDouble :: t1, t2
+    PetscLogDouble :: ts1, ts2
     KSPType :: ksp_type
     PetscInt :: its
     PetscReal :: petsc_norm
@@ -488,6 +381,7 @@ contains
       PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
       PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
+      PetscCallA(PetscTime(ts1, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
@@ -496,13 +390,19 @@ contains
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
+      ! Warm-start: consume the JOREK initial guess (previous-step increment) loaded into
+      ! petsc_sys%x before each KSPSolve. The convergence reference stays the rhs norm
+      ! ||b|| (PETSc default; KSPConvergedDefaultSetUIRNorm is NOT set), so the stopping
+      ! criterion is identical to the zero-start behaviour - only the starting point changes.
+      PetscCallA(KSPSetInitialGuessNonzero(petsc_sys%ksp, PETSC_TRUE, ierr))
+
       ! Set GMRES parameters
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
       PetscCallA(KSPGMRESSetOrthogonalization(petsc_sys%ksp, KSPGMRESClassicalGramSchmidtOrthogonalization, ierr))
       PetscCallA(KSPGMRESSetCGSRefinementType(petsc_sys%ksp, KSP_GMRES_CGS_REFINE_IFNEEDED, ierr))
 
-      if (my_id .eq. 0) write(*,*) "[PETSc] setup: DGMRES + PCFIELDSPLIT + MUMPS"
+      if (my_id .eq. 0) write(*,*) "[PETSc] setup: GMRES + PCFIELDSPLIT + MUMPS"
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
       call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
@@ -510,29 +410,35 @@ contains
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
 
+      PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
+      if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
 
     else if (.not. solve_only) then
       if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: refactorizing"
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
+      PetscCallA(PetscTime(ts1, ierr))
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
 
+      PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
+      if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
 
     else
-      ! solve_only: update A but reuse PC factorization
+      ! solve_only: update A for mat-vec products but reuse PC factorization
       if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
     end if
 
-    ! Copy RHS, solve, copy solution back
+    ! Copy RHS and warm-start guess, solve, copy solution back
     PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
+    PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for GMRES
 
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
