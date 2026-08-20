@@ -80,12 +80,16 @@ contains
       PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
       PetscCallA(PCSetType(subpc, PCLU, ierr))
       PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
-      PetscCallA(KSPSetUp(subksp_array(i), ierr))
+      ! Create the MUMPS factor matrix and set its ICNTLs *before* KSPSetUp, otherwise
+      ! the settings below miss the very first factorization and only take effect from
+      ! the first preconditioner rebuild onwards.
+      PetscCallA(PCFactorSetUpMatSolverType(subpc, ierr))
       PetscCallA(PCFactorGetMatrix(subpc, F, ierr))
       PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (METIS)
       PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
       PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
       PetscCallA(MatMumpsSetIcntl(F, 22, 1,  ierr))   ! out-of-core processing
+      PetscCallA(KSPSetUp(subksp_array(i), ierr))
     enddo
     PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
   end subroutine petsc_setup_toroidal_harmonic_pc
