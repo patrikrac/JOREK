@@ -329,11 +329,11 @@ contains
     call MatCreateVecs(petsc_sys%A, x, PETSC_NULL_VEC, ierr)
     call VecGetOwnershipRange(x, i_start, i_end, ierr)
     n_local = i_end - i_start
-    call VecGetArrayF90(x, x_arr, ierr)
+    call VecGetArray(x, x_arr, ierr)
     do i = 1, n_local
       x_arr(i) = x_global(i_start + i)  ! i_start+1 to i_end maps to x_global indices
     enddo
-    call VecRestoreArrayF90(x, x_arr, ierr)
+    call VecRestoreArray(x, x_arr, ierr)
     call VecAssemblyBegin(x, ierr)
     call VecAssemblyEnd(x, ierr)
 
@@ -541,7 +541,7 @@ contains
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
     n_iter    = its
-    converged = (reason > 0)
+    converged = (reason%v > 0)
 
     if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
 
@@ -567,11 +567,13 @@ contains
     PetscCallA(VecScatterBegin(scatter, petsc_sys%x, x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
     PetscCallA(VecScatterEnd(scatter, petsc_sys%x, x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
 
-    PetscCallA(VecGetArrayF90(x_seq, x_arr, ierr))
+    PetscCallA(VecGetArray(x_seq, x_arr, ierr))
 
-    sol_vec%val(:) = x_arr(:)
+    if (associated(sol_vec%val)) then
+      sol_vec%val(1:sol_vec%n) = x_arr(1:sol_vec%n)
+    end if
 
-    PetscCallA(VecRestoreArrayF90(x_seq, x_arr, ierr))
+    PetscCallA(VecRestoreArray(x_seq, x_arr, ierr))
 
     PetscCallA(VecScatterDestroy(scatter, ierr))
     PetscCallA(VecDestroy(x_seq, ierr))

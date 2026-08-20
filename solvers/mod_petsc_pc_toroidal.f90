@@ -20,6 +20,7 @@ contains
 
     integer :: i, j, k, n_split, split_size, field_size, n_modes_in_fam, idx
     PetscInt :: block_size
+    PetscCount :: field_count
     PetscInt, allocatable :: fields(:)
     integer, allocatable :: fam_modes(:)
     Mat :: F
@@ -64,7 +65,8 @@ contains
           fields(idx) = (j-1)*n_tor + (fam_modes(k) - 1)
         enddo
       enddo
-      PetscCallA(PetscSortInt(field_size, fields, ierr))
+      field_count = field_size
+      PetscCallA(PetscSortInt(field_count, fields, ierr))
       PetscCallA(PCFieldSplitSetFields(pc, PETSC_NULL_CHARACTER, field_size, fields, fields, ierr))
       deallocate(fields, fam_modes)
     enddo
