@@ -94,6 +94,10 @@ program JOREK2
   use mod_reduce_noise, only: reduce_noise
 #endif
 
+#ifdef USE_PETSC
+  use mod_petsc, only: petsc_initialize, petsc_finalize, petsc_print_version
+#endif
+
 
   use, intrinsic :: iso_c_binding
   use, intrinsic :: iso_fortran_env, only : stdin=>input_unit, &
@@ -215,6 +219,13 @@ mpi_required = 0
   call MPI_Init_thread(mpi_required, mpi_provided, StatInfo)
 
   call init_threads()  ! on some systems init_threads needs to come after mpi_init_thread
+
+#ifdef USE_PETSC
+  ! --- Initialize PETSc once, globally (after MPI_Init, before any solver use
+  !     including the Grad-Shafranov equilibrium). Finalized before end program.
+  call petsc_initialize()
+  call petsc_print_version()
+#endif
   
   ! --- Determine number of MPI procs
   call MPI_COMM_SIZE(MPI_COMM_WORLD, comm_size, ierr)
@@ -1204,6 +1215,9 @@ if (allocated(node_list%node)) call dealloc_node_list(node_list)
 if (allocated(aux_node_list%node)) call dealloc_node_list(aux_node_list)
 
   call r3_info_summary ()                                ! timing
+#ifdef USE_PETSC
+  call petsc_finalize()                                  ! finalize PETSc before MPI
+#endif
   call MPI_FINALIZE(IERR)                                ! clean up MPI
 
 end program JOREK2
