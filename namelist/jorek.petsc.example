@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# PETSc solver options for JOREK.
+#
+# Copy this file to  jorek.petsc  in the run directory and uncomment what you
+# need. It is read automatically at startup when present; if it is absent JOREK
+# runs with its built-in defaults, which are exactly the settings listed as
+# "default:" below.
+#
+# Format is the standard PETSc options file: one option per line, '#' comments.
+# Anything set here overrides JOREK's compiled-in default.
+#
+# Three prefixes exist:
+#   -jorek_          the main iterative (GMRES) solve
+#   -jorek_pcblock_  the direct solver inside every preconditioner block
+#   -jorek_direct_   the one-shot direct solve path
+#
+# The -jorek_pcblock_ prefix is shared by all toroidal mode-family blocks, so a
+# single option below reconfigures every one of them.
+# ---------------------------------------------------------------------------
+
+# --- Main iterative solve ---------------------------------------------------
+# -jorek_ksp_type            gmres      # default: gmres
+# -jorek_ksp_rtol            1e-8       # default: 1e-8
+# -jorek_ksp_max_it          400        # default: 400
+# -jorek_ksp_gmres_restart   40         # default: 40
+# -jorek_ksp_view                       # dump the full solver configuration
+#
+# Note: the outer preconditioner is always PCFIELDSPLIT. It carries the toroidal
+# mode-family decomposition, so -jorek_pc_type is not a supported knob.
+
+# --- Direct solver used in each preconditioner block ------------------------
+# Which factorization package. Requires the package in your PETSc build;
+# PETSc reports clearly at startup if it is missing.
+# -jorek_pcblock_pc_factor_mat_solver_type mumps          # default
+# -jorek_pcblock_pc_factor_mat_solver_type superlu_dist
+# -jorek_pcblock_pc_factor_mat_solver_type strumpack
+# -jorek_pcblock_pc_factor_mat_solver_type cudss          # GPU
+#
+# Note: PETSc's built-in LU ('petsc') is NOT usable here - the blocks are MPIAIJ
+# and it only factorizes SEQAIJ. PETSc says so clearly if you try.
+#
+# MUMPS controls. JOREK's defaults are ICNTL(7)=7 (METIS ordering),
+# ICNTL(14)=50 (workspace %), ICNTL(8)=77 (auto scaling), ICNTL(22)=0 (in-core).
+# Setting one here overrides just that one; the rest keep JOREK's values.
+# -jorek_pcblock_mat_mumps_icntl_22 1    # 1 = out-of-core factorization
+# -jorek_pcblock_mat_mumps_icntl_7  5
+#
+# SuperLU_DIST / STRUMPACK / cuDSS controls follow the same pattern:
+# -jorek_pcblock_mat_superlu_dist_colperm PARMETIS
+# -jorek_pcblock_mat_strumpack_compression NONE
+#
+# The block solver itself can also be replaced wholesale, e.g. to try an
+# iterative block solve instead of a direct one:
+# -jorek_pcblock_ksp_type richardson
+# -jorek_pcblock_pc_type  hypre
+
+# --- One-shot direct solve path ---------------------------------------------
+# -jorek_direct_pc_factor_mat_solver_type mumps           # default
+
+# --- Diagnostics ------------------------------------------------------------
+# -options_left                         # report unused (i.e. misspelled) options
+# -log_view                             # PETSc performance summary

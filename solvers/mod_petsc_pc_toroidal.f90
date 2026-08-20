@@ -1,11 +1,16 @@
 module mod_petsc_pc_toroidal
 #ifdef USE_PETSC
   use mpi_mod
+  use mod_petsc_direct_solver, only: petsc_configure_direct_solver
 #include "petsc/finclude/petsc.h"
   use petsc
   implicit none
   private
   public :: petsc_setup_toroidal_harmonic_pc
+
+  !> Shared options prefix for every PCFIELDSPLIT block, e.g.
+  !! -jorek_pcblock_pc_factor_mat_solver_type superlu_dist
+  character(len=*), parameter :: PC_BLOCK_PREFIX = 'jorek_pcblock_'
 
 contains
 
@@ -24,7 +29,6 @@ contains
     PetscCount :: field_count
     PetscInt, allocatable :: fields(:)
     integer, allocatable :: fam_modes(:)
-    Mat :: F
     PC :: pc, subpc
     KSP, pointer, dimension(:) :: subksp_array
     PetscErrorCode :: ierr
@@ -76,23 +80,49 @@ contains
     PetscCallA(KSPSetUp(ksp, ierr))
     PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
     do i = 1, n_split
+      ! All blocks share one options prefix rather than PETSc's per-split
+      ! fieldsplit_<N>_, so that a single option configures every toroidal mode
+      ! family instead of having to be repeated once per split.
+      PetscCallA(KSPSetOptionsPrefix(subksp_array(i), PC_BLOCK_PREFIX, ierr))
       PetscCallA(KSPSetType(subksp_array(i), KSPPREONLY, ierr))
+      PetscCallA(KSPSetFromOptions(subksp_array(i), ierr))
       PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
-      PetscCallA(PCSetType(subpc, PCLU, ierr))
-      PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
-      ! Create the MUMPS factor matrix and set its ICNTLs *before* KSPSetUp, otherwise
-      ! the settings below miss the very first factorization and only take effect from
-      ! the first preconditioner rebuild onwards.
-      PetscCallA(PCFactorSetUpMatSolverType(subpc, ierr))
-      PetscCallA(PCFactorGetMatrix(subpc, F, ierr))
-      PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (METIS)
-      PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
-      PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
-      PetscCallA(MatMumpsSetIcntl(F, 22, 0,  ierr))  ! 0 = in-core factorization
+      call petsc_configure_direct_solver(subpc)
       PetscCallA(KSPSetUp(subksp_array(i), ierr))
     enddo
+    call report_block_solver(subksp_array(1))
     PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
   end subroutine petsc_setup_toroidal_harmonic_pc
+
+
+  !> Report the solver configuration the blocks actually resolved to. All blocks
+  !! share one options prefix, so reporting the first one describes them all.
+  subroutine report_block_solver(subksp)
+    KSP, intent(in) :: subksp
+
+    PC             :: subpc
+    PCType         :: ptype
+    KSPType        :: ktype
+    MatSolverType  :: stype
+    integer        :: comm, my_id, mpierr
+    PetscErrorCode :: ierr
+
+    PetscCallA(PetscObjectGetComm(subksp, comm, ierr))
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+    if (my_id /= 0) return
+
+    PetscCallA(KSPGetType(subksp, ktype, ierr))
+    PetscCallA(KSPGetPC(subksp, subpc, ierr))
+    PetscCallA(PCGetType(subpc, ptype, ierr))
+    if (ptype == PCLU .or. ptype == PCCHOLESKY .or. ptype == PCILU) then
+      PetscCallA(PCFactorGetMatSolverType(subpc, stype, ierr))
+      write(*,*) '[PETSc] PC blocks (-'//PC_BLOCK_PREFIX//'...): ' &
+                 //trim(ktype)//' + '//trim(ptype)//' via '//trim(stype)
+    else
+      write(*,*) '[PETSc] PC blocks (-'//PC_BLOCK_PREFIX//'...): ' &
+                 //trim(ktype)//' + '//trim(ptype)
+    endif
+  end subroutine report_block_solver
 
 #endif
 end module mod_petsc_pc_toroidal

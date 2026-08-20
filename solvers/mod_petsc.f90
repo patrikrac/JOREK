@@ -2,6 +2,7 @@ module mod_petsc
 #ifdef USE_PETSC
   use mpi_mod
   use mod_petsc_pc
+  use mod_petsc_direct_solver, only: petsc_configure_direct_solver
 #include "petsc/finclude/petsc.h"
   use petsc
 #ifdef USE_SLEPC
@@ -11,6 +12,13 @@ module mod_petsc
 
   implicit none
 
+
+  !> Run-directory file read by PetscInitialize for solver options.
+  character(len=*), parameter :: PETSC_OPTIONS_FILE = 'jorek.petsc'
+  !> Options prefix of the main iterative solve, e.g. -jorek_ksp_rtol 1e-9
+  character(len=*), parameter :: PETSC_MAIN_PREFIX   = 'jorek_'
+  !> Options prefix of the one-shot direct solve path
+  character(len=*), parameter :: PETSC_DIRECT_PREFIX = 'jorek_direct_'
 
   type type_PETSC_SYSTEM
     Mat  :: A              ! BAIJ system matrix (from JOREK block-CSR)
@@ -28,17 +36,54 @@ module mod_petsc
 
 contains
 
+  !> Initialize PETSc, reading solver options from PETSC_OPTIONS_FILE in the run
+  !! directory when it exists. That file is the supported way to reconfigure the
+  !! solvers at run time; see namelist/jorek.petsc.example for the available
+  !! prefixes. Passing a file name that does not exist is a fatal error in PETSc,
+  !! hence the inquire.
   subroutine petsc_initialize()
     PetscErrorCode :: ierr
+    logical :: have_opts
     ! PetscCallA(PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-log_view", PETSC_NULL_CHARACTER, ierr))
+
+    inquire(file=PETSC_OPTIONS_FILE, exist=have_opts)
 #ifdef USE_SLEPC
-    call SlepcInitialize(PETSC_NULL_CHARACTER, ierr)  ! superset of PetscInitialize
+    if (have_opts) then
+      call SlepcInitialize(PETSC_OPTIONS_FILE, ierr)  ! superset of PetscInitialize
+    else
+      call SlepcInitialize(PETSC_NULL_CHARACTER, ierr)
+    endif
     if (ierr /= 0) print *, "Error initializing SLEPc/PETSc"
 #else
-    call PetscInitialize(PETSC_NULL_CHARACTER, ierr)
+    if (have_opts) then
+      call PetscInitialize(PETSC_OPTIONS_FILE, ierr)
+    else
+      call PetscInitialize(PETSC_NULL_CHARACTER, ierr)
+    endif
     if (ierr /= 0) print *, "Error initializing PETSc"
 #endif
   end subroutine
+
+
+  !> Report the main solve configuration actually resolved from the defaults
+  !! plus whatever jorek.petsc supplied.
+  subroutine report_main_solver(ksp, my_id)
+    KSP, intent(in)     :: ksp
+    integer, intent(in) :: my_id
+
+    KSPType        :: ktype
+    PetscReal      :: rtol, abstol, dtol
+    PetscInt       :: maxits
+    PetscErrorCode :: ierr
+
+    if (my_id /= 0) return
+
+    PetscCallA(KSPGetType(ksp, ktype, ierr))
+    PetscCallA(KSPGetTolerances(ksp, rtol, abstol, dtol, maxits, ierr))
+    write(*,*) '[PETSc] main solve (-'//PETSC_MAIN_PREFIX//'...): '//trim(ktype) &
+               //' + '//PCFIELDSPLIT
+    write(*,*) '[PETSc]   rtol =', rtol, ' max_it =', maxits
+  end subroutine report_main_solver
 
 
   subroutine petsc_finalize()
@@ -292,31 +337,25 @@ contains
     PC :: pc ! Maybe should be part of petsc_sys in the future
     PetscViewerAndFormat :: vf
     KSPConvergedReason :: reason
-    Mat :: F
     KSPType :: ksp_type
 
     PetscCallA(PetscObjectGetComm(petsc_sys%A, comm, ierr))
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
     PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
+    PetscCallA(KSPSetOptionsPrefix(petsc_sys%ksp, PETSC_DIRECT_PREFIX, ierr))
     PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A, petsc_sys%A, ierr))
 
     PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
     PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
 
     PetscCallA(KSPSetType(petsc_sys%ksp, KSPPREONLY, ierr))
+    PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
 
-    ! Set the preconditioner: LU via MUMPS
+    ! Set the preconditioner: direct solve, LU via MUMPS unless overridden by
+    ! -jorek_direct_pc_* options.
     PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
-    PetscCallA(PCSetType(pc, PCLU, ierr))
-    PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
-
-    PetscCallA(PCFactorSetMatOrderingType(pc,MATORDERINGND,ierr))
-    PetscCallA(PCFactorGetMatrix(pc, F, ierr))
-    PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))  ! fill-reducing ordering
-    PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))  ! workspace expansion %
-    PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))  ! numerical scaling (auto)
-    PetscCallA(MatMumpsSetIcntl(F, 22, 0,  ierr))  ! 0 = in-core factorization
+    call petsc_configure_direct_solver(pc)
 
     PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
     petsc_sys%ksp_ready = .true.
@@ -370,6 +409,7 @@ contains
       PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
 
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
+      PetscCallA(KSPSetOptionsPrefix(petsc_sys%ksp, PETSC_MAIN_PREFIX, ierr))
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
@@ -385,9 +425,17 @@ contains
       PetscCallA(KSPGMRESSetOrthogonalization(petsc_sys%ksp, KSPGMRESClassicalGramSchmidtOrthogonalization, ierr))
       PetscCallA(KSPGMRESSetCGSRefinementType(petsc_sys%ksp, KSP_GMRES_CGS_REFINE_IFNEEDED, ierr))
 
-      if (my_id .eq. 0) write(*,*) "[PETSc] setup: GMRES + PCFIELDSPLIT + MUMPS"
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
+
+      ! Options after the defaults above, so anything in jorek.petsc overrides
+      ! them: -jorek_ksp_rtol, -jorek_ksp_max_it, -jorek_ksp_gmres_restart, ...
+      ! The outer PC type is deliberately NOT a knob - PCFIELDSPLIT carries the
+      ! toroidal mode-family decomposition and is structural, so petsc_setup_pc
+      ! below always sets it. The blocks inside it are fully configurable under
+      ! the -jorek_pcblock_ prefix, and report themselves from there.
+      PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
+      call report_main_solver(petsc_sys%ksp, my_id)
       call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
