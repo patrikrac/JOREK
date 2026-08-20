@@ -491,12 +491,13 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_SP_MATRIX), intent(in)       :: a_mat
 
-    integer :: k, r
+    integer :: k, r, c, j, owner
     integer :: comm, my_id, n_cpu, mpierr
     PetscInt :: n_global, n_local
     PetscInt :: row(1), col(1)
     PetscScalar :: v(1)
-    PetscInt, allocatable :: d_nnz(:)
+    PetscInt, allocatable :: d_nnz(:), o_nnz(:)
+    integer, allocatable  :: d_all(:), o_all(:), d_loc(:), o_loc(:), counts(:), displs(:)
     PetscErrorCode :: ierr
 
     comm = a_mat%comm
@@ -521,10 +522,62 @@ contains
       call MatSeqAIJSetPreallocation(petsc_sys%A, 0, d_nnz, ierr)
       deallocate(d_nnz)
     else
-      call MatSetSizes(petsc_sys%A, PETSC_DECIDE, PETSC_DECIDE, n_global, n_global, ierr)
+      ! Fix the row split up front so rank 0, which holds the whole COO, can work out
+      ! every rank's ownership range and count its rows exactly. The previous
+      ! n_global-per-row preallocation was effectively dense and grew as O(n^2).
+      n_local = PETSC_DECIDE
+      call PetscSplitOwnership(comm, n_local, n_global, ierr)
+      call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
       call MatSetType(petsc_sys%A, MATAIJ, ierr)
-      call MatMPIAIJSetPreallocation(petsc_sys%A, n_global, PETSC_NULL_INTEGER_ARRAY, &
-                                      n_global, PETSC_NULL_INTEGER_ARRAY, ierr)
+
+      allocate(counts(n_cpu), displs(n_cpu))
+      call MPI_Allgather(int(n_local), 1, MPI_INTEGER, counts, 1, MPI_INTEGER, comm, mpierr)
+      displs(1) = 0
+      do k = 2, n_cpu
+        displs(k) = displs(k-1) + counts(k-1)
+      enddo
+
+      ! Per global row, count entries inside vs outside the diagonal block of the rank
+      ! owning that row (duplicates included - a safe overestimate).
+      if (my_id .eq. 0) then
+        allocate(d_all(n_global), o_all(n_global))
+        d_all = 0
+        o_all = 0
+        do k = 1, a_mat%nnz
+          r = a_mat%irn(k)
+          c = a_mat%jcn(k)
+          owner = 1
+          do j = n_cpu, 1, -1
+            if (r-1 >= displs(j)) then
+              owner = j
+              exit
+            endif
+          enddo
+          if (c-1 >= displs(owner) .and. c-1 < displs(owner) + counts(owner)) then
+            d_all(r) = d_all(r) + 1
+          else
+            o_all(r) = o_all(r) + 1
+          endif
+        enddo
+      else
+        allocate(d_all(1), o_all(1))
+      endif
+
+      allocate(d_loc(n_local), o_loc(n_local))
+      call MPI_Scatterv(d_all, counts, displs, MPI_INTEGER, d_loc, int(n_local), MPI_INTEGER, 0, comm, mpierr)
+      call MPI_Scatterv(o_all, counts, displs, MPI_INTEGER, o_loc, int(n_local), MPI_INTEGER, 0, comm, mpierr)
+      deallocate(d_all, o_all)
+
+      ! Clamp to the width actually available in each block; PETSc rejects larger values.
+      allocate(d_nnz(n_local), o_nnz(n_local))
+      do k = 1, n_local
+        d_nnz(k) = min(d_loc(k), int(n_local))
+        o_nnz(k) = min(o_loc(k), int(n_global - n_local))
+      enddo
+      deallocate(d_loc, o_loc, counts, displs)
+
+      call MatMPIAIJSetPreallocation(petsc_sys%A, 0, d_nnz, 0, o_nnz, ierr)
+      deallocate(d_nnz, o_nnz)
     endif
 
     call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
