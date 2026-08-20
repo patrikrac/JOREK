@@ -235,26 +235,18 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_RHS), intent(in) :: rhs_vec
 
-    integer :: i, my_id, mpierr, comm
     PetscInt :: i_start, i_end, n_local
-    PetscInt, allocatable :: indices_petsc(:)
+    PetscScalar, pointer :: b_arr(:)
     PetscErrorCode :: ierr
 
-    PetscCallA(PetscObjectGetComm(petsc_sys%b, comm, ierr))
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-
+    ! rhs_vec%val is the full global rhs on every rank, so the owned slice can be
+    ! written straight into the Vec's local array - no index list, no assembly pass.
     PetscCallA(VecGetOwnershipRange(petsc_sys%b, i_start, i_end, ierr))
     n_local = i_end - i_start
 
-    allocate(indices_petsc(n_local))
-    do i = 1, n_local
-      indices_petsc(i) = i_start + (i - 1)
-    end do
-
-    PetscCallA(VecSetValues(petsc_sys%b, n_local, indices_petsc, rhs_vec%val(i_start+1:i_end), INSERT_VALUES, ierr))
-    PetscCallA(VecAssemblyBegin(petsc_sys%b, ierr))
-    PetscCallA(VecAssemblyEnd(petsc_sys%b, ierr))
-    deallocate(indices_petsc)
+    PetscCallA(VecGetArray(petsc_sys%b, b_arr, ierr))
+    b_arr(1:n_local) = rhs_vec%val(i_start+1:i_end)
+    PetscCallA(VecRestoreArray(petsc_sys%b, b_arr, ierr))
 
   end subroutine petsc_update_rhs
 
@@ -270,9 +262,8 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_RHS), intent(in) :: sol_vec
 
-    integer :: i, my_id, mpierr, comm
     PetscInt :: i_start, i_end, n_local
-    PetscInt, allocatable :: indices_petsc(:)
+    PetscScalar, pointer :: x_arr(:)
     PetscErrorCode :: ierr
 
     if (.not. associated(sol_vec%val)) then
@@ -280,21 +271,13 @@ contains
       return
     endif
 
-    PetscCallA(PetscObjectGetComm(petsc_sys%x, comm, ierr))
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-
+    ! Same ownership slicing as petsc_update_rhs, written directly into the local array.
     PetscCallA(VecGetOwnershipRange(petsc_sys%x, i_start, i_end, ierr))
     n_local = i_end - i_start
 
-    allocate(indices_petsc(n_local))
-    do i = 1, n_local
-      indices_petsc(i) = i_start + (i - 1)
-    end do
-
-    PetscCallA(VecSetValues(petsc_sys%x, n_local, indices_petsc, sol_vec%val(i_start+1:i_end), INSERT_VALUES, ierr))
-    PetscCallA(VecAssemblyBegin(petsc_sys%x, ierr))
-    PetscCallA(VecAssemblyEnd(petsc_sys%x, ierr))
-    deallocate(indices_petsc)
+    PetscCallA(VecGetArray(petsc_sys%x, x_arr, ierr))
+    x_arr(1:n_local) = sol_vec%val(i_start+1:i_end)
+    PetscCallA(VecRestoreArray(petsc_sys%x, x_arr, ierr))
 
   end subroutine petsc_update_initial_guess
 
