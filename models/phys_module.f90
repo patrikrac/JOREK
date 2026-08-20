@@ -140,7 +140,8 @@ module phys_module
   logical :: use_strumpack        !< Use Strumpack solver
   logical :: use_mumps_eq         !< Use Mumps equilibrium solver
   logical :: use_pastix_eq        !< Use Pastix equilibrium solver
-  logical :: use_strumpack_eq     !< Use Strumpack equilibrium solver  
+  logical :: use_strumpack_eq     !< Use Strumpack equilibrium solver
+  logical :: use_petsc_eq         !< Use PETSc (MATAIJ + LU/MUMPS) equilibrium solver
   logical :: use_mumps_prj        !< Use Mumps projection solver
   logical :: use_pastix_prj       !< Use Pastix projection solver
   logical :: use_strumpack_prj    !< Use Strumpack projection solver  

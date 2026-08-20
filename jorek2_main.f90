@@ -439,7 +439,10 @@ mpi_required = 0
 
       ! --- Compute the plasma equilibrium
       if (equil) then
+        call clck_time_barrier(t0)
         call equilibrium(my_id,node_list,element_list,bnd_node_list,bnd_elm_list,xpoint,xcase, .true.)
+        call clck_time_barrier(t1); call clck_ldiff(t0,t1,tsecond)
+        if (my_id .eq. 0) write(*,FMT_TIMING) my_id, '# Time to equilibrium (R/Z grid):',tsecond
         if (export_for_nemec) then
           if(my_id ==0 ) call export_nemec(node_list, element_list, xpoint, xcase)
         endif
@@ -472,7 +475,10 @@ mpi_required = 0
       end if
       
       ! --- Compute the plasma equilibrium
+      call clck_time_barrier(t0)
       call equilibrium(my_id, node_list, element_list, bnd_node_list, bnd_elm_list, xpoint,xcase, .false.)
+      call clck_time_barrier(t1); call clck_ldiff(t0,t1,tsecond)
+      if (my_id .eq. 0) write(*,FMT_TIMING) my_id, '# Time to equilibrium (flux grid):',tsecond
 
     else
       if (my_id == 0 .and. export_polar_boundary) then

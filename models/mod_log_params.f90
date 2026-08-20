@@ -825,7 +825,8 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   write(*,LOGI_FMT) 'use_strumpack         ', use_strumpack  
   write(*,LOGI_FMT) 'use_mumps_eq          ', use_mumps_eq
   write(*,LOGI_FMT) 'use_pastix_eq         ', use_pastix_eq
-  write(*,LOGI_FMT) 'use_strumpack_eq      ', use_strumpack_eq  
+  write(*,LOGI_FMT) 'use_strumpack_eq      ', use_strumpack_eq
+  write(*,LOGI_FMT) 'use_petsc_eq          ', use_petsc_eq
   write(*,LOGI_FMT) 'use_mumps_prj         ', use_mumps_prj
   write(*,LOGI_FMT) 'use_pastix_prj        ', use_pastix_prj
   write(*,LOGI_FMT) 'use_strumpack_prj     ', use_strumpack_prj

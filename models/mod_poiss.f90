@@ -10,7 +10,7 @@ use tr_module
 use data_structure
 use phys_module, only: amix, amix_freeb, delta_psi_GS, newton_GS_freebnd, newton_GS_fixbnd, &
                        n_limiter, treat_axis, fix_axis_nodes, &
-                       use_mumps_eq, use_pastix_eq, use_strumpack_eq
+                       use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq
 use equil_info,  only: ES
 use vacuum_equilibrium, only: vacuum_equil
 use mpi_mod
@@ -29,6 +29,7 @@ use mod_pastix
 #endif
 use mod_sparse_data, only: type_SP_SOLVER, mumps, pastix, strumpack
 use mod_sparse, only: solve_sparse_system
+use mod_clock, only: clcktype, clck_time, clck_ldiff, FMT_TIMING
 
 implicit none
 
@@ -99,10 +100,13 @@ type(type_SP_MATRIX) :: a_mat
 type(type_RHS) :: rhs_vec, sol_vec
 type(type_SP_SOLVER) :: solver
 real*8 :: tmp
+type(clcktype) :: t_asm0, t_asm1, t_slv0, t_slv1
+real*8 :: t_asm_sec, t_slv_sec
 
 real*8 :: new_dofs(1:4,n_coord_tor), old_dofs(1:4)
 
 if (my_id == 0) then
+  if (itype .eq. -1) call clck_time(t_asm0)
   write(*,*) '**************************************'
   write(*,*) '*            Poisson                 *'
   write(*,*) '**************************************'
@@ -463,6 +467,13 @@ if (my_id == 0) then
 
 end if ! my_id == 0
 
+#ifdef USE_PETSC
+  if (use_petsc_eq .and. (itype .eq. -1)) then
+    call MPI_bcast(a_mat%ng, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
+    a_mat%comm = MPI_COMM_WORLD
+  endif
+#endif
+
 !----------------------- boundary conditions
 
 if (freeboundary_equil .and. (itype .eq. -1)) then
@@ -723,10 +734,18 @@ elseif (itype .ne. 0) then        ! apply fixed boundary conditions (not for var
   
 endif
 
-if (my_id == 0) then
+  if (itype .eq. -1 .and. my_id .eq. 0) then
+    call clck_time(t_asm1)
+    call clck_ldiff(t_asm0, t_asm1, t_asm_sec)
+    write(*,FMT_TIMING) my_id, '# Equilibrium assembly time:', t_asm_sec
+  endif
+
+  if (itype .eq. -1) call clck_time(t_slv0)
 
   solver%equilibrium = .true.
   solver%verbose = .false.
+  ! NOTE: when use_petsc_eq is set, solve_sparse_system intercepts the
+  ! equilibrium solve before this library selection is consulted.
   if (use_strumpack_eq) then
     solver%library = strumpack
   elseif (use_mumps_eq) then
@@ -735,8 +754,28 @@ if (my_id == 0) then
     solver%library = pastix
   endif
 
-  call solve_sparse_system(a_mat, rhs_vec, rhs_vec, solver)
-  call solver%finalize()
+#ifdef USE_PETSC
+  if (use_petsc_eq) then
+    ! Collective: all ranks participate in the distributed PETSc solve.
+    call solve_sparse_system(a_mat, rhs_vec, rhs_vec, solver)
+    call solver%finalize()
+  else
+#endif
+    if (my_id == 0) then
+      call solve_sparse_system(a_mat, rhs_vec, rhs_vec, solver)
+      call solver%finalize()
+    endif
+#ifdef USE_PETSC
+  endif
+#endif
+
+  if (itype .eq. -1 .and. my_id .eq. 0) then
+    call clck_time(t_slv1)
+    call clck_ldiff(t_slv0, t_slv1, t_slv_sec)
+    write(*,FMT_TIMING) my_id, '# Equilibrium solve time:', t_slv_sec
+  endif
+
+if (my_id == 0) then
 
   call tr_debug_write("a_mat%ng",int(a_mat%ng))
   call tr_debug_write("a_mat%nnz",int(a_mat%nnz))

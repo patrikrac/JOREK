@@ -75,7 +75,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 resistive_wall,                                     &
                 wall_resistivity, wall_resistivity_fact,            &
                 bc_natural_open,                                    &
-                use_mumps_eq, use_pastix_eq, use_strumpack_eq,      &
+                use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &
                 use_BLR_compression, epsilon_BLR, just_in_time_BLR, &

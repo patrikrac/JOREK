@@ -100,63 +100,77 @@ vertical_FB  = 0.d0
 i_elm_xpoint = 0 
 current_tot  = 0.
 
-if (my_id == 0) then
-
+#ifdef USE_PETSC
+if (use_petsc_eq) then
+  ! Collective fixed-boundary loop: all ranks participate so that the
+  ! PETSc solve inside poisson() can run distributed.  Rank-0 control
+  ! logic is preserved inside inner if (my_id == 0) guards; scalars
+  ! needed by poisson() are broadcast before the call; diff is broadcast
+  ! before the convergence test so all ranks exit together.
   do iter = 1, n_iter
-  
-  
-    call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
-    call print_equil_state(.true.)
 
-    if ((ES%ifail_axis .ne. 0) .and. (iter .le. 5)) then
-      call find_RZ(node_list,element_list,R_geo,Z_geo,R_out,Z_out,i_elm,s_out,t_out,ifail)
-      call interp(node_list,element_list,i_elm,1,1,s_out,t_out,psi_axis,P_s,P_t,P_st,P_ss,P_tt)
-      write(*,'(A,3f10.5)')  ' changed magnetic axis to :  ', R_out,Z_out,psi_axis
-      ES%R_axis     = R_out;    ES%Z_axis = Z_out;  ES%psi_axis   = psi_axis;   
-      ES%s_axis     = s_out;    ES%t_axis = t_out;  ES%i_elm_axis = i_elm;
-      ES%ifail_axis = ifail   
-    endif
-    
-    if (xpoint2) then
-      if (ES%ifail_xpoint == 0) then ! (otherwise, keep the values of the previous iteration as a reasonable guess)
-        ES%psi_bnd  = ES%psi_xpoint(1)
-        if( (xcase2 .eq. UPPER_XPOINT) .or. ((xcase2 .eq. DOUBLE_NULL) .and. (abs(ES%psi_xpoint(2)-ES%psi_axis) .lt. abs(ES%psi_xpoint(1)-ES%psi_axis))) ) then
-          ES%psi_bnd = ES%psi_xpoint(2)
+    if (my_id == 0) then
+
+      call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
+      call print_equil_state(.true.)
+
+      if ((ES%ifail_axis .ne. 0) .and. (iter .le. 5)) then
+        call find_RZ(node_list,element_list,R_geo,Z_geo,R_out,Z_out,i_elm,s_out,t_out,ifail)
+        call interp(node_list,element_list,i_elm,1,1,s_out,t_out,psi_axis,P_s,P_t,P_st,P_ss,P_tt)
+        write(*,'(A,3f10.5)')  ' changed magnetic axis to :  ', R_out,Z_out,psi_axis
+        ES%R_axis     = R_out;    ES%Z_axis = Z_out;  ES%psi_axis   = psi_axis;
+        ES%s_axis     = s_out;    ES%t_axis = t_out;  ES%i_elm_axis = i_elm;
+        ES%ifail_axis = ifail
+      endif
+
+      if (xpoint2) then
+        if (ES%ifail_xpoint == 0) then ! (otherwise, keep the values of the previous iteration as a reasonable guess)
+          ES%psi_bnd  = ES%psi_xpoint(1)
+          if( (xcase2 .eq. UPPER_XPOINT) .or. ((xcase2 .eq. DOUBLE_NULL) .and. (abs(ES%psi_xpoint(2)-ES%psi_axis) .lt. abs(ES%psi_xpoint(1)-ES%psi_axis))) ) then
+            ES%psi_bnd = ES%psi_xpoint(2)
+          endif
+          psi_bnd     = ES%psi_bnd
+          R_xpoint(1) = ES%R_xpoint(1)
+          Z_xpoint(1) = ES%Z_xpoint(1)
+          R_xpoint(2) = ES%R_xpoint(2)
+          Z_xpoint(2) = ES%Z_xpoint(2)
+          if(xcase2 .eq. LOWER_XPOINT) ES%Z_xpoint(2) = +99.d0
+          if(xcase2 .eq. UPPER_XPOINT) ES%Z_xpoint(1) = -99.d0
+        else
+          ES%R_xpoint = R_xpoint
+          ES%Z_xpoint = Z_xpoint
+          ES%psi_bnd  = psi_bnd
+          if (freeboundary_equil) then
+            ES%Z_xpoint(1) = -99.d0
+            ES%Z_xpoint(2) = +99.d0
+          endif
         endif
-        psi_bnd     = ES%psi_bnd
-        R_xpoint(1) = ES%R_xpoint(1)
-        Z_xpoint(1) = ES%Z_xpoint(1)
-        R_xpoint(2) = ES%R_xpoint(2)
-        Z_xpoint(2) = ES%Z_xpoint(2)
-        if(xcase2 .eq. LOWER_XPOINT) ES%Z_xpoint(2) = +99.d0
-        if(xcase2 .eq. UPPER_XPOINT) ES%Z_xpoint(1) = -99.d0
       else
-        ES%R_xpoint = R_xpoint
-        ES%Z_xpoint = Z_xpoint
-        ES%psi_bnd  = psi_bnd
-        if (freeboundary_equil) then
-          ES%Z_xpoint(1) = -99.d0
-          ES%Z_xpoint(2) = +99.d0
+        ES%psi_bnd = ES%psi_lim
+      endif
+
+      if (.not. xpoint) then
+        if ( (ES%Z_lim .gt. ES%Z_xpoint(1)) .and. (ES%Z_lim .lt. ES%Z_xpoint(2)) ) then
+          if (n_limiter /= 0) then   ! else n_limiter = 0 and psi_bnd is set to 0
+            ES%psi_bnd = ES%psi_lim
+            write(*,'(A,3f8.3)') ' LIMITER PLASMA ',ES%psi_lim,ES%R_lim,ES%Z_lim
+          endif
         endif
       endif
-    else
-      ES%psi_bnd = ES%psi_lim
-    endif
 
-    if (.not. xpoint) then
-      if ( (ES%Z_lim .gt. ES%Z_xpoint(1)) .and. (ES%Z_lim .lt. ES%Z_xpoint(2)) ) then
-        if (n_limiter /= 0) then   ! else n_limiter = 0 and psi_bnd is set to 0
-          ES%psi_bnd = ES%psi_lim
-          write(*,'(A,3f8.3)') ' LIMITER PLASMA ',ES%psi_lim,ES%R_lim,ES%Z_lim
-        endif
-      endif
-    endif
-  
-    if(xcase2 .eq. LOWER_XPOINT) write(*,'(A,3es14.6,i3)') ' PSI_AXIS, PSI_BND  : ',ES%psi_axis,ES%psi_bnd,ES%Z_xpoint(1),ES%ifail_xpoint
-    if(xcase2 .eq. UPPER_XPOINT) write(*,'(A,3es14.6,i3)') ' PSI_AXIS, PSI_BND  : ',ES%psi_axis,ES%psi_bnd,ES%Z_xpoint(2),ES%ifail_xpoint
+      if(xcase2 .eq. LOWER_XPOINT) write(*,'(A,3es14.6,i3)') ' PSI_AXIS, PSI_BND  : ',ES%psi_axis,ES%psi_bnd,ES%Z_xpoint(1),ES%ifail_xpoint
+      if(xcase2 .eq. UPPER_XPOINT) write(*,'(A,3es14.6,i3)') ' PSI_AXIS, PSI_BND  : ',ES%psi_axis,ES%psi_bnd,ES%Z_xpoint(2),ES%ifail_xpoint
 
-    write(*,'(A,1f14.8)')                       ' PSI_BND - PSI_AXIS : ', ES%psi_bnd-ES%psi_axis 
+      write(*,'(A,1f14.8)')                       ' PSI_BND - PSI_AXIS : ', ES%psi_bnd-ES%psi_axis
 
+    end if ! my_id == 0
+
+    ! Broadcast scalars that poisson() reads on all ranks for the GS solve.
+    call MPI_bcast(ES%psi_axis, 1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+    call MPI_bcast(ES%psi_bnd,  1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+    call MPI_bcast(ES%Z_xpoint, 2, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+
+    ! Collective: all ranks call poisson so PETSc solve runs distributed.
     call poisson(my_id,-1,node_list,element_list,bnd_node_list,bnd_elm_list,3,1,1, &
                  ES%psi_axis,ES%psi_bnd,xpoint2,xcase2,ES%Z_xpoint,freeboundary_equil,refinement,iter)   !----------- for GS use -1
 
@@ -169,31 +183,135 @@ if (my_id == 0) then
       end if
     end if
 
-    diff = 0.d0
-    do i=1, node_list%n_nodes
-      diff = diff + abs(node_list%node(i)%deltas(1,1,1))
-    enddo  
-    diff = diff / float(node_list%n_nodes)
+    if (my_id == 0) then
+      diff = 0.d0
+      do i=1, node_list%n_nodes
+        diff = diff + abs(node_list%node(i)%deltas(1,1,1))
+      enddo
+      diff = diff / float(node_list%n_nodes)
 
-    ! Error handling, really is no point continuing if diff is NaN
-    if (ISNAN(diff)) then
-      write(*,*)'Equilibrium diff is NaN - stop here'
-      stop
-    end if
+      ! Error handling, really is no point continuing if diff is NaN
+      if (ISNAN(diff)) then
+        write(*,*)'Equilibrium diff is NaN - stop here'
+        stop
+      end if
 
-    write(*,'(A,I4,A,ES10.3)') ' Iteration ', iter, ': diff=', diff
-    
+      write(*,'(A,I4,A,ES10.3)') ' Iteration ', iter, ': diff=', diff
+    end if ! my_id == 0
+
+    call MPI_bcast(diff, 1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+
     if ( (iter > 1) .and. (diff < equil_accuracy) ) then
-      write(*,'(A,I4,A)') ' Fixed boundary equilibrium converged: after', iter, ' iterations'
+      if (my_id == 0) write(*,'(A,I4,A)') ' Fixed boundary equilibrium converged: after', iter, ' iterations'
       exit
     else if ( iter == n_iter) then
-      write(*,'(A,ES10.3)') ' WARNING: Fixed boundary equilibrium not fully converged: diff=', diff
+      if (my_id == 0) write(*,'(A,ES10.3)') ' WARNING: Fixed boundary equilibrium not fully converged: diff=', diff
       exit
     end if
-  
+
   enddo
 
-end if ! my_id == 0
+else ! .not. use_petsc_eq — serial path, unchanged
+#endif
+
+  if (my_id == 0) then
+
+    do iter = 1, n_iter
+
+
+      call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
+      call print_equil_state(.true.)
+
+      if ((ES%ifail_axis .ne. 0) .and. (iter .le. 5)) then
+        call find_RZ(node_list,element_list,R_geo,Z_geo,R_out,Z_out,i_elm,s_out,t_out,ifail)
+        call interp(node_list,element_list,i_elm,1,1,s_out,t_out,psi_axis,P_s,P_t,P_st,P_ss,P_tt)
+        write(*,'(A,3f10.5)')  ' changed magnetic axis to :  ', R_out,Z_out,psi_axis
+        ES%R_axis     = R_out;    ES%Z_axis = Z_out;  ES%psi_axis   = psi_axis;
+        ES%s_axis     = s_out;    ES%t_axis = t_out;  ES%i_elm_axis = i_elm;
+        ES%ifail_axis = ifail
+      endif
+
+      if (xpoint2) then
+        if (ES%ifail_xpoint == 0) then ! (otherwise, keep the values of the previous iteration as a reasonable guess)
+          ES%psi_bnd  = ES%psi_xpoint(1)
+          if( (xcase2 .eq. UPPER_XPOINT) .or. ((xcase2 .eq. DOUBLE_NULL) .and. (abs(ES%psi_xpoint(2)-ES%psi_axis) .lt. abs(ES%psi_xpoint(1)-ES%psi_axis))) ) then
+            ES%psi_bnd = ES%psi_xpoint(2)
+          endif
+          psi_bnd     = ES%psi_bnd
+          R_xpoint(1) = ES%R_xpoint(1)
+          Z_xpoint(1) = ES%Z_xpoint(1)
+          R_xpoint(2) = ES%R_xpoint(2)
+          Z_xpoint(2) = ES%Z_xpoint(2)
+          if(xcase2 .eq. LOWER_XPOINT) ES%Z_xpoint(2) = +99.d0
+          if(xcase2 .eq. UPPER_XPOINT) ES%Z_xpoint(1) = -99.d0
+        else
+          ES%R_xpoint = R_xpoint
+          ES%Z_xpoint = Z_xpoint
+          ES%psi_bnd  = psi_bnd
+          if (freeboundary_equil) then
+            ES%Z_xpoint(1) = -99.d0
+            ES%Z_xpoint(2) = +99.d0
+          endif
+        endif
+      else
+        ES%psi_bnd = ES%psi_lim
+      endif
+
+      if (.not. xpoint) then
+        if ( (ES%Z_lim .gt. ES%Z_xpoint(1)) .and. (ES%Z_lim .lt. ES%Z_xpoint(2)) ) then
+          if (n_limiter /= 0) then   ! else n_limiter = 0 and psi_bnd is set to 0
+            ES%psi_bnd = ES%psi_lim
+            write(*,'(A,3f8.3)') ' LIMITER PLASMA ',ES%psi_lim,ES%R_lim,ES%Z_lim
+          endif
+        endif
+      endif
+
+      if(xcase2 .eq. LOWER_XPOINT) write(*,'(A,3es14.6,i3)') ' PSI_AXIS, PSI_BND  : ',ES%psi_axis,ES%psi_bnd,ES%Z_xpoint(1),ES%ifail_xpoint
+      if(xcase2 .eq. UPPER_XPOINT) write(*,'(A,3es14.6,i3)') ' PSI_AXIS, PSI_BND  : ',ES%psi_axis,ES%psi_bnd,ES%Z_xpoint(2),ES%ifail_xpoint
+
+      write(*,'(A,1f14.8)')                       ' PSI_BND - PSI_AXIS : ', ES%psi_bnd-ES%psi_axis
+
+      call poisson(my_id,-1,node_list,element_list,bnd_node_list,bnd_elm_list,3,1,1, &
+                   ES%psi_axis,ES%psi_bnd,xpoint2,xcase2,ES%Z_xpoint,freeboundary_equil,refinement,iter)   !----------- for GS use -1
+
+      if ( (my_id == 0) .and. forceSDN .and. iter .gt. 2) then
+        if (abs(ES%psi_xpoint(1)-ES%psi_xpoint(2)) .ge. SDN_threshold) then
+          ! --- Project psi to enforce up/down symmetry
+          call Poisson(0,0,node_list,element_list,bnd_node_list,bnd_elm_list, var_psi,var_psi,1, &
+                       0.0,1.0,.true.,xcase,ES%Z_xpoint,.false.,.false.,1)
+          call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
+        end if
+      end if
+
+      diff = 0.d0
+      do i=1, node_list%n_nodes
+        diff = diff + abs(node_list%node(i)%deltas(1,1,1))
+      enddo
+      diff = diff / float(node_list%n_nodes)
+
+      ! Error handling, really is no point continuing if diff is NaN
+      if (ISNAN(diff)) then
+        write(*,*)'Equilibrium diff is NaN - stop here'
+        stop
+      end if
+
+      write(*,'(A,I4,A,ES10.3)') ' Iteration ', iter, ': diff=', diff
+
+      if ( (iter > 1) .and. (diff < equil_accuracy) ) then
+        write(*,'(A,I4,A)') ' Fixed boundary equilibrium converged: after', iter, ' iterations'
+        exit
+      else if ( iter == n_iter) then
+        write(*,'(A,ES10.3)') ' WARNING: Fixed boundary equilibrium not fully converged: diff=', diff
+        exit
+      end if
+
+    enddo
+
+  end if ! my_id == 0
+
+#ifdef USE_PETSC
+endif ! use_petsc_eq
+#endif
 
 !--------------------------------------- freeboundary equilibrium
 freeboundary_equil = freeboundary_equil2
