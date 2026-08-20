@@ -408,6 +408,9 @@ contains
       call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+      ! Force the sub-KSP factorizations here so they are timed as setup, not solve
+      ! (no-op for the toroidal PC, which sets its sub-KSPs up explicitly).
+      PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
 
       PetscCallA(PetscTime(ts2, ierr))
@@ -423,6 +426,10 @@ contains
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+      ! KSPSetUp only rebuilds PCFIELDSPLIT itself; the sub-KSP LU/MUMPS numerical
+      ! factorizations are otherwise deferred to KSPSetUpOnBlocks inside KSPSolve, which
+      ! would charge the whole factorization cost to the GMRES solve timer below.
+      PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
 
       PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
