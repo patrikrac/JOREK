@@ -16,7 +16,15 @@ module mod_petsc_direct_solver
   use petsc
   implicit none
   private
-  public :: petsc_configure_direct_solver
+  public :: petsc_configure_direct_solver, petsc_solver_option
+
+  !> Suffix PCTELESCOPE appends to its own options prefix for the PC it wraps
+  !! (src/ksp/pc/impls/telescope/telescope.c, KSPAppendOptionsPrefix).
+  character(len=*), parameter :: TELESCOPE_SUFFIX = 'telescope_'
+
+  !> How many nested telescopes to walk through. Bounded so that a malformed
+  !! options file cannot drive the walk indefinitely.
+  integer, parameter :: MAX_TELESCOPE_DEPTH = 4
 
 contains
 
@@ -29,28 +37,41 @@ contains
   subroutine petsc_configure_direct_solver(pc)
     PC, intent(inout) :: pc
 
-    PCType         :: ptype
-    MatSolverType  :: stype
-    PetscErrorCode :: ierr
+    PCType             :: ptype
+    MatSolverType      :: stype
+    character(len=256) :: prefix
+    PetscErrorCode     :: ierr
 
     ! --- JOREK defaults, overridable below
     PetscCallA(PCSetType(pc, PCLU, ierr))
     PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
     PetscCallA(PCSetFromOptions(pc, ierr))
 
+    PetscCallA(PCGetType(pc, ptype, ierr))
+    PetscCallA(PCGetOptionsPrefix(pc, prefix, ierr))
+
+    ! PCTELESCOPE is not itself a factorization: it reduces the operator onto a
+    ! sub-communicator and wraps a second PC, and that inner PC is the one doing
+    ! the factorizing. Handing it off rather than returning here is what keeps
+    ! JOREK's package tuning (notably the MUMPS ICNTLs) from being silently
+    ! dropped the moment somebody selects telescope.
+    if (ptype == PCTELESCOPE) then
+      call configure_wrapped_solver(trim(prefix)//TELESCOPE_SUFFIX)
+      return
+    endif
+
     ! Everything below is specific to a factorization preconditioner. The user is
     ! free to select something else entirely (-..._pc_type hypre, jacobi, ...), in
     ! which case there is no factor matrix to configure.
-    PetscCallA(PCGetType(pc, ptype, ierr))
     if (ptype /= PCLU .and. ptype /= PCCHOLESKY .and. ptype /= PCILU) return
 
     PetscCallA(PCFactorGetMatSolverType(pc, stype, ierr))
 
     select case (trim(stype))
       case ('mumps')
-        call tune_mumps(pc)
+        call tune_mumps(trim(prefix))
       case ('strumpack')
-        call tune_strumpack(pc)
+        call tune_strumpack(trim(prefix))
       case ('petsc')
         call tune_petsc_builtin(pc)
       case default
@@ -64,6 +85,57 @@ contains
   end subroutine petsc_configure_direct_solver
 
 
+  !> Apply JOREK's defaults and package tuning to a PC that is addressed only by
+  !! its options prefix, because no object exists to configure.
+  !!
+  !! PCSetUp_Telescope creates the KSP it wraps lazily and only on the ranks it
+  !! reduced onto, during the KSPSetUp that happens after this module has had its
+  !! say. There is therefore nothing to call PCSetType or PCFactorSetMatSolverType
+  !! on. Everything instead goes into the options database, which is exactly where
+  !! that inner KSP reads from once it is built -- the same mechanism tune_mumps
+  !! already relies on, applied one level deeper.
+  !!
+  !! Seeding LU via MUMPS here means selecting telescope alone reproduces the
+  !! solver JOREK would have used without it, rather than falling back to PETSc's
+  !! own default PC for a reduced communicator.
+  subroutine configure_wrapped_solver(prefix)
+    character(len=*), intent(in) :: prefix
+
+    character(len=256) :: pfx
+    character(len=128) :: ptype, stype
+    integer            :: depth
+
+    pfx = prefix
+    ! Telescopes can be nested; walk down to the PC that actually factorizes.
+    do depth = 1, MAX_TELESCOPE_DEPTH
+      call set_default_opt(trim(pfx), 'pc_type', PCLU)
+      call petsc_solver_option(trim(pfx), 'pc_type', ptype)
+      if (trim(ptype) /= PCTELESCOPE) exit
+      pfx = trim(pfx)//TELESCOPE_SUFFIX
+    enddo
+
+    if (trim(ptype) /= PCLU .and. trim(ptype) /= PCCHOLESKY .and. trim(ptype) /= PCILU) return
+
+    call set_default_opt(trim(pfx), 'pc_factor_mat_solver_type', MATSOLVERMUMPS)
+    call petsc_solver_option(trim(pfx), 'pc_factor_mat_solver_type', stype)
+
+    select case (trim(stype))
+      case ('mumps')
+        call tune_mumps(trim(pfx))
+      case ('strumpack')
+        call tune_strumpack(trim(pfx))
+      case ('petsc')
+        ! PCFactorSetMatOrderingType has no object to act on here. Seeding the
+        ! option works in this direction and not in the direct one, because the
+        ! wrapped PC has not run PCSetFromOptions yet whereas `pc` already has.
+        call set_default_opt(trim(pfx), 'pc_factor_mat_ordering_type', MATORDERINGND)
+      case default
+        ! superlu_dist, cudss, ... : PETSc defaults, tunable through
+        ! -<prefix>mat_superlu_dist_* / -<prefix>mat_cudss_* etc.
+    end select
+  end subroutine configure_wrapped_solver
+
+
   !> MUMPS controls JOREK has been tuned for.
   !!
   !! These are seeded into the options database rather than applied with
@@ -72,12 +144,12 @@ contains
   !! its own defaults, which silently reverted ICNTL(14) from 50 to 20. Going
   !! through the options database puts JOREK's values in the same place PETSc
   !! reads from, and set_default_opt leaves any value the user supplied alone.
-  subroutine tune_mumps(pc)
-    PC, intent(in) :: pc
-    call set_default_opt(pc, 'mat_mumps_icntl_7',  '7')    ! fill-reducing ordering (METIS)
-    call set_default_opt(pc, 'mat_mumps_icntl_14', '50')   ! workspace expansion %
-    call set_default_opt(pc, 'mat_mumps_icntl_8',  '77')   ! numerical scaling (auto)
-    call set_default_opt(pc, 'mat_mumps_icntl_22', '0')    ! 0 = in-core factorization
+  subroutine tune_mumps(prefix)
+    character(len=*), intent(in) :: prefix
+    call set_default_opt(prefix, 'mat_mumps_icntl_7',  '7')    ! fill-reducing ordering (METIS)
+    call set_default_opt(prefix, 'mat_mumps_icntl_14', '50')   ! workspace expansion %
+    call set_default_opt(prefix, 'mat_mumps_icntl_8',  '77')   ! numerical scaling (auto)
+    call set_default_opt(prefix, 'mat_mumps_icntl_22', '0')    ! 0 = in-core factorization
   end subroutine tune_mumps
 
 
@@ -85,31 +157,44 @@ contains
   !! Compression is deliberately left at the PETSc default so STRUMPACK stays an
   !! exact factorization rather than an inexact preconditioner; enable it with
   !! -<prefix>mat_strumpack_compression if that is what you want.
-  subroutine tune_strumpack(pc)
-    PC, intent(in) :: pc
-    call set_default_opt(pc, 'mat_strumpack_reordering', 'METIS')
+  subroutine tune_strumpack(prefix)
+    character(len=*), intent(in) :: prefix
+    call set_default_opt(prefix, 'mat_strumpack_reordering', 'METIS')
   end subroutine tune_strumpack
 
 
-  !> Seed one option for `pc` unless the user already supplied it, so that
+  !> Seed one option for `prefix` unless the user already supplied it, so that
   !! JOREK's defaults never override what came from jorek.petsc.
   !!
   !! Going through the options database rather than the package-specific setters
   !! also means this module references no symbol from MUMPS, STRUMPACK or cuDSS,
   !! so it links against any PETSc build regardless of which packages are in it.
-  subroutine set_default_opt(pc, name, val)
-    PC,               intent(in) :: pc
-    character(len=*), intent(in) :: name, val
+  subroutine set_default_opt(prefix, name, val)
+    character(len=*), intent(in) :: prefix, name, val
 
-    character(len=256) :: prefix
-    PetscBool          :: is_set
-    PetscErrorCode     :: ierr
+    PetscBool      :: is_set
+    PetscErrorCode :: ierr
 
-    PetscCallA(PCGetOptionsPrefix(pc, prefix, ierr))
-    PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, trim(prefix), '-'//name, is_set, ierr))
+    PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, prefix, '-'//name, is_set, ierr))
     if (is_set) return
-    PetscCallA(PetscOptionsSetValue(PETSC_NULL_OPTIONS, '-'//trim(prefix)//name, val, ierr))
+    PetscCallA(PetscOptionsSetValue(PETSC_NULL_OPTIONS, '-'//prefix//name, val, ierr))
   end subroutine set_default_opt
+
+
+  !> Read one option for `prefix` back out of the options database, blank if unset.
+  !! Public so that callers can report the solver a telescoped block resolved to,
+  !! which cannot be queried from a PC that has not been created yet.
+  subroutine petsc_solver_option(prefix, name, val)
+    character(len=*), intent(in)  :: prefix, name
+    character(len=*), intent(out) :: val
+
+    PetscBool      :: is_set
+    PetscErrorCode :: ierr
+
+    val = ''
+    PetscCallA(PetscOptionsGetString(PETSC_NULL_OPTIONS, prefix, '-'//name, val, is_set, ierr))
+    if (.not. is_set) val = ''
+  end subroutine petsc_solver_option
 
 
   !> PETSc's own built-in factorization. Unlike the external packages, this one

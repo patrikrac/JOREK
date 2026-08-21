@@ -1,7 +1,7 @@
 module mod_petsc_pc_toroidal
 #ifdef USE_PETSC
   use mpi_mod
-  use mod_petsc_direct_solver, only: petsc_configure_direct_solver
+  use mod_petsc_direct_solver, only: petsc_configure_direct_solver, petsc_solver_option
   use mod_petsc_dump,          only: petsc_dump_operator
 #include "petsc/finclude/petsc.h"
   use petsc
@@ -108,12 +108,13 @@ contains
   subroutine report_block_solver(subksp)
     KSP, intent(in) :: subksp
 
-    PC             :: subpc
-    PCType         :: ptype
-    KSPType        :: ktype
-    MatSolverType  :: stype
-    integer        :: comm, my_id, mpierr
-    PetscErrorCode :: ierr
+    PC                 :: subpc
+    PCType             :: ptype
+    KSPType            :: ktype
+    MatSolverType      :: stype
+    character(len=256) :: inner_ptype, inner_stype, inner_desc
+    integer            :: comm, my_id, mpierr
+    PetscErrorCode     :: ierr
 
     PetscCallA(PetscObjectGetComm(subksp, comm, ierr))
     call MPI_COMM_RANK(comm, my_id, mpierr)
@@ -122,7 +123,17 @@ contains
     PetscCallA(KSPGetType(subksp, ktype, ierr))
     PetscCallA(KSPGetPC(subksp, subpc, ierr))
     PetscCallA(PCGetType(subpc, ptype, ierr))
-    if (ptype == PCLU .or. ptype == PCCHOLESKY .or. ptype == PCILU) then
+    if (ptype == PCTELESCOPE) then
+      ! The PC a telescope wraps is created lazily inside PCSetUp_Telescope, and
+      ! only on the ranks it reduced onto, so report what the options database
+      ! resolved to rather than querying an object that need not exist here.
+      call petsc_solver_option(PC_BLOCK_PREFIX//'telescope_', 'pc_type', inner_ptype)
+      call petsc_solver_option(PC_BLOCK_PREFIX//'telescope_', 'pc_factor_mat_solver_type', inner_stype)
+      inner_desc = inner_ptype
+      if (len_trim(inner_stype) > 0) inner_desc = trim(inner_ptype)//' via '//trim(inner_stype)
+      write(*,*) '[PETSc] PC blocks (-'//PC_BLOCK_PREFIX//'...): ' &
+                 //trim(ktype)//' + '//trim(ptype)//' -> '//trim(inner_desc)
+    elseif (ptype == PCLU .or. ptype == PCCHOLESKY .or. ptype == PCILU) then
       PetscCallA(PCFactorGetMatSolverType(subpc, stype, ierr))
       write(*,*) '[PETSc] PC blocks (-'//PC_BLOCK_PREFIX//'...): ' &
                  //trim(ktype)//' + '//trim(ptype)//' via '//trim(stype)

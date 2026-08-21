@@ -34,10 +34,11 @@
 # -jorek_pcblock_pc_factor_mat_solver_type mumps          # default
 # -jorek_pcblock_pc_factor_mat_solver_type superlu_dist
 # -jorek_pcblock_pc_factor_mat_solver_type strumpack
-# -jorek_pcblock_pc_factor_mat_solver_type cudss          # GPU
 #
 # Note: PETSc's built-in LU ('petsc') is NOT usable here - the blocks are MPIAIJ
-# and it only factorizes SEQAIJ. PETSc says so clearly if you try.
+# and it only factorizes SEQAIJ. PETSc says so clearly if you try. The same
+# applies to cuDSS, which is why it needs the telescope recipe further down
+# rather than appearing in the list above.
 #
 # MUMPS controls. JOREK's defaults are ICNTL(7)=7 (METIS ordering),
 # ICNTL(14)=50 (workspace %), ICNTL(8)=77 (auto scaling), ICNTL(22)=0 (in-core).
@@ -53,6 +54,26 @@
 # iterative block solve instead of a direct one:
 # -jorek_pcblock_ksp_type richardson
 # -jorek_pcblock_pc_type  hypre
+
+# --- Sequential block solvers, via PCTELESCOPE ------------------------------
+# A sequential package (cuDSS, or PETSc's built-in LU) cannot factorize an
+# MPIAIJ block directly. PCTELESCOPE reduces the block onto a smaller
+# communicator first; with a reduction factor equal to the number of ranks that
+# communicator has size 1, and PETSc then resolves the block to SEQAIJ, which
+# those packages do accept.
+#
+# -jorek_pcblock_pc_type                        telescope
+# -jorek_pcblock_pc_telescope_reduction_factor  4          # = number of MPI ranks
+# -jorek_pcblock_telescope_pc_factor_mat_solver_type cudss
+#
+# Everything the block solver understands moves under the extra 'telescope_'
+# prefix, JOREK's own defaults included: selecting telescope and nothing else
+# still gives LU via MUMPS with JOREK's ICNTLs, and an override is written
+# -jorek_pcblock_telescope_mat_mumps_icntl_14 20
+#
+# Caveat when comparing against MUMPS: MUMPS factorizes the block across all
+# ranks, whereas a telescoped block is factorized on one. Telescope both, or
+# compare on a single rank, or the numbers are not measuring the same thing.
 
 # --- One-shot direct solve path ---------------------------------------------
 # -jorek_direct_pc_factor_mat_solver_type mumps           # default
