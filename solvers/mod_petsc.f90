@@ -3,6 +3,7 @@ module mod_petsc
   use mpi_mod
   use mod_petsc_pc
   use mod_petsc_direct_solver, only: petsc_configure_direct_solver
+  use mod_petsc_dump,          only: petsc_dump_operator
 #include "petsc/finclude/petsc.h"
   use petsc
 #ifdef USE_SLEPC
@@ -407,6 +408,8 @@ contains
 
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      ! Opt-in, inert unless -jorek_dump_mat is set.
+      call petsc_dump_operator(petsc_sys%A_aij, 'system')
 
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
       PetscCallA(KSPSetOptionsPrefix(petsc_sys%ksp, PETSC_MAIN_PREFIX, ierr))

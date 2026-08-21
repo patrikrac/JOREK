@@ -2,6 +2,7 @@ module mod_petsc_pc_toroidal
 #ifdef USE_PETSC
   use mpi_mod
   use mod_petsc_direct_solver, only: petsc_configure_direct_solver
+  use mod_petsc_dump,          only: petsc_dump_operator
 #include "petsc/finclude/petsc.h"
   use petsc
   implicit none
@@ -25,6 +26,8 @@ contains
     Mat, intent(in)    :: A
 
     integer :: i, j, k, n_split, split_size, field_size, n_modes_in_fam, idx
+    Mat :: block_A
+    character(len=32) :: dump_tag
     PetscInt :: block_size
     PetscCount :: field_count
     PetscInt, allocatable :: fields(:)
@@ -89,6 +92,11 @@ contains
       PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
       call petsc_configure_direct_solver(subpc)
       PetscCallA(KSPSetUp(subksp_array(i), ierr))
+      ! Opt-in, inert unless -jorek_dump_mat is set: write this block out so it
+      ! can be replayed offline against other factorization packages.
+      PetscCallA(KSPGetOperators(subksp_array(i), block_A, PETSC_NULL_MAT, ierr))
+      write(dump_tag,'(A,I0)') 'pcblock', i
+      call petsc_dump_operator(block_A, trim(dump_tag))
     enddo
     call report_block_solver(subksp_array(1))
     PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
