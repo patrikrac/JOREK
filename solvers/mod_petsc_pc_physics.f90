@@ -3,7 +3,9 @@ module mod_petsc_pc_physics
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx
+  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
+       physics_pc_log_events_register, physics_pc_mixed_arm, &
+       pcev_extract, pcev_build_suu, pcev_fact_pj, pcev_fact_w, pcev_fact_rhot
   use mod_petsc_pc_physics_construction, only: &
        create_variable_index_sets, extract_sub_block, &
        compute_schur_corrected_block_psi, &
@@ -143,6 +145,9 @@ contains
 
     first_time = .not. g_ctx%reduced_ready
 
+    ! Idempotent; the events must exist before the first push below.
+    call physics_pc_log_events_register()
+
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] Building reduced 4x4 system (extracted blocks)..."
 
@@ -164,6 +169,7 @@ contains
     endif
 
     ! --- Extract sub-blocks from full system ---
+    call PetscLogEventBegin(pcev_extract, ierr)
     ! Diagonal blocks of the constraint equations
     call extract_sub_block(A_full, var_zj, var_zj, g_ctx%B_33, first_time)
     call extract_sub_block(A_full, var_w,  var_w,  g_ctx%B_44, first_time)
@@ -194,6 +200,7 @@ contains
     call extract_sub_block(A_full, var_rho, var_u,   g_ctx%B_52, first_time)
     call extract_sub_block(A_full, var_T,   var_psi, g_ctx%B_61, first_time)
     call extract_sub_block(A_full, var_T,   var_u,   g_ctx%B_62, first_time)
+    call PetscLogEventEnd(pcev_extract, ierr)
 
 
     if (my_id == 0) write(*,'(A)') "[Physics PC]   Sub-blocks extracted (21 blocks)"
@@ -291,17 +298,27 @@ contains
     g_ctx%ksp_elliptic_created = .true.
 
     ! --- Step 4b: Form Schur-corrected blocks (element-assembled corrections) ---
-    call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%Atilde_11, first_time)
-    !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%Atilde_11, first_time)
-    call compute_schur_corrected_block_u(g_ctx%B_22, g_ctx%Atilde_22, first_time)
-    !call compute_schur_corrected_block_exact( g_ctx%B_44, g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, g_ctx%Atilde_22, first_time)
+    ! Gated on the SAME predicate as the element assembly that produces the
+    ! K_*_correction operands (mod_petsc_pc_physics_element). The two gates must
+    ! stay in lockstep: running these against an unassembled correction would
+    ! build Atilde from garbage.
+    if (.not. physics_pc_mixed_arm()) then
+      call compute_schur_corrected_block_psi(g_ctx%B_11, g_ctx%Atilde_11, first_time)
+      !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%Atilde_11, first_time)
+      call compute_schur_corrected_block_u(g_ctx%B_22, g_ctx%Atilde_22, first_time)
+      !call compute_schur_corrected_block_exact( g_ctx%B_44, g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, g_ctx%Atilde_22, first_time)
 
-    ! Off-diagonal Schur corrections from element-assembled K_21 / K_61
-    call compute_schur_corrected_block_21(g_ctx%B_21, g_ctx%Atilde_21, first_time)
-    !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, g_ctx%Atilde_21, first_time)
-    call compute_schur_corrected_block_61(g_ctx%B_61, g_ctx%Atilde_61, first_time)
-    !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, g_ctx%Atilde_61, first_time)
-    if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
+      ! Off-diagonal Schur corrections from element-assembled K_21 / K_61
+      call compute_schur_corrected_block_21(g_ctx%B_21, g_ctx%Atilde_21, first_time)
+      !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_21, g_ctx%B_23, g_ctx%B_31, g_ctx%Atilde_21, first_time)
+      call compute_schur_corrected_block_61(g_ctx%B_61, g_ctx%Atilde_61, first_time)
+      !call compute_schur_corrected_block_exact(g_ctx%B_33, g_ctx%B_61, g_ctx%B_63, g_ctx%B_31, g_ctx%Atilde_61, first_time)
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   Computed Schur-corrected blocks"
+    else
+      if (my_id == 0 .and. first_time) write(*,'(A)') &
+        "[Physics PC]   Mixed-pair arm: element-assembled Schur corrections and "// &
+        "Atilde_* blocks SKIPPED (unused by this arm)"
+    endif
 
     if (debug_physics_pc) then
       call MatNorm(g_ctx%Atilde_11, NORM_FROBENIUS, norm_val, ierr)
@@ -396,9 +413,19 @@ contains
       ! Guarded on multi_step so the monolithic path is unchanged (it uses only
       ! ksp_reduced; setting these up there would add three unused factorizations).
       if (physics_pc_multi_step) then
-        call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time, "psi predictor KSP (Atilde_11)")
+        ! ksp_psi is the magnetic predictor of the SUBSTITUTED sweeps. The
+        ! mixed-pair sweep gets psi out of pair_psi instead and never calls it,
+        ! so factoring Atilde_11 there is a whole MUMPS LU per Newton step whose
+        ! result is discarded. (Atilde_11 does not even exist on that arm now --
+        ! see the gate above.) ksp_rho / ksp_T are NOT skipped: the mixed sweep
+        ! uses both, twice each per apply.
+        call PetscLogEventBegin(pcev_fact_rhot, ierr)
+        if (.not. physics_pc_mixed_arm()) then
+          call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time, "psi predictor KSP (Atilde_11)")
+        endif
         call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time, "rho-block KSP")
         call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time, "T-block KSP")
+        call PetscLogEventEnd(pcev_fact_rhot, ierr)
         g_ctx%ksp_created = .true.
 
         ! --- Stage 6.2: the momentum Schur operator for the wave solve ---
@@ -432,9 +459,11 @@ contains
           ! Workstream B: keep j and omega explicit and solve two mixed 2x2
           ! pairs instead of the substituted fourth-order diagonals. No S_PBP,
           ! no commutator blocks, no constraint mass folds in the apply.
+          call PetscLogEventBegin(pcev_build_suu, ierr)
           call build_pair_psi_prod(comm, first_time, my_id)
           call build_schur_mixed_prod(comm, first_time, my_id, &
                                      physics_pc_schur_variant, schur_ok)
+          call PetscLogEventEnd(pcev_build_suu, ierr)
           if (.not. schur_ok) then
             ! Deliberately NOT a fallback to another arm: silently running a
             ! different preconditioner than the one requested would mean
@@ -443,10 +472,14 @@ contains
               "[Physics PC]   FATAL: the mixed-pair Schur (SFM) could not be built."
             call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
           endif
+          call PetscLogEventBegin(pcev_fact_pj, ierr)
           call setup_block_ksp(g_ctx%ksp_pair_psi, g_ctx%K_pj_aij, comm, first_time, &
                                "pair_psi KSP ([B_11,B_13;B_31,B_33])")
+          call PetscLogEventEnd(pcev_fact_pj, ierr)
+          call PetscLogEventBegin(pcev_fact_w, ierr)
           call setup_block_ksp(g_ctx%ksp_pair_w,   g_ctx%S_W_aij,  comm, first_time, &
                                "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])")
+          call PetscLogEventEnd(pcev_fact_w, ierr)
           ! Packed work vectors: the Mat handles are rebuilt every step but their
           ! SIZES never change, so these are created exactly once.
           !

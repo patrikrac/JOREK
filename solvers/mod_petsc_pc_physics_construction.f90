@@ -3,7 +3,8 @@ module mod_petsc_pc_physics_construction
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx
+  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
+       pcev_massinv, pcev_shat, pcev_channel, pcev_convert, pcev_builddiag
   use mod_petsc_pc_toroidal, only: petsc_setup_toroidal_harmonic_pc_blocked
   use mod_petsc_pc_physics_apply, only: k_a_exact_mult, s_pbp_diag_mult, physics_pc_apply, &
                                         pack_2v, unpack_2v
@@ -39,6 +40,27 @@ module mod_petsc_pc_physics_construction
   logical, save :: sfp_massinv_ready = .false.
   logical, save :: sfp_QiR_ready     = .false.   !< sfp_QiR is built on demand (channels >= 2, or a CM_OP_QR candidate)
 
+  ! --- Cached MatMatMult products for the SFM2 build ---------------------
+  ! Measurement (PhysPC_BuildSuu) put operator CONSTRUCTION at roughly twice
+  ! the cost of all three MUMPS factorizations combined, so the products below
+  ! are formed once with MAT_INITIAL_MATRIX and thereafter with
+  ! MAT_REUSE_MATRIX, which skips the symbolic phase on every later rebuild.
+  !
+  ! Every one of these has a rebuild-invariant sparsity pattern: sfp_Qip is
+  ! built once for the run, B_31/B_33 are geometry-only (model199
+  ! mod_elt_matrix.f90:498-499 -- amat_31 and amat_33 contain only basis
+  ! functions, BigR and xjac, with no tstep and no equilibrium state), and the
+  ! remaining factors keep their pattern from the fixed mesh connectivity.
+  ! sfp_prod_nnz guards that assumption at runtime rather than trusting it.
+  Mat, save     :: sfp_TL, sfp_TS            !< B_23*Qi*B_31 and B_13*Qi*B_31 chains
+  Mat, save     :: sfp_TLa, sfp_TSa          !< the first factor of each chain (B_23*Qi, B_13*Qi)
+  Mat, save     :: sfp_ch_Lsc(3), sfp_ch_Tp(3)  !< add_channel scratch, one slot per channel
+  Mat, save     :: sfp_Ltil                  !< persistent Ltil = B_21 - B_23 Qi B_31
+  ! One nnz guard per cached product; negative means "not yet built".
+  integer(kind=8), save :: sfp_nnz_TLa = -1, sfp_nnz_TL = -1
+  integer(kind=8), save :: sfp_nnz_TSa = -1, sfp_nnz_TS = -1
+  integer(kind=8), save :: sfp_nnz_chL(3) = -1, sfp_nnz_chT(3) = -1
+  integer(kind=8), save :: sfp_nnz_Ltil = -1
 
   public :: create_variable_index_sets
   public :: extract_sub_block
@@ -4611,6 +4633,67 @@ contains
   !! the pattern}, then scales g by 1/sqrt(g_i). Rows are independent.
   !--------------------------------------------------------------------
   !--------------------------------------------------------------------
+  !> C = A*B, reusing the symbolic product structure after the first call.
+  !!
+  !! WHY: -log_view put the SFM2 triple products at 47% of total runtime
+  !! (PhysPC_Channel 105 s + PhysPC_Shat 46 s over 11 rebuilds) while running
+  !! at only ~153 Mflop/s. That throughput is the tell: most of the time is
+  !! MatMatMult's SYMBOLIC phase and allocation, not arithmetic. Every one of
+  !! these products has a rebuild-invariant sparsity pattern, so the symbolic
+  !! phase is recomputing the same structure every Newton step.
+  !!
+  !! This is bit-neutral by construction: MAT_REUSE_MATRIX performs the same
+  !! numeric operations in the same order, and only skips re-deriving where the
+  !! nonzeros go.
+  !!
+  !! nnz_ref carries the guard state and must be a saved variable owned by the
+  !! caller, one per cached product:
+  !!   < 0  -> first call: MAT_INITIAL_MATRIX, then record nnz(C)
+  !!   >= 0 -> MAT_REUSE_MATRIX, then verify nnz(C) is unchanged
+  !!
+  !! The guard is not paranoia. PETSc drops entries that are numerically zero,
+  !! so a pattern can silently shrink between rebuilds; MAT_REUSE_MATRIX would
+  !! then write into a structure that no longer matches the operands and
+  !! produce a wrong preconditioner with no error message. That is the same
+  !! failure class as the massinv=2 SEQAIJ/MPIAIJ mismatch, which stayed
+  !! invisible for weeks, so it aborts rather than warns.
+  !--------------------------------------------------------------------
+  subroutine mat_product_cached(A, B, C, nnz_ref, tag, comm, my_id)
+    Mat, intent(in)               :: A, B
+    Mat, intent(inout)            :: C
+    integer(kind=8), intent(inout):: nnz_ref
+    character(len=*), intent(in)  :: tag
+    integer, intent(in)           :: comm, my_id
+
+    PetscErrorCode  :: ierr
+    MatInfo         :: minfo
+    integer(kind=8) :: nnz_now
+    integer         :: mpierr
+
+    if (nnz_ref < 0) then
+      call MatMatMult(A, B, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, C, ierr)
+      call MatGetInfo(C, MAT_GLOBAL_SUM, minfo, ierr)
+      nnz_ref = int(minfo%nz_used, kind=8)
+      if (my_id == 0) write(*,'(A,A,A,I0)') &
+        "[Physics PC]   cached product ", tag, ": pattern fixed, nnz = ", nnz_ref
+    else
+      call MatMatMult(A, B, MAT_REUSE_MATRIX, PETSC_DEFAULT_REAL, C, ierr)
+      call MatGetInfo(C, MAT_GLOBAL_SUM, minfo, ierr)
+      nnz_now = int(minfo%nz_used, kind=8)
+      if (nnz_now /= nnz_ref) then
+        if (my_id == 0) then
+          write(*,'(A,A,A)') "[Physics PC]   FATAL: cached product ", tag, &
+            " changed its sparsity pattern between rebuilds."
+          write(*,'(A,I0,A,I0)') "[Physics PC]     nnz was ", nnz_ref, ", is now ", nnz_now
+          write(*,'(A)') "[Physics PC]     MAT_REUSE_MATRIX is invalid here; the "// &
+            "preconditioner would be silently wrong."
+        endif
+        call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+      endif
+    endif
+  end subroutine mat_product_cached
+
+  !--------------------------------------------------------------------
   subroutine build_fsai(A, P, n, comm, G, nfail)
     Mat, intent(in)  :: A
     Mat, intent(in)  :: P   !< supplies the SPARSITY PATTERN (A itself = level 0,
@@ -5443,9 +5526,11 @@ contains
 
     PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats_nest, PJ_nest, ierr))
 
+    call PetscLogEventBegin(pcev_convert, ierr)
     if (g_ctx%schur_mixed_ready) call MatDestroy(g_ctx%K_pj_aij, ierr)
     call MatConvert(PJ_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_pj_aij, ierr)
     call MatDestroy(PJ_nest, ierr)
+    call PetscLogEventEnd(pcev_convert, ierr)
 
     ! Layout-only strides into the packed vector. Unused by the direct arm; a
     ! future PCFIELDSPLIT inner solver needs exactly these.
@@ -5511,7 +5596,8 @@ contains
     integer        :: nch
     PetscInt       :: n1_loc, n2_loc, n1_glo, n2_glo
     Vec            :: dvec
-    Mat            :: Ltil, Shat, Shati, TA, TB
+    Vec            :: dscale        !< diag(Shati) for the diagonal-pairinv column scaling
+    Mat            :: Shat, Shati
     logical        :: paired
     real*8         :: fL, fS
 
@@ -5557,7 +5643,7 @@ contains
       !--- diagonalising M_y severs psi from j, and since U reaches the momentum
       !--- equation only through its psi-row, the Lorentz coupling B_23 cannot
       !--- reach the Schur complement AT ALL. Retained only as the control.
-      call add_channel(g_ctx%B_21, sfp_Qip, g_ctx%B_12, 1.d0/opz)      ! psi channel
+      call add_channel(g_ctx%B_21, sfp_Qip, g_ctx%B_12, 1.d0/opz, 1)  ! psi channel
     else
       !--- "SFM2": still block diagonal, but with ONE LARGER BLOCK -- rho, T and
       !--- the (psi,j) PAIR kept together:
@@ -5579,18 +5665,40 @@ contains
       !--- uses Q_psi^-1/(1+zeta): Shat additionally carries the J M^-1 J
       !--- correction to the psi diagonal. The (1+zeta) lives INSIDE Shat, so the
       !--- channel coefficient below is 1, not 1/opz.
-      call MatMatMult(g_ctx%B_23, sfp_Qip, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, TA, ierr)
-      call MatMatMult(TA, g_ctx%B_31, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, TB, ierr)
-      call MatDuplicate(g_ctx%B_21, MAT_COPY_VALUES, Ltil, ierr)
-      call MatAXPY(Ltil, -1.0d0, TB, DIFFERENT_NONZERO_PATTERN, ierr)
-      call MatDestroy(TA, ierr); call MatDestroy(TB, ierr)
+      ! Both chains are cached: same operands, same association order, same
+      ! arithmetic -- only the symbolic phase is skipped after the first build.
+      ! sfp_TLa/sfp_TL and sfp_TSa/sfp_TS persist for the run and are never
+      ! destroyed here (that is the point; destroying them would throw away the
+      ! structure this reuses).
+      call PetscLogEventBegin(pcev_shat, ierr)
+      call mat_product_cached(g_ctx%B_23, sfp_Qip,   sfp_TLa, sfp_nnz_TLa, "B_23*Qi ", comm, my_id)
+      call mat_product_cached(sfp_TLa,    g_ctx%B_31, sfp_TL, sfp_nnz_TL,  "(B_23*Qi)*B_31", comm, my_id)
+      ! Ltil is persistent so that the channel product below can reuse its
+      ! symbolic structure -- MAT_REUSE_MATRIX is only valid when the OPERANDS
+      ! keep their identity, and the old code recreated Ltil every rebuild.
+      !
+      ! The refill is bit-identical to the original Duplicate+AXPY: zeroing
+      ! keeps the allocated pattern, adding 1.0*B_21 into zeros reproduces the
+      ! copy exactly, and the -1.0*sfp_TL term is unchanged. Both operands'
+      ! patterns are subsets of the union pattern established on the first
+      ! build, which is what SUBSET_NONZERO_PATTERN asserts.
+      if (sfp_nnz_Ltil < 0) then
+        call MatDuplicate(g_ctx%B_21, MAT_COPY_VALUES, sfp_Ltil, ierr)
+        call MatAXPY(sfp_Ltil, -1.0d0, sfp_TL, DIFFERENT_NONZERO_PATTERN, ierr)
+        call MatGetInfo(sfp_Ltil, MAT_GLOBAL_SUM, minfo, ierr)
+        sfp_nnz_Ltil = int(minfo%nz_used, kind=8)
+      else
+        call MatZeroEntries(sfp_Ltil, ierr)
+        call MatAXPY(sfp_Ltil,  1.0d0, g_ctx%B_21, SUBSET_NONZERO_PATTERN, ierr)
+        call MatAXPY(sfp_Ltil, -1.0d0, sfp_TL,     SUBSET_NONZERO_PATTERN, ierr)
+      endif
 
-      call MatMatMult(g_ctx%B_13, sfp_Qip, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, TA, ierr)
-      call MatMatMult(TA, g_ctx%B_31, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, TB, ierr)
+      call mat_product_cached(g_ctx%B_13, sfp_Qip,   sfp_TSa, sfp_nnz_TSa, "B_13*Qi ", comm, my_id)
+      call mat_product_cached(sfp_TSa,    g_ctx%B_31, sfp_TS, sfp_nnz_TS,  "(B_13*Qi)*B_31", comm, my_id)
       call MatDuplicate(g_ctx%B_33, MAT_COPY_VALUES, Shat, ierr)
       call MatScale(Shat, opz, ierr)
-      call MatAXPY(Shat, -1.0d0, TB, DIFFERENT_NONZERO_PATTERN, ierr)
-      call MatDestroy(TA, ierr); call MatDestroy(TB, ierr)
+      call MatAXPY(Shat, -1.0d0, sfp_TS, DIFFERENT_NONZERO_PATTERN, ierr)
+      call PetscLogEventEnd(pcev_shat, ierr)
 
       ! Shat^-1 gets its OWN fidelity flag, not physics_pc_schur_massinv. Two
       ! reasons: it is the new knob and conflating it with the mass inverse would
@@ -5599,22 +5707,47 @@ contains
       ! density explosion. Default is 2 (diagonal).
       call make_mass_inverse(Shat, Shati, "Shat", comm, my_id, physics_pc_schur_pairinv)
 
-      call add_channel(Ltil, Shati, g_ctx%B_12, 1.0d0)
-
-      call MatNorm(Ltil, NORM_FROBENIUS, fL, ierr)
+      ! Diagnostics FIRST: the psi channel below scales sfp_Ltil in place, so
+      ! measuring ||Ltil||_F afterwards would report the scaled operator.
+      call PetscLogEventBegin(pcev_builddiag, ierr)
+      call MatNorm(sfp_Ltil, NORM_FROBENIUS, fL, ierr)
       call MatNorm(Shat, NORM_FROBENIUS, fS, ierr)
       if (my_id == 0) write(*,'(A,I0,A,ES11.4,A,ES11.4)') &
         "[Physics PC]   SFM2 paired psi channel: pairinv = ", physics_pc_schur_pairinv, &
         ", ||Ltil||_F = ", fL, ", ||Shat||_F = ", fS
-      call report_operator_density(Ltil, "Ltil (B_21 - B_23 Qi B_31)", my_id)
+      call report_operator_density(sfp_Ltil, "Ltil (B_21 - B_23 Qi B_31)", my_id)
       call report_operator_density(Shat, "Shat (opz Q - B_13 Qi B_31)", my_id)
-      call MatDestroy(Ltil, ierr)
+      call PetscLogEventEnd(pcev_builddiag, ierr)
+
+      !--- psi channel: S_uu -= Ltil * Shati * B_12 ---
+      ! pairinv 2 (diagonal) and 3 (row-sum lumped) both give a DIAGONAL Shati.
+      ! Then (Ltil*Shati)_ij = Ltil_ij * d_j exactly, i.e. a column scaling --
+      ! so the first sparse product is not approximated away, it is unnecessary.
+      ! MatDiagonalScale does the same multiplications and nothing else, which
+      ! keeps this bit-identical while removing a MatMatMult per rebuild.
+      ! pairinv 7/8 give an FSAI Shati that is genuinely non-diagonal; that path
+      ! keeps the original product and stays uncached, because Shati is rebuilt
+      ! as a new object each time and MAT_REUSE_MATRIX would be invalid.
+      if (physics_pc_schur_pairinv == 2 .or. physics_pc_schur_pairinv == 3) then
+        call PetscLogEventBegin(pcev_channel, ierr)
+        call MatCreateVecs(Shati, dscale, PETSC_NULL_VEC, ierr)
+        call MatGetDiagonal(Shati, dscale, ierr)
+        call MatDiagonalScale(sfp_Ltil, PETSC_NULL_VEC, dscale, ierr)
+        call VecDestroy(dscale, ierr)
+        call mat_product_cached(sfp_Ltil, g_ctx%B_12, sfp_ch_Tp(1), sfp_nnz_chT(1), &
+                                "psi channel Ltil*B_12", comm, my_id)
+        call MatAXPY(S_uu, -1.0d0, sfp_ch_Tp(1), DIFFERENT_NONZERO_PATTERN, ierr)
+        call PetscLogEventEnd(pcev_channel, ierr)
+      else
+        call add_channel(sfp_Ltil, Shati, g_ctx%B_12, 1.0d0, 0)
+      endif
+
       call MatDestroy(Shat, ierr)
       call MatDestroy(Shati, ierr)
     endif
 
-    if (nch >= 2) call add_channel(g_ctx%B_25, sfp_QiR, g_ctx%B_52, 1.d0/opz)  ! rho channel
-    if (nch >= 3) call add_channel(g_ctx%B_26, sfp_QiR, g_ctx%B_62, 1.d0/opz)  ! T   channel
+    if (nch >= 2) call add_channel(g_ctx%B_25, sfp_QiR, g_ctx%B_52, 1.d0/opz, 2)  ! rho channel
+    if (nch >= 3) call add_channel(g_ctx%B_26, sfp_QiR, g_ctx%B_62, 1.d0/opz, 3)  ! T   channel
 
     !--- Pack into the 2x2 (u,omega) nest and convert to a concrete AIJ.
     ! Row 1 (u eq):     S_uu  B_24
@@ -5626,9 +5759,11 @@ contains
 
     PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats_nest, W_nest, ierr))
 
+    call PetscLogEventBegin(pcev_convert, ierr)
     if (g_ctx%schur_mixed_ready) call MatDestroy(g_ctx%S_W_aij, ierr)
     call MatConvert(W_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%S_W_aij, ierr)
     call MatDestroy(W_nest, ierr)
+    call PetscLogEventEnd(pcev_convert, ierr)
 
     if (.not. g_ctx%schur_mixed_vecs_ready) then
       call MatGetLocalSize(g_ctx%B_22, n1_loc, PETSC_NULL_INTEGER, ierr)
@@ -5654,10 +5789,12 @@ contains
     ! ||S_uu - B_22||_F: how much the Riesz channels actually moved the diagonal.
     ! If this is ~0 the channels are inert; if it is enormous, suspect a
     ! double-counted fold (a Schur-corrected block used in place of a raw one).
+    call PetscLogEventBegin(pcev_builddiag, ierr)
     call MatDuplicate(S_uu, MAT_COPY_VALUES, D_uu_diff, ierr)
     call MatAXPY(D_uu_diff, -1.0d0, g_ctx%B_22, DIFFERENT_NONZERO_PATTERN, ierr)
     call MatNorm(D_uu_diff, NORM_FROBENIUS, fnorm, ierr)
     call MatDestroy(D_uu_diff, ierr)
+    call PetscLogEventEnd(pcev_builddiag, ierr)
 
     ! min/max |diag| of the packed operator: ~1e12 ZBIG penalty rows against ~h^2
     ! mass rows. This ratio decides whether an iterative inner solver has any
@@ -5679,10 +5816,12 @@ contains
     ! triple-product structure, different base and different psi-channel L. S_W
     ! additionally carries the two sparse constraint blocks and twice the rows,
     ! so it is NOT the like-for-like number.
+    call PetscLogEventBegin(pcev_builddiag, ierr)
     call report_operator_density(S_uu,           "S_uu (SFM momentum Schur)", my_id)
     call report_operator_density(g_ctx%S_W_aij,  "S_W  (SFM packed u,omega)", my_id)
     call report_operator_density(g_ctx%K_pj_aij, "K_pj (SFM packed psi,j)  ", my_id)
     call report_operator_density(g_ctx%B_22,     "B_22 (raw u diagonal)    ", my_id)
+    call PetscLogEventEnd(pcev_builddiag, ierr)
 
     call MatDestroy(S_uu, ierr)   ! safe: MatConvert copied the values out
 
@@ -5695,16 +5834,36 @@ contains
     !> S_uu -= alpha * (L Qi U). alpha is explicit because the SFM2 psi channel
     !! carries its (1+zeta) inside Shat and so needs alpha = 1, while every
     !! Riesz-map channel needs alpha = 1/(1+zeta).
-    subroutine add_channel(L, Qi, U, alpha)
+    !! slot selects this channel's cache pair (1 = psi, 2 = rho, 3 = T). Each
+    !! channel has different operands and therefore its own product structure,
+    !! so a single shared cache would be wrong -- hence one slot per channel
+    !! rather than one set of scratch matrices.
+    !!
+    !! slot = 0 means DO NOT CACHE. Required when an operand is rebuilt as a
+    !! fresh Mat every call (the FSAI Shati of the SFM2 psi channel): PETSc ties
+    !! a reusable product to the operand objects it was built from, so reusing
+    !! against a replaced operand is invalid, not merely stale.
+    subroutine add_channel(L, Qi, U, alpha, slot)
       Mat, intent(in)    :: L, Qi, U
       real*8, intent(in) :: alpha
+      integer, intent(in):: slot
       Mat :: Lsc, Tp
 
-      call MatMatMult(L, Qi, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, Lsc, ierr)
-      call MatMatMult(Lsc, U, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, Tp, ierr)
-      call MatAXPY(S_uu, -alpha, Tp, DIFFERENT_NONZERO_PATTERN, ierr)
-      call MatDestroy(Lsc, ierr)
-      call MatDestroy(Tp, ierr)
+      call PetscLogEventBegin(pcev_channel, ierr)
+      if (slot == 0) then
+        call MatMatMult(L, Qi, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, Lsc, ierr)
+        call MatMatMult(Lsc, U, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, Tp, ierr)
+        call MatAXPY(S_uu, -alpha, Tp, DIFFERENT_NONZERO_PATTERN, ierr)
+        call MatDestroy(Lsc, ierr)
+        call MatDestroy(Tp, ierr)
+      else
+        call mat_product_cached(L, Qi, sfp_ch_Lsc(slot), sfp_nnz_chL(slot), &
+                                "channel L*Qi ", comm, my_id)
+        call mat_product_cached(sfp_ch_Lsc(slot), U, sfp_ch_Tp(slot), sfp_nnz_chT(slot), &
+                                "channel (L*Qi)*U", comm, my_id)
+        call MatAXPY(S_uu, -alpha, sfp_ch_Tp(slot), DIFFERENT_NONZERO_PATTERN, ierr)
+      endif
+      call PetscLogEventEnd(pcev_channel, ierr)
     end subroutine add_channel
 
   end subroutine build_schur_mixed_prod
@@ -6045,6 +6204,7 @@ contains
     character(len=64) :: qtype
     character(len=8)  :: dlab
 
+    call PetscLogEventBegin(pcev_massinv, ierr)
     call MatGetSize(Q, nn, PETSC_NULL_INTEGER, ierr)
 
     ! Parallel cross-check: ||Q||_F is independent of everything this routine
@@ -6135,6 +6295,11 @@ contains
         nfloor, " of ", nn
     endif
 
+    ! Everything above is the inverse itself; the block below is diagnostic.
+    ! Split so the -log_view table separates the two.
+    call PetscLogEventEnd(pcev_massinv, ierr)
+
+    call PetscLogEventBegin(pcev_builddiag, ierr)
     ! Fidelity of the inverse: ||Qi*Q - I||_F. Not a curiosity -- the
     ! commutator Schur multiplies by Qi*Q explicitly (its right factor is
     ! Q_u^-1 A_uM), so this number IS the perturbation that separates a
@@ -6152,6 +6317,7 @@ contains
         "[Physics PC]   fidelity(", tag, " mass): ||Qi*Q - I||_F = ", dev, &
         ", per row = ", dev / sqrt(max(real(nn,8), 1.d0))
     end block
+    call PetscLogEventEnd(pcev_builddiag, ierr)
   end subroutine make_mass_inverse
 
 

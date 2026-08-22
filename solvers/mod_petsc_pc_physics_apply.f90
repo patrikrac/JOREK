@@ -3,7 +3,8 @@ module mod_petsc_pc_physics_apply
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx
+  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
+       pcev_apply, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot
   implicit none
   private
 
@@ -659,13 +660,17 @@ contains
     ! equation's own residual, and it is what makes j* equal the mass
     ! back-substitution M_j^-1 (x_j - B_31 psi*).
     call pack_2v(x_psi, x_j, g_ctx%rhs_PJ, ierr)
+    call PetscLogEventBegin(pcev_solve_pj, ierr)
     call KSPSolve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, ierr)
+    call PetscLogEventEnd(pcev_solve_pj, ierr)
     call unpack_2v(g_ctx%sol_PJ, y_psi, y_j, ierr)          ! y_psi = psi*, y_j = j*
 
     ! --- Step 1: predictor density  rho* = B_55^-1 (x_rho - B_51 psi*) ---
     call MatMult(g_ctx%B_51, y_psi, g_ctx%work_3, ierr)
     call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_rho, ierr)
+    call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call KSPSolve(g_ctx%ksp_rho, g_ctx%work_4, g_ctx%tmp_rho, ierr)   ! tmp_rho = rho*
+    call PetscLogEventEnd(pcev_solve_rhot, ierr)
 
     ! --- Step 1: predictor temperature  T* = B_66^-1 (x_T - B_61 psi* - B_63 j*) ---
     ! B_61 and B_63 act against the EXPLICIT predictor pair (psi*, j*). No
@@ -674,7 +679,9 @@ contains
     call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
     call MatMult(g_ctx%B_63, y_j, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
+    call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, g_ctx%tmp_T, ierr)       ! tmp_T = T*
+    call PetscLogEventEnd(pcev_solve_rhot, ierr)
 
     ! --- Step 2: the ONE packed wave solve ---
     !   RHS_u = x_u - B_21 psi* - B_23 j* - B_25 rho* - B_26 T*
@@ -694,7 +701,9 @@ contains
     !   identically zero, so the omega component of (r_w - L y*) is the raw
     !   input residual -- no fold, no correction term.
     call pack_2v(g_ctx%work_5, x_w, g_ctx%rhs_W, ierr)
+    call PetscLogEventBegin(pcev_solve_w, ierr)
     call KSPSolve(g_ctx%ksp_pair_w, g_ctx%rhs_W, g_ctx%sol_W, ierr)
+    call PetscLogEventEnd(pcev_solve_w, ierr)
     call unpack_2v(g_ctx%sol_W, y_u, y_w, ierr)      ! BOTH final; y_w is DONE
 
     ! --- Step 3: corrector psi-pair.  pair_psi (dpsi, dj) = (B_12 u + B_16 T*, 0) ---
@@ -705,7 +714,9 @@ contains
     call VecAXPY(g_ctx%work_3, 1.0d0, g_ctx%work_4, ierr)      ! B_12 u + B_16 T*
     call VecZeroEntries(g_ctx%work_4, ierr)
     call pack_2v(g_ctx%work_3, g_ctx%work_4, g_ctx%rhs_PJ, ierr)
+    call PetscLogEventBegin(pcev_solve_pj, ierr)
     call KSPSolve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, ierr)
+    call PetscLogEventEnd(pcev_solve_pj, ierr)
     call unpack_2v(g_ctx%sol_PJ, g_ctx%work_3, g_ctx%work_4, ierr)  ! dpsi, dj
     call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)            ! y_psi = psi* - dpsi
     call VecAXPY(y_j,   -1.0d0, g_ctx%work_4, ierr)            ! y_j   = j*   - dj
@@ -714,11 +725,15 @@ contains
 
     ! --- Step 3: rho / T correctors. Only u enters -- U's omega COLUMN is zero. ---
     call MatMult(g_ctx%B_52, y_u, g_ctx%work_3, ierr)
+    call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call KSPSolve(g_ctx%ksp_rho, g_ctx%work_3, g_ctx%work_5, ierr)
+    call PetscLogEventEnd(pcev_solve_rhot, ierr)
     call VecWAXPY(y_rho, -1.0d0, g_ctx%work_5, g_ctx%tmp_rho, ierr)
 
     call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
+    call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call KSPSolve(g_ctx%ksp_T, g_ctx%work_3, g_ctx%work_5, ierr)
+    call PetscLogEventEnd(pcev_solve_rhot, ierr)
     call VecWAXPY(y_T, -1.0d0, g_ctx%work_5, g_ctx%tmp_T, ierr)
 
     ierr = 0
@@ -753,6 +768,10 @@ contains
       ierr = 1
       return
     endif
+
+    ! Begin AFTER the early return, so an aborted apply cannot leave the event
+    ! stack unbalanced.
+    call PetscLogEventBegin(pcev_apply, ierr)
 
     ! --- Step 1: Extract variable sub-vectors ---
     call VecGetSubVector(x, g_ctx%is_var(var_psi), x_psi, ierr)
@@ -868,6 +887,8 @@ contains
     call VecRestoreSubVector(y, g_ctx%is_var(var_w),   y_w,   ierr)
     call VecRestoreSubVector(y, g_ctx%is_var(var_rho), y_rho, ierr)
     call VecRestoreSubVector(y, g_ctx%is_var(var_T),   y_T,   ierr)
+
+    call PetscLogEventEnd(pcev_apply, ierr)
 
     ierr = 0
   end subroutine physics_pc_apply

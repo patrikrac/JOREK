@@ -220,5 +220,105 @@ module mod_petsc_pc_physics_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx
 
+  ! ================================================================
+  ! PetscLogEvents for the physics PC.
+  !
+  ! These exist to answer one question that nothing in the code answers
+  ! today: of the wall time the physics PC costs, how much is the rebuild
+  ! (element assembly, block extraction, triple products, factorizations)
+  ! and how much is the apply (the back-solves, once per GMRES iteration)?
+  ! Every optimization decision downstream depends on that split, and it
+  ! must be measured rather than guessed.
+  !
+  ! PetscLogEvent rather than hand-rolled MPI_Wtime counters because
+  ! mod_petsc.f90:377 already registers PetscLogStages for KSP setup/solve,
+  ! so this is the established pattern here; because -log_view then reports
+  ! call counts, times and flops with no new output format to parse; and
+  ! because the events nest correctly inside those existing stages.
+  !
+  ! Read them with:  -log_view
+  ! The event names all share the "PhysPC_" prefix so they sort together.
+  ! ================================================================
+  PetscLogEvent, save :: pcev_elem_asm   = -1  !< construct_schur_correction_matrices
+  PetscLogEvent, save :: pcev_extract    = -1  !< the extract_sub_block group
+  PetscLogEvent, save :: pcev_build_suu  = -1  !< build_schur_mixed_prod (triple products)
+  PetscLogEvent, save :: pcev_fact_pj    = -1  !< MUMPS LU of K_pj_aij
+  PetscLogEvent, save :: pcev_fact_w     = -1  !< MUMPS LU of S_W_aij
+  PetscLogEvent, save :: pcev_fact_rhot  = -1  !< MUMPS LU of B_55 and B_66
+  PetscLogEvent, save :: pcev_apply      = -1  !< one whole physics_pc_apply
+  PetscLogEvent, save :: pcev_solve_pj   = -1  !< pair_psi back-solves (2 per apply)
+  PetscLogEvent, save :: pcev_solve_w    = -1  !< pair_w back-solve    (1 per apply)
+  PetscLogEvent, save :: pcev_solve_rhot = -1  !< rho/T back-solves    (4 per apply)
+
+  ! Sub-events inside pcev_build_suu. The first measurement showed that bucket
+  ! costs more than all three factorizations put together, so it needs to be
+  ! broken down before anything inside it is optimized.
+  PetscLogEvent, save :: pcev_massinv    = -1  !< make_mass_inverse (all call sites)
+  PetscLogEvent, save :: pcev_shat       = -1  !< the Shat and Ltil triple-product chains
+  PetscLogEvent, save :: pcev_channel    = -1  !< add_channel (L Qi U) products
+  PetscLogEvent, save :: pcev_convert    = -1  !< MatConvert nest -> MPIAIJ, both pairs
+  PetscLogEvent, save :: pcev_builddiag  = -1  !< the norm/density diagnostics in the build
+
+  logical, save, private :: pcev_registered = .false.
+
+contains
+
+  !--------------------------------------------------------------------
+  !> .true. on the mixed-pair arms ("SFM", "SFM2"), which keep j and omega
+  !! explicit and solve two 2x2 pairs.
+  !!
+  !! These arms read NONE of the element-assembled Schur corrections
+  !! (K_psi/u/21/61_correction), none of the Atilde_* blocks derived from
+  !! them, and never call ksp_psi -- apply_wave_schur_mixed_pairs works
+  !! entirely from the raw B_ij blocks. Everything guarded by this predicate
+  !! is therefore work whose result is computed and then discarded: a whole
+  !! extra element-loop assembly over the mesh plus a MUMPS factorization,
+  !! per Newton step.
+  !!
+  !! It lives here rather than at each call site so that the assembly gate
+  !! (mod_petsc_pc_physics_element) and the consumer gates
+  !! (mod_petsc_pc_physics) cannot drift apart. They must agree: skipping the
+  !! assembly while still running compute_schur_corrected_block_* would build
+  !! Atilde from an unassembled correction.
+  !--------------------------------------------------------------------
+  logical function physics_pc_mixed_arm()
+    use phys_module, only: physics_pc_schur_variant
+
+    physics_pc_mixed_arm = (trim(physics_pc_schur_variant) == "SFM" .or. &
+                            trim(physics_pc_schur_variant) == "SFM2")
+  end function physics_pc_mixed_arm
+
+  !--------------------------------------------------------------------
+  !> Register the physics-PC log events. Idempotent: safe to call from any
+  !! entry point without the caller having to know whether it ran already.
+  !! Registering twice would give two distinct events with the same name and
+  !! split the timings between them, which is why the guard is here rather
+  !! than at the call site.
+  !--------------------------------------------------------------------
+  subroutine physics_pc_log_events_register()
+    PetscErrorCode :: ierr
+
+    if (pcev_registered) return
+
+    call PetscLogEventRegister("PhysPC_ElemAsm",   0, pcev_elem_asm,   ierr)
+    call PetscLogEventRegister("PhysPC_Extract",   0, pcev_extract,    ierr)
+    call PetscLogEventRegister("PhysPC_BuildSuu",  0, pcev_build_suu,  ierr)
+    call PetscLogEventRegister("PhysPC_FactPJ",    0, pcev_fact_pj,    ierr)
+    call PetscLogEventRegister("PhysPC_FactW",     0, pcev_fact_w,     ierr)
+    call PetscLogEventRegister("PhysPC_FactRhoT",  0, pcev_fact_rhot,  ierr)
+    call PetscLogEventRegister("PhysPC_Apply",     0, pcev_apply,      ierr)
+    call PetscLogEventRegister("PhysPC_SolvePJ",   0, pcev_solve_pj,   ierr)
+    call PetscLogEventRegister("PhysPC_SolveW",    0, pcev_solve_w,    ierr)
+    call PetscLogEventRegister("PhysPC_SolveRhoT", 0, pcev_solve_rhot, ierr)
+
+    call PetscLogEventRegister("PhysPC_MassInv",   0, pcev_massinv,    ierr)
+    call PetscLogEventRegister("PhysPC_Shat",      0, pcev_shat,       ierr)
+    call PetscLogEventRegister("PhysPC_Channel",   0, pcev_channel,    ierr)
+    call PetscLogEventRegister("PhysPC_Convert",   0, pcev_convert,    ierr)
+    call PetscLogEventRegister("PhysPC_BuildDiag", 0, pcev_builddiag,  ierr)
+
+    pcev_registered = .true.
+  end subroutine physics_pc_log_events_register
+
 #endif
 end module mod_petsc_pc_physics_ctx

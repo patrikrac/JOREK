@@ -3,7 +3,8 @@ module mod_petsc_pc_physics_element
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx
+  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
+       physics_pc_log_events_register, pcev_elem_asm, physics_pc_mixed_arm
   implicit none
   private
 
@@ -109,32 +110,51 @@ contains
 
     first_assembly = .not. g_ctx%matrices_ready
 
-    if (first_assembly) then
-      call petsc_create_pc_matrices(a_mat)
-    else
-      ! PetscCallA(MatDestroy(g_ctx%A_j,    ierr))
-      ! PetscCallA(MatDestroy(g_ctx%A_w,    ierr))
-      ! PetscCallA(MatDestroy(g_ctx%A_jpsi, ierr))
-      ! PetscCallA(MatDestroy(g_ctx%A_wu,   ierr))
-      PetscCallA(MatDestroy(g_ctx%K_psi_correction, ierr))
-      PetscCallA(MatDestroy(g_ctx%K_u_correction, ierr))
-      PetscCallA(MatDestroy(g_ctx%K_21_correction,  ierr))
-      PetscCallA(MatDestroy(g_ctx%K_61_correction,  ierr))
-      PetscCallA(MatDestroy(g_ctx%S_PBP,  ierr))
-      call petsc_create_pc_matrices(a_mat)
+    ! Registered here as well as in petsc_physics_pc_build_reduced: this routine
+    ! runs FIRST (jorek2_main.f90 assembles before mod_petsc.f90 builds the
+    ! reduced system), so relying on the other call site would push an
+    ! unregistered event id on the first step. The register call is idempotent.
+    call physics_pc_log_events_register()
+    call PetscLogEventBegin(pcev_elem_asm, ierr)
+
+    ! The mixed-pair arms read none of what this block produces (see
+    ! physics_pc_mixed_arm). Skipping it removes a full element-loop assembly
+    ! over the mesh, plus five BAIJ create/destroy pairs, from every Newton
+    ! step. The *_ready flags are deliberately left .false. so that any future
+    ! reader of Atilde_* on this arm hits the existing "Schur correction block
+    ! required!" error rather than silently using an unassembled matrix.
+    if (.not. physics_pc_mixed_arm()) then
+      if (first_assembly) then
+        call petsc_create_pc_matrices(a_mat)
+      else
+        ! PetscCallA(MatDestroy(g_ctx%A_j,    ierr))
+        ! PetscCallA(MatDestroy(g_ctx%A_w,    ierr))
+        ! PetscCallA(MatDestroy(g_ctx%A_jpsi, ierr))
+        ! PetscCallA(MatDestroy(g_ctx%A_wu,   ierr))
+        PetscCallA(MatDestroy(g_ctx%K_psi_correction, ierr))
+        PetscCallA(MatDestroy(g_ctx%K_u_correction, ierr))
+        PetscCallA(MatDestroy(g_ctx%K_21_correction,  ierr))
+        PetscCallA(MatDestroy(g_ctx%K_61_correction,  ierr))
+        PetscCallA(MatDestroy(g_ctx%S_PBP,  ierr))
+        call petsc_create_pc_matrices(a_mat)
+      endif
+
+      !call construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat, &
+      !                                    g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
+
+      call construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
+                                          g_ctx%K_psi_correction, g_ctx%K_u_correction, &
+                                          g_ctx%K_21_correction,  g_ctx%K_61_correction, g_ctx%S_PBP)
+      g_ctx%psi_correction_ready  = .true.
+      g_ctx%u_correction_ready    = .true.
+      g_ctx%correction_21_ready   = .true.
+      g_ctx%correction_61_ready   = .true.
+      g_ctx%matrices_ready = .true.
     endif
-
-    !call construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat, &
-    !                                    g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
-
-    call construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
-                                        g_ctx%K_psi_correction, g_ctx%K_u_correction, &
-                                        g_ctx%K_21_correction,  g_ctx%K_61_correction, g_ctx%S_PBP)
-    g_ctx%psi_correction_ready  = .true.
-    g_ctx%u_correction_ready    = .true.
-    g_ctx%correction_21_ready   = .true.
-    g_ctx%correction_61_ready   = .true.
-    g_ctx%matrices_ready = .true.
+    ! Ends here, not at the routine's end: P_full below is an optional
+    ! diagnostic path (physics_pc_reduced_pde) and folding it in would make the
+    ! event mean different things in different configurations.
+    call PetscLogEventEnd(pcev_elem_asm, ierr)
 
     ! --- Milestone 1: the reduced PDE operator P_full ---
     if (physics_pc_reduced_pde) then
