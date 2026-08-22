@@ -16,7 +16,7 @@ module mod_petsc_direct_solver
   use petsc
   implicit none
   private
-  public :: petsc_configure_direct_solver, petsc_solver_option
+  public :: petsc_configure_direct_solver, petsc_solver_option, petsc_setup_wrapped_solver
 
   !> Suffix PCTELESCOPE appends to its own options prefix for the PC it wraps
   !! (src/ksp/pc/impls/telescope/telescope.c, KSPAppendOptionsPrefix).
@@ -25,6 +25,13 @@ module mod_petsc_direct_solver
   !> How many nested telescopes to walk through. Bounded so that a malformed
   !! options file cannot drive the walk indefinitely.
   integer, parameter :: MAX_TELESCOPE_DEPTH = 4
+
+  !> Value PETSc default-initializes a Fortran object handle to, and writes back
+  !! when the C routine it wraps yields no object (PETSC_FORTRAN_TYPE_INITIALIZE
+  !! in include/petsc/private/ftnimpl.h). PETSc exposes no predicate for an absent
+  !! Fortran object, so comparing against it is the only way to distinguish "this
+  !! rank was not reduced onto" from a KSP that really is there.
+  PetscFortranAddr, parameter :: ABSENT_HANDLE = -2
 
 contains
 
@@ -134,6 +141,46 @@ contains
         ! -<prefix>mat_superlu_dist_* / -<prefix>mat_cudss_* etc.
     end select
   end subroutine configure_wrapped_solver
+
+
+  !> Run the factorizations that KSPSetUpOnBlocks cannot reach.
+  !!
+  !! PCFIELDSPLIT forwards KSPSetUpOnBlocks to each of its blocks, but PCTELESCOPE
+  !! implements no setuponblocks of its own, so the chain stops at it and the
+  !! factorization inside is left to the first PCApply -- charged, in other words,
+  !! to the GMRES solve rather than to setup. Doing it here restores the accounting
+  !! the untelescoped path already gets from the KSPSetUpOnBlocks call in mod_petsc.
+  !!
+  !! Call it after that KSPSetUpOnBlocks, on every solve rather than only the first:
+  !! PCSetUp_Telescope calls KSPSetOperators on the PC it wraps each time it runs,
+  !! which is what marks the factorization stale again after a matrix update.
+  !!
+  !! Safe on any PC -- anything that is not a telescope returns immediately.
+  subroutine petsc_setup_wrapped_solver(pc)
+    PC, intent(in) :: pc
+
+    PC             :: cur
+    KSP            :: inner
+    PCType         :: ptype
+    integer        :: depth
+    PetscErrorCode :: ierr
+
+    cur = pc
+    do depth = 1, MAX_TELESCOPE_DEPTH
+      PetscCallA(PCGetType(cur, ptype, ierr))
+      if (ptype /= PCTELESCOPE) return
+
+      ! `inner` is deliberately left at its default initialization. Assigning
+      ! PETSC_NULL_KSP first would be read by CHKFORTRANNULLOBJECT in the generated
+      ! stub as "the caller does not want this output", and the handle would come
+      ! back unset on every rank, including the ones that do hold a KSP.
+      PetscCallA(PCTelescopeGetKSP(cur, inner, ierr))
+      if (inner%v == 0 .or. inner%v == ABSENT_HANDLE) return  ! not reduced onto this rank
+
+      PetscCallA(KSPSetUp(inner, ierr))
+      PetscCallA(KSPGetPC(inner, cur, ierr))
+    enddo
+  end subroutine petsc_setup_wrapped_solver
 
 
   !> MUMPS controls JOREK has been tuned for.

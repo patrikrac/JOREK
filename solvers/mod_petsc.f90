@@ -445,6 +445,9 @@ contains
       ! Force the sub-KSP factorizations here so they are timed as setup, not solve
       ! (no-op for the toroidal PC, which sets its sub-KSPs up explicitly).
       PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
+      ! KSPSetUpOnBlocks stops at a PCTELESCOPE, which implements no setuponblocks,
+      ! so a telescoped block solver is factorized here rather than in the solve.
+      call petsc_setup_pc_blocks(petsc_sys%ksp)
       petsc_sys%ksp_ready = .true.
 
       PetscCallA(PetscTime(ts2, ierr))
@@ -464,6 +467,9 @@ contains
       ! factorizations are otherwise deferred to KSPSetUpOnBlocks inside KSPSolve, which
       ! would charge the whole factorization cost to the GMRES solve timer below.
       PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
+      ! ... and KSPSetUpOnBlocks in turn stops at a PCTELESCOPE, which implements no
+      ! setuponblocks, so the block solver it wraps has to be reached separately.
+      call petsc_setup_pc_blocks(petsc_sys%ksp)
 
       PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
