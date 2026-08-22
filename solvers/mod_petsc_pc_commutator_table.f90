@@ -44,11 +44,13 @@ module mod_petsc_pc_commutator_table
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_elt_matrix_commutator, only: CM_NB, CM_ADV1, CM_ADVR, CM_COMP, &
-                                       CM_S1R, CM_SR, CM_ES1R, CM_EG1R
+                                       CM_S1R, CM_SR, CM_ES1R, CM_EG1R, &
+                                       CM_AISO, CM_AANI
   implicit none
   private
 
   public :: CM_NOP, CM_OP_B11, CM_OP_Q1R, CM_OP_QR, CM_MAXC, CM_LABLEN
+  public :: CM_OP_AISO, CM_OP_AANI
   public :: cm_table_build, cm_table_lookup, cm_ops_gather, cm_mstar_mult
   public :: petsc_commutator_assemble, cm_blocks_ready
 
@@ -56,6 +58,13 @@ module mod_petsc_pc_commutator_table
   integer, parameter :: CM_OP_Q1R = 2
   integer, parameter :: CM_OP_QR  = 3
   integer, parameter :: CM_NOP    = 3 + CM_NB   !< B11, Q1R, QR + building blocks
+  !> Handle of the Stage 5.2 continuous-PDE (isotropic) Schur operator. It is
+  !! NOT a candidate building block -- no table row references it -- but it is
+  !! assembled and gathered by the same machinery, so it is addressed the same
+  !! way. Kept in sync with CM_AISO's position among the blocks.
+  integer, parameter :: CM_OP_AISO = 3 + CM_AISO
+  !> Stage 5.3a: the same operator with the field-alignment restored.
+  integer, parameter :: CM_OP_AANI = 3 + CM_AANI
   integer, parameter :: CM_MAXC   = 16          !< candidate-table capacity
   integer, parameter :: CM_LABLEN = 4           !< candidate label length
 

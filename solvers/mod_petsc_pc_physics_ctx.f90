@@ -111,6 +111,70 @@ module mod_petsc_pc_physics_ctx
     KSP :: ksp_S_PBP
     logical :: ksp_S_PBP_created = .false.
 
+    ! --- Stage 6.3: commutator-device momentum Schur (physics_pc_schur_variant /= "SF") ---
+    !! S_PBP then holds S_ass = Atilde_22 Q_u^-1 A_uM - Atilde_21 Q_p^-1 B_12, whose
+    !! inverse is only half the operator: the apply must finish with the RIGHT factor
+    !! Shat^-1 = Q_u^-1 A_uM S_ass^-1. Hence A_uM and Q_u^-1 have to survive the build.
+    Mat :: A_uM_prod                     !< assembled A_uM(ic); OWNED here, rebuilt every PC rebuild
+    Mat :: Qi_u_prod                     !< REFERENCE to sfp_Qip/sfp_QiR; NOT owned, never destroyed here
+    Vec :: u_mask                        !< 1 on interior u-rows, 0 on the ZBIG Dirichlet rows
+    Vec :: u_bnd                         !< 1/diag on the ZBIG rows, 0 elsewhere (the Jacobi add-back)
+    Vec :: u_one                         !< 1 - u_mask, the identity put on the masked rows
+    logical :: schur_comm_ready  = .false. !< A_uM_prod / u_* exist and must be destroyed before reuse
+    logical :: schur_comm_active = .false. !< the apply must use the right factor
+    logical :: schur_comm_mask   = .false. !< ... and the ZBIG interior treatment
+
+    ! --- Workstream B: small-flow MIXED-PAIR arm (physics_pc_schur_variant = "SFM") ---
+    !! Neither constraint variable is eliminated. Instead of substituting
+    !! j = J(psi) and w = W(u) -- which raises the differential order of the psi
+    !! and u diagonals to fourth -- the sweep keeps both constraints explicit and
+    !! solves two 2x2 pairs:
+    !!   pair_psi = [[B_11, B_13], [B_31, B_33]]              (psi,j kept mixed)
+    !!   pair_w   = [[S_uu^SFM, B_24], [B_42, B_44]]          (u,omega kept mixed)
+    !! with the small-flow Schur channel
+    !!   S_uu^SFM = B_22 - sum_ch (L Qi U)/(1+zeta),  L in {B_21, B_25, B_26}
+    !! and Riesz maps Qi = B_33^-1 (psi channel), B_44^-1 (rho, T channels).
+    !!
+    !! RAW blocks only: the base is B_22 and the psi-channel L is B_21, NOT their
+    !! Schur-corrected counterparts. The fourth-order couplings B_24 M_w^-1 B_42
+    !! and B_23 M_j^-1 B_31 are carried by the mixed pairs themselves, so
+    !! subtracting them from the diagonals as well would double-count them --
+    !! silently, with no error and no log difference. Every block of pair_psi and
+    !! pair_w is therefore second order or a mass matrix, which is the point.
+    !!
+    !! The j-channel is absent from S_uu^SFM because the j-row of the upper
+    !! coupling U is identically zero (the j constraint carries no u-coupling), so
+    !! a block-diagonal Riesz M_y contributes nothing through it. That is a
+    !! statement about the SCHUR CHANNEL only -- at the sweep level j is fully
+    !! present, via the explicit B_23 j* and B_63 j* terms in the apply.
+    !!
+    !! CONSEQUENCE FOR THE APPLY: Jacobian rows 3 and 4 are [B_31,0,B_33,0,0,0]
+    !! and [0,B_42,0,B_44,0,0], so both pairs represent their constraint equation
+    !! EXACTLY. This arm therefore needs NO constraint mass pre-solve and NO
+    !! back-substitution -- j and omega come out of the pair solves. The
+    !! dispatcher must skip both, and must not fold -B_24 M_w^-1 x_w into the u
+    !! residual: that coupling lives in the (1,2) entry of pair_w.
+    Mat :: K_pj_aij          !< OWNED MPIAIJ of pair_psi; rebuilt every PC rebuild
+                             !  (B_11 carries theta*tstep and the evolving state)
+    Mat :: S_W_aij           !< OWNED MPIAIJ of pair_w;   rebuilt every PC rebuild
+    KSP :: ksp_pair_psi      !< PREONLY + LU on K_pj_aij
+    KSP :: ksp_pair_w        !< PREONLY + LU on S_W_aij
+    Vec :: rhs_PJ, sol_PJ    !< packed (psi,j)-sized work vecs;   created ONCE
+    Vec :: rhs_W,  sol_W     !< packed (u,omega)-sized work vecs; created ONCE
+                             !  The Mat handles change on every rebuild but their
+                             !  SIZES never do, so create-once is correct.
+    IS  :: is_pair_psi(2), is_pair_w(2)  !< layout-only strides into the packed
+                             !  vectors. Unused by the direct arm; they are what a
+                             !  future PCFIELDSPLIT inner solver needs.
+    logical :: schur_mixed_ready      = .false. !< K_pj_aij/S_W_aij exist and must be
+                                                !  destroyed before being rebuilt
+    logical :: schur_mixed_vecs_ready = .false. !< rhs_PJ/sol_PJ/rhs_W/sol_W + the ISs exist
+    logical :: schur_mixed_active     = .false. !< the apply must take the mixed-pair arm.
+                                                !  Set by the BUILDER on success, never read
+                                                !  from the namelist by the apply -- so a
+                                                !  failed build can never be mistaken for a
+                                                !  successful one.
+
     ! --- Sub-blocks PC: (psi,u) Alfven super-block + independent rho, T blocks ---
     Mat :: K_A_block                     !< 2x2 MatNest of the (psi,u) Alfven super-system
     Mat :: K_A_aij                       !< MPIAIJ conversion of K_A_block for the block solver

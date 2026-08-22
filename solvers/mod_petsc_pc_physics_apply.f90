@@ -10,6 +10,7 @@ module mod_petsc_pc_physics_apply
   public :: physics_pc_apply
   public :: k_a_exact_mult
   public :: s_pbp_diag_mult   ! TEMPORARY diagnostic (Option A, Step 2) -- remove with Step 3
+  public :: pack_2v, unpack_2v   ! Workstream B: also used by the mixed-pair null test
 
 contains
 
@@ -499,7 +500,10 @@ contains
   !>
   !> Work-vector roles:
   !>   work_1 = temp_j, work_2 = temp_w   (inputs; read by the folds, then free)
-  !>   work_3, work_5 = scratch
+  !>   work_3 = scratch
+  !>   work_5 = scratch; in step 2 it holds the wave RHS and, on the commutator
+  !>            arm, must SURVIVE the S_PBP solve -- the ZBIG Jacobi add-back
+  !>            reads it after y_u has been formed
   !>   work_4 = r~_u (held from the fold until the wave RHS is formed)
   !>   y_psi  = psi*  (predictor flux, corrected in place in step 3)
   !>   tmp_rho = rho*, tmp_T = T*  (predictor pressure, corrected into y_rho / y_T)
@@ -544,7 +548,32 @@ contains
     call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
     call MatMult(g_ctx%B_26, g_ctx%tmp_T, g_ctx%work_3, ierr)
     call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
-    call KSPSolve(g_ctx%ksp_S_PBP, g_ctx%work_5, y_u, ierr)             ! y_u = u
+    if (.not. g_ctx%schur_comm_active) then
+      call KSPSolve(g_ctx%ksp_S_PBP, g_ctx%work_5, y_u, ierr)           ! y_u = u
+    else
+      ! Stage 6.3, commutator arm: S_PBP holds only S_ass, so the wave solve
+      ! is Shat^-1 = Q_u^-1 A_uM S_ass^-1 -- the Riesz map and the commutator
+      ! factor that S_ass was multiplied by when it was assembled. Same
+      ! composition as the Stage 4.6 harness (schur_global_pc_apply).
+      ! work_5 must survive to the boundary add-back below, so the masked
+      ! right-hand side goes into work_3 (dead from the line above).
+      if (g_ctx%schur_comm_mask) then
+        call VecPointwiseMult(g_ctx%work_3, g_ctx%work_5, g_ctx%u_mask, ierr)
+      else
+        call VecCopy(g_ctx%work_5, g_ctx%work_3, ierr)
+      endif
+      call KSPSolve(g_ctx%ksp_S_PBP, g_ctx%work_3, y_u, ierr)
+      if (g_ctx%schur_comm_mask) call VecPointwiseMult(y_u, y_u, g_ctx%u_mask, ierr)
+      call MatMult(g_ctx%A_uM_prod, y_u,          g_ctx%work_3, ierr)
+      call MatMult(g_ctx%Qi_u_prod, g_ctx%work_3, y_u,          ierr)   ! y_u = u
+      if (g_ctx%schur_comm_mask) then
+        ! Penalty rows: Jacobi on the ZBIG diagonal. The interior operator
+        ! carries the identity there, which is ~1e11 off.
+        call VecPointwiseMult(y_u, y_u, g_ctx%u_mask, ierr)
+        call VecPointwiseMult(g_ctx%work_3, g_ctx%work_5, g_ctx%u_bnd, ierr)
+        call VecAXPY(y_u, 1.0d0, g_ctx%work_3, ierr)
+      endif
+    endif
 
     ! --- Step 3: flux corrector  psi = psi* - Atilde_11^-1 (B_12 u + B_16 T*) ---
     call MatMult(g_ctx%B_12, y_u, g_ctx%work_3, ierr)                   ! work_3 = B_12 u
@@ -565,6 +594,135 @@ contains
 
     ierr = 0
   end subroutine apply_wave_schur_predictor_corrector
+
+  !--------------------------------------------------------------------
+  !> Apply path: MIXED-PAIR block-LDU sweep (Workstream B, "SFM").
+  !>
+  !> Neither constraint variable is eliminated. Where the substituted schemes
+  !> fold j and omega away with exact mass solves -- raising the differential
+  !> order of the psi and u diagonals to fourth in the process -- this sweep
+  !> keeps both explicit and solves two mixed 2x2 pairs:
+  !>
+  !>   pair_psi = [[B_11, B_13], [B_31, B_33]]
+  !>   pair_w   = [[S_uu^SFM, B_24], [B_42, B_44]]
+  !>
+  !> Sequence (no mass pre-solves, no residual folds, no back-substitution):
+  !>
+  !>   1. Predictor psi-pair: pair_psi (psi*, j*) = (x_psi, x_j)      [1 packed solve]
+  !>   1. Predictor rho:      rho* = B_55^-1 (x_rho - B_51 psi*)
+  !>   1. Predictor T:        T*   = B_66^-1 (x_T - B_61 psi* - B_63 j*)
+  !>   2. Wave solve:         RHS_u  = x_u - B_21 psi* - B_23 j* - B_25 rho* - B_26 T*
+  !>                          RHS_om = x_w
+  !>                          pair_w (u, omega) = (RHS_u, RHS_om)     [1 packed solve]
+  !>   3. Corrector psi-pair: pair_psi (dpsi, dj) = (B_12 u + B_16 T*, 0)
+  !>                          y_psi = psi* - dpsi ,  y_j = j* - dj
+  !>   3. Corrector rho:      y_rho = rho* - B_55^-1 (B_52 u)
+  !>   3. Corrector T:        y_T   = T*   - B_66^-1 (B_62 u)
+  !>
+  !> Three zero structures carry the whole scheme, and each is commented at its
+  !> site below because getting any of them wrong is silent:
+  !>
+  !>   - L's omega-row is zero  -> RHS_om is the RAW input residual x_w, with no
+  !>     fold and no correction. In particular there is NO -B_24 M_w^-1 x_w term
+  !>     on RHS_u: that coupling lives in the (1,2) entry of pair_w, and folding
+  !>     it here as well would double-count it.
+  !>   - U's j-row is zero      -> the corrector pair RHS has a zero j-component.
+  !>     (The PREDICTOR pair RHS j-component is x_j, not zero.)
+  !>   - U's omega-column is zero -> step 3 never touches y_w; omega is final
+  !>     straight out of the wave solve.
+  !>
+  !> Jacobian rows 3 and 4 are [B_31,0,B_33,0,0,0] and [0,B_42,0,B_44,0,0], i.e.
+  !> row 2 of each pair IS its constraint equation verbatim. So the pairs
+  !> reproduce exactly what a mass pre-solve plus back-substitution would have
+  !> computed, and the dispatcher skips both on this arm.
+  !>
+  !> PRECONDITION: none. Unlike every other arm, this one neither reads nor
+  !> requires work_1/work_2 (temp_j/temp_w) -- it never folds.
+  !>
+  !> Work-vector roles:
+  !>   work_3, work_4, work_5 = 1-variable scratch
+  !>   tmp_rho = rho*, tmp_T = T*   (predictor values, needed until step 3)
+  !>   rhs_PJ/sol_PJ, rhs_W/sol_W   = the packed pair vectors
+  !>   y_psi = psi* then psi ; y_j = j* then j ; y_u = u ; y_w = omega (final)
+  !>
+  !> All six output components are written exactly once, so this routine does not
+  !> depend on y being zeroed on entry.
+  !--------------------------------------------------------------------
+  subroutine apply_wave_schur_mixed_pairs(x_psi, x_u, x_j, x_w, x_rho, x_T, &
+                                          y_psi, y_u, y_j, y_w, y_rho, y_T, ierr)
+    Vec, intent(in)    :: x_psi, x_u, x_j, x_w, x_rho, x_T
+    Vec, intent(inout) :: y_psi, y_u, y_j, y_w, y_rho, y_T
+    PetscErrorCode, intent(out) :: ierr
+
+    ! --- Step 1: predictor psi-pair.  pair_psi (psi*, j*) = (x_psi, x_j) ---
+    ! The j-component of the RHS is x_j, NOT zero: this is the constraint
+    ! equation's own residual, and it is what makes j* equal the mass
+    ! back-substitution M_j^-1 (x_j - B_31 psi*).
+    call pack_2v(x_psi, x_j, g_ctx%rhs_PJ, ierr)
+    call KSPSolve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, ierr)
+    call unpack_2v(g_ctx%sol_PJ, y_psi, y_j, ierr)          ! y_psi = psi*, y_j = j*
+
+    ! --- Step 1: predictor density  rho* = B_55^-1 (x_rho - B_51 psi*) ---
+    call MatMult(g_ctx%B_51, y_psi, g_ctx%work_3, ierr)
+    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_rho, ierr)
+    call KSPSolve(g_ctx%ksp_rho, g_ctx%work_4, g_ctx%tmp_rho, ierr)   ! tmp_rho = rho*
+
+    ! --- Step 1: predictor temperature  T* = B_66^-1 (x_T - B_61 psi* - B_63 j*) ---
+    ! B_61 and B_63 act against the EXPLICIT predictor pair (psi*, j*). No
+    ! j-folded lower-triangular block is needed or wanted here.
+    call MatMult(g_ctx%B_61, y_psi, g_ctx%work_3, ierr)
+    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_T, ierr)
+    call MatMult(g_ctx%B_63, y_j, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
+    call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, g_ctx%tmp_T, ierr)       ! tmp_T = T*
+
+    ! --- Step 2: the ONE packed wave solve ---
+    !   RHS_u = x_u - B_21 psi* - B_23 j* - B_25 rho* - B_26 T*
+    ! B_21 is the RAW lower coupling and B_23 j* carries the Lorentz path
+    ! explicitly. There is deliberately NO -B_24 M_w^-1 x_w term: the u-omega
+    ! coupling is the (1,2) entry of pair_w (see the header).
+    call VecCopy(x_u, g_ctx%work_5, ierr)
+    call MatMult(g_ctx%B_21, y_psi, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_23, y_j, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_25, g_ctx%tmp_rho, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_26, g_ctx%tmp_T, g_ctx%work_3, ierr)
+    call VecAXPY(g_ctx%work_5, -1.0d0, g_ctx%work_3, ierr)
+    !   RHS_om = x_w VERBATIM. The omega-row of the lower coupling L is
+    !   identically zero, so the omega component of (r_w - L y*) is the raw
+    !   input residual -- no fold, no correction term.
+    call pack_2v(g_ctx%work_5, x_w, g_ctx%rhs_W, ierr)
+    call KSPSolve(g_ctx%ksp_pair_w, g_ctx%rhs_W, g_ctx%sol_W, ierr)
+    call unpack_2v(g_ctx%sol_W, y_u, y_w, ierr)      ! BOTH final; y_w is DONE
+
+    ! --- Step 3: corrector psi-pair.  pair_psi (dpsi, dj) = (B_12 u + B_16 T*, 0) ---
+    ! Here the j-component of the RHS IS zero, because the j-row of the upper
+    ! coupling U is identically zero. (Contrast the predictor above.)
+    call MatMult(g_ctx%B_12, y_u, g_ctx%work_3, ierr)
+    call MatMult(g_ctx%B_16, g_ctx%tmp_T, g_ctx%work_4, ierr)
+    call VecAXPY(g_ctx%work_3, 1.0d0, g_ctx%work_4, ierr)      ! B_12 u + B_16 T*
+    call VecZeroEntries(g_ctx%work_4, ierr)
+    call pack_2v(g_ctx%work_3, g_ctx%work_4, g_ctx%rhs_PJ, ierr)
+    call KSPSolve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, ierr)
+    call unpack_2v(g_ctx%sol_PJ, g_ctx%work_3, g_ctx%work_4, ierr)  ! dpsi, dj
+    call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)            ! y_psi = psi* - dpsi
+    call VecAXPY(y_j,   -1.0d0, g_ctx%work_4, ierr)            ! y_j   = j*   - dj
+                                                               ! (replaces the j
+                                                               !  back-substitution)
+
+    ! --- Step 3: rho / T correctors. Only u enters -- U's omega COLUMN is zero. ---
+    call MatMult(g_ctx%B_52, y_u, g_ctx%work_3, ierr)
+    call KSPSolve(g_ctx%ksp_rho, g_ctx%work_3, g_ctx%work_5, ierr)
+    call VecWAXPY(y_rho, -1.0d0, g_ctx%work_5, g_ctx%tmp_rho, ierr)
+
+    call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
+    call KSPSolve(g_ctx%ksp_T, g_ctx%work_3, g_ctx%work_5, ierr)
+    call VecWAXPY(y_T, -1.0d0, g_ctx%work_5, g_ctx%tmp_T, ierr)
+
+    ierr = 0
+  end subroutine apply_wave_schur_mixed_pairs
 
   !--------------------------------------------------------------------
   !> PCSHELL apply callback: compute y = P^{-1} x.
@@ -612,14 +770,34 @@ contains
     call VecGetSubVector(y, g_ctx%is_var(var_T),   y_T,   ierr)
 
     ! --- Step 2: Apply inverse of elliptic constraint mass matrices ---
-    ! work_1 = A_33^{-1} * x_j  (temp_j)
-    call KSPSolve(g_ctx%ksp_Mj, x_j, g_ctx%work_1, ierr)
-    ! work_2 = A_44^{-1} * x_w  (temp_w)
-    call KSPSolve(g_ctx%ksp_Mw, x_w, g_ctx%work_2, ierr)
+    ! The mixed-pair arm keeps j and omega explicit, so it needs neither of
+    ! these: both constraint equations are solved inside their pair.
+    !
+    ! The zeroing is deliberate belt-and-braces rather than a bare skip. If any
+    ! fold path were ever reached on this arm, a ZERO makes that fold a no-op,
+    ! which is the correct behaviour here -- whereas values left stale from the
+    ! previous apply would instead produce plausible-looking wrong numbers. Two
+    ! VecZeroEntries in exchange for turning the nastiest silent-failure mode on
+    ! this arm into a harmless one, and it still saves the two solves.
+    if (.not. g_ctx%schur_mixed_active) then
+      ! work_1 = A_33^{-1} * x_j  (temp_j)
+      call KSPSolve(g_ctx%ksp_Mj, x_j, g_ctx%work_1, ierr)
+      ! work_2 = A_44^{-1} * x_w  (temp_w)
+      call KSPSolve(g_ctx%ksp_Mw, x_w, g_ctx%work_2, ierr)
+    else
+      call VecZeroEntries(g_ctx%work_1, ierr)
+      call VecZeroEntries(g_ctx%work_2, ierr)
+    endif
 
     ! --- Step 3: Schur-correct the RHS and solve ---
     if (physics_pc_multi_step) then
-      if (physics_pc_wave_schur) then
+      if (g_ctx%schur_mixed_active) then
+        ! Workstream B: mixed-pair sweep. j and omega are outputs of the two
+        ! packed pair solves, so this routine takes and returns all six
+        ! components and the dispatcher's folds/back-substitutions are skipped.
+        call apply_wave_schur_mixed_pairs(x_psi, x_u, x_j, x_w, x_rho, x_T, &
+                                         y_psi, y_u, y_j, y_w, y_rho, y_T, ierr)
+      else if (physics_pc_wave_schur) then
         ! New wave-Schur block-LDU sweep (Sec. 5.4): full predictor + A_16 corrector.
         call apply_wave_schur_predictor_corrector(x_psi, x_u, x_rho, x_T, &
                                                   y_psi, y_u, y_rho, y_T, ierr)
@@ -659,15 +837,22 @@ contains
     endif
 
     ! --- Step 4: Back-substitute for j and w ---
-    ! y_j = A_33^{-1} * (x_j - B_31 * y_psi)
-    call MatMult(g_ctx%B_31, y_psi, g_ctx%work_3, ierr)
-    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_j, ierr)
-    call KSPSolve(g_ctx%ksp_Mj, g_ctx%work_4, y_j, ierr)
+    ! Skipped on the mixed-pair arm: y_j and y_w are already final, having come
+    ! out of the two pair solves. Row 2 of each pair IS the constraint equation
+    ! being back-substituted here, so the values would be identical -- but y_j is
+    ! a VecGetSubVector view that this block would overwrite, and running it
+    ! would cost two needless solves.
+    if (.not. g_ctx%schur_mixed_active) then
+      ! y_j = A_33^{-1} * (x_j - B_31 * y_psi)
+      call MatMult(g_ctx%B_31, y_psi, g_ctx%work_3, ierr)
+      call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_j, ierr)
+      call KSPSolve(g_ctx%ksp_Mj, g_ctx%work_4, y_j, ierr)
 
-    ! y_w = A_44^{-1} * (x_w - B_42 * y_u)
-    call MatMult(g_ctx%B_42, y_u, g_ctx%work_3, ierr)
-    call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_w, ierr)
-    call KSPSolve(g_ctx%ksp_Mw, g_ctx%work_4, y_w, ierr)
+      ! y_w = A_44^{-1} * (x_w - B_42 * y_u)
+      call MatMult(g_ctx%B_42, y_u, g_ctx%work_3, ierr)
+      call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_w, ierr)
+      call KSPSolve(g_ctx%ksp_Mw, g_ctx%work_4, y_w, ierr)
+    endif
 
     ! --- Step 5: Restore sub-vectors ---
     call VecRestoreSubVector(x, g_ctx%is_var(var_psi), x_psi, ierr)

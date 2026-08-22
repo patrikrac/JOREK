@@ -85,6 +85,18 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 physics_pc_verify_schur,                            &
                 physics_pc_schur_approx,                            &
                 physics_pc_schur_assemble,                          &
+                physics_pc_schur_itersolve,                         &
+                physics_pc_schur_global,                            &
+                physics_pc_schur_channels,                          &
+                physics_pc_schur_massinv,                           &
+                physics_pc_schur_amg,                               &
+                physics_pc_schur_amg_its,                           &
+                physics_pc_schur_variant,                           &
+                physics_pc_schur_inner,                             &
+                physics_pc_schur_mask,                              &
+                physics_pc_schur_pairinv,                           &
+                physics_pc_probe_inner,                             &
+                physics_pc_verify_mixed,                            &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &

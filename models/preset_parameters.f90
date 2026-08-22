@@ -659,6 +659,18 @@ subroutine preset_parameters
   physics_pc_verify_schur   = .false.       ! Stage 4.1: verify the exact Schur factorization of P_full
   physics_pc_schur_approx   = .false.       ! Stage 4.2: small-flow and commutator M_* approximations of S_u
   physics_pc_schur_assemble = .false.       ! Stage 4.4/Workstream A: sparse assembled Shat_ass with lumped mass inverses
+  physics_pc_schur_itersolve = .false.      ! Stage 4.5: is S_ass itself iteratively solvable? (ILU/AMG vs sparse MUMPS)
+  physics_pc_schur_global    = .false.      ! Stage 4.6: global FGMRES on P_full with the assembled-Schur block-LDU PC
+  physics_pc_schur_channels  = 1            ! Stage 6.2: channels in the production small-flow Schur (1=psi, 2=+rho, 3=+T)
+  physics_pc_schur_massinv   = 8            ! Stage 6.2: its mass inverse (2=diagonal, 3=row-sum lumped, 7=FSAI-0, 8=FSAI-1)
+  physics_pc_schur_amg       = .false.      ! Stage 6.2: solve S_PBP by GMRES+BoomerAMG instead of LU/MUMPS
+  physics_pc_schur_amg_its   = 4            ! Stage 6.2: fixed inner AMG-Krylov budget for S_PBP
+  physics_pc_schur_variant   = "SF"         ! Stage 6.3: momentum-Schur ansatz ("SF" = small-flow; else a cm_table label, e.g. M1a, M2e)
+  physics_pc_schur_inner     = 0            ! Stage 6.3: inner S_PBP solver (0 = legacy, honour physics_pc_schur_amg)
+  physics_pc_schur_mask      = .true.       ! Stage 6.3: ZBIG interior treatment for the commutator arm
+  physics_pc_probe_inner     = 0            ! Workstream B phase 5: iterative/AMG amenability probe (0=off, 1=LU+ILU, 2=+scalar AMG, 3=+fieldsplit)
+  physics_pc_schur_pairinv   = 2            ! Workstream B "SFM2": (psi,j) pair Schur inverse (2=diag, 3=lumped, 7=FSAI-0, 8=FSAI-1)
+  physics_pc_verify_mixed    = .false.      ! Workstream B: mixed-pair null test (rows 3/4 hard pass/fail)
   commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 

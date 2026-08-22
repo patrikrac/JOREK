@@ -13,11 +13,17 @@ module mod_petsc_pc_physics
        compute_full_momentum_schur_exact, &
        setup_S_PBP_diag_shell, materialize_S_PBP_diag_aij, &
        setup_block_ksp, setup_constraint_mass_ksp, &
+       build_schur_smallflow_prod, build_schur_commutator_prod, &
+       build_pair_psi_prod, build_schur_mixed_prod, &
+       setup_schur_inner_ksp, &
+       probe_inner_solvers, &
        setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov, &
        setup_alfven_block_ksp, setup_rho_block_ksp, setup_T_block_ksp, &
        assemble_monolithic_4x4, assemble_probed_exact_4x4, &
        verify_alfven_2x2_segregated, verify_reduced_pde_operator, &
-       verify_schur_factorization_4x4, verify_schur_approx_4x4
+       verify_schur_factorization_4x4, verify_schur_approx_4x4, &
+       verify_schur_itersolve, verify_schur_global_solve, &
+       verify_schur_mixed_apply
   use mod_petsc_pc_physics_element, only: &
        petsc_create_pc_matrices, petsc_assemble_pc_matrices, &
        petsc_update_physics_pc_ctx, petsc_test_pc_matrix
@@ -27,8 +33,37 @@ module mod_petsc_pc_physics
   public :: petsc_setup_physics_pc, petsc_create_pc_matrices, &
             petsc_assemble_pc_matrices, petsc_update_physics_pc_ctx, &
             petsc_physics_pc_build_reduced
+  public :: physics_pc_needs_commutator_blocks
 
 contains
+
+  !--------------------------------------------------------------------
+  !> .true. when the PRODUCTION preconditioner needs the assembled
+  !! commutator building blocks, i.e. a non-"SF" Schur variant is selected.
+  !!
+  !! This exists so jorek2_main can assemble the blocks WITHOUT the user
+  !! having to set commutator_analysis. That flag gates two unrelated
+  !! things: the block assembly (cheap, needed here) and
+  !! petsc_commutator_run_analysis, the per-toroidal-harmonic intertwining
+  !! defect sweep -- which is expensive and runs on every step, including
+  !! solve_only ones. Requiring it here would silently make every
+  !! commutator production run pay for a diagnostic it does not use.
+  !--------------------------------------------------------------------
+  logical function physics_pc_needs_commutator_blocks()
+    use phys_module, only: use_physics_pc, physics_pc_multi_step, &
+                          physics_pc_schur_variant
+
+    ! "SFM" (Workstream B, the mixed-pair arm) is like "SF" here: it is built
+    ! from raw B_ij blocks and mass inverses only, so it needs none of the
+    ! assembled commutator element blocks. Without this exclusion every SFM run
+    ! would pay for an assembly it never reads.
+    physics_pc_needs_commutator_blocks = use_physics_pc .and. &
+                                         physics_pc_multi_step .and. &
+                                         trim(physics_pc_schur_variant) /= "SF" .and. &
+                                         trim(physics_pc_schur_variant) /= "SFM" .and. &
+                                         trim(physics_pc_schur_variant) /= "SFM2"
+  end function physics_pc_needs_commutator_blocks
+
 
   !--------------------------------------------------------------------
   !> Register the physics-based PCSHELL on an existing KSP.
@@ -59,13 +94,17 @@ contains
                            physics_pc_multi_step, physics_pc_probe_exact, &
                            physics_pc_sub_blocks, physics_pc_verify_spbp, &
                            physics_pc_verify_reduced, physics_pc_verify_schur, &
-                           physics_pc_schur_approx
+                           physics_pc_schur_approx, physics_pc_schur_itersolve, &
+                           physics_pc_schur_global, &
+                           physics_pc_schur_amg, physics_pc_schur_amg_its, &
+                           physics_pc_schur_variant, physics_pc_verify_mixed
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate, &
                                          petsc_mat_diff_norm
 
     Mat, intent(in) :: A_full
 
     PetscErrorCode :: ierr
+    logical :: schur_ok       !< Stage 6.3: did the commutator builder accept the configuration?
     PetscInt :: bs_ntor
     integer :: comm, my_id, mpierr
     logical :: first_time
@@ -106,6 +145,16 @@ contains
 
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] Building reduced 4x4 system (extracted blocks)..."
+
+      ! Parallel cross-check, upstream of every physics-PC operation: is the
+      ! GLOBAL matrix already partition-dependent? ||A||_F cannot depend on the
+      ! partition, so a mismatch here places the fault in JOREK's assembly
+      ! rather than in the block extraction below.
+      block
+        PetscReal :: afn
+        call MatNorm(A_full, NORM_FROBENIUS, afn, ierr)
+        if (my_id == 0) write(*,'(A,ES16.9)') "[Physics PC]   operand(A_full): ||A||_F = ", afn
+      end block
     endif
 
     ! --- Step 1: Create index sets (first time only) ---
@@ -351,6 +400,99 @@ contains
         call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time, "rho-block KSP")
         call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time, "T-block KSP")
         g_ctx%ksp_created = .true.
+
+        ! --- Stage 6.2: the momentum Schur operator for the wave solve ---
+        ! Until now ksp_S_PBP was never set up and tmp_rho/tmp_T were never
+        ! allocated, so the wave-Schur apply dereferenced unallocated PETSc
+        ! objects -- the long-standing physics_pc_multi_step SIGSEGV. The
+        ! assembled small-flow Schur complement is the missing operand.
+        ! Stage 6.3: which ansatz fills S_PBP. "SF" is the Stage 6.2 small-flow
+        ! operator and is the default, so an existing namelist is unaffected.
+        ! Any other value is a cm_table candidate label (M1a, M2e, ...), whose
+        ! inverse is only half the operator -- the apply then also carries the
+        ! right factor Q_u^-1 A_uM (see apply_wave_schur_predictor_corrector).
+        ! Reset BOTH arm flags unconditionally before dispatching, then let the
+        ! chosen arm set its own. A stale schur_comm_active would make the apply
+        ! dereference an A_uM_prod that this configuration never built.
+        g_ctx%schur_comm_active  = .false.
+        g_ctx%schur_mixed_active = .false.
+
+        ! The inner-KSP setup lives INSIDE each arm, not after the dispatch: the
+        ! mixed-pair arm never builds S_PBP at all, so an unconditional
+        ! setup_schur_inner_ksp on it would hand KSPSetOperators an
+        ! uninitialized Mat.
+        select case (trim(physics_pc_schur_variant))
+
+        case ("SF")
+          call build_schur_smallflow_prod(comm, first_time, my_id)
+          call setup_schur_inner_ksp(g_ctx%ksp_S_PBP, g_ctx%S_PBP, comm, first_time, my_id)
+          g_ctx%ksp_S_PBP_created = .true.
+
+        case ("SFM", "SFM2")
+          ! Workstream B: keep j and omega explicit and solve two mixed 2x2
+          ! pairs instead of the substituted fourth-order diagonals. No S_PBP,
+          ! no commutator blocks, no constraint mass folds in the apply.
+          call build_pair_psi_prod(comm, first_time, my_id)
+          call build_schur_mixed_prod(comm, first_time, my_id, &
+                                     physics_pc_schur_variant, schur_ok)
+          if (.not. schur_ok) then
+            ! Deliberately NOT a fallback to another arm: silently running a
+            ! different preconditioner than the one requested would mean
+            ! measuring the wrong thing while believing otherwise.
+            if (my_id == 0) write(*,'(A)') &
+              "[Physics PC]   FATAL: the mixed-pair Schur (SFM) could not be built."
+            call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+          endif
+          call setup_block_ksp(g_ctx%ksp_pair_psi, g_ctx%K_pj_aij, comm, first_time, &
+                               "pair_psi KSP ([B_11,B_13;B_31,B_33])")
+          call setup_block_ksp(g_ctx%ksp_pair_w,   g_ctx%S_W_aij,  comm, first_time, &
+                               "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])")
+          ! Packed work vectors: the Mat handles are rebuilt every step but their
+          ! SIZES never change, so these are created exactly once.
+          !
+          ! Where physics_pc_schur_inner would hook in later: swap the two
+          ! setup_block_ksp calls for setup_schur_inner_ksp. Note that its AMG
+          ! cases apply SCALAR BoomerAMG, which is the wrong structure for a
+          ! packed 2-field matrix -- the nest->AIJ layout is field-major (all u
+          ! rows, then all omega rows), not interleaved. The right iterative
+          ! structure is PCFIELDSPLIT on is_pair_w with a lower Schur
+          ! factorization (the omega block is a mass matrix). That is a new
+          ! case, not a reuse of the existing AMG helper.
+          if (.not. g_ctx%schur_mixed_vecs_ready) then
+            call MatCreateVecs(g_ctx%K_pj_aij, g_ctx%rhs_PJ, g_ctx%sol_PJ, ierr)
+            call MatCreateVecs(g_ctx%S_W_aij,  g_ctx%rhs_W,  g_ctx%sol_W,  ierr)
+            g_ctx%schur_mixed_vecs_ready = .true.
+          endif
+
+          ! Phase 5 diagnostic: how solvable is each step by an iterative
+          ! method? Off by default; builds and destroys its own KSPs, so it
+          ! cannot perturb the four production solves above.
+          call probe_inner_solvers(comm, my_id)
+
+        case default
+          call build_schur_commutator_prod(comm, first_time, my_id, &
+                                           physics_pc_schur_variant, schur_ok)
+          if (.not. schur_ok) then
+            ! The builder validates before it mutates anything, so S_PBP is
+            ! still in the state the small-flow builder expects for this
+            ! first_time. Falling back keeps the run usable; it is loud so it
+            ! can never be mistaken for the requested configuration.
+            if (my_id == 0) write(*,'(A)') &
+              "[Physics PC]   falling back to the small-flow Schur"
+            g_ctx%schur_comm_active = .false.
+            call build_schur_smallflow_prod(comm, first_time, my_id)
+          endif
+          call setup_schur_inner_ksp(g_ctx%ksp_S_PBP, g_ctx%S_PBP, comm, first_time, my_id)
+          g_ctx%ksp_S_PBP_created = .true.
+
+        end select
+
+        ! 1-variable scratch the predictor/corrector sweep needs for rho*, T*.
+        if (.not. g_ctx%sub_blocks_setup_done) then
+          call MatCreateVecs(g_ctx%B_55, g_ctx%tmp_rho, PETSC_NULL_VEC, ierr)
+          call MatCreateVecs(g_ctx%B_66, g_ctx%tmp_T,   PETSC_NULL_VEC, ierr)
+          g_ctx%sub_blocks_setup_done = .true.
+        endif
       endif
 
       !       ! Build K_A (psi,u) 2x2 MatNest from refs to existing Atilde_*/B_12.
@@ -460,7 +602,16 @@ contains
     !     afterwards, matching the physics_pc_verify_spbp convention.
     if (physics_pc_verify_reduced) call verify_reduced_pde_operator(A_full, comm, my_id)
     if (physics_pc_verify_schur)   call verify_schur_factorization_4x4(comm, my_id)
+    ! Workstream B: the mixed-pair null test. Cheap (O(1) matvecs), so unlike the
+    ! probing harnesses above it runs on any mesh. Rows 3 and 4 are a hard gate.
+    if (physics_pc_verify_mixed)   call verify_schur_mixed_apply(comm, my_id)
     if (physics_pc_schur_approx)   call verify_schur_approx_4x4(comm, my_id)
+    ! Stage 4.5 is independent of the Stage 4.2 harness on purpose: it needs
+    ! no exact S_u, hence no dense probing, hence it runs on refined meshes.
+    if (physics_pc_schur_itersolve) call verify_schur_itersolve(comm, my_id)
+    ! Stage 4.6 closes the loop: 4.2 priced the approximation and 4.5 priced
+    ! the inner solve, but only the global outer count says what the PC is worth.
+    if (physics_pc_schur_global)    call verify_schur_global_solve(comm, my_id)
   end subroutine petsc_physics_pc_build_reduced
 
 

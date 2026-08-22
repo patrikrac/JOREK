@@ -88,3 +88,5 @@ jorek2_fields_xyz
 jorek2_wall_forces
 kinetic_neutrals
 recombination_*
+run_*
+meas_*
