@@ -44,7 +44,8 @@ module mod_sparse
 #ifdef USE_PETSC
 #include "petsc/finclude/petsc.h"
     use petsc
-    use mod_petsc, only: petsc_init_system, petsc_update_matrix, petsc_update_rhs, &
+    use mod_petsc, only: petsc_format_is_aij, &
+                        petsc_init_system, petsc_update_matrix, petsc_update_rhs, &
                          petsc_update_initial_guess, &
                          petsc_solve_iterative_and_retrieve, petsc_recover_solution, &
                          petsc_solve_and_retrieve, petsc_equilibrium_assemble, &
@@ -226,7 +227,15 @@ module mod_sparse
       else
 #endif
 
+      ! iblockptr/jcn_block have exactly two consumers left: the legacy JOREK
+      ! matvecs (mod_matv) and matrix_equilibration/scale_by_cols. The COO path
+      ! uses neither - PETSc owns the sparsity and does its own MatMult - and it
+      ! may not even have irn any more, which this routine reads. So skip it
+      ! there unless equilibration is on.
       if (.not. a_mat%bcsr_mapped) then
+#ifdef USE_PETSC
+        if (use_matrix_equilibration .or. (.not. petsc_format_is_aij())) &
+#endif
         call set_block_csr_permutations(a_mat)
       endif
 

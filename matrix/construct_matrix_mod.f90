@@ -30,9 +30,6 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   use mod_fix_axis_nodes, only: fix_nodes_on_axis
   use vacuum_response, only: vacuum_boundary_integral
   use global_distributed_matrix, only: global_matrix_structure_vacuum
-#ifdef USE_PETSC
-  use mod_petsc, only: petsc_create_matrix, petsc_mat_format, PETSC_FORMAT_AIJ
-#endif
   implicit none
 
 #include "r3_info.h"
@@ -106,45 +103,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   call new_thread_buffers() 
 
   ! --- Allocation/Reallocation of the sparse matrix and right-hand side vector
-#ifdef USE_PETSC
-  ! -jorek_mat_format aij assembles into JOREK's own irn/jcn/val and pushes the
-  ! result to PETSc in one MatSetValuesCOO (see petsc_init_system_coo). Leaving
-  ! petsc_assembled .false. is what selects that: every insertion site - element
-  ! blocks here, boundary conditions in mod_assembly, axis treatment, fix_axis_nodes
-  ! and vacuum_response - already branches on that same flag, so they all keep
-  ! writing into val with no further changes.
-  if ((.not. harmonic_matrix) .and. (trim(petsc_mat_format()) /= PETSC_FORMAT_AIJ)) then !TODO: Might be unnessecary ... constant protection by harmonic_matrix...
-    ! Direct PETSc assembly: skip irn/jcn/val, use PETSc MPIBAIJ matrix
-    if (.not. a_mat%petsc_assembled) then
-      call petsc_create_matrix(a_mat%petsc_A, a_mat)
-      a_mat%petsc_assembled = .true.
-    else
-      PetscCallA(MatZeroEntries(a_mat%petsc_A, ierr))
-    endif
-  else
-#endif
-  if (a_mat%coo_structure_fixed) then
-    ! COO path, steady state: PETSc already holds the sparsity, so only the values
-    ! change from one time step to the next. Re-allocating and re-zeroing irn/jcn
-    ! here would be ~2/3 of the traffic through this block for nothing, and they
-    ! may well have been released by petsc_init_system_coo.
-    a_mat%val(1:a_mat%nnz) = 0.0d0
-  else
-  if (associated(a_mat%irn)) call tr_deallocatep(a_mat%irn, "irn", CAT_DMATRIX)
-  if (associated(a_mat%jcn)) call tr_deallocatep(a_mat%jcn, "jcn", CAT_DMATRIX)
-  if (associated(a_mat%val)) call tr_deallocatep(a_mat%val, "val", CAT_DMATRIX)
-
-  call tr_allocatep(a_mat%irn, Int1, a_mat%nnz, "irn", CAT_DMATRIX)
-  call tr_allocatep(a_mat%jcn, Int1, a_mat%nnz, "jcn", CAT_DMATRIX)
-  call tr_allocatep(a_mat%val, Int1, a_mat%nnz, "val", CAT_DMATRIX)
-
-  a_mat%irn(1:a_mat%nnz) = 0
-  a_mat%jcn(1:a_mat%nnz) = 0
-  a_mat%val(1:a_mat%nnz) = 0.0d0
-  endif
-#ifdef USE_PETSC
-  endif
-#endif
+  call prepare_matrix_storage(a_mat, harmonic_matrix)
 
   if (associated(rhs_vec%val)) call tr_deallocatep(rhs_vec%val,"rhs",CAT_DMATRIX)
   call tr_allocatep(rhs_vec%val, Int1, a_mat%ng, "rhs", CAT_DMATRIX)
@@ -295,6 +254,116 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   call r3_info_end(r3_info_index_0)
   call tr_print_memsize("EndConstM")
 end subroutine construct_matrix
+
+
+!> Get a_mat's storage ready for one assembly pass, and decide which backend that
+!! pass writes into. There are three cases:
+!!
+!!  - BAIJ (the default): assemble straight into a PETSc MATMPIBAIJ. irn/jcn/val
+!!    are never allocated at all; petsc_assembled is what every insertion site
+!!    branches on to take that route.
+!!  - AIJ/COO (-jorek_mat_format aij) and the non-PETSc direct solvers: assemble
+!!    into JOREK's own irn/jcn/val. petsc_assembled stays .false., so element
+!!    blocks here plus the boundary conditions in mod_assembly, mod_axis_treatment,
+!!    mod_fix_axis_nodes and vacuum_response all keep writing into val unchanged;
+!!    petsc_init_system_coo then pushes val in one MatSetValuesCOO.
+!!  - AIJ/COO in steady state: PETSc already owns the sparsity, so only val is
+!!    reset. See the index discussion below.
+subroutine prepare_matrix_storage(a_mat, harmonic_matrix)
+  use tr_module
+  use mod_integer_types, only: Int1
+  use phys_module, only: use_matrix_equilibration
+  use data_structure, only: type_SP_MATRIX
+#ifdef USE_PETSC
+  use mod_petsc, only: petsc_create_matrix, petsc_format_is_aij, petsc_coo_verify_requested
+#endif
+  implicit none
+
+  type(type_SP_MATRIX), intent(inout) :: a_mat
+  logical, intent(in) :: harmonic_matrix
+
+  logical :: need_indices
+#ifdef USE_PETSC
+  PetscErrorCode :: ierr
+
+  if ((.not. harmonic_matrix) .and. (.not. petsc_format_is_aij())) then
+    if (.not. a_mat%petsc_assembled) then
+      call petsc_create_matrix(a_mat%petsc_A, a_mat)
+      a_mat%petsc_assembled = .true.
+    else
+      PetscCallA(MatZeroEntries(a_mat%petsc_A, ierr))
+    endif
+    return
+  endif
+#endif
+
+  ! Does anything still read irn/jcn after this assembly? On the COO path PETSc
+  ! derives the sparsity from the block structure (build_coo_indices), so the two
+  ! nnz-length index arrays have exactly one remaining consumer: equilibration,
+  ! which indexes through jcn on every solve. Skipping them there saves 8 B/nnz at
+  ! the preallocation peak and two integer stores per matrix entry in the first
+  ! element pass. Every other path - the harmonic PC matrix and the MUMPS /
+  ! STRUMPACK / PaStiX direct solvers - consumes irn/jcn directly and keeps them.
+  need_indices = .true.
+#ifdef USE_PETSC
+  if ((.not. harmonic_matrix) .and. petsc_format_is_aij() .and. (.not. use_matrix_equilibration) &
+      .and. (.not. petsc_coo_verify_requested())) then
+    need_indices = .false.
+  endif
+#endif
+
+  if (a_mat%coo_structure_fixed) then
+    ! COO path, steady state: PETSc holds the sparsity, so only the values change
+    ! from one time step to the next. Re-allocating and re-zeroing the indices here
+    ! would be most of the traffic through this routine for nothing, and they may
+    ! well have been released by petsc_init_system_coo.
+    call zero_val_parallel(a_mat)
+    return
+  endif
+
+  if (associated(a_mat%val)) call tr_deallocatep(a_mat%val, "val", CAT_DMATRIX)
+  call tr_allocatep(a_mat%val, Int1, a_mat%nnz, "val", CAT_DMATRIX)
+
+  if (need_indices) then
+    if (associated(a_mat%irn)) call tr_deallocatep(a_mat%irn, "irn", CAT_DMATRIX)
+    if (associated(a_mat%jcn)) call tr_deallocatep(a_mat%jcn, "jcn", CAT_DMATRIX)
+    call tr_allocatep(a_mat%irn, Int1, a_mat%nnz, "irn", CAT_DMATRIX)
+    call tr_allocatep(a_mat%jcn, Int1, a_mat%nnz, "jcn", CAT_DMATRIX)
+    a_mat%irn(1:a_mat%nnz) = 0
+    a_mat%jcn(1:a_mat%nnz) = 0
+  else
+    ! Release rather than leave stale: add_block_to_sp_matrix keys the index fill on
+    ! association, so a surviving array from a previous structure would be written
+    ! with the new one's indices and quietly disagree with what PETSc was given.
+    if (associated(a_mat%irn)) call tr_deallocatep(a_mat%irn, "irn", CAT_DMATRIX)
+    if (associated(a_mat%jcn)) call tr_deallocatep(a_mat%jcn, "jcn", CAT_DMATRIX)
+  endif
+
+  call zero_val_parallel(a_mat)
+
+end subroutine prepare_matrix_storage
+
+
+!> Reset the value array before an assembly pass.
+!!
+!! Threaded rather than a plain array assignment: at production sizes this is a
+!! multi-GB memset once per time step, which single-threaded costs about as much
+!! as the entire element loop that follows. The static schedule also first-touches
+!! the pages from the same threads that will accumulate into them.
+subroutine zero_val_parallel(a_mat)
+  use mod_integer_types, only: int_all
+  use data_structure, only: type_SP_MATRIX
+  implicit none
+
+  type(type_SP_MATRIX), intent(inout) :: a_mat
+  integer(kind=int_all) :: k
+
+  !$omp parallel do default(none) shared(a_mat) private(k) schedule(static)
+  do k = 1, a_mat%nnz
+    a_mat%val(k) = 0.0d0
+  enddo
+  !$omp end parallel do
+end subroutine zero_val_parallel
 
 
 !> Helps to interprete an element matrix index
@@ -622,11 +691,12 @@ subroutine add_block_to_sp_matrix(index_node1, i, i_order, i_bnd, i_bnd_type, &
 
       thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local) = 0.d0
 
-      ! Index fill runs only while the sparsity is still being established. Once
-      ! PETSc's COO preallocation has consumed irn/jcn they are fixed (and may be
-      ! deallocated), so keeping this out of the accumulation loop below saves two
-      ! integer stores per matrix entry on every subsequent time step.
-      if (.not. a_mat%coo_structure_fixed) then
+      ! Index fill runs only for backends that consume irn/jcn. prepare_matrix_storage
+      ! leaves them unassociated on the COO path, where PETSc derives the sparsity
+      ! from the block structure instead (build_coo_indices), and releases them once
+      ! the preallocation is done. Keeping this out of the accumulation loop below
+      ! also saves two integer stores per matrix entry on every later time step.
+      if (associated(a_mat%irn)) then
         do j = 1, n_var * n_tor_local
           do l = 1, n_var * n_tor_local
             ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l

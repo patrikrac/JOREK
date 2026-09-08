@@ -24,10 +24,11 @@
 #   baij (default)  MATMPIBAIJ, filled block-by-block with MatSetValuesBlocked
 #                   straight from the element loop, then MatConvert'ed to
 #                   MATMPIAIJ for the KSP on EVERY solve.
-#   aij             JOREK assembles into its own irn/jcn/val (which is already a
-#                   duplicate-free COO triplet set) and pushes it to a MATAIJ
-#                   operator with one MatSetValuesCOO. The KSP consumes that
-#                   matrix directly - no conversion, and no b/x vector copies.
+#   aij             JOREK assembles into its own val array and pushes it to a
+#                   MATAIJ operator with one MatSetValuesCOO; the COO indices are
+#                   derived from the block sparsity, so irn/jcn are not even
+#                   allocated. The KSP consumes that matrix directly - no
+#                   conversion, and no b/x vector copies.
 #
 # Use aij for anything GPU: PETSc implements the COO interface and the device
 # matrix types (aijcusparse, aijkokkos) for AIJ only, never for BAIJ, so baij
@@ -39,6 +40,32 @@
 # -jorek_mat_type            aijcusparse
 # The solution/RHS vectors are created with MatCreateVecs and so follow the
 # matrix type automatically - there is no separate vector option to set.
+#
+# -jorek_mat_type is read ONLY on the aij path, because that is the only path
+# that calls MatSetFromOptions on the operator. Setting it without also setting
+# -jorek_mat_format aij leaves it unused, which -options_left reports as
+#   Option left: name:-jorek_mat_type value:aijcusparse
+# The log line says which path ran: "[PETSc] init: AIJ/COO matrix ..." for aij,
+# "[PETSc] create_matrix: BAIJ ..." for baij.
+#
+# MEMORY: aij costs about 16 bytes per nonzero more than baij at steady state -
+# JOREK's val array (8) plus PETSc's persistent COO map (16), against the
+# converted-AIJ duplicate baij carries (8). At ~3e8 nonzeros per rank that is
+# ~2.4 GB, which is enough to turn a job that just fits into one that is killed.
+# Raise the memory request before switching a large case over.
+#
+# NOTE on use_matrix_equilibration: equilibration indexes through jcn and the
+# block-CSR map on every solve, so with it enabled the aij path keeps both and
+# the memory saving above does not apply. Be aware also that equilibration is
+# currently applied only when PETSc is NOT assembling the matrix directly, so
+# baij + use_matrix_equilibration silently skips it while aij does not - the two
+# formats are then not comparable.
+#
+# -jorek_coo_verify_indices             # debugging: cross-check the generated
+#     COO indices against the irn/jcn the element loop fills, and abort on any
+#     disagreement. Keeps irn/jcn alive for the comparison, so it costs the
+#     memory the aij path normally saves. Use after touching either the block
+#     structure or the index convention in add_block_to_sp_matrix.
 
 # --- Main iterative solve ---------------------------------------------------
 # -jorek_ksp_type            gmres      # default: gmres
