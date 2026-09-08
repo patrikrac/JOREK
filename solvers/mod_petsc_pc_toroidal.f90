@@ -88,8 +88,19 @@ contains
       ! family instead of having to be repeated once per split.
       PetscCallA(KSPSetOptionsPrefix(subksp_array(i), PC_BLOCK_PREFIX, ierr))
       PetscCallA(KSPSetType(subksp_array(i), KSPPREONLY, ierr))
-      PetscCallA(KSPSetFromOptions(subksp_array(i), ierr))
+      ! Establish JOREK's default block PC *before* any option is processed.
+      ! KSPSetFromOptions below configures whatever PC the sub-KSP currently has,
+      ! and an untyped PC falls back to PETSc's own default - PCBJACOBI when the
+      ! block is parallel, but PCILU when it is sequential. PCILU is a factor PC,
+      ! so it consumes -jorek_pcblock_pc_factor_mat_solver_type and aborts on any
+      ! package with no ILU (MUMPS: "does not support factorization type ILU").
+      ! petsc_configure_direct_solver sets PCLU too, but it runs afterwards, which
+      ! is too late to protect that first pass. Users can still override the type
+      ! here or there - PCSetFromOptions is applied after this in both places.
       PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
+      PetscCallA(PCSetType(subpc, PCLU, ierr))
+      PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
+      PetscCallA(KSPSetFromOptions(subksp_array(i), ierr))
       call petsc_configure_direct_solver(subpc)
       PetscCallA(KSPSetUp(subksp_array(i), ierr))
       ! Opt-in, inert unless -jorek_dump_mat is set: write this block out so it

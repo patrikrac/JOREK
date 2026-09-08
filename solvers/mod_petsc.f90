@@ -521,11 +521,17 @@ contains
     PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
 
     PetscCallA(KSPSetType(petsc_sys%ksp, KSPPREONLY, ierr))
-    PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
 
     ! Set the preconditioner: direct solve, LU via MUMPS unless overridden by
-    ! -jorek_direct_pc_* options.
+    ! -jorek_direct_pc_* options. PCLU is set before KSPSetFromOptions because an
+    ! untyped PC would otherwise be configured from options as PETSc's default
+    ! (PCILU for a sequential operator), which consumes the factor-package option
+    ! and aborts for any package without an ILU. Same reason as the block PC in
+    ! mod_petsc_pc_toroidal.
     PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
+    PetscCallA(PCSetType(pc, PCLU, ierr))
+    PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
+    PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
     call petsc_configure_direct_solver(pc)
 
     PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
