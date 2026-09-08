@@ -21,15 +21,28 @@ module mod_petsc
   !> Options prefix of the one-shot direct solve path
   character(len=*), parameter :: PETSC_DIRECT_PREFIX = 'jorek_direct_'
 
+  !> Operator storage formats selectable with -jorek_mat_format.
+  !! 'baij' is the historical path: MATMPIBAIJ filled block-by-block with
+  !! MatSetValuesBlocked, then MatConvert'ed to MATMPIAIJ for the KSP on every
+  !! solve. 'aij' assembles MATAIJ once through PETSc's COO interface and hands
+  !! it to the KSP directly - no conversion, and the only format that can ever be
+  !! device-resident (PETSc implements COO and the cusparse/kokkos matrix types
+  !! for AIJ only, never for BAIJ).
+  character(len=*), parameter :: PETSC_FORMAT_BAIJ = 'baij'
+  character(len=*), parameter :: PETSC_FORMAT_AIJ  = 'aij'
+
   type type_PETSC_SYSTEM
-    Mat  :: A              ! BAIJ system matrix (from JOREK block-CSR)
-    Mat  :: A_aij          ! AIJ version used by KSP (persistent)
-    Vec  :: x, b           ! BAIJ solution/RHS vectors
-    Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (persistent)
+    Mat  :: A              ! system matrix: MATMPIBAIJ, or MATAIJ when aij_native
+    Mat  :: A_aij          ! AIJ version used by KSP (persistent; unused when aij_native)
+    Vec  :: x, b           ! solution/RHS vectors matching A
+    Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (unused when aij_native)
     KSP  :: ksp            ! Krylov solver context (persistent)
     logical :: initialized   = .false.  ! A, x, b created
     logical :: owns_A        = .false.  ! .true. when A was created by petsc_init_system (old path)
     logical :: ksp_ready     = .false.  ! KSP, A_aij, PC setup + factored
+    !> .true. when A is already the AIJ operator the KSP consumes, so A_aij /
+    !! x_aij / b_aij are never created and no MatConvert or VecCopy happens.
+    logical :: aij_native    = .false.
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
   end type type_PETSC_SYSTEM
@@ -114,6 +127,121 @@ contains
   end subroutine petsc_print_version
 
 
+  !> Operator format requested with -jorek_mat_format {baij|aij}, defaulting to
+  !! baij so an unconfigured run behaves exactly as before.
+  function petsc_mat_format() result(fmt)
+    character(len=8) :: fmt
+    PetscBool        :: found
+    PetscErrorCode   :: ierr
+
+    fmt = PETSC_FORMAT_BAIJ
+    ! NOTE: PetscCallA is a cpp macro, so its argument must stay on one line - a
+    ! Fortran '&' continuation splits it before cpp ever sees the second half.
+    PetscCallA(PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, '-'//PETSC_MAIN_PREFIX//'mat_format', fmt, found, ierr))
+  end function petsc_mat_format
+
+
+  !> Initialize a MATAIJ operator whose values are pushed with PETSc's COO
+  !! interface.
+  !!
+  !! JOREK's a_mat is already a duplicate-free COO triplet set: mod_global_matrix_structure
+  !! builds irn_jcn as a sorted, deduplicated block-column list per block row (it
+  !! explicitly rejects a repeated index) and ijA_index gives each block a contiguous
+  !! slice of val, so every scalar entry has exactly one slot and construct_matrix
+  !! fills the matching irn/jcn (construct_matrix_mod.f90:617-618) with 1-based global
+  !! indices. That means the COO index arrays ARE a_mat%irn/jcn shifted to 0-based,
+  !! and the per-timestep value array IS a_mat%val - no expansion, no re-ordering, and
+  !! no block row/column-major convention to get wrong, because COO is per scalar entry.
+  !!
+  !! It also means boundary conditions need no special handling here: the ZBIG penalty
+  !! writes (mod_assembly.f90, mod_axis_treatment.f90, mod_fix_axis_nodes.f90) and the
+  !! vacuum response contributions are all resolved into a_mat%val on the JOREK side
+  !! before this routine ever sees them, so a single INSERT_VALUES push is correct.
+  !!
+  !! Ranks own disjoint block-row ranges [my_ind_min, my_ind_max] and store full rows,
+  !! so no (i,j) is submitted by two ranks. This matters: PETSc SUMS duplicate COO
+  !! entries across ranks regardless of the InsertMode.
+  subroutine petsc_init_system_coo(petsc_sys, a_mat)
+    use data_structure, only: type_SP_MATRIX
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_SP_MATRIX), intent(in) :: a_mat
+
+    integer :: comm, my_id, mpierr
+    integer :: block_size
+    PetscInt :: n_local, n_global
+    PetscInt, allocatable :: coo_i(:), coo_j(:)
+    PetscCount :: ncoo
+    PetscErrorCode :: ierr
+
+    comm = a_mat%comm
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    block_size = a_mat%block_size
+    n_global   = int(a_mat%ng, kind=kind(n_global))
+    n_local    = int((a_mat%my_ind_max - a_mat%my_ind_min + 1) * block_size, kind=kind(n_local))
+
+    call MatCreate(comm, petsc_sys%A, ierr)
+    call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
+    call MatSetType(petsc_sys%A, MATAIJ, ierr)
+    ! Keep the block size as metadata: PCFIELDSPLIT still slices the operator by
+    ! toroidal mode family and MatSetBlockSize is what makes that indexing valid.
+    call MatSetBlockSize(petsc_sys%A, block_size, ierr)
+    ! The prefix is what makes -jorek_mat_type reach this matrix; without it the key
+    ! would have to be the un-prefixed -mat_type and would hit every other Mat too.
+    call MatSetOptionsPrefix(petsc_sys%A, PETSC_MAIN_PREFIX, ierr)
+    ! Honours -jorek_mat_type aijcusparse (or aijkokkos) without another switch here.
+    call MatSetFromOptions(petsc_sys%A, ierr)
+
+    ! PETSc copies the index arrays, so these are scratch. They are PetscInt (32-bit
+    ! under the cuDSS build) while JOREK's are int_all, hence the explicit conversion.
+    !
+    ! LOAD-BEARING: a_mat%nnz is slightly larger than the number of slots the element
+    ! loop actually fills (global_matrix_structure reserves a block per (row, col) pair
+    ! in irn_jcn; a few are never written). construct_matrix zeroes irn/jcn, so those
+    ! slots arrive here as 0 and the -1 shift turns them into -1, which PETSc's COO
+    ! interface silently ignores - verified against this PETSc build. Do not "fix" the
+    ! shift or the zero-initialisation without re-checking that: mapping them to 0
+    ! instead would dump every unfilled slot onto entry (0,0).
+    ncoo = int(a_mat%nnz, kind=kind(ncoo))
+    allocate(coo_i(a_mat%nnz), coo_j(a_mat%nnz))
+    coo_i(1:a_mat%nnz) = int(a_mat%irn(1:a_mat%nnz) - 1, kind=kind(coo_i))
+    coo_j(1:a_mat%nnz) = int(a_mat%jcn(1:a_mat%nnz) - 1, kind=kind(coo_j))
+
+    PetscCallA(MatSetPreallocationCOO(petsc_sys%A, ncoo, coo_i, coo_j, ierr))
+    deallocate(coo_i, coo_j)
+
+    call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
+
+    petsc_sys%initialized = .true.
+    petsc_sys%owns_A      = .true.
+    petsc_sys%aij_native  = .true.
+    if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0,A,I0)') "[PETSc] init: AIJ/COO matrix ", n_global, "x", n_global, &
+                                                       ", block_size=", block_size, ", local nnz=", a_mat%nnz
+  end subroutine petsc_init_system_coo
+
+
+  !> Push JOREK's value array into the COO-preallocated operator. This replaces the
+  !! whole per-block MatSetValuesBlocked loop of petsc_update_matrix with one call.
+  !!
+  !! a_mat%val is passed as a single contiguous array on purpose, and must stay that
+  !! way: MatSetValuesCOO_SeqAIJCUSPARSE memtype-detects its value pointer
+  !! (aijcusparse.cu:4422) and consumes device memory directly, so moving JOREK's
+  !! assembly onto the GPU later requires no change on this side - only to where
+  !! a_mat%val is allocated and written.
+  subroutine petsc_update_matrix_coo(petsc_sys, a_mat)
+    use data_structure, only: type_SP_MATRIX
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_SP_MATRIX), intent(in) :: a_mat
+    PetscErrorCode :: ierr
+
+    ! INSERT_VALUES, not ADD_VALUES: a_mat holds one slot per (i,j) with all element,
+    ! boundary-condition and vacuum contributions already accumulated into it.
+    PetscCallA(MatSetValuesCOO(petsc_sys%A, a_mat%val, INSERT_VALUES, ierr))
+  end subroutine petsc_update_matrix_coo
+
+
   !> Initialize BAIJ matrix structure and BAIJ vecs — called once when !initialized
   !TODO: Redundant with petsc_create_matrix. One must go...
   subroutine petsc_init_system(petsc_sys, a_mat)
@@ -128,6 +256,11 @@ contains
     integer :: r_start, r_end, c_global, block_col
     PetscInt, allocatable :: d_nnz(:), o_nnz(:)
     PetscErrorCode :: ierr
+
+    if (trim(petsc_mat_format()) == PETSC_FORMAT_AIJ) then
+      call petsc_init_system_coo(petsc_sys, a_mat)
+      return
+    endif
 
     comm = a_mat%comm
     call MPI_COMM_RANK(comm, my_id, mpierr)
@@ -244,6 +377,11 @@ contains
     PetscInt :: idxm(1), idxn(1)
     PetscScalar, allocatable :: vals_petsc(:)
     PetscErrorCode :: ierr
+
+    if (petsc_sys%aij_native) then
+      call petsc_update_matrix_coo(petsc_sys, a_mat)
+      return
+    endif
 
     call MPI_COMM_RANK(a_mat%comm, my_id, mpierr)
 
@@ -375,10 +513,33 @@ contains
   end subroutine petsc_solve_and_retrieve
 
 
+  !> The operator and vectors the KSP actually works on. On the BAIJ path these are
+  !! the converted AIJ duplicates; on the native AIJ path they are simply A, b and x,
+  !! so no conversion or vector copy is needed anywhere in the solve.
+  subroutine ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
+    type(type_PETSC_SYSTEM), intent(in) :: petsc_sys
+    Mat, intent(out) :: A_ksp
+    Vec, intent(out) :: b_ksp, x_ksp
+
+    if (petsc_sys%aij_native) then
+      A_ksp = petsc_sys%A
+      b_ksp = petsc_sys%b
+      x_ksp = petsc_sys%x
+    else
+      A_ksp = petsc_sys%A_aij
+      b_ksp = petsc_sys%b_aij
+      x_ksp = petsc_sys%x_aij
+    endif
+  end subroutine ksp_operands
+
+
   !> Iterative solve with persistent KSP/PC across time steps.
-  !! On first call (!ksp_ready): creates AIJ matrix, KSP, sets up PCFIELDSPLIT+MUMPS.
-  !! When !solve_only: converts A to AIJ (reuse sparsity), calls KSPSetUp to refactorize.
-  !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
+  !! On first call (!ksp_ready): creates the KSP and sets up PCFIELDSPLIT+MUMPS.
+  !! When !solve_only: calls KSPSetUp to refactorize.
+  !! When solve_only:  sets KSPSetReusePreconditioner to skip refactorization.
+  !! On the BAIJ path each of the three additionally converts A to AIJ (reusing the
+  !! sparsity after the first call); on the native AIJ path A is already the KSP
+  !! operator and no conversion happens at all. See ksp_operands.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
@@ -388,6 +549,8 @@ contains
 
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
+    Mat :: A_ksp
+    Vec :: b_ksp, x_ksp
     KSPConvergedReason :: reason
     PetscLogDouble :: t1, t2
     PetscLogDouble :: ts1, ts2
@@ -406,14 +569,17 @@ contains
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
       PetscCallA(PetscTime(ts1, ierr))
 
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
-      PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      if (.not. petsc_sys%aij_native) then
+        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
+        PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      endif
+      call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
       ! Opt-in, inert unless -jorek_dump_mat is set.
-      call petsc_dump_operator(petsc_sys%A_aij, 'system')
+      call petsc_dump_operator(A_ksp, 'system')
 
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
       PetscCallA(KSPSetOptionsPrefix(petsc_sys%ksp, PETSC_MAIN_PREFIX, ierr))
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
       PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
       ! Warm-start: consume the JOREK initial guess (previous-step increment) loaded into
@@ -459,8 +625,11 @@ contains
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
       PetscCallA(PetscTime(ts1, ierr))
 
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      if (.not. petsc_sys%aij_native) then
+        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      endif
+      call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       ! KSPSetUp only rebuilds PCFIELDSPLIT itself; the sub-KSP LU/MUMPS numerical
@@ -478,22 +647,30 @@ contains
     else
       ! solve_only: update A for mat-vec products but reuse PC factorization
       if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      if (.not. petsc_sys%aij_native) then
+        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      endif
+      call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
     end if
 
-    ! Copy RHS and warm-start guess, solve, copy solution back
-    PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
-    PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for GMRES
+    ! Copy RHS and warm-start guess into the KSP's own vectors. On the native AIJ
+    ! path b_ksp/x_ksp ARE b/x, so there is nothing to copy.
+    if (.not. petsc_sys%aij_native) then
+      PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
+      PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for GMRES
+    endif
 
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
-    PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
+    PetscCallA(KSPSolve(petsc_sys%ksp, b_ksp, x_ksp, ierr))
     PetscCallA(PetscLogStagePop(ierr))
     PetscCallA(PetscTime(t2, ierr))
 
-    PetscCallA(VecCopy(petsc_sys%x_aij, petsc_sys%x, ierr))
+    if (.not. petsc_sys%aij_native) then
+      PetscCallA(VecCopy(petsc_sys%x_aij, petsc_sys%x, ierr))
+    endif
 
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
@@ -703,9 +880,13 @@ contains
 
     if (petsc_sys%ksp_ready) then
       call KSPDestroy(petsc_sys%ksp, ierr)
-      call MatDestroy(petsc_sys%A_aij, ierr)
-      call VecDestroy(petsc_sys%b_aij, ierr)
-      call VecDestroy(petsc_sys%x_aij, ierr)
+      ! On the native AIJ path A_aij/b_aij/x_aij were never created - the KSP ran on
+      ! A, b and x directly - so destroying them here would be a double free.
+      if (.not. petsc_sys%aij_native) then
+        call MatDestroy(petsc_sys%A_aij, ierr)
+        call VecDestroy(petsc_sys%b_aij, ierr)
+        call VecDestroy(petsc_sys%x_aij, ierr)
+      endif
       petsc_sys%ksp_ready = .false.
     endif
     if (petsc_sys%initialized) then
@@ -716,6 +897,7 @@ contains
         petsc_sys%owns_A = .false.
       endif
       petsc_sys%initialized = .false.
+      petsc_sys%aij_native  = .false.
     endif
   end subroutine petsc_cleanup
 

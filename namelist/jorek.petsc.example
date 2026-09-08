@@ -18,6 +18,28 @@
 # single option below reconfigures every one of them.
 # ---------------------------------------------------------------------------
 
+# --- Operator storage format ------------------------------------------------
+# How the system matrix is built and handed to the KSP.
+#
+#   baij (default)  MATMPIBAIJ, filled block-by-block with MatSetValuesBlocked
+#                   straight from the element loop, then MatConvert'ed to
+#                   MATMPIAIJ for the KSP on EVERY solve.
+#   aij             JOREK assembles into its own irn/jcn/val (which is already a
+#                   duplicate-free COO triplet set) and pushes it to a MATAIJ
+#                   operator with one MatSetValuesCOO. The KSP consumes that
+#                   matrix directly - no conversion, and no b/x vector copies.
+#
+# Use aij for anything GPU: PETSc implements the COO interface and the device
+# matrix types (aijcusparse, aijkokkos) for AIJ only, never for BAIJ, so baij
+# can never be device-resident. On CPU the two agree to solver tolerance -
+# identical GMRES iteration counts - and differ only in assembly cost.
+# -jorek_mat_format          aij        # default: baij
+#
+# With aij you can additionally pick the concrete PETSc matrix type, e.g.
+# -jorek_mat_type            aijcusparse
+# The solution/RHS vectors are created with MatCreateVecs and so follow the
+# matrix type automatically - there is no separate vector option to set.
+
 # --- Main iterative solve ---------------------------------------------------
 # -jorek_ksp_type            gmres      # default: gmres
 # -jorek_ksp_rtol            1e-8       # default: 1e-8

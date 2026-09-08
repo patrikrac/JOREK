@@ -31,7 +31,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   use vacuum_response, only: vacuum_boundary_integral
   use global_distributed_matrix, only: global_matrix_structure_vacuum
 #ifdef USE_PETSC
-  use mod_petsc, only: petsc_create_matrix
+  use mod_petsc, only: petsc_create_matrix, petsc_mat_format, PETSC_FORMAT_AIJ
 #endif
   implicit none
 
@@ -107,7 +107,13 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
 
   ! --- Allocation/Reallocation of the sparse matrix and right-hand side vector
 #ifdef USE_PETSC
-  if (.not. harmonic_matrix) then !TODO: Might be unnessecary ... constant protection by harmonic_matrix...
+  ! -jorek_mat_format aij assembles into JOREK's own irn/jcn/val and pushes the
+  ! result to PETSc in one MatSetValuesCOO (see petsc_init_system_coo). Leaving
+  ! petsc_assembled .false. is what selects that: every insertion site - element
+  ! blocks here, boundary conditions in mod_assembly, axis treatment, fix_axis_nodes
+  ! and vacuum_response - already branches on that same flag, so they all keep
+  ! writing into val with no further changes.
+  if ((.not. harmonic_matrix) .and. (trim(petsc_mat_format()) /= PETSC_FORMAT_AIJ)) then !TODO: Might be unnessecary ... constant protection by harmonic_matrix...
     ! Direct PETSc assembly: skip irn/jcn/val, use PETSc MPIBAIJ matrix
     if (.not. a_mat%petsc_assembled) then
       call petsc_create_matrix(a_mat%petsc_A, a_mat)
@@ -198,7 +204,10 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     !$omp end parallel
 
 #ifdef USE_PETSC
-    if (.not. harmonic_matrix) then
+    ! petsc_assembled, not .not.harmonic_matrix: with -jorek_mat_format aij there is
+    ! no a_mat%petsc_A to assemble - the values live in val and are pushed once by
+    ! petsc_update_matrix_coo - and the handle would be uninitialised here.
+    if (a_mat%petsc_assembled) then
       ! Flush element contributions (ADD_VALUES) before BCs (INSERT_VALUES)
       PetscCallA(MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, ierr))
       PetscCallA(MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, ierr))
@@ -222,7 +231,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     endif
 
 #ifdef USE_PETSC
-    if (.not. harmonic_matrix) then
+    if (a_mat%petsc_assembled) then
       ! Flush BC contributions (INSERT_VALUES) before vacuum (ADD_VALUES)
       PetscCallA(MatAssemblyBegin(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, ierr))
       PetscCallA(MatAssemblyEnd(a_mat%petsc_A, MAT_FLUSH_ASSEMBLY, ierr))
@@ -241,7 +250,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     endif
 
 #ifdef USE_PETSC
-    if (.not. harmonic_matrix) then
+    if (a_mat%petsc_assembled) then
       ! Final assembly of PETSc matrix
       PetscCallA(MatAssemblyBegin(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, ierr))
       PetscCallA(MatAssemblyEnd(a_mat%petsc_A, MAT_FINAL_ASSEMBLY, ierr))
