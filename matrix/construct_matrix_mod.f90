@@ -123,6 +123,13 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     endif
   else
 #endif
+  if (a_mat%coo_structure_fixed) then
+    ! COO path, steady state: PETSc already holds the sparsity, so only the values
+    ! change from one time step to the next. Re-allocating and re-zeroing irn/jcn
+    ! here would be ~2/3 of the traffic through this block for nothing, and they
+    ! may well have been released by petsc_init_system_coo.
+    a_mat%val(1:a_mat%nnz) = 0.0d0
+  else
   if (associated(a_mat%irn)) call tr_deallocatep(a_mat%irn, "irn", CAT_DMATRIX)
   if (associated(a_mat%jcn)) call tr_deallocatep(a_mat%jcn, "jcn", CAT_DMATRIX)
   if (associated(a_mat%val)) call tr_deallocatep(a_mat%val, "val", CAT_DMATRIX)
@@ -134,6 +141,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   a_mat%irn(1:a_mat%nnz) = 0
   a_mat%jcn(1:a_mat%nnz) = 0
   a_mat%val(1:a_mat%nnz) = 0.0d0
+  endif
 #ifdef USE_PETSC
   endif
 #endif
@@ -614,17 +622,26 @@ subroutine add_block_to_sp_matrix(index_node1, i, i_order, i_bnd, i_bnd_type, &
 
       thread_struct(omp_tid)%synch_buff(1:n_var*n_tor_local*n_var*n_tor_local) = 0.d0
 
+      ! Index fill runs only while the sparsity is still being established. Once
+      ! PETSc's COO preallocation has consumed irn/jcn they are fixed (and may be
+      ! deallocated), so keeping this out of the accumulation loop below saves two
+      ! integer stores per matrix entry on every subsequent time step.
+      if (.not. a_mat%coo_structure_fixed) then
+        do j = 1, n_var * n_tor_local
+          do l = 1, n_var * n_tor_local
+            ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
+            a_mat%irn(ilarge2) = index_large_i + j
+            a_mat%jcn(ilarge2) = index_large_k + l
+          enddo
+        enddo
+      endif
+
       do j = 1, n_var * n_tor_local
         index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j
 
         do l = 1, n_var * n_tor_local
 
           index_kl = n_tor_local * n_var * n_degrees * (k-1) +  n_tor_local * n_var * (k_order-1) + l
-
-          ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
-
-          a_mat%irn(ilarge2) = index_large_i + j
-          a_mat%jcn(ilarge2) = index_large_k + l
 
           thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) = &
             thread_struct(omp_tid)%synch_buff((j-1)*n_var*n_tor_local+l) + thread_struct(omp_tid)%ELM(index_ij,index_kl)

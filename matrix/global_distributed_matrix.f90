@@ -191,8 +191,11 @@ module global_distributed_matrix
                     sparsepos = det_sparse_pos(l_row, j_col, a_mat%my_ind_min, a_mat)
 
                     ! --- Set row and column numbers in the sparse matrix data structure
-                    a_mat%irn(sparsepos) = l_row
-                    a_mat%jcn(sparsepos) = j_col
+                    ! (skipped once PETSc's COO preallocation owns the sparsity)
+                    if (.not. a_mat%coo_structure_fixed) then
+                      a_mat%irn(sparsepos) = l_row
+                      a_mat%jcn(sparsepos) = j_col
+                    endif
 #ifdef USE_PETSC
                     endif
 #endif

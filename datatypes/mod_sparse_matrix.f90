@@ -46,6 +46,13 @@ module mod_sparse_matrix
     logical                                      :: reduced = .false. !< matrix is available on all comm ranks (not distribued)
     logical                                      :: bcsr_mapped = .false.    !< matrix mapping to block CSR format is determined
     logical                                      :: device_mapped = .false.  !<matrix in mapped to the device
+    !> Set once irn/jcn have been handed to PETSc's COO interface
+    !! (petsc_init_system_coo). The sparsity is fixed for the life of the mesh, so
+    !! from then on construct_matrix only refreshes val and the assembly routines
+    !! stop rewriting the index arrays - which is also what makes it safe to
+    !! release them. Cleared by global_matrix_structure whenever the structure is
+    !! rebuilt.
+    logical                                      :: coo_structure_fixed = .false.
 #ifdef USE_PETSC
     Mat                                          :: petsc_A                  !< PETSc MPIBAIJ matrix for direct assembly
     logical                                      :: petsc_assembled = .false. !< true once PETSc matrix has been created

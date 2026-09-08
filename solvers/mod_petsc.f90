@@ -163,9 +163,11 @@ contains
   !! entries across ranks regardless of the InsertMode.
   subroutine petsc_init_system_coo(petsc_sys, a_mat)
     use data_structure, only: type_SP_MATRIX
+    use tr_module,      only: tr_deallocatep, CAT_DMATRIX
+    use phys_module,    only: use_matrix_equilibration
 
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    type(type_SP_MATRIX), intent(in) :: a_mat
+    type(type_SP_MATRIX), intent(inout) :: a_mat
 
     integer :: comm, my_id, mpierr
     integer :: block_size
@@ -204,12 +206,33 @@ contains
     ! shift or the zero-initialisation without re-checking that: mapping them to 0
     ! instead would dump every unfilled slot onto entry (0,0).
     ncoo = int(a_mat%nnz, kind=kind(ncoo))
-    allocate(coo_i(a_mat%nnz), coo_j(a_mat%nnz))
+
+    ! Each index array is converted and then released immediately, rather than
+    ! building both copies first: MatSetPreallocationCOO is the high-water mark of
+    ! the whole run (it also builds its own sorted permutation), so holding irn,
+    ! jcn, coo_i and coo_j simultaneously would add nnz*2 integers to the peak for
+    ! no reason.
+    !
+    ! irn has no remaining reader on this path - set_block_csr_permutations already
+    ! ran, once, before this routine. jcn does: matrix_equilibration and
+    ! scale_by_cols index through it on every solve, so it survives when
+    ! equilibration is on.
+    allocate(coo_i(a_mat%nnz))
     coo_i(1:a_mat%nnz) = int(a_mat%irn(1:a_mat%nnz) - 1, kind=kind(coo_i))
+    call tr_deallocatep(a_mat%irn, "irn", CAT_DMATRIX)
+
+    allocate(coo_j(a_mat%nnz))
     coo_j(1:a_mat%nnz) = int(a_mat%jcn(1:a_mat%nnz) - 1, kind=kind(coo_j))
+    if (.not. use_matrix_equilibration) then
+      call tr_deallocatep(a_mat%jcn, "jcn", CAT_DMATRIX)
+    endif
 
     PetscCallA(MatSetPreallocationCOO(petsc_sys%A, ncoo, coo_i, coo_j, ierr))
     deallocate(coo_i, coo_j)
+
+    ! PETSc now owns the sparsity: from here on construct_matrix only refreshes val,
+    ! and every routine that used to write irn/jcn checks this flag first.
+    a_mat%coo_structure_fixed = .true.
 
     call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
 
@@ -236,6 +259,15 @@ contains
     type(type_SP_MATRIX), intent(in) :: a_mat
     PetscErrorCode :: ierr
 
+    ! The COO map PETSc holds describes the sparsity as it was at preallocation. If
+    ! global_matrix_structure has rebuilt it since (it clears this flag), val no
+    ! longer matches that map and pushing it would silently produce a wrong matrix
+    ! rather than fail - so refuse instead. Re-meshing on this path would need the
+    ! operator torn down and petsc_init_system_coo re-run.
+    if (.not. a_mat%coo_structure_fixed) then
+      SETERRA(PETSC_COMM_SELF, PETSC_ERR_ARG_WRONGSTATE, 'matrix structure was rebuilt after the COO preallocation')
+    endif
+
     ! INSERT_VALUES, not ADD_VALUES: a_mat holds one slot per (i,j) with all element,
     ! boundary-condition and vacuum contributions already accumulated into it.
     PetscCallA(MatSetValuesCOO(petsc_sys%A, a_mat%val, INSERT_VALUES, ierr))
@@ -248,7 +280,7 @@ contains
     use data_structure, only: type_SP_MATRIX
 
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    type(type_SP_MATRIX), intent(in) :: a_mat
+    type(type_SP_MATRIX), intent(inout) :: a_mat
 
     integer :: i, k
     integer :: comm, my_id, mpierr
