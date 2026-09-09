@@ -97,6 +97,11 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 physics_pc_schur_pairinv,                           &
                 physics_pc_probe_inner,                             &
                 physics_pc_verify_mixed,                            &
+                physics_pc_pair_scale,                              &
+                physics_pc_pair_inner,                              &
+                physics_pc_pair_maxits,                             &
+                physics_pc_pair_rtol,                               &
+                physics_pc_pair_amg_thr,                            &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &

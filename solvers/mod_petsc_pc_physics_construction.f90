@@ -78,6 +78,7 @@ module mod_petsc_pc_physics_construction
   public :: setup_alfven_block_ksp
   public :: setup_rho_block_ksp, setup_T_block_ksp
   public :: setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov
+  public :: setup_pair_inner_ksp
   public :: assemble_monolithic_4x4
   public :: assemble_probed_exact_4x4
   public :: verify_alfven_2x2_segregated
@@ -813,6 +814,150 @@ contains
 
     if (present(label)) call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS)")
   end subroutine setup_block_ksp
+
+  !--------------------------------------------------------------------
+  !> Production inner solver for a packed SFM2 pair, per docs S12-S13.
+  !!
+  !! Replaces the PREONLY + LU/MUMPS of setup_block_ksp with the configuration
+  !! the T1-T8 experiments converged on. The whole point is COST, not accuracy:
+  !! it removes a factorisation of the 2n-dimensional packed pair in favour of
+  !! AMG on an n-dimensional block that T1 certified as fully AMG-amenable.
+  !!
+  !! Shape (mode 1), with the MASS block as field 0:
+  !!
+  !!   A~ = [ B_33  B_31 ]      Shat = B_11      (schur_precondition = a11)
+  !!        [ B_13  B_11 ]
+  !!
+  !!   field 0  B_33 (mass)   : GMRES + ILU(0) via bjacobi, few iterations
+  !!   field 1  Shat = B_11   : GMRES + GAMG, unsmoothed aggregation, ILU smoother
+  !!
+  !! Every choice here is a measured one:
+  !!   MASS BLOCK FIRST  T6/S12.6, err 7.098e0 -> 7.02e-2 at fixed rtol. It
+  !!     eliminates the cheap well-conditioned block and leaves B_11, which T1
+  !!     showed AMG handles; the psi-first ordering leaves a Schur that it does not.
+  !!   a11 RATHER THAN selfp  T6: 7.02e-2 vs 8.53e-2, and T8 shows Shat = B_11
+  !!     converges in 18-57 its across EIGHT decades of tolerance, so the dropped
+  !!     B_13 B_33^-1 B_31 costs iterations, not accuracy.
+  !!   agg_nsmooths = 0  E2/S11.2, worth ~5 decades on pair_w; PETSc's default 1
+  !!     smooths an already 1051 nnz/row prolongator into near-dense coarse levels.
+  !!   ILU SMOOTHER  T7/S12.5, the first AMG configuration to pass on a pair
+  !!     (pair_w, 9 its, err 4.0e-7). GAMG's default Chebyshev needs an
+  !!     eigenvalue estimate that is unreliable on these operators. Reached via
+  !!     bjacobi because PCILU cannot be applied to MPIAIJ, which these are even
+  !!     on one rank.
+  !!   FGMRES OUTSIDE  the inner solves are iterative, hence a VARIABLE
+  !!     preconditioner. Admissible only because the global solver is already
+  !!     FGMRES (mod_petsc.f90:387). Left-preconditioned GMRES would silently
+  !!     lose orthogonality here.
+  !!
+  !! Mode 2 is the cheap alternative for pair_w, where the pair structure is not
+  !! needed: plain GMRES + ILU(0) reached err 2.6e-6 in 12 iterations (S11.1),
+  !! beating every AMG configuration on that operator on every axis.
+  !--------------------------------------------------------------------
+  subroutine setup_pair_inner_ksp(ksp_block, A_pair, is_pair, comm, first_time, &
+                                  fieldsplit, tag, label)
+    use phys_module, only: physics_pc_pair_maxits, physics_pc_pair_rtol, &
+                           physics_pc_pair_amg_thr
+
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: A_pair
+    IS,  intent(in)     :: is_pair(2)
+    integer, intent(in) :: comm
+    logical, intent(in) :: first_time
+    logical, intent(in) :: fieldsplit   !< .true. -> mode 1 shape; .false. -> GMRES+ILU(0)
+    character(len=*), intent(in) :: tag !< distinct options prefix per pair
+    character(len=*), intent(in), optional :: label
+
+    PC :: pc
+    PetscErrorCode :: ierr
+    PetscReal :: abstol, dtol
+    character(len=32) :: pfx
+    character(len=128) :: on
+    character(len=24) :: vstr, tstr
+    character(len=96) :: desc
+
+    abstol = 1.0d-50; dtol = 1.0d6
+    pfx = trim(tag)//"_"
+
+    ! DESTROY AND RECREATE on every rebuild, unlike setup_block_ksp.
+    ! PCFIELDSPLIT caches the extracted sub-matrices and the MatSchurComplement
+    ! it builds from them. The packed pair Mat is rebuilt from scratch each PC
+    ! rebuild (K_pj_aij / S_W_aij are OWNED and re-created), so those caches
+    ! point at freed matrices and KSPSetOperators alone does not invalidate
+    ! them -- measured as a SEGV on the SECOND rebuild, i.e. the first step
+    ! after the tstep ramp advances. Recreating is cheap next to the setup work
+    ! that has to be redone anyway once the operator has changed.
+    if (.not. first_time) call KSPDestroy(ksp_block, ierr)
+    call KSPCreate(comm, ksp_block, ierr)
+    call KSPSetOperators(ksp_block, A_pair, A_pair, ierr)
+    call KSPSetOptionsPrefix(ksp_block, trim(pfx), ierr)
+
+    ! FGMRES even here: field 1's own solve is Krylov, so this KSP's
+    ! preconditioner is itself variable.
+    call KSPSetType(ksp_block, KSPFGMRES, ierr)
+    call KSPGMRESSetRestart(ksp_block, max(physics_pc_pair_maxits, 2), ierr)
+    call KSPSetTolerances(ksp_block, physics_pc_pair_rtol, abstol, dtol, &
+                          physics_pc_pair_maxits, ierr)
+    call KSPGetPC(ksp_block, pc, ierr)
+
+    if (.not. fieldsplit) then
+      call PCSetType(pc, PCBJACOBI, ierr)     !< default sub-PC is ILU(0) on the local block
+      desc = "FGMRES + ILU(0)"
+    else
+      call PCSetType(pc, PCFIELDSPLIT, ierr)
+      ! MASS BLOCK FIRST -- is_pair(2) is j for pair_psi and omega for pair_w.
+      call PCFieldSplitSetIS(pc, "0", is_pair(2), ierr)
+      call PCFieldSplitSetIS(pc, "1", is_pair(1), ierr)
+
+      on = "-"//trim(pfx)//"pc_fieldsplit_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "schur", ierr)
+      on = "-"//trim(pfx)//"pc_fieldsplit_schur_fact_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "lower", ierr)
+      on = "-"//trim(pfx)//"pc_fieldsplit_schur_precondition"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "a11", ierr)
+
+      ! field 0: the mass block. Cheap and well conditioned (T1: ILU(0) 11 its
+      ! to 1.8e-9), so a handful of iterations is ample.
+      on = "-"//trim(pfx)//"fieldsplit_0_ksp_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "gmres", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_0_ksp_max_it"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "5", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_0_ksp_rtol"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "1e-2", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_0_pc_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "bjacobi", ierr)
+
+      ! field 1: Shat = B_11, the AMG target.
+      on = "-"//trim(pfx)//"fieldsplit_1_ksp_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "gmres", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_1_ksp_max_it"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "10", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_1_ksp_rtol"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "1e-2", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_1_pc_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "gamg", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_1_pc_gamg_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "agg", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_1_pc_gamg_agg_nsmooths"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "0", ierr)
+      write(vstr,'(ES12.5)') physics_pc_pair_amg_thr
+      on = "-"//trim(pfx)//"fieldsplit_1_pc_gamg_threshold"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), trim(adjustl(vstr)), ierr)
+      on = "-"//trim(pfx)//"fieldsplit_1_mg_levels_pc_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "bjacobi", ierr)
+      desc = "FGMRES + FIELDSPLIT(mass-first, a11) + GAMG[nsm0, ILU]"
+    endif
+
+    call KSPSetFromOptions(ksp_block, ierr)
+    call KSPSetUp(ksp_block, ierr)
+
+    if (present(label)) then
+      write(tstr,'(ES9.2)') physics_pc_pair_rtol
+      call pc_print_block_setup(comm, label, &
+        trim(desc)//", rtol "//trim(adjustl(tstr)))
+    endif
+
+  end subroutine setup_pair_inner_ksp
 
   !--------------------------------------------------------------------
   !> Set up the KSP for a constraint mass matrix (B_33 = M_jj or B_44 = M_ww).
@@ -5180,6 +5325,18 @@ contains
   !!   1  LU (reference) + GMRES/ILU(0)
   !!   2  + GMRES/BoomerAMG applied SCALARLY
   !!   3  + FGMRES/PCFIELDSPLIT on the pair layout (packed operators only)
+  !!   4  + POINT-BLOCK candidates on the interleaved layout (packed only):
+  !!        LU-on-interleaved (wiring gate), GAMG + damped point-block Jacobi,
+  !!        and hypre BoomerAMG with nodal coarsening. This is the Chacon-style
+  !!        coupled-pair smoother question: the smoothing unit is the (psi,j) or
+  !!        (u,omega) pair at one DOF rather than a scalar.
+  !!
+  !!   8  + T8 Schur tolerance ladder (approximation vs stopping criterion).
+  !!   7  + T1 constituent blocks (B_11, B_33, B_44, B_31), T2 hierarchy dump,
+  !!        T3 M-matrix test, T4/T5/T7 advanced AMG, T6 fieldsplit variants.
+  !!   6  + E3 near-null-space variants on the packed pairs (and on m = 0).
+  !!   5  + E2 AMG parameter sweep (strength threshold, aggregation smoothing)
+  !!        on every operator, and E1 per-harmonic probing of the packed pairs.
   !!
   !! On level 2, read the scalar-AMG rows as a control and not as a verdict on
   !! multigrid: the nest->AIJ layout is field-major (all psi rows, then all j
@@ -5217,6 +5374,23 @@ contains
                             g_ctx%is_pair_psi, .false., lvl, comm, my_id)
     call probe_one_operator(g_ctx%B_66, "B_66 (T transport)            ", &
                             g_ctx%is_pair_psi, .false., lvl, comm, my_id)
+
+    ! T1 (level 7): the CONSTITUENT blocks of pair_psi. In a Ciarlet-Raviart
+    ! formulation the scalar second-order block is what multigrid is actually
+    ! supposed to handle -- it is what Chacon's V-cycles run on and what sits in
+    ! FIELDSPLIT's (1,1) slot -- and it has never been probed on this arm.
+    ! B_31 goes LAST: it is a constraint coupling and may be singular, so if a
+    ! direct solve aborts on it everything above is already printed.
+    if (lvl == 7) then
+      call probe_one_operator(g_ctx%B_11, "B_11 (psi diagonal block)     ", &
+                              g_ctx%is_pair_psi, .false., lvl, comm, my_id)
+      call probe_one_operator(g_ctx%B_33, "B_33 (j mass block)           ", &
+                              g_ctx%is_pair_psi, .false., lvl, comm, my_id)
+      call probe_one_operator(g_ctx%B_44, "B_44 (omega mass block)       ", &
+                              g_ctx%is_pair_psi, .false., lvl, comm, my_id)
+      call probe_one_operator(g_ctx%B_31, "B_31 (psi->j constraint)      ", &
+                              g_ctx%is_pair_psi, .false., lvl, comm, my_id)
+    endif
 
     if (my_id == 0) &
       write(*,'(A)') "[Physics PC] ========== end inner-solver probe =========="
@@ -5278,6 +5452,77 @@ contains
     if (lvl >= 2)   call probe_candidate(A, b, x, x_ref, nref, "GMRES + AMG (scalar)", 3, is_pair, comm, my_id)
     if (lvl >= 3 .and. packed) &
                     call probe_candidate(A, b, x, x_ref, nref, "FGMRES + FIELDSPLIT ", 4, is_pair, comm, my_id)
+    ! Level 4: the point-block (interleaved) layout. Packed operators only -- the
+    ! transport blocks have no pair structure to interleave. Case 5 is the WIRING
+    ! GATE and must be read first: it is LU on the permuted operator, so its err
+    ! has to match the case-1 row. If it does not, the permutation is wrong and
+    ! the two AMG rows below mean nothing.
+    if (lvl >= 4 .and. lvl /= 8 .and. packed) then
+      block
+        IS       :: is_h
+        Mat      :: A_h
+        PetscInt :: n1_h
+        logical  :: ok_h
+        call ISGetSize(is_pair(1), n1_h, ierr)
+        call make_pair_interleave_is(A, n1_h, is_h, comm, my_id, ok_h)
+        if (ok_h) then
+          call MatPermute(A, is_h, is_h, A_h, ierr)
+          call report_diag_histogram(A_h, n1_h, tag, comm, my_id)
+          call report_diag_outliers(A_h, n1_h, tag, 1, comm, my_id)
+          call report_diag_outliers(A_h, n1_h, tag, 2, comm, my_id)
+          call MatDestroy(A_h, ierr)
+          call ISDestroy(is_h, ierr)
+        endif
+      end block
+                    call probe_candidate(A, b, x, x_ref, nref, "LU on interleaved   ", 5, is_pair, comm, my_id)
+                    call probe_candidate(A, b, x, x_ref, nref, "GAMG + pbjacobi     ", 6, is_pair, comm, my_id)
+                    call probe_candidate(A, b, x, x_ref, nref, "hypre nodal         ", 7, is_pair, comm, my_id)
+                    call probe_candidate(A, b, x, x_ref, nref, "GAMG default smooth ", 8, is_pair, comm, my_id)
+                    call probe_candidate(A, b, x, x_ref, nref, "pbjacobi alone bs=2 ", 9, is_pair, comm, my_id)
+                    call probe_candidate(A, b, x, x_ref, nref, "pbjacobi bs=2*n_tor ", 10, is_pair, comm, my_id)
+    endif
+
+    ! Level 5: the two experiments that ask whether the earlier AMG negatives
+    ! were about the OPERATOR or about how we configured the coarsening.
+    !   E2  sweep strength-of-connection and aggregation smoothing. Every AMG
+    !       row so far ran at one fixed threshold with smoothed aggregation on.
+    !   E1  probe one toroidal harmonic block alone. B_13/B_31 are harmonic-
+    !       diagonal, so the full operator we have been handing to AMG is a
+    !       direct sum of n_tor disconnected graphs.
+    ! Both are pure diagnostics: neither touches a production KSP.
+    if (lvl >= 5 .and. lvl /= 8) then
+      call probe_amg_sweep(A, b, x, x_ref, nref, tag, comm, my_id)
+      if (packed) call probe_harmonic_blocks(A, is_pair, tag, lvl, comm, my_id)
+    endif
+
+    ! Level 6: E3, the near-null space. This is the one hypothesis the E2 sweep
+    ! does not cover -- E2 varied how aggressively we coarsen, never what the
+    ! prolongator is asked to reproduce.
+    ! Level 6 only: E3b was inconclusive (see doc S11.4) and costs 300
+    ! unpreconditioned GMRES iterations, so level 7 does not repeat it.
+    if (lvl == 6) call report_condition_estimate(A, b, x, tag, comm, my_id)
+
+    if (lvl == 6 .and. packed) then
+      block
+        PetscInt :: n1_e3
+        call ISGetSize(is_pair(1), n1_e3, ierr)
+        call report_degree_classes(A, n1_e3, tag, comm, my_id)
+        call probe_nullspace(A, b, x, x_ref, nref, n1_e3, tag, .true., comm, my_id)
+      end block
+    endif
+
+    ! Level 7: T2/T3 structural diagnostics and the AMG knobs E2 left untested.
+    if (lvl == 7) then
+      call report_mmatrix(A, tag, comm, my_id)
+      call report_amg_hierarchy(A, tag, comm, my_id)
+      call probe_amg_advanced(A, b, x, x_ref, nref, tag, comm, my_id)
+      if (packed) &
+        call probe_fieldsplit_variants(A, b, x, x_ref, nref, is_pair, tag, comm, my_id)
+    endif
+
+    ! Level 8: T8, the approximation-vs-stopping question on the packed pairs.
+    if (lvl >= 8 .and. packed) &
+      call probe_schur_tolerance_ladder(A, b, x, x_ref, nref, is_pair, tag, comm, my_id)
 
     call VecDestroy(x_ref, ierr); call VecDestroy(b, ierr); call VecDestroy(x, ierr)
 
@@ -5290,7 +5535,260 @@ contains
   !! production KSPs or leak across candidates. Options are set with per-
   !! candidate prefixes for the same reason.
   !--------------------------------------------------------------------
+  !--------------------------------------------------------------------
+  !> Build the stride-2 permutation that turns a FIELD-MAJOR packed pair into a
+  !! POINT-BLOCK (interleaved) one:
+  !!
+  !!   new row 2k   <- old row k        (field 1: psi, or u)
+  !!   new row 2k+1 <- old row n1 + k   (field 2: j,   or omega)
+  !!
+  !! WHY this is only a permutation. create_variable_index_sets builds EVERY
+  !! variable's index set with the same ordering,
+  !!   indices(k) = rstart + i*block_size + (v-1)*n_tor + m,
+  !! so row k of B_11 and row k of B_33 are the SAME physical DOF -- the same
+  !! (node-degree block i, toroidal harmonic m). No geometry lookup and no
+  !! renumbering is needed; the two fields are already aligned index-for-index.
+  !!
+  !! This is the enabling step for a Chacon-style coupled-pair smoother: with the
+  !! fields interleaved and MatSetBlockSize(A,2), each 2x2 diagonal block is
+  !! exactly the (psi,j) pair at one DOF, which is what PCPBJACOBI inverts
+  !! analytically -- the same object as Chacon 2025 Eq. (C.3)'s D = [[I,U],[L,I]]
+  !! with P = I - LU. Field-major, a scalar coarsening instead sees two
+  !! weakly-connected half-graphs, which is the recorded reason scalar AMG
+  !! diverges on these operators.
+  !--------------------------------------------------------------------
+  !--------------------------------------------------------------------
+  !> Decade histogram of |diag| for each field of a packed pair.
+  !!
+  !! WHY. On a C1 Bezier/Hermite basis the DOFs at a node are not equivalent:
+  !! the value DOF and the d/ds, d/dt, d2/dsdt DOFs carry basis functions of
+  !! different scale, so a mass matrix diagonal should CLUSTER into groups
+  !! separated by powers of h rather than form one continuum. If that clustering
+  !! is visible here it identifies the DOF classes directly from the operator,
+  !! with no row -> DOF-type map: exactly what is needed both to build a near-null
+  !! space (constant field = 1 on value DOFs, 0 on derivative DOFs) and to try a
+  !! WITHIN-block scaling, which is the part physics_pc_pair_scale provably
+  !! cannot reach (it found s = 1.0000 on pair_psi because the two block means
+  !! are already equal, while the spread inside the blocks is ~1e10).
+  !!
+  !! Diagnostic only: reports, allocates nothing persistent, changes no operator.
+  !--------------------------------------------------------------------
+  subroutine report_diag_histogram(A, n1_glo, label, comm, my_id)
+    Mat, intent(in)              :: A
+    PetscInt, intent(in)         :: n1_glo
+    character(len=*), intent(in) :: label
+    integer, intent(in)          :: comm
+    integer, intent(in)          :: my_id
+
+    PetscErrorCode :: ierr
+    Vec       :: dv
+    PetscInt  :: rlo, rhi, r
+    integer   :: k, nloc, b, f, mpierr
+    PetscScalar, pointer :: dptr(:)
+    integer, parameter :: LO = -20, HI = 10
+    integer   :: hist(2, LO:HI)
+    real*8    :: av
+
+    call MatCreateVecs(A, dv, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, dv, ierr)
+    call MatGetOwnershipRange(A, rlo, rhi, ierr)
+    nloc = int(rhi - rlo)
+    hist = 0
+
+    call VecGetArray(dv, dptr, ierr)
+    do k = 1, nloc
+      r = rlo + k - 1
+      ! Interleaved layout: even rows are field 1, odd rows field 2. (This is
+      ! called on the PERMUTED operator, where that is the layout by construction.)
+      f = 1 + int(mod(r, 2_8))
+      av = abs(dptr(k))
+      if (av <= 0.d0) then
+        b = LO
+      else
+        b = max(LO, min(HI, int(floor(log10(av)))))
+      endif
+      hist(f, b) = hist(f, b) + 1
+    enddo
+    call VecRestoreArray(dv, dptr, ierr)
+    call VecDestroy(dv, ierr)
+
+    call MPI_Allreduce(MPI_IN_PLACE, hist, 2*(HI-LO+1), MPI_INTEGER, MPI_SUM, comm, mpierr)
+
+    if (my_id == 0) then
+      write(*,'(A,A)') "[Physics PC]   |diag| decade histogram, ", trim(label)
+      write(*,'(A)')   "[Physics PC]     decade   field1   field2"
+      do b = LO, HI
+        if (hist(1,b) + hist(2,b) > 0) &
+          write(*,'(A,I5,2I9)') "[Physics PC]     1e", b, hist(1,b), hist(2,b)
+      enddo
+    endif
+
+  end subroutine report_diag_histogram
+
+  !--------------------------------------------------------------------
+  !> Identify the extreme-|diag| rows of an interleaved packed pair and map them
+  !! back to (node-block, toroidal harmonic).
+  !!
+  !! WHY. The decade histogram shows ~96 rows sitting 6-8 decades above the bulk
+  !! in BOTH pairs, and after physics_pc_pair_scale they carry all of the
+  !! remaining diagonal spread -- a uniform per-field scaling cannot touch
+  !! outliers that live INSIDE a field. Identifying them is therefore the
+  !! cheapest remaining conditioning lead.
+  !!
+  !! The inverse map is exact. create_variable_index_sets lays each variable out
+  !! as k = i*n_tor + m (harmonic innermost), and the interleave puts field 1 at
+  !! even rows and field 2 at odd rows, so
+  !!   packed k = r/2 (r even) or (r-1)/2 (r odd),  i = k/n_tor,  m = mod(k,n_tor).
+  !! i is the BAIJ node-block index of the FULL system: a (mesh node, C1 degree)
+  !! location.
+  !!
+  !! Serial-oriented: the index listing is printed from rank 0's own rows. The
+  !! counts are reduced, so a parallel run still reports the right totals.
+  !--------------------------------------------------------------------
+  subroutine report_diag_outliers(A, n1_glo, label, fsel, comm, my_id)
+    use mod_parameters, only: n_tor
+
+    Mat, intent(in)              :: A
+    PetscInt, intent(in)         :: n1_glo
+    character(len=*), intent(in) :: label
+    integer, intent(in)          :: fsel   !< 1 or 2: report this field only
+    integer, intent(in)          :: comm
+    integer, intent(in)          :: my_id
+
+    PetscErrorCode :: ierr
+    Vec       :: dv
+    PetscInt  :: rlo, rhi, r, kpk, ii, mm
+    integer   :: k, nloc, mpierr, nout, nshow
+    integer   :: hcount(0:63), imin, imax, ndistinct, prev
+    PetscScalar, pointer :: dptr(:)
+    PetscReal :: dmax, thr
+    real*8    :: dmx(2)
+    integer   :: kf
+    integer, allocatable :: ilist(:)
+
+    call MatCreateVecs(A, dv, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, dv, ierr)
+    ! PER-FIELD threshold. A single global one does not separate on pair_w: its
+    ! field 1 (S_uu) sits at 1e3-1e4 while the outliers live in field 2 (B_44) at
+    ! 1e6, so max/100 sweeps up most of S_uu as well. Each field gets its own.
+    call MatGetOwnershipRange(A, rlo, rhi, ierr)
+    nloc = int(rhi - rlo)
+    dmx(1) = 0.d0; dmx(2) = 0.d0
+    call VecGetArray(dv, dptr, ierr)
+    do k = 1, nloc
+      r = rlo + k - 1
+      kf = 1 + int(mod(r, 2_8))
+      dmx(kf) = max(dmx(kf), abs(dptr(k)))
+    enddo
+    call VecRestoreArray(dv, dptr, ierr)
+    call MPI_Allreduce(MPI_IN_PLACE, dmx, 2, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
+    dmax = max(dmx(1), dmx(2))
+    thr = dmax * 1.d-2
+
+    allocate(ilist(max(1, nloc)))
+    hcount = 0
+    nout = 0
+    imin = huge(1); imax = -1
+
+    call VecGetArray(dv, dptr, ierr)
+    do k = 1, nloc
+      r = rlo + k - 1
+      kf = 1 + int(mod(r, 2_8))
+      if (kf /= fsel) cycle
+      if (abs(dptr(k)) < dmx(kf) * 1.d-2) cycle
+      if (mod(r, 2_8) == 0) then
+        kpk = r / 2
+      else
+        kpk = (r - 1) / 2
+      endif
+      ii = kpk / n_tor
+      mm = mod(kpk, n_tor)
+      nout = nout + 1
+      ilist(nout) = int(ii)
+      if (mm >= 0 .and. mm <= 63) hcount(mm) = hcount(mm) + 1
+      imin = min(imin, int(ii)); imax = max(imax, int(ii))
+    enddo
+    call VecRestoreArray(dv, dptr, ierr)
+    call VecDestroy(dv, ierr)
+
+    ! distinct node-blocks among the outliers (ilist is generated in increasing r,
+    ! hence non-decreasing i, so a single pass suffices)
+    ndistinct = 0; prev = -1
+    do k = 1, nout
+      if (ilist(k) /= prev) then
+        ndistinct = ndistinct + 1
+        prev = ilist(k)
+      endif
+    enddo
+
+    call MPI_Allreduce(MPI_IN_PLACE, nout, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
+
+    if (my_id == 0) then
+      write(*,'(A,A,A,I0)') "[Physics PC]   |diag| OUTLIERS (> field max/100), ", &
+        trim(label), "  FIELD ", fsel
+      write(*,'(A,ES11.4,A,ES11.4)') "[Physics PC]     max|diag| field1 = ", dmx(1), &
+        "  field2 = ", dmx(2)
+      write(*,'(A)') "[Physics PC]     (threshold is max/100 within EACH field)"
+      write(*,'(A,I0,A,I0,A)') "[Physics PC]     rows = ", nout, &
+        " in ", ndistinct, " distinct node-blocks i"
+      write(*,'(A,I0,A,I0)') "[Physics PC]     i range: ", imin, " .. ", imax
+      write(*,'(A,64I5)') "[Physics PC]     per-harmonic count m=0..: ", &
+        (hcount(k), k = 0, min(n_tor - 1, 63))
+      nshow = min(nout, 24)
+      write(*,'(A,I0,A)') "[Physics PC]     first ", nshow, " node-blocks i:"
+      write(*,'(A,24I7)') "[Physics PC]       ", (ilist(k), k = 1, nshow)
+    endif
+    deallocate(ilist)
+
+  end subroutine report_diag_outliers
+
+  subroutine make_pair_interleave_is(A, n1_glo, is_int, comm, my_id, ok)
+    Mat, intent(in)       :: A
+    PetscInt, intent(in)  :: n1_glo
+    IS, intent(out)       :: is_int
+    integer, intent(in)   :: comm
+    integer, intent(in)   :: my_id
+    logical, intent(out)  :: ok
+
+    PetscErrorCode :: ierr
+    PetscInt :: rlo, rhi, r, ntot
+    PetscInt :: two          !< kind-matched literal; PetscInt may be integer(8)
+    integer  :: k, nloc
+    PetscInt, allocatable :: idx(:)
+
+    ok = .false.
+    call MatGetSize(A, ntot, PETSC_NULL_INTEGER, ierr)
+
+    ! The interleave is only meaningful if the two fields have equal size; both
+    ! packed pairs do (psi/j share the 1/R space, u/omega the R space). Refuse
+    ! rather than silently build a wrong permutation.
+    if (2 * n1_glo /= ntot) then
+      if (my_id == 0) write(*,'(A,I0,A,I0)') &
+        "[Physics PC]     interleave SKIPPED: 2*n1 /= ntot, ", 2*n1_glo, " vs ", ntot
+      return
+    endif
+
+    two = 2
+    call MatGetOwnershipRange(A, rlo, rhi, ierr)
+    nloc = int(rhi - rlo)
+    allocate(idx(max(1, nloc)))
+    do k = 1, nloc
+      r = rlo + k - 1
+      if (mod(r, two) == 0) then
+        idx(k) = r / 2
+      else
+        idx(k) = n1_glo + (r - 1) / 2
+      endif
+    enddo
+    call ISCreateGeneral(comm, nloc, idx, PETSC_COPY_VALUES, is_int, ierr)
+    deallocate(idx)
+    ok = .true.
+
+  end subroutine make_pair_interleave_is
+
   subroutine probe_candidate(A, b, x, x_ref, nref, name, which, is_pair, comm, my_id)
+    use mod_parameters, only: n_tor
+
     Mat, intent(in)              :: A
     Vec, intent(in)              :: b, x_ref
     Vec, intent(inout)           :: x
@@ -5313,11 +5811,68 @@ contains
     character(len=16) :: pfx
     character(len=12) :: verdict
 
+    !--- point-block (interleaved) operands, cases 5-7 only ---
+    Mat      :: A_use, A_int
+    Vec      :: b_use, x_use, xr_use, b_int, x_int, xr_int
+    IS       :: is_int
+    PetscInt :: n1_glo, bs, ntot_chk
+    logical  :: permuted, perm_ok
+
     rtol = 1.0d-8; abstol = 1.0d-50; dtol = 1.0d4
+
+    !--- Cases 1-4 run on the operator as given. Cases 5-7 run on its
+    !--- POINT-BLOCK permutation. A permutation is orthogonal, so ||x - x_ref||_2
+    !--- is identical in both layouts and nref is unchanged: the err column stays
+    !--- directly comparable across every candidate.
+    permuted = .false.
+    A_use = A; b_use = b; x_use = x; xr_use = x_ref
+
+    if (which >= 5) then
+      call ISGetSize(is_pair(1), n1_glo, ierr)
+      call MatGetSize(A, ntot_chk, PETSC_NULL_INTEGER, ierr)
+      call make_pair_interleave_is(A, n1_glo, is_int, comm, my_id, perm_ok)
+      if (.not. perm_ok) then
+        if (my_id == 0) write(*,'(A,A,A)') &
+          "[Physics PC]     ", name, " : SKIPPED (interleave not available)"
+        return
+      endif
+      call MatPermute(A, is_int, is_int, A_int, ierr)
+
+      ! Point size. bs = 2 is the natural analogue of Chacon's per-cell (A,j)
+      ! block: both fields at ONE dof. Case 10 widens it to 2*n_tor, which after
+      ! this permutation is exactly (both fields) x (all toroidal harmonics) at
+      ! one (node, degree) location -- because the pre-permutation ordering is
+      ! k = i*n_tor + m with the harmonic innermost, so 2*n_tor consecutive rows
+      ! of the interleaved matrix are one such group. That tests whether a 2-dof
+      ! point is simply too small a unit on a C1 Bezier basis.
+      if (which == 10) then
+        bs = 2 * n_tor
+      else
+        bs = 2
+      endif
+      if (mod(ntot_chk, bs) /= 0) then
+        if (my_id == 0) write(*,'(A,A,A,I0)') &
+          "[Physics PC]     ", name, " : SKIPPED, rows not divisible by bs = ", bs
+        call MatDestroy(A_int, ierr); call ISDestroy(is_int, ierr)
+        return
+      endif
+      call MatSetBlockSize(A_int, bs, ierr)
+
+      ! Permute copies, never the caller's vectors -- probe_one_operator reuses
+      ! b and x_ref across every candidate.
+      call VecDuplicate(b, b_int, ierr);      call VecCopy(b, b_int, ierr)
+      call VecDuplicate(x_ref, xr_int, ierr); call VecCopy(x_ref, xr_int, ierr)
+      call VecDuplicate(b, x_int, ierr)
+      call VecPermute(b_int,  is_int, PETSC_FALSE, ierr)
+      call VecPermute(xr_int, is_int, PETSC_FALSE, ierr)
+
+      A_use = A_int; b_use = b_int; x_use = x_int; xr_use = xr_int
+      permuted = .true.
+    endif
 
     call PetscTime(t0, ierr)
     call KSPCreate(comm, ksp, ierr)
-    call KSPSetOperators(ksp, A, A, ierr)
+    call KSPSetOperators(ksp, A_use, A_use, ierr)
     call KSPGetPC(ksp, pc, ierr)
 
     select case (which)
@@ -5380,6 +5935,96 @@ contains
         "-probefs_fieldsplit_1_pc_factor_mat_solver_type", "mumps", ierr)
       call KSPSetFromOptions(ksp, ierr)
 
+    case (5)
+      ! WIRING GATE, not a result. LU on the interleaved operator must reproduce
+      ! case 1's error; if it does not, the MatPermute/VecPermute conventions
+      ! disagree and every point-block number below is meaningless. Cheap enough
+      ! to always run before trusting cases 6-7, and it follows the recorded
+      ! discipline on this arm: gate on solutions, never on a converged reason.
+      call KSPSetType(ksp, KSPPREONLY, ierr)
+      call PCSetType(pc, PCLU, ierr)
+      call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
+
+    case (6)
+      ! The Chacon-style candidate: variable-aware coarsening (GAMG derives the
+      ! field structure from the matrix block size, so it cannot silently
+      ! disagree with the layout) plus a COUPLED-PAIR smoother -- damped
+      ! point-block Jacobi, which inverts each 2x2 (psi,j) diagonal block
+      ! exactly. That local solve is Chacon 2025 Eq. (C.3)'s P = I - LU, and the
+      ! richardson scale is his damping sigma; 3 pre/post passes is his V(3,3).
+      pfx = "probepb_"
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call PCSetType(pc, PCGAMG, ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-probepb_pc_gamg_type", "agg", ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-probepb_mg_levels_ksp_type", "richardson", ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-probepb_mg_levels_ksp_richardson_scale", "0.7", ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-probepb_mg_levels_ksp_max_it", "3", ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-probepb_mg_levels_pc_type", "pbjacobi", ierr)
+      call KSPSetFromOptions(ksp, ierr)
+
+    case (7)
+      ! Same question asked of hypre instead of GAMG. BoomerAMG's systems mode is
+      ! an OPTION rather than matrix metadata, so nodal_coarsen must be set
+      ! explicitly and must agree with the block size set above -- which is
+      ! exactly why case 6 is tried first.
+      pfx = "probenod_"
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call PCSetType(pc, PCHYPRE, ierr)
+      call PCHYPRESetType(pc, "boomeramg", ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
+        "-probenod_pc_hypre_boomeramg_nodal_coarsen", "1", ierr)
+      ! nodal_relaxation is deliberately NOT set: with it on, this candidate
+      ! returned its = 0, res = NaN, reason = -9 (DIVERGED_NANORINF) on both
+      ! pairs, i.e. it broke during the first application rather than reporting
+      ! anything about the operator.
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
+        "-probenod_pc_hypre_boomeramg_strong_threshold", "0.5", ierr)
+      call KSPSetFromOptions(ksp, ierr)
+
+    case (8)
+      ! ISOLATION 1: same interleaved operator and block size, but GAMG's DEFAULT
+      ! smoother. Splits the two variables in case 6 -- if this converges and 6
+      ! does not, the coarsening is fine and the damped point-block Jacobi is the
+      ! problem; if both fail, the aggregation is not seeing a usable operator.
+      pfx = "probegd_"
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call PCSetType(pc, PCGAMG, ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-probegd_pc_gamg_type", "agg", ierr)
+      call KSPSetFromOptions(ksp, ierr)
+
+    case (9)
+      ! ISOLATION 2: the smoother ALONE, no multigrid. Does inverting the 2x2
+      ! (psi,j) point block exactly make a usable relaxation on this
+      ! discretisation at all? Chacon's Appendix C smoothing proof is for a
+      ! co-located finite-volume stencil; JOREK is C1 Bezier with several DOFs
+      ! per node, so a 2-DOF point may simply be too small a unit here. This row
+      ! is the direct test of that.
+      pfx = "probepbo_"
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call PCSetType(pc, PCPBJACOBI, ierr)
+      call KSPSetFromOptions(ksp, ierr)
+
+    case (10)
+      ! ISOLATION 3: the smoother alone again, but on a WIDER point (2*n_tor).
+      ! If case 9 diverges and this converges, the 2-dof point was the problem
+      ! and Chacon's smoother transfers once the unit matches the discretisation.
+      ! If both diverge, point-block relaxation is not viable on these operators
+      ! and the approach does not carry over to a C1 Bezier basis.
+      pfx = "probepbw_"
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call PCSetType(pc, PCPBJACOBI, ierr)
+      call KSPSetFromOptions(ksp, ierr)
+
     end select
 
     call KSPSetTolerances(ksp, rtol, abstol, dtol, PROBE_MAXITS, ierr)
@@ -5391,17 +6036,17 @@ contains
     call KSPSetUp(ksp, ierr)
     call PetscTime(t1, ierr)
 
-    call VecZeroEntries(x, ierr)
-    call KSPSolve(ksp, b, x, ierr)
+    call VecZeroEntries(x_use, ierr)
+    call KSPSolve(ksp, b_use, x_use, ierr)
     call PetscTime(t2, ierr)
 
     call KSPGetIterationNumber(ksp, its, ierr)
     call KSPGetResidualNorm(ksp, rnorm, ierr)
     call KSPGetConvergedReason(ksp, reason, ierr)
 
-    call VecDuplicate(x, e, ierr)
-    call VecCopy(x, e, ierr)
-    call VecAXPY(e, -1.0d0, x_ref, ierr)
+    call VecDuplicate(x_use, e, ierr)
+    call VecCopy(x_use, e, ierr)
+    call VecAXPY(e, -1.0d0, xr_use, ierr)
     call VecNorm(e, NORM_2, enorm, ierr)
     call VecDestroy(e, ierr)
     enorm = enorm / max(nref, 1.d-300)
@@ -5428,7 +6073,1318 @@ contains
 
     call KSPDestroy(ksp, ierr)
 
+    ! Everything the permuted path created is local to this candidate, so the
+    ! probe still cannot perturb the production KSPs or leak across candidates.
+    if (permuted) then
+      call MatDestroy(A_int, ierr)
+      call VecDestroy(b_int, ierr)
+      call VecDestroy(x_int, ierr)
+      call VecDestroy(xr_int, ierr)
+      call ISDestroy(is_int, ierr)
+    endif
+
   end subroutine probe_candidate
+
+  !--------------------------------------------------------------------
+  !> E2: strength-of-connection / aggregation sweep on one operator.
+  !!
+  !! WHY. Every AMG row recorded on this arm so far ran at a SINGLE strength
+  !! threshold -- hypre pinned at 0.5, GAMG left at its default 0.0 -- with
+  !! smoothed aggregation always on. On a C1 Bezier basis those defaults are a
+  !! poor bet: the stencil is wide (~200-1000 nnz/row here), so a low threshold
+  !! marks nearly every off-diagonal "strong" and the coarsening degenerates to
+  !! near-no-coarsening, while a smoothed prolongator spreads an already-wide
+  !! stencil further. Sweeping is the cheapest way to separate "this operator
+  !! cannot be coarsened" from "we coarsened it badly", and it needs no new
+  !! numerics -- only the options database.
+  !!
+  !! Read the err column, never the reason: every AMG variant on these pairs has
+  !! returned CONVERGED_RTOL with a wrong solution.
+  !--------------------------------------------------------------------
+  subroutine probe_amg_sweep(A, b, x, x_ref, nref, tag, comm, my_id)
+    Mat, intent(in)              :: A
+    Vec, intent(in)              :: b, x_ref
+    Vec, intent(inout)           :: x
+    PetscReal, intent(in)        :: nref
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: comm, my_id
+
+    integer, parameter :: SW_MAXITS = 200
+    integer, parameter :: NTHR = 6
+    integer, parameter :: NGT  = 4
+    real*8,  parameter :: thr_list(NTHR)  = &
+      [0.02d0, 0.10d0, 0.25d0, 0.50d0, 0.70d0, 0.90d0]
+    real*8,  parameter :: gthr_list(NGT)  = [0.00d0, 0.01d0, 0.05d0, 0.10d0]
+
+    PetscErrorCode :: ierr
+    KSP :: ksp
+    PC  :: pc
+    Vec :: e
+    PetscInt  :: its
+    PetscReal :: rnorm, enorm, rtol, abstol, dtol
+    PetscReal :: t0, t1
+    KSPConvergedReason :: reason
+    integer :: it, ig, ins, icfg
+    character(len=24) :: pfx, vstr, nstr
+    character(len=96) :: onm
+    character(len=32) :: lab
+
+    rtol = 1.0d-8; abstol = 1.0d-50; dtol = 1.0d4
+    icfg = 0
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]   ......................................................."
+      write(*,'(A,A)') "[Physics PC]   E2 AMG SWEEP, ", trim(tag)
+      write(*,'(A)')   "[Physics PC]     config                        its      err      reason"
+      flush(6)
+    endif
+
+    !--- hypre BoomerAMG: strength threshold ---
+    do it = 1, NTHR
+      icfg = icfg + 1
+      write(pfx,'(A,I0,A)') "psw", icfg, "_"
+      write(vstr,'(F6.3)') thr_list(it)
+      call KSPCreate(comm, ksp, ierr)
+      call KSPSetOperators(ksp, A, A, ierr)
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call KSPSetTolerances(ksp, rtol, abstol, dtol, SW_MAXITS, ierr)
+      call KSPGetPC(ksp, pc, ierr)
+      call PCSetType(pc, PCHYPRE, ierr)
+      call PCHYPRESetType(pc, "boomeramg", ierr)
+      onm = "-" // trim(pfx) // "pc_hypre_boomeramg_strong_threshold"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(onm), trim(adjustl(vstr)), ierr)
+      call KSPSetFromOptions(ksp, ierr)
+      write(lab,'(A,F5.2)') "hypre  strength = ", thr_list(it)
+      call sweep_run_report(lab)
+    enddo
+
+    !--- GAMG: threshold x aggregation smoothing ---
+    do ig = 1, NGT
+      do ins = 0, 1
+        icfg = icfg + 1
+        write(pfx,'(A,I0,A)') "psw", icfg, "_"
+        write(vstr,'(F6.3)') gthr_list(ig)
+        write(nstr,'(I0)') ins
+        call KSPCreate(comm, ksp, ierr)
+        call KSPSetOperators(ksp, A, A, ierr)
+        call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+        call KSPSetType(ksp, KSPGMRES, ierr)
+        call KSPGMRESSetRestart(ksp, 60, ierr)
+        call KSPSetTolerances(ksp, rtol, abstol, dtol, SW_MAXITS, ierr)
+        call KSPGetPC(ksp, pc, ierr)
+        call PCSetType(pc, PCGAMG, ierr)
+        onm = "-" // trim(pfx) // "pc_gamg_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(onm), "agg", ierr)
+        onm = "-" // trim(pfx) // "pc_gamg_threshold"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(onm), trim(adjustl(vstr)), ierr)
+        ! nsmooths = 0 is PLAIN (unsmoothed) aggregation. For a wide high-order
+        ! stencil the smoothed prolongator is the prime suspect, so this is the
+        ! single most informative knob in the grid.
+        onm = "-" // trim(pfx) // "pc_gamg_agg_nsmooths"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(onm), trim(adjustl(nstr)), ierr)
+        call KSPSetFromOptions(ksp, ierr)
+        write(lab,'(A,F5.2,A,I0)') "gamg   thr = ", gthr_list(ig), ", nsm = ", ins
+        call sweep_run_report(lab)
+      enddo
+    enddo
+
+  contains
+
+    subroutine sweep_run_report(label)
+      character(len=*), intent(in) :: label
+      character(len=12) :: vd
+
+      call PetscTime(t0, ierr)
+      call KSPSetUp(ksp, ierr)
+      call VecZeroEntries(x, ierr)
+      call KSPSolve(ksp, b, x, ierr)
+      call PetscTime(t1, ierr)
+
+      call KSPGetIterationNumber(ksp, its, ierr)
+      call KSPGetResidualNorm(ksp, rnorm, ierr)
+      call KSPGetConvergedReason(ksp, reason, ierr)
+
+      call VecDuplicate(x, e, ierr)
+      call VecCopy(x, e, ierr)
+      call VecAXPY(e, -1.0d0, x_ref, ierr)
+      call VecNorm(e, NORM_2, enorm, ierr)
+      call VecDestroy(e, ierr)
+      enorm = enorm / max(nref, 1.d-300)
+
+      if (reason%v < 0) then
+        vd = "DIVERGED"
+      else if (enorm > 1.d-6) then
+        vd = "BAD-SOLUTION"
+      else if (its >= SW_MAXITS) then
+        vd = "MAXITS"
+      else
+        vd = "ok"
+      endif
+
+      if (my_id == 0) then
+        write(*,'(A,A30,A,I5,A,ES10.3,A,I4,A,F7.2,A,A)') &
+          "[Physics PC]     ", label, "  its = ", its, ", err = ", enorm, &
+          ", reason = ", reason%v, ", t = ", t1 - t0, " s  ", trim(vd)
+        flush(6)
+      endif
+
+      call KSPDestroy(ksp, ierr)
+    end subroutine sweep_run_report
+
+  end subroutine probe_amg_sweep
+
+  !--------------------------------------------------------------------
+  !> E1: probe ONE toroidal harmonic block of a packed pair in isolation.
+  !!
+  !! WHY. The point-block widening experiment (bs = 2 -> 2*n_tor moved the error
+  !! by 0.04%) proved B_13/B_31 are harmonic-DIAGONAL, so
+  !!
+  !!   pair = (+)_m [ B_11^(m)  B_13^(m) ; B_31^(m)  B_33^(m) ]
+  !!
+  !! is block diagonal in the harmonic index. Every AMG run so far was
+  !! nevertheless handed the full n_tor-coupled matrix to coarsen -- a direct sum
+  !! of n_tor disconnected graphs, which is exactly the structure aggregation
+  !! handles worst. Each summand on its own is a 2D POLOIDAL mixed problem,
+  !! n_tor times smaller, and is the object multigrid should actually see.
+  !!
+  !! The extraction is exact and needs no geometry: create_variable_index_sets
+  !! lays each field out as k = i*n_tor + m with the harmonic innermost, so
+  !! harmonic m of the field-major packed pair is
+  !!   { k : mod(k,n_tor) = m } U { n1 + k : mod(k,n_tor) = m }.
+  !! Taking field 1's rows first keeps the sub-operator field-major too, so the
+  !! fieldsplit candidate remains meaningful on it.
+  !!
+  !! Serial only: MatCreateSubMatrix with a global IS, in a probe that is
+  !! already gated to one rank by schur_mixed_require_serial.
+  !--------------------------------------------------------------------
+  subroutine probe_harmonic_blocks(A, is_pair, tag, lvl, comm, my_id)
+    use mod_parameters, only: n_tor
+
+    Mat, intent(in)              :: A
+    IS,  intent(in)              :: is_pair(2)
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: lvl
+    integer, intent(in)          :: comm, my_id
+
+    PetscErrorCode :: ierr
+    PetscInt  :: n1_glo, ntot, nper, k, cnt, ntorp, m
+    PetscInt  :: zero_p, one_p   !< kind-matched literals; PetscInt is not integer(8) here
+    PetscInt, allocatable :: idx(:)
+    IS   :: is_m, is_sub(2)
+    Mat  :: A_m
+    Vec  :: bm, xm, xrm
+    PetscReal :: nrefm, dmin, dmax
+    MatInfo   :: minfo
+    Vec       :: dvec
+    integer   :: nproc, mpierr
+    character(len=64) :: mtag
+
+    call MPI_Comm_size(comm, nproc, mpierr)
+    if (nproc > 1) then
+      if (my_id == 0) write(*,'(A)') &
+        "[Physics PC]     E1 harmonic probe SKIPPED (np > 1)"
+      return
+    endif
+
+    ntorp = n_tor
+    zero_p = 0; one_p = 1
+    call ISGetSize(is_pair(1), n1_glo, ierr)
+    call MatGetSize(A, ntot, PETSC_NULL_INTEGER, ierr)
+    if (2 * n1_glo /= ntot) then
+      if (my_id == 0) write(*,'(A)') &
+        "[Physics PC]     E1 harmonic probe SKIPPED (2*n1 /= ntot)"
+      return
+    endif
+    if (mod(n1_glo, ntorp) /= 0) then
+      if (my_id == 0) write(*,'(A,I0,A,I0)') &
+        "[Physics PC]     E1 harmonic probe SKIPPED: n1 not divisible by n_tor, ", &
+        n1_glo, " vs ", ntorp
+      return
+    endif
+    nper = n1_glo / ntorp
+
+    do m = 0, ntorp - 1
+      allocate(idx(2 * nper))
+      cnt = 0
+      do k = 0, n1_glo - 1
+        if (mod(k, ntorp) == m) then
+          cnt = cnt + 1
+          idx(cnt) = k
+        endif
+      enddo
+      do k = 0, n1_glo - 1
+        if (mod(k, ntorp) == m) then
+          cnt = cnt + 1
+          idx(cnt) = n1_glo + k
+        endif
+      enddo
+
+      call ISCreateGeneral(comm, cnt, idx, PETSC_COPY_VALUES, is_m, ierr)
+      call MatCreateSubMatrix(A, is_m, is_m, MAT_INITIAL_MATRIX, A_m, ierr)
+      deallocate(idx)
+
+      ! field-major within the sub-operator by construction
+      call ISCreateStride(comm, nper, zero_p, one_p, is_sub(1), ierr)
+      call ISCreateStride(comm, nper, nper,   one_p, is_sub(2), ierr)
+
+      call MatGetInfo(A_m, MAT_GLOBAL_SUM, minfo, ierr)
+      call MatCreateVecs(A_m, dvec, PETSC_NULL_VEC, ierr)
+      call MatGetDiagonal(A_m, dvec, ierr)
+      call VecAbs(dvec, ierr)
+      call VecMax(dvec, PETSC_NULL_INTEGER, dmax, ierr)
+      call VecMin(dvec, PETSC_NULL_INTEGER, dmin, ierr)
+      call VecDestroy(dvec, ierr)
+
+      write(mtag,'(A,A,I0)') trim(tag), "  harmonic m = ", m
+      if (my_id == 0) then
+        write(*,'(A)') "[Physics PC]   ......................................................."
+        write(*,'(A,A)') "[Physics PC]   E1 ", trim(mtag)
+        write(*,'(A,I8,A,F9.2,A,ES10.3,A,ES10.3)') &
+          "[Physics PC]     rows = ", 2*nper, ", nnz/row = ", &
+          minfo%nz_used / max(dble(2*nper), 1.d0), &
+          ", |diag| min = ", dmin, ", max = ", dmax
+        flush(6)
+      endif
+
+      call MatCreateVecs(A_m, xrm, bm, ierr)
+      call VecDuplicate(xrm, xm, ierr)
+      call VecSetRandom(xrm, PETSC_NULL_RANDOM, ierr)
+      call MatMult(A_m, xrm, bm, ierr)
+      call VecNorm(xrm, NORM_2, nrefm, ierr)
+
+      call probe_candidate(A_m, bm, xm, xrm, nrefm, "LU (MUMPS)          ", 1, is_sub, comm, my_id)
+      call probe_candidate(A_m, bm, xm, xrm, nrefm, "GMRES + ILU(0)      ", 2, is_sub, comm, my_id)
+      call probe_candidate(A_m, bm, xm, xrm, nrefm, "GMRES + AMG (scalar)", 3, is_sub, comm, my_id)
+      call probe_candidate(A_m, bm, xm, xrm, nrefm, "FGMRES + FIELDSPLIT ", 4, is_sub, comm, my_id)
+
+      ! The sweep is run on m = 0 only: it is 14 more solves and the harmonics
+      ! are structurally identical, so the extra rows would cost time without
+      ! adding a distinct question.
+      if (m == 0) call probe_amg_sweep(A_m, bm, xm, xrm, nrefm, trim(mtag), comm, my_id)
+      if (m == 0 .and. lvl >= 6) &
+        call probe_nullspace(A_m, bm, xm, xrm, nrefm, nper, trim(mtag), .false., comm, my_id)
+
+      call VecDestroy(bm, ierr); call VecDestroy(xm, ierr); call VecDestroy(xrm, ierr)
+      call MatDestroy(A_m, ierr)
+      call ISDestroy(is_m, ierr)
+      call ISDestroy(is_sub(1), ierr); call ISDestroy(is_sub(2), ierr)
+    enddo
+
+  end subroutine probe_harmonic_blocks
+
+  !--------------------------------------------------------------------
+  !> E3 diagnostic: is the node-degree block index decomposable arithmetically?
+  !!
+  !! construct_pc_matrix_mod / construct_commutator_matrix_mod both address the
+  !! element matrix as
+  !!   idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j,
+  !! i.e. the C1 DEGREE is the inner index of a node block and the vertex the
+  !! outer one. If that survives into the assembled numbering then
+  !!   degree = mod(ii, n_degrees) + 1,   vertex = ii/n_degrees + 1,
+  !! and the value-DOF mask needed for a C1 near-null space is free.
+  !!
+  !! It is NOT obviously valid here: field 1 of each pair has 7827 = 2609*n_tor
+  !! rows and 2609 is prime, so the node-degree block count is not a multiple of
+  !! n_degrees = 4 and something has renumbered. This routine settles it by
+  !! measurement rather than arithmetic: it reports mean |diag| per residue class
+  !! mod n_degrees. Value and derivative DOFs of a C1 basis differ by powers of
+  !! the element size, so a VALID map shows well-separated class means and an
+  !! invalid one shows n_degrees statistically identical numbers.
+  !--------------------------------------------------------------------
+  subroutine report_degree_classes(A, n1_glo, tag, comm, my_id)
+    use mod_parameters, only: n_tor, n_degrees
+
+    Mat, intent(in)              :: A
+    PetscInt, intent(in)         :: n1_glo
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: comm, my_id
+
+    PetscErrorCode :: ierr
+    Vec       :: dv
+    PetscInt  :: rlo, rhi, r, kk, ii
+    integer   :: k, nloc, mpierr, kc
+    PetscScalar, pointer :: dptr(:)
+    real*8    :: csum(0:15), cmin(0:15), cmax(0:15)
+    integer   :: ccnt(0:15)
+
+    if (n_degrees > 16) return
+
+    call MatCreateVecs(A, dv, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, dv, ierr)
+    call MatGetOwnershipRange(A, rlo, rhi, ierr)
+    nloc = int(rhi - rlo)
+
+    csum = 0.d0; ccnt = 0
+    cmin = huge(1.d0); cmax = 0.d0
+
+    call VecGetArray(dv, dptr, ierr)
+    do k = 1, nloc
+      r = rlo + k - 1
+      if (r >= n1_glo) cycle          !< field 1 only
+      ii = r / n_tor                  !< node-degree block index
+      kc = int(mod(ii, int(n_degrees, kind(ii))))
+      csum(kc) = csum(kc) + abs(dptr(k))
+      cmin(kc) = min(cmin(kc), abs(dptr(k)))
+      cmax(kc) = max(cmax(kc), abs(dptr(k)))
+      ccnt(kc) = ccnt(kc) + 1
+    enddo
+    call VecRestoreArray(dv, dptr, ierr)
+    call VecDestroy(dv, ierr)
+
+    call MPI_Allreduce(MPI_IN_PLACE, csum, 16, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+    call MPI_Allreduce(MPI_IN_PLACE, ccnt, 16, MPI_INTEGER,          MPI_SUM, comm, mpierr)
+    call MPI_Allreduce(MPI_IN_PLACE, cmin, 16, MPI_DOUBLE_PRECISION, MPI_MIN, comm, mpierr)
+    call MPI_Allreduce(MPI_IN_PLACE, cmax, 16, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
+
+    if (my_id == 0) then
+      write(*,'(A,A)') "[Physics PC]   E3 degree-class test (field 1), ", trim(tag)
+      write(*,'(A,I0,A)') "[Physics PC]     class = mod(ii, n_degrees), n_degrees = ", &
+        n_degrees, ".  Separated means => the map is valid."
+      do kc = 0, n_degrees - 1
+        if (ccnt(kc) > 0) write(*,'(A,I3,A,I7,A,ES11.4,A,ES11.4,A,ES11.4)') &
+          "[Physics PC]     class ", kc, "  n = ", ccnt(kc), &
+          "  mean = ", csum(kc)/dble(ccnt(kc)), &
+          "  min = ", cmin(kc), "  max = ", cmax(kc)
+      enddo
+      flush(6)
+    endif
+
+  end subroutine report_degree_classes
+
+  !--------------------------------------------------------------------
+  !> E3: does GAMG improve when given a CORRECT near-null space?
+  !!
+  !! WHY. AMG interpolation must reproduce the near-null space of the operator,
+  !! and PETSc's default is the all-ones vector. On a C1 Hermite/Bezier basis a
+  !! constant field is NOT all-ones -- it is value-DOFs = 1, derivative-DOFs = 0
+  !! -- and on a mixed (psi,j) pair it is wronger still, because the constraint
+  !! B_31 psi + B_33 j = 0 with B_31 stiffness-like gives j ~ 0 for a constant
+  !! psi. So the pair's near-kernel is roughly (1_value, 0), and every AMG run
+  !! on this arm so far has been built against (1, 1). This is the one
+  !! hypothesis E2 does NOT cover: E2 varied how aggressively we coarsen, never
+  !! what the prolongator is asked to reproduce.
+  !!
+  !! Variants, all on GAMG with unsmoothed aggregation (E2 showed nsmooths = 0
+  !! is worth several decades on pair_w over the default 1):
+  !!   0  no near-null space set        -- control, reproduces the E2 row
+  !!   1  (1, 1) set explicitly         -- control, must match variant 0
+  !!   2  (1, 0)                        -- cross-field hypothesis alone
+  !!   3  relaxed: 5 damped-Jacobi steps on A from all-ones, renormalised each
+  !!      step. Needs neither a DOF map nor any run state, and is the standard
+  !!      way to expose a near-kernel: relaxation is precisely the operation
+  !!      that fails to reduce it.
+  !!   4  value-DOF mask from mod(ii, n_degrees), field 1 only -- only run if
+  !!      report_degree_classes says the arithmetic map is valid.
+  !!
+  !! A_c is a private duplicate: MatSetNearNullSpace mutates the matrix object,
+  !! and the caller's operator is a live production Mat.
+  !--------------------------------------------------------------------
+  subroutine probe_nullspace(A, b, x, x_ref, nref, n1_glo, tag, use_mask, comm, my_id)
+    use mod_parameters, only: n_tor, n_degrees
+
+    Mat, intent(in)              :: A
+    Vec, intent(in)              :: b, x_ref
+    Vec, intent(inout)           :: x
+    PetscReal, intent(in)        :: nref
+    PetscInt, intent(in)         :: n1_glo
+    character(len=*), intent(in) :: tag
+    logical, intent(in)          :: use_mask   !< .true. -> also run variant 4
+    integer, intent(in)          :: comm, my_id
+
+    integer, parameter :: NS_MAXITS = 200
+    PetscErrorCode :: ierr
+    Mat  :: A_c
+    KSP  :: ksp
+    PC   :: pc
+    Vec  :: v(1), e, dinv, tmp
+    MatNullSpace :: nullsp
+    PetscInt  :: its, rlo, rhi, r, ii
+    integer   :: k, nloc, iv, nvar_max
+    PetscReal :: enorm, rtol, abstol, dtol, vn
+    KSPConvergedReason :: reason
+    PetscScalar, pointer :: vptr(:)
+    character(len=24) :: pfx
+    character(len=32) :: lab
+    character(len=12) :: vd
+    logical :: setns
+
+    rtol = 1.0d-8; abstol = 1.0d-50; dtol = 1.0d4
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]   ......................................................."
+      write(*,'(A,A)') "[Physics PC]   E3 NEAR-NULL SPACE (GAMG, agg_nsmooths = 0), ", trim(tag)
+      flush(6)
+    endif
+
+    call MatDuplicate(A, MAT_COPY_VALUES, A_c, ierr)
+    call MatGetOwnershipRange(A_c, rlo, rhi, ierr)
+    nloc = int(rhi - rlo)
+
+    nvar_max = 3
+    if (use_mask) nvar_max = 4
+
+    do iv = 0, nvar_max
+      ! A fresh vector per variant: MatSetNearNullSpace takes its own reference
+      ! and LOCKS the vector read-only for as long as the matrix holds it, so a
+      ! single reused vector faults on the second VecSet.
+      call MatCreateVecs(A_c, v(1), PETSC_NULL_VEC, ierr)
+      setns = .true.
+      select case (iv)
+      case (0)
+        setns = .false.
+        lab = "none (control)"
+      case (1)
+        call VecSet(v(1), 1.0d0, ierr)
+        lab = "(1,1) all-ones"
+      case (2)
+        call VecSet(v(1), 0.0d0, ierr)
+        call VecGetArray(v(1), vptr, ierr)
+        do k = 1, nloc
+          r = rlo + k - 1
+          if (r < n1_glo) vptr(k) = 1.0d0
+        enddo
+        call VecRestoreArray(v(1), vptr, ierr)
+        lab = "(1,0) field1 only"
+      case (3)
+        ! v <- v - 0.5 D^-1 A v, renormalised. Whatever relaxation cannot damp
+        ! is what interpolation has to reproduce.
+        call VecSet(v(1), 1.0d0, ierr)
+        call MatCreateVecs(A_c, dinv, PETSC_NULL_VEC, ierr)
+        call VecDuplicate(v(1), tmp, ierr)
+        call MatGetDiagonal(A_c, dinv, ierr)
+        call VecReciprocal(dinv, ierr)
+        do k = 1, 5
+          call MatMult(A_c, v(1), tmp, ierr)
+          call VecPointwiseMult(tmp, tmp, dinv, ierr)
+          call VecAXPY(v(1), -0.5d0, tmp, ierr)
+          call VecNorm(v(1), NORM_2, vn, ierr)
+          if (vn > 0.d0) call VecScale(v(1), 1.0d0/vn, ierr)
+        enddo
+        call VecDestroy(dinv, ierr); call VecDestroy(tmp, ierr)
+        lab = "relaxed from ones"
+      case (4)
+        call VecSet(v(1), 0.0d0, ierr)
+        call VecGetArray(v(1), vptr, ierr)
+        do k = 1, nloc
+          r = rlo + k - 1
+          if (r >= n1_glo) cycle
+          ii = r / n_tor
+          if (mod(ii, int(n_degrees, kind(ii))) == 0) vptr(k) = 1.0d0
+        enddo
+        call VecRestoreArray(v(1), vptr, ierr)
+        lab = "value-DOF mask"
+      end select
+
+      if (setns) then
+        call VecNorm(v(1), NORM_2, vn, ierr)
+        if (vn > 0.d0) call VecScale(v(1), 1.0d0/vn, ierr)
+        call MatNullSpaceCreate(comm, PETSC_FALSE, 1, v, nullsp, ierr)
+        call MatSetNearNullSpace(A_c, nullsp, ierr)
+        call MatNullSpaceDestroy(nullsp, ierr)
+      endif
+
+      write(pfx,'(A,I0,A)') "pns", iv, "_"
+      call KSPCreate(comm, ksp, ierr)
+      call KSPSetOperators(ksp, A_c, A_c, ierr)
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call KSPSetTolerances(ksp, rtol, abstol, dtol, NS_MAXITS, ierr)
+      call KSPGetPC(ksp, pc, ierr)
+      call PCSetType(pc, PCGAMG, ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-"//trim(pfx)//"pc_gamg_type", "agg", ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-"//trim(pfx)//"pc_gamg_agg_nsmooths", "0", ierr)
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-"//trim(pfx)//"pc_gamg_threshold", "0.01", ierr)
+      call KSPSetFromOptions(ksp, ierr)
+
+      call KSPSetUp(ksp, ierr)
+      call VecZeroEntries(x, ierr)
+      call KSPSolve(ksp, b, x, ierr)
+      call KSPGetIterationNumber(ksp, its, ierr)
+      call KSPGetConvergedReason(ksp, reason, ierr)
+
+      call VecDuplicate(x, e, ierr)
+      call VecCopy(x, e, ierr)
+      call VecAXPY(e, -1.0d0, x_ref, ierr)
+      call VecNorm(e, NORM_2, enorm, ierr)
+      call VecDestroy(e, ierr)
+      enorm = enorm / max(nref, 1.d-300)
+
+      if (reason%v < 0) then
+        vd = "DIVERGED"
+      else if (enorm > 1.d-6) then
+        vd = "BAD-SOLUTION"
+      else if (its >= NS_MAXITS) then
+        vd = "MAXITS"
+      else
+        vd = "ok"
+      endif
+
+      if (my_id == 0) then
+        write(*,'(A,A20,A,I5,A,ES10.3,A,I4,A,A)') &
+          "[Physics PC]     nns = ", lab, "  its = ", its, ", err = ", enorm, &
+          ", reason = ", reason%v, "  ", trim(vd)
+        flush(6)
+      endif
+
+      call KSPDestroy(ksp, ierr)
+      call VecDestroy(v(1), ierr)   !< our reference only; the Mat keeps its own
+    enddo
+
+    call MatDestroy(A_c, ierr)
+
+  end subroutine probe_nullspace
+
+  !--------------------------------------------------------------------
+  !> E3b: Krylov estimate of the condition number of the RAW operator.
+  !!
+  !! WHY. E1-E3 have now excluded every coarsening-side explanation for
+  !! pair_psi: parameter tuning (E2, flat across 14 configurations), the
+  !! harmonic direct-sum structure (E1), and the near-null space (E3). What is
+  !! left is the operator itself, and there is a direct signature of that in the
+  !! existing data -- FGMRES+FIELDSPLIT returns res = 4.5e-7 with err = 7.1e0,
+  !! and even a MUMPS LU returns err ~7e-9 where B_55's LU returns 2.4e-15.
+  !! Both say the residual has stopped predicting the error, which is a
+  !! statement about kappa(A) and not about multigrid.
+  !!
+  !! Unpreconditioned GMRES with singular-value tracking gives smax/smin over
+  !! the Krylov space. That is a LOWER BOUND on kappa(A) -- Ritz values converge
+  !! from the interior -- so read it as "at least this bad", and read B_55 in
+  !! the same table as the calibration of what the estimator says about an
+  !! operator that is genuinely fine.
+  !--------------------------------------------------------------------
+  subroutine report_condition_estimate(A, b, x, tag, comm, my_id)
+    Mat, intent(in)              :: A
+    Vec, intent(in)              :: b
+    Vec, intent(inout)           :: x
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: comm, my_id
+
+    integer, parameter :: CE_ITS = 300
+    PetscErrorCode :: ierr
+    KSP :: ksp
+    PC  :: pc
+    PetscInt  :: its
+    PetscReal :: smax, smin, rtol, abstol, dtol
+    KSPConvergedReason :: reason
+
+    rtol = 1.0d-12; abstol = 1.0d-50; dtol = 1.0d8
+
+    call KSPCreate(comm, ksp, ierr)
+    call KSPSetOperators(ksp, A, A, ierr)
+    call KSPSetOptionsPrefix(ksp, "pcond_", ierr)
+    call KSPSetType(ksp, KSPGMRES, ierr)
+    ! One long Krylov space, no restart: restarting discards the Ritz history
+    ! the singular-value estimate is built from.
+    call KSPGMRESSetRestart(ksp, CE_ITS, ierr)
+    call KSPSetTolerances(ksp, rtol, abstol, dtol, CE_ITS, ierr)
+    call KSPSetComputeSingularValues(ksp, PETSC_TRUE, ierr)
+    call KSPGetPC(ksp, pc, ierr)
+    call PCSetType(pc, PCNONE, ierr)
+    call KSPSetFromOptions(ksp, ierr)
+
+    call VecZeroEntries(x, ierr)
+    call KSPSolve(ksp, b, x, ierr)
+    call KSPGetIterationNumber(ksp, its, ierr)
+    call KSPGetConvergedReason(ksp, reason, ierr)
+    call KSPComputeExtremeSingularValues(ksp, smax, smin, ierr)
+
+    if (my_id == 0) then
+      write(*,'(A,A)') "[Physics PC]   E3b condition estimate (unpreconditioned GMRES), ", trim(tag)
+      if (smin > 0.d0) then
+        write(*,'(A,ES11.4,A,ES11.4,A,ES11.4,A,I4)') &
+          "[Physics PC]     smax = ", smax, "  smin = ", smin, &
+          "  kappa >= ", smax/smin, "   krylov its = ", its
+      else
+        write(*,'(A,ES11.4,A,I4)') &
+          "[Physics PC]     smin underflowed; smax = ", smax, "   krylov its = ", its
+      endif
+      flush(6)
+    endif
+
+    call KSPDestroy(ksp, ierr)
+
+  end subroutine report_condition_estimate
+
+  !--------------------------------------------------------------------
+  !> T3: is the operator anything like an M-matrix?
+  !!
+  !! WHY. Classical AMG strength-of-connection assumes negative off-diagonals
+  !! and diagonal dominance -- the M-matrix picture inherited from low-order
+  !! finite differences. A C1 Hermite/Bezier stiffness matrix satisfies NEITHER:
+  !! high-order bases routinely produce off-diagonals with the same sign as the
+  !! diagonal, and derivative DOFs are not diagonally dominant at all. That is
+  !! the textbook reason AMG struggles on high-order discretisations, and if it
+  !! holds here it explains E1-E3's negatives at once, as a property of the
+  !! DISCRETISATION rather than of any tunable.
+  !!
+  !! Reported per operator:
+  !!   sign-violating off-diagonals -- entries with sign(a_ij) = sign(a_ii),
+  !!     by count and by magnitude share. An M-matrix has 0%.
+  !!   diagonal dominance |a_ii| / sum_{j/=i} |a_ij| -- mean, and the share of
+  !!     rows at >= 1.
+  !! Read B_55/B_66 as the calibration, exactly as in E2.
+  !--------------------------------------------------------------------
+  subroutine report_mmatrix(A, tag, comm, my_id)
+    Mat, intent(in)              :: A
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: comm, my_id
+
+    PetscErrorCode :: ierr
+    PetscInt :: rlo, rhi, r, ncols, jc
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    real*8  :: diag, offsum, offbad, dd, ddsum
+    real*8  :: tot_off_mag, bad_off_mag
+    integer :: nproc, mpierr
+    integer :: nbad_cnt, noff_cnt, ndd_ok, nrows
+    real*8  :: acc(6)
+
+    call MPI_Comm_size(comm, nproc, mpierr)
+    if (nproc > 1) return          !< MatGetRow walks local rows only
+
+    call MatGetOwnershipRange(A, rlo, rhi, ierr)
+    nbad_cnt = 0; noff_cnt = 0; ndd_ok = 0; nrows = 0
+    tot_off_mag = 0.d0; bad_off_mag = 0.d0; ddsum = 0.d0
+
+    do r = rlo, rhi - 1
+      call MatGetRow(A, r, ncols, cols, vals, ierr)
+      diag = 0.d0
+      do jc = 1, ncols
+        if (cols(jc) == r) diag = dble(vals(jc))
+      enddo
+      offsum = 0.d0; offbad = 0.d0
+      do jc = 1, ncols
+        if (cols(jc) == r) cycle
+        if (vals(jc) == 0.d0) cycle
+        offsum = offsum + abs(dble(vals(jc)))
+        noff_cnt = noff_cnt + 1
+        ! "bad" = same sign as the diagonal, i.e. the opposite of what classical
+        ! AMG's strength measure is built for.
+        if (dble(vals(jc)) * diag > 0.d0) then
+          nbad_cnt = nbad_cnt + 1
+          offbad = offbad + abs(dble(vals(jc)))
+        endif
+      enddo
+      call MatRestoreRow(A, r, ncols, cols, vals, ierr)
+
+      tot_off_mag = tot_off_mag + offsum
+      bad_off_mag = bad_off_mag + offbad
+      nrows = nrows + 1
+      if (offsum > 0.d0) then
+        dd = abs(diag) / offsum
+      else
+        dd = huge(1.d0)
+      endif
+      if (dd >= 1.d0) ndd_ok = ndd_ok + 1
+      ddsum = ddsum + min(dd, 1.d6)
+    enddo
+
+    if (my_id == 0) then
+      write(*,'(A,A)') "[Physics PC]   T3 M-matrix / dominance test, ", trim(tag)
+      write(*,'(A,F8.2,A,F8.2,A)') &
+        "[Physics PC]     sign-violating off-diag: ", &
+        1.d2 * dble(nbad_cnt) / max(dble(noff_cnt), 1.d0), " % by count, ", &
+        1.d2 * bad_off_mag / max(tot_off_mag, 1.d-300), " % by magnitude"
+      write(*,'(A,ES11.4,A,F8.2,A)') &
+        "[Physics PC]     diag dominance |a_ii|/sum|a_ij|: mean = ", &
+        ddsum / max(dble(nrows), 1.d0), ",  rows >= 1: ", &
+        1.d2 * dble(ndd_ok) / max(dble(nrows), 1.d0), " %"
+      flush(6)
+    endif
+
+  end subroutine report_mmatrix
+
+  !--------------------------------------------------------------------
+  !> T2: what did the coarsening actually build?
+  !!
+  !! WHY. Every "coarsening fails" statement on this arm so far is an INFERENCE
+  !! from solver error. The hierarchy itself is observable: level count, and the
+  !! standard grid / operator complexities
+  !!   C_grid = sum_l n_l / n_fine,   C_op = sum_l nnz_l / nnz_fine.
+  !! A healthy AMG coarsens by ~3-8x per level with C_op ~ 1.2-2. Two levels
+  !! with a coarse grid near the fine size means coarsening did not happen at
+  !! all; a large C_op means it happened but produced dense coarse operators.
+  !! Those are different failures with different fixes, and the error column
+  !! cannot tell them apart.
+  !!
+  !! GAMG only: hypre builds its hierarchy inside its own library and does not
+  !! expose it through PCMG.
+  !--------------------------------------------------------------------
+  subroutine report_amg_hierarchy(A, tag, comm, my_id)
+    Mat, intent(in)              :: A
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: comm, my_id
+
+    PetscErrorCode :: ierr
+    KSP :: ksp, ksp_l
+    PC  :: pc
+    Mat :: Al, Pl
+    PetscInt :: nlev, l, nl, nfine
+    MatInfo  :: mi
+    real*8   :: sum_n, sum_nnz, nnz_fine, nnzl
+
+    call KSPCreate(comm, ksp, ierr)
+    call KSPSetOperators(ksp, A, A, ierr)
+    call KSPSetOptionsPrefix(ksp, "phier_", ierr)
+    call KSPSetType(ksp, KSPGMRES, ierr)
+    call KSPGetPC(ksp, pc, ierr)
+    call PCSetType(pc, PCGAMG, ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-phier_pc_gamg_type", "agg", ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-phier_pc_gamg_agg_nsmooths", "0", ierr)
+    call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-phier_pc_gamg_threshold", "0.01", ierr)
+    call KSPSetFromOptions(ksp, ierr)
+    call KSPSetUp(ksp, ierr)
+
+    call PCMGGetLevels(pc, nlev, ierr)
+
+    if (my_id == 0) then
+      write(*,'(A,A)') "[Physics PC]   T2 GAMG hierarchy (nsmooths = 0, thr = 0.01), ", trim(tag)
+      write(*,'(A,I0)') "[Physics PC]     levels = ", nlev
+      write(*,'(A)')    "[Physics PC]     level      rows        nnz    nnz/row"
+    endif
+
+    sum_n = 0.d0; sum_nnz = 0.d0; nnz_fine = 1.d0; nfine = 1
+    do l = 0, nlev - 1
+      call PCMGGetSmoother(pc, l, ksp_l, ierr)
+      call KSPGetOperators(ksp_l, Al, Pl, ierr)
+      call MatGetSize(Al, nl, PETSC_NULL_INTEGER, ierr)
+      call MatGetInfo(Al, MAT_GLOBAL_SUM, mi, ierr)
+      nnzl = mi%nz_used
+      sum_n = sum_n + dble(nl)
+      sum_nnz = sum_nnz + nnzl
+      if (l == nlev - 1) then       !< PCMG numbers the FINEST level last
+        nfine = nl
+        nnz_fine = max(nnzl, 1.d0)
+      endif
+      if (my_id == 0) write(*,'(A,I5,I11,ES13.4,F11.2)') &
+        "[Physics PC]     ", l, nl, nnzl, nnzl / max(dble(nl), 1.d0)
+    enddo
+
+    if (my_id == 0) then
+      write(*,'(A,F8.3,A,F8.3)') &
+        "[Physics PC]     grid complexity = ", sum_n / max(dble(nfine), 1.d0), &
+        ",  operator complexity = ", sum_nnz / nnz_fine
+      flush(6)
+    endif
+
+    call KSPDestroy(ksp, ierr)
+
+  end subroutine report_amg_hierarchy
+
+  !--------------------------------------------------------------------
+  !> T4/T5/T7: the AMG knobs E2 did not touch.
+  !!
+  !! E2 swept strength-of-connection and aggregation smoothing. It left three
+  !! things untested that are plausibly larger levers:
+  !!
+  !!   T4  COARSENING and INTERPOLATION algorithm. Strength decides which
+  !!       couplings count; coarsen_type and interp_type decide what is then
+  !!       done with them. "ext+i" with truncation is the standard recipe for
+  !!       hard problems and is arguably a bigger lever than strength.
+  !!   T5  AIR (approximate ideal restriction, restriction_type = 1). Classical
+  !!       AMG theory assumes a symmetric operator; pair_psi is not symmetric,
+  !!       and AIR is the modern answer for exactly that case.
+  !!   T7  A ROBUST SMOOTHER combined with unsmoothed aggregation. GAMG's
+  !!       default Chebyshev needs an eigenvalue estimate that is unreliable on
+  !!       a strongly nonsymmetric operator -- a plausible source of the reason
+  !!       -5 breakdowns. E2 established nsmooths = 0 matters; this asks what a
+  !!       non-Chebyshev smoother does on top of it.
+  !!
+  !! Note the MPIAIJ restriction that bites elsewhere in this file: these
+  !! operators are MPIAIJ even on one rank, so the ILU smoother must be reached
+  !! through bjacobi rather than named directly.
+  !--------------------------------------------------------------------
+  subroutine probe_amg_advanced(A, b, x, x_ref, nref, tag, comm, my_id)
+    Mat, intent(in)              :: A
+    Vec, intent(in)              :: b, x_ref
+    Vec, intent(inout)           :: x
+    PetscReal, intent(in)        :: nref
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: comm, my_id
+
+    integer, parameter :: AD_MAXITS = 200
+    integer, parameter :: NCFG = 14
+
+    PetscErrorCode :: ierr
+    KSP :: ksp
+    PC  :: pc
+    Vec :: e
+    PetscInt  :: its
+    PetscReal :: enorm, rtol, abstol, dtol, t0, t1
+    KSPConvergedReason :: reason
+    integer :: ic
+    character(len=24) :: pfx
+    character(len=32) :: lab
+    character(len=96) :: on
+
+    rtol = 1.0d-8; abstol = 1.0d-50; dtol = 1.0d4
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]   ......................................................."
+      write(*,'(A,A)') "[Physics PC]   T4/T5/T7 ADVANCED AMG, ", trim(tag)
+      flush(6)
+    endif
+
+    do ic = 1, NCFG
+      write(pfx,'(A,I0,A)') "padv", ic, "_"
+      call KSPCreate(comm, ksp, ierr)
+      call KSPSetOperators(ksp, A, A, ierr)
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call KSPSetTolerances(ksp, rtol, abstol, dtol, AD_MAXITS, ierr)
+      call KSPGetPC(ksp, pc, ierr)
+
+      if (ic <= 11) then
+        call PCSetType(pc, PCHYPRE, ierr)
+        call PCHYPRESetType(pc, "boomeramg", ierr)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_strong_threshold"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "0.5", ierr)
+      else
+        call PCSetType(pc, PCGAMG, ierr)
+        on = "-"//trim(pfx)//"pc_gamg_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "agg", ierr)
+        on = "-"//trim(pfx)//"pc_gamg_agg_nsmooths"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "0", ierr)
+        on = "-"//trim(pfx)//"pc_gamg_threshold"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "0.01", ierr)
+      endif
+
+      select case (ic)
+      !--- T4a: coarsening algorithm, interpolation left at default ---
+      case (1); lab = "coarsen HMIS"
+      case (2); lab = "coarsen PMIS"
+      case (3); lab = "coarsen Falgout"
+      case (4); lab = "coarsen CLJP"
+      !--- T4b: interpolation algorithm, coarsening fixed at HMIS ---
+      case (5); lab = "interp classical"
+      case (6); lab = "interp ext+i"
+      case (7); lab = "interp FF1"
+      case (8); lab = "interp standard"
+      !--- T5: AIR, for nonsymmetry ---
+      case (9);  lab = "AIR restriction"
+      case (10); lab = "AIR + ext+i"
+      !--- T4c: aggressive coarsening ---
+      case (11); lab = "agg_num_levels 2"
+      !--- T7: robust smoothers on top of unsmoothed aggregation ---
+      case (12); lab = "gamg nsm0 + SOR"
+      case (13); lab = "gamg nsm0 + ILU(bjac)"
+      case (14); lab = "gamg nsm0 + rich/SOR"
+      end select
+
+      select case (ic)
+      case (1)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_coarsen_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "HMIS", ierr)
+      case (2)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_coarsen_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "PMIS", ierr)
+      case (3)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_coarsen_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "Falgout", ierr)
+      case (4)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_coarsen_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "CLJP", ierr)
+      case (5:8)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_coarsen_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "HMIS", ierr)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_interp_type"
+        select case (ic)
+        case (5); call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "classical", ierr)
+        case (6); call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "ext+i", ierr)
+        case (7); call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "FF1", ierr)
+        case (8); call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "standard", ierr)
+        end select
+      case (9, 10)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_coarsen_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "HMIS", ierr)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_restriction_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "1", ierr)
+        if (ic == 10) then
+          on = "-"//trim(pfx)//"pc_hypre_boomeramg_interp_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "ext+i", ierr)
+        endif
+      case (11)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_coarsen_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "HMIS", ierr)
+        on = "-"//trim(pfx)//"pc_hypre_boomeramg_agg_nl"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "2", ierr)
+      case (12)
+        on = "-"//trim(pfx)//"mg_levels_pc_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "sor", ierr)
+      case (13)
+        ! PCILU cannot be applied to MPIAIJ; bjacobi's default sub-PC IS ILU(0)
+        ! on the local block, which is the serial-equivalent route.
+        on = "-"//trim(pfx)//"mg_levels_pc_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "bjacobi", ierr)
+      case (14)
+        on = "-"//trim(pfx)//"mg_levels_ksp_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "richardson", ierr)
+        on = "-"//trim(pfx)//"mg_levels_ksp_richardson_scale"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "0.7", ierr)
+        on = "-"//trim(pfx)//"mg_levels_pc_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "sor", ierr)
+      end select
+
+      call KSPSetFromOptions(ksp, ierr)
+
+      call PetscTime(t0, ierr)
+      call KSPSetUp(ksp, ierr)
+      call VecZeroEntries(x, ierr)
+      call KSPSolve(ksp, b, x, ierr)
+      call PetscTime(t1, ierr)
+      call KSPGetIterationNumber(ksp, its, ierr)
+      call KSPGetConvergedReason(ksp, reason, ierr)
+
+      call VecDuplicate(x, e, ierr)
+      call VecCopy(x, e, ierr)
+      call VecAXPY(e, -1.0d0, x_ref, ierr)
+      call VecNorm(e, NORM_2, enorm, ierr)
+      call VecDestroy(e, ierr)
+      enorm = enorm / max(nref, 1.d-300)
+
+      if (my_id == 0) then
+        write(*,'(A,A24,A,I5,A,ES10.3,A,I4,A,F7.2,A,A)') &
+          "[Physics PC]     ", lab, "  its = ", its, ", err = ", enorm, &
+          ", reason = ", reason%v, ", t = ", t1 - t0, " s  ", &
+          trim(merge("DIVERGED    ", merge("BAD-SOLUTION", "ok          ", &
+                     enorm > 1.d-6), reason%v < 0))
+        flush(6)
+      endif
+
+      call KSPDestroy(ksp, ierr)
+    enddo
+
+  end subroutine probe_amg_advanced
+
+  !--------------------------------------------------------------------
+  !> T6: FIELDSPLIT is pair_psi's best iterative option and we have only ever
+  !! run ONE configuration of it.
+  !!
+  !! The probe's case 4 fixes: field 0 = psi, lower factorisation, selfp Schur
+  !! approximation, hypre on the (1,1) block. Each of those is a choice:
+  !!
+  !!   ORDER. Splitting with j first inverts which variable is eliminated, and
+  !!     therefore gives a completely different Schur complement -- B_11 -
+  !!     B_13 B_33^-1 B_31 (eliminating the MASS block, which is the cheap and
+  !!     well-conditioned one) instead of B_33 - B_31 B_11^-1 B_13.
+  !!   FACTORISATION. lower / upper / full.
+  !!   SCHUR APPROXIMATION. selfp builds it from diag of the (1,1) block; a11
+  !!     just uses the (2,2) block. On this layout the (2,2) of the swapped
+  !!     order IS a stiffness block, so the right choice is not obvious a priori.
+  !!   INNER AMG. E2 showed nsmooths = 0 matters; case 4 used hypre at default.
+  !--------------------------------------------------------------------
+  subroutine probe_fieldsplit_variants(A, b, x, x_ref, nref, is_pair, tag, comm, my_id)
+    Mat, intent(in)              :: A
+    Vec, intent(in)              :: b, x_ref
+    Vec, intent(inout)           :: x
+    PetscReal, intent(in)        :: nref
+    IS,  intent(in)              :: is_pair(2)
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: comm, my_id
+
+    integer, parameter :: FS_MAXITS = 200
+    integer, parameter :: NFS = 7
+
+    PetscErrorCode :: ierr
+    KSP :: ksp
+    PC  :: pc
+    Vec :: e
+    PetscInt  :: its
+    PetscReal :: enorm, rtol, abstol, dtol, t0, t1
+    KSPConvergedReason :: reason
+    integer :: iv
+    character(len=24) :: pfx
+    character(len=32) :: lab
+    character(len=96) :: on
+    logical :: swapped
+
+    rtol = 1.0d-8; abstol = 1.0d-50; dtol = 1.0d4
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]   ......................................................."
+      write(*,'(A,A)') "[Physics PC]   T6 FIELDSPLIT VARIANTS, ", trim(tag)
+      flush(6)
+    endif
+
+    do iv = 1, NFS
+      write(pfx,'(A,I0,A)') "pfsv", iv, "_"
+      swapped = (iv >= 5)
+
+      call KSPCreate(comm, ksp, ierr)
+      call KSPSetOperators(ksp, A, A, ierr)
+      call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+      call KSPSetType(ksp, KSPFGMRES, ierr)
+      call KSPGMRESSetRestart(ksp, 60, ierr)
+      call KSPSetTolerances(ksp, rtol, abstol, dtol, FS_MAXITS, ierr)
+      call KSPGetPC(ksp, pc, ierr)
+      call PCSetType(pc, PCFIELDSPLIT, ierr)
+
+      if (swapped) then
+        call PCFieldSplitSetIS(pc, "0", is_pair(2), ierr)
+        call PCFieldSplitSetIS(pc, "1", is_pair(1), ierr)
+      else
+        call PCFieldSplitSetIS(pc, "0", is_pair(1), ierr)
+        call PCFieldSplitSetIS(pc, "1", is_pair(2), ierr)
+      endif
+
+      on = "-"//trim(pfx)//"pc_fieldsplit_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "schur", ierr)
+
+      select case (iv)
+      case (1); lab = "psi-first lower selfp"
+      case (2); lab = "psi-first full  selfp"
+      case (3); lab = "psi-first lower a11"
+      case (4); lab = "psi-first lower selfp gamg0"
+      case (5); lab = "j-first   lower selfp"
+      case (6); lab = "j-first   full  selfp"
+      case (7); lab = "j-first   lower a11"
+      end select
+
+      on = "-"//trim(pfx)//"pc_fieldsplit_schur_fact_type"
+      if (iv == 2 .or. iv == 6) then
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "full", ierr)
+      else
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "lower", ierr)
+      endif
+
+      on = "-"//trim(pfx)//"pc_fieldsplit_schur_precondition"
+      if (iv == 3 .or. iv == 7) then
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "a11", ierr)
+      else
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "selfp", ierr)
+      endif
+
+      ! (1,1) block: inexact AMG-preconditioned Krylov
+      on = "-"//trim(pfx)//"fieldsplit_0_ksp_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "gmres", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_0_ksp_max_it"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "20", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_0_ksp_rtol"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "1e-2", ierr)
+      if (iv == 4) then
+        on = "-"//trim(pfx)//"fieldsplit_0_pc_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "gamg", ierr)
+        on = "-"//trim(pfx)//"fieldsplit_0_pc_gamg_agg_nsmooths"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "0", ierr)
+        on = "-"//trim(pfx)//"fieldsplit_0_pc_gamg_threshold"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "0.01", ierr)
+      else
+        on = "-"//trim(pfx)//"fieldsplit_0_pc_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "hypre", ierr)
+        on = "-"//trim(pfx)//"fieldsplit_0_pc_hypre_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "boomeramg", ierr)
+      endif
+
+      ! (2,2) / Schur block: direct, so the row measures the SPLIT and not the
+      ! inner solver.
+      on = "-"//trim(pfx)//"fieldsplit_1_ksp_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "preonly", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_1_pc_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "lu", ierr)
+      on = "-"//trim(pfx)//"fieldsplit_1_pc_factor_mat_solver_type"
+      call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "mumps", ierr)
+
+      call KSPSetFromOptions(ksp, ierr)
+
+      call PetscTime(t0, ierr)
+      call KSPSetUp(ksp, ierr)
+      call VecZeroEntries(x, ierr)
+      call KSPSolve(ksp, b, x, ierr)
+      call PetscTime(t1, ierr)
+      call KSPGetIterationNumber(ksp, its, ierr)
+      call KSPGetConvergedReason(ksp, reason, ierr)
+
+      call VecDuplicate(x, e, ierr)
+      call VecCopy(x, e, ierr)
+      call VecAXPY(e, -1.0d0, x_ref, ierr)
+      call VecNorm(e, NORM_2, enorm, ierr)
+      call VecDestroy(e, ierr)
+      enorm = enorm / max(nref, 1.d-300)
+
+      if (my_id == 0) then
+        write(*,'(A,A28,A,I5,A,ES10.3,A,I4,A,F7.2,A,A)') &
+          "[Physics PC]     ", lab, "  its = ", its, ", err = ", enorm, &
+          ", reason = ", reason%v, ", t = ", t1 - t0, " s  ", &
+          trim(merge("DIVERGED    ", merge("BAD-SOLUTION", "ok          ", &
+                     enorm > 1.d-6), reason%v < 0))
+        flush(6)
+      endif
+
+      call KSPDestroy(ksp, ierr)
+    enddo
+
+  end subroutine probe_fieldsplit_variants
+
+  !--------------------------------------------------------------------
+  !> T8: does pair_psi's err ~7e-2 floor come from the APPROXIMATION or from the
+  !! STOPPING CRITERION?
+  !!
+  !! T6's best row (j-first, lower, a11) returns err 7.02e-2 while the outer
+  !! FGMRES reports convergence; the baseline shows err 7.08e0 against a residual
+  !! of 4.5e-7, a ratio of 1.6e7. So residual-based stopping demonstrably does
+  !! not control the error here, and two very different readings are open:
+  !!
+  !!   (a) the APPROXIMATION Shat = B_11, i.e. dropping B_13 B_33^-1 B_31, is
+  !!       simply worth ~7e-2 and no amount of iterating will pass it; or
+  !!   (b) the true error is still falling and the solver stopped too early.
+  !!
+  !! These call for opposite next moves -- (a) needs a better Schur
+  !! approximation, (b) needs only the combined cheap-inner-solve path -- so they
+  !! must be separated before any of it is built.
+  !!
+  !! Two variants, each swept over a tolerance ladder, with BOTH inner solves
+  !! made exact so that only the outer stopping and the Schur approximation vary:
+  !!   V1  Shat = B_11 (the a11 choice), LU on both blocks.
+  !!   V2  Shat = S EXACTLY: full factorisation, schur_precondition self, the
+  !!       Schur KSP driven to 1e-10 on the matrix-free MatSchurComplement. If
+  !!       the block factorisation is exact and err STILL floors, the limit is
+  !!       neither the approximation nor the stopping rule.
+  !!
+  !! The reported residual is the TRUE relative residual ||b - A x|| / ||b||,
+  !! recomputed here rather than taken from the KSP, so it cannot be a
+  !! preconditioned-norm artifact.
+  !--------------------------------------------------------------------
+  subroutine probe_schur_tolerance_ladder(A, b, x, x_ref, nref, is_pair, tag, comm, my_id)
+    Mat, intent(in)              :: A
+    Vec, intent(in)              :: b, x_ref
+    Vec, intent(inout)           :: x
+    PetscReal, intent(in)        :: nref
+    IS,  intent(in)              :: is_pair(2)
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: comm, my_id
+
+    integer, parameter :: LD_MAXITS = 1000
+    integer, parameter :: NT = 5
+    real*8,  parameter :: rt(NT) = [1.d-4, 1.d-6, 1.d-8, 1.d-10, 1.d-12]
+
+    PetscErrorCode :: ierr
+    KSP :: ksp
+    PC  :: pc
+    Vec :: e, r
+    PetscInt  :: its
+    PetscReal :: enorm, rnorm, bnorm, abstol, dtol, t0, t1
+    KSPConvergedReason :: reason
+    integer :: iv, k
+    character(len=24) :: pfx
+    character(len=96) :: on
+    character(len=28) :: lab
+
+    abstol = 1.0d-50; dtol = 1.0d8
+    call VecNorm(b, NORM_2, bnorm, ierr)
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC]   ......................................................."
+      write(*,'(A,A)') "[Physics PC]   T8 SCHUR TOLERANCE LADDER, ", trim(tag)
+      write(*,'(A)') "[Physics PC]     err floors => the Shat approximation is the limit."
+      write(*,'(A)') "[Physics PC]     err tracks rtol => the stopping rule was the limit."
+      flush(6)
+    endif
+
+    do iv = 1, 2
+      do k = 1, NT
+        write(pfx,'(A,I0,A,I0,A)') "plad", iv, "x", k, "_"
+
+        call KSPCreate(comm, ksp, ierr)
+        call KSPSetOperators(ksp, A, A, ierr)
+        call KSPSetOptionsPrefix(ksp, trim(pfx), ierr)
+        call KSPSetType(ksp, KSPFGMRES, ierr)
+        call KSPGMRESSetRestart(ksp, 100, ierr)
+        call KSPSetTolerances(ksp, rt(k), abstol, dtol, LD_MAXITS, ierr)
+        call KSPGetPC(ksp, pc, ierr)
+        call PCSetType(pc, PCFIELDSPLIT, ierr)
+
+        ! j FIRST in both variants: field 0 = the mass block.
+        call PCFieldSplitSetIS(pc, "0", is_pair(2), ierr)
+        call PCFieldSplitSetIS(pc, "1", is_pair(1), ierr)
+
+        on = "-"//trim(pfx)//"pc_fieldsplit_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "schur", ierr)
+
+        ! field 0 = B_33, exact, in BOTH variants: only the Schur treatment and
+        ! the outer tolerance are allowed to vary.
+        on = "-"//trim(pfx)//"fieldsplit_0_ksp_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "preonly", ierr)
+        on = "-"//trim(pfx)//"fieldsplit_0_pc_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "lu", ierr)
+        on = "-"//trim(pfx)//"fieldsplit_0_pc_factor_mat_solver_type"
+        call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "mumps", ierr)
+
+        if (iv == 1) then
+          write(lab,'(A,ES8.1)') "V1 a11 exact  rtol ", rt(k)
+          on = "-"//trim(pfx)//"pc_fieldsplit_schur_fact_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "lower", ierr)
+          on = "-"//trim(pfx)//"pc_fieldsplit_schur_precondition"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "a11", ierr)
+          on = "-"//trim(pfx)//"fieldsplit_1_ksp_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "preonly", ierr)
+          on = "-"//trim(pfx)//"fieldsplit_1_pc_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "lu", ierr)
+          on = "-"//trim(pfx)//"fieldsplit_1_pc_factor_mat_solver_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "mumps", ierr)
+        else
+          write(lab,'(A,ES8.1)') "V2 exact S    rtol ", rt(k)
+          on = "-"//trim(pfx)//"pc_fieldsplit_schur_fact_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "full", ierr)
+          ! "self" makes the Schur PC the matrix-free S itself, so the inner KSP
+          ! must carry the accuracy -- hence no PC and a tight tolerance.
+          on = "-"//trim(pfx)//"pc_fieldsplit_schur_precondition"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "self", ierr)
+          on = "-"//trim(pfx)//"fieldsplit_1_ksp_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "gmres", ierr)
+          on = "-"//trim(pfx)//"fieldsplit_1_ksp_rtol"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "1e-10", ierr)
+          on = "-"//trim(pfx)//"fieldsplit_1_ksp_max_it"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "500", ierr)
+          on = "-"//trim(pfx)//"fieldsplit_1_pc_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "none", ierr)
+          ! the inner MatSchurComplement needs its own A00 solve; make it exact too
+          on = "-"//trim(pfx)//"fieldsplit_1_inner_ksp_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "preonly", ierr)
+          on = "-"//trim(pfx)//"fieldsplit_1_inner_pc_type"
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(on), "lu", ierr)
+        endif
+
+        call KSPSetFromOptions(ksp, ierr)
+
+        call PetscTime(t0, ierr)
+        call VecZeroEntries(x, ierr)
+        call KSPSolve(ksp, b, x, ierr)
+        call PetscTime(t1, ierr)
+        call KSPGetIterationNumber(ksp, its, ierr)
+        call KSPGetConvergedReason(ksp, reason, ierr)
+
+        ! TRUE relative residual, recomputed
+        call VecDuplicate(b, r, ierr)
+        call MatMult(A, x, r, ierr)
+        call VecAYPX(r, -1.0d0, b, ierr)
+        call VecNorm(r, NORM_2, rnorm, ierr)
+        call VecDestroy(r, ierr)
+        rnorm = rnorm / max(bnorm, 1.d-300)
+
+        call VecDuplicate(x, e, ierr)
+        call VecCopy(x, e, ierr)
+        call VecAXPY(e, -1.0d0, x_ref, ierr)
+        call VecNorm(e, NORM_2, enorm, ierr)
+        call VecDestroy(e, ierr)
+        enorm = enorm / max(nref, 1.d-300)
+
+        if (my_id == 0) then
+          write(*,'(A,A28,A,I5,A,ES10.3,A,ES10.3,A,I4,A,F7.2,A)') &
+            "[Physics PC]     ", lab, "  its = ", its, &
+            ", true res = ", rnorm, ", err = ", enorm, &
+            ", reason = ", reason%v, ", t = ", t1 - t0, " s"
+          flush(6)
+        endif
+
+        call KSPDestroy(ksp, ierr)
+      enddo
+    enddo
+
+  end subroutine probe_schur_tolerance_ladder
 
   !--------------------------------------------------------------------
   !> Workstream B: hard stop when np > 1.
@@ -5505,6 +7461,8 @@ contains
   !! the next rebuild, so a cached nest would dangle.
   !--------------------------------------------------------------------
   subroutine build_pair_psi_prod(comm, first_time, my_id)
+    use phys_module, only: physics_pc_pair_scale
+
     integer, intent(in) :: comm
     logical, intent(in) :: first_time
     integer, intent(in) :: my_id
@@ -5541,6 +7499,18 @@ contains
       call MatGetSize(g_ctx%B_33, n2_glo, PETSC_NULL_INTEGER, ierr)
       call ISCreateStride(comm, n1_loc, 0,      1, g_ctx%is_pair_psi(1), ierr)
       call ISCreateStride(comm, n2_loc, n1_glo, 1, g_ctx%is_pair_psi(2), ierr)
+    endif
+
+    !--- Step 2: symmetric block scaling, applied to the STORED operator so that
+    !--- the LU (and any later AMG, and the probe) all see the scaled pair. The
+    !--- apply scales the RHS and unscales the solution with the same D, which
+    !--- makes the whole thing an exact similarity.
+    if (physics_pc_pair_scale /= 0) then
+      if (g_ctx%pscale_pj_ready) call VecDestroy(g_ctx%pscale_pj, ierr)
+      call MatGetSize(g_ctx%B_11, n1_glo, PETSC_NULL_INTEGER, ierr)
+      call make_pair_block_scale(g_ctx%K_pj_aij, n1_glo, g_ctx%pscale_pj, &
+                                 comm, my_id, "pair_psi")
+      g_ctx%pscale_pj_ready = .true.
     endif
 
     if (my_id == 0) write(*,'(A)') &
@@ -5581,7 +7551,8 @@ contains
   subroutine build_schur_mixed_prod(comm, first_time, my_id, label, ok)
     use phys_module, only: time_evol_zeta, tstep, tstep_prev, &
                            physics_pc_schur_channels, physics_pc_schur_massinv, &
-                           physics_pc_schur_pairinv, physics_pc_wave_schur
+                           physics_pc_schur_pairinv, physics_pc_wave_schur, &
+                           physics_pc_pair_scale
 
     integer, intent(in)           :: comm
     logical, intent(in)           :: first_time
@@ -5824,6 +7795,17 @@ contains
     call PetscLogEventEnd(pcev_builddiag, ierr)
 
     call MatDestroy(S_uu, ierr)   ! safe: MatConvert copied the values out
+
+    !--- Step 2: block scaling LAST, so every diagnostic above still reports the
+    !--- UNSCALED operator and stays comparable with the recorded runs. The
+    !--- scaled spread is printed by make_pair_block_scale itself.
+    if (physics_pc_pair_scale /= 0) then
+      if (g_ctx%pscale_w_ready) call VecDestroy(g_ctx%pscale_w, ierr)
+      call MatGetSize(g_ctx%B_22, n1_glo, PETSC_NULL_INTEGER, ierr)
+      call make_pair_block_scale(g_ctx%S_W_aij, n1_glo, g_ctx%pscale_w, &
+                                 comm, my_id, "pair_w  ")
+      g_ctx%pscale_w_ready = .true.
+    endif
 
     g_ctx%schur_mixed_ready  = .true.
     g_ctx%schur_mixed_active = .true.
@@ -6077,6 +8059,14 @@ contains
     ! separately. If it lands in the j half, the LU on the packed operator -- not
     ! the wiring -- is the source, and the gate above is measuring the inner
     ! solver rather than the algorithm.
+    !
+    ! With physics_pc_pair_scale on, these two checks report the residual of the
+    ! SCALED system: the solve and the MatMult below use the same stored (D A D),
+    ! so they stay internally consistent, but the number is no longer comparable
+    ! with the recorded unscaled ones. That is the intended reading -- the ~7
+    ! digits lost in the j half were attributed to the pair's dynamic range, so
+    ! measuring it here on the scaled operator is a direct test of whether the
+    ! scaling fixed it.
     call pack_2v(x_psi, x_j, g_ctx%rhs_PJ, ierr)
     call KSPSolve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, ierr)
     call MatMult(g_ctx%K_pj_aij, g_ctx%sol_PJ, pres, ierr)
@@ -6319,6 +8309,128 @@ contains
     end block
     call PetscLogEventEnd(pcev_builddiag, ierr)
   end subroutine make_mass_inverse
+
+  !--------------------------------------------------------------------
+  !> Workstream B, Step 2: symmetric BLOCK scaling of a packed 2-field pair.
+  !!
+  !!   A <- D A D,   D = diag(I, s I)
+  !!
+  !! The caller then solves (D A D) z = D b and recovers x = D z, so this is an
+  !! exact similarity: it changes the conditioning the inner solver sees and
+  !! NOTHING else. physics_pc_pair_scale = 0 skips it entirely and so reproduces
+  !! the unscaled results bit-for-bit.
+  !!
+  !! WHY. Both packed pairs pit an operator block against a mass block, and in
+  !! both the two carry very different scale. Measured over the full ramp with
+  !! physics_pc_probe_inner = 3 (meas_B/pr_ramp_m8), the two behave DIFFERENTLY
+  !! and it matters:
+  !!
+  !!   pair_w   |diag| spread 5.3e9 -> 2.2e10 -> 1.2e12 -> 3.1e13 at tstep
+  !!            1 / 10 / 100 / 1000. min is pinned at 1.858e-5 (the dt-independent
+  !!            B_44 mass rows) while max tracks dt. Genuinely dt-driven.
+  !!   pair_psi |diag| spread CONSTANT at 1.78e10 across the whole ramp. Its
+  !!            mismatch is static, not dt-driven.
+  !!
+  !! So the dt story holds for pair_w only. It is NOT the ZBIG penalty rows in
+  !! either case -- eliminate_boundary_dofs has already removed those, and no
+  !! measured diagonal reaches 1e12 until pair_w does so on its own at tstep=100.
+  !!
+  !! Note also that spread alone does NOT predict solvability: pair_psi holds a
+  !! constant 1.78e10 spread while GMRES+ILU(0) on it improves from err 7.3e+1 at
+  !! tstep=1 to 3.5e-5 at tstep=1000. Scaling is therefore expected to pay on
+  !! pair_w, where the spread grows four decades and every candidate (INCLUDING
+  !! the MUMPS LU, err 1.7e-6 at tstep=1000) degrades with it. It is applied to
+  !! both because it is an exact similarity and costs one MatDiagonalScale.
+  !!
+  !! s is MEASURED from the two block diagonals, not assumed from a power of dt.
+  !! pair_w's max does not follow a clean power of dt (ratios 1.9 / 37 / 26 across
+  !! the ramp's decades) because S_uu carries both a mass part and the dt^2
+  !! channel correction, so an assumed exponent would be wrong; and pair_psi has
+  !! no dt dependence to assume in the first place.
+  !!
+  !! One scalar per block, deliberately: the block structure that a PCFIELDSPLIT
+  !! or a point-block smoother needs is preserved exactly. Per-row equilibration
+  !! would flatten the diagonal further but destroy that structure.
+  !--------------------------------------------------------------------
+  subroutine make_pair_block_scale(A, n1_glo, dvec, comm, my_id, label)
+    Mat, intent(inout)           :: A
+    PetscInt, intent(in)         :: n1_glo   !< global rows in the FIRST field
+    Vec, intent(inout)           :: dvec     !< out: D, kept for the apply
+    integer, intent(in)          :: comm
+    integer, intent(in)          :: my_id
+    character(len=*), intent(in) :: label
+
+    PetscErrorCode :: ierr
+    PetscInt  :: rstart, rend, ii
+    integer   :: kk, mpierr
+    PetscScalar, pointer :: dptr(:)
+    real*8    :: acc(4), m1, m2, s
+    PetscReal :: dmin, dmax
+    Vec       :: chk
+
+    call MatCreateVecs(A, dvec, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, dvec, ierr)
+    call MatGetOwnershipRange(A, rstart, rend, ierr)
+
+    !--- mean |diag| of each field, over owned rows, then reduced.
+    acc = 0.d0
+    call VecGetArray(dvec, dptr, ierr)
+    do kk = 1, int(rend - rstart)
+      ii = rstart + kk - 1
+      if (ii < n1_glo) then
+        acc(1) = acc(1) + abs(dptr(kk))
+        acc(3) = acc(3) + 1.d0
+      else
+        acc(2) = acc(2) + abs(dptr(kk))
+        acc(4) = acc(4) + 1.d0
+      endif
+    enddo
+    call VecRestoreArray(dvec, dptr, ierr)
+    call MPI_Allreduce(MPI_IN_PLACE, acc, 4, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+
+    m1 = acc(1) / max(acc(3), 1.d0)
+    m2 = acc(2) / max(acc(4), 1.d0)
+
+    ! Fall back to the identity rather than guessing. A zero mean means the block
+    ! is not the shape this routine assumes, and a silently wrong scaling would be
+    ! indistinguishable from a bad preconditioner in every downstream number.
+    if (m1 > 0.d0 .and. m2 > 0.d0) then
+      s = sqrt(m1 / m2)
+    else
+      s = 1.d0
+      if (my_id == 0) write(*,'(A,A,A)') &
+        "[Physics PC]   WARNING: ", trim(label), &
+        " block scaling SKIPPED (a field has zero mean |diag|); D = I"
+    endif
+
+    !--- D itself: 1 on the first field, s on the second.
+    call VecGetArray(dvec, dptr, ierr)
+    do kk = 1, int(rend - rstart)
+      ii = rstart + kk - 1
+      if (ii < n1_glo) then
+        dptr(kk) = 1.d0
+      else
+        dptr(kk) = s
+      endif
+    enddo
+    call VecRestoreArray(dvec, dptr, ierr)
+
+    call MatDiagonalScale(A, dvec, dvec, ierr)
+
+    !--- The spread actually achieved. This is the number the scaling exists to
+    !--- move, so it belongs in the log next to the unscaled one.
+    call MatCreateVecs(A, chk, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, chk, ierr)
+    call VecAbs(chk, ierr)
+    call VecMax(chk, PETSC_NULL_INTEGER, dmax, ierr)
+    call VecMin(chk, PETSC_NULL_INTEGER, dmin, ierr)
+    call VecDestroy(chk, ierr)
+
+    if (my_id == 0) write(*,'(A,A,A,ES11.4,A,ES11.4,A,ES11.4,A,ES11.4)') &
+      "[Physics PC]   ", trim(label), " block scale: s = ", s, &
+      ", mean|diag| ", m1, " / ", m2, " -> scaled |diag| spread = ", dmax/max(dmin, 1.d-300)
+
+  end subroutine make_pair_block_scale
 
 
   !--------------------------------------------------------------------

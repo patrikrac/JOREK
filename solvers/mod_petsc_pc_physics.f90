@@ -14,7 +14,7 @@ module mod_petsc_pc_physics
        compute_explicit_preconditioned_matrix, &
        compute_full_momentum_schur_exact, &
        setup_S_PBP_diag_shell, materialize_S_PBP_diag_aij, &
-       setup_block_ksp, setup_constraint_mass_ksp, &
+       setup_block_ksp, setup_constraint_mass_ksp, setup_pair_inner_ksp, &
        build_schur_smallflow_prod, build_schur_commutator_prod, &
        build_pair_psi_prod, build_schur_mixed_prod, &
        setup_schur_inner_ksp, &
@@ -99,7 +99,8 @@ contains
                            physics_pc_schur_approx, physics_pc_schur_itersolve, &
                            physics_pc_schur_global, &
                            physics_pc_schur_amg, physics_pc_schur_amg_its, &
-                           physics_pc_schur_variant, physics_pc_verify_mixed
+                           physics_pc_schur_variant, physics_pc_verify_mixed, &
+                           physics_pc_pair_inner
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate, &
                                          petsc_mat_diff_norm
 
@@ -472,13 +473,34 @@ contains
               "[Physics PC]   FATAL: the mixed-pair Schur (SFM) could not be built."
             call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
           endif
+          ! physics_pc_pair_inner selects the inner solver for the two packed
+          ! pairs. 0 keeps the PREONLY+LU/MUMPS baseline bit-for-bit; 1-3 use
+          ! setup_pair_inner_ksp, whose configuration is the outcome of the
+          ! T1-T8 experiments (docs/physics_pc/workstream_B_smoother_design.md
+          ! S12-S13). Admissible only because the global solver is FGMRES.
           call PetscLogEventBegin(pcev_fact_pj, ierr)
-          call setup_block_ksp(g_ctx%ksp_pair_psi, g_ctx%K_pj_aij, comm, first_time, &
-                               "pair_psi KSP ([B_11,B_13;B_31,B_33])")
+          if (physics_pc_pair_inner == 0) then
+            call setup_block_ksp(g_ctx%ksp_pair_psi, g_ctx%K_pj_aij, comm, first_time, &
+                                 "pair_psi KSP ([B_11,B_13;B_31,B_33])")
+          else
+            call setup_pair_inner_ksp(g_ctx%ksp_pair_psi, g_ctx%K_pj_aij, &
+                                 g_ctx%is_pair_psi, comm, first_time, &
+                                 physics_pc_pair_inner /= 3, "pjinner", &
+                                 "pair_psi KSP ([B_11,B_13;B_31,B_33])")
+          endif
           call PetscLogEventEnd(pcev_fact_pj, ierr)
           call PetscLogEventBegin(pcev_fact_w, ierr)
-          call setup_block_ksp(g_ctx%ksp_pair_w,   g_ctx%S_W_aij,  comm, first_time, &
-                               "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])")
+          if (physics_pc_pair_inner == 0) then
+            call setup_block_ksp(g_ctx%ksp_pair_w,   g_ctx%S_W_aij,  comm, first_time, &
+                                 "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])")
+          else
+            ! pair_w does not need the pair structure: plain GMRES+ILU(0) beat
+            ! every AMG variant on it (S11.1), so modes 2 and 3 use that.
+            call setup_pair_inner_ksp(g_ctx%ksp_pair_w, g_ctx%S_W_aij, &
+                                 g_ctx%is_pair_w, comm, first_time, &
+                                 physics_pc_pair_inner == 1, "winner", &
+                                 "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])")
+          endif
           call PetscLogEventEnd(pcev_fact_w, ierr)
           ! Packed work vectors: the Mat handles are rebuilt every step but their
           ! SIZES never change, so these are created exactly once.

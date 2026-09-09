@@ -671,6 +671,11 @@ subroutine preset_parameters
   physics_pc_probe_inner     = 0            ! Workstream B phase 5: iterative/AMG amenability probe (0=off, 1=LU+ILU, 2=+scalar AMG, 3=+fieldsplit)
   physics_pc_schur_pairinv   = 2            ! Workstream B "SFM2": (psi,j) pair Schur inverse (2=diag, 3=lumped, 7=FSAI-0, 8=FSAI-1)
   physics_pc_verify_mixed    = .false.      ! Workstream B: mixed-pair null test (rows 3/4 hard pass/fail)
+  physics_pc_pair_scale      = 0            ! Workstream B: symmetric block scaling of the packed pairs (0=off, 1=on)
+  physics_pc_pair_inner      = 0            ! Workstream B SFM2: pair inner solver (0=LU baseline, 1=iterative both, 2=iter psi + ILU w, 3=ILU both)
+  physics_pc_pair_maxits     = 30           ! Workstream B SFM2: iteration cap per pair inner solve
+  physics_pc_pair_rtol       = 1.d-2        ! Workstream B SFM2: rtol per pair inner solve
+  physics_pc_pair_amg_thr    = 0.05d0       ! Workstream B SFM2: GAMG strength threshold for the Shat = B_11 solve
   commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 

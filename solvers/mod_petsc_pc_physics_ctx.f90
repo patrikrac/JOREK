@@ -166,6 +166,15 @@ module mod_petsc_pc_physics_ctx
     IS  :: is_pair_psi(2), is_pair_w(2)  !< layout-only strides into the packed
                              !  vectors. Unused by the direct arm; they are what a
                              !  future PCFIELDSPLIT inner solver needs.
+    Vec :: pscale_pj, pscale_w  !< physics_pc_pair_scale: D = diag(I, s I) for each
+                             !  packed pair. The MATRIX is scaled once at build time
+                             !  (A <- D A D); these keep D so the apply can form the
+                             !  scaled RHS (D b) and unscale the solution (x = D z).
+                             !  Held per-pair rather than recomputed because s comes
+                             !  from the block diagonals and the pairs are rebuilt
+                             !  every step.
+    logical :: pscale_pj_ready = .false. !< pscale_pj exists (and pair_psi is scaled)
+    logical :: pscale_w_ready  = .false. !< pscale_w  exists (and pair_w   is scaled)
     logical :: schur_mixed_ready      = .false. !< K_pj_aij/S_W_aij exist and must be
                                                 !  destroyed before being rebuilt
     logical :: schur_mixed_vecs_ready = .false. !< rhs_PJ/sol_PJ/rhs_W/sol_W + the ISs exist

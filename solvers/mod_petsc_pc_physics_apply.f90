@@ -661,7 +661,8 @@ contains
     ! back-substitution M_j^-1 (x_j - B_31 psi*).
     call pack_2v(x_psi, x_j, g_ctx%rhs_PJ, ierr)
     call PetscLogEventBegin(pcev_solve_pj, ierr)
-    call KSPSolve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, ierr)
+    call pair_ksp_solve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, &
+                        g_ctx%pscale_pj, g_ctx%pscale_pj_ready, ierr)
     call PetscLogEventEnd(pcev_solve_pj, ierr)
     call unpack_2v(g_ctx%sol_PJ, y_psi, y_j, ierr)          ! y_psi = psi*, y_j = j*
 
@@ -702,7 +703,8 @@ contains
     !   input residual -- no fold, no correction term.
     call pack_2v(g_ctx%work_5, x_w, g_ctx%rhs_W, ierr)
     call PetscLogEventBegin(pcev_solve_w, ierr)
-    call KSPSolve(g_ctx%ksp_pair_w, g_ctx%rhs_W, g_ctx%sol_W, ierr)
+    call pair_ksp_solve(g_ctx%ksp_pair_w, g_ctx%rhs_W, g_ctx%sol_W, &
+                        g_ctx%pscale_w, g_ctx%pscale_w_ready, ierr)
     call PetscLogEventEnd(pcev_solve_w, ierr)
     call unpack_2v(g_ctx%sol_W, y_u, y_w, ierr)      ! BOTH final; y_w is DONE
 
@@ -715,7 +717,8 @@ contains
     call VecZeroEntries(g_ctx%work_4, ierr)
     call pack_2v(g_ctx%work_3, g_ctx%work_4, g_ctx%rhs_PJ, ierr)
     call PetscLogEventBegin(pcev_solve_pj, ierr)
-    call KSPSolve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, ierr)
+    call pair_ksp_solve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, &
+                        g_ctx%pscale_pj, g_ctx%pscale_pj_ready, ierr)
     call PetscLogEventEnd(pcev_solve_pj, ierr)
     call unpack_2v(g_ctx%sol_PJ, g_ctx%work_3, g_ctx%work_4, ierr)  ! dpsi, dj
     call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)            ! y_psi = psi* - dpsi
@@ -738,6 +741,39 @@ contains
 
     ierr = 0
   end subroutine apply_wave_schur_mixed_pairs
+
+  !--------------------------------------------------------------------
+  !> One packed-pair solve, with the physics_pc_pair_scale block scaling folded in.
+  !!
+  !! The STORED operator was already replaced by D A D at build time
+  !! (make_pair_block_scale), so what is solved here is
+  !!
+  !!   (D A D) z = D b,   and the true solution is  x = D z.
+  !!
+  !! Both the RHS scaling and the solution unscaling use the SAME D, which is what
+  !! makes the scaling an exact similarity rather than an approximation -- the
+  !! preconditioner this arm defines is unchanged, only the conditioning the inner
+  !! solver sees is.
+  !!
+  !! scaled = .false. touches neither vector, so physics_pc_pair_scale = 0 is
+  !! bit-for-bit the previous code path. The flag is read from the CONTEXT, not
+  !! from the namelist: it is set by the builder, so a build that skipped or fell
+  !! back on the scaling can never be mistaken here for one that applied it.
+  !!
+  !! rhs is overwritten in place. That is safe because both packed RHS vectors are
+  !! scratch (g_ctx%rhs_PJ / g_ctx%rhs_W) and are repacked before every solve.
+  !--------------------------------------------------------------------
+  subroutine pair_ksp_solve(ksp, rhs, sol, dsc, scaled, ierr)
+    KSP, intent(in)     :: ksp
+    Vec, intent(in)     :: rhs, sol, dsc
+    logical, intent(in) :: scaled
+    PetscErrorCode, intent(inout) :: ierr
+
+    if (scaled) call VecPointwiseMult(rhs, rhs, dsc, ierr)
+    call KSPSolve(ksp, rhs, sol, ierr)
+    if (scaled) call VecPointwiseMult(sol, sol, dsc, ierr)
+
+  end subroutine pair_ksp_solve
 
   !--------------------------------------------------------------------
   !> PCSHELL apply callback: compute y = P^{-1} x.
