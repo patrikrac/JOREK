@@ -1,0 +1,308 @@
+! =====================================================================
+!  inxflow600_circ_pcbench
+!  Two-arm benchmark for the physics PC (docs/physics_pc).
+!
+!  This is the physics of the maintained regression test
+!  `reg_tests/testcases/inxflow_600_vpar_T_all` -- a ballooning-unstable
+!  pedestal, ZK_par = 100, ohmic heating, edge and gaussian sources --
+!  ported onto model199 (so: WITHOUT parallel velocity) and onto the
+!  CIRCULAR geometry of `namelist/model199/inxflow_circ_pcbench`.
+!
+!  Why the port is nearly free: model199 IS model600's base model.  Both
+!  declare n_var = 6 with the same slots
+!      var_psi=1  var_u=2  var_zj=3  var_w=4  var_rho=5  var_T=6
+!  (models/model199/mod_model_settings.f90 vs models/model600/
+!  mod_model_settings.f90, n_var_base = 6).  The regression test just
+!  switches on the i_ext_vpar extension, giving a 7th variable.  Dropping
+!  v_par is exactly what model199 already is.
+!
+!  Purpose: every PC measurement so far comes from
+!  `intear_pcbench_gradients` -- a 2/1 tearing mode, n = 1, very large
+!  aspect ratio, low beta.  This is the opposite corner, and it is run as
+!  a full time loop with two arms (physics PC vs. baseline), not as a
+!  single-step verify_schur diagnostic.
+!
+!  --- What did NOT survive the port ------------------------------------
+!  Entries of the 600 test that model199's namelist does not declare.
+!  Leaving any of them in makes the read(42,in1) abort:
+!
+!    tgnum_psi/u/zj/w/rho/T/vpar
+!        model199 declares only the indexed `tgnum`, and its element
+!        matrices never reference it -- only model600/mod_elt_matrix_fft.f90
+!        implements Taylor-Galerkin stabilisation.  So this case has NO TG
+!        stabilisation at all; eta_num and visco_num have to carry that
+!        load.  Watch for it if the run gets noisy at tstep = 3.
+!    visco_old_setup      (model600-only; the old R^2-dependent viscosity)
+!    eta_coul_log_dep     (model600-only; model199 has eta_T_dependent)
+!    min_sheath_angle     (model600-only; model199 has gamma_sheath /
+!                          density_reflection, and there is no sheath here
+!                          anyway -- circular limiter, no open region)
+!
+!  Accepted by the namelist but INERT under model199, so set explicitly or
+!  dropped rather than left looking meaningful:
+!
+!    visco_par, visco_par_num  -- with_Vpar = .false., never used
+!    tauIC                     -- not referenced by model199
+!    bootstrap                 -- model199's element matrices never call
+!                                 bootstrap_current (only 303/501/600/710/
+!                                 711 do).  Set .f.
+!    NEO, aki_neo_const, amu_neo_const
+!                              -- neoclassical coefficients are consumed by
+!                                 the v_par equation.  Set NEO = .f.
+!    bc_natural_open           -- meaningless with n_open/n_leg/n_private = 0
+!
+!  Note also that `zkpar_T_dependent` is in the namelist but unused in
+!  model199, so ZK_par stays constant -- ZK_par = 100 does not run away.
+!
+!  --- Geometry ---------------------------------------------------------
+!  CIRCULAR LIMITER, unchanged from inxflow_circ_pcbench.  A diverted mesh
+!  would put `eliminate_boundary_dofs` -- which every measurement in this
+!  study depends on -- on open field lines, where it is untested.
+!
+!  --- How the drive was found (measured, do not re-derive) -------------
+!  Circularizing removes the separatrix flux expansion that gives the
+!  original X-point case its peeling-BALLOONING drive, and model199 also
+!  never calls bootstrap_current, so there is no edge current for the
+!  peeling half either.  n = 6 is consequently IDEAL-STABLE here, and no
+!  pressure/q knob recovers it.  Measured, each from its own stage 1,
+!  ~60-115 steps at tstep = 3, growth reported as (gamma_mag, gamma_kin):
+!
+!    baseline                          beta_N 2.33%  (+4.2e-3, +3.4e-3)
+!    T_coef(4) 0.08 -> 0.04            beta_N 2.32%  (-8.3e-3, -1.2e-2)
+!    T_0     1.5d-2 -> 4.5d-2          beta_N 4.25%  (-2.4e-2, -1.0e-2)
+!    F0         3.0 -> 4.5             beta_N 1.55%  (+2.1e-2, -4.7e-4)
+!    the first two combined            beta_N 4.23%  (-1.7e-2, +8.4e-3)
+!    X-POINT geometry restored         beta_N 1.91%  (-1.1e-2, -5.7e-3)
+!
+!  In every one of those the magnetic and kinetic growth rates disagree in
+!  SIGN and the energies sit at 1e-25..1e-26 -- that is the seed decaying,
+!  not a mode.  Note the X-point row: even restoring the diverted geometry
+!  did not help, which is what points at the missing bootstrap current.
+!
+!  What DOES work is RESISTIVITY -- the physical eta, not eta_num (eta_num
+!  is dissipative, it damps small scales and can never drive anything).
+!  Raising eta 2.d-6 -> 2.d-5 excites a clean n = 6 RESISTIVE mode in the
+!  circular geometry:
+!
+!    E_kin(n=6) 3.1e-26 -> 3.0e-19 over steps 81..181  (7 decades)
+!    gamma*tau_A = 2.66e-2, constant to 3 significant figures
+!
+!  That is the drive this case uses, and it is why `eta` below is 2.d-5
+!  and not the 2.d-6 of the 600 test.  The mode is resistive rather than
+!  ideal-ballooning; the pedestal, the ZK_par = 100 anisotropy and the
+!  sources are still those of the 600 test.
+!
+!  Keeping the geometry circular is what makes this worth it:
+!  `eliminate_boundary_dofs` stays valid (no open field lines), so these
+!  numbers remain comparable with the whole earlier tearing sweep.
+!
+!  --- Mesh -------------------------------------------------------------
+!  Coarsened from inxflow_circ_pcbench's 81x128 / 40x64 to ~3000 DOF per
+!  variable, so a several-hundred-step run of BOTH arms fits on the single
+!  MPI rank the physics PC apply path requires.
+!
+!  --- Compile-time settings --------------------------------------------
+!  n_tor / n_period / n_plane live in models/mod_settings.f90, NOT here.
+!  Two builds:
+!    stage 1, axisymmetric :  ./util/config.sh model=199 n_tor=1 n_period=1 n_plane=1
+!    stage 2/3, ballooning :  ./util/config.sh model=199 n_tor=3 n_period=6 n_plane=4
+!  models/det_modes.f90:13 is mode(itor) = int(itor/2)*n_period, so
+!  n_tor=3, n_period=6 gives exactly n = 0 and n = 6.
+!
+!  --- Workflow ---------------------------------------------------------
+!  Stage 1 MUST ramp the time step.  Starting straight at tstep = 3 blows
+!  the run up within ~25 steps -- and JOREK still exits 0 while writing NaN
+!  restart files, so the failure is silent.
+!
+!    ./util/setinput.sh inxflow600_circ_pcbench \
+!        tstep_n=1.d-3,1.d-2,1.d-1,1.d0,3.d0 nstep_n=10,10,10,10,10 \
+!        restart=.f. nout=5
+!    mpirun -n 1 ./jorek_model199_ntor1 < inxflow600_circ_pcbench
+!
+!  Stage 2 (new harmonics seeded at 1e-10 * the axisymmetric rho and T by
+!  mod_import_restart.f90; the log's "Increasing number of harmonics from
+!  1 to 3!" warning is correct):
+!
+!    ./util/setinput.sh inxflow600_circ_pcbench tstep_n=3.d0 nstep_n=1000 restart=.t. nout=25
+!    mpirun -n 1 ./jorek_model199 < inxflow600_circ_pcbench
+!    egrep 'W_mag,_kin|Growth_mag,_kin' log_stage2 | tail -20
+!
+!  Stage 3, the two arms: copy this file into run_s65_pc/ and run_s65_std/
+!  with the stage-2 restart, and change ONLY the physics-PC block at the
+!  bottom.  `diff` the two `in` files to prove nothing else moved.
+!
+!  Run on 1 MPI rank: the physics PC apply path fails for np > 1
+!  (pre-existing, independent of this work).  OpenMP threads are fine.
+! =====================================================================
+
+&in1
+
+ restart = .f.
+ regrid  = .f.
+
+ tstep_n   = 1.d-3,1.d-2,1.d-1,1.d0,3.d0
+ nstep_n   = 10,10,10,10,10
+
+ nout = 5
+
+ n_tor_fft_thresh = 2
+
+ freeboundary = .f.
+
+ fbnd(1)   = 2.
+ fbnd(2:4) = 0.
+ mf        = 0
+
+! --- circular limiter geometry ---------------------------------------
+ ellip  = 1.
+ tria_u = 0.
+ tria_l = 0.
+ quad_u = 0.
+ quad_l = 0.
+
+ xpoint = .f.
+ xampl  = 0.
+ xsig   = 0.6
+ xwidth = 1.5
+ xtheta = 4.7
+ xshift = 0.0
+
+ R_begin = 2.9
+ R_end   = 3.1
+ Z_begin = -0.1
+ Z_end   = 0.1
+
+ R_geo = 3.0
+ Z_geo = 0.
+ amin  = 1.
+
+ F0    = 3.0
+
+! --- mesh: ~3000 DOF/variable, both arms must fit on 1 rank -----------
+ n_R      = 0
+ n_Z      = 0
+ n_radial = 41
+ n_pol    = 64
+
+ n_flux    = 24
+ n_tht     = 32
+ n_open    = 0
+ n_leg     = 0
+ n_private = 0
+
+! --- transport, from inxflow_600_vpar_T_all --------------------------
+! eta is the ONE value deliberately changed from the 600 test (2.d-6):
+! it is the drive.  See "How the drive was found" in the header.
+ eta       = 2.d-5
+ eta_ohmic = 1.d-7
+ visco     = 4.d-6
+
+! numerical dissipation: with no Taylor-Galerkin term in model199 this is
+! the only stabilisation this case has
+ eta_num   = 3.d-10
+ visco_num = 1.d-11
+
+ D_par     = 0.d0
+ D_perp(1) = 1.d-5
+ D_perp(2) = 0.85d0
+ D_perp(3) = 0.d0
+ D_perp(4) = 0.01d0
+ D_perp(5) = 0.92d0
+
+ ZK_par     = 100.d0
+ ZK_perp(1) = 1.d-5
+ ZK_perp(2) = 0.85d0
+ ZK_perp(3) = 0.d0
+ ZK_perp(4) = 0.01d0
+ ZK_perp(5) = 0.92d0
+
+! --- equilibrium ------------------------------------------------------
+ FF_0 = 1.6
+ FF_1 = 0.
+ FF_coef(1)  = -1.0
+ FF_coef(2)  = 0.d0
+ FF_coef(3)  = 0.d0
+ FF_coef(4)  = 0.03d0
+ FF_coef(5)  = 1.0d0
+ FF_coef(6)  = -0.06d0
+ FF_coef(7)  = 0.90d0
+ FF_coef(8)  = 0.07d0
+
+ T_0 = 1.5d-2
+ T_1 = 3.d-4
+ T_coef(1) = -0.66d0
+ T_coef(2) = +0.0d0
+ T_coef(3) = 0.d0
+ T_coef(4) = 0.08d0
+ T_coef(5) = 0.94d0
+
+ rho_0 = 1.
+ rho_1 = 0.01
+ rho_coef(1)  =  0.0
+ rho_coef(2)  =  0.0
+ rho_coef(3)  =  0.0
+ rho_coef(4)  =  0.08
+ rho_coef(5)  =  0.94d0
+
+! --- sources ----------------------------------------------------------
+ heatsource                = 1.d-7
+ particlesource            = 5.d-6
+ edgeparticlesource        = 1.d-7
+ edgeparticlesource_psin   = 1.d0
+ edgeparticlesource_sig    = 0.03d0
+ particlesource_gauss      = 1.d-7
+ particlesource_gauss_psin = 0.d0
+ particlesource_gauss_sig  = 0.1d0
+ heatsource_gauss          = 1.d-8
+ heatsource_gauss_psin     = 0.d0
+ heatsource_gauss_sig      = 0.1d0
+
+! Present in the 600 test, but model199 implements neither: its element
+! matrices never call bootstrap_current, and the neoclassical coefficients
+! are consumed by the v_par equation that this model does not have.
+ bootstrap = .f.
+ NEO       = .f.
+
+! --- solver -----------------------------------------------------------
+ iter_precon    = 22
+ gmres_m        = 20
+ gmres_4        = 1.d0
+ gmres_max_iter = 200
+ gmres_tol      = 1.d-8
+
+! --- physics PC -------------------------------------------------------
+! Eliminate the Dirichlet DOFs (row+column zeroed, representative diagonal)
+! instead of the 1e12 ZBIG penalty.  Wanted for the PC study: the penalty
+! rows otherwise dominate every operator norm.
+!
+! CAUTION: this flag is ours, it is in no stock JOREK case, and it is applied
+! to the MAIN system matrix (matrix/construct_matrix_mod.f90:474-748), not
+! only to the PC matrices -- so it changes the boundary condition of the
+! physics solve.  Keep it OFF for the stage-1/stage-2 physics runs; for the
+! stage-3 two-arm comparison it must be ON and IDENTICAL in both arms, or
+! the two arms are not solving the same problem.
+ eliminate_boundary_dofs      = .f.
+
+ use_physics_pc               = .f.
+ debug_physics_pc             = .f.
+ physics_pc_monolithic        = .f.
+ physics_pc_multi_step        = .t.
+ physics_pc_wave_schur        = .t.
+ physics_pc_schur_channels    = 1
+ physics_pc_schur_massinv     = 8
+ physics_pc_reduced_pde       = .f.
+ physics_pc_drop_psi_coupling = .f.
+ physics_pc_verify_reduced    = .f.
+
+! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
+ use_strumpack     = .f.
+ use_strumpack_eq  = .f.
+ use_strumpack_prj = .f.
+ use_mumps         = .f.
+ use_mumps_eq      = .f.
+ use_mumps_prj     = .f.
+ use_pastix        = .f.
+ use_pastix_eq     = .f.
+ use_pastix_prj    = .f.
+ use_petsc_eq      = .t.
+/

@@ -1,0 +1,162 @@
+! =====================================================================
+!  intear_island_demo
+!  The standard JOREK tutorial 2/1 tearing-mode case (m=2, n=1), set up
+!  for island-formation figures and as the SECOND corner for the physics
+!  preconditioner study (docs/physics_pc).
+!
+!  Derived from `intear` with NO physics changes: same equilibrium, same
+!  eta = 1e-6, same flat rho/T profiles, same tutorial mesh (51x16 /
+!  41x16).  What is added here is only:
+!    - a tstep ramp + production steps (stock `intear` has nstep = 0)
+!    - nout for VTK frames
+!    - eliminate_boundary_dofs and the solver flags this build needs
+!      (no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc)
+!    - the physics-PC flags, off by default (baseline arm)
+!
+!  Contrast with `intear_pcbench_gradients`, which raised eta 100x and put
+!  a steep barrier inside the domain: there Wkin(n=0) is dominated by
+!  resistive equilibrium relaxation (see workstream_A section 11.11) and
+!  no island of visible size forms.  Here eta is low and the profiles are
+!  flat, so the n=0 flow stays small and the 2/1 island is the physics.
+!
+!  REQUIRES a build with n_tor = 3, n_period = 1 in models/mod_settings.f90
+!  (compile-time).  With n_period = 6 or n_tor = 1 this silently runs the
+!  axisymmetric problem and no mode grows.  The m=2 seed is hard-coded at
+!  amplitude 1e-10 in models/model199/initial_conditions.f90.
+!
+!  Run on 1 MPI rank: the physics PC apply path fails for np > 1.
+! =====================================================================
+
+&in1
+
+ restart = .f.
+ regrid  = .f.
+ refinement=.false.
+ tstep   = 1.
+ nstep   = 0
+ tstep_n = 1.d0,1.d1,1.d2,1.d3
+ nstep_n = 10,10,10,200
+
+ nout = 10
+
+! rst_hdf5 = 1    ! = 0 ; restart from binary files
+!                 ! = 1 ; restart from HDF5 files
+
+ fbnd(1)   = 2.
+ fbnd(2:4) = 0.
+ mf        = 0
+
+ ellip  = 1.
+ tria_u = 0.
+ tria_l = 0.
+ quad_u = -0.
+ quad_l = -0.
+
+ freeboundary = .f.
+
+ xampl  = +0.
+ xsig   = 0.6
+ xwidth = 1.5
+ xtheta = 4.7
+ xshift = 0.0
+ xpoint = .f.
+
+ R_begin = 2.9
+ R_end   = 3.1
+ Z_begin = -0.1
+ Z_end   = 0.1
+
+ R_geo = 10.0
+ Z_geo = 0.
+
+ F0    = 10.0
+
+ amin     = 1.
+
+ n_R      = 0
+ n_Z      = 0
+ n_radial = 51
+ n_pol    = 16
+
+ n_flux   = 41
+ n_tht    = 16
+ n_open   = 0
+ n_leg    = 0
+ n_private = 0
+
+ eta   = 1.d-6
+ visco = 1.d-7
+
+ eta_num = 0.d-10
+ visco_num = 0.d0
+
+ D_par  = 0.d0
+ D_perp = 1.d-7
+
+ ZK_par  = 1.d0
+ ZK_perp = 1.d-7
+
+ FF_0 = 1.173
+ FF_1 = 0.
+ FF_coef(1)  = -1.0
+ FF_coef(2)  = 0.d0
+ FF_coef(3)  = 0.d0
+ FF_coef(4)  = 0.03d0
+ FF_coef(5)  = 5.0d0
+ FF_coef(6)  = 1.d0
+ FF_coef(7)  = 10.d0
+ FF_coef(8)  = 1.d0
+
+ heatsource     = 0.d0
+ particlesource = 0.d0
+
+ T_0 = 1.d-6
+ T_1 = 1.d-8
+ T_coef(1) = -0.8d0
+ T_coef(2) = +0.0d0
+ T_coef(3) = 0.d0
+ T_coef(4) = 1.d0
+ T_coef(5) = 5.d0
+
+ rho_0 = 1.
+ rho_1 = 1.
+ rho_coef(1)  =  0.0
+ rho_coef(2)  =  0.0
+ rho_coef(3)  =  0.0
+ rho_coef(4)  =  1.d0
+ rho_coef(5)  =  5.d0
+
+ iter_precon = 22
+ gmres_m = 20
+ gmres_4 = 1.d0
+ gmres_max_iter = 200
+ gmres_tol = 1.d-8
+
+! --- boundary DOF treatment and solver flags -------------------------
+ eliminate_boundary_dofs = .t.
+
+! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
+ use_strumpack     = .f.
+ use_strumpack_eq  = .f.
+ use_strumpack_prj = .f.
+ use_mumps         = .f.
+ use_mumps_eq      = .f.
+ use_mumps_prj     = .f.
+ use_pastix        = .f.
+ use_pastix_eq     = .f.
+ use_pastix_prj    = .f.
+ use_petsc_eq      = .t.
+
+! --- physics PC (off = baseline arm) ---------------------------------
+ use_physics_pc               = .f.
+ debug_physics_pc             = .f.
+ physics_pc_monolithic        = .f.
+ physics_pc_multi_step        = .t.
+ physics_pc_wave_schur        = .t.
+ physics_pc_schur_channels    = 1
+ physics_pc_schur_massinv     = 8
+ physics_pc_schur_amg         = .f.
+ physics_pc_reduced_pde       = .f.
+ physics_pc_drop_psi_coupling = .f.
+ physics_pc_verify_reduced    = .f.
+/
