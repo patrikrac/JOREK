@@ -1130,6 +1130,7 @@ subroutine apply_bc_pc_matrix_nvar(pc_mat, n_vars, var_map, local_elms, &
   use mod_node_indices, only: calculate_node_indices
   use phys_module, only: keep_n0_const, eliminate_boundary_dofs
   use vacuum, only: is_freebound
+  use mpi_mod
 
   implicit none
 
@@ -1156,6 +1157,13 @@ subroutine apply_bc_pc_matrix_nvar(pc_mat, n_vars, var_map, local_elms, &
   PetscInt :: nloc_bc, krow
   real*8  :: diag_avg, dsum
   integer :: ndiag
+  !> per-variable representative diagonal (see the block near the end)
+  real*8  :: dsum_v(n_vars), diag_v(n_vars)
+  integer :: ndiag_v(n_vars), vr2, ivar, nrow_v, mpierr
+#ifdef USE_PETSC
+  PetscInt :: grlo, grhi, grow, nvt
+  PetscInt, allocatable :: bc_v(:)
+#endif
   integer :: index_node, index_tmp, kk, ll, iv_dir
   integer :: node_indices((n_order+1)/2, (n_order+1)/2)
 #ifdef USE_PETSC
@@ -1262,25 +1270,77 @@ subroutine apply_bc_pc_matrix_nvar(pc_mat, n_vars, var_map, local_elms, &
     call VecGetArray(dg, dgarr, ierr)
     dsum  = 0.d0
     ndiag = 0
+    !--- PER-VARIABLE representative diagonal.
+    !
+    ! This used to be ONE mean over every row of pc_mat, floored at 1.0. pc_mat
+    ! holds all n_vars variables together and their diagonals differ by ~8
+    ! decades (psi/j ~1e-4 against u ~1e3-1e4 on the 51x16 case), so that single
+    ! scalar -- measured 3.3004e3 -- put the psi and j boundary rows about seven
+    ! decades above their OWN bulk, and the max(...,1.d0) floor would have kept
+    ! them four decades high even if the mean had been per-variable. Those rows
+    ! (16 boundary nodes x 2 constrained C1 degrees x n_tor per variable) then
+    ! carried essentially the entire diagonal spread of the physics PC's packed
+    ! pairs: 1.78e10 measured, against ~1e4 for the bulk alone. See
+    ! docs/physics_pc/workstream_B_smoother_design.md section 10.4.
+    !
+    ! Variable of a global row, from the same layout petsc_row is built with:
+    !   row = n_vars*n_tor*(node-1) + (vr-1)*n_tor + (in-1)
+    !   =>  vr - 1 = mod(row, n_vars*n_tor) / n_tor
+    nvt = int(n_vars * n_tor, kind(nvt))
+    call VecGetOwnershipRange(dg, grlo, grhi, ierr)
+    dsum_v  = 0.d0
+    ndiag_v = 0
     do krow = 1, nloc_bc
       if (abs(dgarr(krow)) > 0.d0) then
-        dsum  = dsum + abs(dgarr(krow))
-        ndiag = ndiag + 1
+        grow = grlo + krow - 1
+        ivar = int(mod(grow, nvt) / n_tor) + 1
+        if (ivar >= 1 .and. ivar <= n_vars) then
+          dsum_v(ivar)  = dsum_v(ivar)  + abs(dgarr(krow))
+          ndiag_v(ivar) = ndiag_v(ivar) + 1
+        endif
       endif
     enddo
     call VecRestoreArray(dg, dgarr, ierr)
     call VecDestroy(dg, ierr)
-    if (ndiag > 0) then
-      diag_avg = dsum / dble(ndiag)
-    else
-      diag_avg = 1.d0
-    endif
-    diag_avg = max(diag_avg, 1.d0)
-    diag_avg = min(diag_avg, 1.d12)
+    call MPI_Allreduce(MPI_IN_PLACE, dsum_v,  n_vars, MPI_DOUBLE_PRECISION, &
+                       MPI_SUM, MPI_COMM_WORLD, mpierr)
+    call MPI_Allreduce(MPI_IN_PLACE, ndiag_v, n_vars, MPI_INTEGER, &
+                       MPI_SUM, MPI_COMM_WORLD, mpierr)
 
+    do vr2 = 1, n_vars
+      if (ndiag_v(vr2) > 0) then
+        diag_v(vr2) = dsum_v(vr2) / dble(ndiag_v(vr2))
+      else
+        diag_v(vr2) = 1.d0
+      endif
+      ! NO absolute floor. A floor at 1.0 is exactly what broke the small-scale
+      ! variables, and it is meaningless once the value is per-variable: the
+      ! whole point is that each variable's own scale sets it. Guard only against
+      ! a degenerate (zero or non-finite) result, and keep the upper clamp.
+      if (.not. (diag_v(vr2) > 0.d0)) diag_v(vr2) = 1.d0
+      diag_v(vr2) = min(diag_v(vr2), 1.d12)
+    enddo
+
+    ! MatZeroRowsColumns takes ONE scalar, so it is applied once per variable on
+    ! that variable's own rows. The row sets are disjoint, so the passes cannot
+    ! interfere: zeroing variable v's columns only touches OFF-diagonal entries
+    ! of other variables' rows. Collective, so every rank loops all n_vars and
+    ! passes zero rows where it owns none.
     call MatSetOption(pc_mat, MAT_NO_OFF_PROC_ZERO_ROWS, PETSC_TRUE, ierr)
-    call MatZeroRowsColumns(pc_mat, n_bc_rows, bc_rows(1:n_bc_rows), diag_avg, &
-                            PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    allocate(bc_v(max(1, n_bc_rows)))
+    do vr2 = 1, n_vars
+      nrow_v = 0
+      do krow = 1, n_bc_rows
+        ivar = int(mod(bc_rows(krow), nvt) / n_tor) + 1
+        if (ivar == vr2) then
+          nrow_v = nrow_v + 1
+          bc_v(nrow_v) = bc_rows(krow)
+        endif
+      enddo
+      call MatZeroRowsColumns(pc_mat, nrow_v, bc_v, diag_v(vr2), &
+                              PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    enddo
+    deallocate(bc_v)
   endif
   deallocate(bc_rows)
 #endif

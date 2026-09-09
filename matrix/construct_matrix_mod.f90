@@ -464,8 +464,18 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
 
   logical :: i_bnd
   integer :: i_bnd_type
-  real*8 :: elm_diagonal_average
-  integer :: nnz_counter
+  !> PER-VARIABLE representative diagonal for eliminate_boundary_dofs BC rows.
+  !! Was a single scalar averaged over ALL variables and then floored at 1.0.
+  !! n_var variables share this element matrix and their diagonals differ by ~8
+  !! decades (psi/j ~1e-4 against u ~1e3-1e4 on the 51x16 case), so one scalar --
+  !! measured 3.3004e3 -- landed psi's and j's boundary rows about seven decades
+  !! above their own bulk, and the floor would have kept them four decades high
+  !! even per-variable. Those rows then carried essentially the whole diagonal
+  !! spread of the physics PC's packed pairs (1.78e10 measured, against ~1e4 for
+  !! the bulk alone). See docs/physics_pc/workstream_B_smoother_design.md 10.4.
+  real*8 :: elm_diagonal_average(n_var)
+  integer :: nnz_counter(n_var)
+  integer :: jvar
 
   integer :: n_tor_local
 
@@ -478,14 +488,28 @@ subroutine add_to_a_mat(element, node_out, a_mat, rhs_local, my_ind_min, my_ind_
       do i_order = 1, n_degrees
           do j = 1, n_var * n_tor_local
             index_ij = n_tor_local * n_var * n_degrees * (i-1) + n_tor_local * n_var * (i_order-1) + j
-            if (abs(thread_struct(omp_tid)%ELM(index_ij,index_ij)) .ne. 0) nnz_counter = nnz_counter + 1
-            elm_diagonal_average = elm_diagonal_average + abs(thread_struct(omp_tid)%ELM(index_ij,index_ij))
+            ! j runs over (variable, harmonic), harmonic innermost -- the same
+            ! layout the BC rows are built with elsewhere.
+            jvar = (j - 1) / n_tor_local + 1
+            if (abs(thread_struct(omp_tid)%ELM(index_ij,index_ij)) .ne. 0) &
+              nnz_counter(jvar) = nnz_counter(jvar) + 1
+            elm_diagonal_average(jvar) = elm_diagonal_average(jvar) &
+                                       + abs(thread_struct(omp_tid)%ELM(index_ij,index_ij))
           enddo
       enddo
     enddo
-    elm_diagonal_average = elm_diagonal_average  / nnz_counter
-    elm_diagonal_average = max(elm_diagonal_average, 1.d0)
-    elm_diagonal_average = min(elm_diagonal_average, 1.d12)
+    do jvar = 1, n_var
+      if (nnz_counter(jvar) > 0) then
+        elm_diagonal_average(jvar) = elm_diagonal_average(jvar) / nnz_counter(jvar)
+      else
+        elm_diagonal_average(jvar) = 1.d0
+      endif
+      ! NO absolute floor. max(...,1.d0) is what broke the small-scale variables,
+      ! and it is meaningless once the value is per-variable -- the point is that
+      ! each variable's own scale sets it. Guard only against a degenerate value.
+      if (.not. (elm_diagonal_average(jvar) > 0.d0)) elm_diagonal_average(jvar) = 1.d0
+      elm_diagonal_average(jvar) = min(elm_diagonal_average(jvar), 1.d12)
+    enddo
   endif
 
   ! --- We only look at non-refined elements
@@ -576,7 +600,7 @@ subroutine add_block_to_sp_matrix(index_node1, i, i_order, i_bnd, i_bnd_type, &
   integer, intent(in) :: omp_tid, n_tor_local
   integer, intent(in) :: my_ind_min, my_ind_max
   logical, intent(in) :: eliminate_boundary_dofs
-  real*8, intent(in) :: elm_diagonal_average
+  real*8, intent(in) :: elm_diagonal_average(:)   !< one per variable
 
   integer :: j, k, l, k_order
   integer :: knode
@@ -651,7 +675,8 @@ subroutine add_block_to_sp_matrix(index_node1, i, i_order, i_bnd, i_bnd_type, &
               do l = 1, n_var * n_tor_local
                 ilarge2 = ijA_position - 1 + (j-1) * n_var * n_tor_local + l
                 if (j .eq. l) then
-                  a_mat%val(ilarge2) = a_mat%val(ilarge2) + elm_diagonal_average
+                  a_mat%val(ilarge2) = a_mat%val(ilarge2) &
+                                     + elm_diagonal_average((j-1)/n_tor_local + 1)
                 else
                   a_mat%val(ilarge2) = 0.d0
                 endif
@@ -704,7 +729,7 @@ subroutine add_block_to_petsc(index_node1, i, i_order, i_bnd, i_bnd_type, &
   type(type_SP_MATRIX), intent(inout) :: a_mat
   integer, intent(in) :: omp_tid, n_tor_local
   logical, intent(in) :: eliminate_boundary_dofs
-  real*8, intent(in) :: elm_diagonal_average
+  real*8, intent(in) :: elm_diagonal_average(:)   !< one per variable
 
   integer :: j, k, l, k_order
   integer :: knode
@@ -752,7 +777,8 @@ subroutine add_block_to_petsc(index_node1, i, i_order, i_bnd, i_bnd_type, &
           ! Diagonal boundary block: replace with diagonal of elm_diagonal_average
           thread_struct(omp_tid)%synch_buff(1:block_size*block_size) = 0.d0
           do j = 1, block_size
-            thread_struct(omp_tid)%synch_buff((j-1)*block_size+j) = elm_diagonal_average
+            thread_struct(omp_tid)%synch_buff((j-1)*block_size+j) = &
+              elm_diagonal_average((j-1)/n_tor_local + 1)
           enddo
         else if ((i_bnd .and. (i_order .eq. 1 .or. (i_bnd_type .eq. 2 .and. i_order .eq. 3) .or. &
                                                   (i_bnd_type .eq. 1 .and. i_order .eq. 2) .or. &
