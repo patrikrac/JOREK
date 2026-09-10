@@ -74,8 +74,59 @@
 # -jorek_ksp_gmres_restart   40         # default: 40
 # -jorek_ksp_view                       # dump the full solver configuration
 #
-# Note: the outer preconditioner is always PCFIELDSPLIT. It carries the toroidal
-# mode-family decomposition, so -jorek_pc_type is not a supported knob.
+# Note: -jorek_pc_type is not a supported knob. The outer preconditioner carries
+# the toroidal mode-family decomposition and is structural. What you can choose
+# is how that decomposition is laid out across the ranks - see the next section.
+
+# --- Parallel layout of the mode-family preconditioner ----------------------
+# The preconditioner is block-diagonal in the toroidal mode families. There are
+# two ways to spread those blocks over the ranks, and they differ enormously in
+# parallel efficiency.
+#
+#   PCFIELDSPLIT (default)  every block lives on the full communicator, and the
+#                           blocks are applied one after another. Each block is
+#                           therefore factorized across ALL ranks - exactly the
+#                           regime in which a sparse direct solver stops scaling.
+#
+#   -jorek_pc_mode_split    each mode family gets its own disjoint MPI
+#                           sub-communicator, holding that family's sub-matrix
+#                           and its own direct solver. Because the communicators
+#                           are disjoint, all blocks are factorized and solved
+#                           CONCURRENTLY, each by a smaller set of ranks. This is
+#                           the layout JOREK's legacy (non-PETSc) solver has
+#                           always used.
+#
+# -jorek_pc_mode_split                  # default: off (PCFIELDSPLIT)
+#
+# Which mode families exist, and how many ranks each gets, come from the JOREK
+# namelist, not from here - the same variables the legacy path uses:
+#   autodistribute_modes, n_mode_families, modes_per_family, mode_families_modes,
+#   weights_per_family, autodistribute_ranks, ranks_per_family
+# With autodistribute_modes (the default) there is one family per toroidal
+# harmonic - family 1 is the n=0 mode alone, every other family is a sin/cos
+# pair - and autodistribute_ranks spreads the ranks over them evenly.
+#
+# REQUIREMENT: at least one rank per mode family, so n_ranks >= n_mode_families.
+# JOREK says so and stops if that is not met. Family 1 holds half as many modes
+# as the others, so its block is smaller; ranks_per_family is how you compensate,
+# e.g. ranks_per_family = 1,2,2,2 with autodistribute_ranks = .f.
+#
+# Startup prints the resulting partition:
+#   [PETSc] mode-split PC: 2 mode families over 2 ranks
+#     family 1: 1 rank(s), weight 1.00, modes: 1
+#     family 2: 1 rank(s), weight 1.00, modes: 2 3
+#
+# The blocks are configured exactly as under PCFIELDSPLIT: everything below under
+# the -jorek_pcblock_ prefix applies unchanged.
+
+# Under -jorek_pc_mode_split each rebuild also reports where its time went:
+#   [PETSc] mode-split PCSetUp: extraction   1.2345E-01 s, factorization   4.5678E+00 s
+# Extraction is carving the family operators out of the global one - a collective
+# on the full communicator, paid by every rank. Factorization is the family-local
+# direct solve setup, and the only half that concurrency or any future background
+# scheme can act on. The factorization figure is family 1's, measured on rank 0;
+# the families are not synchronized against each other, so it is a lower bound on
+# the slowest one.
 
 # --- Direct solver used in each preconditioner block ------------------------
 # Which factorization package. Requires the package in your PETSc build;
@@ -123,6 +174,20 @@
 # Caveat when comparing against MUMPS: MUMPS factorizes the block across all
 # ranks, whereas a telescoped block is factorized on one. Telescope both, or
 # compare on a single rank, or the numbers are not measuring the same thing.
+#
+# ON MORE THAN ONE RANK, PREFER -jorek_pc_mode_split TO THIS RECIPE. PETSc's
+# PetscSubcomm_isActiveRank puts colour 0 on rank 0 for every reduction factor
+# and subcomm type, so every telescoped block is reduced onto the SAME rank: one
+# GPU does all the work and the rest idle, and no prefix or factor changes that.
+# The mode-split PC gives each family its own communicator instead, so at one
+# rank per family PETSc resolves each block to SEQAIJ - what cuDSS needs - on a
+# DIFFERENT rank, and every GPU is busy:
+#
+#   -jorek_pc_mode_split
+#   -jorek_pcblock_pc_factor_mat_solver_type cudss
+#
+# Telescope remains the right tool for reducing a block below one rank per
+# family, or for reaching cuDSS reorderings only available on a single rank.
 
 # --- One-shot direct solve path ---------------------------------------------
 # -jorek_direct_pc_factor_mat_solver_type mumps           # default

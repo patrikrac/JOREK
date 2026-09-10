@@ -86,23 +86,60 @@ contains
   end subroutine
 
 
+  !> Which parallel layout the mode-family preconditioner should use.
+  !!
+  !! Both preconditioners represent the same block-diagonal-in-mode-families
+  !! operator; they differ only in where the blocks live. PCFIELDSPLIT (default)
+  !! keeps every block on the full communicator and applies them one after another.
+  !! -jorek_pc_mode_split gives each family its own disjoint sub-communicator, so
+  !! the blocks are factorized and solved concurrently - which is where the
+  !! parallel efficiency of a sparse direct block solver comes from, and the only
+  !! way more than one GPU is ever busy with cuDSS.
+  integer function select_pc_type()
+    PetscBool      :: mode_split, is_set
+    PetscErrorCode :: ierr
+
+    mode_split = PETSC_FALSE
+    PetscCallA(PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_MAIN_PREFIX, '-pc_mode_split', mode_split, is_set, ierr))
+    if (mode_split) then
+      select_pc_type = PETSC_PC_MODE_SPLIT
+    else
+      select_pc_type = PETSC_PC_TOROIDAL_HARMONIC
+    endif
+  end function select_pc_type
+
+
   !> Report the main solve configuration actually resolved from the defaults
   !! plus whatever jorek.petsc supplied.
-  subroutine report_main_solver(ksp, my_id)
+  subroutine report_main_solver(ksp, my_id, pc_type)
     KSP, intent(in)     :: ksp
     integer, intent(in) :: my_id
+    integer, intent(in) :: pc_type
 
     KSPType        :: ktype
     PetscReal      :: rtol, abstol, dtol
     PetscInt       :: maxits
+    character(len=64) :: pc_desc
     PetscErrorCode :: ierr
 
     if (my_id /= 0) return
 
+    ! The PC is installed by petsc_setup_pc *after* this runs, so its type has to
+    ! be named from the selection rather than queried off the object - which used
+    ! to be hardcoded to fieldsplit, and would now be wrong half the time.
+    select case (pc_type)
+      case (PETSC_PC_MODE_SPLIT)
+        pc_desc = 'mode-split (one sub-communicator per mode family)'
+      case (PETSC_PC_PHYSICS)
+        pc_desc = 'physics-based'
+      case default
+        pc_desc = PCFIELDSPLIT//' (mode families, shared communicator)'
+    end select
+
     PetscCallA(KSPGetType(ksp, ktype, ierr))
     PetscCallA(KSPGetTolerances(ksp, rtol, abstol, dtol, maxits, ierr))
     write(*,*) '[PETSc] main solve (-'//PETSC_MAIN_PREFIX//'...): '//trim(ktype) &
-               //' + '//PCFIELDSPLIT
+               //' + '//trim(pc_desc)
     write(*,*) '[PETSc]   rtol =', rtol, ' max_it =', maxits
   end subroutine report_main_solver
 
@@ -793,6 +830,7 @@ contains
     PetscLogDouble :: ts1, ts2
     KSPType :: ksp_type
     PetscInt :: its
+    integer :: pc_type
     PetscReal :: petsc_norm
     PetscViewerAndFormat :: vf
 
@@ -833,13 +871,16 @@ contains
 
       ! Options after the defaults above, so anything in jorek.petsc overrides
       ! them: -jorek_ksp_rtol, -jorek_ksp_max_it, -jorek_ksp_gmres_restart, ...
-      ! The outer PC type is deliberately NOT a knob - PCFIELDSPLIT carries the
+      ! -jorek_pc_type is deliberately NOT a knob: the outer PC carries the
       ! toroidal mode-family decomposition and is structural, so petsc_setup_pc
-      ! below always sets it. The blocks inside it are fully configurable under
-      ! the -jorek_pcblock_ prefix, and report themselves from there.
+      ! below always sets it. The one choice that IS offered is which parallel
+      ! layout that decomposition uses - see select_pc_type. Either way the blocks
+      ! are fully configurable under the -jorek_pcblock_ prefix, and report
+      ! themselves from there.
       PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
-      call report_main_solver(petsc_sys%ksp, my_id)
-      call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
+      pc_type = select_pc_type()
+      call report_main_solver(petsc_sys%ksp, my_id, pc_type)
+      call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, pc_type)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       ! Force the sub-KSP factorizations here so they are timed as setup, not solve

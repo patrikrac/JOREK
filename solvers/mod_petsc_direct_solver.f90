@@ -16,7 +16,8 @@ module mod_petsc_direct_solver
   use petsc
   implicit none
   private
-  public :: petsc_configure_direct_solver, petsc_solver_option, petsc_setup_wrapped_solver
+  public :: petsc_configure_direct_solver, petsc_solver_option, petsc_setup_wrapped_solver, &
+            petsc_report_solver
 
   !> Suffix PCTELESCOPE appends to its own options prefix for the PC it wraps
   !! (src/ksp/pc/impls/telescope/telescope.c, KSPAppendOptionsPrefix).
@@ -251,6 +252,48 @@ contains
     PetscErrorCode    :: ierr
     PetscCallA(PCFactorSetMatOrderingType(pc, MATORDERINGND, ierr))
   end subroutine tune_petsc_builtin
+
+
+  !> Report the solver configuration a block KSP actually resolved to.
+  !!
+  !! All blocks of a given preconditioner share one options prefix, so reporting
+  !! any one of them describes them all. The caller decides which rank prints -
+  !! this routine has no way to know whether `ksp` lives on the global
+  !! communicator or on a sub-communicator that has its own rank 0.
+  subroutine petsc_report_solver(ksp, prefix)
+    KSP, intent(in) :: ksp
+    character(len=*), intent(in) :: prefix
+
+    PC                 :: pc
+    PCType             :: ptype
+    KSPType            :: ktype
+    MatSolverType      :: stype
+    character(len=256) :: inner_ptype, inner_stype, inner_desc
+    PetscErrorCode     :: ierr
+
+    PetscCallA(KSPGetType(ksp, ktype, ierr))
+    PetscCallA(KSPGetPC(ksp, pc, ierr))
+    PetscCallA(PCGetType(pc, ptype, ierr))
+    if (ptype == PCTELESCOPE) then
+      ! The PC a telescope wraps is created lazily inside PCSetUp_Telescope, and
+      ! only on the ranks it reduced onto, so report what the options database
+      ! resolved to rather than querying an object that need not exist here.
+      call petsc_solver_option(prefix//TELESCOPE_SUFFIX, 'pc_type', inner_ptype)
+      call petsc_solver_option(prefix//TELESCOPE_SUFFIX, 'pc_factor_mat_solver_type', inner_stype)
+      inner_desc = inner_ptype
+      if (len_trim(inner_stype) > 0) inner_desc = trim(inner_ptype)//' via '//trim(inner_stype)
+      write(*,*) '[PETSc] PC blocks (-'//prefix//'...): ' &
+                 //trim(ktype)//' + '//trim(ptype)//' -> '//trim(inner_desc)
+    elseif (ptype == PCLU .or. ptype == PCCHOLESKY .or. ptype == PCILU) then
+      PetscCallA(PCFactorGetMatSolverType(pc, stype, ierr))
+      write(*,*) '[PETSc] PC blocks (-'//prefix//'...): ' &
+                 //trim(ktype)//' + '//trim(ptype)//' via '//trim(stype)
+    else
+      write(*,*) '[PETSc] PC blocks (-'//prefix//'...): ' &
+                 //trim(ktype)//' + '//trim(ptype)
+    endif
+  end subroutine petsc_report_solver
+
 
 #endif
 end module mod_petsc_direct_solver

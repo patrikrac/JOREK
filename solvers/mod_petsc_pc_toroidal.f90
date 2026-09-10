@@ -1,7 +1,7 @@
 module mod_petsc_pc_toroidal
 #ifdef USE_PETSC
   use mpi_mod
-  use mod_petsc_direct_solver, only: petsc_configure_direct_solver, petsc_solver_option
+  use mod_petsc_direct_solver, only: petsc_configure_direct_solver, petsc_report_solver
   use mod_petsc_dump,          only: petsc_dump_operator
 #include "petsc/finclude/petsc.h"
   use petsc
@@ -34,8 +34,10 @@ contains
     integer, allocatable :: fam_modes(:)
     PC :: pc, subpc
     KSP, pointer, dimension(:) :: subksp_array
+    integer :: comm, my_id, mpierr
     PetscErrorCode :: ierr
 
+    PetscCallA(PetscObjectGetComm(ksp, comm, ierr))
     PetscCallA(MatGetBlockSize(A, block_size, ierr))
     PetscCallA(KSPGetPC(ksp, pc, ierr))
     PetscCallA(PCSetType(pc, PCFIELDSPLIT, ierr))
@@ -109,50 +111,13 @@ contains
       write(dump_tag,'(A,I0)') 'pcblock', i
       call petsc_dump_operator(block_A, trim(dump_tag))
     enddo
-    call report_block_solver(subksp_array(1))
+    ! One line describes every block: they share PC_BLOCK_PREFIX. The splits live
+    ! on the parent communicator, so its rank 0 is the right one to print from.
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+    if (my_id == 0) call petsc_report_solver(subksp_array(1), PC_BLOCK_PREFIX)
     PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
   end subroutine petsc_setup_toroidal_harmonic_pc
 
-
-  !> Report the solver configuration the blocks actually resolved to. All blocks
-  !! share one options prefix, so reporting the first one describes them all.
-  subroutine report_block_solver(subksp)
-    KSP, intent(in) :: subksp
-
-    PC                 :: subpc
-    PCType             :: ptype
-    KSPType            :: ktype
-    MatSolverType      :: stype
-    character(len=256) :: inner_ptype, inner_stype, inner_desc
-    integer            :: comm, my_id, mpierr
-    PetscErrorCode     :: ierr
-
-    PetscCallA(PetscObjectGetComm(subksp, comm, ierr))
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-    if (my_id /= 0) return
-
-    PetscCallA(KSPGetType(subksp, ktype, ierr))
-    PetscCallA(KSPGetPC(subksp, subpc, ierr))
-    PetscCallA(PCGetType(subpc, ptype, ierr))
-    if (ptype == PCTELESCOPE) then
-      ! The PC a telescope wraps is created lazily inside PCSetUp_Telescope, and
-      ! only on the ranks it reduced onto, so report what the options database
-      ! resolved to rather than querying an object that need not exist here.
-      call petsc_solver_option(PC_BLOCK_PREFIX//'telescope_', 'pc_type', inner_ptype)
-      call petsc_solver_option(PC_BLOCK_PREFIX//'telescope_', 'pc_factor_mat_solver_type', inner_stype)
-      inner_desc = inner_ptype
-      if (len_trim(inner_stype) > 0) inner_desc = trim(inner_ptype)//' via '//trim(inner_stype)
-      write(*,*) '[PETSc] PC blocks (-'//PC_BLOCK_PREFIX//'...): ' &
-                 //trim(ktype)//' + '//trim(ptype)//' -> '//trim(inner_desc)
-    elseif (ptype == PCLU .or. ptype == PCCHOLESKY .or. ptype == PCILU) then
-      PetscCallA(PCFactorGetMatSolverType(subpc, stype, ierr))
-      write(*,*) '[PETSc] PC blocks (-'//PC_BLOCK_PREFIX//'...): ' &
-                 //trim(ktype)//' + '//trim(ptype)//' via '//trim(stype)
-    else
-      write(*,*) '[PETSc] PC blocks (-'//PC_BLOCK_PREFIX//'...): ' &
-                 //trim(ktype)//' + '//trim(ptype)
-    endif
-  end subroutine report_block_solver
 
 #endif
 end module mod_petsc_pc_toroidal
