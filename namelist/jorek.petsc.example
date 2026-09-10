@@ -128,6 +128,27 @@
 # the families are not synchronized against each other, so it is a lower bound on
 # the slowest one.
 
+# --- REQUIRED when MUMPS factorizes across more than one rank ---------------
+# MUMPS' distributed-RHS path (ICNTL(20)=10, PETSc's default for parallel MUMPS)
+# reads out of bounds inside dmumps_scatter_dist_rhs on at least some builds. The
+# damage is silent: it usually does not crash, it corrupts the heap, and the run
+# goes on to produce WRONG ANSWERS. Forcing a centralized RHS avoids that path.
+#
+# Set it for EVERY prefix that runs MUMPS on more than one rank. Missing one is
+# enough to reintroduce the bug - the equilibrium solve is easy to forget:
+#
+# -jorek_pcblock_mat_mumps_icntl_20 0   # PC block solves (fieldsplit and mode-split)
+# -jorek_direct_mat_mumps_icntl_20 0    # the direct/equilibrium solve
+#
+# How to tell whether you need it: run any two of the preconditioners on the same
+# case and compare solution norms. They must agree. If they do not, you are seeing
+# this bug. A stronger check is macOS Guard Malloc:
+#   mpirun -n 2 -x DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib ./jorek_model... 
+# which turns the silent corruption into an immediate, located crash.
+#
+# Not needed when every factorization lands on exactly one rank (e.g.
+# -jorek_pc_mode_split with n_ranks == n_mode_families and a serial equilibrium).
+
 # --- Direct solver used in each preconditioner block ------------------------
 # Which factorization package. Requires the package in your PETSc build;
 # PETSc reports clearly at startup if it is missing.
