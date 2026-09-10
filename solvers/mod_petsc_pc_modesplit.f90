@@ -84,6 +84,16 @@ module mod_petsc_pc_modesplit
 
   type(type_modesplit_ctx), save :: g_ctx
 
+  !> THROWAWAY INSTRUMENTATION - async-PC round-trip study, remove afterwards.
+  !!
+  !! In the asynchronous design the KSPSolve below stops being local: the family
+  !! factorization lives on dedicated service ranks, so every PCApply becomes a
+  !! round trip to them. Whether that is affordable depends entirely on how it
+  !! compares to the block solve it wraps, so the block solve is the denominator
+  !! and this is what measures it.
+  PetscLogDouble, save :: g_solve_time  = 0.0d0
+  integer,        save :: g_solve_count = 0
+
 contains
 
   !> Install the mode-split preconditioner on an existing KSP.
@@ -429,8 +439,14 @@ contains
     Vec :: x, y
     PetscErrorCode :: ierr
 
+    PetscLogDouble :: ts0, ts1
+
     if (g_ctx%passthrough) then
+      PetscCallA(PetscTime(ts0, ierr))
       PetscCallA(KSPSolve(g_ctx%ksp_fam, x, y, ierr))
+      PetscCallA(PetscTime(ts1, ierr))
+      g_solve_time  = g_solve_time + (ts1 - ts0)
+      g_solve_count = g_solve_count + 1
       ierr = 0
       return
     endif
@@ -440,7 +456,11 @@ contains
 
     call modesplit_copy_local(g_ctx%stage, g_ctx%rhs_fam)
 
+    PetscCallA(PetscTime(ts0, ierr))
     PetscCallA(KSPSolve(g_ctx%ksp_fam, g_ctx%rhs_fam, g_ctx%sol_fam, ierr))
+    PetscCallA(PetscTime(ts1, ierr))
+    g_solve_time  = g_solve_time + (ts1 - ts0)
+    g_solve_count = g_solve_count + 1
 
     ! Overlapping families solve for the same mode more than once; the weights are
     ! what stop it being counted twice when the contributions are summed below.
@@ -486,6 +506,46 @@ contains
   end subroutine modesplit_copy_local
 
 
+  !> THROWAWAY INSTRUMENTATION - async-PC round-trip study, remove afterwards.
+  !!
+  !! Prints the per-apply block solve cost and the geometry the standalone
+  !! ping-pong benchmark has to be parameterized with.
+  !!
+  !! Reduced across the global communicator rather than simply printed from rank
+  !! 0, because rank 0 is not representative: under autodistribute_modes family 1
+  !! holds the n=0 harmonic alone while every other family holds a sin/cos pair,
+  !! so family 1's block is half the size of the rest - and rank 0 is always in
+  !! family 1. Reporting its numbers alone would understate both the solve and
+  !! n_loc. The max is the one that matters: the families run concurrently, so the
+  !! slowest is what a Krylov iteration actually waits for.
+  subroutine modesplit_report_solve()
+    integer :: f, mpierr
+    real(kind=8) :: mine, t_max, t_min
+    integer :: n_max, n_min
+
+    if (g_solve_count == 0) return
+
+    mine = g_solve_time/dble(g_solve_count)
+    call MPI_REDUCE(mine, t_max, 1, MPI_DOUBLE_PRECISION, MPI_MAX, 0, g_ctx%comm, mpierr)
+    call MPI_REDUCE(mine, t_min, 1, MPI_DOUBLE_PRECISION, MPI_MIN, 0, g_ctx%comm, mpierr)
+    call MPI_REDUCE(g_ctx%n_loc, n_max, 1, MPI_INTEGER, MPI_MAX, 0, g_ctx%comm, mpierr)
+    call MPI_REDUCE(g_ctx%n_loc, n_min, 1, MPI_INTEGER, MPI_MIN, 0, g_ctx%comm, mpierr)
+
+    if (g_ctx%my_id /= 0) return
+
+    write(*,'(A,I0,A)') ' [PETSc] mode-split PCApply block solve: ', g_solve_count, ' solves/rank'
+    write(*,'(A,ES12.4,A,ES12.4,A)') '   per solve: slowest family ', t_max, &
+          ' s, fastest ', t_min, ' s   <- T_solve is the slowest'
+    write(*,'(A,I0,A,I0,A,I0)') '   n_loc doubles/rank/apply: max ', n_max, ', min ', n_min, &
+          '   over n_fam ', g_ctx%n_fam
+    write(*,'(A)',advance='no') '   ranks per family:'
+    do f = 1, g_ctx%n_fam
+      write(*,'(1X,I0)',advance='no') g_ctx%ranks_per_fam(f)
+    enddo
+    write(*,*)
+  end subroutine modesplit_report_solve
+
+
   !> PCSHELL destroy callback. Also frees the family communicator - this is the
   !! first PETSc path in JOREK that owns one, and the legacy path's habit of never
   !! releasing its communicators is not worth copying.
@@ -499,6 +559,8 @@ contains
       ierr = 0
       return
     endif
+
+    call modesplit_report_solve()
 
     if (g_ctx%solver_ready) then
       PetscCallA(KSPDestroy(g_ctx%ksp_fam, ierr))
