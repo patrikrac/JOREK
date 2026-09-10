@@ -52,6 +52,20 @@ module mod_petsc
     logical :: aij_native    = .false.
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
+
+    !> Operator the preconditioner is built from. Normally the KSP is given the
+    !! system operator twice and there is no such matrix at all; A_pc exists only
+    !! when -jorek_pc_lag_steps deliberately builds the PC from an older operator,
+    !! and pc_lag_ready says whether it does. Keeping it opt-in matters: it is a
+    !! full duplicate of the system matrix, and the default path must not pay for
+    !! a diagnostic.
+    Mat     :: A_pc
+    logical :: pc_lag_ready = .false.
+    !> Time steps the preconditioner is built behind the operator; 0 = off.
+    integer :: pc_lag_steps = 0
+    !> Solves still to go before the deferred rebuild fires; <= 0 when none is in
+    !! flight. Set to pc_lag_steps when the snapshot is taken.
+    integer :: pc_lag_pending = 0
   end type type_PETSC_SYSTEM
 
 
@@ -766,6 +780,97 @@ contains
   end subroutine ksp_operands
 
 
+  !> The operator the preconditioner is built from, for KSPSetOperators' second
+  !! argument. It is the system operator itself unless the PC is being lagged, which
+  !! is the only case in which A_pc exists - so with the feature off this returns
+  !! exactly what JOREK has always passed.
+  subroutine ksp_pc_operand(petsc_sys, A_ksp, P_ksp)
+    type(type_PETSC_SYSTEM), intent(in) :: petsc_sys
+    Mat, intent(in)  :: A_ksp
+    Mat, intent(out) :: P_ksp
+
+    if (petsc_sys%pc_lag_ready) then
+      P_ksp = petsc_sys%A_pc
+    else
+      P_ksp = A_ksp
+    endif
+  end subroutine ksp_pc_operand
+
+
+  !> Read -jorek_pc_lag_steps and, if it asks for a lag, create the separate
+  !! preconditioner operator. Called once, from the first solve.
+  !!
+  !! This is a measurement instrument, not a production feature: it makes the
+  !! preconditioner be built from an operator N time steps old, which is exactly the
+  !! numerical situation a background/asynchronous refactorization would produce.
+  !! It costs one extra copy of the system matrix, which is why nothing is allocated
+  !! unless the option is set.
+  subroutine petsc_pc_lag_init(petsc_sys, A_ksp, my_id)
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    Mat, intent(in)     :: A_ksp
+    integer, intent(in) :: my_id
+
+    PetscInt       :: lag
+    PetscBool      :: is_set
+    PetscErrorCode :: ierr
+
+    lag = 0
+    PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_MAIN_PREFIX, '-pc_lag_steps', lag, is_set, ierr))
+    if (lag < 0) lag = 0
+    petsc_sys%pc_lag_steps   = int(lag)
+    petsc_sys%pc_lag_pending = 0
+
+    if (petsc_sys%pc_lag_steps == 0) return
+
+    PetscCallA(MatDuplicate(A_ksp, MAT_COPY_VALUES, petsc_sys%A_pc, ierr))
+    petsc_sys%pc_lag_ready = .true.
+
+    if (my_id == 0) write(*,'(A,I0,A)') &
+      ' [PETSc] -jorek_pc_lag_steps ', petsc_sys%pc_lag_steps, &
+      ': preconditioner will be built from an operator this many steps old'
+  end subroutine petsc_pc_lag_init
+
+
+  !> Decide whether this solve rebuilds the preconditioner, and keep the lag state
+  !! machine moving.
+  !!
+  !! Without a lag this is just the caller's solve_only flag. With one, a rebuild
+  !! request does not refactorize: it snapshots the operator into A_pc and schedules
+  !! the factorization pc_lag_steps solves later, against that unchanged snapshot.
+  !! In between the old factorization keeps being used - the same thing that would
+  !! happen while a background factorization was still running.
+  subroutine petsc_pc_lag_advance(petsc_sys, A_ksp, solve_only, do_rebuild, my_id)
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    Mat, intent(in)      :: A_ksp
+    logical, intent(in)  :: solve_only
+    logical, intent(out) :: do_rebuild
+    integer, intent(in)  :: my_id
+
+    PetscErrorCode :: ierr
+
+    if (.not. petsc_sys%pc_lag_ready) then
+      do_rebuild = .not. solve_only
+      return
+    endif
+
+    if (petsc_sys%pc_lag_pending > 0) then
+      ! A rebuild is already scheduled. Whatever solve_only says now is irrelevant -
+      ! re-snapshotting here would reset the lag and never let the rebuild land.
+      petsc_sys%pc_lag_pending = petsc_sys%pc_lag_pending - 1
+      do_rebuild = (petsc_sys%pc_lag_pending == 0)
+    else if (.not. solve_only) then
+      PetscCallA(MatCopy(A_ksp, petsc_sys%A_pc, SAME_NONZERO_PATTERN, ierr))
+      petsc_sys%pc_lag_pending = petsc_sys%pc_lag_steps
+      do_rebuild = .false.
+      if (my_id == 0) write(*,'(A,I0,A)') &
+        ' [PETSc] PC rebuild requested: operator snapshotted, refactorizing in ', &
+        petsc_sys%pc_lag_steps, ' step(s)'
+    else
+      do_rebuild = .false.
+    endif
+  end subroutine petsc_pc_lag_advance
+
+
   !> Make the KSP operator reflect the values just assembled into petsc_sys%A.
   !!
   !! On the native AIJ path this is nothing at all: A already IS the KSP operator,
@@ -811,6 +916,8 @@ contains
   !! On first call (!ksp_ready): creates the KSP and sets up PCFIELDSPLIT+MUMPS.
   !! When !solve_only: calls KSPSetUp to refactorize.
   !! When solve_only:  sets KSPSetReusePreconditioner to skip refactorization.
+  !! Under -jorek_pc_lag_steps the rebuild is deferred - see petsc_pc_lag_advance -
+  !! so !solve_only schedules a refactorization instead of performing one.
   !! On the BAIJ path each of the three additionally converts A to AIJ (reusing the
   !! sparsity after the first call); on the native AIJ path A is already the KSP
   !! operator and no conversion happens at all. See ksp_operands.
@@ -823,8 +930,9 @@ contains
 
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
-    Mat :: A_ksp
+    Mat :: A_ksp, P_ksp
     Vec :: b_ksp, x_ksp
+    logical :: do_rebuild
     KSPConvergedReason :: reason
     PetscLogDouble :: t1, t2
     PetscLogDouble :: ts1, ts2
@@ -849,9 +957,14 @@ contains
       ! Opt-in, inert unless -jorek_dump_mat is set.
       call petsc_dump_operator(A_ksp, 'system')
 
+      ! Before the first KSPSetOperators: it decides whether the PC gets its own
+      ! operator, and the KSP has to be told that from the start.
+      call petsc_pc_lag_init(petsc_sys, A_ksp, my_id)
+      call ksp_pc_operand(petsc_sys, A_ksp, P_ksp)
+
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
       PetscCallA(KSPSetOptionsPrefix(petsc_sys%ksp, PETSC_MAIN_PREFIX, ierr))
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, P_ksp, ierr))
       PetscCallA(KSPSetType(petsc_sys%ksp, KSPGMRES, ierr))
 
       ! Warm-start: consume the JOREK initial guess (previous-step increment) loaded into
@@ -895,35 +1008,42 @@ contains
       PetscCallA(PetscLogStagePop(ierr))
       if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
 
-    else if (.not. solve_only) then
-      if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: refactorizing"
-      PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
-      PetscCallA(PetscTime(ts1, ierr))
-
-      call petsc_refresh_ksp_operator(petsc_sys, first_call=.false.)
-      call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
-      PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
-      PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
-      ! KSPSetUp only rebuilds PCFIELDSPLIT itself; the sub-KSP LU/MUMPS numerical
-      ! factorizations are otherwise deferred to KSPSetUpOnBlocks inside KSPSolve, which
-      ! would charge the whole factorization cost to the GMRES solve timer below.
-      PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
-      ! ... and KSPSetUpOnBlocks in turn stops at a PCTELESCOPE, which implements no
-      ! setuponblocks, so the block solver it wraps has to be reached separately.
-      call petsc_setup_pc_blocks(petsc_sys%ksp)
-
-      PetscCallA(PetscTime(ts2, ierr))
-      PetscCallA(PetscLogStagePop(ierr))
-      if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
-
     else
-      ! solve_only: update A for mat-vec products but reuse PC factorization
-      if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
+      ! The operator has to be refreshed either way - the mat-vecs need it even when
+      ! the factorization is being reused - and the lag state machine needs it in
+      ! hand to snapshot from, so both happen before the branch.
       call petsc_refresh_ksp_operator(petsc_sys, first_call=.false.)
       call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
-      PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
+      call petsc_pc_lag_advance(petsc_sys, A_ksp, solve_only, do_rebuild, my_id)
+      call ksp_pc_operand(petsc_sys, A_ksp, P_ksp)
+
+      if (do_rebuild) then
+        if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: refactorizing"
+        PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
+        PetscCallA(PetscTime(ts1, ierr))
+
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, P_ksp, ierr))
+        PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
+        PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+        ! KSPSetUp only rebuilds PCFIELDSPLIT itself; the sub-KSP LU/MUMPS numerical
+        ! factorizations are otherwise deferred to KSPSetUpOnBlocks inside KSPSolve, which
+        ! would charge the whole factorization cost to the GMRES solve timer below.
+        PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
+        ! ... and KSPSetUpOnBlocks in turn stops at a PCTELESCOPE, which implements no
+        ! setuponblocks, so the block solver it wraps has to be reached separately.
+        call petsc_setup_pc_blocks(petsc_sys%ksp)
+
+        PetscCallA(PetscTime(ts2, ierr))
+        PetscCallA(PetscLogStagePop(ierr))
+        if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
+
+      else
+        ! update A for mat-vec products but reuse the PC factorization
+        if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: skipping refactorization"
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, P_ksp, ierr))
+        PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
+      end if
+
     end if
 
     call petsc_sync_ksp_vectors(petsc_sys, to_ksp=.true.)
@@ -1145,6 +1265,10 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     PetscErrorCode :: ierr
 
+    if (petsc_sys%pc_lag_ready) then
+      call MatDestroy(petsc_sys%A_pc, ierr)
+      petsc_sys%pc_lag_ready = .false.
+    endif
     if (petsc_sys%ksp_ready) then
       call KSPDestroy(petsc_sys%ksp, ierr)
       ! On the native AIJ path A_aij/b_aij/x_aij were never created - the KSP ran on

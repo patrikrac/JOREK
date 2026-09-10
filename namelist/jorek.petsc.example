@@ -149,6 +149,31 @@
 # Not needed when every factorization lands on exactly one rank (e.g.
 # -jorek_pc_mode_split with n_ranks == n_mode_families and a serial equilibrium).
 
+# --- Lagging the preconditioner deliberately (diagnostic) -------------------
+# When JOREK decides the preconditioner needs rebuilding (the iter_precon /
+# max_steps_noUpdate heuristic in the JOREK namelist), it normally refactorizes
+# there and then, from the operator as it stands. This option instead snapshots
+# the operator at that moment and delays the factorization by N time steps,
+# running on the OLD factorization until then and finally factorizing the
+# snapshot - so the new preconditioner is built from N-step-old data.
+#
+# That is exactly the numerical situation an asynchronous, background
+# refactorization would produce, which is what this is for: it measures the
+# iteration-count penalty of a lagged preconditioner without any of the machinery
+# needed to actually overlap the factorization with the solve. It saves no time on
+# its own - the factorization still runs on the critical path - so it is a
+# measurement instrument, not a production setting.
+#
+# It costs one extra full copy of the system matrix, allocated only when the
+# option is set. Unset (the default), nothing is duplicated and the code path is
+# the one JOREK has always taken.
+#
+# -jorek_pc_lag_steps 0                 # default: 0 = off
+#
+# Compare the total GMRES iterations of a run at N = 0 against one at N set to
+# the typical number of steps between rebuilds. The difference is what an
+# asynchronous scheme would have to pay for hiding the factorization cost.
+
 # --- Direct solver used in each preconditioner block ------------------------
 # Which factorization package. Requires the package in your PETSc build;
 # PETSc reports clearly at startup if it is missing.
