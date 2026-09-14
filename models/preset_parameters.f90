@@ -691,6 +691,11 @@ subroutine preset_parameters
   physics_pc_gmg_smoother    = 0            ! Workstream D: 0 GMRES+Jacobi, 1 Richardson+Jacobi, 2 Richardson+node block, 3 GMRES+node block
   physics_pc_gmg_nsmooth     = 0            ! Workstream D: smoothing steps (0 = 4 for GMRES, 3 for Richardson)
   physics_pc_gmg_omega       = 0.7d0        ! Workstream D: Richardson damping (Chacon 2025)
+  physics_pc_gmg_ring_aspect = 1.0d0        ! Workstream D: smoother 6 rings where r*dtheta/dr < this, radial lines outside
+  physics_pc_gmg_axis_rings  = 0            ! Workstream D: rings 0..k in one axis block (block smoothers 4/5/6); -1 = rings below r*dtheta/dr = ring_aspect
+  physics_pc_gmg_axis_mult   = 0            ! Workstream D: axis block / lines coupling (0 Jacobi, 1 axis first, 2 lines first, 3 symmetric)
+  physics_pc_gmg_bnd_drop    = 0            ! Workstream D: 1 = coarse levels drop the Dirichlet u, b DOFs of the boundary ring
+  physics_pc_gmg_ring_diag   = 0            ! Workstream D: k > 0 = per-ring-zone residual profile on k V-cycles per rebuild
   physics_pc_suu_comp        = 0            ! Workstream D: 1 = abs-row-sum diagonal compensation of the ring mask
   physics_pc_w_gmg           = 0            ! Workstream C: pair_w by C1 geometric multigrid (0=off, 1=one V-cycle, 2=FGMRES+V-cycle)
   commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
