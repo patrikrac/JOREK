@@ -49,8 +49,14 @@ submitted again. `results.tsv` is rewritten after every case.
 
 | series | default | knob |
 |---|---|---|
-| strong | 161×64 at np = 1, 2, 4, …, 256 | `PCS_MESH`, `PCS_NPS` |
-| weak | 81×32 at 1, 161×64 at 4, 321×128 at 16, 641×256 at 64 (about 47k DOFs per rank) | `PCS_WEAK` |
+| strong | 161×64 (741k DOFs) at np = 1, 2, 4, …, 64 | `PCS_MESH`, `PCS_NPS` |
+| weak | 81×32 at 1, 161×64 at 4, 321×128 at 16, 641×256 at 64 (about 186k DOFs per rank) | `PCS_WEAK` |
+
+Problem sizes: 41×16 = 47k, 81×32 = 186k, 161×64 = 741k, 321×128 = 2.96M,
+641×256 = 11.8M DOFs. Keep at least about 20k DOFs (and a few flux-surface
+rings) per rank. Below that, the rank-local line smoother degenerates and
+communication dominates, so use 321×128 for strong scaling beyond about 64
+ranks.
 
 The GMG arm needs n_flux − 1 divisible by 4 and n_tht divisible by 8 (at least
 3 levels); `mknml.py` refuses other meshes. The `sfm2_lu` arm at np = 1 on

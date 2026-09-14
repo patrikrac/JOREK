@@ -11,7 +11,7 @@
 #  Environment (defaults in brackets):
 #    PCS_ARMS    arms to run, in order          [sfm2_gmg sfm2_lu jorek]
 #    PCS_MESH    strong: the fixed mesh         [161x64]
-#    PCS_NPS     strong: rank counts            [1 2 4 8 16 32 64 128 256]
+#    PCS_NPS     strong: rank counts            [1 2 4 8 16 32 64]
 #    PCS_WEAK    weak: mesh:np pairs            [81x32:1 161x64:4 321x128:16 641x256:64]
 #    PCS_MAXNP   upper limit on np              [$SLURM_NTASKS, else 8]
 #    PCS_DRYRUN  1 = list the cases, run nothing []
@@ -35,7 +35,7 @@ cases=()
 case "$MODE" in
   strong)
     MESH=${PCS_MESH:-161x64}
-    for np in ${PCS_NPS:-1 2 4 8 16 32 64 128 256}; do
+    for np in ${PCS_NPS:-1 2 4 8 16 32 64}; do
       cases+=("${MESH%x*} ${MESH#*x} $np")
     done ;;
   weak)
