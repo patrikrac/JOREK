@@ -37,6 +37,7 @@
 module mod_petsc_pc_gmg
 #ifdef USE_PETSC
   use mpi_mod
+  !$ use omp_lib
 #include "petsc/finclude/petsc.h"
   use petsc
   implicit none
@@ -69,12 +70,32 @@ module mod_petsc_pc_gmg
   integer, save     :: nlev = 0
   Mat, save         :: gP(1:MAX_LEV-1)
   Mat, save         :: gA(0:MAX_LEV-1)      !< gA(0) borrowed (the fine operator), gA(g>0) owned
-  KSP, save         :: gSm(0:MAX_LEV-1), gCoarse, gAxis
+  KSP, save         :: gSm(0:MAX_LEV-1), gAxis
   Vec, save         :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1), gzax
   IS, save          :: gisAxis
   Mat, save         :: gF                   !< fine-level matvec operator: gA(0), or a
                                             !< matrix-free equivalent (Workstream D)
   logical, save     :: p_ready = .false., op_ready = .false., vec_ready = .false.
+
+  !> A direct solve of A(rows, rows) done REDUNDANTLY on the ranks that own
+  !! some of those rows (sub-communicator comm; mostly one rank, since JOREK
+  !! partitions ring by ring). Each member holds the whole submatrix as a
+  !! sequential AIJ (sub(1)) with its own LU, so a solve costs no collective on
+  !! the hierarchy's communicator -- only an Allgatherv among the members when
+  !! the rows span ranks -- and non-members skip it. loc = the rank's rows
+  !! (local, 0-based, ascending; set before the first rds_setup), cnt/dsp =
+  !! the members' row counts/offsets. Used for the stage-D13 axis blocks and
+  !! the coarsest level, which both live on a few ranks at scale.
+  type :: rds_t
+    logical :: ready = .false., member = .false.
+    integer :: comm = MPI_COMM_NULL, np = 0, me = 0
+    integer, allocatable :: loc(:), cnt(:), dsp(:)
+    real*8, allocatable  :: send(:)
+    IS  :: isq
+    Mat, pointer :: sub(:) => null()
+    KSP :: ksp
+    Vec :: b, x
+  end type rds_t
 
   ! Workstream D: node-block Jacobi smoother (Chacon 2025 S4.1). One dense block
   ! per (node, toroidal harmonic) holding both fields and all four C1 DOFs, and
@@ -91,11 +112,11 @@ module mod_petsc_pc_gmg
     ! 0..axis_lim(g), every slot) is not factored dense but by MUMPS on its
     ! submatrix: it holds a fixed fraction of the level's rows (~I_s/n_flux),
     ! so a dense LU would cost O(N^3). axblk(b) marks its blocks.
-    logical :: axsparse = .false., axready = .false.
+    ! The solve is an rds_t: only the ranks owning axis rows take part.
+    logical :: axsparse = .false.
     logical, allocatable :: axblk(:)
     IS  :: axis_is
-    Mat :: axmat
-    KSP :: axksp
+    type(rds_t) :: ax
     ! physics_pc_gmg_axis_mult > 0: Gauss-Seidel coupling between the axis
     ! block and the lines through the interface blocks A(rest,ax), A(ax,rest)
     logical :: gsready = .false., gsvec = .false.
@@ -104,6 +125,7 @@ module mod_petsc_pc_gmg
     Vec :: xw, xw2, tr, ta
   end type blk_t
   type(blk_t), save, target :: gBk(0:MAX_LEV-1)
+  type(rds_t), save :: gcrs                  !< the coarsest level's direct solve
   type(lvl_t), allocatable, save :: glv(:)   !< coarse DOF numberings, kept for the block maps
   integer, allocatable, save :: fine_node(:) !< level-0 row -> node-1 (i*n_tht + j), from node%index
   integer, allocatable, save :: fine_kf(:)   !< level-0 row -> canonical DOF k + 4*field (ring diagnostics)
@@ -112,7 +134,8 @@ module mod_petsc_pc_gmg
   integer, save :: nf_s = 0, cur_lev = 0
   integer, save :: sm_type = 0, sm_nstep = 4
   logical, save :: sm_blocks = .false.
-  real*8, allocatable, save :: blk_t_work(:)
+  real*8, allocatable, save :: blk_t_work(:,:)   !< (max block size, 0:threads-1)
+  integer, parameter :: LINES_OMP_MIN = 4000     !< rows below which lines_solve stays serial
   ! Axis treatment (Bourne et al., JCP 488 (2023) 112249 S2-S3). Fine rings
   ! I < ring_is have median r*dtheta/dr below physics_pc_gmg_ring_aspect: the
   ! circle couplings dominate there, so smoother 6 uses ring blocks inside and
@@ -120,6 +143,14 @@ module mod_petsc_pc_gmg
   integer, save :: ring_is = 1, axis_k = 0, axis_mult = 0
   integer, save :: diag_left = 0            !< ring-diag samples left in this rebuild
   integer, save :: gcomm = 0, gme = 0       !< communicator and rank of the hierarchy
+  ! Galerkin chain reuse: the fine operand's sparsity pattern is fixed (the
+  ! physics PC even keeps the same Mat for the run), so the PtAP symbolic phase
+  ! (80% of GMG_PtAP) is done once and later rebuilds refill values
+  ! (MAT_REUSE_MATRIX). a0_id/a0_nzst identify the last operand; for another
+  ! Mat, a0_sig (a hash of the pattern) decides, and a mismatch falls back to
+  ! a fresh product.
+  integer(8), save :: a0_sig(2) = 0
+  integer(8), save :: a0_id = 0, a0_nzst = -1   !< the last fine operand and its nonzero state
 
   ! Workstream D (pair_psi): several independent hierarchies in one module.
   ! The routines below work on the module-level state; gmg_select(k) parks
@@ -132,9 +163,11 @@ module mod_petsc_pc_gmg
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
     integer :: ring_is = 1, axis_k = 0, axis_mult = 0, diag_left = 0
+    integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false., sm_blocks = .false.
     Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gF
-    KSP :: gSm(0:MAX_LEV-1), gCoarse, gAxis
+    KSP :: gSm(0:MAX_LEV-1), gAxis
+    type(rds_t) :: gcrs
     Vec :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1), gzax
     IS  :: gisAxis
     type(blk_t) :: gBk(0:MAX_LEV-1)
@@ -148,6 +181,7 @@ module mod_petsc_pc_gmg
   ! physics-PC ctx, so this module keeps no dependency on it.
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1, gev_axislu = -1
   PetscLogEvent, save :: gev_axis = -1
+  PetscLogEvent, save :: gev_lines = -1, gev_axsolve = -1   !< the block smoother's two halves
   ! per hierarchy instance (1 = pair_w keeps the original names, 2 = GMG2_*)
   PetscLogEvent, save :: gev_vcycle(4) = -1, gev_smooth0(4) = -1, gev_smooth(4) = -1, gev_coarse(4) = -1
   logical, save       :: gev_ready = .false.
@@ -171,12 +205,14 @@ contains
     associate (S => inst(cur_inst))
       S%nlev = nlev; S%nth0 = nth0; S%nf_s = nf_s; S%sm_type = sm_type; S%sm_nstep = sm_nstep
       S%ring_is = ring_is; S%axis_k = axis_k; S%axis_mult = axis_mult; S%diag_left = diag_left
+      S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready; S%sm_blocks = sm_blocks
-      S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm; S%gCoarse = gCoarse; S%gAxis = gAxis
+      S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm; S%gAxis = gAxis
       S%gx = gx; S%gb = gb; S%gr = gr; S%gzax = gzax; S%gisAxis = gisAxis
       do g = 0, MAX_LEV - 1
         call move_blk(gBk(g), S%gBk(g))
       enddo
+      call move_rds(gcrs, S%gcrs)
       if (allocated(glv)) call move_alloc(glv, S%glv)
       if (allocated(fine_node)) call move_alloc(fine_node, S%fine_node)
       if (allocated(fine_kf)) call move_alloc(fine_kf, S%fine_kf)
@@ -186,12 +222,14 @@ contains
     associate (S => inst(k))
       nlev = S%nlev; nth0 = S%nth0; nf_s = S%nf_s; sm_type = S%sm_type; sm_nstep = S%sm_nstep
       ring_is = S%ring_is; axis_k = S%axis_k; axis_mult = S%axis_mult; diag_left = S%diag_left
+      a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready; sm_blocks = S%sm_blocks
-      gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm; gCoarse = S%gCoarse; gAxis = S%gAxis
+      gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm; gAxis = S%gAxis
       gx = S%gx; gb = S%gb; gr = S%gr; gzax = S%gzax; gisAxis = S%gisAxis
       do g = 0, MAX_LEV - 1
         call move_blk(S%gBk(g), gBk(g))
       enddo
+      call move_rds(S%gcrs, gcrs)
       if (allocated(S%glv)) call move_alloc(S%glv, glv)
       if (allocated(S%fine_node)) call move_alloc(S%fine_node, fine_node)
       if (allocated(S%fine_kf)) call move_alloc(S%fine_kf, fine_kf)
@@ -204,9 +242,9 @@ contains
     type(blk_t), intent(inout) :: a, b
     b%nb = a%nb; b%nrow = a%nrow; b%nsing = a%nsing
     a%nb = 0; a%nrow = 0; a%nsing = 0
-    b%axsparse = a%axsparse; b%axready = a%axready
-    b%axis_is = a%axis_is; b%axmat = a%axmat; b%axksp = a%axksp
-    a%axsparse = .false.; a%axready = .false.
+    b%axsparse = a%axsparse; b%axis_is = a%axis_is
+    a%axsparse = .false.
+    call move_rds(a%ax, b%ax)
     b%gsready = a%gsready; b%gsvec = a%gsvec
     b%rest_is = a%rest_is; b%Bra = a%Bra; b%Bar = a%Bar
     b%xw = a%xw; b%xw2 = a%xw2; b%tr = a%tr; b%ta = a%ta
@@ -224,6 +262,168 @@ contains
     if (allocated(a%loff)) call move_alloc(a%loff, b%loff)
     if (allocated(a%lu))   call move_alloc(a%lu,   b%lu)
   end subroutine move_blk
+
+  subroutine move_rds(a, b)
+    type(rds_t), intent(inout) :: a, b
+    b%ready = a%ready; b%member = a%member
+    b%comm = a%comm; b%np = a%np; b%me = a%me
+    b%isq = a%isq; b%ksp = a%ksp; b%b = a%b; b%x = a%x
+    b%sub => a%sub; a%sub => null()
+    a%ready = .false.; a%member = .false.; a%comm = MPI_COMM_NULL; a%np = 0; a%me = 0
+    if (allocated(a%loc))  call move_alloc(a%loc,  b%loc)
+    if (allocated(a%cnt))  call move_alloc(a%cnt,  b%cnt)
+    if (allocated(a%dsp))  call move_alloc(a%dsp,  b%dsp)
+    if (allocated(a%send)) call move_alloc(a%send, b%send)
+  end subroutine move_rds
+
+  !> (Re)build R for A(rows, rows), rows = R%loc on each rank. what = options
+  !! prefix part (gmg<k>_<what>_); tag = label of the first build's
+  !! factor-size print.
+  subroutine rds_setup(R, A, what, tag)
+    type(rds_t), intent(inout) :: R
+    Mat, intent(in)     :: A
+    character(len=*), intent(in) :: what, tag
+    PetscInt, parameter :: one = 1
+    PetscInt :: rst, ren
+    PetscErrorCode :: ierr
+    PC :: pc
+    integer :: color, mpierr, k, nl, ntot
+    integer, allocatable :: gl(:)
+    character(len=64) :: pre
+
+    call MatGetOwnershipRange(A, rst, ren, ierr)
+    if (.not. R%ready) then
+      ! members, and the whole row set (global, ascending = rank order) on each
+      nl = size(R%loc)
+      color = MPI_UNDEFINED
+      if (nl > 0) color = 1
+      call MPI_Comm_split(gcomm, color, gme, R%comm, mpierr)
+      R%member = (nl > 0)
+      ntot = 0
+      if (R%member) then
+        call MPI_Comm_size(R%comm, R%np, mpierr)
+        call MPI_Comm_rank(R%comm, R%me, mpierr)
+        allocate(R%cnt(0:R%np - 1), R%dsp(0:R%np), R%send(nl))
+        call MPI_Allgather(nl, 1, MPI_INTEGER, R%cnt, 1, MPI_INTEGER, R%comm, mpierr)
+        R%dsp(0) = 0
+        do k = 0, R%np - 1
+          R%dsp(k + 1) = R%dsp(k) + R%cnt(k)
+        enddo
+        ntot = R%dsp(R%np)
+        allocate(gl(ntot))
+        call MPI_Allgatherv(int(rst) + R%loc, nl, MPI_INTEGER, gl, R%cnt, R%dsp(0:R%np - 1), &
+                            MPI_INTEGER, R%comm, mpierr)
+      else
+        allocate(gl(0))
+      endif
+      call ISCreateGeneral(PETSC_COMM_SELF, int(ntot, kind(rst)), int(gl, kind(rst)), &
+                           PETSC_COPY_VALUES, R%isq, ierr)
+      deallocate(gl)
+    else
+      ! Re-extracted at every rebuild. MAT_REUSE_MATRIX refills of this
+      ! gathered submatrix left it out of date at np > 1 (coarse self-check
+      ! residual 1e-6 .. 6 from the second build on, exact at np = 1); the
+      ! extraction and the symbolic LU of these small blocks cost little.
+      call MatDestroySubMatrices(one, R%sub, ierr)
+    endif
+    ! collective on A's communicator (non-members pass an empty IS)
+    call MatCreateSubMatrices(A, one, [R%isq], [R%isq], MAT_INITIAL_MATRIX, R%sub, ierr)
+    if (R%member) then
+      if (.not. R%ready) then
+        call rds_make_ksp(MATSOLVERPETSC)
+        call MatCreateVecs(R%sub(1), R%x, R%b, ierr)
+      else
+        call KSPSetOperators(R%ksp, R%sub(1), R%sub(1), ierr)
+      endif
+    endif
+    if (R%member) then
+      call KSPSetUp(R%ksp, ierr)
+      ! PETSc's LU does not pivot: on a failed factorisation, MUMPS instead
+      block
+        PCFailedReason :: why
+        call KSPGetPC(R%ksp, pc, ierr)
+        call PCGetFailedReason(pc, why, ierr)
+        if (why /= PC_NOERROR) then
+          write(*,'(A,I0,A,A,A)') "[Physics PC]   GMG", cur_inst, " ", tag, &
+            ": PETSc LU failed (zero pivot?), refactoring with MUMPS"
+          call KSPDestroy(R%ksp, ierr)
+          call rds_make_ksp(MATSOLVERMUMPS)
+          call KSPSetUp(R%ksp, ierr)
+        endif
+      end block
+    endif
+    if (.not. R%ready .and. R%member) then      ! factor size
+      if (R%me == 0) then
+        block
+          Mat :: F
+          MatInfo :: finfo
+          PetscInt :: nax
+          call KSPGetPC(R%ksp, pc, ierr)
+          call PCFactorGetMatrix(pc, F, ierr)
+          call MatGetInfo(F, MAT_LOCAL, finfo, ierr)
+          call ISGetSize(R%isq, nax, ierr)
+          write(*,'(A,I0,A,A,A,I0,A,I0,A,ES10.3)') "[Mem] GMG", cur_inst, " ", tag, " LU: ", &
+            nax, " rows on ", R%np, " rank(s), factor entries ", finfo%nz_used
+        end block
+      endif
+    endif
+    R%ready = .true.
+
+  contains
+
+    !> Sequential LU KSP of R%sub(1). Default PETSc's own LU with a
+    !! nested-dissection ordering: on these few-thousand-row blocks its
+    !! triangular solve is ~2.5x cheaper per call than MUMPS'. Options under
+    !! gmg<k>_<what>_ override both choices.
+    subroutine rds_make_ksp(stype)
+      MatSolverType, intent(in) :: stype
+      call KSPCreate(PETSC_COMM_SELF, R%ksp, ierr)
+      call KSPSetOperators(R%ksp, R%sub(1), R%sub(1), ierr)
+      call KSPSetType(R%ksp, KSPPREONLY, ierr)
+      call KSPGetPC(R%ksp, pc, ierr)
+      call PCSetType(pc, PCLU, ierr)
+      call PCFactorSetMatSolverType(pc, stype, ierr)
+      if (stype == MATSOLVERPETSC) call PCFactorSetMatOrderingType(pc, MATORDERINGND, ierr)
+      write(pre, '(A,I0,A,A,A)') "gmg", cur_inst, "_", what, "_"   ! sequential: no ICNTL(20) needed
+      call KSPSetOptionsPrefix(R%ksp, trim(pre), ierr)
+      call KSPSetFromOptions(R%ksp, ierr)
+    end subroutine rds_make_ksp
+  end subroutine rds_setup
+
+  !> yy(R%loc) = A(rows, rows)^-1 xx(R%loc) on the members; others return.
+  subroutine rds_solve(R, xx, yy)
+    type(rds_t), intent(inout) :: R
+    Vec :: xx, yy
+    PetscScalar, pointer :: xp(:), yp(:), bp(:)
+    PetscErrorCode :: ie
+    integer :: q, nl, o, mpierr
+    if (.not. R%member) return
+    nl = size(R%loc)
+    o = R%dsp(R%me)
+    call VecGetArrayRead(xx, xp, ie)
+    call VecGetArray(R%b, bp, ie)
+    if (R%np == 1) then
+      do q = 1, nl
+        bp(q) = xp(R%loc(q) + 1)
+      enddo
+    else
+      do q = 1, nl
+        R%send(q) = xp(R%loc(q) + 1)
+      enddo
+      call MPI_Allgatherv(R%send, nl, MPI_DOUBLE_PRECISION, bp, R%cnt, R%dsp(0:R%np - 1), &
+                          MPI_DOUBLE_PRECISION, R%comm, mpierr)
+    endif
+    call VecRestoreArray(R%b, bp, ie)
+    call VecRestoreArrayRead(xx, xp, ie)
+    call KSPSolve(R%ksp, R%b, R%x, ie)
+    call VecGetArrayRead(R%x, bp, ie)
+    call VecGetArray(yy, yp, ie)
+    do q = 1, nl
+      yp(R%loc(q) + 1) = bp(o + q)
+    enddo
+    call VecRestoreArray(yy, yp, ie)
+    call VecRestoreArrayRead(R%x, bp, ie)
+  end subroutine rds_solve
 
   !> One V-cycle of hierarchy k on b (x out), outside any PC: the pair_psi
   !! eta-Schur applies it to Shat.
@@ -777,7 +977,8 @@ contains
 
   !--------------------------------------------------------------------
   !> Galerkin chain, smoothers, coarse and axis solves for operator A. Called
-  !! at every PC rebuild (A is a new Mat each time); P is reused.
+  !! at every PC rebuild with new values in A; P is reused, and with an
+  !! unchanged pattern so are the coarse operators and the LUs' symbolic phase.
   !--------------------------------------------------------------------
   subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, smoother, nsmooth)
     use phys_module, only: physics_pc_gmg_smoother, physics_pc_gmg_nsmooth, physics_pc_gmg_omega, &
@@ -797,15 +998,42 @@ contains
     PetscInt :: nr
     integer :: g
     real*8 :: nz0, nzt, nzg
+    integer(8) :: sig(2)
+    logical :: reuse
+
+    ! Same fine pattern as the last build: keep the coarse operators (and the
+    ! coarse LU's symbolic factorisation) and refill them in place. The same
+    ! Mat (PETSc object ids are never reused) with an unchanged nonzero state
+    ! -- the physics PC keeps its operands for the run, patterns frozen --
+    ! needs no check; anything else is hashed.
+    block
+      PetscObjectState :: nzst
+      PetscInt64 :: aid
+      logical :: same_obj
+      integer :: mpierr
+      call MatGetNonzeroState(A, nzst, ierr)
+      call PetscObjectGetId(A, aid, ierr)
+      same_obj = op_ready .and. int(aid, 8) == a0_id .and. int(nzst, 8) == a0_nzst
+      call MPI_Allreduce(MPI_IN_PLACE, same_obj, 1, MPI_LOGICAL, MPI_LAND, comm, mpierr)
+      if (same_obj) then
+        reuse = .true.
+      else
+        sig = pattern_sig(A, comm)
+        reuse = op_ready .and. all(sig == a0_sig)
+        a0_sig = sig
+      endif
+      a0_id = int(aid, 8); a0_nzst = int(nzst, 8)
+    end block
 
     if (op_ready) then
-      do g = 1, nlev - 1
-        call MatDestroy(gA(g), ierr)
-      enddo
+      if (.not. reuse) then
+        do g = 1, nlev - 1
+          call MatDestroy(gA(g), ierr)
+        enddo
+      endif
       do g = 0, nlev - 2
         call KSPDestroy(gSm(g), ierr)
       enddo
-      call KSPDestroy(gCoarse, ierr)
       if (.not. sm_blocks) call KSPDestroy(gAxis, ierr)   ! sm_blocks: still last setup's
     endif
 
@@ -815,7 +1043,11 @@ contains
     if (present(Afine)) gF = Afine
     call PetscLogEventBegin(gev_ptap, ierr)
     do g = 1, nlev - 1
-      call MatPtAP(gA(g - 1), gP(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
+      if (reuse) then
+        call MatPtAP(gA(g - 1), gP(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
+      else
+        call MatPtAP(gA(g - 1), gP(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
+      endif
     enddo
     call PetscLogEventEnd(gev_ptap, ierr)
 
@@ -899,18 +1131,46 @@ contains
       endif
     end block
 
-    ! Coarse and axis LUs carry an options prefix (gmg<k>_coarse_, gmg<k>_axis_)
-    ! so e.g. -gmg1_coarse_pc_type telescope can be tried without a rebuild.
+    ! Coarse and axis LUs carry an options prefix (gmg<k>_coarse_, gmg<k>_axis_,
+    ! gmg<k>_axblk<g>_) for MUMPS options without a rebuild.
+    ! Coarsest level: an exact LU done redundantly on the few ranks owning its
+    ! rows (rds_t), not a MUMPS solve over the whole communicator per V-cycle.
     call PetscLogEventBegin(gev_coarselu, ierr)
-    call KSPCreate(comm, gCoarse, ierr)
-    call KSPSetOperators(gCoarse, gA(nlev - 1), gA(nlev - 1), ierr)
-    call KSPSetType(gCoarse, KSPPREONLY, ierr)
-    call KSPGetPC(gCoarse, pc, ierr)
-    call PCSetType(pc, PCLU, ierr)
-    call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
-    call set_prefix_mumps(gCoarse, "coarse")
-    call KSPSetUp(gCoarse, ierr)
+    if (.not. gcrs%ready) then
+      call MatGetLocalSize(gA(nlev - 1), nr, PETSC_NULL_INTEGER, ierr)
+      allocate(gcrs%loc(nr))
+      do g = 1, int(nr)
+        gcrs%loc(g) = g - 1
+      enddo
+    endif
+    call rds_setup(gcrs, gA(nlev - 1), "coarse", "coarse level")
     call PetscLogEventEnd(gev_coarselu, ierr)
+    ! Wiring gate at every build (one coarse solve): the redundant solve must
+    ! be exact. Printed on the first build, and loudly whenever it is not.
+    block
+        Vec :: cb, cx, cr
+        real*8 :: rn, bn, xn, en
+        call MatCreateVecs(gA(nlev - 1), cx, cb, ierr)
+        call VecDuplicate(cb, cr, ierr)
+        ! manufactured solution: b = A xt, so both the residual and the
+        ! error of the solve are known (an ill-conditioned coarse operator
+        ! shows as a small residual with a large error)
+        call VecSetRandom(cr, PETSC_NULL_RANDOM, ierr)               ! xt
+        call MatMult(gA(nlev - 1), cr, cb, ierr)
+        call VecZeroEntries(cx, ierr)
+        call rds_solve(gcrs, cb, cx)
+        call VecNorm(cr, NORM_2, en, ierr)
+        call VecAXPY(cr, -1.0d0, cx, ierr)                           ! xt - x
+        call VecNorm(cr, NORM_2, xn, ierr)
+        call MatMult(gA(nlev - 1), cx, cr, ierr)
+        call VecAXPY(cr, -1.0d0, cb, ierr)
+        call VecNorm(cr, NORM_2, rn, ierr)
+        call VecNorm(cb, NORM_2, bn, ierr)
+        if (my_id == 0 .and. (.not. op_ready .or. rn > 1.d-8 * bn)) write(*,'(A,A,ES10.3,A,ES10.3)') &
+          "[Physics PC]   GMG coarse solve self-check", merge(": WARNING, inexact! ", ":                   ", &
+          rn > 1.d-8 * bn), rn / max(bn, 1.d-300), " (residual), ", xn / max(en, 1.d-300)
+        call VecDestroy(cb, ierr); call VecDestroy(cx, ierr); call VecDestroy(cr, ierr)
+    end block
 
     ! The exact axis patch is only applied with the point-Jacobi smoothers; the
     ! block smoothers carry the axis ring as one block of their own.
@@ -954,6 +1214,36 @@ contains
     enddo
     if (my_id == 0) write(*,'(A,F6.3)') "   C_op = ", nzt / max(nz0, 1.d0)
   end subroutine gmg_setup_operator
+
+  !> Two hashes of A's sparsity pattern (row lengths and global column indices
+  !! of the owned rows), summed over the ranks. Equal signatures between two
+  !! rebuilds let gmg_setup_operator reuse the PtAP symbolic phase; any change
+  !! of the pattern changes them.
+  function pattern_sig(A, comm) result(sig)
+    Mat, intent(in)     :: A
+    integer, intent(in) :: comm
+    integer(8) :: sig(2)
+    integer(8), parameter :: PM = 2147483647_8
+    PetscInt :: rst, ren, r, ncols, c
+    PetscInt, pointer :: cols(:)
+    PetscErrorCode :: ierr
+    integer :: mpierr
+    integer(8) :: h1, h2, v
+    call MatGetOwnershipRange(A, rst, ren, ierr)
+    h1 = mod(int(rst, 8) + 1_8, PM); h2 = mod(int(ren, 8) + 7_8, PM)
+    do r = rst, ren - 1
+      call MatGetRow(A, r, ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      h1 = mod(h1 * 131_8 + int(ncols, 8) + 1_8, PM)
+      do c = 1, ncols
+        v = mod(int(cols(c), 8), PM)
+        h1 = mod(h1 * 131_8 + v + 1_8, PM)
+        h2 = mod(h2 * 1000003_8 + v + 3_8, PM)
+      enddo
+      call MatRestoreRow(A, r, ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+    enddo
+    sig = [h1, h2]
+    call MPI_Allreduce(MPI_IN_PLACE, sig, 2, MPI_INTEGER8, MPI_SUM, comm, mpierr)
+  end function pattern_sig
 
   !> Options prefix gmg<k>_<what>_ for a direct-solve KSP of hierarchy k, and
   !! MUMPS' centralized RHS under that prefix unless the user set it: PETSc's
@@ -1011,6 +1301,8 @@ contains
     call PetscLogEventRegister("GMG4_SmoothC", cid, gev_smooth(4),  ierr)
     call PetscLogEventRegister("GMG4_Coarse",  cid, gev_coarse(4),  ierr)
     call PetscLogEventRegister("GMG_Axis",     cid, gev_axis,     ierr)
+    call PetscLogEventRegister("GMG_Lines",    cid, gev_lines,    ierr)
+    call PetscLogEventRegister("GMG_AxSolve",  cid, gev_axsolve,  ierr)
     gev_ready = .true.
   end subroutine gmg_register_events
 
@@ -1021,7 +1313,7 @@ contains
 
     if (g == nlev - 1) then
       call PetscLogEventBegin(gev_coarse(cur_inst), ierr)
-      call KSPSolve(gCoarse, b, x, ierr)
+      call rds_solve(gcrs, b, x)
       call PetscLogEventEnd(gev_coarse(cur_inst), ierr)
       return
     endif
@@ -1082,12 +1374,13 @@ contains
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
-    integer :: nc, I, J, m, bb, q, pr, pcn, info, n, ldab, kk, tmp
+    integer :: nc, I, J, m, bb, q, pr, pcn, info, n, ldab, kk, tmp, nthr
     integer, allocatable :: cnt(:), key(:)
     integer(8) :: tot, ix
     PetscInt, allocatable :: axr(:)
-    PC :: axpc
+    integer, allocatable :: binfo(:)
     character(len=16) :: axname
+    character(len=24) :: axtag
     external :: dgetrf, dgbtrf
 
     B => gBk(g)
@@ -1192,12 +1485,25 @@ contains
         enddo
         call ISCreateGeneral(gcomm, int(n, kind(nr)), axr, PETSC_COPY_VALUES, B%axis_is, ierr)
         call ISSort(B%axis_is, ierr)
-        deallocate(axr)
+        ! the same rows, local and ascending, for the redundant axis solve
+        allocate(B%ax%loc(n), key(B%nrow))
+        key = 0
+        do q = 1, n
+          key(axr(q) - rst + 1) = 1
+        enddo
+        n = 0
+        do r = 1, B%nrow
+          if (key(r) == 0) cycle
+          n = n + 1; B%ax%loc(n) = int(r) - 1
+        enddo
+        deallocate(axr, key)
       endif
+      nthr = 1
+      !$ nthr = omp_get_max_threads()
       if (allocated(blk_t_work)) then
-        if (size(blk_t_work) < maxval(B%sz)) deallocate(blk_t_work)
+        if (size(blk_t_work, 1) < maxval(B%sz) .or. size(blk_t_work, 2) < nthr) deallocate(blk_t_work)
       endif
-      if (.not. allocated(blk_t_work)) allocate(blk_t_work(maxval(B%sz)))
+      if (.not. allocated(blk_t_work)) allocate(blk_t_work(maxval(B%sz), 0:nthr - 1))
     endif
 
     ! band widths of the blocks as stored in A (pattern fixed across rebuilds,
@@ -1249,16 +1555,28 @@ contains
       enddo
       call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
     enddo
+    ! The blocks are independent: factor them on the rank's OpenMP threads
+    ! (hybrid runs leave them idle in the PETSc parts). The singular-block
+    ! fallback reads A (MatGetRow is not thread-safe), so it runs afterwards.
+    allocate(binfo(B%nb))
+    binfo = 0
+    !$omp parallel do schedule(dynamic, 1) private(bb, n, ldab)
+    do bb = 1, B%nb
+      if (B%axblk(bb)) cycle
+      n = B%sz(bb)
+      if (B%band(bb)) then
+        ldab = 2 * B%kl(bb) + B%ku(bb) + 1
+        call dgbtrf(n, n, B%kl(bb), B%ku(bb), B%lu(B%loff(bb) + 1), ldab, B%piv(B%off(bb) + 1), binfo(bb))
+      else
+        call dgetrf(n, n, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), binfo(bb))
+      endif
+    enddo
+    !$omp end parallel do
     B%nsing = 0
     do bb = 1, B%nb
       n = B%sz(bb)
       if (B%axblk(bb)) cycle
-      if (B%band(bb)) then
-        ldab = 2 * B%kl(bb) + B%ku(bb) + 1
-        call dgbtrf(n, n, B%kl(bb), B%ku(bb), B%lu(B%loff(bb) + 1), ldab, B%piv(B%off(bb) + 1), info)
-      else
-        call dgetrf(n, n, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), info)
-      endif
+      info = binfo(bb)
       if (info /= 0) then
         ! singular block: keep only its diagonal, from the Pmat (point Jacobi)
         B%nsing = B%nsing + 1
@@ -1282,34 +1600,9 @@ contains
     enddo
 
     if (B%axsparse) then
-      if (B%axready) then
-        call KSPDestroy(B%axksp, ierr)
-        call MatDestroy(B%axmat, ierr)
-      endif
-      call MatCreateSubMatrix(A, B%axis_is, B%axis_is, MAT_INITIAL_MATRIX, B%axmat, ierr)
-      call KSPCreate(gcomm, B%axksp, ierr)
-      call KSPSetOperators(B%axksp, B%axmat, B%axmat, ierr)
-      call KSPSetType(B%axksp, KSPPREONLY, ierr)
-      call KSPGetPC(B%axksp, axpc, ierr)
-      call PCSetType(axpc, PCLU, ierr)
-      call PCFactorSetMatSolverType(axpc, MATSOLVERMUMPS, ierr)
       write(axname, '(A,I0)') "axblk", g
-      call set_prefix_mumps(B%axksp, trim(axname))
-      call KSPSetUp(B%axksp, ierr)
-      if (.not. B%axready) then                ! first build: factor size (INFOG 22 = MB, 29 = entries)
-        block
-          Mat :: Fax
-          PetscInt :: mb, nent, nax
-          call PCFactorGetMatrix(axpc, Fax, ierr)
-          call MatMumpsGetInfog(Fax, 22_4, mb, ierr)
-          call MatMumpsGetInfog(Fax, 29_4, nent, ierr)
-          call ISGetSize(B%axis_is, nax, ierr)
-          if (gme == 0) write(*,'(A,I0,A,I0,A,I0,A,I0,A,ES10.3)') "[Mem] MUMPS GMG", cur_inst, &
-            " axis block level ", g, ": ", nax, " rows, MB ", mb, ", factor entries ", &
-            merge(-dble(nent) * 1.d6, dble(nent), nent < 0)
-        end block
-      endif
-      B%axready = .true.
+      write(axtag, '(A,I0)') "axis block level ", g
+      call rds_setup(B%ax, A, trim(axname), trim(axtag))
     endif
 
     if (B%axsparse .and. axis_mult > 0) then
@@ -1331,6 +1624,43 @@ contains
       B%gsready = .true.
     endif
   end subroutine build_blocks
+
+  !> x = A^-1 x for one right-hand side, A = the dgbtrf factors in LAPACK band
+  !! storage (ldab = 2 kl + ku + 1, pivots ipiv): dgbtrs('N') written out.
+  !! dgbtrs does one level-2 BLAS call (dger / dtbsv column step) per column on
+  !! vectors of length ~kl, so for the GMG's radial lines (n ~ 10^2-10^3,
+  !! kl ~ 15) the call overhead was most of GMG_Lines. Same operations in the
+  !! same order: L with the row interchanges, then U by columns.
+  subroutine band_solve(n, kl, ku, ab, ipiv, x)
+    integer, intent(in)   :: n, kl, ku, ipiv(n)
+    real*8, intent(in)    :: ab(2 * kl + ku + 1, n)
+    real*8, intent(inout) :: x(n)
+    integer :: j, i, l, lm, kd
+    real*8  :: t
+    kd = kl + ku + 1
+    if (kl > 0) then
+      do j = 1, n - 1
+        lm = min(kl, n - j)
+        l = ipiv(j)
+        if (l /= j) then
+          t = x(l); x(l) = x(j); x(j) = t
+        endif
+        t = x(j)
+        do i = 1, lm
+          x(j + i) = x(j + i) - ab(kd + i, j) * t
+        enddo
+      enddo
+    endif
+    do j = n, 1, -1
+      if (x(j) /= 0.0d0) then
+        x(j) = x(j) / ab(kd, j)
+        t = x(j)
+        do i = j - 1, max(1, j - kl - ku), -1
+          x(i) = x(i) - t * ab(kd + i - j, j)
+        enddo
+      endif
+    enddo
+  end subroutine band_solve
 
   !> Storage index of entry (i, j) of block bb (dense column-major, or LAPACK
   !! band storage with the kl extra rows dgbtrf needs for fill).
@@ -1427,45 +1757,51 @@ contains
 
   contains
 
-    !> y(rows outside the axis block) = dense/banded block solves of x
+    !> y(rows outside the axis block) = dense/banded block solves of x. The
+    !! blocks own disjoint rows, so they run on the rank's OpenMP threads.
     subroutine lines_solve(xx, yy)
       Vec :: xx, yy
       PetscScalar, pointer :: xp(:), yp(:)
       PetscErrorCode :: ie
-      integer :: bb, q, n, info
-      external :: dgetrs, dgbtrs
+      integer :: bb, q, n, info, t
+      external :: dgetrs
+      call PetscLogEventBegin(gev_lines, ie)
       call VecGetArrayRead(xx, xp, ie)
       call VecGetArray(yy, yp, ie)
+      ! small (coarse) levels stay serial: fork/join would cost more than the work
+      !$omp parallel do schedule(dynamic, 4) private(bb, q, n, info, t) if (B%nrow >= LINES_OMP_MIN)
       do bb = 1, B%nb
         if (B%axblk(bb)) cycle
+        t = 0
+        !$ t = omp_get_thread_num()
         n = B%sz(bb)
         do q = 1, n
-          blk_t_work(q) = xp(B%rows(B%off(bb) + q) + 1)
+          blk_t_work(q, t) = xp(B%rows(B%off(bb) + q) + 1)
         enddo
         if (B%band(bb)) then
-          call dgbtrs('N', n, B%kl(bb), B%ku(bb), 1, B%lu(B%loff(bb) + 1), 2 * B%kl(bb) + B%ku(bb) + 1, &
-                      B%piv(B%off(bb) + 1), blk_t_work, n, info)
+          call band_solve(n, B%kl(bb), B%ku(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), &
+                          blk_t_work(1, t))
         else
-          call dgetrs('N', n, 1, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), blk_t_work, n, info)
+          call dgetrs('N', n, 1, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), blk_t_work(1, t), n, info)
         endif
         do q = 1, n
-          yp(B%rows(B%off(bb) + q) + 1) = blk_t_work(q)
+          yp(B%rows(B%off(bb) + q) + 1) = blk_t_work(q, t)
         enddo
       enddo
+      !$omp end parallel do
       call VecRestoreArrayRead(xx, xp, ie)
       call VecRestoreArray(yy, yp, ie)
+      call PetscLogEventEnd(gev_lines, ie)
     end subroutine lines_solve
 
-    !> y(axis rows) = axis-block solve of x(axis rows)
+    !> y(axis rows) = axis-block solve of x(axis rows), on the axis ranks only
     subroutine ax_solve(xx, yy)
       Vec :: xx, yy
-      Vec :: xs, ys
       PetscErrorCode :: ie
-      call VecGetSubVector(xx, B%axis_is, xs, ie)
-      call VecGetSubVector(yy, B%axis_is, ys, ie)
-      call KSPSolve(B%axksp, xs, ys, ie)
-      call VecRestoreSubVector(yy, B%axis_is, ys, ie)
-      call VecRestoreSubVector(xx, B%axis_is, xs, ie)
+      if (.not. B%ax%member) return
+      call PetscLogEventBegin(gev_axsolve, ie)
+      call rds_solve(B%ax, xx, yy)
+      call PetscLogEventEnd(gev_axsolve, ie)
     end subroutine ax_solve
 
     !> w = x, then w(to rows) -= C y(from rows), C = A(to, from)

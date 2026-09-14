@@ -15,6 +15,11 @@ module mod_petsc_pc_physics_apply
   public :: s_pbp_diag_mult   ! TEMPORARY diagnostic (Option A, Step 2) -- remove with Step 3
   public :: pack_2v, unpack_2v   ! Workstream B: also used by the mixed-pair null test
 
+  ! physics_pc_apply's per-variable copies of x and y (created on first use;
+  ! every variable block has B_11's layout)
+  Vec, save     :: sv_x(6), sv_y(6)
+  logical, save :: sv_ready = .false.
+
 contains
 
   !> Pack two 1-variable PETSc vecs into one 2v-sized packed vec.
@@ -819,9 +824,10 @@ contains
     Vec :: x, y
     PetscErrorCode :: ierr
 
-    ! Sub-vectors (views into x and y)
+    ! Per-variable copies of x and y (persistent work vecs, see split_vars)
     Vec :: x_psi, x_u, x_j, x_w, x_rho, x_T
     Vec :: y_psi, y_u, y_j, y_w, y_rho, y_T
+    integer :: k
 
     if (.not. g_ctx%reduced_ready) then
       ierr = 1
@@ -833,19 +839,24 @@ contains
     call PetscLogEventBegin(pcev_apply, ierr)
 
     ! --- Step 1: Extract variable sub-vectors ---
-    call VecGetSubVector(x, g_ctx%is_var(var_psi), x_psi, ierr)
-    call VecGetSubVector(x, g_ctx%is_var(var_u),   x_u,   ierr)
-    call VecGetSubVector(x, g_ctx%is_var(var_zj),  x_j,   ierr)
-    call VecGetSubVector(x, g_ctx%is_var(var_w),   x_w,   ierr)
-    call VecGetSubVector(x, g_ctx%is_var(var_rho), x_rho, ierr)
-    call VecGetSubVector(x, g_ctx%is_var(var_T),   x_T,   ierr)
-
-    call VecGetSubVector(y, g_ctx%is_var(var_psi), y_psi, ierr)
-    call VecGetSubVector(y, g_ctx%is_var(var_u),   y_u,   ierr)
-    call VecGetSubVector(y, g_ctx%is_var(var_zj),  y_j,   ierr)
-    call VecGetSubVector(y, g_ctx%is_var(var_w),   y_w,   ierr)
-    call VecGetSubVector(y, g_ctx%is_var(var_rho), y_rho, ierr)
-    call VecGetSubVector(y, g_ctx%is_var(var_T),   y_T,   ierr)
+    ! is_var(v) is the rank's own rows node*bs + (v-1)*n_tor + m, so the split
+    ! is a local strided copy. VecGetSubVector did the same through a fresh
+    ! VecScatter per call, with two global reductions each at np > 1.
+    if (.not. sv_ready) then
+      call MatCreateVecs(g_ctx%B_11, sv_x(1), PETSC_NULL_VEC, ierr)
+      do k = 2, 6
+        call VecDuplicate(sv_x(1), sv_x(k), ierr)
+      enddo
+      do k = 1, 6
+        call VecDuplicate(sv_x(1), sv_y(k), ierr)
+      enddo
+      sv_ready = .true.
+    endif
+    call split_vars(x, sv_x)
+    x_psi = sv_x(var_psi); x_u = sv_x(var_u); x_j = sv_x(var_zj)
+    x_w = sv_x(var_w); x_rho = sv_x(var_rho); x_T = sv_x(var_T)
+    y_psi = sv_y(var_psi); y_u = sv_y(var_u); y_j = sv_y(var_zj)
+    y_w = sv_y(var_w); y_rho = sv_y(var_rho); y_T = sv_y(var_T)
 
     ! --- Step 2: Apply inverse of elliptic constraint mass matrices ---
     ! The mixed-pair arm keeps j and omega explicit, so it needs neither of
@@ -932,25 +943,62 @@ contains
       call KSPSolve(g_ctx%ksp_Mw, g_ctx%work_4, y_w, ierr)
     endif
 
-    ! --- Step 5: Restore sub-vectors ---
-    call VecRestoreSubVector(x, g_ctx%is_var(var_psi), x_psi, ierr)
-    call VecRestoreSubVector(x, g_ctx%is_var(var_u),   x_u,   ierr)
-    call VecRestoreSubVector(x, g_ctx%is_var(var_zj),  x_j,   ierr)
-    call VecRestoreSubVector(x, g_ctx%is_var(var_w),   x_w,   ierr)
-    call VecRestoreSubVector(x, g_ctx%is_var(var_rho), x_rho, ierr)
-    call VecRestoreSubVector(x, g_ctx%is_var(var_T),   x_T,   ierr)
-
-    call VecRestoreSubVector(y, g_ctx%is_var(var_psi), y_psi, ierr)
-    call VecRestoreSubVector(y, g_ctx%is_var(var_u),   y_u,   ierr)
-    call VecRestoreSubVector(y, g_ctx%is_var(var_zj),  y_j,   ierr)
-    call VecRestoreSubVector(y, g_ctx%is_var(var_w),   y_w,   ierr)
-    call VecRestoreSubVector(y, g_ctx%is_var(var_rho), y_rho, ierr)
-    call VecRestoreSubVector(y, g_ctx%is_var(var_T),   y_T,   ierr)
+    ! --- Step 5: write the six variables back into y ---
+    call merge_vars(sv_y, y)
 
     call PetscLogEventEnd(pcev_apply, ierr)
 
     ierr = 0
   end subroutine physics_pc_apply
+
+  !> v(k) = variable k of the full-system vector x (k = 1..6): local rows
+  !! node*bs + (k-1)*n_tor + m -> node*n_tor + m, bs = n_var*n_tor, exactly the
+  !! map of create_variable_index_sets. Rank-local, no communication.
+  subroutine split_vars(x, v)
+    use mod_parameters, only: n_var, n_tor
+    Vec :: x
+    Vec :: v(6)
+    PetscScalar, pointer :: xa(:), va(:)
+    PetscErrorCode :: ierr
+    PetscInt :: nl
+    integer :: k, i, bs, nn
+    call VecGetLocalSize(x, nl, ierr)
+    bs = n_var * n_tor
+    nn = int(nl) / bs
+    call VecGetArrayRead(x, xa, ierr)
+    do k = 1, 6
+      call VecGetArray(v(k), va, ierr)
+      do i = 0, nn - 1
+        va(i * n_tor + 1 : (i + 1) * n_tor) = xa(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor)
+      enddo
+      call VecRestoreArray(v(k), va, ierr)
+    enddo
+    call VecRestoreArrayRead(x, xa, ierr)
+  end subroutine split_vars
+
+  !> Inverse of split_vars: variables 1..6 of y from v(k); any further
+  !! variables of y (n_var > 6) are left untouched, as before.
+  subroutine merge_vars(v, y)
+    use mod_parameters, only: n_var, n_tor
+    Vec :: v(6)
+    Vec :: y
+    PetscScalar, pointer :: ya(:), va(:)
+    PetscErrorCode :: ierr
+    PetscInt :: nl
+    integer :: k, i, bs, nn
+    call VecGetLocalSize(y, nl, ierr)
+    bs = n_var * n_tor
+    nn = int(nl) / bs
+    call VecGetArray(y, ya, ierr)
+    do k = 1, 6
+      call VecGetArrayRead(v(k), va, ierr)
+      do i = 0, nn - 1
+        ya(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor) = va(i * n_tor + 1 : (i + 1) * n_tor)
+      enddo
+      call VecRestoreArrayRead(v(k), va, ierr)
+    enddo
+    call VecRestoreArray(y, ya, ierr)
+  end subroutine merge_vars
 
 #endif
 end module mod_petsc_pc_physics_apply

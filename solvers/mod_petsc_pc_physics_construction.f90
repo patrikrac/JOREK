@@ -57,6 +57,9 @@ module mod_petsc_pc_physics_construction
   Mat, save     :: sfp_TLa, sfp_TSa          !< the first factor of each chain (B_23*Qi, B_13*Qi)
   Mat, save     :: sfp_ch_Lsc(3), sfp_ch_Tp(3)  !< add_channel scratch, one slot per channel
   Mat, save     :: sfp_Ltil                  !< persistent Ltil = B_21 - B_23 Qi B_31
+  Mat, save     :: sfp_Suu                   !< persistent S_uu (union pattern of the first build)
+  logical, save :: sfp_suu_ready = .false.
+  logical, save :: kpj_packed = .false., sw_packed = .false.   !< K_pj_aij / S_W_aij exist (pack_pair_aij)
   ! One nnz guard per cached product; negative means "not yet built".
   integer(kind=8), save :: sfp_nnz_TLa = -1, sfp_nnz_TL = -1
   integer(kind=8), save :: sfp_nnz_TSa = -1, sfp_nnz_TS = -1
@@ -69,6 +72,7 @@ module mod_petsc_pc_physics_construction
   Mat, save     :: psc_Shat                  !< B_11 - diag(B_13/B_33) B_31, rebuilt every PC rebuild
   KSP, save     :: psc_kspS                  !< mode 1: LU of psc_Shat; mode 2: LU of its axis patch
   Vec, save     :: psc_dinv, psc_res, psc_zpsi, psc_zj, psc_t, psc_zax
+  Vec, save     :: psc_rp, psc_rj            !< psc_apply's copies of the two halves of r
   IS, save      :: psc_is_axis
   integer, save :: psc_mode = 0
   logical, save :: psc_ready = .false., psc_vecs_ready = .false.
@@ -97,12 +101,13 @@ module mod_petsc_pc_physics_construction
   type(ms_t), save, target :: ms(2)
   Vec, save     :: shw_d                     !< Dh, refreshed at every rebuild
   Vec, save     :: shw_xs, shw_p1, shw_p2, shw_j1, shw_j2, shw_t
+  Vec, save     :: shw_xu, shw_xw, shw_yu, shw_yw   !< the u / omega halves of x and y
   IS, save      :: shw_isu, shw_isw
   logical, save :: shw_ready = .false., shw_d_ready = .false.
 
   public :: create_variable_index_sets
   public :: extract_sub_block
-  public :: extract_sub_block_h
+  public :: extract_sub_block_h, extract_sub_blocks_h
   public :: compute_schur_corrected_block_psi
   public :: compute_schur_corrected_block_u
   public :: compute_schur_corrected_block_21
@@ -346,6 +351,122 @@ contains
     call MatAssemblyEnd(B, MAT_FINAL_ASSEMBLY, ierr)
     if (first_time) call MatSetOption(B, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
   end subroutine extract_sub_block_h
+
+  !--------------------------------------------------------------------
+  !> extract_sub_block_h for a list of blocks Mb(k) = A(eqs(k), vrs(k)) in ONE
+  !! pass over A_full's rows: each equation row is read once (MatGetRow on
+  !! JOREK's BAIJ matrix expands the whole n_var*n_tor-wide block row) and its
+  !! entries are dispatched to every requested block of that equation. The
+  !! 21-block SFM2 extraction read each row 2-6 times. Same entries, same
+  !! per-row insertion order, same preallocation as extract_sub_block_h.
+  !--------------------------------------------------------------------
+  subroutine extract_sub_blocks_h(A_full, eqs, vrs, Mb, first_time)
+    use phys_module,    only: physics_pc_harm_split
+    use mod_parameters, only: n_tor, n_var
+    Mat, intent(in)     :: A_full
+    integer, intent(in) :: eqs(:), vrs(:)
+    Mat, intent(inout)  :: Mb(:)
+    logical, intent(in) :: first_time
+    PetscErrorCode :: ierr
+    PetscInt :: i, ncols, rstart, rend, m, k, q, bs, nloc, nsub, nglob
+    PetscInt :: sr, sc, cstart, cend, node, cb
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    PetscInt, allocatable :: dcnt(:,:), ocnt(:,:), cc(:,:)
+    PetscScalar, allocatable :: vv(:,:)
+    integer, allocatable :: tgt(:,:), c(:)
+    integer :: comm, nb, e, v, kb, pass
+
+    nb = size(eqs)
+    if (physics_pc_harm_split == 0) then
+      do kb = 1, nb
+        call extract_sub_block(A_full, eqs(kb), vrs(kb), Mb(kb), first_time)
+      enddo
+      return
+    endif
+
+    bs = n_var * n_tor
+    call MatGetOwnershipRange(A_full, rstart, rend, ierr)
+    call MatGetSize(A_full, nglob, PETSC_NULL_INTEGER, ierr)
+    nloc   = ((rend - rstart) / bs) * n_tor
+    nsub   = (nglob / bs) * n_tor
+    cstart = (rstart / bs) * n_tor
+    cend   = cstart + nloc
+    allocate(tgt(n_var, n_var), c(nb))
+    tgt = 0
+    do kb = 1, nb
+      tgt(eqs(kb), vrs(kb)) = kb
+    enddo
+
+    if (first_time) then
+      allocate(dcnt(nloc, nb), ocnt(nloc, nb))
+      dcnt = 0; ocnt = 0
+    else
+      do kb = 1, nb
+        call MatZeroEntries(Mb(kb), ierr)
+      enddo
+    endif
+    allocate(cc(bs * 64, nb), vv(bs * 64, nb))
+
+    do pass = merge(1, 2, first_time), 2          ! 1 = count (first build), 2 = fill
+      do node = rstart / bs, rend / bs - 1
+        do e = 1, n_var
+          if (all(tgt(e, :) == 0)) cycle
+          do m = 0, n_tor - 1
+            i  = node * bs + (e - 1) * n_tor + m
+            sr = node * n_tor + m
+            call MatGetRow(A_full, i, ncols, cols, vals, ierr)
+            if (ncols > size(cc, 1)) then
+              deallocate(cc, vv); allocate(cc(ncols, nb), vv(ncols, nb))
+            endif
+            c = 0
+            do k = 1, ncols
+              cb = mod(cols(k), bs)
+              v  = int(cb / n_tor) + 1
+              kb = tgt(e, v)
+              if (kb == 0) cycle
+              q = cb - (v - 1) * n_tor
+              if ((q + 1) / 2 /= (m + 1) / 2) cycle
+              sc = (cols(k) / bs) * n_tor + q
+              if (pass == 1) then
+                if (sc >= cstart .and. sc < cend) then
+                  dcnt(sr - cstart + 1, kb) = dcnt(sr - cstart + 1, kb) + 1
+                else
+                  ocnt(sr - cstart + 1, kb) = ocnt(sr - cstart + 1, kb) + 1
+                endif
+              else
+                c(kb) = c(kb) + 1; cc(c(kb), kb) = sc; vv(c(kb), kb) = vals(k)
+              endif
+            enddo
+            call MatRestoreRow(A_full, i, ncols, cols, vals, ierr)
+            if (pass == 2) then
+              do kb = 1, nb
+                if (c(kb) > 0) call MatSetValues(Mb(kb), 1_4, [sr], c(kb), cc(1:c(kb), kb), &
+                                                 vv(1:c(kb), kb), INSERT_VALUES, ierr)
+              enddo
+            endif
+          enddo
+        enddo
+      enddo
+      if (pass == 1) then
+        call PetscObjectGetComm(A_full, comm, ierr)
+        do kb = 1, nb
+          call MatCreate(comm, Mb(kb), ierr)
+          call MatSetSizes(Mb(kb), nloc, nloc, nsub, nsub, ierr)
+          call MatSetType(Mb(kb), MATMPIAIJ, ierr)
+          call MatMPIAIJSetPreallocation(Mb(kb), PETSC_DEFAULT_INTEGER, dcnt(:, kb), &
+                                         PETSC_DEFAULT_INTEGER, ocnt(:, kb), ierr)
+        enddo
+        deallocate(dcnt, ocnt)
+      endif
+    enddo
+    deallocate(cc, vv, tgt, c)
+    do kb = 1, nb
+      call MatAssemblyBegin(Mb(kb), MAT_FINAL_ASSEMBLY, ierr)
+      call MatAssemblyEnd(Mb(kb), MAT_FINAL_ASSEMBLY, ierr)
+      if (first_time) call MatSetOption(Mb(kb), MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
+    enddo
+  end subroutine extract_sub_blocks_h
 
 
 
@@ -8267,6 +8388,137 @@ contains
   !! to B_11/B_13/B_31/B_33, which are themselves destroyed and re-extracted on
   !! the next rebuild, so a cached nest would dangle.
   !--------------------------------------------------------------------
+  !--------------------------------------------------------------------
+  !> C = [[A11, A12], [A21, A22]] as one MPIAIJ in the packed layout of
+  !! MatConvert(MatNest -> MPIAIJ): rank r owns [its field-1 rows | its field-2
+  !! rows], and a field-j column c owned by rank p sits at packed column
+  !! c + rg2(p) (field 1) or c + rg1(p+1) (field 2), rg = the fields'
+  !! ownership starts. Replaces that MatConvert, whose parallel path
+  !! ISAllGathers every global column index onto every rank -- O(N) memory and
+  !! traffic per rank, twice per PC rebuild.
+  !!
+  !! First call (ready = .false.): exact preallocation, and the pattern is
+  !! frozen (MAT_NEW_NONZERO_LOCATION_ERR). Later calls refill the values in
+  !! place, so C keeps its identity across rebuilds and every consumer (the
+  !! GMG's PtAP, the coarse/axis LUs, MUMPS) reuses its symbolic phase. The
+  !! stored values and each row's column order are those of the MatConvert.
+  !--------------------------------------------------------------------
+  subroutine pack_pair_aij(A11, A12, A21, A22, C, ready, comm)
+    Mat, intent(in)        :: A11, A12, A21, A22
+    Mat, intent(inout)     :: C
+    logical, intent(inout) :: ready
+    integer, intent(in)    :: comm
+    PetscErrorCode :: ierr
+    PetscInt :: s1, e1, s2, e2, n1, n2, ps, r, ncols, k, pr
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    PetscInt, allocatable :: dnz(:), onz(:), pc_(:)
+    integer, allocatable :: rg1(:), rg2(:)
+    integer :: np, me, mpierr, pass
+
+    call MPI_Comm_size(comm, np, mpierr)
+    call MPI_Comm_rank(comm, me, mpierr)
+    call MatGetOwnershipRange(A11, s1, e1, ierr)
+    call MatGetOwnershipRange(A22, s2, e2, ierr)
+    n1 = e1 - s1; n2 = e2 - s2
+    allocate(rg1(0:np), rg2(0:np))
+    call MPI_Allgather(int(s1), 1, MPI_INTEGER, rg1, 1, MPI_INTEGER, comm, mpierr)
+    call MPI_Allgather(int(s2), 1, MPI_INTEGER, rg2, 1, MPI_INTEGER, comm, mpierr)
+    call MatGetSize(A11, k, PETSC_NULL_INTEGER, ierr); rg1(np) = int(k)
+    call MatGetSize(A22, k, PETSC_NULL_INTEGER, ierr); rg2(np) = int(k)
+    ps = s1 + s2                                    ! first packed row of this rank
+
+    if (.not. ready) then
+      allocate(dnz(n1 + n2), onz(n1 + n2))
+      dnz = 0; onz = 0
+    else
+      call MatZeroEntries(C, ierr)
+    endif
+    allocate(pc_(64))
+    ! pass 1 counts (first call only), pass 2 inserts
+    do pass = merge(2, 1, ready), 2
+      do r = 0, n1 - 1
+        pr = ps + r
+        call put_row(A11, s1 + r, 1, pr, pass)
+        call put_row(A12, s1 + r, 2, pr, pass)
+      enddo
+      do r = 0, n2 - 1
+        pr = ps + n1 + r
+        call put_row(A21, s2 + r, 1, pr, pass)
+        call put_row(A22, s2 + r, 2, pr, pass)
+      enddo
+      if (pass == 1) then
+        call MatCreate(comm, C, ierr)
+        call MatSetSizes(C, n1 + n2, n1 + n2, int(rg1(np) + rg2(np), kind(n1)), &
+                         int(rg1(np) + rg2(np), kind(n1)), ierr)
+        call MatSetType(C, MATMPIAIJ, ierr)
+        call MatMPIAIJSetPreallocation(C, PETSC_DEFAULT_INTEGER, dnz, PETSC_DEFAULT_INTEGER, onz, ierr)
+        deallocate(dnz, onz)
+      endif
+    enddo
+    call MatAssemblyBegin(C, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(C, MAT_FINAL_ASSEMBLY, ierr)
+    if (.not. ready) call MatSetOption(C, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
+    ready = .true.
+    deallocate(rg1, rg2, pc_)
+
+  contains
+
+    !> Row `row` of block Ab (columns in field fc) into packed row prow:
+    !! pass 1 counts diagonal/off-diagonal entries, pass 2 inserts.
+    subroutine put_row(Ab, row, fc, prow, pass_)
+      Mat, intent(in)      :: Ab
+      PetscInt, intent(in) :: row, prow
+      integer, intent(in)  :: fc, pass_
+      PetscInt :: q, cg
+      integer :: p
+      call MatGetRow(Ab, row, ncols, cols, vals, ierr)
+      if (ncols > size(pc_)) then
+        deallocate(pc_); allocate(pc_(2 * ncols))
+      endif
+      p = me
+      do q = 1, ncols
+        cg = cols(q)
+        if (fc == 1) then
+          if (cg < rg1(p) .or. cg >= rg1(p + 1)) p = owner(rg1, int(cg))
+          pc_(q) = cg + rg2(p)
+        else
+          if (cg < rg2(p) .or. cg >= rg2(p + 1)) p = owner(rg2, int(cg))
+          pc_(q) = cg + rg1(p + 1)
+        endif
+      enddo
+      if (pass_ == 1) then
+        do q = 1, ncols
+          if (pc_(q) >= ps .and. pc_(q) < ps + n1 + n2) then
+            dnz(prow - ps + 1) = dnz(prow - ps + 1) + 1
+          else
+            onz(prow - ps + 1) = onz(prow - ps + 1) + 1
+          endif
+        enddo
+      else if (ncols > 0) then
+        call MatSetValues(C, 1_4, [prow], ncols, pc_(1:ncols), vals(1:ncols), INSERT_VALUES, ierr)
+      endif
+      call MatRestoreRow(Ab, row, ncols, cols, vals, ierr)
+    end subroutine put_row
+
+    !> Rank owning index ix of a field with ownership starts rg(0:np).
+    integer function owner(rg, ix)
+      integer, intent(in) :: rg(0:), ix
+      integer :: lo, hi, mid
+      lo = 0; hi = np - 1
+      do while (lo < hi)
+        mid = (lo + hi + 1) / 2
+        if (rg(mid) <= ix) then
+          lo = mid
+        else
+          hi = mid - 1
+        endif
+      enddo
+      owner = lo
+    end function owner
+
+  end subroutine pack_pair_aij
+
   subroutine build_pair_psi_prod(comm, first_time, my_id)
     use phys_module, only: physics_pc_pair_scale, physics_pc_psi_schur
 
@@ -8274,27 +8526,18 @@ contains
     logical, intent(in) :: first_time
     integer, intent(in) :: my_id
 
-    Mat            :: mats_nest(4), PJ_nest
     PetscErrorCode :: ierr
     PetscInt       :: n1_loc, n2_loc, n1_glo, n2_glo
 
     call schur_mixed_require_serial(comm, my_id, "physics_pc_schur_variant = 'SFM'")
 
-    ! Row-major (PETSc Fortran MatCreateNest convention, see assemble_monolithic_4x4).
     ! Row 1 (psi eq):  B_11  B_13
-    mats_nest(1) = g_ctx%B_11
-    mats_nest(2) = g_ctx%B_13
     ! Row 2 (j eq):    B_31  B_33   -- verbatim, no sign flip: the constraint is
     !                                  assembled as B_31 psi + B_33 j = r_j.
-    mats_nest(3) = g_ctx%B_31
-    mats_nest(4) = g_ctx%B_33
-
-    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats_nest, PJ_nest, ierr))
-
+    ! Packed in place (the MatNest -> MPIAIJ layout); K_pj_aij keeps its
+    ! identity and pattern across rebuilds.
     call PetscLogEventBegin(pcev_convert, ierr)
-    if (g_ctx%schur_mixed_ready) call MatDestroy(g_ctx%K_pj_aij, ierr)
-    call MatConvert(PJ_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%K_pj_aij, ierr)
-    call MatDestroy(PJ_nest, ierr)
+    call pack_pair_aij(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%B_33, g_ctx%K_pj_aij, kpj_packed, comm)
     call PetscLogEventEnd(pcev_convert, ierr)
 
     ! Layout-only strides into the packed vector. Unused by the direct arm; a
@@ -8430,7 +8673,6 @@ contains
     end block
 
     !--- Shat = B_11 - diag(r) B_31
-    if (psc_ready) call MatDestroy(psc_Shat, ierr)
     call MatDuplicate(g_ctx%B_31, MAT_COPY_VALUES, T31, ierr)
     call MatDiagonalScale(T31, d13, PETSC_NULL_VEC, ierr)
     ! How far Shat is from mass-dominated: |diag(diag(r) B_31)| / |diag(B_11)|
@@ -8468,8 +8710,19 @@ contains
         "[Physics PC]   pair_psi Shat resistive/B_11 diagonal ratio: mean ", rsum / max(nr_, 1), &
         ", max ", rmax
     end block
-    call MatDuplicate(g_ctx%B_11, MAT_COPY_VALUES, psc_Shat, ierr)
-    call MatAXPY(psc_Shat, -1.0d0, T31, DIFFERENT_NONZERO_PATTERN, ierr)
+    ! psc_Shat lives for the run: the first build fixes the union pattern of
+    ! B_11 and B_31, later builds refill it in place (0 + 1.0*B_11 = B_11
+    ! exactly, then the same y + a*x as the DIFFERENT_NONZERO_PATTERN MatAXPY),
+    ! so the GMG sees the same Mat and reuses its PtAP symbolic phase.
+    if (psc_ready) then
+      call MatZeroEntries(psc_Shat, ierr)
+      call MatAXPY(psc_Shat, 1.0d0, g_ctx%B_11, SUBSET_NONZERO_PATTERN, ierr)
+      call MatAXPY(psc_Shat, -1.0d0, T31, SUBSET_NONZERO_PATTERN, ierr)
+    else
+      call MatDuplicate(g_ctx%B_11, MAT_COPY_VALUES, psc_Shat, ierr)
+      call MatAXPY(psc_Shat, -1.0d0, T31, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatSetOption(psc_Shat, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)   ! frozen
+    endif
     call MatDestroy(T31, ierr)
     call VecDestroy(d13, ierr)
     call VecDestroy(d33, ierr)
@@ -8484,6 +8737,8 @@ contains
       call VecDuplicate(psc_zpsi, psc_t, ierr)
       call VecDuplicate(psc_zpsi, psc_zj, ierr)
       call VecDuplicate(psc_zpsi, psc_dinv, ierr)
+      call VecDuplicate(psc_zpsi, psc_rp, ierr)
+      call VecDuplicate(psc_zpsi, psc_rj, ierr)
       ! Axis patch rows (mode 2 only): every DOF of every axis node, all
       ! harmonics. Geometry only, so built once. Shared axis DOFs
       ! (force_central_node) appear once. Each rank lists only the rows it
@@ -8661,17 +8916,15 @@ contains
     PC  :: pc
     Vec :: rvec, zvec
     PetscErrorCode :: ierr
-    Vec :: rp, rj, zp, zj
+    Vec :: rp, rj
 
     call PetscLogEventBegin(pcev_psipc, ierr)
-    call VecGetSubVector(rvec, g_ctx%is_pair_psi(2), rj, ierr)
+    rp = psc_rp; rj = psc_rj
+    call pack_halves(rvec, rp, rj, .false., .false.)             ! (r_psi, r_j)
     call KSPSolve(g_ctx%ksp_Mj, rj, psc_zj, ierr)                ! z_j = B_33^-1 r_j
-    call VecRestoreSubVector(rvec, g_ctx%is_pair_psi(2), rj, ierr)
 
     call MatMult(g_ctx%B_13, psc_zj, psc_t, ierr)
-    call VecGetSubVector(rvec, g_ctx%is_pair_psi(1), rp, ierr)
     call VecAYPX(psc_t, -1.0d0, rp, ierr)                        ! t = r_psi - B_13 z_j
-    call VecRestoreSubVector(rvec, g_ctx%is_pair_psi(1), rp, ierr)
 
     if (psc_mode == 1) then
       call KSPSolve(psc_kspS, psc_t, psc_zpsi, ierr)
@@ -8684,12 +8937,7 @@ contains
       call psc_jacobi_sweeps()
     endif
 
-    call VecGetSubVector(zvec, g_ctx%is_pair_psi(1), zp, ierr)
-    call VecCopy(psc_zpsi, zp, ierr)
-    call VecRestoreSubVector(zvec, g_ctx%is_pair_psi(1), zp, ierr)
-    call VecGetSubVector(zvec, g_ctx%is_pair_psi(2), zj, ierr)
-    call VecCopy(psc_zj, zj, ierr)
-    call VecRestoreSubVector(zvec, g_ctx%is_pair_psi(2), zj, ierr)
+    call pack_halves(zvec, psc_zpsi, psc_zj, .true., .false.)    ! z = [z_psi; z_j]
     call PetscLogEventEnd(pcev_psipc, ierr)
 
   contains
@@ -8762,6 +9010,8 @@ contains
       call MatCreateVecs(g_ctx%B_22, PETSC_NULL_VEC, shw_t, ierr)     ! u space
       call ISCreateStride(comm, n1, rs, 1, shw_isu, ierr)
       call ISCreateStride(comm, n2 - n1, rs + n1, 1, shw_isw, ierr)
+      call MatCreateVecs(g_ctx%B_22, shw_xu, shw_yu, ierr)
+      call MatCreateVecs(g_ctx%B_44, shw_xw, shw_yw, ierr)
       shw_ready = .true.
     endif
 
@@ -8788,12 +9038,10 @@ contains
     Vec :: xu, xw, yu, yw
 
     call PetscLogEventBegin(pcev_shellmult, ierr)
-    call VecCopy(x, shw_xs, ierr)
-    if (g_ctx%pscale_w_ready) call VecPointwiseMult(shw_xs, shw_xs, g_ctx%pscale_w, ierr)
-    call VecGetSubVector(shw_xs, shw_isu, xu, ierr)
-    call VecGetSubVector(shw_xs, shw_isw, xw, ierr)
-    call VecGetSubVector(y, shw_isu, yu, ierr)
-    call VecGetSubVector(y, shw_isw, yw, ierr)
+    ! (xu, xw) = the rank's [u local | omega local] halves of Ds x. A local
+    ! copy: VecGetSubVector cost two global reductions per call at np > 1.
+    xu = shw_xu; xw = shw_xw; yu = shw_yu; yw = shw_yw
+    call pack_halves(x, xu, xw, .false., g_ctx%pscale_w_ready)
 
     call MatMult(g_ctx%B_12, xu, shw_p1, ierr)                     ! p = Dh B_12 x_u
     call VecPointwiseMult(shw_p1, shw_p1, shw_d, ierr)
@@ -8813,14 +9061,63 @@ contains
     call MatMult(g_ctx%B_42, xu, yw, ierr)
     call MatMultAdd(g_ctx%B_44, xw, yw, yw, ierr)
 
-    call VecRestoreSubVector(shw_xs, shw_isu, xu, ierr)
-    call VecRestoreSubVector(shw_xs, shw_isw, xw, ierr)
-    call VecRestoreSubVector(y, shw_isu, yu, ierr)
-    call VecRestoreSubVector(y, shw_isw, yw, ierr)
-    if (g_ctx%pscale_w_ready) call VecPointwiseMult(y, y, g_ctx%pscale_w, ierr)
+    call pack_halves(y, yu, yw, .true., g_ctx%pscale_w_ready)      ! y = Ds [yu; yw]
     call PetscLogEventEnd(pcev_shellmult, ierr)
     ierr = 0
   end subroutine shw_mult
+
+  !> Split a packed pair vector p (the rank's [field-1 local | field-2 local],
+  !! the Nest->AIJ layout) into its halves (to_p = .false.) or pack them back
+  !! (to_p = .true.). scaled: multiply by the pair_w block scaling Ds -- the
+  !! same products as VecPointwiseMult on p. Rank-local; replaces
+  !! VecGetSubVector, which cost two global reductions per call at np > 1.
+  subroutine pack_halves(p, h1, h2, to_p, scaled)
+    Vec :: p, h1, h2
+    logical, intent(in) :: to_p, scaled
+    PetscScalar, pointer :: pa(:), a1(:), a2(:), da(:)
+    PetscErrorCode :: ierr
+    PetscInt :: n1, n2
+    integer :: i
+    call VecGetLocalSize(h1, n1, ierr)
+    call VecGetLocalSize(h2, n2, ierr)
+    if (to_p) then
+      call VecGetArray(p, pa, ierr)
+      call VecGetArrayRead(h1, a1, ierr)
+      call VecGetArrayRead(h2, a2, ierr)
+      pa(1:n1) = a1(1:n1)
+      pa(n1 + 1:n1 + n2) = a2(1:n2)
+      call VecRestoreArrayRead(h1, a1, ierr)
+      call VecRestoreArrayRead(h2, a2, ierr)
+      if (scaled) then
+        call VecGetArrayRead(g_ctx%pscale_w, da, ierr)
+        do i = 1, int(n1 + n2)
+          pa(i) = pa(i) * da(i)
+        enddo
+        call VecRestoreArrayRead(g_ctx%pscale_w, da, ierr)
+      endif
+      call VecRestoreArray(p, pa, ierr)
+    else
+      call VecGetArrayRead(p, pa, ierr)
+      call VecGetArray(h1, a1, ierr)
+      call VecGetArray(h2, a2, ierr)
+      if (scaled) then
+        call VecGetArrayRead(g_ctx%pscale_w, da, ierr)
+        do i = 1, int(n1)
+          a1(i) = pa(i) * da(i)
+        enddo
+        do i = 1, int(n2)
+          a2(i) = pa(n1 + i) * da(n1 + i)
+        enddo
+        call VecRestoreArrayRead(g_ctx%pscale_w, da, ierr)
+      else
+        a1(1:n1) = pa(1:n1)
+        a2(1:n2) = pa(n1 + 1:n1 + n2)
+      endif
+      call VecRestoreArray(h1, a1, ierr)
+      call VecRestoreArray(h2, a2, ierr)
+      call VecRestoreArrayRead(p, pa, ierr)
+    endif
+  end subroutine pack_halves
 
   !> Reference arm without multigrid (physics_pc_w_gmg = 0, pair_inner = 0):
   !! FGMRES on the shell, preconditioned by the existing LU of S_W_aij, to
@@ -8845,8 +9142,8 @@ contains
   !--------------------------------------------------------------------
   !> Workstream C: pair_w by geometric multigrid on the exact nested C1
   !! coarse space (mod_petsc_pc_gmg). The prolongations are built once per
-  !! run; the Galerkin chain and smoothers are rebuilt here at every PC rebuild
-  !! because S_W_aij is a new Mat each time.
+  !! run; the Galerkin chain values and smoothers are rebuilt here at every PC
+  !! rebuild, since S_W_aij gets new values (same Mat, same pattern).
   !!
   !! physics_pc_w_gmg = 1: PREONLY -- ONE V-cycle per pair_w solve. Offline
   !!   every configuration reached the rtol-1e-1 inexact bar in one cycle.
@@ -9048,7 +9345,9 @@ contains
     character(len=*), intent(in)  :: label   !< "SFM" or "SFM2"
     logical, intent(out)          :: ok
 
-    Mat            :: S_uu, D_uu_diff, mats_nest(4), W_nest
+    Mat            :: S_uu, D_uu_diff
+    logical        :: suu_keep
+    MatStructure   :: suu_str
     PetscErrorCode :: ierr
     MatInfo        :: minfo
     real*8         :: opz, nzS, nzD, fnorm, dmin, dmax
@@ -9111,7 +9410,22 @@ contains
     paired = (trim(label) == "SFM2")
 
     !--- (1,1) entry: S_uu. NOTE B_22 -- the raw u diagonal (see header).
-    call MatDuplicate(g_ctx%B_22, MAT_COPY_VALUES, S_uu, ierr)
+    ! When every channel product is cached (fixed patterns), S_uu is kept for
+    ! the run with the union pattern of its first build and refilled in place:
+    ! 0 + 1.0*B_22 is B_22 exactly and the channel terms are the same y + a*x
+    ! as the DIFFERENT_NONZERO_PATTERN MatAXPY, which allocated a new matrix
+    ! every rebuild. suu_str is the MatAXPY structure flag of the channels.
+    suu_keep = (.not. paired .or. physics_pc_schur_pairinv == 2 .or. physics_pc_schur_pairinv == 3) &
+               .and. physics_pc_suu_ring == 0
+    if (suu_keep .and. sfp_suu_ready) then
+      S_uu = sfp_Suu
+      call MatZeroEntries(S_uu, ierr)
+      call MatAXPY(S_uu, 1.0d0, g_ctx%B_22, SUBSET_NONZERO_PATTERN, ierr)
+      suu_str = SUBSET_NONZERO_PATTERN
+    else
+      call MatDuplicate(g_ctx%B_22, MAT_COPY_VALUES, S_uu, ierr)
+      suu_str = DIFFERENT_NONZERO_PATTERN
+    endif
 
     if (.not. paired) then
       !--- "SFM": M_y^-1 -> a fully block-DIAGONAL Riesz map. Measured and
@@ -9237,7 +9551,7 @@ contains
         call VecDestroy(dscale, ierr)
         call mat_product_cached(sfp_Ltil, g_ctx%B_12, sfp_ch_Tp(1), sfp_nnz_chT(1), &
                                 "psi channel Ltil*B_12", comm, my_id)
-        call MatAXPY(S_uu, -1.0d0, sfp_ch_Tp(1), DIFFERENT_NONZERO_PATTERN, ierr)
+        call MatAXPY(S_uu, -1.0d0, sfp_ch_Tp(1), suu_str, ierr)
         call PetscLogEventEnd(pcev_channel, ierr)
         if (first_time) call physics_pc_mem("SFM2: channel Ltil*B_12 and S_uu", my_id)
       else
@@ -9256,20 +9570,11 @@ contains
     ! Workstream D: restrict S_uu to the ring-k node stencil (off by default).
     if (physics_pc_suu_ring > 0) call mask_suu_ring(S_uu, comm, my_id)
 
-    !--- Pack into the 2x2 (u,omega) nest and convert to a concrete AIJ.
+    !--- Pack the 2x2 (u,omega) pair into one AIJ, in place (pack_pair_aij).
     ! Row 1 (u eq):     S_uu  B_24
-    mats_nest(1) = S_uu
-    mats_nest(2) = g_ctx%B_24
     ! Row 2 (omega eq): B_42  B_44   -- verbatim, no sign flip (constraint row 4).
-    mats_nest(3) = g_ctx%B_42
-    mats_nest(4) = g_ctx%B_44
-
-    PetscCallA(MatCreateNest(comm, 2, PETSC_NULL_IS_ARRAY, 2, PETSC_NULL_IS_ARRAY, mats_nest, W_nest, ierr))
-
     call PetscLogEventBegin(pcev_convert, ierr)
-    if (g_ctx%schur_mixed_ready) call MatDestroy(g_ctx%S_W_aij, ierr)
-    call MatConvert(W_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%S_W_aij, ierr)
-    call MatDestroy(W_nest, ierr)
+    call pack_pair_aij(S_uu, g_ctx%B_24, g_ctx%B_42, g_ctx%B_44, g_ctx%S_W_aij, sw_packed, comm)
     call PetscLogEventEnd(pcev_convert, ierr)
     if (first_time) call physics_pc_mem("SFM2: S_W packed (S_uu still alive)", my_id)
 
@@ -9362,7 +9667,13 @@ contains
     ! dumped pairs are the unscaled operators.
     if (physics_pc_dump_blocks /= 0) call dump_sfm2_blocks(S_uu, comm, my_id)
 
-    call MatDestroy(S_uu, ierr)   ! safe: MatConvert copied the values out
+    if (suu_keep) then
+      sfp_Suu = S_uu               ! kept: next rebuild refills it in place
+      if (.not. sfp_suu_ready) call MatSetOption(sfp_Suu, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
+      sfp_suu_ready = .true.
+    else
+      call MatDestroy(S_uu, ierr)   ! safe: pack_pair_aij copied the values out
+    endif
 
     !--- Step 2: block scaling LAST, so every diagnostic above still reports the
     !--- UNSCALED operator and stays comparable with the recorded runs. The
@@ -9476,7 +9787,7 @@ contains
                                 "channel L*Qi ", comm, my_id)
         call mat_product_cached(sfp_ch_Lsc(slot), U, sfp_ch_Tp(slot), sfp_nnz_chT(slot), &
                                 "channel (L*Qi)*U", comm, my_id)
-        call MatAXPY(S_uu, -alpha, sfp_ch_Tp(slot), DIFFERENT_NONZERO_PATTERN, ierr)
+        call MatAXPY(S_uu, -alpha, sfp_ch_Tp(slot), suu_str, ierr)
       endif
       call PetscLogEventEnd(pcev_channel, ierr)
     end subroutine add_channel

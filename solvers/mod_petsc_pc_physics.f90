@@ -8,7 +8,7 @@ module mod_petsc_pc_physics
        pcev_extract, pcev_build_suu, pcev_fact_pj, pcev_fact_w, pcev_fact_rhot, &
        physics_pc_mem
   use mod_petsc_pc_physics_construction, only: &
-       create_variable_index_sets, extract_sub_block, extract_sub_block_h, &
+       create_variable_index_sets, extract_sub_block, extract_sub_block_h, extract_sub_blocks_h, &
        compute_schur_corrected_block_psi, &
        compute_schur_corrected_block_u, compute_schur_corrected_block_21, &
        compute_schur_corrected_block_61, compute_schur_corrected_block_exact, &
@@ -104,7 +104,7 @@ contains
                            physics_pc_schur_amg, physics_pc_schur_amg_its, &
                            physics_pc_schur_variant, physics_pc_verify_mixed, &
                            physics_pc_pair_inner, physics_pc_psi_schur, physics_pc_w_gmg, physics_pc_rhot_gmg, &
-                           physics_pc_suu_shell
+                           physics_pc_suu_shell, physics_pc_lean_setup
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate, &
                                          petsc_mat_diff_norm
 
@@ -162,11 +162,15 @@ contains
     ! once called on rank 0 only, which printed a garbage norm at np > 1 (the
     ! 2026-08-19 "partition-dependent A" reading) and let the stray Allreduce
     ! collide with the next collective on the other ranks.
-    block
-      PetscReal :: afn
-      call MatNorm(A_full, NORM_FROBENIUS, afn, ierr)
-      if (my_id == 0) write(*,'(A,ES16.9)') "[Physics PC]   operand(A_full): ||A||_F = ", afn
-    end block
+    ! A full pass over the Jacobian plus a reduction: the lean setup does it on
+    ! the first build only, like the other per-rebuild diagnostics (audit A2).
+    if (first_time .or. physics_pc_lean_setup == 0) then
+      block
+        PetscReal :: afn
+        call MatNorm(A_full, NORM_FROBENIUS, afn, ierr)
+        if (my_id == 0) write(*,'(A,ES16.9)') "[Physics PC]   operand(A_full): ||A||_F = ", afn
+      end block
+    endif
 
     call physics_pc_mem("PC build: entry", my_id)
     ! --- Step 1: Create index sets (first time only) ---
@@ -177,36 +181,38 @@ contains
 
     ! --- Extract sub-blocks from full system ---
     call PetscLogEventBegin(pcev_extract, ierr)
-    ! Diagonal blocks of the constraint equations
-    call extract_sub_block_h(A_full, var_zj, var_zj, g_ctx%B_33, first_time)
-    call extract_sub_block_h(A_full, var_w,  var_w,  g_ctx%B_44, first_time)
-
-    ! Constraint operator blocks (always needed for back-sub and Schur correction)
-    call extract_sub_block_h(A_full, var_zj,  var_psi, g_ctx%B_31, first_time)
-    call extract_sub_block_h(A_full, var_w,   var_u,   g_ctx%B_42, first_time)
-
-    ! Coupling blocks TO j,w (always needed for RHS correction)
-    call extract_sub_block_h(A_full, var_psi, var_zj, g_ctx%B_13, first_time)
-    call extract_sub_block_h(A_full, var_u,   var_zj, g_ctx%B_23, first_time)
-    call extract_sub_block_h(A_full, var_u,   var_w,  g_ctx%B_24, first_time)
-    call extract_sub_block_h(A_full, var_T,   var_zj, g_ctx%B_63, first_time)
-
-    ! Diagonal blocks of the 4x4 system (only extract if not reassembling)
-    call extract_sub_block_h(A_full, var_psi, var_psi, g_ctx%B_11, first_time)
-    call extract_sub_block_h(A_full, var_u,   var_u,   g_ctx%B_22, first_time)
-    call extract_sub_block_h(A_full, var_rho, var_rho, g_ctx%B_55, first_time)
-    call extract_sub_block_h(A_full, var_T,   var_T,   g_ctx%B_66, first_time)
-
-    ! Off-diagonal blocks of the 4x4 system (always needed for coupled mode)
-    call extract_sub_block_h(A_full, var_psi, var_u,   g_ctx%B_12, first_time)
-    call extract_sub_block_h(A_full, var_psi, var_T,   g_ctx%B_16, first_time)
-    call extract_sub_block_h(A_full, var_u,   var_psi, g_ctx%B_21, first_time)
-    call extract_sub_block_h(A_full, var_u,   var_rho, g_ctx%B_25, first_time)
-    call extract_sub_block_h(A_full, var_u,   var_T,   g_ctx%B_26, first_time)
-    call extract_sub_block_h(A_full, var_rho, var_psi, g_ctx%B_51, first_time)
-    call extract_sub_block_h(A_full, var_rho, var_u,   g_ctx%B_52, first_time)
-    call extract_sub_block_h(A_full, var_T,   var_psi, g_ctx%B_61, first_time)
-    call extract_sub_block_h(A_full, var_T,   var_u,   g_ctx%B_62, first_time)
+    ! All 21 blocks in one pass over A_full (extract_sub_blocks_h):
+    !   constraint diagonals B_33, B_44 and operators B_31, B_42;
+    !   couplings to j, w: B_13, B_23, B_24, B_63;
+    !   4x4 diagonals B_11, B_22, B_55, B_66;
+    !   4x4 off-diagonals B_12, B_16, B_21, B_25, B_26, B_51, B_52, B_61, B_62.
+    block
+      integer, parameter :: NBLK = 21
+      integer :: eqs(NBLK), vrs(NBLK)
+      Mat :: M(NBLK)
+      eqs = [var_zj, var_w, var_zj, var_w, &
+             var_psi, var_u, var_u, var_T, &
+             var_psi, var_u, var_rho, var_T, &
+             var_psi, var_psi, var_u, var_u, var_u, var_rho, var_rho, var_T, var_T]
+      vrs = [var_zj, var_w, var_psi, var_u, &
+             var_zj, var_zj, var_w, var_zj, &
+             var_psi, var_u, var_rho, var_T, &
+             var_u, var_T, var_psi, var_rho, var_T, var_psi, var_u, var_psi, var_u]
+      if (.not. first_time) then
+        M = [g_ctx%B_33, g_ctx%B_44, g_ctx%B_31, g_ctx%B_42, &
+             g_ctx%B_13, g_ctx%B_23, g_ctx%B_24, g_ctx%B_63, &
+             g_ctx%B_11, g_ctx%B_22, g_ctx%B_55, g_ctx%B_66, &
+             g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_25, g_ctx%B_26, &
+             g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62]
+      endif
+      call extract_sub_blocks_h(A_full, eqs, vrs, M, first_time)
+      g_ctx%B_33 = M(1);  g_ctx%B_44 = M(2);  g_ctx%B_31 = M(3);  g_ctx%B_42 = M(4)
+      g_ctx%B_13 = M(5);  g_ctx%B_23 = M(6);  g_ctx%B_24 = M(7);  g_ctx%B_63 = M(8)
+      g_ctx%B_11 = M(9);  g_ctx%B_22 = M(10); g_ctx%B_55 = M(11); g_ctx%B_66 = M(12)
+      g_ctx%B_12 = M(13); g_ctx%B_16 = M(14); g_ctx%B_21 = M(15); g_ctx%B_25 = M(16)
+      g_ctx%B_26 = M(17); g_ctx%B_51 = M(18); g_ctx%B_52 = M(19); g_ctx%B_61 = M(20)
+      g_ctx%B_62 = M(21)
+    end block
     call PetscLogEventEnd(pcev_extract, ierr)
     call physics_pc_mem("PC build: 21 blocks extracted", my_id)
 
@@ -538,8 +544,8 @@ contains
           endif
           call PetscLogEventEnd(pcev_fact_w, ierr)
           call physics_pc_mem("PC build: pair_w solver set up", my_id)
-          ! Packed work vectors: the Mat handles are rebuilt every step but their
-          ! SIZES never change, so these are created exactly once.
+          ! Packed work vectors: the pair Mats keep their layout for the run,
+          ! so these are created exactly once.
           !
           ! Where physics_pc_schur_inner would hook in later: swap the two
           ! setup_block_ksp calls for setup_schur_inner_ksp. Note that its AMG
