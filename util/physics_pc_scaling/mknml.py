@@ -35,6 +35,12 @@ SFM2_COMMON = {
     'physics_pc_lean_setup': '3',
     'physics_pc_mass_split': '1',
     'physics_pc_pair_rtol': '1.d-1',
+    # PC reuse: JOREK rebuilds when its_n + its_{n-1} > 2*iter_precon. The
+    # base namelists' 22 suits the direct-solver default PC (1-5 its); SFM2
+    # needs ~40-50 at tstep 10 and would rebuild every step, although reusing
+    # the PC within a tstep block left every iteration count unchanged
+    # (81x32, np 4: 2 rebuilds instead of 4). A tstep change still rebuilds.
+    'iter_precon': '60',
 }
 
 ARMS = {

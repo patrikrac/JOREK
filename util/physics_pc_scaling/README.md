@@ -103,8 +103,11 @@ of the large cases.
   - `PhysPC_MjSolve`: the exact-mass MUMPS solve inside every matrix-free
     pair_w matvec. **This is the component that stopped scaling on the
     8-core laptop.**
-  - `GMG_Coarse`: the coarsest-level MUMPS solve. Try
-    `-gmg1_coarse_pc_type redundant` if it grows with np.
+  - `GMG_Coarse`, `GMG_AxSolve`: the coarsest level and the axis blocks. Both
+    are exact LUs solved redundantly on the few ranks that own their rows
+    (rank 0 for the axis), so they involve no collective over all ranks. A
+    growing `GMG_AxSolve` shows the extra work that rank 0 carries.
+  - `GMG_Lines`: the radial-line block solves of the smoother (OpenMP).
 - `mem_max_total_GB` / `mem_max_rank_GB`: `-memory_view` peak RSS, summed over
   ranks / largest rank.
 
@@ -122,11 +125,12 @@ of the large cases.
 - **Threads.** `OMP_NUM_THREADS`, `MKL_NUM_THREADS` and `OPENBLAS_NUM_THREADS`
   are set to `PCS_OMP`, with `OMP_PLACES=cores` and `OMP_PROC_BIND=close`
   unless already set.
-  - What uses the threads: JOREK's matrix construction, and MUMPS through a
-    threaded BLAS.
-  - What doesn't: the physics PC has no OpenMP regions, and PETSc's sparse
-    kernels (MatMult, PtAP) run on one thread per rank. With 8 × 16 per node,
-    the GMG, the shell matvecs and the Krylov work use 8 of the 128 cores.
+  - What uses the threads: JOREK's matrix construction, MUMPS through a
+    threaded BLAS, and in the physics PC the GMG smoother's block solves
+    (`GMG_Lines`) and block factorisations.
+  - What doesn't: PETSc's sparse kernels (MatMult, PtAP, the Krylov vector
+    work) run on one thread per rank, and so do the shell matvecs. With 8 × 16
+    per node, those use 8 of the 128 cores.
   - Keep this in mind when comparing arms. The `t_*` event times show how
     much of each case runs single-threaded.
 
