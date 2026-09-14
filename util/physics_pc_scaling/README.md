@@ -16,9 +16,18 @@ preconditioner. The test case is the committed benchmark
 
 ## Build requirements
 
-- `jorek_model199` built with `n_tor = 3` and `n_period = 1` in
-  `models/mod_settings.f90`. These are compile-time settings: a wrong binary
-  runs the axisymmetric problem and still exits 0.
+- `jorek_model199` built with `n_tor = 3` in `models/mod_settings.f90`. These
+  settings are compile-time; the namelist cannot change them.
+- `n_period` decides which harmonics exist: 6 gives n = 0, 6 and 1 gives
+  n = 0, 1.
+  - All the local reference numbers, and the whole serial study, used the
+    committed `n_period = 6`.
+  - The 2/1 tearing physics of `intear_island_demo` needs `n_period = 1`.
+  - For the solver study either works, since the operator structure is the
+    same, but the toroidal couplings differ, so never mix the two in one
+    comparison.
+  - `collect.py` reads both values from each log into the `n_tor` and
+    `n_period` columns.
 - A PETSc build with MUMPS (`USE_PETSC`). Use the same compiler and MPI stack
   at run time as at build time.
 - Python 3 (standard library only).

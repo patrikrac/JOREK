@@ -19,7 +19,8 @@ EVENTS = [
     'GMG_VCycle', 'GMG_Smooth0', 'GMG_Coarse', 'GMG2_VCycle', 'GMG3_VCycle',
     'GMG4_VCycle', 'MatMult', 'KSPSolve',
 ]
-COLS = (['case', 'arm', 'n_flux', 'n_tht', 'np', 'omp', 'cores', 'nodes', 'status', 'ndof', 'wall_s',
+COLS = (['case', 'arm', 'n_flux', 'n_tht', 'np', 'omp', 'cores', 'nodes', 'n_tor', 'n_period',
+         'status', 'ndof', 'wall_s',
          'step_s_sum', 'setup_s_sum', 'solve_s_sum', 'outer_its', 'outer_sum',
          'pw_cycles_mean', 'pp_its_mean', 'rt_its_mean', 'mem_max_total_GB',
          'mem_max_rank_GB'] + ['t_' + e for e in EVENTS])
@@ -60,6 +61,10 @@ def parse_log(path, row):
     row['step_s_sum'] = tsum(r'Elapsed time ITERATION :')
     row['setup_s_sum'] = tsum(r'\[PETSc\] Elapsed time in solver setup :')
     row['solve_s_sum'] = tsum(r'\[PETSc\] Elapsed time in solve :')
+    # compile-time toroidal settings, from the log (the namelist cannot set them)
+    for k in ('n_tor', 'n_period'):
+        m = re.search(r'^\s*' + k + r'\s*=\s*(\d+)', txt, re.M)
+        row[k] = m.group(1) if m else ''
     m = re.search(r'create_matrix: BAIJ (\d+)x\d+', txt)
     row['ndof'] = m.group(1) if m else ''
     # -memory_view: "Maximum (over computational time) process memory: total X max Y min Z"
