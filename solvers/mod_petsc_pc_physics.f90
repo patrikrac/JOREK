@@ -5,16 +5,19 @@ module mod_petsc_pc_physics
   use petsc
   use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
        physics_pc_log_events_register, physics_pc_mixed_arm, &
-       pcev_extract, pcev_build_suu, pcev_fact_pj, pcev_fact_w, pcev_fact_rhot
+       pcev_extract, pcev_build_suu, pcev_fact_pj, pcev_fact_w, pcev_fact_rhot, &
+       physics_pc_mem
   use mod_petsc_pc_physics_construction, only: &
-       create_variable_index_sets, extract_sub_block, &
+       create_variable_index_sets, extract_sub_block, extract_sub_block_h, &
        compute_schur_corrected_block_psi, &
        compute_schur_corrected_block_u, compute_schur_corrected_block_21, &
        compute_schur_corrected_block_61, compute_schur_corrected_block_exact, &
        compute_explicit_preconditioned_matrix, &
        compute_full_momentum_schur_exact, &
        setup_S_PBP_diag_shell, materialize_S_PBP_diag_aij, &
-       setup_block_ksp, setup_constraint_mass_ksp, setup_pair_inner_ksp, &
+       setup_block_ksp, setup_constraint_mass_ksp, setup_pair_inner_ksp, setup_scalar_gmg_ksp, &
+       setup_psi_eta_schur_ksp, setup_pair_w_gmg_ksp, &
+       setup_pair_w_shell, pair_w_shell_wrap_lu, &
        build_schur_smallflow_prod, build_schur_commutator_prod, &
        build_pair_psi_prod, build_schur_mixed_prod, &
        setup_schur_inner_ksp, &
@@ -100,7 +103,8 @@ contains
                            physics_pc_schur_global, &
                            physics_pc_schur_amg, physics_pc_schur_amg_its, &
                            physics_pc_schur_variant, physics_pc_verify_mixed, &
-                           physics_pc_pair_inner
+                           physics_pc_pair_inner, physics_pc_psi_schur, physics_pc_w_gmg, physics_pc_rhot_gmg, &
+                           physics_pc_suu_shell
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate, &
                                          petsc_mat_diff_norm
 
@@ -149,20 +153,22 @@ contains
     ! Idempotent; the events must exist before the first push below.
     call physics_pc_log_events_register()
 
-    if (my_id == 0) then
-      write(*,'(A)') "[Physics PC] Building reduced 4x4 system (extracted blocks)..."
+    if (my_id == 0) write(*,'(A)') "[Physics PC] Building reduced 4x4 system (extracted blocks)..."
 
-      ! Parallel cross-check, upstream of every physics-PC operation: is the
-      ! GLOBAL matrix already partition-dependent? ||A||_F cannot depend on the
-      ! partition, so a mismatch here places the fault in JOREK's assembly
-      ! rather than in the block extraction below.
-      block
-        PetscReal :: afn
-        call MatNorm(A_full, NORM_FROBENIUS, afn, ierr)
-        if (my_id == 0) write(*,'(A,ES16.9)') "[Physics PC]   operand(A_full): ||A||_F = ", afn
-      end block
-    endif
+    ! Parallel cross-check, upstream of every physics-PC operation: is the
+    ! GLOBAL matrix already partition-dependent? ||A||_F cannot depend on the
+    ! partition, so a mismatch here places the fault in JOREK's assembly
+    ! rather than in the block extraction below. MatNorm is COLLECTIVE: it was
+    ! once called on rank 0 only, which printed a garbage norm at np > 1 (the
+    ! 2026-08-19 "partition-dependent A" reading) and let the stray Allreduce
+    ! collide with the next collective on the other ranks.
+    block
+      PetscReal :: afn
+      call MatNorm(A_full, NORM_FROBENIUS, afn, ierr)
+      if (my_id == 0) write(*,'(A,ES16.9)') "[Physics PC]   operand(A_full): ||A||_F = ", afn
+    end block
 
+    call physics_pc_mem("PC build: entry", my_id)
     ! --- Step 1: Create index sets (first time only) ---
     if (.not. g_ctx%is_created) then
       call create_variable_index_sets(A_full, comm)
@@ -172,36 +178,37 @@ contains
     ! --- Extract sub-blocks from full system ---
     call PetscLogEventBegin(pcev_extract, ierr)
     ! Diagonal blocks of the constraint equations
-    call extract_sub_block(A_full, var_zj, var_zj, g_ctx%B_33, first_time)
-    call extract_sub_block(A_full, var_w,  var_w,  g_ctx%B_44, first_time)
+    call extract_sub_block_h(A_full, var_zj, var_zj, g_ctx%B_33, first_time)
+    call extract_sub_block_h(A_full, var_w,  var_w,  g_ctx%B_44, first_time)
 
     ! Constraint operator blocks (always needed for back-sub and Schur correction)
-    call extract_sub_block(A_full, var_zj,  var_psi, g_ctx%B_31, first_time)
-    call extract_sub_block(A_full, var_w,   var_u,   g_ctx%B_42, first_time)
+    call extract_sub_block_h(A_full, var_zj,  var_psi, g_ctx%B_31, first_time)
+    call extract_sub_block_h(A_full, var_w,   var_u,   g_ctx%B_42, first_time)
 
     ! Coupling blocks TO j,w (always needed for RHS correction)
-    call extract_sub_block(A_full, var_psi, var_zj, g_ctx%B_13, first_time)
-    call extract_sub_block(A_full, var_u,   var_zj, g_ctx%B_23, first_time)
-    call extract_sub_block(A_full, var_u,   var_w,  g_ctx%B_24, first_time)
-    call extract_sub_block(A_full, var_T,   var_zj, g_ctx%B_63, first_time)
+    call extract_sub_block_h(A_full, var_psi, var_zj, g_ctx%B_13, first_time)
+    call extract_sub_block_h(A_full, var_u,   var_zj, g_ctx%B_23, first_time)
+    call extract_sub_block_h(A_full, var_u,   var_w,  g_ctx%B_24, first_time)
+    call extract_sub_block_h(A_full, var_T,   var_zj, g_ctx%B_63, first_time)
 
     ! Diagonal blocks of the 4x4 system (only extract if not reassembling)
-    call extract_sub_block(A_full, var_psi, var_psi, g_ctx%B_11, first_time)
-    call extract_sub_block(A_full, var_u,   var_u,   g_ctx%B_22, first_time)
-    call extract_sub_block(A_full, var_rho, var_rho, g_ctx%B_55, first_time)
-    call extract_sub_block(A_full, var_T,   var_T,   g_ctx%B_66, first_time)
+    call extract_sub_block_h(A_full, var_psi, var_psi, g_ctx%B_11, first_time)
+    call extract_sub_block_h(A_full, var_u,   var_u,   g_ctx%B_22, first_time)
+    call extract_sub_block_h(A_full, var_rho, var_rho, g_ctx%B_55, first_time)
+    call extract_sub_block_h(A_full, var_T,   var_T,   g_ctx%B_66, first_time)
 
     ! Off-diagonal blocks of the 4x4 system (always needed for coupled mode)
-    call extract_sub_block(A_full, var_psi, var_u,   g_ctx%B_12, first_time)
-    call extract_sub_block(A_full, var_psi, var_T,   g_ctx%B_16, first_time)
-    call extract_sub_block(A_full, var_u,   var_psi, g_ctx%B_21, first_time)
-    call extract_sub_block(A_full, var_u,   var_rho, g_ctx%B_25, first_time)
-    call extract_sub_block(A_full, var_u,   var_T,   g_ctx%B_26, first_time)
-    call extract_sub_block(A_full, var_rho, var_psi, g_ctx%B_51, first_time)
-    call extract_sub_block(A_full, var_rho, var_u,   g_ctx%B_52, first_time)
-    call extract_sub_block(A_full, var_T,   var_psi, g_ctx%B_61, first_time)
-    call extract_sub_block(A_full, var_T,   var_u,   g_ctx%B_62, first_time)
+    call extract_sub_block_h(A_full, var_psi, var_u,   g_ctx%B_12, first_time)
+    call extract_sub_block_h(A_full, var_psi, var_T,   g_ctx%B_16, first_time)
+    call extract_sub_block_h(A_full, var_u,   var_psi, g_ctx%B_21, first_time)
+    call extract_sub_block_h(A_full, var_u,   var_rho, g_ctx%B_25, first_time)
+    call extract_sub_block_h(A_full, var_u,   var_T,   g_ctx%B_26, first_time)
+    call extract_sub_block_h(A_full, var_rho, var_psi, g_ctx%B_51, first_time)
+    call extract_sub_block_h(A_full, var_rho, var_u,   g_ctx%B_52, first_time)
+    call extract_sub_block_h(A_full, var_T,   var_psi, g_ctx%B_61, first_time)
+    call extract_sub_block_h(A_full, var_T,   var_u,   g_ctx%B_62, first_time)
     call PetscLogEventEnd(pcev_extract, ierr)
+    call physics_pc_mem("PC build: 21 blocks extracted", my_id)
 
 
     if (my_id == 0) write(*,'(A)') "[Physics PC]   Sub-blocks extracted (21 blocks)"
@@ -294,9 +301,10 @@ contains
 
     ! --- Set up KSPs for elliptic constraint mass matrices ---
     ! (Must be done before Schur correction so MUMPS factorization is available)
-    call setup_constraint_mass_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time, "Mj constraint-mass KSP")
-    call setup_constraint_mass_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time, "Mw constraint-mass KSP")
+    call setup_constraint_mass_ksp(g_ctx%ksp_Mj, g_ctx%B_33, comm, first_time, "Mj constraint-mass KSP", 1)
+    call setup_constraint_mass_ksp(g_ctx%ksp_Mw, g_ctx%B_44, comm, first_time, "Mw constraint-mass KSP", 2)
     g_ctx%ksp_elliptic_created = .true.
+    call physics_pc_mem("PC build: Mj/Mw factored", my_id)
 
     ! --- Step 4b: Form Schur-corrected blocks (element-assembled corrections) ---
     ! Gated on the SAME predicate as the element assembly that produces the
@@ -424,9 +432,15 @@ contains
         if (.not. physics_pc_mixed_arm()) then
           call setup_block_ksp(g_ctx%ksp_psi, g_ctx%Atilde_11, comm, first_time, "psi predictor KSP (Atilde_11)")
         endif
-        call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time, "rho-block KSP")
-        call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time, "T-block KSP")
+        if (physics_pc_rhot_gmg > 0) then
+          call setup_scalar_gmg_ksp(g_ctx%ksp_rho, g_ctx%B_55, 3, comm, my_id, first_time, "rho-block KSP")
+          call setup_scalar_gmg_ksp(g_ctx%ksp_T,   g_ctx%B_66, 4, comm, my_id, first_time, "T-block KSP")
+        else
+          call setup_block_ksp(g_ctx%ksp_rho, g_ctx%B_55,      comm, first_time, "rho-block KSP")
+          call setup_block_ksp(g_ctx%ksp_T,   g_ctx%B_66,      comm, first_time, "T-block KSP")
+        endif
         call PetscLogEventEnd(pcev_fact_rhot, ierr)
+        call physics_pc_mem("PC build: rho/T factored", my_id)
         g_ctx%ksp_created = .true.
 
         ! --- Stage 6.2: the momentum Schur operator for the wave solve ---
@@ -462,9 +476,11 @@ contains
           ! no commutator blocks, no constraint mass folds in the apply.
           call PetscLogEventBegin(pcev_build_suu, ierr)
           call build_pair_psi_prod(comm, first_time, my_id)
+          call physics_pc_mem("PC build: pair_psi assembled", my_id)
           call build_schur_mixed_prod(comm, first_time, my_id, &
                                      physics_pc_schur_variant, schur_ok)
           call PetscLogEventEnd(pcev_build_suu, ierr)
+          call physics_pc_mem("PC build: S_uu / pair_w assembled", my_id)
           if (.not. schur_ok) then
             ! Deliberately NOT a fallback to another arm: silently running a
             ! different preconditioner than the one requested would mean
@@ -479,7 +495,11 @@ contains
           ! T1-T8 experiments (docs/physics_pc/workstream_B_smoother_design.md
           ! S12-S13). Admissible only because the global solver is FGMRES.
           call PetscLogEventBegin(pcev_fact_pj, ierr)
-          if (physics_pc_pair_inner == 0) then
+          if (physics_pc_psi_schur /= 0) then
+            ! Workstream C: eta-scaled j-first Schur shell; overrides
+            ! physics_pc_pair_inner for pair_psi only (see its header).
+            call setup_psi_eta_schur_ksp(comm, my_id)
+          else if (physics_pc_pair_inner == 0) then
             call setup_block_ksp(g_ctx%ksp_pair_psi, g_ctx%K_pj_aij, comm, first_time, &
                                  "pair_psi KSP ([B_11,B_13;B_31,B_33])")
           else
@@ -489,10 +509,25 @@ contains
                                  "pair_psi KSP ([B_11,B_13;B_31,B_33])")
           endif
           call PetscLogEventEnd(pcev_fact_pj, ierr)
+          call physics_pc_mem("PC build: pair_psi solver set up", my_id)
           call PetscLogEventBegin(pcev_fact_w, ierr)
-          if (physics_pc_pair_inner == 0) then
+          ! Workstream D: matrix-free fine pair_w operator (needs Dh from the build)
+          if (physics_pc_suu_shell /= 0) then
+            if (physics_pc_w_gmg == 0 .and. physics_pc_pair_inner /= 0) then
+              if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_suu_shell "// &
+                "needs physics_pc_w_gmg /= 0 or physics_pc_pair_inner = 0."
+              call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+            endif
+            call setup_pair_w_shell(comm, my_id)
+          endif
+          if (physics_pc_w_gmg /= 0) then
+            ! Workstream C: C1 geometric multigrid; overrides
+            ! physics_pc_pair_inner for pair_w only.
+            call setup_pair_w_gmg_ksp(comm, my_id)
+          else if (physics_pc_pair_inner == 0) then
             call setup_block_ksp(g_ctx%ksp_pair_w,   g_ctx%S_W_aij,  comm, first_time, &
                                  "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])")
+            if (physics_pc_suu_shell /= 0) call pair_w_shell_wrap_lu(comm)
           else
             ! pair_w does not need the pair structure: plain GMRES+ILU(0) beat
             ! every AMG variant on it (S11.1), so modes 2 and 3 use that.
@@ -502,6 +537,7 @@ contains
                                  "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])")
           endif
           call PetscLogEventEnd(pcev_fact_w, ierr)
+          call physics_pc_mem("PC build: pair_w solver set up", my_id)
           ! Packed work vectors: the Mat handles are rebuilt every step but their
           ! SIZES never change, so these are created exactly once.
           !

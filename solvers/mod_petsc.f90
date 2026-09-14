@@ -38,7 +38,32 @@ contains
     call PetscInitialize(PETSC_NULL_CHARACTER, ierr)
     if (ierr /= 0) print *, "Error initializing PETSc"
 #endif
+    call petsc_default_mumps_central_rhs()
   end subroutine
+
+
+  !> Default every MUMPS factor to a centralized dense RHS (ICNTL(20) = 0).
+  !! In parallel PETSc defaults to the distributed-RHS path (10), which reads out
+  !! of bounds and corrupts the heap on our builds (np > 1 bus error even with
+  !! JOREK's default PC). PETSc reads this value only from the options database
+  !! at the symbolic factorisation, so MatMumpsSetIcntl cannot set it. Covers the
+  !! un-prefixed factors and the fieldsplit sub-solvers; a value given by the
+  !! user (command line, PETSC_OPTIONS) is left alone.
+  subroutine petsc_default_mumps_central_rhs()
+    PetscErrorCode :: ierr
+    PetscBool      :: has
+    character(len=64) :: nm
+    integer :: k
+    do k = -1, 7
+      if (k < 0) then
+        nm = "-mat_mumps_icntl_20"
+      else
+        write(nm, '(A,I0,A)') "-fieldsplit_", k, "_mat_mumps_icntl_20"
+      endif
+      call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), has, ierr)
+      if (.not. has) call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(nm), "0", ierr)
+    enddo
+  end subroutine petsc_default_mumps_central_rhs
 
 
   subroutine petsc_finalize()
@@ -350,9 +375,11 @@ contains
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
-    use phys_module, only: use_physics_pc, commutator_analysis
+    use phys_module, only: use_physics_pc, commutator_analysis, physics_pc_lean_setup, &
+                           physics_pc_harm_split
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
     use mod_petsc_pc_commutator_analysis, only: petsc_commutator_run_analysis
+    use mod_petsc_pc_physics_ctx, only: physics_pc_report_inner, physics_pc_mem
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -368,8 +395,17 @@ contains
     PetscInt :: its
     PetscReal :: petsc_norm
     PetscViewerAndFormat :: vf
+    logical :: no_aij
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
+    ! Memory audit (physics_pc_lean_setup >= 3): the physics PC reads its blocks
+    ! row by row (extract_sub_block_h) and FGMRES only needs matvecs, so both work
+    ! on JOREK's own BAIJ matrix and the AIJ copy (a second full Jacobian, 1.4 GB
+    ! at 81x32) is never made. A_aij then ALIASES A, which JOREK creates once and
+    ! refills in place every step; the extra reference keeps petsc_cleanup's
+    ! MatDestroy(A_aij) balanced.
+    no_aij = use_physics_pc .and. physics_pc_lean_setup >= 3 .and. &
+             physics_pc_harm_split /= 0 .and. .not. commutator_analysis
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
     if (.not. petsc_sys%ksp_ready) then
@@ -379,7 +415,15 @@ contains
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
       PetscCallA(PetscTime(ts1, ierr))
 
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
+      call physics_pc_mem("solver: before AIJ copy (JOREK assembled)", my_id)
+      if (no_aij) then
+        PetscCallA(PetscObjectReference(petsc_sys%A, ierr))
+        petsc_sys%A_aij = petsc_sys%A
+        if (my_id == 0) write(*,*) "[PETSc] setup: no AIJ copy, KSP and physics PC use the BAIJ matrix"
+      else
+        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
+      endif
+      call physics_pc_mem("solver: after AIJ copy", my_id)
       PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
 
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
@@ -413,6 +457,7 @@ contains
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       petsc_sys%ksp_ready = .true.
+      call physics_pc_mem("solver: setup done", my_id)
 
       PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
@@ -423,12 +468,15 @@ contains
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
       PetscCallA(PetscTime(ts1, ierr))
 
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      if (.not. no_aij) then
+        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      endif
       if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
       if (commutator_analysis)   call petsc_commutator_run_analysis(petsc_sys%A_aij, my_id)
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+      call physics_pc_mem("solver: rebuild done", my_id)
 
       PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
@@ -438,7 +486,9 @@ contains
       ! solve_only: update A for mat-vec products but reuse PC factorization
       if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
       if (commutator_analysis)   call petsc_commutator_run_analysis(petsc_sys%A_aij, my_id)
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      if (.not. no_aij) then
+        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+      endif
       PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
     end if
@@ -454,6 +504,7 @@ contains
     PetscCallA(PetscTime(t2, ierr))
 
     PetscCallA(VecCopy(petsc_sys%x_aij, petsc_sys%x, ierr))
+    call physics_pc_mem("solver: solve done", my_id)
 
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
@@ -467,6 +518,7 @@ contains
     ! reported, so a run's cost could only be read off the wall time.
     if (my_id == 0) write(*,'(A,I5,A,I0)') &
       "[PETSc] outer iterations: ", n_iter, "   converged reason: ", reason%v
+    if (use_physics_pc) call physics_pc_report_inner(my_id)
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))

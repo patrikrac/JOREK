@@ -4,7 +4,8 @@ module mod_petsc_pc_physics_construction
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
-       pcev_massinv, pcev_shat, pcev_channel, pcev_convert, pcev_builddiag
+       pcev_massinv, pcev_shat, pcev_channel, pcev_convert, pcev_builddiag, &
+       pcev_shellmult, pcev_mjsolve, physics_pc_mumps_mem, physics_pc_mem, pcev_psipc
   use mod_petsc_pc_toroidal, only: petsc_setup_toroidal_harmonic_pc_blocked
   use mod_petsc_pc_physics_apply, only: k_a_exact_mult, s_pbp_diag_mult, physics_pc_apply, &
                                         pack_2v, unpack_2v
@@ -62,8 +63,46 @@ module mod_petsc_pc_physics_construction
   integer(kind=8), save :: sfp_nnz_chL(3) = -1, sfp_nnz_chT(3) = -1
   integer(kind=8), save :: sfp_nnz_Ltil = -1
 
+  ! --- Workstream C: eta-scaled j-first Schur for pair_psi -----------------
+  ! (docs/physics_pc/workstream_C_gmg_probe.md S3.6). PCSHELL operands live
+  ! here for the same reason as the g46_* state above; the arm is serial.
+  Mat, save     :: psc_Shat                  !< B_11 - diag(B_13/B_33) B_31, rebuilt every PC rebuild
+  KSP, save     :: psc_kspS                  !< mode 1: LU of psc_Shat; mode 2: LU of its axis patch
+  Vec, save     :: psc_dinv, psc_res, psc_zpsi, psc_zj, psc_t, psc_zax
+  IS, save      :: psc_is_axis
+  integer, save :: psc_mode = 0
+  logical, save :: psc_ready = .false., psc_vecs_ready = .false.
+  integer, parameter :: PSC_SWEEPS = 3       !< damped-Jacobi sweeps before and after the axis patch
+  real*8, parameter  :: PSC_OMEGA  = 0.6d0   !< the offline probe's damping (tools/gmg_probe.py)
+
+  ! --- Workstream D: matrix-free fine pair_w operator (physics_pc_suu_shell) --
+  ! MATSHELL for D W D with W = [[S_uu, B_24], [B_42, B_44]] applied from the
+  ! raw blocks, S_uu x = B_22 x - (B_21 - B_23 M B_31) Dh B_12 x, where M is the
+  ! FSAI sfp_Qip (mode 1, reproduces S_W_aij) or the exact B_33^-1 by ksp_Mj
+  ! (mode 2). Dh = diag(Shat^-1) is saved by build_schur_mixed_prod (pairinv 2).
+  Mat, save     :: shw_A
+  ! Workstream D1 (physics_pc_mass_split = 1): per-slot constraint-mass
+  ! factors. ms(1) = B_33 (ksp_Mj), ms(2) = B_44 (ksp_Mw). Slots with an
+  ! identical matrix form one group sharing one factor; a group of k slots is
+  ! solved as one k-column dense RHS (rhs/sol), so the factor is read once.
+  type :: ms_t
+    logical :: ready = .false.
+    integer :: ngrp = 0
+    integer, allocatable :: gn(:)        !< slots in group g
+    integer, allocatable :: gm(:,:)      !< gm(g, c) = c-th slot (0-based) of group g
+    KSP, allocatable     :: ksp(:)       !< factor of group g's slot matrix
+    Mat, allocatable     :: rhs(:), sol(:)
+    PetscInt :: nloc_s = 0
+  end type ms_t
+  type(ms_t), save, target :: ms(2)
+  Vec, save     :: shw_d                     !< Dh, refreshed at every rebuild
+  Vec, save     :: shw_xs, shw_p1, shw_p2, shw_j1, shw_j2, shw_t
+  IS, save      :: shw_isu, shw_isw
+  logical, save :: shw_ready = .false., shw_d_ready = .false.
+
   public :: create_variable_index_sets
   public :: extract_sub_block
+  public :: extract_sub_block_h
   public :: compute_schur_corrected_block_psi
   public :: compute_schur_corrected_block_u
   public :: compute_schur_corrected_block_21
@@ -74,7 +113,7 @@ module mod_petsc_pc_physics_construction
   public :: setup_S_PBP_diag_shell        ! TEMPORARY diagnostic (Option A, Step 2)
   public :: materialize_S_PBP_diag_aij    ! TEMPORARY diagnostic (Option A, Step 2)
   public :: setup_block_ksp
-  public :: setup_constraint_mass_ksp
+  public :: setup_constraint_mass_ksp, setup_scalar_gmg_ksp
   public :: setup_alfven_block_ksp
   public :: setup_rho_block_ksp, setup_T_block_ksp
   public :: setup_block_ksp_amg_krylov, setup_block_ksp_hypre_amg_krylov
@@ -94,6 +133,10 @@ module mod_petsc_pc_physics_construction
   public :: probe_inner_solvers            ! Workstream B phase 5: AMG amenability probe
   public :: build_schur_commutator_prod    ! Stage 6.3: the production commutator-device S_PBP
   public :: build_pair_psi_prod            ! Workstream B: pair_psi = [[B_11,B_13],[B_31,B_33]]
+  public :: setup_psi_eta_schur_ksp        ! Workstream C: pair_psi by the eta-scaled j-first Schur
+  public :: setup_pair_w_gmg_ksp           ! Workstream C: pair_w by C1 geometric multigrid
+  public :: setup_pair_w_shell             ! Workstream D: matrix-free fine pair_w operator
+  public :: pair_w_shell_wrap_lu           ! Workstream D: FGMRES(shell) + LU(S_W_aij) reference
   public :: build_schur_mixed_prod         ! Workstream B: pair_w   = [[S_uu^SFM,B_24],[B_42,B_44]]
   public :: schur_mixed_require_serial     ! Workstream B: shared np>1 hard stop
   public :: verify_schur_mixed_apply       ! Workstream B: the mixed-pair null test
@@ -193,6 +236,116 @@ contains
       PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), MAT_REUSE_MATRIX, B, ierr))
     endif
   end subroutine extract_sub_block
+
+  !--------------------------------------------------------------------
+  !> Audit A8: extract_sub_block, optionally keeping only the entries between
+  !! the SAME toroidal mode number |n| (group (m+1)/2 of slot m; cos and sin of
+  !! one n stay coupled) (physics_pc_harm_split = 1). JOREK assembles n_tor x n_tor blocks,
+  !! so every extracted block stores the cross-harmonic couplings, which are
+  !! zero for an axisymmetric linearisation and O(perturbation) otherwise. The
+  !! standard JOREK preconditioner is already harmonic-block-diagonal; this
+  !! makes the physics PC's operands so too, which removes ~2/3 of every
+  !! product's and matvec's work and splits each pair LU into n_tor
+  !! independent factorizations.
+  !!
+  !! The filtered block is read straight out of A_full's rows (MatGetRow), so
+  !! no unfiltered copy is ever held (memory audit: those copies of the 21
+  !! blocks were ~0.8 GB at 81x32), and A_full may be the AIJ copy or JOREK's
+  !! own BAIJ matrix (physics_pc_lean_setup >= 3 drops the AIJ copy).
+  !! Layout (create_variable_index_sets): full row node*bs + (v-1)*n_tor + m,
+  !! sub-block row node*n_tor + m, bs = n_var*n_tor.
+  !!
+  !! B keeps its identity across rebuilds (the product caches depend on it):
+  !! it is refilled into the pattern fixed on the first build.
+  !--------------------------------------------------------------------
+  subroutine extract_sub_block_h(A_full, eq_row, var_col, B, first_time)
+    use phys_module,    only: physics_pc_harm_split
+    use mod_parameters, only: n_tor, n_var
+    Mat, intent(in)     :: A_full
+    integer, intent(in) :: eq_row, var_col
+    Mat, intent(inout)  :: B
+    logical, intent(in) :: first_time
+    PetscErrorCode :: ierr
+    PetscInt :: i, ncols, rstart, rend, m, k, q, c, bs, nloc, nsub, nglob
+    PetscInt :: sr, sc, cstart, cend, node, col0
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    PetscInt, allocatable :: dcnt(:), ocnt(:), cc(:)
+    PetscScalar, allocatable :: vv(:)
+    integer :: comm
+
+    if (physics_pc_harm_split == 0) then
+      call extract_sub_block(A_full, eq_row, var_col, B, first_time)
+      return
+    endif
+
+    bs = n_var * n_tor
+    call MatGetOwnershipRange(A_full, rstart, rend, ierr)
+    call MatGetSize(A_full, nglob, PETSC_NULL_INTEGER, ierr)
+    nloc   = ((rend - rstart) / bs) * n_tor
+    nsub   = (nglob / bs) * n_tor
+    cstart = (rstart / bs) * n_tor            ! owned sub-block columns [cstart, cend)
+    cend   = cstart + nloc
+    col0   = (var_col - 1) * n_tor            ! first slot of var_col inside a block
+
+    if (first_time) then
+      allocate(dcnt(nloc), ocnt(nloc))
+      dcnt = 0; ocnt = 0
+      do node = rstart / bs, rend / bs - 1
+        do m = 0, n_tor - 1
+          i = node * bs + (eq_row - 1) * n_tor + m
+          sr = node * n_tor + m - cstart + 1
+          call MatGetRow(A_full, i, ncols, cols, vals, ierr)
+          do k = 1, ncols
+            q = mod(cols(k), bs) - col0
+            if (q < 0 .or. q >= n_tor) cycle
+            if ((q + 1) / 2 /= (m + 1) / 2) cycle
+            sc = (cols(k) / bs) * n_tor + q
+            if (sc >= cstart .and. sc < cend) then
+              dcnt(sr) = dcnt(sr) + 1
+            else
+              ocnt(sr) = ocnt(sr) + 1
+            endif
+          enddo
+          call MatRestoreRow(A_full, i, ncols, cols, vals, ierr)
+        enddo
+      enddo
+      call PetscObjectGetComm(A_full, comm, ierr)
+      call MatCreate(comm, B, ierr)
+      call MatSetSizes(B, nloc, nloc, nsub, nsub, ierr)
+      call MatSetType(B, MATMPIAIJ, ierr)
+      call MatMPIAIJSetPreallocation(B, PETSC_DEFAULT_INTEGER, dcnt, &
+                                     PETSC_DEFAULT_INTEGER, ocnt, ierr)
+      deallocate(dcnt, ocnt)
+    else
+      call MatZeroEntries(B, ierr)
+    endif
+
+    allocate(cc(bs * 64), vv(bs * 64))
+    do node = rstart / bs, rend / bs - 1
+      do m = 0, n_tor - 1
+        i = node * bs + (eq_row - 1) * n_tor + m
+        sr = node * n_tor + m
+        call MatGetRow(A_full, i, ncols, cols, vals, ierr)
+        if (ncols > size(cc)) then
+          deallocate(cc, vv); allocate(cc(ncols), vv(ncols))
+        endif
+        c = 0
+        do k = 1, ncols
+          q = mod(cols(k), bs) - col0
+          if (q < 0 .or. q >= n_tor) cycle
+          if ((q + 1) / 2 /= (m + 1) / 2) cycle
+          c = c + 1; cc(c) = (cols(k) / bs) * n_tor + q; vv(c) = vals(k)
+        enddo
+        call MatRestoreRow(A_full, i, ncols, cols, vals, ierr)
+        if (c > 0) call MatSetValues(B, 1_4, [sr], c, cc(1:c), vv(1:c), INSERT_VALUES, ierr)
+      enddo
+    enddo
+    deallocate(cc, vv)
+    call MatAssemblyBegin(B, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(B, MAT_FINAL_ASSEMBLY, ierr)
+    if (first_time) call MatSetOption(B, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
+  end subroutine extract_sub_block_h
 
 
 
@@ -801,6 +954,7 @@ contains
 
     PC :: pc
     PetscErrorCode :: ierr
+    integer :: rank
 
     if (first_time) then
       call KSPCreate(comm, ksp_block, ierr)
@@ -813,6 +967,10 @@ contains
     call KSPSetUp(ksp_block, ierr)
 
     if (present(label)) call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS)")
+    if (first_time .and. present(label)) then
+      call MPI_Comm_rank(comm, rank, ierr)
+      call physics_pc_mumps_mem(ksp_block, label, rank)
+    endif
   end subroutine setup_block_ksp
 
   !--------------------------------------------------------------------
@@ -966,29 +1124,255 @@ contains
   !! MUMPS factorization is performed ONCE (first_time) and reused for the whole
   !! run. Signature matches setup_block_ksp for a drop-in swap.
   !--------------------------------------------------------------------
-  subroutine setup_constraint_mass_ksp(ksp_block, B_block, comm, first_time, label)
+  subroutine setup_constraint_mass_ksp(ksp_block, B_block, comm, first_time, label, ms_id)
+    use phys_module, only: physics_pc_lean_setup, physics_pc_mass_split
     KSP, intent(inout)  :: ksp_block
     Mat, intent(in)     :: B_block
     integer, intent(in) :: comm
     logical, intent(in) :: first_time
     character(len=*), intent(in), optional :: label
+    integer, intent(in), optional :: ms_id    !< 1 = B_33, 2 = B_44 (D1 slot split)
 
     PC :: pc
     PetscErrorCode :: ierr
+    PetscBool :: symm
+    logical :: chol
+    integer :: rank
 
     ! Operator never changes: skip re-factorization on every rebuild after the first.
     if (.not. first_time) return
+
+    if (physics_pc_mass_split /= 0 .and. present(ms_id)) then
+      call setup_mass_split(ksp_block, B_block, comm, ms_id, label)
+      return
+    endif
 
     call KSPCreate(comm, ksp_block, ierr)
     call KSPSetOperators(ksp_block, B_block, B_block, ierr)
     call KSPSetType(ksp_block, KSPPREONLY, ierr)
     call KSPGetPC(ksp_block, pc, ierr)
-    call PCSetType(pc, PCLU, ierr)
+    ! Audit A7 (physics_pc_lean_setup >= 2): the constraint masses are SPD, and
+    ! the matrix-free pair_w applies B_33^-1 once per matvec, so a Cholesky
+    ! factor (half the fill, half the triangular-solve traffic) is used when the
+    ! stored matrix is symmetric to round-off.
+    chol = .false.
+    if (physics_pc_lean_setup >= 2) then
+      call MatIsSymmetric(B_block, 1.d-12, symm, ierr)
+      chol = symm
+    endif
+    if (chol) then
+      call MatSetOption(B_block, MAT_SPD, PETSC_TRUE, ierr)
+      call PCSetType(pc, PCCHOLESKY, ierr)
+    else
+      call PCSetType(pc, PCLU, ierr)
+    endif
     call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
     call KSPSetUp(ksp_block, ierr)
 
-    if (present(label)) call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS), factored once")
+    if (present(label)) then
+      if (chol) then
+        call pc_print_block_setup(comm, label, "PREONLY + Cholesky (MUMPS), factored once")
+      else
+        call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS), factored once")
+      endif
+      call MPI_Comm_rank(comm, rank, ierr)
+      call physics_pc_mumps_mem(ksp_block, label, rank)
+    endif
   end subroutine setup_constraint_mass_ksp
+
+  !--------------------------------------------------------------------
+  !> Workstream D1: the constraint mass B (B_33 or B_44) factored per toroidal
+  !! slot. JOREK's mass matrices are exactly slot-block-diagonal (the stored
+  !! cross-slot entries are 0, even between cos and sin of one n), and the
+  !! cos/sin slots of every n >= 1 carry the SAME matrix (n = 0 differs: 2x on
+  !! the interior, not on the boundary ring). So one factor per DISTINCT slot
+  !! matrix serves every slot, and ksp_block becomes PREONLY + a PCSHELL that
+  !! gathers the slots of a group into a dense multi-column RHS. Callers of
+  !! KSPSolve(ksp_Mj / ksp_Mw) are unchanged.
+  !!
+  !! Both structural facts are GATED here, not assumed: a mass with cross-slot
+  !! content aborts (not a fallback -- silently factoring a different operator
+  !! would be measuring the wrong thing), and slot identity is MatEqual (exact).
+  !! Factor memory: (#distinct slots) x one 2D factor, i.e. 2 for any n_tor.
+  !--------------------------------------------------------------------
+  subroutine setup_mass_split(ksp_block, B_block, comm, id, label)
+    use mod_parameters, only: n_tor
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm, id
+    character(len=*), intent(in), optional :: label
+    type(ms_t), pointer :: MS_
+    Mat, allocatable :: S(:)
+    IS             :: ism
+    PC             :: pc
+    PetscErrorCode :: ierr
+    PetscInt       :: rstart, rend, nloc, nglo, i, ncols
+    PetscInt, pointer    :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    PetscBool      :: eq, symm
+    real*8         :: fB, fs, cross
+    integer        :: m, g, k, rank, grp(0:n_tor - 1), maxn
+    character(len=160) :: line
+
+    call MPI_Comm_rank(comm, rank, ierr)
+    MS_ => ms(id)
+    call MatGetOwnershipRange(B_block, rstart, rend, ierr)
+    call MatGetSize(B_block, nglo, PETSC_NULL_INTEGER, ierr)
+    nloc = rend - rstart
+    if (mod(rstart, n_tor) /= 0 .or. mod(nloc, n_tor) /= 0) then
+      if (rank == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_mass_split needs "// &
+        "slot-aligned row ownership."
+      flush(6)
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    endif
+    MS_%nloc_s = nloc / n_tor
+
+    !--- cross-slot gate, summed entry by entry (a difference of Frobenius
+    !--- norms would cancel to ~sqrt(eps) and could not tell 0 from round-off)
+    fs = 0.d0
+    do i = rstart, rend - 1
+      call MatGetRow(B_block, i, ncols, cols, vals, ierr)
+      do k = 1, ncols
+        if (mod(cols(k), n_tor) /= mod(i, n_tor)) fs = fs + abs(vals(k))**2
+      enddo
+      call MatRestoreRow(B_block, i, ncols, cols, vals, ierr)
+    enddo
+    call MatNorm(B_block, NORM_FROBENIUS, fB, ierr)
+    cross = sqrt(fs) / fB
+    if (cross > 1.d-13) then
+      if (rank == 0) write(*,'(A,ES10.3,A)') "[Physics PC]   FATAL: physics_pc_mass_split: "// &
+        "the mass has cross-slot content (||cross||/||B|| = ", cross, ")."
+      flush(6)
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    endif
+
+    !--- slot matrices
+    allocate(S(0:n_tor - 1))
+    do m = 0, n_tor - 1
+      call ISCreateStride(comm, MS_%nloc_s, rstart + m, int(n_tor, kind=kind(rstart)), ism, ierr)
+      call MatCreateSubMatrix(B_block, ism, ism, MAT_INITIAL_MATRIX, S(m), ierr)
+      call ISDestroy(ism, ierr)
+    enddo
+
+    !--- group identical slots (exact MatEqual against each group's first slot)
+    grp = 0; MS_%ngrp = 0
+    allocate(MS_%gn(n_tor), MS_%gm(n_tor, n_tor))
+    MS_%gn = 0; MS_%gm = -1
+    do m = 0, n_tor - 1
+      do g = 1, MS_%ngrp
+        call MatEqual(S(m), S(MS_%gm(g, 1)), eq, ierr)
+        if (eq) exit
+      enddo
+      if (g > MS_%ngrp) then
+        MS_%ngrp = MS_%ngrp + 1; g = MS_%ngrp
+      endif
+      grp(m) = g
+      MS_%gn(g) = MS_%gn(g) + 1
+      MS_%gm(g, MS_%gn(g)) = m
+    enddo
+
+    !--- one factor per group (Cholesky when symmetric, as the whole-mass path)
+    allocate(MS_%ksp(MS_%ngrp), MS_%rhs(MS_%ngrp), MS_%sol(MS_%ngrp))
+    maxn = 0
+    do g = 1, MS_%ngrp
+      call KSPCreate(comm, MS_%ksp(g), ierr)
+      call KSPSetOperators(MS_%ksp(g), S(MS_%gm(g, 1)), S(MS_%gm(g, 1)), ierr)
+      call KSPSetType(MS_%ksp(g), KSPPREONLY, ierr)
+      call KSPGetPC(MS_%ksp(g), pc, ierr)
+      call MatIsSymmetric(S(MS_%gm(g, 1)), 1.d-12, symm, ierr)
+      if (symm) then
+        call MatSetOption(S(MS_%gm(g, 1)), MAT_SPD, PETSC_TRUE, ierr)
+        call PCSetType(pc, PCCHOLESKY, ierr)
+      else
+        call PCSetType(pc, PCLU, ierr)
+      endif
+      call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
+      call KSPSetUp(MS_%ksp(g), ierr)
+      call MatCreateDense(comm, MS_%nloc_s, PETSC_DECIDE, nglo / n_tor, int(MS_%gn(g), kind=kind(nglo)), &
+                          PETSC_NULL_SCALAR_ARRAY, MS_%rhs(g), ierr)
+      call MatDuplicate(MS_%rhs(g), MAT_DO_NOT_COPY_VALUES, MS_%sol(g), ierr)
+      write(line,'(A,I0,A,I0,A)') "slot group ", g, " (", MS_%gn(g), " slots)"
+      if (present(label)) call physics_pc_mumps_mem(MS_%ksp(g), trim(label)//" "//trim(line), rank)
+      maxn = max(maxn, MS_%gn(g))
+    enddo
+    do m = 0, n_tor - 1
+      call MatDestroy(S(m), ierr)       ! each group KSP holds its own reference
+    enddo
+    deallocate(S)
+
+    !--- the KSP every caller uses
+    call KSPCreate(comm, ksp_block, ierr)
+    call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+    call KSPSetType(ksp_block, KSPPREONLY, ierr)
+    call KSPGetPC(ksp_block, pc, ierr)
+    call PCSetType(pc, PCSHELL, ierr)
+    if (id == 1) then
+      call PCShellSetApply(pc, ms_apply_1, ierr)
+    else
+      call PCShellSetApply(pc, ms_apply_2, ierr)
+    endif
+    call PCShellSetName(pc, "per-slot constraint mass (D1)", ierr)
+    call KSPSetUp(ksp_block, ierr)
+    MS_%ready = .true.
+
+    if (rank == 0) write(*,'(A,A,A,I0,A,I0,A,ES9.2,A)') "[Physics PC]   ", trim(label), &
+      ": PREONLY + per-slot MUMPS factors, ", MS_%ngrp, " distinct of ", n_tor, &
+      " slots (cross-slot ||.||/||B|| = ", cross, "), factored once"
+  end subroutine setup_mass_split
+
+  subroutine ms_apply_1(pc, x, y, ierr)
+    PC  :: pc
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call ms_apply(1, x, y, ierr)
+  end subroutine ms_apply_1
+
+  subroutine ms_apply_2(pc, x, y, ierr)
+    PC  :: pc
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call ms_apply(2, x, y, ierr)
+  end subroutine ms_apply_2
+
+  !> y = B^-1 x slot by slot: gather each group's slots into its dense RHS
+  !! (row i of slot m is local entry i*n_tor + m), one multi-RHS solve per
+  !! group, scatter back.
+  subroutine ms_apply(id, x, y, ierr)
+    use mod_parameters, only: n_tor
+    integer, intent(in) :: id
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    type(ms_t), pointer :: MS_
+    PetscScalar, pointer :: xa(:), ya(:), a2(:,:)
+    integer :: g, c, m
+    PetscInt :: i
+
+    MS_ => ms(id)
+    call VecGetArrayRead(x, xa, ierr)
+    call VecGetArray(y, ya, ierr)
+    do g = 1, MS_%ngrp
+      call MatDenseGetArray(MS_%rhs(g), a2, ierr)
+      do c = 1, MS_%gn(g)
+        m = MS_%gm(g, c)
+        do i = 1, MS_%nloc_s
+          a2(i, c) = xa((i - 1) * n_tor + m + 1)
+        enddo
+      enddo
+      call MatDenseRestoreArray(MS_%rhs(g), a2, ierr)
+      call KSPMatSolve(MS_%ksp(g), MS_%rhs(g), MS_%sol(g), ierr)
+      call MatDenseGetArrayRead(MS_%sol(g), a2, ierr)
+      do c = 1, MS_%gn(g)
+        m = MS_%gm(g, c)
+        do i = 1, MS_%nloc_s
+          ya((i - 1) * n_tor + m + 1) = a2(i, c)
+        enddo
+      enddo
+      call MatDenseRestoreArrayRead(MS_%sol(g), a2, ierr)
+    enddo
+    call VecRestoreArrayRead(x, xa, ierr)
+    call VecRestoreArray(y, ya, ierr)
+    ierr = 0
+  end subroutine ms_apply
 
   !--------------------------------------------------------------------
   !> Create the exact-(psi,u)-Schur MATSHELL and its 1-variable work vecs (once).
@@ -4803,6 +5187,109 @@ contains
   !! failure class as the massinv=2 SEQAIJ/MPIAIJ mismatch, which stayed
   !! invisible for weeks, so it aborts rather than warns.
   !--------------------------------------------------------------------
+  !--------------------------------------------------------------------
+  !> d_i += alpha * (L R)_ii without forming L R: row_i(L) . row_i(Rt), with
+  !! Rt = R^T supplied by the caller. MatGetRow returns ascending columns, so
+  !! each dot is a sorted merge. Serial (global row = local row), like the
+  !! SFM2 build that calls it.
+  !--------------------------------------------------------------------
+  !--------------------------------------------------------------------
+  !> Audit A8: how much of A's stored pattern couples DIFFERENT toroidal
+  !! mode numbers |n|. Slot m = mod(index, n_tor) in the is_var layout (and in
+  !! the packed pairs, n1 being a multiple of n_tor); slots 2k-1, 2k are the
+  !! cos/sin of the same |n| and ARE coupled by d/dphi (B_12, B_23: F0 d_phi),
+  !! so the group is (m+1)/2, not m. A first version keyed on m and dropped
+  !! the parallel-gradient coupling: 400 outer its at tstep 10. JOREK stores n_tor x n_tor
+  !! blocks (BAIJ), so for an operator that is harmonic-diagonal these entries
+  !! are stored zeros that every product, matvec and factorization carries.
+  !--------------------------------------------------------------------
+  subroutine report_harmonic_coupling(A, tag, my_id)
+    use mod_parameters, only: n_tor
+    Mat, intent(in) :: A
+    character(len=*), intent(in) :: tag
+    integer, intent(in) :: my_id
+    PetscInt :: i, nr, nc, k
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    PetscErrorCode :: ierr
+    real*8 :: fx, ft, cmax, dmax, sbuf(4), rbuf(4), mbuf(2), mrbuf(2)
+    integer(8) :: nx, nt, nz0, ibuf(3), irbuf(3)
+    PetscInt :: rstart, rend
+    integer :: acomm
+    integer :: mpierr
+
+    ! Owned rows only (MatGetRow is local), then reduce: the shares are global.
+    call MatGetOwnershipRange(A, rstart, rend, ierr)
+    fx = 0.0d0; ft = 0.0d0; nx = 0; nt = 0; nz0 = 0; cmax = 0.0d0; dmax = 0.0d0
+    do i = rstart, rend - 1
+      call MatGetRow(A, i, nc, cols, vals, ierr)
+      do k = 1, nc
+        nt = nt + 1
+        ft = ft + vals(k)**2
+        if ((mod(cols(k), n_tor) + 1) / 2 /= (mod(i, n_tor) + 1) / 2) then
+          nx = nx + 1
+          fx = fx + vals(k)**2
+          cmax = max(cmax, abs(vals(k)))
+          if (vals(k) == 0.0d0) nz0 = nz0 + 1
+        else
+          dmax = max(dmax, abs(vals(k)))
+        endif
+      enddo
+      call MatRestoreRow(A, i, nc, cols, vals, ierr)
+    enddo
+    call PetscObjectGetComm(A, acomm, ierr)
+    sbuf = [fx, ft, 0.0d0, 0.0d0]
+    call MPI_Allreduce(sbuf, rbuf, 2, MPI_DOUBLE_PRECISION, MPI_SUM, acomm, mpierr)
+    fx = rbuf(1); ft = rbuf(2)
+    mbuf = [cmax, dmax]
+    call MPI_Allreduce(mbuf, mrbuf, 2, MPI_DOUBLE_PRECISION, MPI_MAX, acomm, mpierr)
+    cmax = mrbuf(1); dmax = mrbuf(2)
+    ibuf = [nx, nt, nz0]
+    call MPI_Allreduce(ibuf, irbuf, 3, MPI_INTEGER8, MPI_SUM, acomm, mpierr)
+    nx = irbuf(1); nt = irbuf(2); nz0 = irbuf(3)
+    if (my_id == 0) write(*,'(A,A,A,F6.3,A,F6.3,A,ES9.2,A,ES9.2)') &
+      "[Physics PC]   A8 harmonic coupling ", tag, ": cross share of nnz = ", &
+      dble(nx) / max(dble(nt), 1.d0), ", exact zeros among them = ", &
+      dble(nz0) / max(dble(nx), 1.d0), ", ||cross||_F/||A||_F = ", &
+      sqrt(fx / max(ft, 1.d-300)), ", max|cross|/max|same| = ", cmax / max(dmax, 1.d-300)
+  end subroutine report_harmonic_coupling
+
+  subroutine mat_diag_of_product(L, Rt, d, alpha)
+    Mat, intent(in)    :: L, Rt
+    Vec, intent(inout) :: d
+    real*8, intent(in) :: alpha
+    PetscInt :: i, n, nl, nr, a, b
+    PetscInt, pointer :: cl(:), cr(:)
+    PetscScalar, pointer :: vl(:), vr(:), dp(:)
+    PetscErrorCode :: ierr
+    real*8 :: acc
+    PetscInt :: rstart, rend
+
+    ! Owned rows: L, Rt and d share the row layout; MatGetRow gives sorted
+    ! GLOBAL columns on MPIAIJ, so the merge below is layout-independent.
+    call MatGetOwnershipRange(L, rstart, rend, ierr)
+    call VecGetLocalSize(d, n, ierr)
+    call VecGetArray(d, dp, ierr)
+    do i = 0, n - 1
+      call MatGetRow(L, rstart + i, nl, cl, vl, ierr)
+      call MatGetRow(Rt, rstart + i, nr, cr, vr, ierr)
+      acc = 0.0d0; a = 1; b = 1
+      do while (a <= nl .and. b <= nr)
+        if (cl(a) == cr(b)) then
+          acc = acc + vl(a) * vr(b); a = a + 1; b = b + 1
+        else if (cl(a) < cr(b)) then
+          a = a + 1
+        else
+          b = b + 1
+        endif
+      enddo
+      call MatRestoreRow(Rt, rstart + i, nr, cr, vr, ierr)
+      call MatRestoreRow(L, rstart + i, nl, cl, vl, ierr)
+      dp(i + 1) = dp(i + 1) + alpha * acc
+    enddo
+    call VecRestoreArray(d, dp, ierr)
+  end subroutine mat_diag_of_product
+
   subroutine mat_product_cached(A, B, C, nnz_ref, tag, comm, my_id)
     Mat, intent(in)               :: A, B
     Mat, intent(inout)            :: C
@@ -4846,80 +5333,148 @@ contains
     PetscInt, intent(in) :: n
     integer, intent(in)  :: comm
     Mat, intent(out) :: G
-    integer, intent(out) :: nfail   !< rows that fell back to the identity
+    integer, intent(out) :: nfail   !< rows that fell back to the identity (global)
 
-    PetscInt :: i, k, m, ncols
+    ! PARALLEL: each rank builds its OWNED rows of G. Row i needs A(J_i, J_i)
+    ! with J_i = {j <= i in pattern row i}, which reaches rows of other ranks;
+    ! those are fetched once as a sequential submatrix A(S, S), S = the union
+    ! of all J_i (MatCreateSubMatrices). On one rank A is read directly, so
+    ! the result is bit-identical to the former serial routine.
+    PetscInt :: i, k, m, ncols, rs, re, nloc, ns, q
+    PetscInt, parameter :: one = 1
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
-    PetscInt, allocatable :: jj(:), rcnt(:)
+    PetscInt, allocatable :: jj(:), jl(:), dnz(:), onz(:), lp(:), lj(:), sidx(:)
+    integer, allocatable :: gmap(:)
+    logical, allocatable :: need(:)
     real*8, allocatable :: asub(:,:), rhs(:)
     integer, allocatable :: ipiv(:)
-    integer :: info
+    integer :: info, nproc, mpierr, nfl
     character(len=64) :: mtype
     PetscErrorCode :: ierr
+    Mat :: Aloc
+    Mat, pointer :: subm(:)
+    IS :: isS(1)
     external :: dgesv
 
-    allocate(rcnt(n))
-    do i = 0, n-1
-      call MatGetRow(P, i, ncols, PETSC_NULL_INTEGER_POINTER, &
-                     PETSC_NULL_SCALAR_POINTER, ierr)
-      rcnt(i+1) = ncols
-      call MatRestoreRow(P, i, ncols, PETSC_NULL_INTEGER_POINTER, &
-                         PETSC_NULL_SCALAR_POINTER, ierr)
+    call MPI_Comm_size(comm, nproc, mpierr)
+    call MatGetOwnershipRange(P, rs, re, ierr)
+    nloc = re - rs
+
+    !--- lower-triangular pattern of the owned rows (CSR, global columns)
+    allocate(lp(0:nloc))
+    lp(0) = 0
+    do i = rs, re - 1
+      call MatGetRow(P, i, ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      m = 0
+      do k = 1, ncols
+        if (cols(k) <= i) m = m + 1
+      enddo
+      call MatRestoreRow(P, i, ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      lp(i - rs + 1) = lp(i - rs) + m
+    enddo
+    allocate(lj(max(lp(nloc), one)))
+    do i = rs, re - 1
+      call MatGetRow(P, i, ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      m = lp(i - rs)
+      do k = 1, ncols
+        if (cols(k) <= i) then
+          m = m + 1; lj(m) = cols(k)
+        endif
+      enddo
+      call MatRestoreRow(P, i, ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
     enddo
 
+    !--- the values' source: A itself on one rank, else A(S,S) on this rank
+    allocate(gmap(0:n - 1))
+    if (nproc == 1) then
+      Aloc = A
+      do i = 0, n - 1
+        gmap(i) = int(i)
+      enddo
+    else
+      allocate(need(0:n - 1))
+      need = .false.
+      do k = 1, lp(nloc)
+        need(lj(k)) = .true.
+      enddo
+      ns = count(need)
+      allocate(sidx(ns))
+      q = 0; gmap = -1
+      do i = 0, n - 1
+        if (need(i)) then
+          q = q + 1; sidx(q) = i; gmap(i) = int(q - 1)
+        endif
+      enddo
+      deallocate(need)
+      call ISCreateGeneral(PETSC_COMM_SELF, ns, sidx, PETSC_COPY_VALUES, isS(1), ierr)
+      call MatCreateSubMatrices(A, one, isS, isS, MAT_INITIAL_MATRIX, subm, ierr)
+      Aloc = subm(1)
+      deallocate(sidx)
+    endif
+
+    !--- G: A's layout, exact diagonal/off-diagonal preallocation
+    allocate(dnz(nloc), onz(nloc))
+    do i = 1, nloc
+      dnz(i) = 0; onz(i) = 0
+      do k = lp(i - 1) + 1, lp(i)
+        if (lj(k) >= rs .and. lj(k) < re) then
+          dnz(i) = dnz(i) + 1
+        else
+          onz(i) = onz(i) + 1
+        endif
+      enddo
+      dnz(i) = max(dnz(i), 1)                         ! identity fallback row
+    enddo
     ! Match A's type exactly: the blocks this multiplies are MPIAIJ even on
     ! one rank, and PETSc has no mixed MPIAIJ*SEQAIJ product.
     call MatGetType(A, mtype, ierr)
     call MatCreate(comm, G, ierr)
-    call MatSetSizes(G, n, n, n, n, ierr)
+    call MatSetSizes(G, nloc, nloc, n, n, ierr)
     call MatSetType(G, mtype, ierr)
-    call MatSeqAIJSetPreallocation(G, PETSC_DEFAULT_INTEGER, rcnt, ierr)
-    call MatMPIAIJSetPreallocation(G, PETSC_DEFAULT_INTEGER, rcnt, &
-                                   PETSC_DEFAULT_INTEGER, PETSC_NULL_INTEGER_ARRAY, ierr)
+    call MatSeqAIJSetPreallocation(G, PETSC_DEFAULT_INTEGER, dnz, ierr)
+    call MatMPIAIJSetPreallocation(G, PETSC_DEFAULT_INTEGER, dnz, &
+                                   PETSC_DEFAULT_INTEGER, onz, ierr)
     call MatSetOption(G, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
 
-    nfail = 0
-    do i = 0, n-1
-      call MatGetRow(P, i, ncols, cols, vals, ierr)
-      m = 0
-      allocate(jj(ncols))
-      do k = 1, ncols
-        if (cols(k) <= i) then
-          m = m + 1
-          jj(m) = cols(k)
-        endif
-      enddo
-      call MatRestoreRow(P, i, ncols, cols, vals, ierr)
-
+    nfl = 0
+    do i = rs, re - 1
+      m = lp(i - rs + 1) - lp(i - rs)
       if (m < 1) then
         call MatSetValue(G, i, i, 1.0d0, INSERT_VALUES, ierr)
-        nfail = nfail + 1
-        deallocate(jj)
+        nfl = nfl + 1
         cycle
       endif
-
+      allocate(jj(m), jl(m), asub(m,m), rhs(m), ipiv(m))
+      jj = lj(lp(i - rs) + 1 : lp(i - rs + 1))
+      do k = 1, m
+        jl(k) = gmap(jj(k))
+      enddo
       ! MatGetRow returns columns in ascending order, so jj(m) == i.
-      allocate(asub(m,m), rhs(m), ipiv(m))
-      call MatGetValues(A, m, jj(1:m), m, jj(1:m), asub, ierr)
+      call MatGetValues(Aloc, m, jl, m, jl, asub, ierr)
       rhs      = 0.0d0
       rhs(m)   = 1.0d0
-      call dgesv(m, 1, asub, m, ipiv, rhs, m, info)
+      call dgesv(int(m), 1, asub, int(m), ipiv, rhs, int(m), info)
 
       if (info /= 0 .or. rhs(m) <= 0.0d0) then
         ! singular row (a zeroed Dirichlet row) -- fall back to identity
         call MatSetValue(G, i, i, 1.0d0, INSERT_VALUES, ierr)
-        nfail = nfail + 1
+        nfl = nfl + 1
       else
         rhs = rhs / sqrt(rhs(m))
-        call MatSetValues(G, 1, (/ i /), m, jj(1:m), rhs, INSERT_VALUES, ierr)
+        call MatSetValues(G, one, (/ i /), m, jj, rhs, INSERT_VALUES, ierr)
       endif
-      deallocate(asub, rhs, ipiv, jj)
+      deallocate(asub, rhs, ipiv, jj, jl)
     enddo
 
     call MatAssemblyBegin(G, MAT_FINAL_ASSEMBLY, ierr)
     call MatAssemblyEnd(G, MAT_FINAL_ASSEMBLY, ierr)
-    deallocate(rcnt)
+    if (nproc > 1) then
+      call MatDestroySubMatrices(one, subm, ierr)
+      call ISDestroy(isS(1), ierr)
+    endif
+    deallocate(lp, lj, gmap, dnz, onz)
+    call MPI_Allreduce(nfl, nfail, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
 
   end subroutine build_fsai
 
@@ -5300,6 +5855,257 @@ contains
       "[Physics PC]   DENSITY ", tag, ": rows = ", nrow, &
       ", nnz = ", nz, ", nnz/row = ", nz / max(dble(nrow), 1.d0)
   end subroutine report_operator_density
+
+  !--------------------------------------------------------------------
+  !> Workstream C: dump the SFM2 operators and the grid for the offline
+  !! geometric-multigrid probe (docs/physics_pc/tools/gmg_probe.py).
+  !!
+  !! WHY offline: the question is whether an exact nested C1 coarse space
+  !! (Hermite subdivision on the logically structured polar grid) avoids the
+  !! pathological GAMG hierarchy (T2) and the coupling failure (T1). Building P
+  !! and iterating on smoothers/cycles is far cheaper in scipy than in PCMG;
+  !! only a winner is worth porting.
+  !!
+  !! Files go to the run directory: PETSc binary matrices named
+  !! gmgdump_<op>_ts<tstep>_mi<massinv>_pi<pairinv>.petsc, plus one text file
+  !! gmgdump_grid.txt with everything the prolongation needs. The PC row map is
+  !! row = (node%index(k)-1)*n_tor + m (create_variable_index_sets, serial).
+  !! pair_w is dumped before its block scaling, but pair_psi is scaled in place
+  !! by build_pair_psi_prod first -- run with physics_pc_pair_scale = 0 to get
+  !! both pairs unscaled (the scaling is an exact similarity, re-applied offline).
+  !--------------------------------------------------------------------
+  subroutine dump_sfm2_blocks(S_uu, comm, my_id)
+    use phys_module,    only: tstep, physics_pc_schur_massinv, physics_pc_schur_pairinv
+    use mod_parameters, only: n_tor
+
+    Mat, intent(in)     :: S_uu
+    integer, intent(in) :: comm, my_id
+
+    character(len=64)   :: suffix
+    character(len=16)   :: tstr
+
+    write(tstr,'(F0.3)') tstep
+    write(suffix,'(A,A,I0,A,I0,A)') trim(adjustl(tstr)), "_mi", physics_pc_schur_massinv, &
+                                    "_pi", physics_pc_schur_pairinv, ".petsc"
+
+    call dump_one(g_ctx%K_pj_aij, "pair_psi")
+    call dump_one(g_ctx%S_W_aij,  "pair_w")
+    call dump_one(S_uu,           "S_uu")
+    call dump_one(g_ctx%B_11,     "B_11")
+    call dump_one(g_ctx%B_33,     "B_33")
+    call dump_one(g_ctx%B_44,     "B_44")
+
+    if (my_id == 0) call dump_grid()
+
+  contains
+
+    subroutine dump_one(A, op)
+      Mat, intent(in)              :: A
+      character(len=*), intent(in) :: op
+      PetscViewer    :: viewer
+      PetscErrorCode :: ierr
+      character(len=128) :: fname
+
+      fname = "gmgdump_" // op // "_ts" // trim(suffix)
+      call PetscViewerBinaryOpen(comm, trim(fname), FILE_MODE_WRITE, viewer, ierr)
+      call MatView(A, viewer, ierr)
+      call PetscViewerDestroy(viewer, ierr)
+      if (my_id == 0) write(*,'(A,A)') "[Physics PC]   GMG dump: ", trim(fname)
+    end subroutine dump_one
+
+    !> Grid is geometry-only, so it is rewritten identically on every call.
+    subroutine dump_grid()
+      use nodes_elements, only: node_list, element_list
+      use phys_module,    only: n_flux, n_tht, force_central_node, treat_axis
+      use mod_parameters, only: n_degrees
+      integer :: u, i, k
+
+      open(newunit=u, file="gmgdump_grid.txt", status="replace", action="write")
+      write(u,'(A)') "# n_nodes n_elements n_tor n_degrees n_flux n_tht force_central_node treat_axis"
+      write(u,'(6I8,2L3)') node_list%n_nodes, element_list%n_elements, n_tor, n_degrees, &
+                           n_flux, n_tht, force_central_node, treat_axis
+      write(u,'(A)') "# NODES: index(1:n_degrees) boundary axis_node R(1:n_degrees) Z(1:n_degrees)"
+      do i = 1, node_list%n_nodes
+        write(u,'(*(I8))', advance="no") (node_list%node(i)%index(k), k = 1, n_degrees), &
+                                          node_list%node(i)%boundary
+        write(u,'(L3,*(ES24.16))') node_list%node(i)%axis_node, &
+                                   (node_list%node(i)%X(1,k,1), k = 1, n_degrees), &
+                                   (node_list%node(i)%X(1,k,2), k = 1, n_degrees)
+      enddo
+      write(u,'(A)') "# ELEMENTS: vertex(1:4) size(1:4,1:n_degrees) (vertex-major)"
+      do i = 1, element_list%n_elements
+        write(u,'(4I8,*(ES24.16))') element_list%element(i)%vertex(1:4), &
+                                    (element_list%element(i)%size(k,1:n_degrees), k = 1, 4)
+      enddo
+      close(u)
+    end subroutine dump_grid
+
+  end subroutine dump_sfm2_blocks
+
+  !--------------------------------------------------------------------
+  !> Workstream D (physics_pc_suu_ring = k > 0): replace S_uu by its
+  !! restriction to the ring-k node stencil, before it is packed into pair_w.
+  !!
+  !! S_uu = B_22 - (B_21 - B_23 Qi B_31) D B_12 spans 5 node rings at massinv 7
+  !! (each element block adds one, Qi = G^T G adds two), 11x an element block.
+  !! Offline (docs/physics_pc/data/stageD1_suu_sparsify.tsv) ring 3 is free for
+  !! the pair_w inner solve at tstep 0.1-10; this knob measures the OUTER cost.
+  !!
+  !! Ring k = the k-th power of the element connectivity on node indices, all
+  !! harmonics coupled. Built from the grid, not from a matrix: Dirichlet
+  !! elimination strips the boundary rows of every assembled block. Row map
+  !! row = (node%index-1)*n_tor + m, as in dump_sfm2_blocks (serial only; the
+  !! caller has already enforced np = 1).
+  !!
+  !! physics_pc_suu_comp = 1 adds sign(d_ii) * sum_dropped |s_ij| to the
+  !! diagonal (the only compensation that kept ring 1-2 working at tstep 10).
+  !! This saves no setup: the full product is formed first, then masked.
+  !--------------------------------------------------------------------
+  subroutine mask_suu_ring(S_uu, comm, my_id)
+    use nodes_elements, only: node_list, element_list
+    use mod_parameters, only: n_tor, n_degrees
+    use phys_module,    only: physics_pc_suu_ring, physics_pc_suu_comp
+
+    Mat, intent(inout)  :: S_uu
+    integer, intent(in) :: comm, my_id
+
+    Mat            :: E, Ak, Tmp, T
+    PetscErrorCode :: ierr
+    PetscInt       :: n_idx, n_rows, ncol_glo, r, ridx, k, m, nd, ncols, nk, i
+    PetscInt, allocatable    :: dofs(:), rcnt(:), jj(:)
+    PetscScalar, allocatable :: ones(:,:), vv(:)
+    PetscInt, pointer        :: cols(:), kcols(:)
+    PetscScalar, pointer     :: vals(:), kvals(:)
+    logical, allocatable     :: mark(:)
+    character(len=64)        :: mtype
+    real*8  :: fdrop, foff, dsum, nz0, nz1
+    integer :: iel, iv, kd, mpierr
+
+    !--- node-index element connectivity E (pattern only, values 1)
+    n_idx = 0
+    do i = 1, node_list%n_nodes
+      n_idx = max(n_idx, int(maxval(node_list%node(i)%index(1:n_degrees)), kind=kind(n_idx)))
+    enddo
+    call MatGetSize(S_uu, n_rows, ncol_glo, ierr)
+    if (n_rows /= n_idx * n_tor) then
+      if (my_id == 0) write(*,'(A,I0,A,I0,A,I0)') &
+        "[Physics PC]   FATAL: physics_pc_suu_ring: S_uu has ", n_rows, &
+        " rows, expected n_idx*n_tor = ", n_idx, "*", n_tor
+      call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+    endif
+
+    call MatCreateSeqAIJ(PETSC_COMM_SELF, n_idx, n_idx, 64, PETSC_NULL_INTEGER_ARRAY, E, ierr)
+    call MatSetOption(E, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    nd = 4 * n_degrees
+    allocate(dofs(nd), ones(nd, nd))
+    ones = 1.0d0
+    do iel = 1, element_list%n_elements
+      m = 0
+      do iv = 1, 4
+        do kd = 1, n_degrees
+          m = m + 1
+          dofs(m) = node_list%node(element_list%element(iel)%vertex(iv))%index(kd) - 1
+        enddo
+      enddo
+      call MatSetValues(E, nd, dofs, nd, dofs, ones, INSERT_VALUES, ierr)
+    enddo
+    call MatAssemblyBegin(E, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(E, MAT_FINAL_ASSEMBLY, ierr)
+    deallocate(dofs, ones)
+
+    ! Entries are sums of products of ones, so nothing cancels: the pattern of
+    ! E^k is exactly the ring-k adjacency.
+    call MatDuplicate(E, MAT_COPY_VALUES, Ak, ierr)
+    do k = 2, physics_pc_suu_ring
+      call MatMatMult(Ak, E, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, Tmp, ierr)
+      call MatDestroy(Ak, ierr)
+      Ak = Tmp
+    enddo
+    call MatDestroy(E, ierr)
+
+    !--- pass 1: kept count per row
+    allocate(rcnt(n_rows), mark(0:n_idx-1))
+    mark = .false.
+    do r = 0, n_rows - 1
+      ridx = r / n_tor
+      call MatGetRow(Ak, ridx, nk, kcols, kvals, ierr)
+      mark(kcols(1:nk)) = .true.
+      call MatGetRow(S_uu, r, ncols, cols, vals, ierr)
+      rcnt(r+1) = count(mark(cols(1:ncols) / n_tor))
+      call MatRestoreRow(S_uu, r, ncols, cols, vals, ierr)
+      mark(kcols(1:nk)) = .false.
+      call MatRestoreRow(Ak, ridx, nk, kcols, kvals, ierr)
+    enddo
+
+    ! Match S_uu's type: the nest->AIJ pack and every product downstream
+    ! expect the extracted blocks' type (MPIAIJ even on one rank).
+    call MatGetType(S_uu, mtype, ierr)
+    call MatCreate(comm, T, ierr)
+    call MatSetSizes(T, n_rows, n_rows, n_rows, n_rows, ierr)
+    call MatSetType(T, mtype, ierr)
+    call MatSeqAIJSetPreallocation(T, PETSC_DEFAULT_INTEGER, rcnt, ierr)
+    call MatMPIAIJSetPreallocation(T, PETSC_DEFAULT_INTEGER, rcnt, &
+                                   PETSC_DEFAULT_INTEGER, PETSC_NULL_INTEGER_ARRAY, ierr)
+
+    !--- pass 2: copy kept entries, optionally compensate the diagonal
+    fdrop = 0.0d0; foff = 0.0d0
+    do r = 0, n_rows - 1
+      ridx = r / n_tor
+      call MatGetRow(Ak, ridx, nk, kcols, kvals, ierr)
+      mark(kcols(1:nk)) = .true.
+      call MatGetRow(S_uu, r, ncols, cols, vals, ierr)
+      allocate(jj(ncols), vv(ncols))
+      m = 0; dsum = 0.0d0
+      do i = 1, ncols
+        if (cols(i) /= r) foff = foff + vals(i)**2
+        if (mark(cols(i) / n_tor)) then
+          m = m + 1
+          jj(m) = cols(i); vv(m) = vals(i)
+        else
+          dsum  = dsum + abs(vals(i))
+          fdrop = fdrop + vals(i)**2
+        endif
+      enddo
+      if (physics_pc_suu_comp == 1 .and. dsum > 0.0d0) then
+        do i = 1, m
+          if (jj(i) == r) vv(i) = vv(i) + sign(dsum, vv(i))
+        enddo
+      endif
+      call MatSetValues(T, 1, (/ r /), m, jj(1:m), vv(1:m), INSERT_VALUES, ierr)
+      deallocate(jj, vv)
+      call MatRestoreRow(S_uu, r, ncols, cols, vals, ierr)
+      mark(kcols(1:nk)) = .false.
+      call MatRestoreRow(Ak, ridx, nk, kcols, kvals, ierr)
+    enddo
+    call MatAssemblyBegin(T, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(T, MAT_FINAL_ASSEMBLY, ierr)
+    call MatDestroy(Ak, ierr)
+
+    nz0 = 0.0d0; nz1 = 0.0d0
+    do r = 1, n_rows
+      nz1 = nz1 + rcnt(r)
+    enddo
+    call MatGetInfoNnz(S_uu, nz0)
+    if (my_id == 0) write(*,'(A,I0,A,I0,A,F8.1,A,F8.1,A,ES10.3)') &
+      "[Physics PC]   S_uu ring mask: ring ", physics_pc_suu_ring, ", comp ", physics_pc_suu_comp, &
+      ", nnz/row ", nz0 / n_rows, " -> ", nz1 / n_rows, &
+      ", dropped ||.||_F / ||offdiag||_F = ", sqrt(fdrop / max(foff, tiny(1.0d0)))
+    deallocate(rcnt, mark)
+
+    call MatDestroy(S_uu, ierr)
+    S_uu = T
+
+  contains
+
+    subroutine MatGetInfoNnz(A, nz)
+      Mat, intent(in)     :: A
+      real*8, intent(out) :: nz
+      MatInfo :: info
+      call MatGetInfo(A, MAT_GLOBAL_SUM, info, ierr)
+      nz = info%nz_used
+    end subroutine MatGetInfoNnz
+
+  end subroutine mask_suu_ring
 
   !--------------------------------------------------------------------
   !> Workstream B, phase 5: is any step of the mixed sweep multigrid-amenable?
@@ -7417,8 +8223,9 @@ contains
     ! rank does not own. The diagonal/lumped arm of make_mass_inverse is now
     ! ownership-range correct, so an SFM2 configuration that uses only diagonal
     ! inverses is parallel-safe and must NOT be blocked here.
-    needs_fsai = (physics_pc_schur_massinv == 7 .or. physics_pc_schur_massinv == 8 .or. &
-                  physics_pc_schur_pairinv == 7 .or. physics_pc_schur_pairinv == 8)
+    ! build_fsai is ownership-aware since 2026-09-14 (ghost rows via
+    ! MatCreateSubMatrices), so FSAI no longer forces a serial run.
+    needs_fsai = .false.
 
     if (unconditional .or. needs_fsai) then
       if (my_id == 0) then
@@ -7461,7 +8268,7 @@ contains
   !! the next rebuild, so a cached nest would dangle.
   !--------------------------------------------------------------------
   subroutine build_pair_psi_prod(comm, first_time, my_id)
-    use phys_module, only: physics_pc_pair_scale
+    use phys_module, only: physics_pc_pair_scale, physics_pc_psi_schur
 
     integer, intent(in) :: comm
     logical, intent(in) :: first_time
@@ -7497,18 +8304,26 @@ contains
       call MatGetLocalSize(g_ctx%B_33, n2_loc, PETSC_NULL_INTEGER, ierr)
       call MatGetSize(g_ctx%B_11, n1_glo, PETSC_NULL_INTEGER, ierr)
       call MatGetSize(g_ctx%B_33, n2_glo, PETSC_NULL_INTEGER, ierr)
-      call ISCreateStride(comm, n1_loc, 0,      1, g_ctx%is_pair_psi(1), ierr)
-      call ISCreateStride(comm, n2_loc, n1_glo, 1, g_ctx%is_pair_psi(2), ierr)
+      ! The Nest->AIJ pack is rank-contiguous: rank r owns [field-1 local |
+      ! field-2 local], so each field's stride starts at the rank's own offset.
+      block
+        PetscInt :: prs, pre
+        call MatGetOwnershipRange(g_ctx%K_pj_aij, prs, pre, ierr)
+        call ISCreateStride(comm, n1_loc, prs,          1, g_ctx%is_pair_psi(1), ierr)
+        call ISCreateStride(comm, n2_loc, prs + n1_loc, 1, g_ctx%is_pair_psi(2), ierr)
+      end block
     endif
 
     !--- Step 2: symmetric block scaling, applied to the STORED operator so that
     !--- the LU (and any later AMG, and the probe) all see the scaled pair. The
     !--- apply scales the RHS and unscales the solution with the same D, which
     !--- makes the whole thing an exact similarity.
-    if (physics_pc_pair_scale /= 0) then
+    ! Skipped under physics_pc_psi_schur: that shell works on the UNSCALED
+    ! g_ctx blocks (and ksp_Mj), so a scaled K_pj would not match it.
+    if (physics_pc_pair_scale /= 0 .and. physics_pc_psi_schur == 0) then
       if (g_ctx%pscale_pj_ready) call VecDestroy(g_ctx%pscale_pj, ierr)
-      call MatGetSize(g_ctx%B_11, n1_glo, PETSC_NULL_INTEGER, ierr)
-      call make_pair_block_scale(g_ctx%K_pj_aij, n1_glo, g_ctx%pscale_pj, &
+      call MatGetLocalSize(g_ctx%B_11, n1_loc, PETSC_NULL_INTEGER, ierr)
+      call make_pair_block_scale(g_ctx%K_pj_aij, n1_loc, g_ctx%pscale_pj, &
                                  comm, my_id, "pair_psi")
       g_ctx%pscale_pj_ready = .true.
     endif
@@ -7517,6 +8332,677 @@ contains
       "[Physics PC]   pair_psi: [[B_11,B_13],[B_31,B_33]] assembled (j kept mixed)"
 
   end subroutine build_pair_psi_prod
+
+  !--------------------------------------------------------------------
+  !> Workstream C: solve pair_psi by ONE application of the j-first lower
+  !! block factorisation with the eta-scaled Schur approximation
+  !!
+  !!   z_j   = B_33^-1 r_j                    (ksp_Mj: LU factored once per run)
+  !!   z_psi = Shat^-1 (r_psi - B_13 z_j),    Shat = B_11 - diag(r) B_31,
+  !!                                          r_i  = (B_13)_ii / (B_33)_ii
+  !!
+  !! WHY (docs/physics_pc/workstream_C_gmg_probe.md S3.6): in model199,
+  !! B_13 = -theta dt (eta_num K_1 + M_{eta_T/R}) and B_33 = M_{1/R}. With
+  !! eta_num = 0, B_13 is a row-scaled B_33 up to the variation of eta_T over
+  !! an element, so the exact Schur correction B_13 B_33^-1 B_31 is diag(r) B_31:
+  !! sparse, on B_11's stencil, with no mass inverse. The a11 layout
+  !! (setup_pair_inner_ksp) drops it, and its weight grows like theta dt eta/h^2,
+  !! which is why that layout fails under refinement. Offline: 4/5/6 outer its
+  !! at tstep 0.1/1/10 on BOTH 41x16 and 81x32, and 12/13/13 on
+  !! intear_pcbench_gradients, where eta_T varies 400x.
+  !!
+  !! physics_pc_psi_schur = 1: Shat by PREONLY + LU (MUMPS), a scalar 81 nnz/row
+  !!   operator instead of the 210 nnz/row packed pair.
+  !! physics_pc_psi_schur = 2: Shat by PSC_SWEEPS damped-Jacobi sweeps, an exact
+  !!   solve on the axis patch, and PSC_SWEEPS more. No factorisation of Shat.
+  !!   Shat is mass-dominated in the target window, so no coarse grid is needed
+  !!   (the offline GMG and smoother-only rows are identical). The axis patch
+  !!   is required: the polar-axis angular DOFs are near-null.
+  !!
+  !! B_33 must be solved accurately; approximating it degrades with dt and h,
+  !! because its error re-enters through B_13 ~ dt. That is free: ksp_Mj exists.
+  !!
+  !! Uses the UNSCALED g_ctx blocks, so build_pair_psi_prod skips the pair_psi
+  !! block scaling when this arm is on. K_pj_aij is still built: it is this
+  !! KSP's nominal operator, the self-check's operator, and the dump's.
+  !--------------------------------------------------------------------
+  subroutine setup_psi_eta_schur_ksp(comm, my_id)
+    use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
+                                gmg_setup_operator
+    use phys_module,    only: physics_pc_psi_schur, physics_pc_verify_mixed, eta_num, tstep, &
+                              physics_pc_psi_outer, physics_pc_pair_rtol, &
+                              physics_pc_psi_gmg_smoother, physics_pc_psi_gmg_nsmooth
+    use mod_parameters, only: n_tor, n_degrees
+    use nodes_elements, only: node_list
+
+    integer, intent(in) :: comm, my_id
+
+    Vec            :: d13, d33
+    Mat            :: T31, Sax
+    PC             :: pc
+    PetscErrorCode :: ierr
+    PetscScalar, pointer :: a13(:), a33(:), ad(:)
+    PetscInt       :: n, k, nax, m, idx, i_n
+    PetscInt, allocatable :: ax(:)
+    logical, allocatable  :: seen(:)
+    real*8         :: dmax, emin, emax
+    logical        :: ok
+
+    call schur_mixed_require_serial(comm, my_id, "physics_pc_psi_schur /= 0")
+    if (eta_num /= 0.d0) then
+      ! Not a fallback: with hyper-resistivity B_13 gains eta_num K_1, whose
+      ! diagonal dominates r, and the true correction is a discrete biharmonic
+      ! that no row scaling can represent. Refuse rather than mis-measure.
+      if (my_id == 0) write(*,'(A)') &
+        "[Physics PC]   FATAL: physics_pc_psi_schur needs eta_num = 0 (the eta-scaled "// &
+        "Schur is invalid with hyper-resistivity; see workstream_C_gmg_probe.md S3.6)."
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    endif
+    psc_mode = physics_pc_psi_schur
+
+    !--- r = diag(B_13) / diag(B_33); 0 on rows with no mass (boundary rows).
+    !--- n is the LOCAL row count: every loop below walks VecGetArray data.
+    call MatGetLocalSize(g_ctx%B_33, n, PETSC_NULL_INTEGER, ierr)
+    call MatCreateVecs(g_ctx%B_33, d33, PETSC_NULL_VEC, ierr)
+    call VecDuplicate(d33, d13, ierr)
+    call MatGetDiagonal(g_ctx%B_33, d33, ierr)
+    call MatGetDiagonal(g_ctx%B_13, d13, ierr)
+    call VecNorm(d33, NORM_INFINITY, dmax, ierr)
+    call VecGetArray(d13, a13, ierr)
+    call VecGetArrayRead(d33, a33, ierr)
+    emin = huge(1.d0); emax = -huge(1.d0)
+    do k = 1, n
+      if (abs(a33(k)) > 1.d-12 * dmax) then
+        a13(k) = a13(k) / a33(k)
+        emin = min(emin, -a13(k) / tstep); emax = max(emax, -a13(k) / tstep)
+      else
+        a13(k) = 0.d0
+      endif
+    enddo
+    call VecRestoreArrayRead(d33, a33, ierr)
+    call VecRestoreArray(d13, a13, ierr)
+    block
+      real*8 :: ebuf(2), erbuf(2)
+      integer :: mpierr_
+      ebuf = [-emin, emax]
+      call MPI_Allreduce(ebuf, erbuf, 2, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr_)
+      emin = -erbuf(1); emax = erbuf(2)
+    end block
+
+    !--- Shat = B_11 - diag(r) B_31
+    if (psc_ready) call MatDestroy(psc_Shat, ierr)
+    call MatDuplicate(g_ctx%B_31, MAT_COPY_VALUES, T31, ierr)
+    call MatDiagonalScale(T31, d13, PETSC_NULL_VEC, ierr)
+    ! How far Shat is from mass-dominated: |diag(diag(r) B_31)| / |diag(B_11)|
+    ! on the rows with mass (r /= 0; the ZBIG Dirichlet rows would swamp any
+    ! norm). Small = the Jacobi sweeps see an h-flat operator (C1 mass); O(1)
+    ! and growing with refinement = the resistive part dominates and
+    ! psi_schur = 3 (GMG) is needed for mesh independence.
+    block
+      Vec :: dc, d11
+      PetscScalar, pointer :: ac(:), a11(:), ar(:)
+      real*8 :: rmax, rsum
+      integer :: nr_
+      call VecDuplicate(d33, dc, ierr); call VecDuplicate(d33, d11, ierr)
+      call MatGetDiagonal(T31, dc, ierr); call MatGetDiagonal(g_ctx%B_11, d11, ierr)
+      call VecGetArrayRead(dc, ac, ierr); call VecGetArrayRead(d11, a11, ierr)
+      call VecGetArrayRead(d13, ar, ierr)
+      rmax = 0.d0; rsum = 0.d0; nr_ = 0
+      do k = 1, n
+        if (ar(k) == 0.d0 .or. a11(k) == 0.d0) cycle
+        rmax = max(rmax, abs(ac(k) / a11(k))); rsum = rsum + abs(ac(k) / a11(k)); nr_ = nr_ + 1
+      enddo
+      call VecRestoreArrayRead(dc, ac, ierr); call VecRestoreArrayRead(d11, a11, ierr)
+      call VecRestoreArrayRead(d13, ar, ierr)
+      call VecDestroy(dc, ierr); call VecDestroy(d11, ierr)
+      block
+        real*8 :: sb(2), rb
+        integer :: mpierr_, nrg
+        sb(1) = rsum; sb(2) = dble(nr_)
+        call MPI_Allreduce(MPI_IN_PLACE, sb, 2, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr_)
+        rsum = sb(1); nrg = nint(sb(2))
+        call MPI_Allreduce(rmax, rb, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr_)
+        rmax = rb; nr_ = nrg
+      end block
+      if (my_id == 0) write(*,'(A,ES10.3,A,ES10.3)') &
+        "[Physics PC]   pair_psi Shat resistive/B_11 diagonal ratio: mean ", rsum / max(nr_, 1), &
+        ", max ", rmax
+    end block
+    call MatDuplicate(g_ctx%B_11, MAT_COPY_VALUES, psc_Shat, ierr)
+    call MatAXPY(psc_Shat, -1.0d0, T31, DIFFERENT_NONZERO_PATTERN, ierr)
+    call MatDestroy(T31, ierr)
+    call VecDestroy(d13, ierr)
+    call VecDestroy(d33, ierr)
+
+    if (my_id == 0) write(*,'(A,I0,A,ES10.3,A,ES10.3,A)') &
+      "[Physics PC]   pair_psi eta-Schur (mode ", psc_mode, "): theta*eta_T = -r/tstep in [", &
+      emin, ", ", emax, "]"
+    call report_operator_density(psc_Shat, "Shat (eta-scaled psi Schur)", my_id)
+
+    if (.not. psc_vecs_ready) then
+      call MatCreateVecs(psc_Shat, psc_zpsi, psc_res, ierr)
+      call VecDuplicate(psc_zpsi, psc_t, ierr)
+      call VecDuplicate(psc_zpsi, psc_zj, ierr)
+      call VecDuplicate(psc_zpsi, psc_dinv, ierr)
+      ! Axis patch rows (mode 2 only): every DOF of every axis node, all
+      ! harmonics. Geometry only, so built once. Shared axis DOFs
+      ! (force_central_node) appear once. Each rank lists only the rows it
+      ! owns, so the IS has no duplicates at np > 1.
+      if (psc_mode == 2) then
+        block
+          PetscInt :: ng, rs, re
+          call MatGetSize(g_ctx%B_33, ng, PETSC_NULL_INTEGER, ierr)
+          call MatGetOwnershipRange(g_ctx%B_33, rs, re, ierr)
+          allocate(seen(ng), ax(ng))
+          seen = .false.; nax = 0
+          do i_n = 1, node_list%n_nodes
+            if (.not. node_list%node(i_n)%axis_node) cycle
+            do k = 1, n_degrees
+              do m = 0, n_tor - 1
+                idx = (node_list%node(i_n)%index(k) - 1) * n_tor + m
+                if (idx < rs .or. idx >= re) cycle
+                if (.not. seen(idx + 1)) then
+                  seen(idx + 1) = .true.; nax = nax + 1; ax(nax) = idx
+                endif
+              enddo
+            enddo
+          enddo
+        end block
+        call ISCreateGeneral(comm, nax, ax(1:nax), PETSC_COPY_VALUES, psc_is_axis, ierr)
+        deallocate(seen, ax)
+      endif
+      psc_vecs_ready = .true.
+    endif
+
+    !--- the Shat solver (modes 1 and 2; mode 3 uses the GMG below and never
+    !--- touches psc_kspS -- the axis LU it used to build here was unused)
+    if (psc_mode /= 3) then
+    if (psc_ready) call KSPDestroy(psc_kspS, ierr)
+    call KSPCreate(comm, psc_kspS, ierr)
+    call KSPSetType(psc_kspS, KSPPREONLY, ierr)
+    call KSPGetPC(psc_kspS, pc, ierr)
+    call PCSetType(pc, PCLU, ierr)
+    call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
+    if (psc_mode == 1) then
+      call KSPSetOperators(psc_kspS, psc_Shat, psc_Shat, ierr)
+    else
+      call MatGetDiagonal(psc_Shat, psc_dinv, ierr)
+      call VecGetArray(psc_dinv, ad, ierr)
+      do k = 1, n
+        if (ad(k) /= 0.d0) then
+          ad(k) = 1.d0 / ad(k)
+        else
+          ad(k) = 1.d0
+        endif
+      enddo
+      call VecRestoreArray(psc_dinv, ad, ierr)
+      call MatCreateSubMatrix(psc_Shat, psc_is_axis, psc_is_axis, MAT_INITIAL_MATRIX, Sax, ierr)
+      call KSPSetOperators(psc_kspS, Sax, Sax, ierr)
+      if (psc_ready) call VecDestroy(psc_zax, ierr)
+      call MatCreateVecs(Sax, psc_zax, PETSC_NULL_VEC, ierr)
+      call MatDestroy(Sax, ierr)      ! the KSP holds its own reference
+    endif
+    call KSPSetUp(psc_kspS, ierr)
+    endif
+
+    !--- mode 3: Shat by one V-cycle of the C1 GMG (hierarchy instance 2, one
+    !--- field). Scalable where the Jacobi sweeps are not: the C1 mass is badly
+    !--- Jacobi-conditioned (kappa ~ 470) and the theta dt eta K part grows like
+    !--- 1/h^2. Its axis block sits inside the smoother blocks (smoother >= 2).
+    if (psc_mode == 3) then
+      call gmg_select(2)
+      if (.not. gmg_is_ready()) then
+        call gmg_build_prolongations(psc_Shat, comm, my_id, 1, ok)
+        if (.not. ok) then
+          if (my_id == 0) write(*,'(A)') &
+            "[Physics PC]   FATAL: physics_pc_psi_schur = 3 needs the structured flux-surface grid."
+          call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+        endif
+      endif
+      call gmg_setup_operator(psc_Shat, comm, my_id, tag="pair_psi Shat", &
+                              smoother=physics_pc_psi_gmg_smoother, nsmooth=physics_pc_psi_gmg_nsmooth)
+      call gmg_select(1)
+    endif
+
+    !--- the pair_psi KSP: one application of the shell
+    if (psc_ready) call KSPDestroy(g_ctx%ksp_pair_psi, ierr)
+    call KSPCreate(comm, g_ctx%ksp_pair_psi, ierr)
+    call KSPSetOperators(g_ctx%ksp_pair_psi, g_ctx%K_pj_aij, g_ctx%K_pj_aij, ierr)
+    if (physics_pc_psi_outer > 0) then
+      ! Inner Krylov on the (sparse, raw-block) pair: one application of the
+      ! factorisation loses ~10 outer its at tstep 10 even with Shat exact.
+      call KSPSetType(g_ctx%ksp_pair_psi, KSPFGMRES, ierr)
+      call KSPGMRESSetRestart(g_ctx%ksp_pair_psi, max(physics_pc_psi_outer, 2), ierr)
+      call KSPSetTolerances(g_ctx%ksp_pair_psi, physics_pc_pair_rtol, 1.d-50, 1.d6, &
+                            physics_pc_psi_outer, ierr)
+    else
+      call KSPSetType(g_ctx%ksp_pair_psi, KSPPREONLY, ierr)
+    endif
+    call KSPGetPC(g_ctx%ksp_pair_psi, pc, ierr)
+    call PCSetType(pc, PCSHELL, ierr)
+    call PCShellSetApply(pc, psc_apply, ierr)
+    call PCShellSetName(pc, "pair_psi eta-scaled j-first Schur", ierr)
+    call KSPSetUp(g_ctx%ksp_pair_psi, ierr)
+    psc_ready = .true.
+
+    if (physics_pc_psi_outer > 0 .and. my_id == 0) write(*,'(A,I0,A,ES9.2)') &
+      "[Physics PC]   pair_psi: FGMRES around the eta-Schur, maxits ", physics_pc_psi_outer, &
+      ", rtol ", physics_pc_pair_rtol
+    if (psc_mode == 1) then
+      call pc_print_block_setup(comm, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
+        "PREONLY + SHELL[j-first, Shat = B_11 - diag(B_13/B_33) B_31 by LU]")
+    else if (psc_mode == 3) then
+      call pc_print_block_setup(comm, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
+        "SHELL[j-first, Shat by one C1 GMG V-cycle]")
+    else
+      call pc_print_block_setup(comm, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
+        "PREONLY + SHELL[j-first, Shat by Jacobi sweeps + axis patch]")
+    endif
+
+    if (physics_pc_verify_mixed) call psc_self_check(comm, my_id)
+
+  end subroutine setup_psi_eta_schur_ksp
+
+  !--------------------------------------------------------------------
+  !> A one-field block (B_55 rho, B_66 T) by FGMRES(physics_pc_rhot_gmg) to
+  !! physics_pc_pair_rtol, preconditioned by one V-cycle of its own C1 GMG
+  !! hierarchy (instance 3 or 4). Replaces the per-rebuild MUMPS LU: the last
+  !! factorisation of a fine operator in the SFM2 sweep.
+  !--------------------------------------------------------------------
+  subroutine setup_scalar_gmg_ksp(ksp_block, B_block, inst_id, comm, my_id, first_time, label)
+    use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
+                                gmg_setup_operator, gmg_pc_apply_3, gmg_pc_apply_4
+    use phys_module, only: physics_pc_rhot_gmg, physics_pc_rhot_gmg_smoother, physics_pc_pair_rtol
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: inst_id, comm, my_id
+    logical, intent(in) :: first_time
+    character(len=*), intent(in) :: label
+    PC  :: pc
+    PetscErrorCode :: ierr
+    logical :: ok
+    character(len=24) :: tstr
+
+    call schur_mixed_require_serial(comm, my_id, "physics_pc_rhot_gmg /= 0")
+    call gmg_select(inst_id)
+    if (.not. gmg_is_ready()) then
+      call gmg_build_prolongations(B_block, comm, my_id, 1, ok)
+      if (.not. ok) then
+        if (my_id == 0) write(*,'(A)') &
+          "[Physics PC]   FATAL: physics_pc_rhot_gmg needs the structured flux-surface grid."
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+    endif
+    call gmg_setup_operator(B_block, comm, my_id, tag=label, smoother=physics_pc_rhot_gmg_smoother)
+    call gmg_select(1)
+
+    if (.not. first_time) call KSPDestroy(ksp_block, ierr)
+    call KSPCreate(comm, ksp_block, ierr)
+    call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+    call KSPSetType(ksp_block, KSPFGMRES, ierr)
+    call KSPGMRESSetRestart(ksp_block, max(physics_pc_rhot_gmg, 2), ierr)
+    call KSPSetTolerances(ksp_block, physics_pc_pair_rtol, 1.d-50, 1.d6, physics_pc_rhot_gmg, ierr)
+    call KSPGetPC(ksp_block, pc, ierr)
+    call PCSetType(pc, PCSHELL, ierr)
+    if (inst_id == 3) then
+      call PCShellSetApply(pc, gmg_pc_apply_3, ierr)
+    else
+      call PCShellSetApply(pc, gmg_pc_apply_4, ierr)
+    endif
+    call KSPSetUp(ksp_block, ierr)
+    write(tstr,'(ES9.2)') physics_pc_pair_rtol
+    call pc_print_block_setup(comm, label, "FGMRES + SHELL[C1 GMG V-cycle], rtol "//trim(adjustl(tstr)))
+  end subroutine setup_scalar_gmg_ksp
+
+  !> PCSHELL apply for setup_psi_eta_schur_ksp. rvec/zvec are pair_psi-packed
+  !! (psi rows first, then j), exactly the is_pair_psi layout.
+  subroutine psc_apply(pc, rvec, zvec, ierr)
+    use mod_petsc_pc_gmg, only: gmg_vcycle
+    PC  :: pc
+    Vec :: rvec, zvec
+    PetscErrorCode :: ierr
+    Vec :: rp, rj, zp, zj
+
+    call PetscLogEventBegin(pcev_psipc, ierr)
+    call VecGetSubVector(rvec, g_ctx%is_pair_psi(2), rj, ierr)
+    call KSPSolve(g_ctx%ksp_Mj, rj, psc_zj, ierr)                ! z_j = B_33^-1 r_j
+    call VecRestoreSubVector(rvec, g_ctx%is_pair_psi(2), rj, ierr)
+
+    call MatMult(g_ctx%B_13, psc_zj, psc_t, ierr)
+    call VecGetSubVector(rvec, g_ctx%is_pair_psi(1), rp, ierr)
+    call VecAYPX(psc_t, -1.0d0, rp, ierr)                        ! t = r_psi - B_13 z_j
+    call VecRestoreSubVector(rvec, g_ctx%is_pair_psi(1), rp, ierr)
+
+    if (psc_mode == 1) then
+      call KSPSolve(psc_kspS, psc_t, psc_zpsi, ierr)
+    else if (psc_mode == 3) then
+      call gmg_vcycle(2, psc_t, psc_zpsi)
+    else
+      call VecZeroEntries(psc_zpsi, ierr)
+      call psc_jacobi_sweeps()
+      call psc_axis_patch()
+      call psc_jacobi_sweeps()
+    endif
+
+    call VecGetSubVector(zvec, g_ctx%is_pair_psi(1), zp, ierr)
+    call VecCopy(psc_zpsi, zp, ierr)
+    call VecRestoreSubVector(zvec, g_ctx%is_pair_psi(1), zp, ierr)
+    call VecGetSubVector(zvec, g_ctx%is_pair_psi(2), zj, ierr)
+    call VecCopy(psc_zj, zj, ierr)
+    call VecRestoreSubVector(zvec, g_ctx%is_pair_psi(2), zj, ierr)
+    call PetscLogEventEnd(pcev_psipc, ierr)
+
+  contains
+
+    subroutine psc_jacobi_sweeps()
+      integer :: s
+      do s = 1, PSC_SWEEPS
+        call MatMult(psc_Shat, psc_zpsi, psc_res, ierr)
+        call VecAYPX(psc_res, -1.0d0, psc_t, ierr)               ! res = t - Shat z
+        call VecPointwiseMult(psc_res, psc_res, psc_dinv, ierr)
+        call VecAXPY(psc_zpsi, PSC_OMEGA, psc_res, ierr)
+      enddo
+    end subroutine psc_jacobi_sweeps
+
+    subroutine psc_axis_patch()
+      Vec :: rsub, zsub
+      call MatMult(psc_Shat, psc_zpsi, psc_res, ierr)
+      call VecAYPX(psc_res, -1.0d0, psc_t, ierr)
+      call VecGetSubVector(psc_res, psc_is_axis, rsub, ierr)
+      call KSPSolve(psc_kspS, rsub, psc_zax, ierr)
+      call VecRestoreSubVector(psc_res, psc_is_axis, rsub, ierr)
+      call VecGetSubVector(psc_zpsi, psc_is_axis, zsub, ierr)
+      call VecAXPY(zsub, 1.0d0, psc_zax, ierr)
+      call VecRestoreSubVector(psc_zpsi, psc_is_axis, zsub, ierr)
+    end subroutine psc_axis_patch
+
+  end subroutine psc_apply
+
+  !--------------------------------------------------------------------
+  !> Workstream D (physics_pc_suu_shell = 1 | 2): a MATSHELL for the fine pair_w
+  !! operator, applied from the raw blocks instead of the assembled S_W_aij.
+  !!
+  !!   y = Ds W (Ds x),  W = [[S_uu, B_24], [B_42, B_44]],  Ds = pscale_w
+  !!   S_uu x = B_22 x - B_21 p + B_23 M B_31 p,   p = Dh B_12 x
+  !!
+  !! mode 1: M = sfp_Qip (FSAI), algebraically S_W_aij -- the correctness gate.
+  !! mode 2: M = B_33^-1 by ksp_Mj (MUMPS LU, factored once per run). Q^-1 is
+  !!   dense even though its factors are sparse, so this operator can only exist
+  !!   matrix-free (memory assembled-schur-mass-inverse, point 3).
+  !! Stage 1: S_W_aij is still assembled and supplies the multigrid's Galerkin
+  !! coarse operators, Jacobi diagonal and axis block; the shell replaces every
+  !! fine-level matvec (smoother, residuals, axis patch, inner FGMRES).
+  !--------------------------------------------------------------------
+  subroutine setup_pair_w_shell(comm, my_id)
+    use phys_module, only: physics_pc_suu_shell
+    integer, intent(in) :: comm, my_id
+    PetscErrorCode :: ierr
+    PetscInt :: n1, n2, ng, rs, re
+    Vec :: x, y1, y2
+    real*8 :: dn, yn
+
+    if (.not. shw_d_ready) then
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: pair_w shell built before Dh."
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    endif
+    if (.not. shw_ready) then
+      ! Same layout as S_W_aij: rank r owns [u local | omega local] (the
+      ! Nest->AIJ pack), so the field strides start at the rank's own offset.
+      call MatGetLocalSize(g_ctx%B_22, n1, PETSC_NULL_INTEGER, ierr)
+      call MatGetLocalSize(g_ctx%S_W_aij, n2, PETSC_NULL_INTEGER, ierr)
+      call MatGetSize(g_ctx%S_W_aij, ng, PETSC_NULL_INTEGER, ierr)
+      call MatGetOwnershipRange(g_ctx%S_W_aij, rs, re, ierr)
+      call MatCreateShell(comm, n2, n2, ng, ng, PETSC_NULL_INTEGER, shw_A, ierr)
+      call MatShellSetOperation(shw_A, MATOP_MULT, shw_mult, ierr)
+      call MatCreateVecs(g_ctx%S_W_aij, shw_xs, PETSC_NULL_VEC, ierr)
+      call MatCreateVecs(g_ctx%B_12, PETSC_NULL_VEC, shw_p1, ierr)    ! psi space
+      call VecDuplicate(shw_p1, shw_p2, ierr)
+      call MatCreateVecs(g_ctx%B_31, PETSC_NULL_VEC, shw_j1, ierr)    ! j space
+      call VecDuplicate(shw_j1, shw_j2, ierr)
+      call MatCreateVecs(g_ctx%B_22, PETSC_NULL_VEC, shw_t, ierr)     ! u space
+      call ISCreateStride(comm, n1, rs, 1, shw_isu, ierr)
+      call ISCreateStride(comm, n2 - n1, rs + n1, 1, shw_isw, ierr)
+      shw_ready = .true.
+    endif
+
+    ! Agreement with the assembled operator: ~1e-15 in mode 1 (a wiring gate),
+    ! the FSAI mass-inverse error in mode 2 (a measurement).
+    call MatCreateVecs(g_ctx%S_W_aij, x, y1, ierr)
+    call VecDuplicate(y1, y2, ierr)
+    call VecSetRandom(x, PETSC_NULL_RANDOM, ierr)
+    call MatMult(g_ctx%S_W_aij, x, y1, ierr)
+    call MatMult(shw_A, x, y2, ierr)
+    call VecNorm(y1, NORM_2, yn, ierr)
+    call VecAXPY(y2, -1.0d0, y1, ierr)
+    call VecNorm(y2, NORM_2, dn, ierr)
+    if (my_id == 0) write(*,'(A,I0,A,ES10.3)') "[Physics PC]   pair_w shell (mode ", &
+      physics_pc_suu_shell, "): ||A_shell x - S_W x|| / ||S_W x|| = ", dn / yn
+    call VecDestroy(x, ierr); call VecDestroy(y1, ierr); call VecDestroy(y2, ierr)
+  end subroutine setup_pair_w_shell
+
+  subroutine shw_mult(A, x, y, ierr)
+    use phys_module, only: physics_pc_suu_shell
+    Mat :: A
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    Vec :: xu, xw, yu, yw
+
+    call PetscLogEventBegin(pcev_shellmult, ierr)
+    call VecCopy(x, shw_xs, ierr)
+    if (g_ctx%pscale_w_ready) call VecPointwiseMult(shw_xs, shw_xs, g_ctx%pscale_w, ierr)
+    call VecGetSubVector(shw_xs, shw_isu, xu, ierr)
+    call VecGetSubVector(shw_xs, shw_isw, xw, ierr)
+    call VecGetSubVector(y, shw_isu, yu, ierr)
+    call VecGetSubVector(y, shw_isw, yw, ierr)
+
+    call MatMult(g_ctx%B_12, xu, shw_p1, ierr)                     ! p = Dh B_12 x_u
+    call VecPointwiseMult(shw_p1, shw_p1, shw_d, ierr)
+    call MatMult(g_ctx%B_31, shw_p1, shw_j1, ierr)
+    if (physics_pc_suu_shell == 1) then
+      call MatMult(sfp_Qip, shw_j1, shw_j2, ierr)
+    else
+      call PetscLogEventBegin(pcev_mjsolve, ierr)
+      call KSPSolve(g_ctx%ksp_Mj, shw_j1, shw_j2, ierr)
+      call PetscLogEventEnd(pcev_mjsolve, ierr)
+    endif
+    call MatMult(g_ctx%B_23, shw_j2, yu, ierr)                     ! + B_23 M B_31 p
+    call MatMultAdd(g_ctx%B_22, xu, yu, yu, ierr)                  ! + B_22 x_u
+    call MatMult(g_ctx%B_21, shw_p1, shw_t, ierr)
+    call VecAXPY(yu, -1.0d0, shw_t, ierr)                          ! - B_21 p
+    call MatMultAdd(g_ctx%B_24, xw, yu, yu, ierr)                  ! + B_24 x_w
+    call MatMult(g_ctx%B_42, xu, yw, ierr)
+    call MatMultAdd(g_ctx%B_44, xw, yw, yw, ierr)
+
+    call VecRestoreSubVector(shw_xs, shw_isu, xu, ierr)
+    call VecRestoreSubVector(shw_xs, shw_isw, xw, ierr)
+    call VecRestoreSubVector(y, shw_isu, yu, ierr)
+    call VecRestoreSubVector(y, shw_isw, yw, ierr)
+    if (g_ctx%pscale_w_ready) call VecPointwiseMult(y, y, g_ctx%pscale_w, ierr)
+    call PetscLogEventEnd(pcev_shellmult, ierr)
+    ierr = 0
+  end subroutine shw_mult
+
+  !> Reference arm without multigrid (physics_pc_w_gmg = 0, pair_inner = 0):
+  !! FGMRES on the shell, preconditioned by the existing LU of S_W_aij, to
+  !! physics_pc_pair_rtol. Isolates what the exact M_j^-1 does to the OUTER
+  !! count when the inner solve is accurate.
+  subroutine pair_w_shell_wrap_lu(comm)
+    use phys_module, only: physics_pc_pair_maxits, physics_pc_pair_rtol
+    integer, intent(in) :: comm
+    PetscErrorCode :: ierr
+    character(len=24) :: tstr
+    call KSPSetOperators(g_ctx%ksp_pair_w, shw_A, g_ctx%S_W_aij, ierr)
+    call KSPSetType(g_ctx%ksp_pair_w, KSPFGMRES, ierr)
+    call KSPGMRESSetRestart(g_ctx%ksp_pair_w, max(physics_pc_pair_maxits, 2), ierr)
+    call KSPSetTolerances(g_ctx%ksp_pair_w, physics_pc_pair_rtol, 1.d-50, 1.d6, &
+                          physics_pc_pair_maxits, ierr)
+    call KSPSetUp(g_ctx%ksp_pair_w, ierr)
+    write(tstr,'(ES9.2)') physics_pc_pair_rtol
+    call pc_print_block_setup(comm, "pair_w KSP (shell)", &
+      "FGMRES(shell) + LU(S_W_aij), rtol "//trim(adjustl(tstr)))
+  end subroutine pair_w_shell_wrap_lu
+
+  !--------------------------------------------------------------------
+  !> Workstream C: pair_w by geometric multigrid on the exact nested C1
+  !! coarse space (mod_petsc_pc_gmg). The prolongations are built once per
+  !! run; the Galerkin chain and smoothers are rebuilt here at every PC rebuild
+  !! because S_W_aij is a new Mat each time.
+  !!
+  !! physics_pc_w_gmg = 1: PREONLY -- ONE V-cycle per pair_w solve. Offline
+  !!   every configuration reached the rtol-1e-1 inexact bar in one cycle.
+  !! physics_pc_w_gmg = 2: FGMRES with the V-cycle as preconditioner, capped by
+  !!   physics_pc_pair_maxits / physics_pc_pair_rtol.
+  !!
+  !! Operates on S_W_aij AS STORED, i.e. block-scaled when
+  !! physics_pc_pair_scale = 1 (the configuration measured offline); the apply's
+  !! pair_ksp_solve handles D.
+  !! Keep physics_pc_schur_pairinv = 2: FSAI-0 on Shat (pairinv = 7) makes S_uu
+  !! indefinite at tstep 10 and no smoother survives (S3.3).
+  !--------------------------------------------------------------------
+  subroutine setup_pair_w_gmg_ksp(comm, my_id)
+    use mod_petsc_pc_gmg, only: gmg_build_prolongations, gmg_setup_operator, &
+                                gmg_vcycle_apply, gmg_is_ready, gmg_select
+    use phys_module, only: physics_pc_w_gmg, physics_pc_verify_mixed, &
+                           physics_pc_pair_maxits, physics_pc_pair_rtol, &
+                           physics_pc_schur_pairinv, physics_pc_suu_shell
+    integer, intent(in) :: comm, my_id
+    logical, save :: pw_ready = .false.
+    logical :: ok
+    PC  :: pc
+    PetscErrorCode :: ierr
+    character(len=24) :: tstr
+
+    call schur_mixed_require_serial(comm, my_id, "physics_pc_w_gmg /= 0")
+    call gmg_select(1)
+    if (.not. gmg_is_ready()) then
+      call gmg_build_prolongations(g_ctx%S_W_aij, comm, my_id, 2, ok)
+      if (.not. ok) then
+        if (my_id == 0) write(*,'(A)') &
+          "[Physics PC]   FATAL: physics_pc_w_gmg needs the structured flux-surface grid."
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+      if (physics_pc_schur_pairinv /= 2 .and. my_id == 0) write(*,'(A)') &
+        "[Physics PC]   WARNING: physics_pc_w_gmg with pairinv /= 2 -- S_uu can turn "// &
+        "indefinite at tstep >= 10 and the smoother then stagnates (workstream C S3.3)."
+    endif
+    if (physics_pc_suu_shell /= 0) then
+      call gmg_setup_operator(g_ctx%S_W_aij, comm, my_id, shw_A)
+    else
+      call gmg_setup_operator(g_ctx%S_W_aij, comm, my_id)
+    endif
+
+    if (pw_ready) call KSPDestroy(g_ctx%ksp_pair_w, ierr)
+    call KSPCreate(comm, g_ctx%ksp_pair_w, ierr)
+    if (physics_pc_suu_shell /= 0) then
+      call KSPSetOperators(g_ctx%ksp_pair_w, shw_A, g_ctx%S_W_aij, ierr)
+    else
+      call KSPSetOperators(g_ctx%ksp_pair_w, g_ctx%S_W_aij, g_ctx%S_W_aij, ierr)
+    endif
+    if (physics_pc_w_gmg == 1) then
+      call KSPSetType(g_ctx%ksp_pair_w, KSPPREONLY, ierr)
+    else
+      call KSPSetType(g_ctx%ksp_pair_w, KSPFGMRES, ierr)
+      call KSPGMRESSetRestart(g_ctx%ksp_pair_w, max(physics_pc_pair_maxits, 2), ierr)
+      call KSPSetTolerances(g_ctx%ksp_pair_w, physics_pc_pair_rtol, 1.d-50, 1.d6, &
+                            physics_pc_pair_maxits, ierr)
+    endif
+    call KSPGetPC(g_ctx%ksp_pair_w, pc, ierr)
+    call PCSetType(pc, PCSHELL, ierr)
+    call PCShellSetApply(pc, gmg_vcycle_apply, ierr)
+    call PCShellSetName(pc, "pair_w C1 geometric multigrid V-cycle", ierr)
+    call KSPSetUp(g_ctx%ksp_pair_w, ierr)
+    pw_ready = .true.
+
+    if (physics_pc_w_gmg == 1) then
+      call pc_print_block_setup(comm, "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])", &
+        "PREONLY + SHELL[GMG V-cycle, GMRES(4)+Jacobi, axis patch]")
+    else
+      write(tstr,'(ES9.2)') physics_pc_pair_rtol
+      call pc_print_block_setup(comm, "pair_w KSP ([S_uu^SFM,B_24;B_42,B_44])", &
+        "FGMRES + SHELL[GMG V-cycle], rtol "//trim(adjustl(tstr)))
+    endif
+
+    if (physics_pc_verify_mixed) call pw_self_check()
+
+  contains
+
+    !> Offline reference (tools/gmg_experiments.py, G2, same operator): 15/16/44
+    !! its to rtol 1e-8 at tstep 0.1/1/10 on 41x16.
+    subroutine pw_self_check()
+      KSP :: kchk
+      PC  :: pck
+      Vec :: xref, b, x
+      PetscInt :: its
+      KSPConvergedReason :: reason
+      real*8 :: ex, nx
+      call MatCreateVecs(g_ctx%S_W_aij, xref, b, ierr)
+      call VecDuplicate(xref, x, ierr)
+      call VecSetRandom(xref, PETSC_NULL_RANDOM, ierr)
+      call MatMult(g_ctx%S_W_aij, xref, b, ierr)
+      call KSPCreate(comm, kchk, ierr)
+      call KSPSetOperators(kchk, g_ctx%S_W_aij, g_ctx%S_W_aij, ierr)
+      call KSPSetType(kchk, KSPFGMRES, ierr)
+      call KSPGMRESSetRestart(kchk, 40, ierr)
+      call KSPSetTolerances(kchk, 1.d-8, 1.d-50, 1.d8, 200, ierr)
+      call KSPGetPC(kchk, pck, ierr)
+      call PCSetType(pck, PCSHELL, ierr)
+      call PCShellSetApply(pck, gmg_vcycle_apply, ierr)
+      call KSPSolve(kchk, b, x, ierr)
+      call KSPGetIterationNumber(kchk, its, ierr)
+      call KSPGetConvergedReason(kchk, reason, ierr)
+      call VecNorm(xref, NORM_2, nx, ierr)
+      call VecAXPY(x, -1.0d0, xref, ierr)
+      call VecNorm(x, NORM_2, ex, ierr)
+      if (my_id == 0) write(*,'(A,I0,A,I0,A,ES10.3)') &
+        "[Physics PC]   pair_w GMG self-check: FGMRES its = ", its, &
+        ", reason = ", reason, ", err = ", ex / nx
+      call KSPDestroy(kchk, ierr)
+      call VecDestroy(xref, ierr); call VecDestroy(b, ierr); call VecDestroy(x, ierr)
+    end subroutine pw_self_check
+
+  end subroutine setup_pair_w_gmg_ksp
+
+  !> Wiring gate (physics_pc_verify_mixed): FGMRES on pair_psi preconditioned
+  !! by the shell, to rtol 1e-8. Offline reference (tools/psi_schur.py, same
+  !! operator): mode 1 needs 4/5/6 its at tstep 0.1/1/10 on intear_island_demo,
+  !! mode 2 about 17. A count far above that means the shell is mis-wired.
+  subroutine psc_self_check(comm, my_id)
+    integer, intent(in) :: comm, my_id
+    KSP :: kchk
+    PC  :: pc
+    Vec :: xref, b, x
+    PetscErrorCode :: ierr
+    PetscInt :: its
+    KSPConvergedReason :: reason
+    real*8 :: ex, nx
+
+    call MatCreateVecs(g_ctx%K_pj_aij, xref, b, ierr)
+    call VecDuplicate(xref, x, ierr)
+    call VecSetRandom(xref, PETSC_NULL_RANDOM, ierr)
+    call MatMult(g_ctx%K_pj_aij, xref, b, ierr)
+    call KSPCreate(comm, kchk, ierr)
+    call KSPSetOperators(kchk, g_ctx%K_pj_aij, g_ctx%K_pj_aij, ierr)
+    call KSPSetType(kchk, KSPFGMRES, ierr)
+    call KSPGMRESSetRestart(kchk, 40, ierr)
+    call KSPSetTolerances(kchk, 1.d-8, 1.d-50, 1.d8, 200, ierr)
+    call KSPSetNormType(kchk, KSP_NORM_UNPRECONDITIONED, ierr)
+    call KSPGetPC(kchk, pc, ierr)
+    call PCSetType(pc, PCSHELL, ierr)
+    call PCShellSetApply(pc, psc_apply, ierr)
+    call KSPSolve(kchk, b, x, ierr)
+    call KSPGetIterationNumber(kchk, its, ierr)
+    call KSPGetConvergedReason(kchk, reason, ierr)
+    call VecNorm(xref, NORM_2, nx, ierr)
+    call VecAXPY(x, -1.0d0, xref, ierr)
+    call VecNorm(x, NORM_2, ex, ierr)
+    if (my_id == 0) write(*,'(A,I0,A,I0,A,ES10.3)') &
+      "[Physics PC]   pair_psi eta-Schur self-check: FGMRES its = ", its, &
+      ", reason = ", reason, ", err = ", ex / nx
+    call KSPDestroy(kchk, ierr)
+    call VecDestroy(xref, ierr)
+    call VecDestroy(b, ierr)
+    call VecDestroy(x, ierr)
+  end subroutine psc_self_check
 
   !--------------------------------------------------------------------
   !> Workstream B: assemble pair_w = [[S_uu^SFM, B_24], [B_42, B_44]], the
@@ -7552,7 +9038,9 @@ contains
     use phys_module, only: time_evol_zeta, tstep, tstep_prev, &
                            physics_pc_schur_channels, physics_pc_schur_massinv, &
                            physics_pc_schur_pairinv, physics_pc_wave_schur, &
-                           physics_pc_pair_scale
+                           physics_pc_pair_scale, physics_pc_dump_blocks, &
+                           physics_pc_suu_ring, physics_pc_suu_shell, &
+                           physics_pc_lean_setup
 
     integer, intent(in)           :: comm
     logical, intent(in)           :: first_time
@@ -7571,8 +9059,14 @@ contains
     Mat            :: Shat, Shati
     logical        :: paired
     real*8         :: fL, fS
+    logical        :: lean_dh, diag_now
+    Vec            :: dscale_lean
 
     ok = .false.
+    lean_dh = .false.
+    ! Workstream D audit A2: the lean setup runs the per-rebuild diagnostics
+    ! (norms, densities, ||S_uu - B_22||_F) on the first build only.
+    diag_now = (physics_pc_lean_setup == 0 .or. first_time)
 
     !--- Guards. Both run BEFORE anything is created or destroyed, so a failure
     !--- leaves g_ctx exactly as it was found for this value of first_time.
@@ -7588,6 +9082,17 @@ contains
 
     opz = 1.d0 + time_evol_zeta * 2.d0 * tstep / (tstep + tstep_prev)
     nch = max(1, min(3, physics_pc_schur_channels))
+
+    ! Workstream D: the shell applies ONLY the SFM2 psi channel with a diagonal
+    ! Shat^-1; anything else would make the shell and S_W_aij disagree silently.
+    if (physics_pc_suu_shell /= 0) then
+      if (trim(label) /= "SFM2" .or. nch /= 1 .or. physics_pc_schur_pairinv /= 2 &
+          .or. physics_pc_suu_ring /= 0) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_suu_shell needs "// &
+          "SFM2, physics_pc_schur_channels = 1, physics_pc_schur_pairinv = 2 and no ring mask."
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+    endif
 
     ! B_33 (1/R mass) and B_44 (R mass) are geometry-only, so their sparse
     ! inverses are built once for the whole run. TWO separate ready flags, not
@@ -7665,30 +9170,45 @@ contains
       endif
 
       call mat_product_cached(g_ctx%B_13, sfp_Qip,   sfp_TSa, sfp_nnz_TSa, "B_13*Qi ", comm, my_id)
-      call mat_product_cached(sfp_TSa,    g_ctx%B_31, sfp_TS, sfp_nnz_TS,  "(B_13*Qi)*B_31", comm, my_id)
-      call MatDuplicate(g_ctx%B_33, MAT_COPY_VALUES, Shat, ierr)
-      call MatScale(Shat, opz, ierr)
-      call MatAXPY(Shat, -1.0d0, sfp_TS, DIFFERENT_NONZERO_PATTERN, ierr)
+      ! Workstream D audit A1: pairinv 2 reads only diag(Shat), so the lean
+      ! setup takes it from row dots of B_13*Qi with B_31^T instead of forming
+      ! the 22.8M-nnz product (B_13*Qi)*B_31 and a full Shat.
+      lean_dh = (physics_pc_lean_setup /= 0 .and. physics_pc_schur_pairinv == 2)
+      if (.not. lean_dh) then
+        call mat_product_cached(sfp_TSa,    g_ctx%B_31, sfp_TS, sfp_nnz_TS,  "(B_13*Qi)*B_31", comm, my_id)
+        call MatDuplicate(g_ctx%B_33, MAT_COPY_VALUES, Shat, ierr)
+        call MatScale(Shat, opz, ierr)
+        call MatAXPY(Shat, -1.0d0, sfp_TS, DIFFERENT_NONZERO_PATTERN, ierr)
+      endif
       call PetscLogEventEnd(pcev_shat, ierr)
+      if (first_time) call physics_pc_mem("SFM2: Shat chain (TLa, TL, Ltil, TSa)", my_id)
 
       ! Shat^-1 gets its OWN fidelity flag, not physics_pc_schur_massinv. Two
       ! reasons: it is the new knob and conflating it with the mass inverse would
       ! hide which one matters; and massinv = 8 forms Q*Q for its sparsity
       ! pattern, which for a Shat that is already a triple product would be a
       ! density explosion. Default is 2 (diagonal).
-      call make_mass_inverse(Shat, Shati, "Shat", comm, my_id, physics_pc_schur_pairinv)
+      if (lean_dh) then
+        call PetscLogEventBegin(pcev_shat, ierr)
+        call shat_diag_inverse(opz, dscale_lean)
+        call PetscLogEventEnd(pcev_shat, ierr)
+      else
+        call make_mass_inverse(Shat, Shati, "Shat", comm, my_id, physics_pc_schur_pairinv)
+      endif
 
       ! Diagnostics FIRST: the psi channel below scales sfp_Ltil in place, so
       ! measuring ||Ltil||_F afterwards would report the scaled operator.
-      call PetscLogEventBegin(pcev_builddiag, ierr)
-      call MatNorm(sfp_Ltil, NORM_FROBENIUS, fL, ierr)
-      call MatNorm(Shat, NORM_FROBENIUS, fS, ierr)
-      if (my_id == 0) write(*,'(A,I0,A,ES11.4,A,ES11.4)') &
-        "[Physics PC]   SFM2 paired psi channel: pairinv = ", physics_pc_schur_pairinv, &
-        ", ||Ltil||_F = ", fL, ", ||Shat||_F = ", fS
-      call report_operator_density(sfp_Ltil, "Ltil (B_21 - B_23 Qi B_31)", my_id)
-      call report_operator_density(Shat, "Shat (opz Q - B_13 Qi B_31)", my_id)
-      call PetscLogEventEnd(pcev_builddiag, ierr)
+      if (diag_now .and. .not. lean_dh) then
+        call PetscLogEventBegin(pcev_builddiag, ierr)
+        call MatNorm(sfp_Ltil, NORM_FROBENIUS, fL, ierr)
+        call MatNorm(Shat, NORM_FROBENIUS, fS, ierr)
+        if (my_id == 0) write(*,'(A,I0,A,ES11.4,A,ES11.4)') &
+          "[Physics PC]   SFM2 paired psi channel: pairinv = ", physics_pc_schur_pairinv, &
+          ", ||Ltil||_F = ", fL, ", ||Shat||_F = ", fS
+        call report_operator_density(sfp_Ltil, "Ltil (B_21 - B_23 Qi B_31)", my_id)
+        call report_operator_density(Shat, "Shat (opz Q - B_13 Qi B_31)", my_id)
+        call PetscLogEventEnd(pcev_builddiag, ierr)
+      endif
 
       !--- psi channel: S_uu -= Ltil * Shati * B_12 ---
       ! pairinv 2 (diagonal) and 3 (row-sum lumped) both give a DIAGONAL Shati.
@@ -7701,24 +9221,40 @@ contains
       ! as a new object each time and MAT_REUSE_MATRIX would be invalid.
       if (physics_pc_schur_pairinv == 2 .or. physics_pc_schur_pairinv == 3) then
         call PetscLogEventBegin(pcev_channel, ierr)
-        call MatCreateVecs(Shati, dscale, PETSC_NULL_VEC, ierr)
-        call MatGetDiagonal(Shati, dscale, ierr)
+        if (lean_dh) then
+          dscale = dscale_lean
+        else
+          call MatCreateVecs(Shati, dscale, PETSC_NULL_VEC, ierr)
+          call MatGetDiagonal(Shati, dscale, ierr)
+        endif
+        if (physics_pc_suu_shell /= 0) then     ! Workstream D: the shell needs Dh
+          if (shw_d_ready) call VecDestroy(shw_d, ierr)
+          call VecDuplicate(dscale, shw_d, ierr)
+          call VecCopy(dscale, shw_d, ierr)
+          shw_d_ready = .true.
+        endif
         call MatDiagonalScale(sfp_Ltil, PETSC_NULL_VEC, dscale, ierr)
         call VecDestroy(dscale, ierr)
         call mat_product_cached(sfp_Ltil, g_ctx%B_12, sfp_ch_Tp(1), sfp_nnz_chT(1), &
                                 "psi channel Ltil*B_12", comm, my_id)
         call MatAXPY(S_uu, -1.0d0, sfp_ch_Tp(1), DIFFERENT_NONZERO_PATTERN, ierr)
         call PetscLogEventEnd(pcev_channel, ierr)
+        if (first_time) call physics_pc_mem("SFM2: channel Ltil*B_12 and S_uu", my_id)
       else
         call add_channel(sfp_Ltil, Shati, g_ctx%B_12, 1.0d0, 0)
       endif
 
-      call MatDestroy(Shat, ierr)
-      call MatDestroy(Shati, ierr)
+      if (.not. lean_dh) then
+        call MatDestroy(Shat, ierr)
+        call MatDestroy(Shati, ierr)
+      endif
     endif
 
     if (nch >= 2) call add_channel(g_ctx%B_25, sfp_QiR, g_ctx%B_52, 1.d0/opz, 2)  ! rho channel
     if (nch >= 3) call add_channel(g_ctx%B_26, sfp_QiR, g_ctx%B_62, 1.d0/opz, 3)  ! T   channel
+
+    ! Workstream D: restrict S_uu to the ring-k node stencil (off by default).
+    if (physics_pc_suu_ring > 0) call mask_suu_ring(S_uu, comm, my_id)
 
     !--- Pack into the 2x2 (u,omega) nest and convert to a concrete AIJ.
     ! Row 1 (u eq):     S_uu  B_24
@@ -7735,14 +9271,21 @@ contains
     call MatConvert(W_nest, MATMPIAIJ, MAT_INITIAL_MATRIX, g_ctx%S_W_aij, ierr)
     call MatDestroy(W_nest, ierr)
     call PetscLogEventEnd(pcev_convert, ierr)
+    if (first_time) call physics_pc_mem("SFM2: S_W packed (S_uu still alive)", my_id)
 
     if (.not. g_ctx%schur_mixed_vecs_ready) then
       call MatGetLocalSize(g_ctx%B_22, n1_loc, PETSC_NULL_INTEGER, ierr)
       call MatGetLocalSize(g_ctx%B_44, n2_loc, PETSC_NULL_INTEGER, ierr)
       call MatGetSize(g_ctx%B_22, n1_glo, PETSC_NULL_INTEGER, ierr)
       call MatGetSize(g_ctx%B_44, n2_glo, PETSC_NULL_INTEGER, ierr)
-      call ISCreateStride(comm, n1_loc, 0,      1, g_ctx%is_pair_w(1), ierr)
-      call ISCreateStride(comm, n2_loc, n1_glo, 1, g_ctx%is_pair_w(2), ierr)
+      ! The Nest->AIJ pack is rank-contiguous: rank r owns [field-1 local |
+      ! field-2 local], so each field's stride starts at the rank's own offset.
+      block
+        PetscInt :: prs, pre
+        call MatGetOwnershipRange(g_ctx%S_W_aij, prs, pre, ierr)
+        call ISCreateStride(comm, n1_loc, prs,          1, g_ctx%is_pair_w(1), ierr)
+        call ISCreateStride(comm, n2_loc, prs + n1_loc, 1, g_ctx%is_pair_w(2), ierr)
+      end block
     endif
 
     !--- Diagnostics. These are the measurements this arm exists for.
@@ -7760,12 +9303,15 @@ contains
     ! ||S_uu - B_22||_F: how much the Riesz channels actually moved the diagonal.
     ! If this is ~0 the channels are inert; if it is enormous, suspect a
     ! double-counted fold (a Schur-corrected block used in place of a raw one).
-    call PetscLogEventBegin(pcev_builddiag, ierr)
-    call MatDuplicate(S_uu, MAT_COPY_VALUES, D_uu_diff, ierr)
-    call MatAXPY(D_uu_diff, -1.0d0, g_ctx%B_22, DIFFERENT_NONZERO_PATTERN, ierr)
-    call MatNorm(D_uu_diff, NORM_FROBENIUS, fnorm, ierr)
-    call MatDestroy(D_uu_diff, ierr)
-    call PetscLogEventEnd(pcev_builddiag, ierr)
+    fnorm = -1.0d0
+    if (diag_now) then
+      call PetscLogEventBegin(pcev_builddiag, ierr)
+      call MatDuplicate(S_uu, MAT_COPY_VALUES, D_uu_diff, ierr)
+      call MatAXPY(D_uu_diff, -1.0d0, g_ctx%B_22, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatNorm(D_uu_diff, NORM_FROBENIUS, fnorm, ierr)
+      call MatDestroy(D_uu_diff, ierr)
+      call PetscLogEventEnd(pcev_builddiag, ierr)
+    endif
 
     ! min/max |diag| of the packed operator: ~1e12 ZBIG penalty rows against ~h^2
     ! mass rows. This ratio decides whether an iterative inner solver has any
@@ -7787,12 +9333,34 @@ contains
     ! triple-product structure, different base and different psi-channel L. S_W
     ! additionally carries the two sparse constraint blocks and twice the rows,
     ! so it is NOT the like-for-like number.
-    call PetscLogEventBegin(pcev_builddiag, ierr)
-    call report_operator_density(S_uu,           "S_uu (SFM momentum Schur)", my_id)
-    call report_operator_density(g_ctx%S_W_aij,  "S_W  (SFM packed u,omega)", my_id)
-    call report_operator_density(g_ctx%K_pj_aij, "K_pj (SFM packed psi,j)  ", my_id)
-    call report_operator_density(g_ctx%B_22,     "B_22 (raw u diagonal)    ", my_id)
-    call PetscLogEventEnd(pcev_builddiag, ierr)
+    if (diag_now) then
+      call PetscLogEventBegin(pcev_builddiag, ierr)
+      call report_operator_density(S_uu,           "S_uu (SFM momentum Schur)", my_id)
+      call report_operator_density(g_ctx%S_W_aij,  "S_W  (SFM packed u,omega)", my_id)
+      call report_operator_density(g_ctx%K_pj_aij, "K_pj (SFM packed psi,j)  ", my_id)
+      call report_operator_density(g_ctx%B_22,     "B_22 (raw u diagonal)    ", my_id)
+      call PetscLogEventEnd(pcev_builddiag, ierr)
+    endif
+
+    ! Audit A8, first build only: cross-harmonic content of the operands.
+    if (first_time) then
+      call report_harmonic_coupling(g_ctx%B_12, "B_12", my_id)
+      call report_harmonic_coupling(g_ctx%B_21, "B_21", my_id)
+      call report_harmonic_coupling(g_ctx%B_22, "B_22", my_id)
+      call report_harmonic_coupling(g_ctx%B_23, "B_23", my_id)
+      call report_harmonic_coupling(g_ctx%B_31, "B_31", my_id)
+      call report_harmonic_coupling(g_ctx%B_33, "B_33", my_id)
+      call report_harmonic_coupling(g_ctx%B_24, "B_24", my_id)
+      call report_harmonic_coupling(g_ctx%B_44, "B_44", my_id)
+      call report_harmonic_coupling(g_ctx%B_11, "B_11", my_id)
+      call report_harmonic_coupling(g_ctx%B_13, "B_13", my_id)
+      call report_harmonic_coupling(g_ctx%S_W_aij, "S_W ", my_id)
+      call report_harmonic_coupling(g_ctx%K_pj_aij, "K_pj", my_id)
+    endif
+
+    ! Workstream C: offline GMG probe. Before the block scaling below, so the
+    ! dumped pairs are the unscaled operators.
+    if (physics_pc_dump_blocks /= 0) call dump_sfm2_blocks(S_uu, comm, my_id)
 
     call MatDestroy(S_uu, ierr)   ! safe: MatConvert copied the values out
 
@@ -7801,8 +9369,8 @@ contains
     !--- scaled spread is printed by make_pair_block_scale itself.
     if (physics_pc_pair_scale /= 0) then
       if (g_ctx%pscale_w_ready) call VecDestroy(g_ctx%pscale_w, ierr)
-      call MatGetSize(g_ctx%B_22, n1_glo, PETSC_NULL_INTEGER, ierr)
-      call make_pair_block_scale(g_ctx%S_W_aij, n1_glo, g_ctx%pscale_w, &
+      call MatGetLocalSize(g_ctx%B_22, n1_loc, PETSC_NULL_INTEGER, ierr)
+      call make_pair_block_scale(g_ctx%S_W_aij, n1_loc, g_ctx%pscale_w, &
                                  comm, my_id, "pair_w  ")
       g_ctx%pscale_w_ready = .true.
     endif
@@ -7812,6 +9380,71 @@ contains
     ok = .true.
 
   contains
+
+    !> Audit A1: d = 1 / diag(Shat), Shat = opz*B_33 - (B_13 Qi) B_31, with the
+    !! same magnitude-relative floor as make_mass_inverse's diagonal arm, but
+    !! never forming Shat: diag((B_13 Qi) B_31)_i = row_i(B_13 Qi) . row_i(B_31^T).
+    !! On the first build the result is checked against the product path.
+    subroutine shat_diag_inverse(opz_, d)
+      real*8, intent(in) :: opz_
+      Vec, intent(out)   :: d
+      Mat :: Bt
+      Vec :: dref
+      PetscScalar, pointer :: dp(:)
+      PetscReal :: dmx, err, nrm
+      integer :: i, nfl
+      PetscInt :: nn
+
+      call MatCreateVecs(g_ctx%B_33, PETSC_NULL_VEC, d, ierr)
+      call MatGetDiagonal(g_ctx%B_33, d, ierr)
+      call VecScale(d, opz_, ierr)
+      call MatTranspose(g_ctx%B_31, MAT_INITIAL_MATRIX, Bt, ierr)
+      call mat_diag_of_product(sfp_TSa, Bt, d, -1.0d0)      ! d -= diag(TSa B_31)
+      call MatDestroy(Bt, ierr)
+
+      if (first_time) then
+        ! A1 gate, once per run: the product path's diagonal.
+        call mat_product_cached(sfp_TSa, g_ctx%B_31, sfp_TS, sfp_nnz_TS, "(B_13*Qi)*B_31", comm, my_id)
+        call VecDuplicate(d, dref, ierr)
+        call MatGetDiagonal(sfp_TS, dref, ierr)
+        call VecScale(dref, -1.0d0, ierr)
+        call VecGetSize(d, nn, ierr)
+        block
+          Vec :: b33
+          call VecDuplicate(d, b33, ierr)
+          call MatGetDiagonal(g_ctx%B_33, b33, ierr)
+          call VecAXPY(dref, opz_, b33, ierr)                 ! dref = opz diag(B_33) - diag(TS)
+          call VecDestroy(b33, ierr)
+        end block
+        call VecNorm(dref, NORM_INFINITY, nrm, ierr)
+        call VecAXPY(dref, -1.0d0, d, ierr)
+        call VecNorm(dref, NORM_INFINITY, err, ierr)
+        call VecDestroy(dref, ierr)
+        if (my_id == 0) write(*,'(A,ES10.3)') &
+          "[Physics PC]   lean diag(Shat) gate: ||d_rowdot - d_product||_inf / ||d||_inf = ", err / max(nrm, 1.d-300)
+      endif
+
+      call VecNorm(d, NORM_INFINITY, dmx, ierr)
+      call VecGetLocalSize(d, nn, ierr)
+      call VecGetArray(d, dp, ierr)
+      nfl = 0
+      do i = 1, int(nn)
+        if (abs(dp(i)) > 1.d-12 * max(dmx, 1.d-300)) then
+          dp(i) = 1.0d0 / dp(i)
+        else
+          dp(i) = 1.0d0; nfl = nfl + 1
+        endif
+      enddo
+      call VecRestoreArray(d, dp, ierr)
+      block
+        integer :: nfl_g, mpierr_
+        call MPI_Allreduce(nfl, nfl_g, 1, MPI_INTEGER, MPI_SUM, comm, mpierr_)
+        nfl = nfl_g
+      end block
+      call VecGetSize(d, nn, ierr)
+      if (my_id == 0) write(*,'(A,I0,A,I0)') &
+        "[Physics PC]   lean diag(Shat) inverse built (no Shat product): floored rows = ", nfl, " of ", nn
+    end subroutine shat_diag_inverse
 
     !> S_uu -= alpha * (L Qi U). alpha is explicit because the SFM2 psi channel
     !! carries its (1+zeta) inside Shat and so needs alpha = 1, while every
@@ -8352,9 +9985,10 @@ contains
   !! or a point-block smoother needs is preserved exactly. Per-row equilibration
   !! would flatten the diagonal further but destroy that structure.
   !--------------------------------------------------------------------
-  subroutine make_pair_block_scale(A, n1_glo, dvec, comm, my_id, label)
+  subroutine make_pair_block_scale(A, n1_loc, dvec, comm, my_id, label)
     Mat, intent(inout)           :: A
-    PetscInt, intent(in)         :: n1_glo   !< global rows in the FIRST field
+    PetscInt, intent(in)         :: n1_loc   !< LOCAL rows in the FIRST field: the
+                                             !< Nest->AIJ pack is [f1 local | f2 local] per rank
     Vec, intent(inout)           :: dvec     !< out: D, kept for the apply
     integer, intent(in)          :: comm
     integer, intent(in)          :: my_id
@@ -8376,8 +10010,7 @@ contains
     acc = 0.d0
     call VecGetArray(dvec, dptr, ierr)
     do kk = 1, int(rend - rstart)
-      ii = rstart + kk - 1
-      if (ii < n1_glo) then
+      if (kk <= n1_loc) then
         acc(1) = acc(1) + abs(dptr(kk))
         acc(3) = acc(3) + 1.d0
       else
@@ -8406,8 +10039,7 @@ contains
     !--- D itself: 1 on the first field, s on the second.
     call VecGetArray(dvec, dptr, ierr)
     do kk = 1, int(rend - rstart)
-      ii = rstart + kk - 1
-      if (ii < n1_glo) then
+      if (kk <= n1_loc) then
         dptr(kk) = 1.d0
       else
         dptr(kk) = s

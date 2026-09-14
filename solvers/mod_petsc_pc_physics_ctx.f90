@@ -268,6 +268,18 @@ module mod_petsc_pc_physics_ctx
   PetscLogEvent, save :: pcev_convert    = -1  !< MatConvert nest -> MPIAIJ, both pairs
   PetscLogEvent, save :: pcev_builddiag  = -1  !< the norm/density diagnostics in the build
 
+  ! Workstream D: the matrix-free pair_w operator. ShellMult / MjSolve counts
+  ! against GMG_VCycle's count give fine matvecs per V-cycle.
+  PetscLogEvent, save :: pcev_shellmult  = -1  !< one shw_mult (fine pair_w matvec)
+  PetscLogEvent, save :: pcev_mjsolve    = -1  !< the B_33^-1 solve inside shw_mult
+  PetscLogEvent, save :: pcev_psipc      = -1  !< one application of the pair_psi eta-Schur PC
+
+  ! Inner pair_w iterations, accumulated over one outer solve and printed next
+  ! to the outer count by physics_pc_report_inner.
+  integer, save :: pw_its_sum = 0, pw_its_max = 0, pw_nsolve = 0
+  integer, save :: pp_its_sum = 0, pp_its_max = 0, pp_nsolve = 0   !< same for pair_psi
+  integer, save :: rt_its_sum = 0, rt_its_max = 0, rt_nsolve = 0   !< same for rho/T
+
   logical, save, private :: pcev_registered = .false.
 
 contains
@@ -325,9 +337,97 @@ contains
     call PetscLogEventRegister("PhysPC_Channel",   0, pcev_channel,    ierr)
     call PetscLogEventRegister("PhysPC_Convert",   0, pcev_convert,    ierr)
     call PetscLogEventRegister("PhysPC_BuildDiag", 0, pcev_builddiag,  ierr)
+    call PetscLogEventRegister("PhysPC_ShellMult", 0, pcev_shellmult,  ierr)
+    call PetscLogEventRegister("PhysPC_MjSolve",   0, pcev_mjsolve,    ierr)
+    call PetscLogEventRegister("PhysPC_PsiPC",     0, pcev_psipc,      ierr)
 
     pcev_registered = .true.
   end subroutine physics_pc_log_events_register
+
+  !> Print and reset the inner pair_w iteration counters of the outer solve
+  !! that just finished. Silent when pair_w was not solved (other arms).
+  subroutine physics_pc_report_inner(my_id)
+    integer, intent(in) :: my_id
+    if (pw_nsolve > 0 .and. my_id == 0) write(*,'(A,I0,A,I0,A,F7.2,A,I0)') &
+      "[Physics PC] pair_w inner its: solves = ", pw_nsolve, ", sum = ", pw_its_sum, &
+      ", mean = ", dble(pw_its_sum) / dble(pw_nsolve), ", max = ", pw_its_max
+    pw_its_sum = 0; pw_its_max = 0; pw_nsolve = 0
+    if (pp_nsolve > 0 .and. pp_its_sum > pp_nsolve .and. my_id == 0) write(*,'(A,I0,A,I0,A,F7.2,A,I0)') &
+      "[Physics PC] pair_psi inner its: solves = ", pp_nsolve, ", sum = ", pp_its_sum, &
+      ", mean = ", dble(pp_its_sum) / dble(pp_nsolve), ", max = ", pp_its_max
+    pp_its_sum = 0; pp_its_max = 0; pp_nsolve = 0
+    if (rt_nsolve > 0 .and. rt_its_sum > rt_nsolve .and. my_id == 0) write(*,'(A,I0,A,I0,A,F7.2,A,I0)') &
+      "[Physics PC] rho/T inner its: solves = ", rt_nsolve, ", sum = ", rt_its_sum, &
+      ", mean = ", dble(rt_its_sum) / dble(rt_nsolve), ", max = ", rt_its_max
+    rt_its_sum = 0; rt_its_max = 0; rt_nsolve = 0
+  end subroutine physics_pc_report_inner
+
+  !> Peak resident set size of the process so far, in bytes (getrusage).
+  !! ru_maxrss is the fifth long of struct rusage (after two 16-byte timevals)
+  !! and is in bytes on macOS but in KiB on Linux. gfortran's preprocessor
+  !! defines no OS macro, so the unit is decided at run time: a peak below the
+  !! current RSS can only be KiB.
+  real*8 function physics_pc_peak_rss()
+    use iso_c_binding, only: c_int, c_long
+    interface
+      integer(c_int) function c_getrusage(who, buf) bind(C, name="getrusage")
+        import :: c_int, c_long
+        integer(c_int), value :: who
+        integer(c_long)       :: buf(18)
+      end function c_getrusage
+    end interface
+    integer(c_long) :: buf(18)
+    integer(c_int)  :: rc
+    PetscLogDouble  :: cur
+    PetscErrorCode  :: ierr
+    buf = 0
+    rc  = c_getrusage(0_c_int, buf)
+    call PetscMemoryGetCurrentUsage(cur, ierr)
+    physics_pc_peak_rss = dble(buf(5))
+    if (physics_pc_peak_rss < 0.5d0 * cur) physics_pc_peak_rss = physics_pc_peak_rss * 1024.d0
+  end function physics_pc_peak_rss
+
+  !> Memory audit checkpoint, in GB: the live PETSc heap and its high-water
+  !! mark (tracked only under -log_view_memory or -malloc_debug, else 0), and
+  !! the process peak RSS. On macOS the RSS is load-dependent (the compressor
+  !! evicts pages under pressure), so the heap figures are the attribution;
+  !! MUMPS-internal memory is not on the PETSc heap (see physics_pc_mumps_mem).
+  subroutine physics_pc_mem(tag, my_id)
+    character(len=*), intent(in) :: tag
+    integer, intent(in)          :: my_id
+    PetscLogDouble :: hcur, hmax
+    PetscErrorCode :: ierr
+    call PetscMallocGetCurrentUsage(hcur, ierr)
+    call PetscMallocGetMaximumUsage(hmax, ierr)
+    if (my_id == 0) write(*,'(A,A,T52,A,F7.3,A,F7.3,A,F7.3,A)') "[Mem] ", tag, &
+      "heap ", hcur / 1.d9, " GB, heap peak ", hmax / 1.d9, " GB, RSS peak ", &
+      physics_pc_peak_rss() / 1.d9, " GB"
+  end subroutine physics_pc_mem
+
+  !> Memory audit: MUMPS memory and factor size of a factored PREONLY KSP.
+  !! INFOG(22) = MB effectively used during factorisation, INFOG(29) = entries
+  !! in the factors (negative means millions). Silent if the PC is not MUMPS.
+  subroutine physics_pc_mumps_mem(ksp, label, my_id)
+    KSP, intent(in)              :: ksp
+    character(len=*), intent(in) :: label
+    integer, intent(in)          :: my_id
+    PC             :: pc
+    Mat            :: F
+    MatSolverType  :: stype
+    PetscInt       :: mb, nent
+    PetscErrorCode :: ierr
+    real*8         :: ent
+    call KSPGetPC(ksp, pc, ierr)
+    call PCFactorGetMatSolverType(pc, stype, ierr)
+    if (ierr /= 0 .or. trim(stype) /= "mumps") return
+    call PCFactorGetMatrix(pc, F, ierr)
+    call MatMumpsGetInfog(F, 22_4, mb, ierr)
+    call MatMumpsGetInfog(F, 29_4, nent, ierr)
+    ent = dble(nent)
+    if (nent < 0) ent = -dble(nent) * 1.d6
+    if (my_id == 0) write(*,'(A,A,T52,A,I7,A,ES10.3)') "[Mem] MUMPS ", label, &
+      "MB ", mb, ", factor entries ", ent
+  end subroutine physics_pc_mumps_mem
 
 #endif
 end module mod_petsc_pc_physics_ctx

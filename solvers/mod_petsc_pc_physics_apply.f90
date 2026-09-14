@@ -4,7 +4,9 @@ module mod_petsc_pc_physics_apply
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
-       pcev_apply, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot
+       pcev_apply, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, &
+       pw_its_sum, pw_its_max, pw_nsolve, pp_its_sum, pp_its_max, pp_nsolve, &
+       rt_its_sum, rt_its_max, rt_nsolve
   implicit none
   private
 
@@ -654,6 +656,7 @@ contains
     Vec, intent(in)    :: x_psi, x_u, x_j, x_w, x_rho, x_T
     Vec, intent(inout) :: y_psi, y_u, y_j, y_w, y_rho, y_T
     PetscErrorCode, intent(out) :: ierr
+    PetscInt :: pw_its
 
     ! --- Step 1: predictor psi-pair.  pair_psi (psi*, j*) = (x_psi, x_j) ---
     ! The j-component of the RHS is x_j, NOT zero: this is the constraint
@@ -664,6 +667,10 @@ contains
     call pair_ksp_solve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, &
                         g_ctx%pscale_pj, g_ctx%pscale_pj_ready, ierr)
     call PetscLogEventEnd(pcev_solve_pj, ierr)
+    call KSPGetIterationNumber(g_ctx%ksp_pair_psi, pw_its, ierr)
+    pp_its_sum = pp_its_sum + int(pw_its)
+    pp_its_max = max(pp_its_max, int(pw_its))
+    pp_nsolve  = pp_nsolve + 1
     call unpack_2v(g_ctx%sol_PJ, y_psi, y_j, ierr)          ! y_psi = psi*, y_j = j*
 
     ! --- Step 1: predictor density  rho* = B_55^-1 (x_rho - B_51 psi*) ---
@@ -671,6 +678,8 @@ contains
     call VecWAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, x_rho, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call KSPSolve(g_ctx%ksp_rho, g_ctx%work_4, g_ctx%tmp_rho, ierr)   ! tmp_rho = rho*
+    call KSPGetIterationNumber(g_ctx%ksp_rho, pw_its, ierr)
+    rt_its_sum = rt_its_sum + int(pw_its); rt_its_max = max(rt_its_max, int(pw_its)); rt_nsolve = rt_nsolve + 1
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
 
     ! --- Step 1: predictor temperature  T* = B_66^-1 (x_T - B_61 psi* - B_63 j*) ---
@@ -682,6 +691,8 @@ contains
     call VecAXPY(g_ctx%work_4, -1.0d0, g_ctx%work_3, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call KSPSolve(g_ctx%ksp_T, g_ctx%work_4, g_ctx%tmp_T, ierr)       ! tmp_T = T*
+    call KSPGetIterationNumber(g_ctx%ksp_T, pw_its, ierr)
+    rt_its_sum = rt_its_sum + int(pw_its); rt_its_max = max(rt_its_max, int(pw_its)); rt_nsolve = rt_nsolve + 1
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
 
     ! --- Step 2: the ONE packed wave solve ---
@@ -706,6 +717,10 @@ contains
     call pair_ksp_solve(g_ctx%ksp_pair_w, g_ctx%rhs_W, g_ctx%sol_W, &
                         g_ctx%pscale_w, g_ctx%pscale_w_ready, ierr)
     call PetscLogEventEnd(pcev_solve_w, ierr)
+    call KSPGetIterationNumber(g_ctx%ksp_pair_w, pw_its, ierr)
+    pw_its_sum = pw_its_sum + int(pw_its)
+    pw_its_max = max(pw_its_max, int(pw_its))
+    pw_nsolve  = pw_nsolve + 1
     call unpack_2v(g_ctx%sol_W, y_u, y_w, ierr)      ! BOTH final; y_w is DONE
 
     ! --- Step 3: corrector psi-pair.  pair_psi (dpsi, dj) = (B_12 u + B_16 T*, 0) ---
@@ -720,6 +735,10 @@ contains
     call pair_ksp_solve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, &
                         g_ctx%pscale_pj, g_ctx%pscale_pj_ready, ierr)
     call PetscLogEventEnd(pcev_solve_pj, ierr)
+    call KSPGetIterationNumber(g_ctx%ksp_pair_psi, pw_its, ierr)
+    pp_its_sum = pp_its_sum + int(pw_its)
+    pp_its_max = max(pp_its_max, int(pw_its))
+    pp_nsolve  = pp_nsolve + 1
     call unpack_2v(g_ctx%sol_PJ, g_ctx%work_3, g_ctx%work_4, ierr)  ! dpsi, dj
     call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)            ! y_psi = psi* - dpsi
     call VecAXPY(y_j,   -1.0d0, g_ctx%work_4, ierr)            ! y_j   = j*   - dj
@@ -730,12 +749,16 @@ contains
     call MatMult(g_ctx%B_52, y_u, g_ctx%work_3, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call KSPSolve(g_ctx%ksp_rho, g_ctx%work_3, g_ctx%work_5, ierr)
+    call KSPGetIterationNumber(g_ctx%ksp_rho, pw_its, ierr)
+    rt_its_sum = rt_its_sum + int(pw_its); rt_its_max = max(rt_its_max, int(pw_its)); rt_nsolve = rt_nsolve + 1
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
     call VecWAXPY(y_rho, -1.0d0, g_ctx%work_5, g_ctx%tmp_rho, ierr)
 
     call MatMult(g_ctx%B_62, y_u, g_ctx%work_3, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call KSPSolve(g_ctx%ksp_T, g_ctx%work_3, g_ctx%work_5, ierr)
+    call KSPGetIterationNumber(g_ctx%ksp_T, pw_its, ierr)
+    rt_its_sum = rt_its_sum + int(pw_its); rt_its_max = max(rt_its_max, int(pw_its)); rt_nsolve = rt_nsolve + 1
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
     call VecWAXPY(y_T, -1.0d0, g_ctx%work_5, g_ctx%tmp_T, ierr)
 

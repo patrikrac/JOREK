@@ -102,6 +102,18 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 physics_pc_pair_maxits,                             &
                 physics_pc_pair_rtol,                               &
                 physics_pc_pair_amg_thr,                            &
+                physics_pc_dump_blocks,                             &
+                physics_pc_psi_schur,                               &
+                physics_pc_w_gmg,                                   &
+                physics_pc_suu_ring,                                &
+                physics_pc_suu_comp,                                &
+                physics_pc_suu_shell,                               &
+                physics_pc_lean_setup, physics_pc_gmg_smoother,     &
+                physics_pc_harm_split, physics_pc_mass_split,       &
+                physics_pc_psi_outer,                               &
+                physics_pc_psi_gmg_smoother, physics_pc_psi_gmg_nsmooth, &
+                physics_pc_rhot_gmg, physics_pc_rhot_gmg_smoother,  &
+                physics_pc_gmg_nsmooth, physics_pc_gmg_omega,       &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &

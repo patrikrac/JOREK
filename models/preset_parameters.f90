@@ -676,6 +676,23 @@ subroutine preset_parameters
   physics_pc_pair_maxits     = 30           ! Workstream B SFM2: iteration cap per pair inner solve
   physics_pc_pair_rtol       = 1.d-2        ! Workstream B SFM2: rtol per pair inner solve
   physics_pc_pair_amg_thr    = 0.05d0       ! Workstream B SFM2: GAMG strength threshold for the Shat = B_11 solve
+  physics_pc_dump_blocks     = 0            ! Workstream C: dump SFM2 operators + grid for the offline GMG probe (0=off)
+  physics_pc_psi_schur       = 0            ! Workstream C: pair_psi by the eta-scaled j-first Schur (0=off, 1=LU Shat, 2=Jacobi+axis patch)
+  physics_pc_suu_ring        = 0            ! Workstream D: restrict S_uu to the ring-k node stencil (0=off)
+  physics_pc_suu_shell       = 0            ! Workstream D: matrix-free fine pair_w (0=off, 1=FSAI M, 2=exact B_33^-1)
+  physics_pc_rhot_gmg        = 0            ! k > 0 = rho/T blocks by FGMRES(k) + C1 GMG
+  physics_pc_rhot_gmg_smoother = -1
+  physics_pc_psi_gmg_smoother = -1          ! psi_schur = 3: Shat smoother (-1 = physics_pc_gmg_smoother)
+  physics_pc_psi_gmg_nsmooth  = 0
+  physics_pc_psi_outer       = 0            ! Workstream D: k > 0 = FGMRES(k) around the eta-Schur pair_psi solve
+  physics_pc_mass_split      = 0            ! Workstream D1: 1 = per-slot constraint-mass factors, shared across identical slots
+  physics_pc_lean_setup      = 0            ! Workstream D audit: 1 = diag-only Shat + first-build-only diagnostics
+  physics_pc_harm_split      = 0            ! Workstream D audit A8: 1 = drop cross-harmonic entries of the PC operands
+  physics_pc_gmg_smoother    = 0            ! Workstream D: 0 GMRES+Jacobi, 1 Richardson+Jacobi, 2 Richardson+node block, 3 GMRES+node block
+  physics_pc_gmg_nsmooth     = 0            ! Workstream D: smoothing steps (0 = 4 for GMRES, 3 for Richardson)
+  physics_pc_gmg_omega       = 0.7d0        ! Workstream D: Richardson damping (Chacon 2025)
+  physics_pc_suu_comp        = 0            ! Workstream D: 1 = abs-row-sum diagonal compensation of the ring mask
+  physics_pc_w_gmg           = 0            ! Workstream C: pair_w by C1 geometric multigrid (0=off, 1=one V-cycle, 2=FGMRES+V-cycle)
   commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
 

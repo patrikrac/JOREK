@@ -24,7 +24,8 @@
 !  axisymmetric problem and no mode grows.  The m=2 seed is hard-coded at
 !  amplitude 1e-10 in models/model199/initial_conditions.f90.
 !
-!  Run on 1 MPI rank: the physics PC apply path fails for np > 1.
+!  Runs on any number of MPI ranks (the scalable SFM2 path is MPI-ported;
+!  MUMPS gets a centralized RHS by default, see mod_petsc petsc_initialize).
 ! =====================================================================
 
 &in1
