@@ -4,7 +4,7 @@
 #
 #    pc_case.sh <arm> <n_flux> <n_tht> <np> [key=value ...]
 #
-#  arm     jorek | sfm2_lu | sfm2_gmg   (see mknml.py)
+#  arm     jorek | sfm2_lu | sfm2_gmg | sfm2_gmg_d12   (see mknml.py)
 #  np      MPI ranks for this case (<= ranks of the allocation); every rank
 #          runs PCS_OMP OpenMP threads (hybrid MPI+OpenMP, as JOREK is run)
 #  extra key=value pairs are passed to mknml.py as namelist overrides.

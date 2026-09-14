@@ -59,7 +59,8 @@ submitted again. `results.tsv` is rewritten after every case.
 
 | arm | preconditioner |
 |---|---|
-| `sfm2_gmg` | SFM2 without refactorisations: C¹ GMG on pair_w (matrix-free fine operator with the exact mass), eta-Schur + GMG on pair_psi, GMG on ρ/T. Only the constraint masses are factored, once per run. |
+| `sfm2_gmg` | SFM2 without refactorisations: C¹ GMG on pair_w (matrix-free fine operator with the exact mass), eta-Schur + GMG on pair_psi, GMG on ρ/T. Only the constraint masses are factored, once per run. Every hierarchy uses the stage-D13 axis treatment: one axis block over the rings with r·Δθ/Δr < 1, solved by MUMPS (`physics_pc_gmg_axis_rings = -1`), and coarse levels without the boundary ring's Dirichlet DOFs (`physics_pc_gmg_bnd_drop = 1`). |
+| `sfm2_gmg_d12` | `sfm2_gmg` without the axis treatment (the configuration of commit `3cafa9f46`), for comparison. |
 | `sfm2_lu` | SFM2 with MUMPS LU inner solves (the reference for approximation quality); refactored at every PC rebuild |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
 
@@ -88,8 +89,12 @@ of the large cases.
 - `outer_its`: FGMRES iterations per time step. They must stay flat with np;
   only round-off changes them.
 - `pw_cycles_mean`: mean pair_w GMG V-cycles per solve, per step. At np > 1
-  the radial-line smoother is cut into per-rank segments, so a slow rise with
-  np is expected.
+  the radial-line smoother is cut into per-rank segments, so a rise with np is
+  expected. JOREK distributes the rows ring by ring, so each rank owns a band
+  of flux surfaces and every radial line gets one block-Jacobi cut per rank
+  boundary. On 41×16 the D13 axis treatment saves 35% / 20% / 10% of the
+  cycles at np = 1 / 2 / 4, because these cuts grow with np. Compare
+  `sfm2_gmg` against `sfm2_gmg_d12` at equal np.
 - `pp_its_mean` / `rt_its_mean`: inner iterations of pair_psi and ρ/T.
 - `wall_s`: PETSc total time. `setup_s_sum` / `solve_s_sum` are the PC build
   and the Krylov solves, summed over steps.
@@ -127,7 +132,8 @@ of the large cases.
 
 ## Local reference: 8-core MacBook Air (4 performance + 4 efficiency cores)
 
-`sfm2_gmg` on 81×32 (186k DOFs), commit `3cafa9f46`, 1 thread per rank:
+`sfm2_gmg` as of commit `3cafa9f46` (now the `sfm2_gmg_d12` arm) on 81×32
+(186k DOFs), 1 thread per rank:
 
 | np | wall [s] | pair_w solve [s] | MjSolve [s] | outer its (tstep 10) | pair_w cycles (tstep 10) |
 |---|---|---|---|---|---|
@@ -138,3 +144,13 @@ of the large cases.
 
 At np = 8 the efficiency cores are in use. The PC setup (block extraction,
 products, PtAP) roughly halves from np = 1 to np = 2, but the solve does not.
+
+With the D13 axis treatment (`sfm2_gmg` now), the serial runs on the same
+laptop give, at tstep 10:
+
+| mesh | `sfm2_gmg_d12` wall / pair_w cycles | `sfm2_gmg` wall / pair_w cycles |
+|---|---|---|
+| 81×32 | 245 s / 5.4–6.1 | 203 s / 2.6–2.7 |
+| 121×48 | 706 s / 7.4–8.3 | 513 s / 3.0–3.9 |
+
+Outer iterations are unchanged to within +4.

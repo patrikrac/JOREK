@@ -43,7 +43,7 @@ export PCS_ROOT=${PCS_ROOT:-$PWD/pc_scaling_$MODE}
 export PCS_OMP=${PCS_OMP:-${SLURM_CPUS_PER_TASK:-1}}
 
 # Arms and series (defaults in pc_study.sh). np = MPI ranks:
-# export PCS_ARMS="sfm2_gmg sfm2_lu jorek"
+# export PCS_ARMS="sfm2_gmg sfm2_gmg_d12 sfm2_lu jorek"
 # export PCS_MESH=161x64
 # export PCS_NPS="1 2 4 8"                        # e.g. 1 node at 8 ranks/node
 # export PCS_WEAK="81x32:1 161x64:4 321x128:16 641x256:64"

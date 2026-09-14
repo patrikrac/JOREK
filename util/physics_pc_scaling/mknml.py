@@ -49,7 +49,10 @@ ARMS = {
         'physics_pc_rhot_gmg': '0',
     }),
     # SFM2, factorisation-free: C1 GMG on pair_w (matrix-free fine operator with
-    # the exact mass), eta-Schur + GMG on pair_psi, GMG on rho/T
+    # the exact mass), eta-Schur + GMG on pair_psi, GMG on rho/T. Every
+    # hierarchy uses the stage-D13 axis treatment: one axis block over the
+    # rings with r*dtheta/dr < 1 (solved by MUMPS) and coarse levels without the
+    # Dirichlet u/b DOFs of the boundary ring.
     'sfm2_gmg': dict(SFM2_COMMON, **{
         'physics_pc_w_gmg': '2',
         'physics_pc_suu_shell': '2',
@@ -58,8 +61,17 @@ ARMS = {
         'physics_pc_psi_outer': '10',
         'physics_pc_rhot_gmg': '10',
         'physics_pc_rhot_gmg_smoother': '5',
+        'physics_pc_gmg_axis_rings': '-1',
+        'physics_pc_gmg_bnd_drop': '1',
     }),
 }
+# The same without the axis treatment (stage D12, commit 3cafa9f46): radial
+# lines with the axis ring alone as a block, Dirichlet DOFs kept on the coarse
+# levels. The comparison arm for the D13 changes.
+ARMS['sfm2_gmg_d12'] = dict(ARMS['sfm2_gmg'], **{
+    'physics_pc_gmg_axis_rings': '0',
+    'physics_pc_gmg_bnd_drop': '0',
+})
 
 
 def gmg_levels(n_flux, n_tht):
