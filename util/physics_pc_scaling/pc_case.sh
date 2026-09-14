@@ -5,10 +5,11 @@
 #    pc_case.sh <arm> <n_flux> <n_tht> <np> [key=value ...]
 #
 #  arm     jorek | sfm2_lu | sfm2_gmg   (see mknml.py)
-#  np      MPI ranks for this case (<= ranks of the allocation)
+#  np      MPI ranks for this case (<= ranks of the allocation); every rank
+#          runs PCS_OMP OpenMP threads (hybrid MPI+OpenMP, as JOREK is run)
 #  extra key=value pairs are passed to mknml.py as namelist overrides.
 #
-#  Creates  $PCS_ROOT/<arm>_<n_flux>x<n_tht>_np<np>[_<PCS_TAG>]/  with the
+#  Creates  $PCS_ROOT/<arm>_<n_flux>x<n_tht>_np<np>x<omp>[_<PCS_TAG>]/  with the
 #  namelist, stdout/stderr (log), -log_view profile (prof.txt) and case.meta,
 #  runs the case, and prints one summary line. collect.py turns a whole
 #  study into a table. An existing case directory with status ok is skipped
@@ -18,8 +19,10 @@
 #    JOREK_BIN     jorek_model199 built with n_tor=3, n_period=1  [required]
 #    PCS_ROOT      study directory                     [$PWD/pc_scaling]
 #    PCS_TAG       suffix for the case directory       []
-#    PCS_LAUNCH    MPI launcher prefix; NP is substituted
-#                  [srun -n NP --cpu-bind=cores  inside SLURM, else mpirun -np NP]
+#    PCS_OMP       OpenMP threads per MPI rank         [$SLURM_CPUS_PER_TASK, else 1]
+#    PCS_LAUNCH    MPI launcher prefix; NP and OMP are substituted
+#                  [srun -n NP -c OMP --cpu-bind=cores  inside SLURM,
+#                   else mpirun -np NP]
 #    PCS_PETSC_OPTS  extra PETSc options               []
 #    PCS_TSTEP_N / PCS_NSTEP_N   tstep ramp            [1.d-1,1.d0,1.d1 / 3,3,3]
 #    PCS_FORCE     1 = rerun even if the case finished []
@@ -35,18 +38,20 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${JOREK_BIN:?set JOREK_BIN to the jorek_model199 executable}"
 JOREK_BIN=$(readlink -f "$JOREK_BIN" 2>/dev/null || echo "$JOREK_BIN")
 PCS_ROOT=${PCS_ROOT:-$PWD/pc_scaling}
+OMP=${PCS_OMP:-${SLURM_CPUS_PER_TASK:-1}}
 TAG=${PCS_TAG:+_$PCS_TAG}
-CASE=${ARM}_${NF}x${NT}_np${NP}${TAG}
+CASE=${ARM}_${NF}x${NT}_np${NP}x${OMP}${TAG}
 DIR=$PCS_ROOT/$CASE
 
 if [ -z "${PCS_LAUNCH:-}" ]; then
   if [ -n "${SLURM_JOB_ID:-}" ]; then
-    PCS_LAUNCH="srun -n NP --cpu-bind=cores"
+    PCS_LAUNCH="srun -n NP -c OMP --cpu-bind=cores"
   else
     PCS_LAUNCH="mpirun -np NP"
   fi
 fi
 LAUNCH=${PCS_LAUNCH//NP/$NP}
+LAUNCH=${LAUNCH//OMP/$OMP}
 
 if [ -f "$DIR/case.meta" ] && grep -q '^status=ok' "$DIR/case.meta" && [ "${PCS_FORCE:-0}" != 1 ]; then
   echo "[pc_case] $CASE already done, skipping (PCS_FORCE=1 to rerun)"
@@ -58,16 +63,18 @@ python3 "$HERE/mknml.py" "$ARM" "$NF" "$NT" "$DIR/in" "$@" || exit 1
 
 NODES=${SLURM_JOB_NUM_NODES:-1}
 {
-  echo "arm=$ARM"; echo "n_flux=$NF"; echo "n_tht=$NT"; echo "np=$NP"; echo "nodes=$NODES"
+  echo "arm=$ARM"; echo "n_flux=$NF"; echo "n_tht=$NT"; echo "np=$NP"; echo "omp=$OMP"; echo "nodes=$NODES"
   echo "overrides=$*"; echo "bin=$JOREK_BIN"; echo "launch=$LAUNCH"
   echo "slurm_job=${SLURM_JOB_ID:-}"; echo "host=$(hostname)"; echo "start=$(date '+%Y-%m-%dT%H:%M:%S')"
   echo "git=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null)"
 } > "$DIR/case.meta"
 
 cd "$DIR" || exit 1
-# One PETSc/MUMPS thread per rank: the physics PC has no OpenMP, and a
-# threaded BLAS inside MUMPS would oversubscribe the cores srun gave us.
-export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+# Hybrid MPI+OpenMP: OMP threads per rank for JOREK's threaded parts (matrix
+# construction) and a threaded BLAS inside MUMPS. The physics PC itself has no
+# OpenMP regions; PETSc kernels run on one thread per rank.
+export OMP_NUM_THREADS=$OMP MKL_NUM_THREADS=$OMP OPENBLAS_NUM_THREADS=$OMP
+export OMP_PLACES=${OMP_PLACES:-cores} OMP_PROC_BIND=${OMP_PROC_BIND:-close}
 export PETSC_OPTIONS="-log_view :prof.txt -memory_view ${PCS_PETSC_OPTS:-}"
 T0=$(python3 -c "import time; print(time.time())")
 $LAUNCH "$JOREK_BIN" < in > log 2>&1

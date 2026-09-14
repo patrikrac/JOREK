@@ -8,7 +8,7 @@ preconditioner. The test case is the committed benchmark
 
 | file | role |
 |---|---|
-| `job_study.slurm` | example jobscript: adapt the `#SBATCH` lines and modules, then `sbatch` it |
+| `job_study.slurm` | generic jobscript template: copy it to `job_study.local.slurm` (git-ignored) and add the machine's partition, account and modules there |
 | `pc_study.sh` | runs a strong or weak series one case after another inside one allocation |
 | `pc_case.sh` | runs one case: writes the namelist, launches, profiles, records `case.meta` |
 | `mknml.py` | namelist = base + arm flags + mesh + ramp (+ `key=value` overrides) |
@@ -26,11 +26,20 @@ preconditioner. The test case is the committed benchmark
 ## Quick start
 
 ```bash
+cd util/physics_pc_scaling
+cp job_study.slurm job_study.local.slurm       # machine specifics go here, not into git
 export JOREK_BIN=/path/to/jorek/jorek_model199
-PCS_DRYRUN=1 PCS_MAXNP=64 util/physics_pc_scaling/pc_study.sh strong   # list the cases
-sbatch --export=ALL,MODE=strong util/physics_pc_scaling/job_study.slurm
-sbatch --export=ALL,MODE=weak   util/physics_pc_scaling/job_study.slurm
+PCS_DRYRUN=1 PCS_MAXNP=64 PCS_OMP=16 ./pc_study.sh strong   # list the cases
+sbatch --export=ALL,MODE=strong job_study.local.slurm
+sbatch --export=ALL,MODE=weak   job_study.local.slurm
 ```
+
+**Hybrid MPI+OpenMP.** JOREK is always run hybrid. Every case uses `np` MPI
+ranks with `PCS_OMP` OpenMP threads each; the default comes from the job's
+`--cpus-per-task`. Case directories are named
+`<arm>_<mesh>_np<ranks>x<threads>`, so 8×16 and 16×16 runs of the same mesh
+can share one study directory. Choose `--ntasks-per-node` × `--cpus-per-task`
+= the node's physical cores, for example 8 × 16 or 16 × 16.
 
 Each series runs inside one allocation, so request the largest rank count in
 the series; cases needing more ranks than the allocation has are skipped.
@@ -49,14 +58,15 @@ submitted again. `results.tsv` is rewritten after every case.
 
 | series | default | knob |
 |---|---|---|
-| strong | 161×64 (741k DOFs) at np = 1, 2, 4, …, 64 | `PCS_MESH`, `PCS_NPS` |
+| strong | 161×64 (741k DOFs) at np = 1, 2, 4, …, 64 MPI ranks | `PCS_MESH`, `PCS_NPS` |
 | weak | 81×32 at 1, 161×64 at 4, 321×128 at 16, 641×256 at 64 (about 186k DOFs per rank) | `PCS_WEAK` |
 
 Problem sizes: 41×16 = 47k, 81×32 = 186k, 161×64 = 741k, 321×128 = 2.96M,
-641×256 = 11.8M DOFs. Keep at least about 20k DOFs (and a few flux-surface
-rings) per rank. Below that, the rank-local line smoother degenerates and
+641×256 = 11.8M DOFs. Keep at least about 20k DOFs, and a few flux-surface
+rings, per MPI rank. Below that, the rank-local line smoother degenerates and
 communication dominates, so use 321×128 for strong scaling beyond about 64
-ranks.
+ranks. The partition, and therefore the smoother, depends only on the rank
+count, not on the thread count.
 
 The GMG arm needs n_flux − 1 divisible by 4 and n_tht divisible by 8 (at least
 3 levels); `mknml.py` refuses other meshes. The `sfm2_lu` arm at np = 1 on
@@ -95,12 +105,20 @@ of the large cases.
   `job_study.slurm` for the prefixes. Command-line values override the default.
 - **Do not add `-log_view_memory`.** PETSc 3.24.6 aborts with it on this path
   (unbalanced log event in `MatGetBrowsOfAoCols_MPIAIJ`).
-- **Threads.** `OMP_NUM_THREADS=1` is exported per case. The physics PC has no
-  OpenMP, so use one rank per physical core.
+- **Threads.** `OMP_NUM_THREADS`, `MKL_NUM_THREADS` and `OPENBLAS_NUM_THREADS`
+  are set to `PCS_OMP`, with `OMP_PLACES=cores` and `OMP_PROC_BIND=close`
+  unless already set.
+  - What uses the threads: JOREK's matrix construction, and MUMPS through a
+    threaded BLAS.
+  - What doesn't: the physics PC has no OpenMP regions, and PETSc's sparse
+    kernels (MatMult, PtAP) run on one thread per rank. With 8 × 16 per node,
+    the GMG, the shell matvecs and the Krylov work use 8 of the 128 cores.
+  - Keep this in mind when comparing arms. The `t_*` event times show how
+    much of each case runs single-threaded.
 
 ## Local reference: 8-core MacBook Air (4 performance + 4 efficiency cores)
 
-`sfm2_gmg` on 81×32 (186k DOFs), commit `3cafa9f46`:
+`sfm2_gmg` on 81×32 (186k DOFs), commit `3cafa9f46`, 1 thread per rank:
 
 | np | wall [s] | pair_w solve [s] | MjSolve [s] | outer its (tstep 10) | pair_w cycles (tstep 10) |
 |---|---|---|---|---|---|

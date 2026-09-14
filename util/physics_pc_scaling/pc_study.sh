@@ -4,8 +4,11 @@
 #  run one after the other inside ONE allocation (call it from a SLURM
 #  jobscript, see job_study.slurm).
 #
-#    pc_study.sh strong      # fixed mesh, np = 1 2 4 ... up to the allocation
+#    pc_study.sh strong      # fixed mesh, MPI ranks np = 1 2 4 ... up to the allocation
 #    pc_study.sh weak        # DOFs per rank fixed: mesh x2 per direction, np x4
+#
+#  np counts MPI ranks; each rank runs PCS_OMP OpenMP threads (default: the
+#  job's --cpus-per-task), so a case uses np x PCS_OMP cores.
 #    PCS_DRYRUN=1 pc_study.sh strong   # only print the cases that would run
 #
 #  Environment (defaults in brackets):
@@ -13,9 +16,10 @@
 #    PCS_MESH    strong: the fixed mesh         [161x64]
 #    PCS_NPS     strong: rank counts            [1 2 4 8 16 32 64]
 #    PCS_WEAK    weak: mesh:np pairs            [81x32:1 161x64:4 321x128:16 641x256:64]
-#    PCS_MAXNP   upper limit on np              [$SLURM_NTASKS, else 8]
+#    PCS_MAXNP   upper limit on np (MPI ranks)  [$SLURM_NTASKS, else 8]
+#    PCS_OMP     OpenMP threads per rank        [$SLURM_CPUS_PER_TASK, else 1]
 #    PCS_DRYRUN  1 = list the cases, run nothing []
-#  plus everything pc_case.sh reads (JOREK_BIN, PCS_ROOT, PCS_TAG, PCS_LAUNCH,
+#  plus everything pc_case.sh reads (JOREK_BIN, PCS_ROOT, PCS_TAG, PCS_OMP, PCS_LAUNCH,
 #  PCS_PETSC_OPTS, PCS_TSTEP_N, PCS_NSTEP_N, PCS_FORCE).
 #
 #  Cases larger than the allocation are skipped with a message. Finished
@@ -50,7 +54,8 @@ case "$MODE" in
     echo "unknown mode '$MODE'"; exit 1 ;;
 esac
 
-echo "[pc_study] mode=$MODE arms='$ARMS' maxnp=$MAXNP root=$PCS_ROOT"
+export PCS_OMP=${PCS_OMP:-${SLURM_CPUS_PER_TASK:-1}}
+echo "[pc_study] mode=$MODE arms='$ARMS' maxnp=$MAXNP omp/rank=$PCS_OMP root=$PCS_ROOT"
 for arm in $ARMS; do
   for c in "${cases[@]}"; do
     set -- $c
@@ -59,7 +64,7 @@ for arm in $ARMS; do
       continue
     fi
     if [ "${PCS_DRYRUN:-0}" = 1 ]; then
-      echo "[pc_study] would run: $arm $1x$2 np=$3"
+      echo "[pc_study] would run: $arm $1x$2 np=$3 x $PCS_OMP threads"
       continue
     fi
     "$HERE/pc_case.sh" "$arm" "$1" "$2" "$3"

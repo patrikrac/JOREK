@@ -19,7 +19,7 @@ EVENTS = [
     'GMG_VCycle', 'GMG_Smooth0', 'GMG_Coarse', 'GMG2_VCycle', 'GMG3_VCycle',
     'GMG4_VCycle', 'MatMult', 'KSPSolve',
 ]
-COLS = (['case', 'arm', 'n_flux', 'n_tht', 'np', 'nodes', 'status', 'ndof', 'wall_s',
+COLS = (['case', 'arm', 'n_flux', 'n_tht', 'np', 'omp', 'cores', 'nodes', 'status', 'ndof', 'wall_s',
          'step_s_sum', 'setup_s_sum', 'solve_s_sum', 'outer_its', 'outer_sum',
          'pw_cycles_mean', 'pp_its_mean', 'rt_its_mean', 'mem_max_total_GB',
          'mem_max_rank_GB'] + ['t_' + e for e in EVENTS])
@@ -106,7 +106,9 @@ def main(roots):
                 continue
             meta = parse_meta(os.path.join(d, 'case.meta'))
             row = {c: '' for c in COLS}
-            row.update({k: meta.get(k, '') for k in ('arm', 'n_flux', 'n_tht', 'np', 'nodes')})
+            row.update({k: meta.get(k, '') for k in ('arm', 'n_flux', 'n_tht', 'np', 'omp', 'nodes')})
+            if row['np'] and row['omp']:
+                row['cores'] = int(row['np']) * int(row['omp'])
             row['case'] = os.path.basename(d)
             row['status'] = 'no-log'
             if 'log' in files:
@@ -116,7 +118,7 @@ def main(roots):
             if not row['wall_s'] and meta.get('wall_s'):
                 row['wall_s'] = meta['wall_s']
             rows.append(row)
-    rows.sort(key=lambda r: (r['arm'], int(r['n_flux'] or 0), int(r['np'] or 0)))
+    rows.sort(key=lambda r: (r['arm'], int(r['n_flux'] or 0), int(r['omp'] or 0), int(r['np'] or 0)))
     for r in rows:
         print('\t'.join(str(r[c]) for c in COLS))
 
