@@ -59,7 +59,7 @@ submitted again. `results.tsv` is rewritten after every case.
 
 | arm | preconditioner |
 |---|---|
-| `sfm2_gmg` | SFM2 without refactorisations: C¹ GMG on pair_w (matrix-free fine operator with the exact mass), eta-Schur + GMG on pair_psi, GMG on ρ/T. Only the constraint masses are factored, once per run. Every hierarchy uses the stage-D13 axis treatment: one axis block over the rings with r·Δθ/Δr < 1, solved by MUMPS (`physics_pc_gmg_axis_rings = -1`), and coarse levels without the boundary ring's Dirichlet DOFs (`physics_pc_gmg_bnd_drop = 1`). |
+| `sfm2_gmg` | SFM2 without refactorisations: C¹ GMG on pair_w (matrix-free fine operator with the exact mass), eta-Schur + GMG on pair_psi, GMG on ρ/T. Only the constraint masses are factored, once per run. Every hierarchy uses the stage-D13 axis treatment: rings 0–3 of every level in one axis block solved by MUMPS (`physics_pc_gmg_axis_rings = 3`), and coarse levels without the boundary ring's Dirichlet DOFs (`physics_pc_gmg_bnd_drop = 1`). The ring count is fixed on purpose: the automatic choice (`-1`, all rings with r·Δθ/Δr < 1) grows like n_tht/2π rings, so its factor grows faster than N (438 MB at 49×64, tens of GB at 641×256). k = 3 was the fastest setting on both benchmarks. |
 | `sfm2_gmg_d12` | `sfm2_gmg` without the axis treatment (the configuration of commit `3cafa9f46`), for comparison. |
 | `sfm2_lu` | SFM2 with MUMPS LU inner solves (the reference for approximation quality); refactored at every PC rebuild |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
@@ -150,7 +150,10 @@ laptop give, at tstep 10:
 
 | mesh | `sfm2_gmg_d12` wall / pair_w cycles | `sfm2_gmg` wall / pair_w cycles |
 |---|---|---|
-| 81×32 | 245 s / 5.4–6.1 | 203 s / 2.6–2.7 |
-| 121×48 | 706 s / 7.4–8.3 | 513 s / 3.0–3.9 |
+| 81×32 | 245 s / 5.4–6.1 | 203 s / 2.6–2.7 (automatic axis block) |
+| 121×48 | 706 s / 7.4–8.3 | 477 s / 3.2–3.7 (k = 3) |
 
-Outer iterations are unchanged to within +4.
+Outer iterations are unchanged to within +4. On the ballooning corner
+(`inxflow600_circ_pcbench`, 49×64, tstep 10) the pair_w cycles fall from
+20–24 to 10–11 and the wall time from 1337 s to 992 s; JOREK's default PC
+needs 273 s there.

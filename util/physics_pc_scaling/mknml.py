@@ -50,9 +50,12 @@ ARMS = {
     }),
     # SFM2, factorisation-free: C1 GMG on pair_w (matrix-free fine operator with
     # the exact mass), eta-Schur + GMG on pair_psi, GMG on rho/T. Every
-    # hierarchy uses the stage-D13 axis treatment: one axis block over the
-    # rings with r*dtheta/dr < 1 (solved by MUMPS) and coarse levels without the
-    # Dirichlet u/b DOFs of the boundary ring.
+    # hierarchy uses the stage-D13 axis treatment: rings 0..3 of every level
+    # in one axis block (solved by MUMPS) and coarse levels without the
+    # Dirichlet u/b DOFs of the boundary ring. A FIXED ring count, not the
+    # automatic rings-below-r*dtheta/dr=1 (-1): that block holds ~n_tht/(2 pi)
+    # rings, so its factor grows faster than N (438 MB at 49x64, tens of GB at
+    # 641x256), while k = 3 was the fastest setting on both benchmarks.
     'sfm2_gmg': dict(SFM2_COMMON, **{
         'physics_pc_w_gmg': '2',
         'physics_pc_suu_shell': '2',
@@ -61,7 +64,7 @@ ARMS = {
         'physics_pc_psi_outer': '10',
         'physics_pc_rhot_gmg': '10',
         'physics_pc_rhot_gmg_smoother': '5',
-        'physics_pc_gmg_axis_rings': '-1',
+        'physics_pc_gmg_axis_rings': '3',
         'physics_pc_gmg_bnd_drop': '1',
     }),
 }
