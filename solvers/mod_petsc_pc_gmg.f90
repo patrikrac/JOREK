@@ -376,7 +376,7 @@ contains
     !! triangular solve is ~2.5x cheaper per call than MUMPS'. Options under
     !! gmg<k>_<what>_ override both choices.
     subroutine rds_make_ksp(stype)
-      MatSolverType, intent(in) :: stype
+      character(len=*), intent(in) :: stype   ! not MatSolverType (len=80): ifort rejects the short constants
       call KSPCreate(PETSC_COMM_SELF, R%ksp, ierr)
       call KSPSetOperators(R%ksp, R%sub(1), R%sub(1), ierr)
       call KSPSetType(R%ksp, KSPPREONLY, ierr)
