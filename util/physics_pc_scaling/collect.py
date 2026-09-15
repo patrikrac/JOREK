@@ -16,7 +16,7 @@ EVENTS = [
     'PhysPC_Extract', 'PhysPC_BuildSuu', 'PhysPC_FactPJ', 'PhysPC_FactW',
     'PhysPC_FactRhoT', 'GMG_PtAP', 'PhysPC_Apply', 'PhysPC_SolvePJ', 'PhysPC_SolveW',
     'PhysPC_SolveRhoT', 'PhysPC_ShellMult', 'PhysPC_MjSolve', 'PhysPC_PsiPC',
-    'GMG_VCycle', 'GMG_Smooth0', 'GMG_Coarse', 'GMG2_VCycle', 'GMG3_VCycle',
+    'GMG_VCycle', 'GMG_Smooth0', 'GMG_Lines', 'GMG_AxSolve', 'GMG_Coarse', 'GMG2_VCycle', 'GMG3_VCycle',
     'GMG4_VCycle', 'MatMult', 'KSPSolve',
 ]
 COLS = (['case', 'arm', 'n_flux', 'n_tht', 'np', 'omp', 'cores', 'nodes', 'n_tor', 'n_period',
