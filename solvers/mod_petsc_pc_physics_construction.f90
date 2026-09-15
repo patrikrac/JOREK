@@ -99,6 +99,23 @@ module mod_petsc_pc_physics_construction
     PetscInt :: nloc_s = 0
   end type ms_t
   type(ms_t), save, target :: ms(2)
+  ! Stage Q (physics_pc_mass_solver = 1 | 2): the same masses by a Krylov
+  ! iteration instead of a factor. mc(1) = B_33, mc(2) = B_44. The node-block
+  ! Jacobi preconditioner keeps one dense inverse per (JOREK node, slot) block
+  ! of the node's Hermite DOFs; rows(off(b)+1 : off(b)+sz(b)) are its local rows.
+  type :: mc_t
+    logical :: ready = .false.
+    integer :: nb = 0, deg = 0
+    integer, allocatable :: off(:), sz(:), rows(:), ioff(:)
+    real*8, allocatable  :: inv(:)
+    real*8 :: lo = 0.d0, hi = 0.d0
+  end type mc_t
+  type(mc_t), save, target :: mc(2)
+  ! Manufactured-solution error the Chebyshev degree must meet. The mass
+  ! solves sit inside a preconditioner whose pair solves stop at rtol 1e-1,
+  ! so 1e-6 is far below anything the outer FGMRES can see. PETSc option
+  ! -physpc_mass_tol overrides it (read at the first build).
+  real*8, save :: MC_TOL = 1.d-6
   Vec, save     :: shw_d                     !< Dh, refreshed at every rebuild
   Vec, save     :: shw_xs, shw_p1, shw_p2, shw_j1, shw_j2, shw_t
   Vec, save     :: shw_xu, shw_xw, shw_yu, shw_yw   !< the u / omega halves of x and y
@@ -1246,7 +1263,7 @@ contains
   !! run. Signature matches setup_block_ksp for a drop-in swap.
   !--------------------------------------------------------------------
   subroutine setup_constraint_mass_ksp(ksp_block, B_block, comm, first_time, label, ms_id)
-    use phys_module, only: physics_pc_lean_setup, physics_pc_mass_split
+    use phys_module, only: physics_pc_lean_setup, physics_pc_mass_split, physics_pc_mass_solver
     KSP, intent(inout)  :: ksp_block
     Mat, intent(in)     :: B_block
     integer, intent(in) :: comm
@@ -1259,6 +1276,15 @@ contains
     PetscBool :: symm
     logical :: chol
     integer :: rank
+
+    if (physics_pc_mass_solver /= 0 .and. present(ms_id)) then
+      if (present(label)) then
+        call setup_mass_iter(ksp_block, B_block, comm, ms_id, label, first_time)
+      else
+        call setup_mass_iter(ksp_block, B_block, comm, ms_id, "constraint mass", first_time)
+      endif
+      return
+    endif
 
     ! Operator never changes: skip re-factorization on every rebuild after the first.
     if (.not. first_time) return
@@ -1494,6 +1520,391 @@ contains
     call VecRestoreArray(y, ya, ierr)
     ierr = 0
   end subroutine ms_apply
+
+  !--------------------------------------------------------------------
+  !> Stage Q (physics_pc_mass_solver = 1 | 2): the constraint mass B (B_33 or
+  !! B_44) solved by an iteration, node-block Jacobi preconditioned.
+  !!
+  !! WHY: the MUMPS solve (centralized RHS) stopped scaling on the cluster
+  !! (161x64: 90 s at np 1, 312 s at np 32), while the Jacobi-preconditioned
+  !! consistent mass has h-independent eigenvalue bounds that follow element
+  !! by element (Wathen, IMA J. Numer. Anal. 7 (1987) 449). Blocks over the
+  !! Hermite DOFs of a node remove the intra-node coupling of the C1 basis.
+  !!
+  !! Chebyshev of fixed degree (Wathen & Rees 2009): no inner products, only
+  !! the halo exchanges of B's matvec and the preconditioner, and a FIXED
+  !! linear operator, so the shell that wraps it stays linear inside GMRES.
+  !! Bounds come from one CG/Lanczos estimate per run (the mass is
+  !! time-independent); the degree is raised until a manufactured solution is
+  !! met to MC_TOL.
+  !! Mode 1: node-block Jacobi. Measured kappa 86 on the C1 Hermite mass
+  !!   (41x16), degree 100: correct but 30x a serial MUMPS solve. Kept for
+  !!   reference.
+  !! Mode 2: additive Schwarz, one subdomain per rank, overlap 1, ICC(0) with
+  !!   ND ordering (41x16, np 4: kappa 4.9, degree 22; local LU gives kappa
+  !!   2.5 but costs more per solve; overlap 0 gives kappa 9.8). At np = 1
+  !!   the single subdomain is solved as it is (no Chebyshev needed if exact).
+  !! Mode 3: CG + the mode-2 preconditioner to rtol 1e-10 (diagnostic).
+  !!
+  !! Row map: B's global row of (JOREK index idx, slot m) is (idx-1)*n_tor + m,
+  !! the index-major order extract_sub_blocks_h keeps (see ms_apply). Every
+  !! rebuild refreshes the block inverses (the boundary rows carry JOREK's BC
+  !! diagonal) and re-runs the check; only the first build prints.
+  !--------------------------------------------------------------------
+  subroutine setup_mass_iter(ksp_block, B_block, comm, id, label, first_time)
+    use phys_module, only: physics_pc_mass_solver
+    KSP, intent(inout)  :: ksp_block
+    Mat, intent(in)     :: B_block
+    integer, intent(in) :: comm, id
+    character(len=*), intent(in) :: label
+    logical, intent(in) :: first_time
+    type(mc_t), pointer :: MC_
+    KSP :: est
+    PC  :: pc
+    PetscErrorCode :: ierr
+    PetscInt :: its, maxit
+    real*8 :: emax, emin, err
+    integer :: rank, k
+    logical :: nodeblk
+    character(len=64) :: pcname
+
+    MC_ => mc(id)
+    call MPI_Comm_rank(comm, rank, ierr)
+    if (first_time) then
+      block
+        PetscBool :: flg
+        real*8 :: tv
+        call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-physpc_mass_tol", tv, flg, ierr)
+        if (flg) MC_TOL = tv
+      end block
+    endif
+
+    if (.not. first_time) then
+      ! ASM refactors its local LU itself when B's values change
+      if (physics_pc_mass_solver == 1) call mc_fill(MC_, B_block)
+      call mc_check(ksp_block, B_block, err)
+      if (err > 1.d2 * MC_TOL .and. rank == 0) write(*,'(A,A,A,ES9.2,A)') "[Physics PC]   ", &
+        trim(label), ": WARNING, iterative mass solve inexact after rebuild (err ", err, ")"
+      return
+    endif
+
+    nodeblk = (physics_pc_mass_solver == 1)
+    if (nodeblk) then
+      call mc_blocks(MC_, B_block, comm)
+      call mc_fill(MC_, B_block)
+      pcname = "node-block Jacobi"
+    else
+      pcname = "additive Schwarz (1 subdomain/rank, overlap 1, local ICC(0))"
+    endif
+
+    call KSPCreate(comm, ksp_block, ierr)
+    call KSPSetOperators(ksp_block, B_block, B_block, ierr)
+    call KSPGetPC(ksp_block, pc, ierr)
+    call mc_set_pc(pc, id, nodeblk)
+
+    if (physics_pc_mass_solver == 3) then
+      call KSPSetType(ksp_block, KSPCG, ierr)
+      maxit = 1000
+      call KSPSetTolerances(ksp_block, 1.d-10, 1.d-50, 1.d10, maxit, ierr)
+      call KSPSetUp(ksp_block, ierr)
+      call mc_check(ksp_block, B_block, err)
+      call KSPGetIterationNumber(ksp_block, its, ierr)
+      if (rank == 0) write(*,'(A,A,A,A,I0,A,ES9.2)') "[Physics PC]   ", trim(label), &
+        ": CG + ", trim(pcname), ", rtol 1e-10: its = ", its, ", check err ", err
+      MC_%ready = .true.
+      return
+    endif
+
+    ! --- eigenvalue bounds of P^-1 B from one preconditioned CG (Lanczos) run
+    call KSPCreate(comm, est, ierr)
+    call KSPSetOperators(est, B_block, B_block, ierr)
+    call KSPSetType(est, KSPCG, ierr)
+    call KSPGetPC(est, pc, ierr)
+    call mc_set_pc(pc, id, nodeblk)
+    call KSPSetComputeSingularValues(est, PETSC_TRUE, ierr)
+    maxit = 500
+    call KSPSetTolerances(est, 1.d-10, 1.d-50, 1.d10, maxit, ierr)
+    call KSPSetUp(est, ierr)
+    call mc_check(est, B_block, err)
+    call KSPGetIterationNumber(est, its, ierr)
+    call KSPComputeExtremeSingularValues(est, emax, emin, ierr)
+    call KSPDestroy(est, ierr)
+
+    if (its <= 1) then
+      ! the preconditioner is the exact inverse (one subdomain): apply it once
+      call KSPSetType(ksp_block, KSPPREONLY, ierr)
+      call KSPSetUp(ksp_block, ierr)
+      call mc_check(ksp_block, B_block, err)
+      MC_%deg = 1; MC_%lo = emin; MC_%hi = emax
+    else
+      ! Lanczos brackets the spectrum from inside: widen both ends
+      MC_%lo = 0.9d0 * emin
+      MC_%hi = 1.05d0 * emax
+      MC_%deg = cheb_degree(MC_%hi / MC_%lo)
+      call KSPSetType(ksp_block, KSPCHEBYSHEV, ierr)
+      call KSPSetNormType(ksp_block, KSP_NORM_NONE, ierr)   ! no reductions: fixed degree
+      do k = 1, 6
+        call KSPChebyshevSetEigenvalues(ksp_block, MC_%hi, MC_%lo, ierr)
+        maxit = MC_%deg
+        call KSPSetTolerances(ksp_block, 1.d-50, 1.d-50, 1.d10, maxit, ierr)
+        call KSPSetUp(ksp_block, ierr)
+        call mc_check(ksp_block, B_block, err)
+        if (err <= MC_TOL) exit
+        ! missed: the smallest eigenvalue was over-estimated or the degree is short
+        MC_%lo = 0.8d0 * MC_%lo
+        MC_%deg = max(cheb_degree(MC_%hi / MC_%lo), ceiling(1.3d0 * MC_%deg))
+      enddo
+    endif
+    MC_%ready = .true.
+    if (rank == 0) then
+      write(*,'(A,A,A,I0,A,A,A,2ES10.3,A,F7.2,A,I0,A,ES9.2)') "[Physics PC]   ", trim(label), &
+        ": Chebyshev(", MC_%deg, ") + ", trim(pcname), ", lambda in [", &
+        MC_%lo, MC_%hi, "], kappa ", MC_%hi / MC_%lo, ", CG estimate its ", its, ", check err ", err
+      if (err > MC_TOL) write(*,'(A,A,A)') "[Physics PC]   ", trim(label), &
+        ": WARNING, Chebyshev did not reach the target accuracy"
+    endif
+
+  contains
+
+    !> Chebyshev degree with 2 rho^d <= MC_TOL/10, rho = (sqrt k - 1)/(sqrt k + 1)
+    integer function cheb_degree(kk)
+      real*8, intent(in) :: kk
+      real*8 :: rho
+      rho = (sqrt(kk) - 1.d0) / (sqrt(kk) + 1.d0)
+      cheb_degree = max(1, ceiling(log(2.d0 / (0.1d0 * MC_TOL)) / log(1.d0 / max(rho, 1.d-12))))
+    end function cheb_degree
+  end subroutine setup_mass_iter
+
+  !> The mass preconditioner. nodeblk: PCSHELL with mc_apply_<id>. Otherwise
+  !! additive Schwarz, one subdomain per rank with overlap 1 and a local LU
+  !! (BASIC = symmetric, as Chebyshev/CG need). A mass matrix is an L2-type
+  !! operator, so one-level Schwarz needs no coarse space. Options prefix
+  !! mass<id>_ (e.g. -mass1_pc_asm_overlap 2, -mass1_sub_pc_type icc).
+  subroutine mc_set_pc(pc, id, nodeblk)
+    PC :: pc
+    integer, intent(in) :: id
+    logical, intent(in) :: nodeblk
+    PetscErrorCode :: ierr
+    PetscInt :: ovl
+    PetscBool :: has
+    character(len=16) :: pre
+    if (nodeblk) then
+      call PCSetType(pc, PCSHELL, ierr)
+      if (id == 1) then
+        call PCShellSetApply(pc, mc_apply_1, ierr)
+      else
+        call PCShellSetApply(pc, mc_apply_2, ierr)
+      endif
+      call PCShellSetName(pc, "node-block Jacobi (constraint mass)", ierr)
+      return
+    endif
+    write(pre, '(A,I0,A)') "mass", id, "_"
+    call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-"//trim(pre)//"sub_pc_type", has, ierr)
+    if (.not. has) call PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-"//trim(pre)//"sub_pc_type", "icc", ierr)
+    call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, &
+                             "-"//trim(pre)//"sub_pc_factor_mat_ordering_type", has, ierr)
+    if (.not. has) call PetscOptionsSetValue(PETSC_NULL_OPTIONS, &
+                             "-"//trim(pre)//"sub_pc_factor_mat_ordering_type", "nd", ierr)
+    call PCSetType(pc, PCASM, ierr)
+    ovl = 1
+    call PCASMSetOverlap(pc, ovl, ierr)
+    call PCASMSetType(pc, PC_ASM_BASIC, ierr)
+    call PCSetOptionsPrefix(pc, trim(pre), ierr)
+    call PCSetFromOptions(pc, ierr)
+  end subroutine mc_set_pc
+
+  !> ||x - xt|| / ||xt|| for x = solve(B xt), xt random
+  subroutine mc_check(ksp, B, err)
+    KSP :: ksp
+    Mat :: B
+    real*8, intent(out) :: err
+    Vec :: xt, bv, x
+    PetscRandom :: rnd
+    PetscErrorCode :: ierr
+    real*8 :: nx
+    integer :: cm
+    call MatCreateVecs(B, xt, bv, ierr)
+    call VecDuplicate(xt, x, ierr)
+    call PetscObjectGetComm(B, cm, ierr)
+    call PetscRandomCreate(cm, rnd, ierr)      ! PETSc's fixed default seed: reproducible
+    call VecSetRandom(xt, rnd, ierr)
+    call MatMult(B, xt, bv, ierr)
+    call KSPSolve(ksp, bv, x, ierr)
+    call VecNorm(xt, NORM_2, nx, ierr)
+    call VecAXPY(x, -1.d0, xt, ierr)
+    call VecNorm(x, NORM_2, err, ierr)
+    err = err / nx
+    call PetscRandomDestroy(rnd, ierr)
+    call VecDestroy(xt, ierr); call VecDestroy(bv, ierr); call VecDestroy(x, ierr)
+  end subroutine mc_check
+
+  !> Blocks of the node-block Jacobi: per JOREK node its owned, not yet taken
+  !! indices (the axis nodes share the value index, so only the first axis
+  !! node holds it), times each slot. Rows no node covers become 1x1 blocks.
+  subroutine mc_blocks(MC_, B, comm)
+    use nodes_elements, only: node_list
+    use mod_parameters, only: n_tor, n_degrees
+    type(mc_t), intent(inout) :: MC_
+    Mat, intent(in)     :: B
+    integer, intent(in) :: comm
+    PetscInt :: rstart, rend
+    PetscErrorCode :: ierr
+    integer :: nloc, n, k, m, idx, cnt, nidx, nb, nr, loose, q, rank, mpierr
+    integer :: il(n_degrees)
+    logical, allocatable :: seen(:), cov(:)
+
+    call MatGetOwnershipRange(B, rstart, rend, ierr)
+    nloc = int(rend - rstart)
+    nidx = 0
+    do n = 1, node_list%n_nodes
+      nidx = max(nidx, maxval(node_list%node(n)%index(1:n_degrees)))
+    enddo
+    if (allocated(MC_%off)) deallocate(MC_%off, MC_%sz, MC_%rows, MC_%ioff)
+    allocate(MC_%off(nloc + 1), MC_%sz(nloc), MC_%rows(nloc), MC_%ioff(nloc + 1))
+    allocate(seen(nidx), cov(0:nloc - 1))
+    seen = .false.; cov = .false.
+    nb = 0; nr = 0
+    MC_%off(1) = 0; MC_%ioff(1) = 0
+    do n = 1, node_list%n_nodes
+      cnt = 0
+      do k = 1, n_degrees
+        idx = node_list%node(n)%index(k)
+        if (idx < 1 .or. seen(idx)) cycle
+        if ((idx - 1) * n_tor < rstart .or. (idx - 1) * n_tor >= rend) cycle
+        seen(idx) = .true.
+        cnt = cnt + 1; il(cnt) = idx
+      enddo
+      if (cnt == 0) cycle
+      do m = 0, n_tor - 1
+        nb = nb + 1
+        do q = 1, cnt
+          nr = nr + 1
+          MC_%rows(nr) = (il(q) - 1) * n_tor + m - int(rstart)
+          cov(MC_%rows(nr)) = .true.
+        enddo
+        MC_%sz(nb) = cnt
+        MC_%off(nb + 1) = nr
+        MC_%ioff(nb + 1) = MC_%ioff(nb) + cnt * cnt
+      enddo
+    enddo
+    loose = 0
+    do q = 0, nloc - 1
+      if (cov(q)) cycle
+      loose = loose + 1
+      nb = nb + 1; nr = nr + 1
+      MC_%rows(nr) = q
+      MC_%sz(nb) = 1
+      MC_%off(nb + 1) = nr
+      MC_%ioff(nb + 1) = MC_%ioff(nb) + 1
+    enddo
+    MC_%nb = nb
+    if (allocated(MC_%inv)) deallocate(MC_%inv)
+    allocate(MC_%inv(MC_%ioff(nb + 1)))
+    call MPI_Allreduce(MPI_IN_PLACE, loose, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
+    call MPI_Comm_rank(comm, rank, mpierr)
+    if (loose > 0 .and. rank == 0) write(*,'(A,I0,A)') "[Physics PC]   node-block Jacobi: ", &
+      loose, " rows outside every node block (kept as 1x1 blocks)"
+    deallocate(seen, cov)
+  end subroutine mc_blocks
+
+  !> Dense inverse of every node block of B (a singular block falls back to
+  !! the inverse of its diagonal)
+  subroutine mc_fill(MC_, B)
+    type(mc_t), intent(inout) :: MC_
+    Mat, intent(in) :: B
+    PetscInt :: rstart, rend, ncols, row
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    PetscErrorCode :: ierr
+    integer :: ib, n, o, q, p, kk, c, info, mx
+    real*8, allocatable :: a(:,:), wk(:)
+    integer, allocatable :: piv(:)
+    external :: dgetrf, dgetri
+
+    call MatGetOwnershipRange(B, rstart, rend, ierr)
+    mx = maxval(MC_%sz(1:MC_%nb))
+    allocate(a(mx, mx), wk(mx * mx), piv(mx))
+    do ib = 1, MC_%nb
+      n = MC_%sz(ib); o = MC_%off(ib)
+      a(1:n, 1:n) = 0.d0
+      do q = 1, n
+        row = rstart + MC_%rows(o + q)
+        call MatGetRow(B, row, ncols, cols, vals, ierr)
+        do kk = 1, int(ncols)
+          c = int(cols(kk) - rstart)
+          do p = 1, n
+            if (MC_%rows(o + p) == c) then
+              a(q, p) = vals(kk)
+              exit
+            endif
+          enddo
+        enddo
+        call MatRestoreRow(B, row, ncols, cols, vals, ierr)
+      enddo
+      call dgetrf(n, n, a, mx, piv, info)
+      if (info == 0) call dgetri(n, a, mx, piv, wk, mx * mx, info)
+      if (info /= 0) then                   ! singular block: diagonal inverse
+        do q = 1, n
+          row = rstart + MC_%rows(o + q)
+          call MatGetRow(B, row, ncols, cols, vals, ierr)
+          a(q, 1:n) = 0.d0
+          a(q, q) = 1.d0
+          do kk = 1, int(ncols)
+            if (cols(kk) == row .and. vals(kk) /= 0.d0) a(q, q) = 1.d0 / vals(kk)
+          enddo
+          call MatRestoreRow(B, row, ncols, cols, vals, ierr)
+        enddo
+      endif
+      do p = 1, n
+        do q = 1, n
+          MC_%inv(MC_%ioff(ib) + (p - 1) * n + q) = a(q, p)
+        enddo
+      enddo
+    enddo
+    deallocate(a, wk, piv)
+  end subroutine mc_fill
+
+  subroutine mc_apply_1(pc, x, y, ierr)
+    PC  :: pc
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call mc_apply(mc(1), x, y, ierr)
+  end subroutine mc_apply_1
+
+  subroutine mc_apply_2(pc, x, y, ierr)
+    PC  :: pc
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call mc_apply(mc(2), x, y, ierr)
+  end subroutine mc_apply_2
+
+  !> y = blockdiag(B)^-1 x, rank-local (OpenMP over the blocks)
+  subroutine mc_apply(MC_, x, y, ierr)
+    type(mc_t), intent(in) :: MC_
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    PetscScalar, pointer :: xa(:), ya(:)
+    integer :: b, n, o, io, q, p
+    real*8 :: s
+
+    call VecGetArrayRead(x, xa, ierr)
+    call VecGetArray(y, ya, ierr)
+    !$omp parallel do schedule(static) private(b, n, o, io, q, p, s) if (MC_%nb >= 4000)
+    do b = 1, MC_%nb
+      n = MC_%sz(b); o = MC_%off(b); io = MC_%ioff(b)
+      do q = 1, n
+        s = 0.d0
+        do p = 1, n
+          s = s + MC_%inv(io + (p - 1) * n + q) * xa(MC_%rows(o + p) + 1)
+        enddo
+        ya(MC_%rows(o + q) + 1) = s
+      enddo
+    enddo
+    !$omp end parallel do
+    call VecRestoreArrayRead(x, xa, ierr)
+    call VecRestoreArray(y, ya, ierr)
+    ierr = 0
+  end subroutine mc_apply
 
   !--------------------------------------------------------------------
   !> Create the exact-(psi,u)-Schur MATSHELL and its 1-variable work vecs (once).

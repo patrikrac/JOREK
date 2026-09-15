@@ -117,6 +117,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 physics_pc_gmg_ring_aspect, physics_pc_gmg_axis_rings, &
                 physics_pc_gmg_ring_diag, physics_pc_gmg_axis_mult, &
                 physics_pc_gmg_bnd_drop,                            &
+                physics_pc_mass_solver, physics_pc_gmg_smooth_op,   &
+                physics_pc_gmg_axis_split, physics_pc_gmg_axis_droptol, &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &

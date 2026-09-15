@@ -77,6 +77,25 @@ ARMS = {
 # The same without the axis treatment (stage D12, commit 3cafa9f46): radial
 # lines with the axis ring alone as a block, Dirichlet DOFs kept on the coarse
 # levels. The comparison arm for the D13 changes.
+# Stage Q (2026-09-15): the two components that did not scale on the first
+# cluster series, each on its own and together, on top of sfm2_gmg.
+#   mass  = the exact-mass solves by Chebyshev + additive Schwarz instead of
+#           MUMPS with a centralized RHS (PhysPC_MjSolve: 90 s at np 1, 312 s
+#           at np 32 on 161x64). Iteration counts are unchanged; on the laptop
+#           at np 4 it is SLOWER than MUMPS, which is the point of the test.
+#   smop  = the fine GMG smoother on the assembled operator, so the exact
+#           operator is applied only for residuals: 4.8x fewer mass solves,
+#           +16% pair_w V-cycles and +1..2 outer its (41x16 / 81x32, np 4).
+ARMS['sfm2_gmg_mass'] = dict(ARMS['sfm2_gmg'], **{
+    'physics_pc_mass_solver': '2',
+})
+ARMS['sfm2_gmg_smop'] = dict(ARMS['sfm2_gmg'], **{
+    'physics_pc_gmg_smooth_op': '1',
+})
+ARMS['sfm2_gmg_q'] = dict(ARMS['sfm2_gmg'], **{
+    'physics_pc_mass_solver': '2',
+    'physics_pc_gmg_smooth_op': '1',
+})
 ARMS['sfm2_gmg_d12'] = dict(ARMS['sfm2_gmg'], **{
     'physics_pc_gmg_axis_rings': '0',
     'physics_pc_gmg_bnd_drop': '0',

@@ -695,6 +695,10 @@ subroutine preset_parameters
   physics_pc_gmg_axis_rings  = 0            ! Workstream D: rings 0..k in one axis block (block smoothers 4/5/6); -1 = rings below r*dtheta/dr = ring_aspect
   physics_pc_gmg_axis_mult   = 0            ! Workstream D: axis block / lines coupling (0 Jacobi, 1 axis first, 2 lines first, 3 symmetric)
   physics_pc_gmg_bnd_drop    = 0            ! Workstream D: 1 = coarse levels drop the Dirichlet u, b DOFs of the boundary ring
+  physics_pc_mass_solver     = 0            ! Stage Q: constraint masses by 0 MUMPS, 1 Chebyshev + node-block Jacobi, 2 Chebyshev + additive Schwarz/ICC, 3 CG (diagnostic)
+  physics_pc_gmg_smooth_op   = 0            ! Stage Q: 1 = fine GMG smoother on the assembled Pmat instead of the matrix-free shell
+  physics_pc_gmg_axis_split  = 0            ! Stage Q: 1 = one axis LU per |n| group, group k on rank mod(k, np)
+  physics_pc_gmg_axis_droptol = 0.d0        ! Stage Q: relative drop tolerance of the axis block before its LU
   physics_pc_gmg_ring_diag   = 0            ! Workstream D: k > 0 = per-ring-zone residual profile on k V-cycles per rebuild
   physics_pc_suu_comp        = 0            ! Workstream D: 1 = abs-row-sum diagonal compensation of the ring mask
   physics_pc_w_gmg           = 0            ! Workstream C: pair_w by C1 geometric multigrid (0=off, 1=one V-cycle, 2=FGMRES+V-cycle)

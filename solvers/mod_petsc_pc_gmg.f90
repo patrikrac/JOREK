@@ -86,13 +86,18 @@ module mod_petsc_pc_gmg
   !! (local, 0-based, ascending; set before the first rds_setup), cnt/dsp =
   !! the members' row counts/offsets. Used for the stage-D13 axis blocks and
   !! the coarsest level, which both live on a few ranks at scale.
+  ! root >= 0 (stage Q, physics_pc_gmg_axis_split): the member of rank root
+  ! alone factors and solves; the others gather their rows to it and get the
+  ! solution back. root = -1: every member solves the same system redundantly.
   type :: rds_t
-    logical :: ready = .false., member = .false.
-    integer :: comm = MPI_COMM_NULL, np = 0, me = 0
+    logical :: ready = .false., member = .false., solver = .false.
+    integer :: comm = MPI_COMM_NULL, np = 0, me = 0, root = -1
     integer, allocatable :: loc(:), cnt(:), dsp(:)
     real*8, allocatable  :: send(:)
     IS  :: isq
     Mat, pointer :: sub(:) => null()
+    Mat :: flt                        !< sub(1) with small entries dropped (axis_droptol > 0)
+    logical :: filtered = .false.
     KSP :: ksp
     Vec :: b, x
   end type rds_t
@@ -116,7 +121,10 @@ module mod_petsc_pc_gmg
     logical :: axsparse = .false.
     logical, allocatable :: axblk(:)
     IS  :: axis_is
-    type(rds_t) :: ax
+    ! one solve per |n| group with physics_pc_gmg_axis_split (the block is
+    ! block-diagonal in |n| once harm_split drops the cross-|n| entries),
+    ! group k solved on rank mod(k, np); otherwise one group, all slots
+    type(rds_t), allocatable :: axg(:)
     ! physics_pc_gmg_axis_mult > 0: Gauss-Seidel coupling between the axis
     ! block and the lines through the interface blocks A(rest,ax), A(ax,rest)
     logical :: gsready = .false., gsvec = .false.
@@ -141,6 +149,8 @@ module mod_petsc_pc_gmg
   ! circle couplings dominate there, so smoother 6 uses ring blocks inside and
   ! radial lines outside (GMGPolar). Rings 0..axis_k form the axis block.
   integer, save :: ring_is = 1, axis_k = 0, axis_mult = 0
+  logical, save :: axis_split = .false.     !< stage Q: per-|n| axis solves on distinct ranks
+  real*8, save  :: axis_droptol = 0.d0      !< stage Q: relative drop tolerance of the axis block
   integer, save :: diag_left = 0            !< ring-diag samples left in this rebuild
   integer, save :: gcomm = 0, gme = 0       !< communicator and rank of the hierarchy
   ! Galerkin chain reuse: the fine operand's sparsity pattern is fixed (the
@@ -163,6 +173,8 @@ module mod_petsc_pc_gmg
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
     integer :: ring_is = 1, axis_k = 0, axis_mult = 0, diag_left = 0
+    logical :: axis_split = .false.
+    real*8  :: axis_droptol = 0.d0
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false., sm_blocks = .false.
     Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gF
@@ -205,6 +217,7 @@ contains
     associate (S => inst(cur_inst))
       S%nlev = nlev; S%nth0 = nth0; S%nf_s = nf_s; S%sm_type = sm_type; S%sm_nstep = sm_nstep
       S%ring_is = ring_is; S%axis_k = axis_k; S%axis_mult = axis_mult; S%diag_left = diag_left
+      S%axis_split = axis_split; S%axis_droptol = axis_droptol
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready; S%sm_blocks = sm_blocks
       S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm; S%gAxis = gAxis
@@ -222,6 +235,7 @@ contains
     associate (S => inst(k))
       nlev = S%nlev; nth0 = S%nth0; nf_s = S%nf_s; sm_type = S%sm_type; sm_nstep = S%sm_nstep
       ring_is = S%ring_is; axis_k = S%axis_k; axis_mult = S%axis_mult; diag_left = S%diag_left
+      axis_split = S%axis_split; axis_droptol = S%axis_droptol
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready; sm_blocks = S%sm_blocks
       gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm; gAxis = S%gAxis
@@ -244,7 +258,7 @@ contains
     a%nb = 0; a%nrow = 0; a%nsing = 0
     b%axsparse = a%axsparse; b%axis_is = a%axis_is
     a%axsparse = .false.
-    call move_rds(a%ax, b%ax)
+    if (allocated(a%axg)) call move_alloc(a%axg, b%axg)
     b%gsready = a%gsready; b%gsvec = a%gsvec
     b%rest_is = a%rest_is; b%Bra = a%Bra; b%Bar = a%Bar
     b%xw = a%xw; b%xw2 = a%xw2; b%tr = a%tr; b%ta = a%ta
@@ -265,11 +279,13 @@ contains
 
   subroutine move_rds(a, b)
     type(rds_t), intent(inout) :: a, b
-    b%ready = a%ready; b%member = a%member
-    b%comm = a%comm; b%np = a%np; b%me = a%me
+    b%ready = a%ready; b%member = a%member; b%solver = a%solver
+    b%comm = a%comm; b%np = a%np; b%me = a%me; b%root = a%root
     b%isq = a%isq; b%ksp = a%ksp; b%b = a%b; b%x = a%x
+    b%flt = a%flt; b%filtered = a%filtered; a%filtered = .false.
     b%sub => a%sub; a%sub => null()
-    a%ready = .false.; a%member = .false.; a%comm = MPI_COMM_NULL; a%np = 0; a%me = 0
+    a%ready = .false.; a%member = .false.; a%solver = .false.; a%comm = MPI_COMM_NULL; a%np = 0; a%me = 0
+    a%root = -1
     if (allocated(a%loc))  call move_alloc(a%loc,  b%loc)
     if (allocated(a%cnt))  call move_alloc(a%cnt,  b%cnt)
     if (allocated(a%dsp))  call move_alloc(a%dsp,  b%dsp)
@@ -278,11 +294,13 @@ contains
 
   !> (Re)build R for A(rows, rows), rows = R%loc on each rank. what = options
   !! prefix part (gmg<k>_<what>_); tag = label of the first build's
-  !! factor-size print.
-  subroutine rds_setup(R, A, what, tag)
+  !! factor-size print. solver_rank (rank in gcomm): that rank alone solves,
+  !! whether or not it owns any of the rows; absent: all owners solve.
+  subroutine rds_setup(R, A, what, tag, solver_rank)
     type(rds_t), intent(inout) :: R
     Mat, intent(in)     :: A
     character(len=*), intent(in) :: what, tag
+    integer, intent(in), optional :: solver_rank
     PetscInt, parameter :: one = 1
     PetscInt :: rst, ren
     PetscErrorCode :: ierr
@@ -297,12 +315,22 @@ contains
       nl = size(R%loc)
       color = MPI_UNDEFINED
       if (nl > 0) color = 1
+      if (present(solver_rank)) then
+        if (gme == solver_rank) color = 1
+      endif
       call MPI_Comm_split(gcomm, color, gme, R%comm, mpierr)
-      R%member = (nl > 0)
+      R%member = (color == 1)
       ntot = 0
       if (R%member) then
         call MPI_Comm_size(R%comm, R%np, mpierr)
         call MPI_Comm_rank(R%comm, R%me, mpierr)
+        R%root = -1
+        if (present(solver_rank)) then
+          k = -1
+          if (gme == solver_rank) k = R%me
+          call MPI_Allreduce(k, R%root, 1, MPI_INTEGER, MPI_MAX, R%comm, mpierr)
+        endif
+        R%solver = (R%root < 0 .or. R%me == R%root)
         allocate(R%cnt(0:R%np - 1), R%dsp(0:R%np), R%send(nl))
         call MPI_Allgather(nl, 1, MPI_INTEGER, R%cnt, 1, MPI_INTEGER, R%comm, mpierr)
         R%dsp(0) = 0
@@ -313,6 +341,9 @@ contains
         allocate(gl(ntot))
         call MPI_Allgatherv(int(rst) + R%loc, nl, MPI_INTEGER, gl, R%cnt, R%dsp(0:R%np - 1), &
                             MPI_INTEGER, R%comm, mpierr)
+        if (.not. R%solver) then            ! the root alone extracts and factors
+          deallocate(gl); allocate(gl(0)); ntot = 0
+        endif
       else
         allocate(gl(0))
       endif
@@ -328,15 +359,20 @@ contains
     endif
     ! collective on A's communicator (non-members pass an empty IS)
     call MatCreateSubMatrices(A, one, [R%isq], [R%isq], MAT_INITIAL_MATRIX, R%sub, ierr)
-    if (R%member) then
+    if (R%solver .and. axis_droptol > 0.d0 .and. what(1:2) == "ax") then
+      if (R%filtered) call MatDestroy(R%flt, ierr)
+      call rds_filter(R, tag, .not. R%ready)
+      R%filtered = .true.
+    endif
+    if (R%solver) then
       if (.not. R%ready) then
         call rds_make_ksp(MATSOLVERPETSC)
-        call MatCreateVecs(R%sub(1), R%x, R%b, ierr)
+        call MatCreateVecs(rds_op(R), R%x, R%b, ierr)
       else
-        call KSPSetOperators(R%ksp, R%sub(1), R%sub(1), ierr)
+        call KSPSetOperators(R%ksp, rds_op(R), rds_op(R), ierr)
       endif
     endif
-    if (R%member) then
+    if (R%solver) then
       call KSPSetUp(R%ksp, ierr)
       ! PETSc's LU does not pivot: on a failed factorisation, MUMPS instead
       block
@@ -352,8 +388,8 @@ contains
         endif
       end block
     endif
-    if (.not. R%ready .and. R%member) then      ! factor size
-      if (R%me == 0) then
+    if (.not. R%ready .and. R%solver) then      ! factor size
+      if (R%me == max(R%root, 0)) then
         block
           Mat :: F
           MatInfo :: finfo
@@ -378,7 +414,7 @@ contains
     subroutine rds_make_ksp(stype)
       character(len=*), intent(in) :: stype   ! not MatSolverType (len=80): ifort rejects the short constants
       call KSPCreate(PETSC_COMM_SELF, R%ksp, ierr)
-      call KSPSetOperators(R%ksp, R%sub(1), R%sub(1), ierr)
+      call KSPSetOperators(R%ksp, rds_op(R), rds_op(R), ierr)
       call KSPSetType(R%ksp, KSPPREONLY, ierr)
       call KSPGetPC(R%ksp, pc, ierr)
       call PCSetType(pc, PCLU, ierr)
@@ -390,17 +426,99 @@ contains
     end subroutine rds_make_ksp
   end subroutine rds_setup
 
+  !> The matrix the KSP factors: the filtered copy where there is one.
+  function rds_op(R) result(M_)
+    type(rds_t), intent(in) :: R
+    Mat :: M_
+    M_ = R%sub(1)
+    if (R%filtered) M_ = R%flt
+  end function rds_op
+
+  !> Stage Q (physics_pc_gmg_axis_droptol): R%flt = R%sub(1) without the
+  !! entries below tol*sqrt(|a_ii a_jj|). The scaling is per entry because
+  !! JOREK's boundary rows carry a diagonal about 7 decades above the bulk,
+  !! so one absolute threshold would empty the small-scale rows. The block
+  !! is a smoother component, so an approximate factor is allowed; what it
+  !! buys is a smaller factor and a cheaper triangular solve per call.
+  subroutine rds_filter(R, tag, verbose)
+    type(rds_t), intent(inout) :: R
+    character(len=*), intent(in) :: tag
+    logical, intent(in) :: verbose
+    Vec :: dv
+    MatInfo :: i0, i1
+    PetscScalar, pointer :: dp(:)
+    PetscErrorCode :: ierr
+    PetscInt :: n, q
+
+    call MatDuplicate(R%sub(1), MAT_COPY_VALUES, R%flt, ierr)
+    call MatCreateVecs(R%flt, dv, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(R%flt, dv, ierr)
+    call VecGetLocalSize(dv, n, ierr)
+    call VecGetArray(dv, dp, ierr)
+    do q = 1, n
+      if (abs(dp(q)) > 0.d0) then
+        dp(q) = 1.d0 / sqrt(abs(dp(q)))
+      else
+        dp(q) = 1.d0
+      endif
+    enddo
+    call VecRestoreArray(dv, dp, ierr)
+    call MatGetInfo(R%flt, MAT_LOCAL, i0, ierr)
+    ! symmetric diagonal scaling, absolute filter, scaling undone: drops the
+    ! entries with |a_ij| < tol*sqrt(|a_ii a_jj|)
+    call MatDiagonalScale(R%flt, dv, dv, ierr)
+    call MatFilter(R%flt, axis_droptol, PETSC_TRUE, PETSC_TRUE, ierr)
+    call VecGetArray(dv, dp, ierr)
+    do q = 1, n
+      dp(q) = 1.d0 / dp(q)
+    enddo
+    call VecRestoreArray(dv, dp, ierr)
+    call MatDiagonalScale(R%flt, dv, dv, ierr)
+    ! compression can leave a row without a stored diagonal, which the LU
+    ! needs: put the (zero) diagonals back
+    call MatSetOption(R%flt, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    call VecSet(dv, 0.d0, ierr)
+    call MatDiagonalSet(R%flt, dv, ADD_VALUES, ierr)
+    call MatGetInfo(R%flt, MAT_LOCAL, i1, ierr)
+    call VecDestroy(dv, ierr)
+    if (verbose) write(*,'(A,I0,A,A,A,F5.1,A,ES8.1)') "[Mem] GMG", cur_inst, " ", trim(tag), &
+      ": axis drop keeps ", 100.d0 * i1%nz_used / max(i0%nz_used, 1.d0), "% of the entries, tol ", axis_droptol
+  end subroutine rds_filter
+
   !> yy(R%loc) = A(rows, rows)^-1 xx(R%loc) on the members; others return.
   subroutine rds_solve(R, xx, yy)
     type(rds_t), intent(inout) :: R
     Vec :: xx, yy
-    PetscScalar, pointer :: xp(:), yp(:), bp(:)
+    PetscScalar, pointer :: xp(:), yp(:)
+    PetscErrorCode :: ie
+    if (.not. R%member) return
+    call VecGetArrayRead(xx, xp, ie)
+    call VecGetArray(yy, yp, ie)
+    call rds_solve_arr(R, xp, yp)
+    call VecRestoreArray(yy, yp, ie)
+    call VecRestoreArrayRead(xx, xp, ie)
+  end subroutine rds_solve
+
+  !> rds_solve on the arrays of xx and yy. blk_apply calls it from the
+  !! master thread while the other threads run the line blocks, so it must
+  !! not touch xx/yy as PETSc objects (VecGetArray is not thread-safe); its
+  !! own R%b/R%x and R%comm are used by this thread alone.
+  subroutine rds_solve_arr(R, xp, yp)
+    type(rds_t), intent(inout) :: R
+    PetscScalar, intent(in)    :: xp(:)
+    PetscScalar, intent(inout) :: yp(:)
+    PetscScalar, pointer :: bp(:)
     PetscErrorCode :: ie
     integer :: q, nl, o, mpierr
     if (.not. R%member) return
+    if (R%root >= 0) then
+      call rds_gather(R, xp)
+      call rds_local(R)
+      call rds_return(R, yp)
+      return
+    endif
     nl = size(R%loc)
     o = R%dsp(R%me)
-    call VecGetArrayRead(xx, xp, ie)
     call VecGetArray(R%b, bp, ie)
     if (R%np == 1) then
       do q = 1, nl
@@ -414,16 +532,87 @@ contains
                           MPI_DOUBLE_PRECISION, R%comm, mpierr)
     endif
     call VecRestoreArray(R%b, bp, ie)
-    call VecRestoreArrayRead(xx, xp, ie)
     call KSPSolve(R%ksp, R%b, R%x, ie)
     call VecGetArrayRead(R%x, bp, ie)
-    call VecGetArray(yy, yp, ie)
     do q = 1, nl
       yp(R%loc(q) + 1) = bp(o + q)
     enddo
-    call VecRestoreArray(yy, yp, ie)
     call VecRestoreArrayRead(R%x, bp, ie)
-  end subroutine rds_solve
+  end subroutine rds_solve_arr
+
+  !> Several rooted solves at once (the per-|n| axis groups): every group's
+  !! rows go to its root first, then each root solves its groups, then the
+  !! solutions come back, so groups on different ranks are solved at the
+  !! same time. All ranks walk the groups in the same order (no deadlock).
+  subroutine rds_solve_groups(Rs, xp, yp)
+    type(rds_t), intent(inout) :: Rs(:)
+    PetscScalar, intent(in)    :: xp(:)
+    PetscScalar, intent(inout) :: yp(:)
+    integer :: k
+    if (size(Rs) == 1) then
+      call rds_solve_arr(Rs(1), xp, yp)
+      return
+    endif
+    do k = 1, size(Rs)
+      if (Rs(k)%member) call rds_gather(Rs(k), xp)
+    enddo
+    do k = 1, size(Rs)
+      if (Rs(k)%member) call rds_local(Rs(k))
+    enddo
+    do k = 1, size(Rs)
+      if (Rs(k)%member) call rds_return(Rs(k), yp)
+    enddo
+  end subroutine rds_solve_groups
+
+  !> rooted R: the members' rows of xp into the root's R%b
+  subroutine rds_gather(R, xp)
+    type(rds_t), intent(inout) :: R
+    PetscScalar, intent(in) :: xp(:)
+    PetscScalar, pointer :: bp(:)
+    PetscErrorCode :: ie
+    integer :: q, nl, mpierr
+    nl = size(R%loc)
+    do q = 1, nl
+      R%send(q) = xp(R%loc(q) + 1)
+    enddo
+    if (R%solver) then
+      call VecGetArray(R%b, bp, ie)
+      call MPI_Gatherv(R%send, nl, MPI_DOUBLE_PRECISION, bp, R%cnt, R%dsp(0:R%np - 1), &
+                       MPI_DOUBLE_PRECISION, R%root, R%comm, mpierr)
+      call VecRestoreArray(R%b, bp, ie)
+    else
+      call MPI_Gatherv(R%send, nl, MPI_DOUBLE_PRECISION, R%send, R%cnt, R%dsp(0:R%np - 1), &
+                       MPI_DOUBLE_PRECISION, R%root, R%comm, mpierr)
+    endif
+  end subroutine rds_gather
+
+  subroutine rds_local(R)
+    type(rds_t), intent(inout) :: R
+    PetscErrorCode :: ie
+    if (R%solver) call KSPSolve(R%ksp, R%b, R%x, ie)
+  end subroutine rds_local
+
+  !> rooted R: the root's R%x back to the members' rows of yp
+  subroutine rds_return(R, yp)
+    type(rds_t), intent(inout) :: R
+    PetscScalar, intent(inout) :: yp(:)
+    PetscScalar, pointer :: bp(:)
+    PetscErrorCode :: ie
+    integer :: q, nl, mpierr
+    nl = size(R%loc)
+    if (R%solver) then
+      call VecGetArrayRead(R%x, bp, ie)
+      call MPI_Scatterv(bp, R%cnt, R%dsp(0:R%np - 1), MPI_DOUBLE_PRECISION, R%send, nl, &
+                        MPI_DOUBLE_PRECISION, R%root, R%comm, mpierr)
+      call VecRestoreArrayRead(R%x, bp, ie)
+    else
+      call MPI_Scatterv(R%send, R%cnt, R%dsp(0:R%np - 1), MPI_DOUBLE_PRECISION, R%send, nl, &
+                        MPI_DOUBLE_PRECISION, R%root, R%comm, mpierr)
+    endif
+    do q = 1, nl
+      yp(R%loc(q) + 1) = R%send(q)
+    enddo
+  end subroutine rds_return
 
   !> One V-cycle of hierarchy k on b (x out), outside any PC: the pair_psi
   !! eta-Schur applies it to Shat.
@@ -983,7 +1172,8 @@ contains
   subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, smoother, nsmooth)
     use phys_module, only: physics_pc_gmg_smoother, physics_pc_gmg_nsmooth, physics_pc_gmg_omega, &
                            physics_pc_gmg_axis_rings, physics_pc_gmg_ring_diag, physics_pc_gmg_axis_mult, &
-                           physics_pc_gmg_bnd_drop
+                           physics_pc_gmg_bnd_drop, physics_pc_gmg_smooth_op, physics_pc_gmg_axis_split, &
+                           physics_pc_harm_split, physics_pc_gmg_axis_droptol
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
     Mat, intent(in), optional :: Afine  !< Workstream D: applies the fine operator
@@ -1069,12 +1259,20 @@ contains
     if (sm_type >= 4) axis_k = max(physics_pc_gmg_axis_rings, -1)
     axis_mult = 0
     if (axis_k /= 0) axis_mult = min(max(physics_pc_gmg_axis_mult, 0), 3)
+    axis_droptol = max(physics_pc_gmg_axis_droptol, 0.d0)
+    ! per-|n| axis solves need the block to be block-diagonal in |n|
+    axis_split = (axis_k /= 0 .and. physics_pc_gmg_axis_split > 0 .and. physics_pc_harm_split > 0)
+    if (axis_k /= 0 .and. physics_pc_gmg_axis_split > 0 .and. physics_pc_harm_split == 0 .and. my_id == 0) &
+      write(*,'(A)') "[Physics PC]   GMG: physics_pc_gmg_axis_split needs physics_pc_harm_split = 1; ignored"
     diag_left = max(physics_pc_gmg_ring_diag, 0)
     do g = 0, nlev - 2
       call KSPCreate(comm, gSm(g), ierr)
-      if (g == 0) then
+      if (g == 0 .and. physics_pc_gmg_smooth_op == 0) then
         call KSPSetOperators(gSm(g), gF, gA(g), ierr)     ! Jacobi reads the Pmat
       else
+        ! smooth_op 1: the fine smoother iterates on the assembled surrogate;
+        ! only the V-cycle residual and the outer Krylov apply gF (the shell)
+        ! -- one exact-mass solve per matvec there instead of per GMRES step
         call KSPSetOperators(gSm(g), gA(g), gA(g), ierr)
       endif
       if (sm_type == 1 .or. sm_type == 2) then
@@ -1374,13 +1572,13 @@ contains
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
-    integer :: nc, I, J, m, bb, q, pr, pcn, info, n, ldab, kk, tmp, nthr
+    integer :: nc, I, J, m, bb, q, pr, pcn, info, n, ldab, kk, tmp, nthr, ngrp, gnp, mpierr
     integer, allocatable :: cnt(:), key(:)
     integer(8) :: tot, ix
     PetscInt, allocatable :: axr(:)
     integer, allocatable :: binfo(:)
-    character(len=16) :: axname
-    character(len=24) :: axtag
+    character(len=24) :: axname
+    character(len=64) :: axtag
     external :: dgetrf, dgbtrf
 
     B => gBk(g)
@@ -1485,16 +1683,30 @@ contains
         enddo
         call ISCreateGeneral(gcomm, int(n, kind(nr)), axr, PETSC_COPY_VALUES, B%axis_is, ierr)
         call ISSort(B%axis_is, ierr)
-        ! the same rows, local and ascending, for the redundant axis solve
-        allocate(B%ax%loc(n), key(B%nrow))
+        ! the same rows, local and ascending, per axis group (key = group + 1)
+        ngrp = 1
+        if (axis_split) ngrp = (n_tor + 1) / 2
+        allocate(B%axg(ngrp), key(B%nrow))
         key = 0
         do q = 1, n
-          key(axr(q) - rst + 1) = 1
+          r = axr(q) - rst + 1
+          key(r) = 1
+          if (axis_split) then
+            if (g == 0) then
+              m = fine_harm(r)
+            else
+              m = glv(g)%rharm(r)
+            endif
+            key(r) = (m + 1) / 2 + 1                 ! |n| group of slot m (cos/sin together)
+          endif
         enddo
-        n = 0
-        do r = 1, B%nrow
-          if (key(r) == 0) cycle
-          n = n + 1; B%ax%loc(n) = int(r) - 1
+        do kk = 1, ngrp
+          allocate(B%axg(kk)%loc(count(key == kk)))
+          n = 0
+          do r = 1, B%nrow
+            if (key(r) /= kk) cycle
+            n = n + 1; B%axg(kk)%loc(n) = int(r) - 1
+          enddo
         enddo
         deallocate(axr, key)
       endif
@@ -1600,9 +1812,19 @@ contains
     enddo
 
     if (B%axsparse) then
-      write(axname, '(A,I0)') "axblk", g
-      write(axtag, '(A,I0)') "axis block level ", g
-      call rds_setup(B%ax, A, trim(axname), trim(axtag))
+      if (size(B%axg) == 1) then
+        write(axname, '(A,I0)') "axblk", g
+        write(axtag, '(A,I0)') "axis block level ", g
+        call rds_setup(B%axg(1), A, trim(axname), trim(axtag))
+      else
+        call MPI_Comm_size(gcomm, gnp, mpierr)
+        do kk = 1, size(B%axg)
+          write(axname, '(A,I0,A,I0)') "axblk", g, "n", kk - 1
+          write(axtag, '(A,I0,A,I0,A,I0)') "axis block level ", g, " |n|-group ", kk - 1, &
+                                           " on rank ", mod(kk - 1, gnp)
+          call rds_setup(B%axg(kk), A, trim(axname), trim(axtag), mod(kk - 1, gnp))
+        enddo
+      endif
     endif
 
     if (B%axsparse .and. axis_mult > 0) then
@@ -1798,9 +2020,14 @@ contains
     subroutine ax_solve(xx, yy)
       Vec :: xx, yy
       PetscErrorCode :: ie
-      if (.not. B%ax%member) return
+      PetscScalar, pointer :: xp(:), yp(:)
+      if (.not. any(B%axg(:)%member)) return
       call PetscLogEventBegin(gev_axsolve, ie)
-      call rds_solve(B%ax, xx, yy)
+      call VecGetArrayRead(xx, xp, ie)
+      call VecGetArray(yy, yp, ie)
+      call rds_solve_groups(B%axg, xp, yp)
+      call VecRestoreArray(yy, yp, ie)
+      call VecRestoreArrayRead(xx, xp, ie)
       call PetscLogEventEnd(gev_axsolve, ie)
     end subroutine ax_solve
 

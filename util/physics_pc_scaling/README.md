@@ -60,6 +60,9 @@ submitted again. `results.tsv` is rewritten after every case.
 | arm | preconditioner |
 |---|---|
 | `sfm2_gmg` | SFM2 without refactorisations: C¹ GMG on pair_w (matrix-free fine operator with the exact mass), eta-Schur + GMG on pair_psi, GMG on ρ/T. Only the constraint masses are factored, once per run. Every hierarchy uses the stage-D13 axis treatment: rings 0–3 of every level in one axis block solved by MUMPS (`physics_pc_gmg_axis_rings = 3`), and coarse levels without the boundary ring's Dirichlet DOFs (`physics_pc_gmg_bnd_drop = 1`). The ring count is fixed on purpose: the automatic choice (`-1`, all rings with r·Δθ/Δr < 1) grows like n_tht/2π rings, so its factor grows faster than N (438 MB at 49×64, tens of GB at 641×256). k = 3 was the fastest setting on both benchmarks. |
+| `sfm2_gmg_mass` | `sfm2_gmg` with the exact-mass solves done by a fixed-degree Chebyshev iteration preconditioned by additive Schwarz (one subdomain per rank, overlap 1, local ICC(0)) instead of MUMPS with a centralized RHS (`physics_pc_mass_solver = 2`). Iteration counts are identical; the point is that its cost per rank falls with the rank count while the MUMPS solve's rises (161×64: `PhysPC_MjSolve` 90 s at np 1, 312 s at np 32). On few ranks it is SLOWER than MUMPS. |
+| `sfm2_gmg_smop` | `sfm2_gmg` with the fine GMG smoother on the assembled operator, the exact matrix-free operator only for residuals (`physics_pc_gmg_smooth_op = 1`): about 4.8× fewer exact-mass solves, at +16% pair_w V-cycles and +1..2 outer iterations. |
+| `sfm2_gmg_q` | both of the above. |
 | `sfm2_gmg_d12` | `sfm2_gmg` without the axis treatment (the configuration of commit `3cafa9f46`), for comparison. |
 | `sfm2_lu` | SFM2 with MUMPS LU inner solves (the reference for approximation quality); refactored at every PC rebuild |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
@@ -83,6 +86,18 @@ The GMG arm needs n_flux − 1 divisible by 4 and n_tht divisible by 8 (at least
 161×64 and above needs a lot of memory (7.4 GB at 81×32, and LU fill grows
 faster than the DOF count). Run it on whole nodes (`--mem=0`), or leave it out
 of the large cases.
+
+Two further knobs are off by default and have no arm, because they need a
+case the study does not cover (see `docs/physics_pc/workstream_D_matrix_free.md`
+§14):
+
+- `physics_pc_gmg_axis_split = 1` solves the axis block as one LU per |n|
+  group, group k on rank mod(k, np), instead of one LU of all slots on rank 0.
+  The counts are identical. At n_tor = 3 it only cuts the peak by 20% and the
+  gather/scatter costs more than that, so it needs a larger n_tor.
+- `physics_pc_gmg_axis_droptol = 1.d-4` drops the entries below
+  tol·sqrt(|a_ii a_jj|) from the axis block before its LU: −47% factor entries
+  and −23% `GMG_AxSolve` at 41×16, with unchanged counts.
 
 ## Output columns (`results.tsv`)
 
