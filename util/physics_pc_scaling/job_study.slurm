@@ -54,7 +54,7 @@ export PCS_OMP=${PCS_OMP:-${SLURM_CPUS_PER_TASK:-1}}
 # Arms and series (defaults in pc_study.sh). np = MPI ranks:
 # export PCS_NL_MESH=161x64; export PCS_NL_NP=16      # nonlinear trajectory
 # export PCS_PROBE_ARMS="sfm2_lu_hs0 sfm2_gmg_hs0"    # probes
-# export PCS_ARMS="sfm2_gmg sfm2_gmg_d12 sfm2_lu jorek"
+# export PCS_ARMS="jorek sfm2_lu sfm2_gmg sfm2_gmg_q"
 # export PCS_MESH=161x64
 # export PCS_NPS="1 2 4 8"                        # e.g. 1 node at 8 ranks/node
 # export PCS_WEAK="81x32:1 161x64:4 321x128:16 641x256:64"

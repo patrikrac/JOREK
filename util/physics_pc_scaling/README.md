@@ -64,7 +64,7 @@ submitted again. `results.tsv` is rewritten after every case.
 | `sfm2_gmg_mass` | `sfm2_gmg` with the exact-mass solves done by a fixed-degree Chebyshev iteration preconditioned by additive Schwarz (one subdomain per rank, overlap 1, local ICC(0)) instead of MUMPS with a centralized RHS (`physics_pc_mass_solver = 2`). Iteration counts are identical; the point is that its cost per rank falls with the rank count while the MUMPS solve's rises (161×64: `PhysPC_MjSolve` 90 s at np 1, 312 s at np 32). On few ranks it is SLOWER than MUMPS. |
 | `sfm2_gmg_smop` | `sfm2_gmg` with the fine GMG smoother on the assembled operator, the exact matrix-free operator only for residuals (`physics_pc_gmg_smooth_op = 1`): about 4.8× fewer exact-mass solves, at +16% pair_w V-cycles and +1..2 outer iterations. |
 | `sfm2_gmg_q` | both of the above. |
-| `sfm2_gmg_d12` | `sfm2_gmg` without the axis treatment (the configuration of commit `3cafa9f46`), for comparison. |
+| `sfm2_gmg_d12` | `sfm2_gmg` without the axis treatment (the configuration of commit `3cafa9f46`). Opt-in only: the comparison is already measured (161×64, np 16: 473 s against 365 s), so it is not in the default arms. |
 | `sfm2_lu` | SFM2 with MUMPS LU inner solves (the reference for approximation quality); refactored at every PC rebuild |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
 | `jorek_fresh` | `jorek` with the PC rebuilt at every step (`iter_precon = 0`): separates the loss of the mode coupling from a stale factorisation |

@@ -19,7 +19,7 @@
 #    PCS_DRYRUN=1 pc_study.sh strong   # only print the cases that would run
 #
 #  Environment (defaults in brackets):
-#    PCS_ARMS    arms to run, in order          [sfm2_gmg sfm2_gmg_d12 sfm2_lu jorek;
+#    PCS_ARMS    arms to run, in order          [jorek sfm2_lu sfm2_gmg sfm2_gmg_q;
 #                                                 nonlinear: jorek jorek_fresh sfm2_lu sfm2_lu_hs0 sfm2_gmg_hs0]
 #    PCS_MESH    strong: the fixed mesh         [161x64]
 #    PCS_NPS     strong: rank counts            [1 2 4 8 16 32 64]
@@ -49,7 +49,10 @@ MODE=${1:-}
 if [ "$MODE" = nonlinear ]; then
   ARMS=${PCS_ARMS:-"jorek jorek_fresh sfm2_lu sfm2_lu_hs0 sfm2_gmg_hs0"}
 else
-  ARMS=${PCS_ARMS:-"sfm2_gmg sfm2_gmg_d12 sfm2_lu jorek"}
+  # jorek first: it is the cheapest, so a timed-out job still has the baseline.
+  # sfm2_gmg_d12 is NOT a default: it only exists to show what the D13 axis
+  # treatment bought, and that comparison is already measured.
+  ARMS=${PCS_ARMS:-"jorek sfm2_lu sfm2_gmg sfm2_gmg_q"}
 fi
 MAXNP=${PCS_MAXNP:-${SLURM_NTASKS:-8}}
 export PCS_ROOT=${PCS_ROOT:-$PWD/pc_scaling}
