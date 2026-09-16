@@ -8,6 +8,15 @@
 #     sbatch --export=ALL,MODE=strong job_study.local.slurm
 #     sbatch --export=ALL,MODE=weak   job_study.local.slurm
 #
+#  The motivation study adds two more modes (see README, "Motivation figures"):
+#
+#     sbatch --export=ALL,MODE=nonlinear job_study.local.slurm
+#     sbatch --export=ALL,MODE=probes,PCS_REF=/path/to/pc_scaling_nonlinear/jorek_<mesh>_np1x<omp> \
+#            job_study.local.slurm
+#
+#  nonlinear and probes only need their iteration counts, so one node is
+#  enough for them; strong and weak are the timed series.
+#
 #  JOREK runs hybrid MPI+OpenMP: set --ntasks-per-node (MPI ranks per node)
 #  and --cpus-per-task (OpenMP threads per rank) so that their product is the
 #  number of physical cores per node, e.g. 8 x 16 or 16 x 16 on a 128- or
@@ -43,6 +52,8 @@ export PCS_ROOT=${PCS_ROOT:-$PWD/pc_scaling_$MODE}
 export PCS_OMP=${PCS_OMP:-${SLURM_CPUS_PER_TASK:-1}}
 
 # Arms and series (defaults in pc_study.sh). np = MPI ranks:
+# export PCS_NL_MESH=161x64; export PCS_NL_NP=16      # nonlinear trajectory
+# export PCS_PROBE_ARMS="sfm2_lu_hs0 sfm2_gmg_hs0"    # probes
 # export PCS_ARMS="sfm2_gmg sfm2_gmg_d12 sfm2_lu jorek"
 # export PCS_MESH=161x64
 # export PCS_NPS="1 2 4 8"                        # e.g. 1 node at 8 ranks/node

@@ -4,7 +4,7 @@
 #
 #    pc_case.sh <arm> <n_flux> <n_tht> <np> [key=value ...]
 #
-#  arm     jorek | sfm2_lu | sfm2_gmg | sfm2_gmg_d12   (see mknml.py)
+#  arm     jorek | jorek_fresh | sfm2_lu | sfm2_lu_hs0 | sfm2_gmg | sfm2_gmg_* (see mknml.py)
 #  np      MPI ranks for this case (<= ranks of the allocation); every rank
 #          runs PCS_OMP OpenMP threads (hybrid MPI+OpenMP, as JOREK is run)
 #  extra key=value pairs are passed to mknml.py as namelist overrides.
@@ -25,6 +25,8 @@
 #                   else mpirun -np NP]
 #    PCS_PETSC_OPTS  extra PETSc options               []
 #    PCS_TSTEP_N / PCS_NSTEP_N   tstep ramp            [1.d-1,1.d0,1.d1 / 3,3,3]
+#    PCS_NOUT      restart/field output every N steps  [1000]
+#    PCS_RESTART   restart from this jorek*.h5 file (copied in as jorek_restart.h5) []
 #    PCS_FORCE     1 = rerun even if the case finished []
 # =====================================================================
 set -u
@@ -60,11 +62,14 @@ fi
 
 mkdir -p "$DIR" || exit 1
 python3 "$HERE/mknml.py" "$ARM" "$NF" "$NT" "$DIR/in" "$@" || exit 1
+if [ -n "${PCS_RESTART:-}" ]; then
+  cp "$PCS_RESTART" "$DIR/jorek_restart.h5" || exit 1
+fi
 
 NODES=${SLURM_JOB_NUM_NODES:-1}
 {
   echo "arm=$ARM"; echo "n_flux=$NF"; echo "n_tht=$NT"; echo "np=$NP"; echo "omp=$OMP"; echo "nodes=$NODES"
-  echo "overrides=$*"; echo "bin=$JOREK_BIN"; echo "launch=$LAUNCH"
+  echo "overrides=$*"; echo "bin=$JOREK_BIN"; echo "launch=$LAUNCH"; echo "restart_from=${PCS_RESTART:-}"
   echo "slurm_job=${SLURM_JOB_ID:-}"; echo "host=$(hostname)"; echo "start=$(date '+%Y-%m-%dT%H:%M:%S')"
   echo "git=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null)"
 } > "$DIR/case.meta"
@@ -84,6 +89,7 @@ WALL=$(python3 -c "print('%.1f' % ($T1 - $T0))")
 
 STATUS=ok
 [ $RC -ne 0 ] && STATUS=exit$RC
+grep -q 'NO CONVERGENCE' log && STATUS=noconv     # JOREK aborts but exits 0
 grep -q 'PETSC ERROR\|FATAL' log && STATUS=error
 grep -q '\[PETSc\] outer iterations' log || STATUS=${STATUS/ok/incomplete}
 { echo "rc=$RC"; echo "wall_s=$WALL"; echo "end=$(date '+%Y-%m-%dT%H:%M:%S')"; echo "status=$STATUS"; } >> case.meta

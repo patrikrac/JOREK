@@ -13,6 +13,8 @@ Environment:
   PCS_BASE     base namelist (default: <repo>/namelist/model199/intear_island_demo)
   PCS_TSTEP_N  tstep ramp   (default: 1.d-1,1.d0,1.d1)
   PCS_NSTEP_N  steps per tstep (default: 3,3,3)
+  PCS_NOUT     restart/field output every N steps (default: 1000)
+  PCS_RESTART  if set, the case restarts (restart = .t.) from that file
 """
 import os
 import sys
@@ -96,6 +98,19 @@ ARMS['sfm2_gmg_q'] = dict(ARMS['sfm2_gmg'], **{
     'physics_pc_mass_solver': '2',
     'physics_pc_gmg_smooth_op': '1',
 })
+# Motivation study (nonlinear phase, `pc_study.sh nonlinear`):
+#   jorek_fresh  = JOREK's default PC rebuilt at EVERY step (iter_precon = 0),
+#                  so a rise of its in the nonlinear phase is the per-harmonic
+#                  PC losing the mode coupling, not a stale factorisation.
+#   sfm2_*_hs0   = keeping the cross-|n| entries (harm_split = 0). They are
+#                  exact zeros at equilibrium but NOT once the island is
+#                  nonlinear: at saturation (41x16, tstep 1000) ||cross||/||A||
+#                  is 0.98 in B_24 and 0.32 in B_21, and with harm_split = 1
+#                  both sfm2_lu and sfm2_gmg stall at 400 its while sfm2_lu_hs0
+#                  converges in a flat 71 its per step.
+ARMS['jorek_fresh'] = dict(ARMS['jorek'], **{'iter_precon': '0'})
+ARMS['sfm2_lu_hs0'] = dict(ARMS['sfm2_lu'], **{'physics_pc_harm_split': '0'})
+ARMS['sfm2_gmg_hs0'] = dict(ARMS['sfm2_gmg'], **{'physics_pc_harm_split': '0'})
 ARMS['sfm2_gmg_d12'] = dict(ARMS['sfm2_gmg'], **{
     'physics_pc_gmg_axis_rings': '0',
     'physics_pc_gmg_bnd_drop': '0',
@@ -126,7 +141,9 @@ def main(argv):
     ov['n_tht'] = str(n_tht)
     ov['tstep_n'] = os.environ.get('PCS_TSTEP_N', '1.d-1,1.d0,1.d1')
     ov['nstep_n'] = os.environ.get('PCS_NSTEP_N', '3,3,3')
-    ov['nout'] = '1000'                       # no field output during timing
+    ov['nout'] = os.environ.get('PCS_NOUT', '1000')   # 1000: no field output during timing
+    if os.environ.get('PCS_RESTART'):         # pc_case.sh copied the restart file in
+        ov['restart'] = '.t.'
     for a in argv[5:]:
         k, v = a.split('=', 1)
         ov[k.strip()] = v.strip()

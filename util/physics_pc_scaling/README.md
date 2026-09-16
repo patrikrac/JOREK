@@ -9,10 +9,11 @@ preconditioner. The test case is the committed benchmark
 | file | role |
 |---|---|
 | `job_study.slurm` | generic jobscript template: copy it to `job_study.local.slurm` (git-ignored) and add the machine's partition, account and modules there |
-| `pc_study.sh` | runs a strong or weak series one case after another inside one allocation |
+| `pc_study.sh` | runs a strong, weak, nonlinear or probe series one case after another inside one allocation |
 | `pc_case.sh` | runs one case: writes the namelist, launches, profiles, records `case.meta` |
 | `mknml.py` | namelist = base + arm flags + mesh + ramp (+ `key=value` overrides) |
-| `collect.py` | turns a study directory into `results.tsv` |
+| `collect.py` | turns a study directory into `results.tsv`, and each case's log into `steps.tsv` |
+| `plot_motivation.py` | the motivation figures from a strong, a weak and a nonlinear study (see below) |
 
 ## Build requirements
 
@@ -66,6 +67,8 @@ submitted again. `results.tsv` is rewritten after every case.
 | `sfm2_gmg_d12` | `sfm2_gmg` without the axis treatment (the configuration of commit `3cafa9f46`), for comparison. |
 | `sfm2_lu` | SFM2 with MUMPS LU inner solves (the reference for approximation quality); refactored at every PC rebuild |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
+| `jorek_fresh` | `jorek` with the PC rebuilt at every step (`iter_precon = 0`): separates the loss of the mode coupling from a stale factorisation |
+| `sfm2_lu_hs0`, `sfm2_gmg_hs0` | `sfm2_lu` / `sfm2_gmg` keeping the cross-\|n\| entries (`physics_pc_harm_split = 0`). They are zeros at equilibrium but O(1) in the saturated island, where the `harm_split = 1` arms stall. |
 
 ## Series
 
@@ -73,6 +76,7 @@ submitted again. `results.tsv` is rewritten after every case.
 |---|---|---|
 | strong | 161×64 (741k DOFs) at np = 1, 2, 4, …, 64 MPI ranks | `PCS_MESH`, `PCS_NPS` |
 | weak | 81×32 at 1, 161×64 at 4, 321×128 at 16, 641×256 at 64 (about 186k DOFs per rank) | `PCS_WEAK` |
+| nonlinear | one trajectory per arm on 41×16, np 1: tstep 1, 10, 100 (10 steps each), then 200 steps at 1000, through the island's linear growth into saturation; restart files every 10 steps | `PCS_NL_MESH`, `PCS_NL_NP`, `PCS_NL_N` |
 
 Problem sizes: 41×16 = 47k, 81×32 = 186k, 161×64 = 741k, 321×128 = 2.96M,
 641×256 = 11.8M DOFs. Keep at least about 20k DOFs, and a few flux-surface
@@ -98,6 +102,61 @@ case the study does not cover (see `docs/physics_pc/workstream_D_matrix_free.md`
 - `physics_pc_gmg_axis_droptol = 1.d-4` drops the entries below
   tol·sqrt(|a_ii a_jj|) from the axis block before its LU: −47% factor entries
   and −23% `GMG_AxSolve` at 41×16, with unchanged counts.
+
+## Motivation figures (`plot_motivation.py`)
+
+Five figures for the case for a scalable physics PC. Each comes from one
+series; a series is one study directory:
+
+| figure | claim | series (`pc_study.sh …`) | arms |
+|---|---|---|---|
+| `F1_lu_strong` | JOREK's LU PC does not strong-scale: factorisation and triangular-solve time and efficiency vs cores | `strong` | `jorek` |
+| `F1_lu_weak` | at fixed DOFs per rank the LU build, apply and memory per rank grow with N; SFM2-GMG's stay flatter | `weak` | `jorek sfm2_lu sfm2_gmg` |
+| `F2_nonlinear_lu` | JOREK's iterations rise ~10× once the island goes nonlinear, also when the PC is rebuilt every step | `nonlinear` | `jorek jorek_fresh` |
+| `F3_nonlinear_all` | SFM2 keeps its count through the nonlinear phase, absolute and relative to its own linear-phase count | `nonlinear` | `jorek jorek_fresh sfm2_lu sfm2_lu_hs0 sfm2_gmg_hs0` |
+| `F4_components` | each SFM2 part (D_ρ/D_T, pair_psi, pair_w, the Schur assembly), LU inner solves vs scalable ones: time per outer iteration vs cores, and parallel efficiency | `strong` | `sfm2_lu sfm2_gmg sfm2_gmg_q` (+ `jorek` as the whole-system LU reference) |
+| `F5_mode_coupling` | why: the n=0↔n=1 blocks go from ~0 to O(1) as the island grows | `probes` (one step from each restart of the `nonlinear` run) | `sfm2_lu_hs0` (the A8 report needs harm_split = 0) |
+
+```bash
+export JOREK_BIN=/path/to/jorek_model199          # n_tor = 3, n_period = 1 build
+PCS_ROOT=$PWD/pc_scaling_strong PCS_ARMS="jorek sfm2_lu sfm2_gmg sfm2_gmg_q" ./pc_study.sh strong
+PCS_ROOT=$PWD/pc_scaling_weak   PCS_ARMS="jorek sfm2_lu sfm2_gmg"            ./pc_study.sh weak
+PCS_ROOT=$PWD/pc_scaling_nl     PCS_NL_MESH=41x16                            ./pc_study.sh nonlinear
+# F5 (and F3's probe points): one step at tstep 1000 from each restart of the
+# jorek trajectory. sfm2_gmg_hs0 is usually too slow for a whole trajectory,
+# so probe it here instead.
+PCS_ROOT=$PWD/pc_scaling_coupling PCS_REF=$PWD/pc_scaling_nl/jorek_41x16_np1x1 \
+  PCS_PROBE_ARMS="sfm2_lu_hs0 sfm2_gmg_hs0" PCS_PROBE_NP=1 ./pc_study.sh probes
+python3 -m venv .venv && .venv/bin/pip install matplotlib numpy
+.venv/bin/python plot_motivation.py --strong pc_scaling_strong --weak pc_scaling_weak \
+    --nonlinear pc_scaling_nl --coupling pc_scaling_coupling --out figures
+```
+
+On the cluster: strong at 161×64 (and 321×128 beyond ~64 ranks), weak with
+the default `PCS_WEAK`, and the nonlinear series at 161×64 on 16 ranks
+(`PCS_NL_MESH=161x64 PCS_NL_NP=16`). The nonlinear figures only plot
+iteration counts, so the rank count there does not matter.
+
+**Things the figures do not hide:**
+- **The mode coupling decides the nonlinear phase.** With `harm_split = 1`
+  SFM2 drops the cross-|n| blocks, the same approximation JOREK's
+  per-harmonic PC makes. It then stalls at 400 its in the saturated island at
+  tstep 1000 (41×16, both `sfm2_lu` and `sfm2_gmg`). Keeping the blocks
+  (`*_hs0`) gives a flat 71 (LU) / 55 (GMG) its per step there, against
+  103–105 in the linear phase. Every nonlinear-phase claim needs the `_hs0`
+  arms; `harm_split = 1` is only for linear-phase timing.
+- **SFM2 needs more iterations than JOREK's PC in absolute terms**: ~70 against
+  14–17 in saturation, and ~105 against 1–2 in the linear phase. F3 shows
+  both panels. The case for SFM2 is its flat count and its parallel parts,
+  not its count today.
+- **The whole SFM2 PC is still slower than JOREK's.** F4 compares the parts'
+  scaling, not their absolute cost.
+- The nonlinear degradation shows at large tstep. At tstep 10, JOREK's PC
+  needs 2–3 its even in the saturated island, and 4–8 at tstep 100.
+- With n_tor = 3 only n = 0 ↔ 1 is coupled. Production runs with more
+  harmonics drop more coupling.
+- On the laptop, np > 4 uses the efficiency cores, so the laptop scaling
+  numbers only show that the pipeline works.
 
 ## Output columns (`results.tsv`)
 
@@ -125,6 +184,15 @@ case the study does not cover (see `docs/physics_pc/workstream_D_matrix_free.md`
   - `GMG_Lines`: the radial-line block solves of the smoother (OpenMP).
 - `mem_max_total_GB` / `mem_max_rank_GB`: `-memory_view` peak RSS, summed over
   ranks / largest rank.
+- `rebuilds`: PC builds (the first setup plus every refactorisation).
+- `n_<event>`: the call count of each event, for times per call.
+- `status`: `ok`, `noconv` (JOREK aborted after 400 its; it still exits 0),
+  `error`, `incomplete`.
+
+Every case directory also gets a `steps.tsv`, one row per time step: tstep,
+time, outer its, rebuild flag, step/setup/solve seconds, and W_mag/W_kin of
+the first and last harmonic. An aborted step is kept as the last row, with a
+negative reason.
 
 ## Things to know
 
@@ -176,3 +244,21 @@ Outer iterations are unchanged to within +4. On the ballooning corner
 (`inxflow600_circ_pcbench`, 49×64, tstep 10) the pair_w cycles fall from
 20–24 to 10–11 and the wall time from 1337 s to 992 s; JOREK's default PC
 needs 273 s there.
+
+### Motivation figures on the same laptop (2026-09-15, `n_period = 1` build)
+
+`plot_motivation.py` on 81×32 (strong), `41x16:1 57x24:2 81x32:4` (weak) and
+the 41×16 nonlinear run:
+
+- **Nonlinear phase, tstep 1000:**
+  - JOREK's PC goes from 1–3 to 16–18 its, and still 13–15 when it is rebuilt every step.
+  - `sfm2_lu_hs0` falls from 105 to 66–72; `sfm2_gmg_hs0` probes from 85 to 52–63.
+  - `sfm2_lu` (harm_split = 1) stalls at 400 its at step 105.
+- **Strong scaling:**
+  - JOREK's LU factorisation stays at ~9 s per rebuild at np 1, 2 and 4.
+  - Among the SFM2 parts, only the Schur assembly scales (~60% at 4).
+  - pair_w's GMG smoother scales, but its exact-mass MUMPS solve (8 → 29 s) and rank-0 axis LU (5 → 12 s) grow with np.
+- **Weak scaling:** JOREK's PC build grows 6.5× over 4× the DOFs at fixed DOFs per rank; SFM2-GMG's grows 2.1×.
+
+Four P-cores sharing one memory bus cannot show strong scaling of sparse
+kernels. Only the cluster can confirm or refute claim 4.

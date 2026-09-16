@@ -5,8 +5,15 @@
 
 Every directory below a root that holds a `case.meta` (written by pc_case.sh)
 and a `log` becomes one row. Times of the -log_view events are the MAX over
-ranks, summed over logging stages. Missing quantities are left empty, so a
-crashed or unfinished case still shows up (status column).
+ranks, summed over logging stages (the generic LU/KSP events MatLUFactor*,
+MatSolve, PC*, KSPSolve, MatMult only over the time-step KSP stages, not the
+equilibrium solve's Main Stage); n_<event> is the call count. Missing
+quantities are left empty, so a crashed or unfinished case still shows up
+(status column).
+
+Each case directory also gets a steps.tsv: one row per completed time step
+(tstep, time, outer iterations, PC rebuild flag, timings, W_mag/W_kin of the
+first and last harmonic), which the nonlinear-phase figures read.
 """
 import os
 import re
@@ -18,12 +25,18 @@ EVENTS = [
     'PhysPC_SolveRhoT', 'PhysPC_ShellMult', 'PhysPC_MjSolve', 'PhysPC_PsiPC',
     'GMG_VCycle', 'GMG_Smooth0', 'GMG_Lines', 'GMG_AxSolve', 'GMG_Coarse', 'GMG2_VCycle', 'GMG3_VCycle',
     'GMG4_VCycle', 'MatMult', 'KSPSolve',
+    # the LU factorisations and triangular solves (JOREK's default PC, and the
+    # MUMPS inner solves of sfm2_lu)
+    'MatLUFactorSym', 'MatLUFactorNum', 'MatSolve', 'PCSetUp', 'PCApply',
 ]
 COLS = (['case', 'arm', 'n_flux', 'n_tht', 'np', 'omp', 'cores', 'nodes', 'n_tor', 'n_period',
          'status', 'ndof', 'wall_s',
-         'step_s_sum', 'setup_s_sum', 'solve_s_sum', 'outer_its', 'outer_sum',
+         'step_s_sum', 'setup_s_sum', 'solve_s_sum', 'outer_its', 'outer_sum', 'rebuilds',
          'pw_cycles_mean', 'pp_its_mean', 'rt_its_mean', 'mem_max_total_GB',
-         'mem_max_rank_GB'] + ['t_' + e for e in EVENTS])
+         'mem_max_rank_GB'] + ['t_' + e for e in EVENTS] + ['n_' + e for e in EVENTS])
+STEP_ONLY = {'MatLUFactorSym', 'MatLUFactorNum', 'MatSolve', 'PCSetUp', 'PCApply', 'KSPSolve', 'MatMult'}
+STEP_COLS = ['step', 'tstep', 't_now', 'outer_its', 'rebuild', 'step_s', 'setup_s', 'solve_s',
+             'wmag_n0', 'wmag_nlast', 'wkin_n0', 'wkin_nlast', 'reason']
 
 RE_FLOAT = r'([-+]?\d+(?:\.\d*)?(?:[eEdD][-+]?\d+)?)'
 
@@ -61,6 +74,8 @@ def parse_log(path, row):
     row['step_s_sum'] = tsum(r'Elapsed time ITERATION :')
     row['setup_s_sum'] = tsum(r'\[PETSc\] Elapsed time in solver setup :')
     row['solve_s_sum'] = tsum(r'\[PETSc\] Elapsed time in solve :')
+    # the first setup plus every refactorisation
+    row['rebuilds'] = len(re.findall(r'\[PETSc\] Elapsed time in solver setup :', txt))
     # compile-time toroidal settings, from the log (the namelist cannot set them)
     for k in ('n_tor', 'n_period'):
         m = re.search(r'^\s*' + k + r'\s*=\s*(\d+)', txt, re.M)
@@ -75,24 +90,85 @@ def parse_log(path, row):
         row['mem_max_rank_GB'] = '%.3f' % (fnum(m.group(2)) / 1e9)
     if 'PETSC ERROR' in txt or 'FATAL' in txt:
         row['status'] = 'error'
+    elif 'NO CONVERGENCE' in txt:        # JOREK aborts the run, but exits 0
+        row['status'] = 'noconv'
     elif re.search(r'Elapsed time ITERATION', txt) and outer:
         row['status'] = 'ok'
     else:
         row['status'] = 'incomplete'
 
 
+def parse_steps(path):
+    """One dict per completed time step of a JOREK log.
+
+    A step ends at its 'Elapsed time ITERATION' line; everything since the
+    previous one (the step header, the solver setup and solve, the energies)
+    belongs to it. A step that JOREK aborted (NO CONVERGENCE) has no such line;
+    it is kept as the last row, with a negative reason and no step time.
+    W_mag/W_kin are the first and last toroidal harmonic of the log's
+    'W_mag,_kin' line (n = 0 and n = 1 for n_tor = 3, n_period = 1).
+    """
+    txt = open(path, errors='replace').read()
+    steps = []
+    parts = re.split(r'Elapsed time ITERATION :\s*' + RE_FLOAT, txt)
+    chunks = list(zip(parts[0:-1:2], parts[1::2]))
+    if 'NO CONVERGENCE' in parts[-1]:    # the aborted step: keep it, it is the result
+        chunks.append((parts[-1], ''))
+    for chunk, step_s in chunks:
+        outer = re.findall(r'\[PETSc\] outer iterations:\s+(\d+)\s+converged reason:\s*(-?\d+)', chunk)
+        if not outer:
+            continue
+        s = {c: '' for c in STEP_COLS}
+        s['outer_its'] = sum(int(o[0]) for o in outer)
+        s['reason'] = outer[-1][1]
+        s['step_s'] = step_s
+        s['rebuild'] = 1 if re.search(r'Elapsed time in solver setup', chunk) else 0
+        v = re.findall(r'\[PETSc\] Elapsed time in solver setup :\s*' + RE_FLOAT, chunk)
+        s['setup_s'] = '%.4f' % sum(fnum(x) for x in v) if v else '0'
+        v = re.findall(r'\[PETSc\] Elapsed time in solve :\s*' + RE_FLOAT, chunk)
+        s['solve_s'] = '%.4f' % sum(fnum(x) for x in v) if v else ''
+        m = re.findall(r'time step :\s+\d+\s+\d+\s+(\d+)\s+' + RE_FLOAT, chunk)
+        if m:
+            s['step'], s['tstep'] = m[-1][0], m[-1][1]
+        m = re.findall(r'After step \d+ \(t_now=\s*' + RE_FLOAT + r'\)', chunk)
+        if m:
+            s['t_now'] = m[-1]
+        m = re.findall(r'W_mag,_kin\s*=\s*' + RE_FLOAT + r'\s*\.\.\.\s*' + RE_FLOAT + r',\s*'
+                       + RE_FLOAT + r'\s*\.\.\.\s*' + RE_FLOAT, chunk)
+        if m:
+            s['wmag_n0'], s['wmag_nlast'], s['wkin_n0'], s['wkin_nlast'] = m[-1]
+        steps.append(s)
+    return steps
+
+
+def write_steps(case_dir, steps):
+    with open(os.path.join(case_dir, 'steps.tsv'), 'w') as f:
+        f.write('\t'.join(STEP_COLS) + '\n')
+        for s in steps:
+            f.write('\t'.join(str(s[c]) for c in STEP_COLS) + '\n')
+
+
 def parse_prof(path, row):
     tot = {}
+    cnt = {}
     wall = None
+    stage = None
     for line in open(path, errors='replace'):
         f = line.split()
         if not f:
             continue
         if line.startswith('Time (sec):') and len(f) >= 3:
             wall = fnum(f[2])
+        if line.startswith('--- Event Stage'):
+            stage = line.split(':', 1)[1].strip()
+        # JOREK's equilibrium solve (Main Stage) also factorises with MUMPS;
+        # the generic LU/PC events count only in the time-step KSP stages.
+        if f[0] in STEP_ONLY and stage == 'Main Stage':
+            continue
         if f[0] in EVENTS and len(f) > 4:
             try:
                 tot[f[0]] = tot.get(f[0], 0.0) + fnum(f[3])
+                cnt[f[0]] = cnt.get(f[0], 0) + int(f[1])
             except ValueError:
                 pass
     if wall is not None:
@@ -100,6 +176,7 @@ def parse_prof(path, row):
     for e in EVENTS:
         if e in tot:
             row['t_' + e] = '%.3f' % tot[e]
+            row['n_' + e] = cnt[e]
 
 
 def main(roots):
@@ -118,8 +195,11 @@ def main(roots):
             row['status'] = 'no-log'
             if 'log' in files:
                 parse_log(os.path.join(d, 'log'), row)
+                write_steps(d, parse_steps(os.path.join(d, 'log')))
             if 'prof.txt' in files:
                 parse_prof(os.path.join(d, 'prof.txt'), row)
+            if 'status' not in meta:        # pc_case.sh writes it when the run ends
+                row['status'] = 'running'
             if not row['wall_s'] and meta.get('wall_s'):
                 row['wall_s'] = meta['wall_s']
             rows.append(row)

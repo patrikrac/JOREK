@@ -1,3 +1,4 @@
 # machine-specific jobscripts and study output stay local
 *.local.*
 pc_scaling*/
+.venv/
