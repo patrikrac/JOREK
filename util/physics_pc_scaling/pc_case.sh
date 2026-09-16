@@ -28,6 +28,8 @@
 #    PCS_NOUT      restart/field output every N steps  [1000]
 #    PCS_RESTART   restart from this jorek*.h5 file (copied in as jorek_restart.h5) []
 #    PCS_FORCE     1 = rerun even if the case finished []
+#    PCS_NODES_MAX this binary's compile-time n_nodes_max, for the mesh-size
+#                  warning (n_flux*n_tht nodes are needed)   [60001]
 # =====================================================================
 set -u
 
@@ -37,6 +39,16 @@ fi
 ARM=$1; NF=$2; NT=$3; NP=$4; shift 4
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# n_nodes_max / n_elements_max are compile-time (models/mod_settings.f90) and
+# JOREK stops in the grid generation when the mesh needs more nodes than the
+# binary was built for. Warn here, where it is cheap, instead of in the job.
+NODES_NEEDED=$((NF * NT))
+if [ "$NODES_NEEDED" -gt "${PCS_NODES_MAX:-60001}" ]; then
+  echo "[pc_case] WARNING: ${NF}x${NT} needs $NODES_NEEDED nodes, more than n_nodes_max"
+  echo "[pc_case]          (assumed ${PCS_NODES_MAX:-60001}). Rebuild with larger n_nodes_max and"
+  echo "[pc_case]          n_elements_max, or set PCS_NODES_MAX to this binary's value."
+fi
 : "${JOREK_BIN:?set JOREK_BIN to the jorek_model199 executable}"
 JOREK_BIN=$(readlink -f "$JOREK_BIN" 2>/dev/null || echo "$JOREK_BIN")
 PCS_ROOT=${PCS_ROOT:-$PWD/pc_scaling}

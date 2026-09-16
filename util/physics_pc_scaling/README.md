@@ -79,7 +79,18 @@ submitted again. `results.tsv` is rewritten after every case.
 | nonlinear | one trajectory per arm on 41×16, np 1: tstep 1, 10, 100 (10 steps each), then 200 steps at 1000, through the island's linear growth into saturation; restart files every 10 steps | `PCS_NL_MESH`, `PCS_NL_NP`, `PCS_NL_N` |
 
 Problem sizes: 41×16 = 47k, 81×32 = 186k, 161×64 = 741k, 321×128 = 2.96M,
-641×256 = 11.8M DOFs. Keep at least about 20k DOFs, and a few flux-surface
+481×192 = 6.6M, 641×256 = 11.8M DOFs (72 DOFs per node: 6 variables × 4 C¹
+Hermite DOFs × n_tor).
+
+**Mesh sizes are limited at compile time.** `n_nodes_max` and
+`n_elements_max` in `models/mod_settings.f90` are 60001 in the committed
+settings, which covers up to 321×128 (41k nodes). Above that JOREK stops in
+the grid generation ("hard-coded parameter n_nodes_max is too small"), so
+481×192 (92k nodes) and 641×256 (164k nodes) — the last point of the default
+weak series — need their own build with larger values. The node list is
+allocated at `n_nodes_max` on every rank, so raise it only just above the
+mesh you run and keep a separate binary for the big cases. `pc_case.sh` warns
+when a case needs more nodes than `PCS_NODES_MAX` (default 60001). Keep at least about 20k DOFs, and a few flux-surface
 rings, per MPI rank. Below that, the rank-local line smoother degenerates and
 communication dominates, so use 321×128 for strong scaling beyond about 64
 ranks. The partition, and therefore the smoother, depends only on the rank
