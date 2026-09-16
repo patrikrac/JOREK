@@ -152,7 +152,8 @@ PCS_ROOT=$PWD/pc_scaling_strong_161  PCS_MESH=161x64  PCS_NPS="1 2 4 8 16 32"   
 PCS_ROOT=$PWD/pc_scaling_strong_321  PCS_MESH=321x128 PCS_NPS="4 8 16 32 64" \
   PCS_ARMS="jorek sfm2_gmg sfm2_gmg_q"                                               ./pc_study.sh strong
 PCS_ROOT=$PWD/pc_scaling_weak        ./pc_study.sh weak      # 81x32:1 161x64:4 321x128:16
-PCS_ROOT=$PWD/pc_scaling_nl          PCS_NL_MESH=161x64 PCS_NL_NP=16 ./pc_study.sh nonlinear
+PCS_ROOT=$PWD/pc_scaling_nl PCS_NL_MESH=161x64 PCS_NL_NP=16 \
+  PCS_ARMS="jorek jorek_fresh sfm2_lu sfm2_lu_hs0" ./pc_study.sh nonlinear
 ```
 
 - 161×64 stops at np 32: at np 64 it is only 11.6k DOFs per rank, below the
@@ -161,7 +162,26 @@ PCS_ROOT=$PWD/pc_scaling_nl          PCS_NL_MESH=161x64 PCS_NL_NP=16 ./pc_study.
   N (7.4 GB already at 81×32), and it is not needed there — `sfm2_lu` at
   161×64 is what F4 compares against.
 - The nonlinear and probe series only produce iteration counts, so their rank
-  count is a matter of turnaround, not of the result.
+  count is a matter of turnaround, not of the result. 81×32 gives the same
+  figures for a fraction of the time.
+
+**What the nonlinear series actually runs.** Unlike `strong` and `weak`,
+which take 9 time steps (the 0.1/1/10 ramp, 3 steps each), `nonlinear` is a
+whole simulation per arm: the 1/10/100 ramp with 10 steps each, then
+`PCS_NL_N` (200) steps at tstep 1000 — about 230 steps from scratch, through
+the linear growth into the saturated island. Scaled from the laptop, at
+161×64 on 16 ranks expect roughly 20–40 min for `jorek`, ~1.5× that for
+`jorek_fresh` (it refactorises every step), 1–2 h for `sfm2_lu_hs0`, and
+6 h or more for `sfm2_gmg_hs0` — which is why the command above leaves that
+arm to the `probes` series.
+
+- `sfm2_lu` (harm_split = 1) is EXPECTED to end as `status=noconv` partway
+  through: it stalls at 400 iterations as the island goes nonlinear. That is
+  the result, not a broken run, and F3 marks it.
+- Afterwards check that the island really saturated:
+  `cut -f1,2,10 <root>/jorek_<mesh>_np<np>x<omp>/steps.tsv | tail` — the
+  `wmag_nlast` column must flatten. If it is still rising, raise `PCS_NL_N`
+  and resubmit with `PCS_FORCE=1` (a finished case is skipped otherwise).
 
 **Things the figures do not hide:**
 - **The mode coupling decides the nonlinear phase.** With `harm_split = 1`
