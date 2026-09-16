@@ -23,7 +23,8 @@
 #                                                 nonlinear: jorek jorek_fresh sfm2_lu sfm2_lu_hs0 sfm2_gmg_hs0]
 #    PCS_MESH    strong: the fixed mesh         [161x64]
 #    PCS_NPS     strong: rank counts            [1 2 4 8 16 32 64]
-#    PCS_WEAK    weak: mesh:np pairs            [81x32:1 161x64:4 321x128:16 641x256:64]
+#    PCS_WEAK    weak: mesh:np pairs            [81x32:1 161x64:4 321x128:16]
+#                (adding 641x256:64 needs a build with larger n_nodes_max)
 #    PCS_NL_MESH nonlinear: the mesh            [41x16]
 #    PCS_NL_NP   nonlinear: MPI ranks           [1]
 #    PCS_NL_N    nonlinear: steps at tstep 1000 [200]
@@ -66,7 +67,7 @@ case "$MODE" in
       cases+=("${MESH%x*} ${MESH#*x} $np")
     done ;;
   weak)
-    for p in ${PCS_WEAK:-81x32:1 161x64:4 321x128:16 641x256:64}; do
+    for p in ${PCS_WEAK:-81x32:1 161x64:4 321x128:16}; do
       m=${p%:*}; np=${p#*:}
       cases+=("${m%x*} ${m#*x} $np")
     done ;;

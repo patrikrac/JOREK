@@ -75,7 +75,7 @@ submitted again. `results.tsv` is rewritten after every case.
 | series | default | knob |
 |---|---|---|
 | strong | 161×64 (741k DOFs) at np = 1, 2, 4, …, 64 MPI ranks | `PCS_MESH`, `PCS_NPS` |
-| weak | 81×32 at 1, 161×64 at 4, 321×128 at 16, 641×256 at 64 (about 186k DOFs per rank) | `PCS_WEAK` |
+| weak | 81×32 at 1, 161×64 at 4, 321×128 at 16 (about 186k DOFs per rank). Extend with `641x256:64` only on a build with larger `n_nodes_max`. | `PCS_WEAK` |
 | nonlinear | one trajectory per arm on 41×16, np 1: tstep 1, 10, 100 (10 steps each), then 200 steps at 1000, through the island's linear growth into saturation; restart files every 10 steps | `PCS_NL_MESH`, `PCS_NL_NP`, `PCS_NL_N` |
 
 Problem sizes: 41×16 = 47k, 81×32 = 186k, 161×64 = 741k, 321×128 = 2.96M,
@@ -143,10 +143,25 @@ python3 -m venv .venv && .venv/bin/pip install matplotlib numpy
     --nonlinear pc_scaling_nl --coupling pc_scaling_coupling --out figures
 ```
 
-On the cluster: strong at 161×64 (and 321×128 beyond ~64 ranks), weak with
-the default `PCS_WEAK`, and the nonlinear series at 161×64 on 16 ranks
-(`PCS_NL_MESH=161x64 PCS_NL_NP=16`). The nonlinear figures only plot
-iteration counts, so the rank count there does not matter.
+On a 64-rank allocation, with the committed `mod_settings.f90` (meshes up to
+321×128):
+
+```bash
+# strong, two meshes: the second is the one that separates the arms
+PCS_ROOT=$PWD/pc_scaling_strong_161  PCS_MESH=161x64  PCS_NPS="1 2 4 8 16 32"        ./pc_study.sh strong
+PCS_ROOT=$PWD/pc_scaling_strong_321  PCS_MESH=321x128 PCS_NPS="4 8 16 32 64" \
+  PCS_ARMS="jorek sfm2_gmg sfm2_gmg_q"                                               ./pc_study.sh strong
+PCS_ROOT=$PWD/pc_scaling_weak        ./pc_study.sh weak      # 81x32:1 161x64:4 321x128:16
+PCS_ROOT=$PWD/pc_scaling_nl          PCS_NL_MESH=161x64 PCS_NL_NP=16 ./pc_study.sh nonlinear
+```
+
+- 161×64 stops at np 32: at np 64 it is only 11.6k DOFs per rank, below the
+  ~20k where the rank-local line smoother degenerates.
+- `sfm2_lu` is left out of the 321×128 series: its LU fill grows faster than
+  N (7.4 GB already at 81×32), and it is not needed there — `sfm2_lu` at
+  161×64 is what F4 compares against.
+- The nonlinear and probe series only produce iteration counts, so their rank
+  count is a matter of turnaround, not of the result.
 
 **Things the figures do not hide:**
 - **The mode coupling decides the nonlinear phase.** With `harm_split = 1`
