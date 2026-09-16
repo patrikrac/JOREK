@@ -43,7 +43,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # n_nodes_max / n_elements_max are compile-time (models/mod_settings.f90) and
 # JOREK stops in the grid generation when the mesh needs more nodes than the
 # binary was built for. Warn here, where it is cheap, instead of in the job.
-NODES_NEEDED=$((NF * NT))
+NODES_NEEDED=$(( (NF + 10) * NT ))     # the initial equilibrium grid, the larger of the two
 if [ "$NODES_NEEDED" -gt "${PCS_NODES_MAX:-60001}" ]; then
   echo "[pc_case] WARNING: ${NF}x${NT} needs $NODES_NEEDED nodes, more than n_nodes_max"
   echo "[pc_case]          (assumed ${PCS_NODES_MAX:-60001}). Rebuild with larger n_nodes_max and"

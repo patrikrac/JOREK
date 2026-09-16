@@ -14,6 +14,7 @@ Environment:
   PCS_TSTEP_N  tstep ramp   (default: 1.d-1,1.d0,1.d1)
   PCS_NSTEP_N  steps per tstep (default: 3,3,3)
   PCS_NOUT     restart/field output every N steps (default: 1000)
+  PCS_N_RADIAL / PCS_N_POL   initial equilibrium grid (default: n_flux+10, n_tht)
   PCS_RESTART  if set, the case restarts (restart = .t.) from that file
 """
 import os
@@ -139,6 +140,13 @@ def main(argv):
     ov = dict(ARMS[arm])
     ov['n_flux'] = str(n_flux)
     ov['n_tht'] = str(n_tht)
+    # The equilibrium is computed on the INITIAL polar grid (n_radial, n_pol)
+    # and only then aligned to the flux-surface grid (n_flux, n_tht). Scaling
+    # only the latter leaves the equilibrium on the base namelist's 51x16, and
+    # the post-equilibrium check fails on every larger mesh. Keep the base
+    # namelist's ratio: n_radial = n_flux + 10, n_pol = n_tht.
+    ov['n_radial'] = os.environ.get('PCS_N_RADIAL', str(n_flux + 10))
+    ov['n_pol'] = os.environ.get('PCS_N_POL', str(n_tht))
     ov['tstep_n'] = os.environ.get('PCS_TSTEP_N', '1.d-1,1.d0,1.d1')
     ov['nstep_n'] = os.environ.get('PCS_NSTEP_N', '3,3,3')
     ov['nout'] = os.environ.get('PCS_NOUT', '1000')   # 1000: no field output during timing

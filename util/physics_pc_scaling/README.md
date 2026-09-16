@@ -96,6 +96,14 @@ communication dominates, so use 321×128 for strong scaling beyond about 64
 ranks. The partition, and therefore the smoother, depends only on the rank
 count, not on the thread count.
 
+**Two grids scale together.** The equilibrium is computed on the initial
+polar grid (`n_radial`, `n_pol`) and only then aligned to the flux-surface
+grid (`n_flux`, `n_tht`). `mknml.py` scales both, keeping the base namelist's
+ratio — `n_radial = n_flux + 10`, `n_pol = n_tht` — so 41×16 still reproduces
+the committed namelist exactly. Scaling only `n_flux`/`n_tht` leaves the
+equilibrium on a 51×16 grid and every larger mesh then fails in the check
+after the equilibrium computation. Override with `PCS_N_RADIAL`/`PCS_N_POL`.
+
 The GMG arm needs n_flux − 1 divisible by 4 and n_tht divisible by 8 (at least
 3 levels); `mknml.py` refuses other meshes. The `sfm2_lu` arm at np = 1 on
 161×64 and above needs a lot of memory (7.4 GB at 81×32, and LU fill grows
