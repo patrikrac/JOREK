@@ -11,7 +11,7 @@ module mod_gmres2
 contains
 
 !> solve a_mat x=b using iterative GMRES method with right (or left) preconditioning
-subroutine gmres2_driver(a_mat,b,x,n,solver)
+subroutine gmres2_driver(a_mat,b,x,n,solver,converged)
   use mod_sparse_data, only: type_SP_SOLVER
   use data_structure,  only: type_SP_MATRIX
 
@@ -20,22 +20,25 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   real(kind=8), dimension(:), pointer :: x, b
   integer :: n
   type(type_SP_SOLVER)  :: solver
-  
+  logical, intent(out)  :: converged
+
   real(kind=8) :: atol, rtol, gamma, delta, rho, rho0, scale_norm, res_target
-  real(kind=8) :: norm_p, norm_p_new
+  real(kind=8) :: norm_p, norm_gs, norm_gs_new
   integer :: totit, maxit, restart, nrit, it, ldh, k, j
   integer :: n_ortho
-  logical :: no_conv, breakdown
+  logical :: no_conv, breakdown, hard_breakdown
   logical :: GSC=.false., GSM=.false., GSCI=.true., GSMI=.false.
   !> .true.  : right preconditioning, A M^-1 y = b -> minimises the TRUE residual ||b-Ax||
   !> .false. : left  preconditioning, M^-1 A x = M^-1 b -> minimises ||M^-1 (b-Ax)||
-  logical :: right_prec=.true.
+  logical :: right_prec
   !> Relative threshold below which h_{j+1,j} is treated as a (happy) breakdown
   real(kind=8), parameter :: bd_tol = 1.d-14
   !> Smallest relative residual ||r||/||b|| that is attainable in double precision. The
   !> convergence target is never set below this, otherwise we chase round-off until iter_max.
   real(kind=8), parameter :: res_floor = 1.d-14
-  real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, b_prec, b_, s_
+  !> V : Arnoldi basis (restart+1 columns), Z : M^-1 V (restart columns, right prec. only),
+  !> w_ : scratch vector of length n
+  real(kind=8), dimension(:), allocatable, target :: givens_c, givens_s, hess, V, Z, w_, b_, s_
 
   integer :: my_id, my_id_n, n_cpu, ierr
   integer :: MPI_GLOB, MPI_COMM_N
@@ -54,14 +57,16 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   atol = 1.d-36
   maxit = solver%iter_max
   restart = solver%gmres_m
+  right_prec = solver%right_prec
   n_ortho = 3 ! Number of iterations for the orthogonalization methos (in case of iterative methods)
   if (restart > maxit) restart = maxit
 
-  allocate(givens_c(restart),givens_s(restart),b_(restart+1),hess((restart+1)*restart),V(n*(restart+1)),b_prec(n))
-  if (GSCI .or. GSMI) allocate(s_(restart)) 
+  allocate(givens_c(restart),givens_s(restart),b_(restart+1),hess((restart+1)*restart),V(n*(restart+1)),w_(n))
+  if (right_prec) allocate(Z(n*restart))
+  if (GSCI .or. GSMI) allocate(s_(restart))
 
-  givens_c(1:restart) = 0.
-  givens_s(1:restart) = 0.
+  givens_c(1:restart) = 0.d0
+  givens_s(1:restart) = 0.d0
 
   ldh = restart+1
 
@@ -69,13 +74,15 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
   if (right_prec) then
     scale_norm = dnrm2(n, b(1:n), 1)
   else
-    call prec(solver, b(1:n), b_prec(1:n), n, MPI_GLOB, MPI_COMM_N)
-    scale_norm = dnrm2(n, b_prec(1:n), 1)
+    call prec(solver, b(1:n), w_(1:n), n, MPI_GLOB, MPI_COMM_N)
+    scale_norm = dnrm2(n, w_(1:n), 1)
   endif
   if (scale_norm .le. 0.d0) scale_norm = 1.d0
 
-  no_conv   = .true.
-  breakdown = .false.
+  no_conv        = .true.
+  breakdown      = .false.
+  hard_breakdown = .false.
+  converged      = .false.
   totit = 0
 
   rho0       = 0.d0
@@ -90,8 +97,8 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
     ! --- Left preconditioning: v_1 = M^-1 (b - A * x) ---
     if (.not. right_prec) then
-      call dcopy(n, V(1), 1, b_prec(1), 1)
-      call prec(solver, b_prec(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
+      call dcopy(n, V(1), 1, w_(1), 1)
+      call prec(solver, w_(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
     endif
 
     ! --- rho = ||v_1||_2 ---
@@ -103,12 +110,13 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       res_target = max(rtol*rho0, res_floor*scale_norm)
     endif
 
-    if ((rho .le. res_target) .or. (rho < atol)) then
-      no_conv = .false.
+    if ((rho .le. res_target) .or. (rho .lt. atol)) then
+      no_conv   = .false.
+      converged = .true.
       exit
     endif
     !--- v_1 = v_1 / rho
-    call dscal(n, 1./rho, V(1:n), 1)
+    call dscal(n, 1.d0/rho, V(1:n), 1)
     b_(1) = rho
     b_(2:restart+1) = 0.d0
     nrit = restart-1
@@ -121,20 +129,23 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     do it = 1, restart
       totit = totit +1
       if (right_prec) then
-        ! --- b_prec = M^-1 * v_j ---
-        call prec(solver, V((it-1)*n+1:it*n), b_prec(1:n), n, MPI_GLOB, MPI_COMM_N)
+        ! --- z_j = M^-1 * v_j (kept, so that the solution update needs no extra solve) ---
+        call prec(solver, V((it-1)*n+1:it*n), Z((it-1)*n+1:it*n), n, MPI_GLOB, MPI_COMM_N)
 
-        ! --- v_j+1 = A * b_prec = A * M^-1 * v_j ---
-        call bcsr_matv(a_mat, b_prec(1:n), V(it*n+1:(it+1)*n))
+        ! --- v_j+1 = A * z_j = A * M^-1 * v_j ---
+        call bcsr_matv(a_mat, Z((it-1)*n+1:it*n), V(it*n+1:(it+1)*n))
       else
-        ! --- b_prec = A * v_j ---
-        call bcsr_matv(a_mat, V((it-1)*n+1:it*n), b_prec(1:n))
+        ! --- w_ = A * v_j ---
+        call bcsr_matv(a_mat, V((it-1)*n+1:it*n), w_(1:n))
 
-        ! --- v_j+1 = M^-1 * b_prec = M^-1 * A * v_j ---
-        call prec(solver, b_prec(1:n), V(it*n+1:(it+1)*n), n, MPI_GLOB, MPI_COMM_N)
+        ! --- v_j+1 = M^-1 * w_ = M^-1 * A * v_j ---
+        call prec(solver, w_(1:n), V(it*n+1:(it+1)*n), n, MPI_GLOB, MPI_COMM_N)
       endif
 
-      ! --- Norm of the un-orthogonalized vector (reference for the breakdown test) ---
+      ! --- Norm of the un-orthogonalized vector (reference for the breakdown test). It must
+      !     NOT be overwritten by the iterative Gram-Schmidt loops below, which track their
+      !     own norm: after heavy cancellation their norm collapses with the vector and the
+      !     breakdown test would then never trigger. ---
       norm_p = dnrm2(n, V(it*n+1), 1)
 
       ! --- Orthogonalization ---
@@ -148,25 +159,27 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
         enddo
       elseif (GSCI) then ! Gram-Schmidt Classical Iterative
         hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
+        norm_gs = norm_p
         do j=1,n_ortho
           call dgemv('C', n, it, 1.d0, V(1), n, V(it*n+1), 1, 0.d0, s_(1), 1)
           call dgemv('N', n, it, -1.d0, V(1), n, s_(1), 1, 1.d0, V(it*n+1), 1)
           call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
-          norm_p_new = dnrm2(n, V(it*n+1), 1)
-          if (2.d0 * norm_p_new .gt. norm_p) exit ! Stopping criterion for iterative GS methods
-          norm_p = norm_p_new
+          norm_gs_new = dnrm2(n, V(it*n+1), 1)
+          if (2.d0 * norm_gs_new .gt. norm_gs) exit ! Stopping criterion for iterative GS methods
+          norm_gs = norm_gs_new
         enddo
       elseif (GSMI) then ! Gram-Schmidt Modified Iterative
         hess((it-1)*ldh+1:(it-1)*ldh+1+it) = 0.d0
+        norm_gs = norm_p
         do j=1,n_ortho
           do k=1,it
             s_(k) = ddot(n, V((k-1)*n+1), 1, V(it*n+1), 1)
             call daxpy(n, -s_(k), V((k-1)*n+1), 1, V(it*n+1), 1)
           enddo
           call daxpy(it, 1.d0, s_(1), 1, hess((it-1)*ldh+1), 1)
-          norm_p_new = dnrm2(n, V(it*n+1), 1)
-          if (2.d0 * norm_p_new .gt. norm_p) exit ! Stopping criterion for iterative GS methods
-          norm_p = norm_p_new
+          norm_gs_new = dnrm2(n, V(it*n+1), 1)
+          if (2.d0 * norm_gs_new .gt. norm_gs) exit ! Stopping criterion for iterative GS methods
+          norm_gs = norm_gs_new
         enddo
       endif
       ! --- h_j+1,j = ||v_j+1||_2 ---
@@ -191,7 +204,8 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
         ! Hard breakdown: the whole column vanished, no further progress is possible.
         givens_c(it) = 1.d0
         givens_s(it) = 0.d0
-        breakdown = .true.
+        breakdown      = .true.
+        hard_breakdown = .true.
       else
         givens_c(it) = hess(it+(it-1)*ldh) / delta
         givens_s(it) = hess(it+(it-1)*ldh+1) / delta
@@ -202,8 +216,11 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
       rho = abs(b_(it+1))
       if (my_id.eq.0) write(*, "(A, X, I0, X, A, X, ES14.6, X, A, X, ES14.6, X, A, X, ES14.6)") &
         "[GMRES] iteration", totit, "res =", rho, "res/res0 =", rho/rho0, "res/rhs =", rho/scale_norm
-      if ((rho .le. res_target).or.(rho < atol).or.(totit >= maxit).or.breakdown) then
+      if ((rho .le. res_target).or.(rho .lt. atol).or.(totit .ge. maxit).or.breakdown) then
         no_conv = .false.
+        ! A happy breakdown leaves rho = 0 -> convergence.
+        ! A hard breakdown zeroes rho as well -> no convergence.
+        converged = ((rho .le. res_target) .or. (rho .lt. atol)) .and. (.not. hard_breakdown)
         nrit = it-1
         exit
       endif
@@ -212,11 +229,8 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
     ! --- Solve upper triangular system b_ = H \ b_ ---
     call dtrsv('U', 'N', 'N', nrit+1, hess, ldh, b_, 1)
     if (right_prec) then
-      ! --- Form z = V * b_ ---
-      call dgemv('N', n, nrit+1, 1.d0, V(1), n, b_(1), 1, 0.d0, b_prec(1:n), 1)
-      ! --- Update solution x = x + M^-1 * z ---
-      call prec(solver, b_prec(1:n), V(1:n), n, MPI_GLOB, MPI_COMM_N)
-      call daxpy(n, 1.d0, V(1:n), 1, x(1:n), 1)
+      ! --- Update solution x = x + Z * b_ = x + M^-1 * V * b_ ---
+      call dgemv('N', n, nrit+1, 1.d0, Z(1), n, b_(1), 1, 1.d0, x(1:n), 1)
     else
       ! --- Update solution x = x + V * b_ ---
       call dgemv('N', n, nrit+1, 1.d0, V(1), n, b_(1), 1, 1.d0, x(1:n), 1)
@@ -226,13 +240,14 @@ subroutine gmres2_driver(a_mat,b,x,n,solver)
 
   solver%iter_gmres = totit
 
-  deallocate(givens_c,givens_s,b_,hess,V,b_prec)
-  if (GSCI .or. GSMI) deallocate(s_) 
+  deallocate(givens_c,givens_s,b_,hess,V,w_)
+  if (right_prec) deallocate(Z)
+  if (GSCI .or. GSMI) deallocate(s_)
 
 end subroutine gmres2_driver
 
 
-!> apply preconditioner y = M\x
+!> apply preconditioner b = M^-1 x
   subroutine prec(solver, x, b, n_glob, MPI_GLOB, MPI_COMM_N)
     use mod_sparse_data, only: type_SP_SOLVER
 #ifdef USE_STRUMPACK
