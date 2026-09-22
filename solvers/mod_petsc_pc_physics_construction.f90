@@ -158,6 +158,8 @@ module mod_petsc_pc_physics_construction
   public :: setup_psi_eta_schur_ksp        ! Workstream C: pair_psi by the eta-scaled j-first Schur
   public :: setup_pair_w_gmg_ksp           ! Workstream C: pair_w by C1 geometric multigrid
   public :: setup_pair_w_shell             ! Workstream D: matrix-free fine pair_w operator
+  public :: pack_pair_aij                  ! Workstream E: util/block_bench packs the pairs itself
+  public :: physics_pc_set_dh              ! Workstream E: hand the bench's loaded Dh to the shell
   public :: pair_w_shell_wrap_lu           ! Workstream D: FGMRES(shell) + LU(S_W_aij) reference
   public :: build_schur_mixed_prod         ! Workstream B: pair_w   = [[S_uu^SFM,B_24],[B_42,B_44]]
   public :: schur_mixed_require_serial     ! Workstream B: shared np>1 hard stop
@@ -1151,7 +1153,7 @@ contains
   !! beating every AMG configuration on that operator on every axis.
   !--------------------------------------------------------------------
   subroutine setup_pair_inner_ksp(ksp_block, A_pair, is_pair, comm, first_time, &
-                                  fieldsplit, tag, label)
+                                  fieldsplit, tag, label, rtol_over)
     use phys_module, only: physics_pc_pair_maxits, physics_pc_pair_rtol, &
                            physics_pc_pair_amg_thr
 
@@ -1163,16 +1165,23 @@ contains
     logical, intent(in) :: fieldsplit   !< .true. -> mode 1 shape; .false. -> GMRES+ILU(0)
     character(len=*), intent(in) :: tag !< distinct options prefix per pair
     character(len=*), intent(in), optional :: label
+    !> Workstream F: per-pair rtol override. Absent (or negative) keeps
+    !! physics_pc_pair_rtol, so pair_w and every pre-existing arm are unchanged.
+    real*8, intent(in), optional :: rtol_over
 
     PC :: pc
     PetscErrorCode :: ierr
-    PetscReal :: abstol, dtol
+    PetscReal :: abstol, dtol, rtol_use
     character(len=32) :: pfx
     character(len=128) :: on
     character(len=24) :: vstr, tstr
     character(len=96) :: desc
 
     abstol = 1.0d-50; dtol = 1.0d6
+    rtol_use = physics_pc_pair_rtol
+    if (present(rtol_over)) then
+      if (rtol_over > 0.d0) rtol_use = rtol_over
+    endif
     pfx = trim(tag)//"_"
 
     ! DESTROY AND RECREATE on every rebuild, unlike setup_block_ksp.
@@ -1192,7 +1201,7 @@ contains
     ! preconditioner is itself variable.
     call KSPSetType(ksp_block, KSPFGMRES, ierr)
     call KSPGMRESSetRestart(ksp_block, max(physics_pc_pair_maxits, 2), ierr)
-    call KSPSetTolerances(ksp_block, physics_pc_pair_rtol, abstol, dtol, &
+    call KSPSetTolerances(ksp_block, rtol_use, abstol, dtol, &
                           physics_pc_pair_maxits, ierr)
     call KSPGetPC(ksp_block, pc, ierr)
 
@@ -1248,7 +1257,7 @@ contains
     call KSPSetUp(ksp_block, ierr)
 
     if (present(label)) then
-      write(tstr,'(ES9.2)') physics_pc_pair_rtol
+      write(tstr,'(ES9.2)') rtol_use
       call pc_print_block_setup(comm, label, &
         trim(desc)//", rtol "//trim(adjustl(tstr)))
     endif
@@ -6389,25 +6398,62 @@ contains
   end subroutine report_operator_density
 
   !--------------------------------------------------------------------
-  !> Workstream C: dump the SFM2 operators and the grid for the offline
-  !! geometric-multigrid probe (docs/physics_pc/tools/gmg_probe.py).
+  !> Workstreams C and E: dump the SFM2 operators and the grid so ONE block can
+  !! be studied in isolation, outside a JOREK run.
   !!
-  !! WHY offline: the question is whether an exact nested C1 coarse space
-  !! (Hermite subdivision on the logically structured polar grid) avoids the
-  !! pathological GAMG hierarchy (T2) and the coupling failure (T1). Building P
-  !! and iterating on smoothers/cycles is far cheaper in scipy than in PCMG;
-  !! only a winner is worth porting.
+  !! Two consumers:
+  !!   - docs/physics_pc/tools/gmg_probe.py -- the original scipy probe, which
+  !!     answered whether an exact nested C1 coarse space (Hermite subdivision
+  !!     on the logically structured polar grid) avoids the pathological GAMG
+  !!     hierarchy (T2) and the coupling failure (T1). Serial.
+  !!   - util/block_bench -- the standalone MPI driver. Same question, but for
+  !!     COST rather than iteration counts: on the cluster at 161x64 the two
+  !!     components that do not scale are the exact mass solve inside the S_uu
+  !!     shell (PhysPC_MjSolve, 90 s at np 1 -> 312 s at np 32) and the rank-0
+  !!     axis block (GMG_AxSolve, flat ~50 s). Neither can be measured on the
+  !!     laptop inside a full run.
   !!
-  !! Files go to the run directory: PETSc binary matrices named
-  !! gmgdump_<op>_ts<tstep>_mi<massinv>_pi<pairinv>.petsc, plus one text file
-  !! gmgdump_grid.txt with everything the prolongation needs. The PC row map is
+  !! Files go to the run directory: PETSc binary matrices and vectors named
+  !! gmgdump_<op>_ts<tstep>_mi<massinv>_pi<pairinv>.petsc, plus gmgdump_grid.txt
+  !! (everything the prolongation needs) and gmgdump_meta.txt (the compile-time
+  !! toroidal settings and the PC flags, so a mismatched bench binary is
+  !! rejected instead of silently solving the wrong problem). The PC row map is
   !! row = (node%index(k)-1)*n_tor + m (create_variable_index_sets, serial).
+  !!
+  !! physics_pc_dump_blocks is a LEVEL, because a full case is large (210 MB at
+  !! 41x16, ~16x that at 161x64) and a mesh x tstep x phase set of them would
+  !! swamp the run directory:
+  !!
+  !!   1  pair_w bench set. The operands of shw_mult -- B_12, B_21, B_22, B_23,
+  !!      B_24, B_31, B_42 -- plus B_33, B_44, the assembled S_uu and the Dh
+  !!      vector. The ASSEMBLED S_uu is only the Galerkin/Jacobi surrogate the
+  !!      coarse chain and axis block are built from; the true fine operator
+  !!      carries M = B_33^-1, which is dense, so the bench must rebuild it
+  !!      matrix-free from these pieces or it is benchmarking a different
+  !!      operator than production solves.  (~107 MB at 41x16)
+  !!   2  + the other three production systems: B_11, B_13 (pair_psi), B_55
+  !!      (rho), B_66 (T).  (~129 MB)
+  !!   3  + the PACKED pairs pair_w and pair_psi. Redundant -- both are
+  !!      pack_pair_aij applied to blocks levels 1-2 already wrote, and they are
+  !!      the two largest files (96 MB of 210 MB at 41x16). Level 3 exists only
+  !!      to gate the bench's own packing, so generate it once per mesh.
+  !!
+  !! The wiring gate needs massinv = 2: only the diagonal arm makes the mass
+  !! inverse Qi = diag(B_33)^-1 reproducible offline, and then
+  !!   S_uu = B_22 - (B_21 - B_23 Qi B_31) diag(Dh) B_12
+  !! holds to round-off (measured 5.9e-17 at 41x16). At massinv = 7 (FSAI, the
+  !! production default) the assembled S_uu and the exact-mass shell genuinely
+  !! differ, so a mi7 dump measures the mass-inverse error but cannot gate.
+  !!
   !! pair_w is dumped before its block scaling, but pair_psi is scaled in place
   !! by build_pair_psi_prod first -- run with physics_pc_pair_scale = 0 to get
-  !! both pairs unscaled (the scaling is an exact similarity, re-applied offline).
+  !! both pairs unscaled (the scaling is an exact similarity, re-applied offline;
+  !! make_pair_block_scale is a pure function of the pair, so it is recomputed
+  !! in the bench rather than dumped).
   !--------------------------------------------------------------------
   subroutine dump_sfm2_blocks(S_uu, comm, my_id)
-    use phys_module,    only: tstep, physics_pc_schur_massinv, physics_pc_schur_pairinv
+    use phys_module,    only: tstep, physics_pc_schur_massinv, physics_pc_schur_pairinv, &
+                              physics_pc_dump_blocks
     use mod_parameters, only: n_tor
 
     Mat, intent(in)     :: S_uu
@@ -6415,19 +6461,66 @@ contains
 
     character(len=64)   :: suffix
     character(len=16)   :: tstr
+    integer             :: lvl
 
     write(tstr,'(F0.3)') tstep
     write(suffix,'(A,A,I0,A,I0,A)') trim(adjustl(tstr)), "_mi", physics_pc_schur_massinv, &
                                     "_pi", physics_pc_schur_pairinv, ".petsc"
 
-    call dump_one(g_ctx%K_pj_aij, "pair_psi")
-    call dump_one(g_ctx%S_W_aij,  "pair_w")
-    call dump_one(S_uu,           "S_uu")
-    call dump_one(g_ctx%B_11,     "B_11")
+    lvl = physics_pc_dump_blocks
+
+    !--- LEVEL 1: everything needed to study pair_w, and nothing redundant.
+    !--- The OPERANDS of shw_mult, so util/block_bench can rebuild the
+    !--- matrix-free fine operator exactly:
+    !---   S_uu x = B_22 x - B_21 p + B_23 M B_31 p,   p = Dh B_12 x
+    !--- The assembled S_uu is only the Galerkin/Jacobi surrogate the coarse
+    !--- chain and the axis block are built from; the exact-mass M = B_33^-1
+    !--- makes the true fine operator dense, so it can only ever exist
+    !--- matrix-free and must be rebuilt from these pieces.
+    call dump_one(g_ctx%B_12,     "B_12")
+    call dump_one(g_ctx%B_21,     "B_21")
+    call dump_one(g_ctx%B_22,     "B_22")
+    call dump_one(g_ctx%B_23,     "B_23")
+    call dump_one(g_ctx%B_24,     "B_24")
+    call dump_one(g_ctx%B_31,     "B_31")
+    call dump_one(g_ctx%B_42,     "B_42")
     call dump_one(g_ctx%B_33,     "B_33")
     call dump_one(g_ctx%B_44,     "B_44")
+    call dump_one(S_uu,           "S_uu")
+
+    !--- Dh = diag(Shati), the psi-channel scaling the shell applies to B_12 x.
+    !--- Only populated for suu_shell /= 0 with pairinv 2 or 3 (see the
+    !--- assignment in build_schur_mixed_prod); dump_meta records whether it is
+    !--- here, so the bench fails loudly rather than solving the wrong operator.
+    if (shw_d_ready) call dump_vec(shw_d, "Dh")
+
+    !--- Workstream E: the COMPOSED force operator, when physics_pc_force_operator
+    !--- is on. Dumped at level 1 because it is the direct counterpart of S_uu:
+    !--- the bench forms B_22 + W and compares against S_uu on the same case.
+    if (g_ctx%w_force_ready) call dump_one(g_ctx%W_force, "W_force")
+
+    !--- LEVEL 2: the other three production systems.
+    if (lvl >= 2) then
+      call dump_one(g_ctx%B_11,   "B_11")
+      call dump_one(g_ctx%B_13,   "B_13")
+      call dump_one(g_ctx%B_55,   "B_55")
+      call dump_one(g_ctx%B_66,   "B_66")
+    endif
+
+    !--- LEVEL 3: the PACKED pairs. Redundant by construction --
+    !---   pair_w   = [[S_uu, B_24], [B_42, B_44]]
+    !---   pair_psi = [[B_11, B_13], [B_31, B_33]]
+    !--- are pack_pair_aij applied to blocks levels 1-2 already wrote, and they
+    !--- are the two largest files in the dump (96 MB of 210 MB at 41x16). The
+    !--- bench packs them itself; level 3 exists only to GATE that packing
+    !--- against the real thing, so generate it once per mesh, not per case.
+    if (lvl >= 3) then
+      call dump_one(g_ctx%S_W_aij,  "pair_w")
+      call dump_one(g_ctx%K_pj_aij, "pair_psi")
+    endif
 
     if (my_id == 0) call dump_grid()
+    if (my_id == 0) call dump_meta()
 
   contains
 
@@ -6444,6 +6537,54 @@ contains
       call PetscViewerDestroy(viewer, ierr)
       if (my_id == 0) write(*,'(A,A)') "[Physics PC]   GMG dump: ", trim(fname)
     end subroutine dump_one
+
+    !> Same naming as dump_one, for the vector operands of the shell.
+    subroutine dump_vec(v, op)
+      Vec, intent(in)              :: v
+      character(len=*), intent(in) :: op
+      PetscViewer    :: viewer
+      PetscErrorCode :: ierr
+      character(len=128) :: fname
+
+      fname = "gmgdump_" // op // "_ts" // trim(suffix)
+      call PetscViewerBinaryOpen(comm, trim(fname), FILE_MODE_WRITE, viewer, ierr)
+      call VecView(v, viewer, ierr)
+      call PetscViewerDestroy(viewer, ierr)
+      if (my_id == 0) write(*,'(A,A)') "[Physics PC]   GMG dump: ", trim(fname)
+    end subroutine dump_vec
+
+    !> Everything util/block_bench needs to reject a mismatched case: the
+    !! compile-time toroidal settings (a wrong binary runs axisymmetric and
+    !! exits 0), the mesh, and the PC flags the dumped operators depend on.
+    subroutine dump_meta()
+      use phys_module,    only: n_flux, n_tht, physics_pc_harm_split, &
+                                physics_pc_suu_shell, physics_pc_pair_scale, &
+                                physics_pc_schur_channels, physics_pc_lean_setup
+      use mod_settings,   only: n_period
+      use mod_parameters, only: n_degrees
+      integer :: u
+
+      open(newunit=u, file="gmgdump_meta.txt", status="replace", action="write")
+      write(u,'(A)')        "# util/block_bench case metadata"
+      write(u,'(A,ES24.16)') "tstep              ", tstep
+      write(u,'(A,I0)')     "n_flux             ", n_flux
+      write(u,'(A,I0)')     "n_tht              ", n_tht
+      write(u,'(A,I0)')     "n_tor              ", n_tor
+      write(u,'(A,I0)')     "n_period           ", n_period
+      write(u,'(A,I0)')     "n_degrees          ", n_degrees
+      write(u,'(A,I0)')     "massinv            ", physics_pc_schur_massinv
+      write(u,'(A,I0)')     "pairinv            ", physics_pc_schur_pairinv
+      write(u,'(A,I0)')     "harm_split         ", physics_pc_harm_split
+      write(u,'(A,I0)')     "suu_shell          ", physics_pc_suu_shell
+      write(u,'(A,I0)')     "pair_scale         ", physics_pc_pair_scale
+      write(u,'(A,I0)')     "schur_channels     ", physics_pc_schur_channels
+      write(u,'(A,I0)')     "lean_setup         ", physics_pc_lean_setup
+      write(u,'(A,I0)')     "dump_level         ", physics_pc_dump_blocks
+      write(u,'(A,L1)')     "have_Dh            ", shw_d_ready
+      write(u,'(A,L1)')     "have_W_force       ", g_ctx%w_force_ready
+      close(u)
+      write(*,'(A)') "[Physics PC]   GMG dump: gmgdump_meta.txt"
+    end subroutine dump_meta
 
     !> Grid is geometry-only, so it is rewritten identically on every call.
     subroutine dump_grid()
@@ -6473,6 +6614,7 @@ contains
     end subroutine dump_grid
 
   end subroutine dump_sfm2_blocks
+
 
   !--------------------------------------------------------------------
   !> Workstream D (physics_pc_suu_ring = k > 0): replace S_uu by its
@@ -9024,7 +9166,7 @@ contains
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator
     use phys_module,    only: physics_pc_psi_schur, physics_pc_verify_mixed, eta_num, tstep, &
-                              physics_pc_psi_outer, physics_pc_pair_rtol, &
+                              physics_pc_psi_outer, physics_pc_pair_rtol, physics_pc_psi_rtol, &
                               physics_pc_psi_gmg_smoother, physics_pc_psi_gmg_nsmooth
     use mod_parameters, only: n_tor, n_degrees
     use nodes_elements, only: node_list
@@ -9239,7 +9381,10 @@ contains
       ! factorisation loses ~10 outer its at tstep 10 even with Shat exact.
       call KSPSetType(g_ctx%ksp_pair_psi, KSPFGMRES, ierr)
       call KSPGMRESSetRestart(g_ctx%ksp_pair_psi, max(physics_pc_psi_outer, 2), ierr)
-      call KSPSetTolerances(g_ctx%ksp_pair_psi, physics_pc_pair_rtol, 1.d-50, 1.d6, &
+      ! Workstream F: pair_psi's own rtol when set, else the shared one.
+      call KSPSetTolerances(g_ctx%ksp_pair_psi, &
+                            merge(physics_pc_psi_rtol, physics_pc_pair_rtol, &
+                                  physics_pc_psi_rtol > 0.d0), 1.d-50, 1.d6, &
                             physics_pc_psi_outer, ierr)
     else
       call KSPSetType(g_ctx%ksp_pair_psi, KSPPREONLY, ierr)
@@ -9253,7 +9398,7 @@ contains
 
     if (physics_pc_psi_outer > 0 .and. my_id == 0) write(*,'(A,I0,A,ES9.2)') &
       "[Physics PC]   pair_psi: FGMRES around the eta-Schur, maxits ", physics_pc_psi_outer, &
-      ", rtol ", physics_pc_pair_rtol
+      ", rtol ", merge(physics_pc_psi_rtol, physics_pc_pair_rtol, physics_pc_psi_rtol > 0.d0)
     if (psc_mode == 1) then
       call pc_print_block_setup(comm, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
         "PREONLY + SHELL[j-first, Shat = B_11 - diag(B_13/B_33) B_31 by LU]")
@@ -9392,6 +9537,25 @@ contains
   !! coarse operators, Jacobi diagonal and axis block; the shell replaces every
   !! fine-level matvec (smoother, residuals, axis patch, inner FGMRES).
   !--------------------------------------------------------------------
+  !--------------------------------------------------------------------
+  !> Workstream E: install a Dh vector from outside this module.
+  !!
+  !! In a JOREK run Dh = diag(Shati) falls out of build_schur_mixed_prod. The
+  !! standalone bench (util/block_bench) has no Jacobian to build it from -- it
+  !! loads the dumped vector instead -- but it must drive the SAME shw_mult, so
+  !! it needs to reach the same module state. This is the only piece of that
+  !! state a caller cannot otherwise set; everything else the shell reads lives
+  !! in the public g_ctx.
+  !--------------------------------------------------------------------
+  subroutine physics_pc_set_dh(v)
+    Vec, intent(in) :: v
+    PetscErrorCode :: ierr
+    if (shw_d_ready) call VecDestroy(shw_d, ierr)
+    call VecDuplicate(v, shw_d, ierr)
+    call VecCopy(v, shw_d, ierr)
+    shw_d_ready = .true.
+  end subroutine physics_pc_set_dh
+
   subroutine setup_pair_w_shell(comm, my_id)
     use phys_module, only: physics_pc_suu_shell
     integer, intent(in) :: comm, my_id
@@ -9748,7 +9912,9 @@ contains
                            physics_pc_schur_pairinv, physics_pc_wave_schur, &
                            physics_pc_pair_scale, physics_pc_dump_blocks, &
                            physics_pc_suu_ring, physics_pc_suu_shell, &
-                           physics_pc_lean_setup
+                           physics_pc_lean_setup, &
+                           physics_pc_suu_form, physics_pc_force_operator, &
+                           physics_pc_corrector_form
 
     integer, intent(in)           :: comm
     logical, intent(in)           :: first_time
@@ -9804,6 +9970,30 @@ contains
       endif
     endif
 
+    !--- Workstream E: preconditions for shipping the composed (1,1) block.
+    if (physics_pc_suu_form == 1) then
+      if (trim(label) /= "SFM2" .or. physics_pc_force_operator /= 1 &
+          .or. nch /= 1 .or. physics_pc_suu_ring /= 0) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_suu_form = 1 needs "// &
+          "SFM2, physics_pc_force_operator = 1 (the FULL Eq. (19) W), "// &
+          "physics_pc_schur_channels = 1 and no ring mask."
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+      if (.not. g_ctx%w_force_ready) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_suu_form = 1 but "// &
+          "W_force was never assembled (petsc_assemble_pc_matrices did not run?)."
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+      !--- Not fatal: the shell reconstructs S_uu analytically from the operands
+      !--- (shw_mult) and so structurally cannot see a substituted (1,1) block.
+      !--- util/block_bench forces it off the same way.
+      if (physics_pc_suu_shell /= 0) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   suu_form = 1: forcing "// &
+          "physics_pc_suu_shell = 0 (the shell rebuilds S_uu from the operands)."
+        physics_pc_suu_shell = 0
+      endif
+    endif
+
     ! B_33 (1/R mass) and B_44 (R mass) are geometry-only, so their sparse
     ! inverses are built once for the whole run. TWO separate ready flags, not
     ! one: sfp_QiR is only needed for channels >= 2 here but also by a CM_OP_QR
@@ -9818,6 +10008,21 @@ contains
       sfp_QiR_ready = .true.
     endif
 
+    !--- Workstream F: the Eq. (17) corrector reuses the psi channel's own
+    !--- surrogate for M^-1, so it needs that surrogate to be a DIAGONAL that
+    !--- outlives the channel. sfp_Qip is built for the run just above; the
+    !--- diagonal is captured below, on whichever branch produces it.
+    g_ctx%corr_Qip = sfp_Qip
+    if (physics_pc_corrector_form == 1) then
+      if (trim(label) /= "SFM2" .or. &
+          (physics_pc_schur_pairinv /= 2 .and. physics_pc_schur_pairinv /= 3)) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_corrector_form = 1 "// &
+          "needs SFM2 and physics_pc_schur_pairinv = 2 or 3 (the M^-1 surrogate must be "// &
+          "diagonal; pairinv 7/8 build an FSAI Mat that is destroyed with the channel)."
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+    endif
+
     paired = (trim(label) == "SFM2")
 
     !--- (1,1) entry: S_uu. NOTE B_22 -- the raw u diagonal (see header).
@@ -9828,6 +10033,13 @@ contains
     ! every rebuild. suu_str is the MatAXPY structure flag of the channels.
     suu_keep = (.not. paired .or. physics_pc_schur_pairinv == 2 .or. physics_pc_schur_pairinv == 3) &
                .and. physics_pc_suu_ring == 0
+    ! Workstream E, suu_form = 1: the composed block has a different (smaller)
+    ! pattern than the triple product, and both pack_pair_aij and the sfp_Suu
+    ! reuse path freeze their pattern on the FIRST build. Forcing the duplicate
+    ! path removes that hazard outright; the extra MatDuplicate per rebuild is
+    ! negligible against the whole channel chain this arm skips. Revisit only if
+    ! the arm wins and the last few percent of setup time start to matter.
+    if (physics_pc_suu_form == 1) suu_keep = .false.
     if (suu_keep .and. sfp_suu_ready) then
       S_uu = sfp_Suu
       call MatZeroEntries(S_uu, ierr)
@@ -9838,7 +10050,42 @@ contains
       suu_str = DIFFERENT_NONZERO_PATTERN
     endif
 
-    if (.not. paired) then
+    if (physics_pc_suu_form == 1) then
+      !--- Workstream E: SHIP THE COMPOSED OPERATOR.  S_uu := B_22 + W, where W
+      !--- is the analytic composition of the two off-diagonal couplings
+      !--- (Chacon JCP 526 (2025) 113789, Eq. 18) assembled in
+      !--- construct_force_operator_matrix and already carrying its (theta*dt)^2
+      !--- prefactor, its toroidal channels and its zeroed Dirichlet rows.
+      !---
+      !--- The ENTIRE psi-channel chain below is skipped, not built and thrown
+      !--- away: sfp_TLa, sfp_TL, sfp_Ltil, Shat/Shati and the triple product
+      !--- never exist on this path, and that is precisely where the setup-time
+      !--- saving comes from. Dh is likewise not needed (it is only read by the
+      !--- shell, which this arm forces off).
+      !---
+      !--- This is NOT a better approximation to the triple-product S_uu -- it is
+      !--- measurably worse at that (section 3.2 of the workstream note), and
+      !--- worse under refinement. It is defensible only as a REPLACEMENT, where
+      !--- S_uu stops being the target: the composed pair is mesh-independent
+      !--- under the production C1 GMG (6/8/8 inner its vs 19/23/23), ~5x cheaper
+      !--- per solve, ~2x cheaper setup, and needs no PhysPC_MjSolve. The verdict
+      !--- is therefore the OUTER FGMRES count and the total time per step.
+      call MatAXPY(S_uu, 1.0d0, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
+      if (first_time .and. my_id == 0) write(*,'(A)') &
+        "[Physics PC] S_uu = B_22 + W (composed; triple product skipped)"
+
+      !--- Workstream F: this branch skips the psi channel, so diag(Shat) -- the
+      !--- corrector's M^-1 surrogate -- has no other producer. Build it here.
+      !--- Only B_13*Qi is needed: shat_diag_inverse gets diag((B_13 Qi) B_31)
+      !--- from row dots, never forming the triple product, so this costs one
+      !--- sparse product and not the chain the branch exists to avoid.
+      if (physics_pc_corrector_form == 1) then
+        call mat_product_cached(g_ctx%B_13, sfp_Qip, sfp_TSa, sfp_nnz_TSa, "B_13*Qi ", comm, my_id)
+        call shat_diag_inverse(opz, dscale)
+        call stash_corrector_diag(dscale)
+        call VecDestroy(dscale, ierr)
+      endif
+    else if (.not. paired) then
       !--- "SFM": M_y^-1 -> a fully block-DIAGONAL Riesz map. Measured and
       !--- rejected (see docs/physics_pc/workstream_B_mixed_schur.md section 5):
       !--- diagonalising M_y severs psi from j, and since U reaches the momentum
@@ -9958,6 +10205,9 @@ contains
           call VecCopy(dscale, shw_d, ierr)
           shw_d_ready = .true.
         endif
+        ! Workstream F: same capture for the Eq. (17) corrector. MUST precede
+        ! the MatDiagonalScale below, which consumes dscale and then frees it.
+        if (physics_pc_corrector_form == 1) call stash_corrector_diag(dscale)
         call MatDiagonalScale(sfp_Ltil, PETSC_NULL_VEC, dscale, ierr)
         call VecDestroy(dscale, ierr)
         call mat_product_cached(sfp_Ltil, g_ctx%B_12, sfp_ch_Tp(1), sfp_nnz_chT(1), &
@@ -10167,6 +10417,19 @@ contains
       if (my_id == 0) write(*,'(A,I0,A,I0)') &
         "[Physics PC]   lean diag(Shat) inverse built (no Shat product): floored rows = ", nfl, " of ", nn
     end subroutine shat_diag_inverse
+
+    !> Workstream F: keep a private copy of 1/diag(Shat) for the Eq. (17)
+    !! corrector. Both producers of that diagonal hand it straight to a consumer
+    !! that destroys it (MatDiagonalScale's dscale, or the local temporary on the
+    !! suu_form = 1 branch), so the corrector cannot simply hold a reference.
+    !! Rebuilt every PC rebuild, exactly like the operator it approximates.
+    subroutine stash_corrector_diag(d)
+      Vec, intent(in) :: d
+      if (g_ctx%corr_ready) call VecDestroy(g_ctx%corr_dsi, ierr)
+      call VecDuplicate(d, g_ctx%corr_dsi, ierr)
+      call VecCopy(d, g_ctx%corr_dsi, ierr)
+      g_ctx%corr_ready = .true.
+    end subroutine stash_corrector_diag
 
     !> S_uu -= alpha * (L Qi U). alpha is explicit because the SFM2 psi channel
     !! carries its (1+zeta) inside Shat and so needs alpha = 1, while every

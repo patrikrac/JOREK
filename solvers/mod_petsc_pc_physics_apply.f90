@@ -17,6 +17,11 @@ module mod_petsc_pc_physics_apply
 
   ! physics_pc_apply's per-variable copies of x and y (created on first use;
   ! every variable block has B_11's layout)
+  ! Workstream E: the real packed pair_w RHS is dumped once, on the first
+  ! solve, so util/block_bench can stop driving pair_w with a synthetic
+  ! b = A x_ref (which is why its rtol 1e-1 row has been unreadable).
+  logical, save :: rhs_w_dumped = .false.
+
   Vec, save     :: sv_x(6), sv_y(6)
   logical, save :: sv_ready = .false.
 
@@ -26,6 +31,42 @@ contains
   !!
   !! y_packed must already exist with size = size(x1) + size(x2).
   !! Layout: top half = x1, bottom half = x2.
+  !--------------------------------------------------------------------
+  !> Dump the REAL packed pair_w right-hand side, once, on the first solve.
+  !!
+  !! Workstream E. util/block_bench has always driven pair_w with a synthetic
+  !! `b = A x_ref`, x_ref uniform random. That excites the worst-conditioned
+  !! modes, which is why the bench's rtol 1e-1 row reads as meaningless (a
+  !! relative error of ~2.7e2) while production runs happily at
+  !! physics_pc_pair_rtol = 1e-1 on real residuals. The tolerance was never the
+  !! problem -- the RHS was. With the true rhs_W dumped, its@1e-1 becomes the
+  !! production-relevant metric it should always have been.
+  !!
+  !! Lives here rather than beside dump_sfm2_blocks because the construction
+  !! module already uses this one; the reverse direction would be circular.
+  subroutine dump_pair_w_rhs(v, my_id)
+    use phys_module, only: tstep, physics_pc_schur_massinv, physics_pc_schur_pairinv
+
+    Vec, intent(in)     :: v
+    integer, intent(in) :: my_id
+
+    character(len=64)   :: suffix
+    character(len=16)   :: tstr
+    character(len=128)  :: fname
+    PetscViewer         :: viewer
+    PetscErrorCode      :: ierr
+
+    write(tstr,'(F0.3)') tstep
+    write(suffix,'(A,A,I0,A,I0,A)') trim(adjustl(tstr)), "_mi", physics_pc_schur_massinv, &
+                                    "_pi", physics_pc_schur_pairinv, ".petsc"
+    fname = "gmgdump_rhs_W_ts" // trim(suffix)
+
+    call PetscViewerBinaryOpen(PETSC_COMM_WORLD, trim(fname), FILE_MODE_WRITE, viewer, ierr)
+    call VecView(v, viewer, ierr)
+    call PetscViewerDestroy(viewer, ierr)
+    if (my_id == 0) write(*,'(A,A)') "[Physics PC]   GMG dump: ", trim(fname)
+  end subroutine dump_pair_w_rhs
+
   subroutine pack_2v(x1, x2, y_packed, ierr)
     Vec            :: x1, x2, y_packed
     PetscErrorCode :: ierr
@@ -627,6 +668,19 @@ contains
   !>   3. Corrector rho:      y_rho = rho* - B_55^-1 (B_52 u)
   !>   3. Corrector T:        y_T   = T*   - B_66^-1 (B_62 u)
   !>
+  !> Step 3's psi-pair has TWO forms, selected by physics_pc_corrector_form,
+  !> and they are the two equations of Chacon JCP 526 (2025) 113789:
+  !>
+  !>   0 (default) = Eq. (16), the exact block-LDU: a second FULL pair_psi solve.
+  !>   1           = Eq. (17): M^-1 is replaced by the SAME solve-free surrogate
+  !>                 the momentum Schur complement already uses, so the corrector
+  !>                 and the operator it corrects for are one approximation
+  !>                 rather than two. See the branch below for the algebra.
+  !>
+  !> Form 0 is the more accurate correction, but it is more accurate than the
+  !> S_uu it corrects for -- the psi channel of S_uu is built with a DIAGONAL
+  !> Shat^-1. Form 1 removes that mismatch and one of the two pair_psi solves.
+  !>
   !> Three zero structures carry the whole scheme, and each is commented at its
   !> site below because getting any of them wrong is silent:
   !>
@@ -658,10 +712,13 @@ contains
   !--------------------------------------------------------------------
   subroutine apply_wave_schur_mixed_pairs(x_psi, x_u, x_j, x_w, x_rho, x_T, &
                                           y_psi, y_u, y_j, y_w, y_rho, y_T, ierr)
+    use phys_module, only: physics_pc_dump_blocks, physics_pc_corrector_form
+
     Vec, intent(in)    :: x_psi, x_u, x_j, x_w, x_rho, x_T
     Vec, intent(inout) :: y_psi, y_u, y_j, y_w, y_rho, y_T
     PetscErrorCode, intent(out) :: ierr
     PetscInt :: pw_its
+    integer  :: my_id_pc, mpierr
 
     ! --- Step 1: predictor psi-pair.  pair_psi (psi*, j*) = (x_psi, x_j) ---
     ! The j-component of the RHS is x_j, NOT zero: this is the constraint
@@ -718,6 +775,11 @@ contains
     !   identically zero, so the omega component of (r_w - L y*) is the raw
     !   input residual -- no fold, no correction term.
     call pack_2v(g_ctx%work_5, x_w, g_ctx%rhs_W, ierr)
+    if (physics_pc_dump_blocks /= 0 .and. .not. rhs_w_dumped) then
+      call MPI_COMM_RANK(PETSC_COMM_WORLD, my_id_pc, mpierr)
+      call dump_pair_w_rhs(g_ctx%rhs_W, my_id_pc)
+      rhs_w_dumped = .true.
+    endif
     call PetscLogEventBegin(pcev_solve_w, ierr)
     call pair_ksp_solve(g_ctx%ksp_pair_w, g_ctx%rhs_W, g_ctx%sol_W, &
                         g_ctx%pscale_w, g_ctx%pscale_w_ready, ierr)
@@ -734,21 +796,59 @@ contains
     call MatMult(g_ctx%B_12, y_u, g_ctx%work_3, ierr)
     call MatMult(g_ctx%B_16, g_ctx%tmp_T, g_ctx%work_4, ierr)
     call VecAXPY(g_ctx%work_3, 1.0d0, g_ctx%work_4, ierr)      ! B_12 u + B_16 T*
-    call VecZeroEntries(g_ctx%work_4, ierr)
-    call pack_2v(g_ctx%work_3, g_ctx%work_4, g_ctx%rhs_PJ, ierr)
-    call PetscLogEventBegin(pcev_solve_pj, ierr)
-    call pair_ksp_solve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, &
-                        g_ctx%pscale_pj, g_ctx%pscale_pj_ready, ierr)
-    call PetscLogEventEnd(pcev_solve_pj, ierr)
-    call KSPGetIterationNumber(g_ctx%ksp_pair_psi, pw_its, ierr)
-    pp_its_sum = pp_its_sum + int(pw_its)
-    pp_its_max = max(pp_its_max, int(pw_its))
-    pp_nsolve  = pp_nsolve + 1
-    call unpack_2v(g_ctx%sol_PJ, g_ctx%work_3, g_ctx%work_4, ierr)  ! dpsi, dj
-    call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)            ! y_psi = psi* - dpsi
-    call VecAXPY(y_j,   -1.0d0, g_ctx%work_4, ierr)            ! y_j   = j*   - dj
+
+    if (physics_pc_corrector_form == 1) then
+      !--- Eq. (17) of Chacon JCP 526 (2025) 113789, in place of Eq. (16).
+      !
+      ! Eq. (16) is the exact block-LDU and applies M^-1 TWICE: once as the
+      ! predictor (step 1) and once here. Eq. (17) keeps the predictor exact but
+      ! replaces this second M^-1 by the small-bulk-flow approximation -- Chacon
+      ! writes M^-1 -> Delta_t I, which on a finite-element discretisation is a
+      ! mass-weighted diagonal, not the identity. Crucially he uses the SAME
+      ! approximation inside P_SF = D_v - Delta_t L U.
+      !
+      ! Our P_SF is S_uu, whose psi channel is built as Ltil * diag(Shat)^-1 *
+      ! B_12. So the surrogate is already chosen for us: using anything else
+      ! here would correct for an operator we did not build. With pair^-1
+      ! acting on the RHS (r_psi, 0),
+      !
+      !   B_11 dpsi + B_13 dj = r_psi ,   B_31 dpsi + B_33 dj = 0
+      !     =>  dj   = -M_j^-1 B_31 dpsi
+      !         Shat dpsi = r_psi ,  Shat = (1+zeta) Q_psi - B_13 M_j^-1 B_31
+      !
+      ! and the channel's own operands supply both inverses: corr_dsi for
+      ! Shat^-1 (a diagonal, so a pointwise multiply) and corr_Qip for M_j^-1.
+      ! Cost is one matvec and two pointwise multiplies against a full LU
+      ! back-solve -- one of the two pair_psi solves in every apply.
+      if (.not. g_ctx%corr_ready) then
+        call MPI_COMM_RANK(PETSC_COMM_WORLD, my_id_pc, mpierr)
+        if (my_id_pc == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_corrector_form = 1 "// &
+          "but diag(Shat) was never captured (build_schur_mixed_prod did not run?)."
+        call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+      endif
+      call VecPointwiseMult(g_ctx%work_4, g_ctx%corr_dsi, g_ctx%work_3, ierr)  ! dpsi
+      call VecAXPY(y_psi, -1.0d0, g_ctx%work_4, ierr)           ! y_psi = psi* - dpsi
+      call MatMult(g_ctx%B_31, g_ctx%work_4, g_ctx%work_3, ierr)
+      call MatMult(g_ctx%corr_Qip, g_ctx%work_3, g_ctx%work_5, ierr)  ! M_j^-1 B_31 dpsi
+      call VecAXPY(y_j, 1.0d0, g_ctx%work_5, ierr)              ! y_j = j* - dj, dj = -(...)
+    else
+      !--- Eq. (16): the exact block-LDU corrector, a second full pair_psi solve.
+      call VecZeroEntries(g_ctx%work_4, ierr)
+      call pack_2v(g_ctx%work_3, g_ctx%work_4, g_ctx%rhs_PJ, ierr)
+      call PetscLogEventBegin(pcev_solve_pj, ierr)
+      call pair_ksp_solve(g_ctx%ksp_pair_psi, g_ctx%rhs_PJ, g_ctx%sol_PJ, &
+                          g_ctx%pscale_pj, g_ctx%pscale_pj_ready, ierr)
+      call PetscLogEventEnd(pcev_solve_pj, ierr)
+      call KSPGetIterationNumber(g_ctx%ksp_pair_psi, pw_its, ierr)
+      pp_its_sum = pp_its_sum + int(pw_its)
+      pp_its_max = max(pp_its_max, int(pw_its))
+      pp_nsolve  = pp_nsolve + 1
+      call unpack_2v(g_ctx%sol_PJ, g_ctx%work_3, g_ctx%work_4, ierr)  ! dpsi, dj
+      call VecAXPY(y_psi, -1.0d0, g_ctx%work_3, ierr)          ! y_psi = psi* - dpsi
+      call VecAXPY(y_j,   -1.0d0, g_ctx%work_4, ierr)          ! y_j   = j*   - dj
                                                                ! (replaces the j
                                                                !  back-substitution)
+    endif   ! physics_pc_corrector_form
 
     ! --- Step 3: rho / T correctors. Only u enters -- U's omega COLUMN is zero. ---
     call MatMult(g_ctx%B_52, y_u, g_ctx%work_3, ierr)

@@ -104,7 +104,8 @@ contains
                            physics_pc_schur_amg, physics_pc_schur_amg_its, &
                            physics_pc_schur_variant, physics_pc_verify_mixed, &
                            physics_pc_pair_inner, physics_pc_psi_schur, physics_pc_w_gmg, physics_pc_rhot_gmg, &
-                           physics_pc_suu_shell, physics_pc_lean_setup
+                           physics_pc_suu_shell, physics_pc_lean_setup, &
+                           physics_pc_psi_rtol
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate, &
                                          petsc_mat_diff_norm
 
@@ -512,7 +513,8 @@ contains
             call setup_pair_inner_ksp(g_ctx%ksp_pair_psi, g_ctx%K_pj_aij, &
                                  g_ctx%is_pair_psi, comm, first_time, &
                                  physics_pc_pair_inner /= 3, "pjinner", &
-                                 "pair_psi KSP ([B_11,B_13;B_31,B_33])")
+                                 "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
+                                 rtol_over=physics_pc_psi_rtol)
           endif
           call PetscLogEventEnd(pcev_fact_pj, ierr)
           call physics_pc_mem("PC build: pair_psi solver set up", my_id)

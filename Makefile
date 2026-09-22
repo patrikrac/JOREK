@@ -94,6 +94,7 @@ DIRS := diagnostics				\
 	benchmarks				\
 	core					\
 	core/tests                      	\
+	util/block_bench			\
 	.					\
 	vacuum				\
 	numerics

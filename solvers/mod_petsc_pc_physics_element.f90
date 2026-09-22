@@ -97,7 +97,8 @@ contains
     use construct_pc_matrix_mod
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
-    use phys_module,     only: debug_physics_pc, physics_pc_reduced_pde
+    use phys_module,     only: debug_physics_pc, physics_pc_reduced_pde, &
+                               physics_pc_force_operator
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
@@ -170,6 +171,22 @@ contains
       g_ctx%p_full_ready = .true.
 
       if (my_id .eq. 0) write(*,'(A)') "[Physics PC]   P_full (reduced PDE operator) assembled"
+    endif
+
+    ! --- Workstream E: the composed force operator W ---
+    ! Assembled here rather than in the SFM2 build because it needs mhd_sim (the
+    ! linearisation state), which only this routine is given. Purely diagnostic:
+    ! dump_sfm2_blocks writes it out, nothing in the apply reads it yet.
+    if (physics_pc_force_operator /= 0) then
+      if (g_ctx%w_force_ready) PetscCallA(MatDestroy(g_ctx%W_force, ierr))
+      call petsc_create_pc_matrix(g_ctx%W_force, a_mat, 1)
+
+      call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
+                                           mhd_sim, g_ctx%W_force)
+      g_ctx%w_force_ready = .true.
+
+      if (my_id .eq. 0) write(*,'(A)') &
+        "[Physics PC]   W (composed force operator) assembled"
     endif
   end subroutine petsc_assemble_pc_matrices
 

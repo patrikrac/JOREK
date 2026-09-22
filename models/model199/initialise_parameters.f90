@@ -103,6 +103,10 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 physics_pc_pair_rtol,                               &
                 physics_pc_pair_amg_thr,                            &
                 physics_pc_dump_blocks,                             &
+                physics_pc_force_operator,                          &
+                physics_pc_suu_form,                                &
+                physics_pc_psi_rtol,                                &
+                physics_pc_corrector_form,                          &
                 physics_pc_psi_schur,                               &
                 physics_pc_w_gmg,                                   &
                 physics_pc_suu_ring,                                &

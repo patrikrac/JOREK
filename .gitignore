@@ -90,3 +90,10 @@ kinetic_neutrals
 recombination_*
 run_*
 meas_*
+block_bench
+
+# macOS sed -i backups (util/config.sh)
+*-e
+# build artifacts
+algexpr2fort
+generate_code

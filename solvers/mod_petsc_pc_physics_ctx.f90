@@ -85,6 +85,17 @@ module mod_petsc_pc_physics_ctx
     Mat :: P_full_perm
     logical :: p_full_perm_ready = .false.
 
+    !> Workstream E: the momentum-Schur FORCE OPERATOR, assembled directly from
+    !! the analytic composition of the two off-diagonal couplings rather than
+    !! formed as the matrix triple product Ltil*Shat^-1*B_12 (Chacon JCP 526
+    !! (2025) Eqs. 17-19). One variable (u), block size n_tor, and scaled so that
+    !! the composed operator is simply B_22 + W_force. See
+    !! models/model199/mod_pc_elt_matrix_force_fft.f90 and
+    !! docs/physics_pc/note_pair_w_force_operator/. Diagnostic for now: it is
+    !! assembled and dumped, nothing reads it in the apply.
+    Mat :: W_force
+    logical :: w_force_ready = .false.
+
     !> Monolithic 4x4 reduced system (stage-one test mode)
     Mat :: A_reduced_4x4
     KSP :: ksp_reduced
@@ -117,6 +128,16 @@ module mod_petsc_pc_physics_ctx
     !! Shat^-1 = Q_u^-1 A_uM S_ass^-1. Hence A_uM and Q_u^-1 have to survive the build.
     Mat :: A_uM_prod                     !< assembled A_uM(ic); OWNED here, rebuilt every PC rebuild
     Mat :: Qi_u_prod                     !< REFERENCE to sfp_Qip/sfp_QiR; NOT owned, never destroyed here
+    ! --- Workstream F: operands of the Eq. (17) corrector (physics_pc_corrector_form = 1) ---
+    !! Step 3 of the LDU sweep replaces its full pair_psi solve by the SAME
+    !! solve-free surrogate the momentum Schur complement already uses, so that
+    !! the corrector and the operator it corrects for are the same
+    !! approximation. Both are read by the APPLY module, which cannot `use` the
+    !! construction module (construction uses apply -- see dump_pair_w_rhs), so
+    !! they are handed over here rather than through a module variable.
+    Vec :: corr_dsi                      !< 1/diag(Shat), Shat = (1+zeta) Q_psi - B_13 Qi B_31; OWNED here
+    Mat :: corr_Qip                      !< REFERENCE to sfp_Qip (the 1/R mass inverse); NOT owned, never destroyed here
+    logical :: corr_ready = .false.      !< corr_dsi exists; corrector_form = 1 aborts if this is false at apply time
     Vec :: u_mask                        !< 1 on interior u-rows, 0 on the ZBIG Dirichlet rows
     Vec :: u_bnd                         !< 1/diag on the ZBIG rows, 0 elsewhere (the Jacobi add-back)
     Vec :: u_one                         !< 1 - u_mask, the identity put on the masked rows
