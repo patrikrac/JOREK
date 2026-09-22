@@ -1,0 +1,284 @@
+! =====================================================================
+!  inxflow_shaped_pcbench
+!  SHAPED LIMITER inxflow -- resistively driven, for the physics PC study.
+!
+!  Derived from `inxflow_circ_pcbench`, which is itself `model303/inxflow`
+!  (the JOREK howto peeling-ballooning case) ported to model199.  That port
+!  made the geometry CIRCULAR.  This namelist restores model303's SHAPE and
+!  keeps the limiter boundary:
+!
+!      ellip  1.  -> 1.7        (model303 value)
+!      quad_l 0.  -> -0.4       (model303 value)
+!      xpoint .f.               (UNCHANGED -- no X-point)
+!      n_open/n_leg/n_private 0 (UNCHANGED -- closed field lines only)
+!
+!  So this is the configuration the circular port skipped: non-circular,
+!  but NOT diverted.  Closed field lines keep `eliminate_boundary_dofs`
+!  valid, which every measurement in this study depends on.
+!
+!  --- WHY THE DRIVE IS RESISTIVITY, NOT SHAPE -------------------------
+!  Do not expect the shaping to destabilise this case on its own.  The
+!  sibling `inxflow600_circ_pcbench` runbook (Stage 2) measured six drive
+!  variants and EVERY pressure/q/geometry knob failed:
+!
+!      arm  change                        beta_N   growth (mag, kin)
+!      ---  ----------------------------  -------  -----------------
+!      base --                             2.33 %  (+4.2e-3, +3.4e-3)
+!      A    T_coef(4) 0.08 -> 0.04         2.32 %  (-8.3e-3, -1.2e-2)
+!      B    T_0 1.5d-2 -> 4.5d-2           4.25 %  (-2.4e-2, -1.0e-2)
+!      C    F0 3.0 -> 4.5                  1.55 %  (+2.1e-2, -4.7e-4)
+!      D    A + B combined                 4.23 %  (-1.7e-2, +8.4e-3)
+!      X    FULL X-POINT GEOMETRY RESTORED 1.91 %  (-1.1e-2, -5.7e-3)
+!
+!  In every row the magnetic and kinetic rates disagree in SIGN at
+!  energies of 1e-25..1e-26: that is the seed decaying, not a mode.
+!  Note rows B and X in particular -- raising T_0 to beta_N 4.25 % did not
+!  help, and restoring the FULL diverted geometry did not help.  Shape and
+!  beta were both tried and both failed on that case.
+!
+!  What worked there was the physical `eta`, 2.d-6 -> 2.d-5, which grew a
+!  clean n = 6 RESISTIVE mode over 7 decades at gamma*tau_A = 2.66e-2,
+!  constant to three significant figures.  That is the drive used here.
+!
+!  Also structural: model199 element matrices never call
+!  `bootstrap_current`, so there is no edge current and the PEELING half of
+!  peeling-ballooning is absent whatever the geometry.  The target here is
+!  a RESISTIVE BALLOONING mode, not an ideal one.
+!
+!
+!  --- MEASURED OUTCOME: IT GROWS, AND IT IS A BALLOONING MODE ---------
+!  Stage 1 (50 ramped steps, ntor1): beta_N = 1.372 %, beta_p = 0.507,
+!  beta_t = 0.0170, no NaN.
+!  Stage 2 (200 steps at tstep 3, n = 0/6 build), measured over t = 44..440:
+!
+!      E_kin(n=6)  4.17e-26 -> 6.64e-18   8.2 decades   gamma = 0.02916
+!      E_mag(n=6)  4.19e-25 -> 2.59e-18   6.8 decades   gamma = 0.02926
+!
+!  The two rates AGREE TO 0.4 %.  That is the discriminator: in all six
+!  failed arms of the sibling case the magnetic and kinetic rates disagreed
+!  in SIGN at 1e-25..1e-26, i.e. a decaying seed.  Here they track each
+!  other to three digits across eight decades.  gamma sits next to
+!  inxflow600's resistive mode (2.66e-2), as expected for the same drive.
+!  The rate drifts down slowly (0.0306 -> 0.0275): the n=0 equilibrium
+!  relaxing resistively underneath the mode at eta = 2e-5.
+!
+!  MODE STRUCTURE (jorek000240.h5, t = 611, scratchpad/modestruct.py):
+!    - EDGE LOCALISED.  The radial envelope of u is < 0.01 inside ring 27
+!      of 41 and peaks at ring 38-39 -- on the pedestal that T_coef(5) =
+!      0.94 puts there.  The mode sits exactly on the pressure gradient.
+!    - OUTBOARD WEIGHTED.  Outboard/inboard energy ratio 5.9 (u), 4.9
+!      (psi), 19.5 (T).  Bad-curvature side, as a ballooning mode must be.
+!    - HIGH m, ONE-SIDED, AND FIELD ALIGNED.  <|m|> = 15.8 (u), 18.9 (psi).
+!      EVERY dominant harmonic has the same sign of m, and each maps onto a
+!      rational surface in the pedestal, m = -n*q:
+!
+!         m     q = |m|/n    psi_n where q matches
+!        -14      2.333           0.800
+!        -17      2.833           0.903     (2nd strongest, 0.993)
+!        -19      3.167           0.946     (STRONGEST; pedestal centre)
+!        -21      3.500           0.979
+!
+!      n*q at the pedestal is 18.7, against a dominant m of 19.  A chain of
+!      poloidal harmonics on adjacent rational surfaces, coupled by
+!      toroidal curvature -- the classic ballooning structure, not an
+!      interchange (poloidally uniform) and not a tearing mode (low m,
+!      single resonant surface).
+!
+!  So the shaping DID matter here, where it did not on inxflow600 -- but
+!  note the drive is still resistive, and eta = 2e-5 is doing work.  The
+!  clean control (this shape at eta = 2e-6) has NOT been run.
+!
+!  --- v2 SHAPE: UP/DOWN SYMMETRIC (2026-09-18) ------------------------
+!  v1 inherited `quad_l = -0.4` from model303/inxflow with `quad_u = 0`.
+!  In the parent case that lower squareness existed to shape the plasma INTO
+!  a lower X-point; with xpoint = .f. it has no physical partner, so the LCFS
+!  was a diverted boundary with the divertor deleted.  Measured on v1:
+!    R0 3.00, a 1.00, aspect 3.0, kappa 1.696,
+!    triangularity +0.088 (upper) / +0.063 (lower),
+!    |Z_up/Z_low| = 0.88 at R = 2.5 and 3.5  -- ~12 % fuller below than above.
+!  A valid closed surface, but arbitrary.  v2 sets quad_u = quad_l = 0 and
+!  tria_u = tria_l = 0.1, keeping ellip = 1.7: a clean, up/down symmetric
+!  elongated limiter plasma with slight triangularity.
+!
+!  WHY TRIANGULARITY IS KEPT SMALL.  Triangularity RAISES the critical
+!  ballooning alpha, i.e. it is stabilising.  This case is only marginally
+!  unstable (gamma*tau_A ~ 0.028 at beta_N 1.37 %), so a tokamak-like
+!  delta ~ 0.3-0.4 risks killing the mode outright.  delta ~ 0.1 is also
+!  perfectly typical of limiter devices, so this is realistic AND safe.
+!
+!  v1 IS ARCHIVED, NOT DELETED: archive/runs/inxshaped_v1_asym/ holds the full
+!  pipeline (restarts, all 46 snapshots, logs, the six PC arms and the figures)
+!  plus a README with every result.  v1 physics is NOT invalidated by the shape
+!  -- but v2 changes the equilibrium, so v2 numbers are not comparable to v1.
+!  THE MEASURED OUTCOME BLOCK BELOW IS v1's AND MUST BE REMEASURED FOR v2.
+!  --- Changes relative to inxflow_circ_pcbench ------------------------
+!    - ellip 1. -> 1.7, quad_l 0. -> -0.4   (the shape; see above)
+!    - eta 2.d-6 -> 2.d-5                   (the drive; see above)
+!    - n_flux 40 -> 41                      (see the mesh note below)
+!
+!  --- MESH: n_flux MUST BE ODD ----------------------------------------
+!  `gmg_build_prolongations` halves radial lines and needs (n_flux-1) even,
+!  so n_flux = 40 is REFUSED and pair_w multigrid cannot be built on it.
+!  41 coarsens 41 -> 21 -> 11 -> 6; n_tht = 64 passes its own gate
+!  (divisible by 4).  Worse, the refusal message is currently lost --
+!  MPI_Abort beats the stdout flush -- so a wrong n_flux presents as an
+!  unexplained exit 1 in the middle of PC construction.
+!
+!  --- Compile-time settings -------------------------------------------
+!  n_tor / n_period / n_plane are in models/mod_settings.f90, NOT here.
+!    stage 1, axisymmetric :  ./util/config.sh model=199 n_tor=1 n_period=1 n_plane=1
+!    stage 2, ballooning   :  ./util/config.sh model=199 n_tor=3 n_period=6 n_plane=4
+!  det_modes.f90 then gives harmonics n = 0 and n = 6 in stage 2.
+!  A wrong binary silently runs the axisymmetric problem and exits 0.
+!
+!  --- Workflow --------------------------------------------------------
+!  Stage 1 MUST ramp the time step (the ramp below); starting at tstep = 3
+!  blows the run up within ~20 steps.
+!
+!    stage 1:  restart=.f., the shipped ramp, ntor1 binary
+!    stage 2:  restart=.t., tstep_n=3.d0, nstep_n=500, ntor3 binary
+!    stage 3:  restart=.t., nstep=1, use_physics_pc=.t.
+!
+!  Run on 1 MPI rank: the physics PC apply path fails for np > 1
+!  (pre-existing, independent of this work).
+! =====================================================================
+
+&in1
+
+ restart = .f.
+ regrid  = .f.
+
+ tstep_n   = 1.d-3,1.d-2,1.d-1,1.d0,3.d0
+ nstep_n   = 10,10,10,10,10
+
+ nout = 5
+
+ freeboundary = .f.
+
+ fbnd(1)   = 2.
+ fbnd(2:4) = 0.
+ mf        = 0
+
+! --- circular limiter geometry ---------------------------------------
+ ellip  = 1.7
+ tria_u = 0.1
+ tria_l = 0.1
+ quad_u = 0.
+ quad_l = 0.
+
+ xpoint = .f.
+ xampl  = 0.
+ xsig   = 0.6
+ xwidth = 1.5
+ xtheta = 4.7
+ xshift = 0.0
+
+ R_begin = 2.9
+ R_end   = 3.1
+ Z_begin = -0.1
+ Z_end   = 0.1
+
+ R_geo = 3.0
+ Z_geo = 0.
+ amin  = 1.
+
+ F0    = 3.0
+
+ n_R      = 0
+ n_Z      = 0
+ n_radial = 81
+ n_pol    = 128
+
+ n_flux    = 41
+ n_tht     = 64
+ n_open    = 0
+ n_leg     = 0
+ n_private = 0
+
+ eta   = 2.d-5
+ visco = 4.d-6
+
+! numerical resistivity is required for this case
+ eta_num = 3.d-10
+
+ D_par     = 0.d0
+ D_perp(1) = 1.d-5
+ D_perp(2) = 0.85d0
+ D_perp(3) = 0.d0
+ D_perp(4) = 0.01d0
+ D_perp(5) = 0.92d0
+
+ ZK_par     = 10.d0
+ ZK_perp(1) = 1.d-5
+ ZK_perp(2) = 0.85d0
+ ZK_perp(3) = 0.d0
+ ZK_perp(4) = 0.01d0
+ ZK_perp(5) = 0.92d0
+
+ FF_0 = 1.6
+ FF_1 = 0.
+ FF_coef(1)  = -1.0
+ FF_coef(2)  = 0.d0
+ FF_coef(3)  = 0.d0
+ FF_coef(4)  = 0.03d0
+ FF_coef(5)  = 1.0d0
+ FF_coef(6)  = -0.06d0
+ FF_coef(7)  = 0.90d0
+ FF_coef(8)  = 0.07d0
+
+ heatsource     = 1.d-7
+ particlesource = 5.d-6
+
+ T_0 = 1.5d-2
+ T_1 = 3.d-4
+ T_coef(1) = -0.66d0
+ T_coef(2) = +0.0d0
+ T_coef(3) = 0.d0
+ T_coef(4) = 0.08d0
+ T_coef(5) = 0.94d0
+
+ rho_0 = 1.
+ rho_1 = 0.01
+ rho_coef(1)  =  0.0
+ rho_coef(2)  =  0.0
+ rho_coef(3)  =  0.0
+ rho_coef(4)  =  0.08
+ rho_coef(5)  =  0.94d0
+
+ iter_precon    = 22
+ gmres_m        = 20
+ gmres_4        = 1.d0
+ gmres_max_iter = 200
+ gmres_tol      = 1.d-8
+
+! --- physics PC -------------------------------------------------------
+! Eliminate the Dirichlet DOFs (row+column zeroed, representative diagonal)
+! instead of the 1e12 ZBIG penalty.  Wanted for the PC study: the penalty
+! rows otherwise dominate every operator norm.
+!
+! CAUTION: this flag is ours, it is in no stock JOREK case, and it is applied
+! to the MAIN system matrix (matrix/construct_matrix_mod.f90:474-748), not
+! only to the PC matrices -- so it changes the boundary condition of the
+! physics solve.  Keep it OFF for the stage-1/stage-2 physics runs and turn
+! it on only for the stage-3 diagnostics.
+ eliminate_boundary_dofs      = .f.
+
+ use_physics_pc               = .f.
+ debug_physics_pc             = .f.
+ physics_pc_monolithic        = .t.
+ physics_pc_reduced_pde       = .t.
+ physics_pc_drop_psi_coupling = .f.
+ physics_pc_verify_reduced    = .f.
+
+! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
+ use_strumpack     = .f.
+ use_strumpack_eq  = .f.
+ use_strumpack_prj = .f.
+ use_mumps         = .f.
+ use_mumps_eq      = .f.
+ use_mumps_prj     = .f.
+ use_pastix        = .f.
+ use_pastix_eq     = .f.
+ use_pastix_prj    = .f.
+ use_petsc_eq      = .t.
+/
