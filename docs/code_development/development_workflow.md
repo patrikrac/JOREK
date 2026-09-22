@@ -131,6 +131,7 @@ During the migration to GitHub, the history of commit hashes will change. Follow
 
 1. **Push Your Branches Before Migration (end of July)**:
    - Before the migration, push all your local branches to the current repository:
+
 ```bash
      git push origin <branch-name>
 ```
@@ -144,7 +145,7 @@ During the migration to GitHub, the history of commit hashes will change. Follow
    - Clone your fork of the new main repository:
 
 ```bash
-     git clone https://github.com/<your-username>/<fork-repo>.git
+     git clone git@github.com:<your-username>/<fork-repo>.git
      cd <fork-repo>
 ```
 
@@ -170,6 +171,12 @@ During the migration to GitHub, the history of commit hashes will change. Follow
 
 ```bash
      git push -u origin <branch-name>
+```
+
+  - You might need to use the following command to make the branch track your fork
+
+```bash             
+     git branch feature/m600refluid  -u origin/feature/m600refluid
 ```
 
    The old branch and the public repository share the same history, so the

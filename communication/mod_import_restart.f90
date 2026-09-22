@@ -923,7 +923,9 @@ endif
       do i=1,node_list%n_nodes
         node_list%node(i)%values(n_tor_tmp+1:n_tor,:,:)= 0.d0
         do j=n_tor_tmp+1, n_tor
-          node_list%node(i)%values(j,:,var_rho)= amplitude * node_list%node(i)%values(1,:,var_rho)
+          if (with_rho) then
+            node_list%node(i)%values(j,:,var_rho)= amplitude * node_list%node(i)%values(1,:,var_rho)
+          endif
 #ifdef WITH_TiTe
           node_list%node(i)%values(j,:,var_Ti)= amplitude * node_list%node(i)%values(1,:,var_Ti)
           node_list%node(i)%values(j,:,var_Te)= amplitude * node_list%node(i)%values(1,:,var_Te)
@@ -2380,7 +2382,9 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
         do m=2,n_tor
           if ( new_mode(m) .eq. 1 ) then
           node_list%node(i)%values(m,:,:) = 0.d0
-          node_list%node(i)%values(m,:,var_rho)   = amplitude * node_list%node(i)%values(1,:,var_rho)
+          if (with_rho) then
+            node_list%node(i)%values(m,:,var_rho)   = amplitude * node_list%node(i)%values(1,:,var_rho)
+          endif
 #ifdef WITH_TiTe
           node_list%node(i)%values(m,:,var_Ti)   = amplitude * node_list%node(i)%values(1,:,var_Ti)
           node_list%node(i)%values(m,:,var_Te)   = amplitude * node_list%node(i)%values(1,:,var_Te)

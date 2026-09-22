@@ -3,6 +3,7 @@ module mod_model_settings
 
 implicit none
 
+logical, parameter :: with_rho        = .true.  ! not possible to switch off in FMHD for now
 logical, parameter :: with_vpar       = .false. ! not possible to switch for full MHD
 logical, parameter :: with_TiTe       = .true.
 logical, parameter :: with_neutrals   = .true.

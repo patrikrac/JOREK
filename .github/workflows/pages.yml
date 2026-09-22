@@ -3,6 +3,12 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [develop]
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
   workflow_dispatch:
 
 permissions:
@@ -48,6 +54,7 @@ jobs:
           path: docs/_site
 
   deploy:
+    if: ${{ github.event.repository.fork != true && github.ref == 'refs/heads/develop' }} # Only deploy from the develop branch if not a fork
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -63,8 +63,8 @@ real*8     :: ZK_par_T, dZK_par_dT, ZKi_par_T, dZKi_par_dT, ZKe_par_T, dZKe_par_
 real*8     :: D_prof, D_par_local, ZK_prof, ZKi_prof, ZKe_prof, psi_norm, theta, zeta, delta_u_x, delta_u_y, delta_ps_x, delta_ps_y
 real*8     :: D_prof_imp, D_par_local_imp
 real*8     :: V_prof_pinch, psi_grad2
-real*8     :: rhs_ij(n_var), rhs_ij_k(n_var)
-real*8     :: amat(n_var,n_var), amat_k(n_var,n_var), amat_n(n_var,n_var), amat_kn(n_var,n_var), amat_nn(n_var,n_var)
+real*8, dimension(0:n_var)         :: rhs_ij, rhs_ij_k
+real*8, dimension(0:n_var,0:n_var) :: amat, amat_k, amat_n, amat_kn, amat_nn
 
 real*8     :: v, v_x, v_y, v_s, v_t, v_p, v_ss, v_st, v_tt, v_xx, v_xy, v_yy
 real*8     :: ps0, ps0_x, ps0_y, ps0_p, ps0_s, ps0_t, ps0_ss, ps0_tt, ps0_st, ps0_xx, ps0_yy, ps0_xy
@@ -181,7 +181,7 @@ complex*16 :: out_fft(1:n_plane)
 integer*8  :: plan
 
 integer    :: max_terms_loop, i_term
-real*8     :: factor(n_var,max_terms)
+real*8     :: factor(0:n_var,max_terms)
 
 integer    :: i_v, i_loc, j_loc
 
@@ -246,6 +246,7 @@ real*8, dimension(n_plane,n_var,n_gauss,n_gauss) :: delta_g, delta_s, delta_t
 real*8, dimension(n_plane,n_aux_var,n_gauss,n_gauss) :: eq_aux_g, eq_aux_s, eq_aux_t, eq_aux_p ! make allocatable?
 
 real*8, dimension(n_tor,n_plane) :: HHZ, HHZ_p, HHZ_pp
+real*8 :: delta_rho_g, delta_rho_s, delta_rho_t
 
 !  --- For shock capturing stabilization
 real*8     :: midp_edge1(1:2), midp_edge2(1:2), midp_edge3(1:2), midp_edge4(1:2)
@@ -574,17 +575,37 @@ do i=1,n_vertex_max
           w0_tt = eq_tt(mp,var_w,ms,mt)
           w0_st = eq_st(mp,var_w,ms,mt)
 
-          r0    = eq_g(mp,var_rho,ms,mt)
-          r0_corr = corr_neg_dens(r0)
-          dr0_corr_dn = dcorr_neg_dens_drho(r0)
-          r0_x  = (   y_t(ms,mt) * eq_s(mp,var_rho,ms,mt) - y_s(ms,mt) * eq_t(mp,var_rho,ms,mt) ) / xjac
-          r0_y  = ( - x_t(ms,mt) * eq_s(mp,var_rho,ms,mt) + x_s(ms,mt) * eq_t(mp,var_rho,ms,mt) ) / xjac
-          r0_p  = eq_p(mp,var_rho,ms,mt)
-          r0_s  = eq_s(mp,var_rho,ms,mt)
-          r0_t  = eq_t(mp,var_rho,ms,mt)
-          r0_ss = eq_ss(mp,var_rho,ms,mt)
-          r0_st = eq_st(mp,var_rho,ms,mt)
-          r0_tt = eq_tt(mp,var_rho,ms,mt)
+          if (with_rho) then
+            r0    = eq_g(mp,var_rho,ms,mt)
+            r0_corr = corr_neg_dens(r0)
+            dr0_corr_dn = dcorr_neg_dens_drho(r0)
+            r0_x  = (   y_t(ms,mt) * eq_s(mp,var_rho,ms,mt) - y_s(ms,mt) * eq_t(mp,var_rho,ms,mt) ) / xjac
+            r0_y  = ( - x_t(ms,mt) * eq_s(mp,var_rho,ms,mt) + x_s(ms,mt) * eq_t(mp,var_rho,ms,mt) ) / xjac
+            r0_p  = eq_p(mp,var_rho,ms,mt)
+            r0_s  = eq_s(mp,var_rho,ms,mt)
+            r0_t  = eq_t(mp,var_rho,ms,mt)
+            r0_ss = eq_ss(mp,var_rho,ms,mt)
+            r0_st = eq_st(mp,var_rho,ms,mt)
+            r0_tt = eq_tt(mp,var_rho,ms,mt)
+            delta_rho_g = delta_g(mp,var_rho,ms,mt) 
+            delta_rho_s = delta_s(mp,var_rho,ms,mt) 
+            delta_rho_t = delta_t(mp,var_rho,ms,mt) 
+          else
+            r0    = 1.d0 
+            r0_corr = 1.d0
+            dr0_corr_dn = 1.d0
+            r0_x  = 0.d0 
+            r0_y  = 0.d0
+            r0_p  = 0.d0
+            r0_s  = 0.d0
+            r0_t  = 0.d0
+            r0_ss = 0.d0
+            r0_st = 0.d0
+            r0_tt = 0.d0
+            delta_rho_g = 0.d0
+            delta_rho_s = 0.d0
+            delta_rho_t = 0.d0
+          endif
 
           r0_hat   = BigR**2 * r0
           r0_x_hat = 2.d0 * BigR * BigR_x  * r0 + BigR**2 * r0_x
@@ -1588,7 +1609,7 @@ do i=1,n_vertex_max
                          ! New terms coming from -(\partial_t \rho + \nabla \cdot (\rho \mathbf{v})) \mathbf{v} in RHS of momentum equation
                          ! (see wiki: https://www.jorek.eu/wiki/doku.php?id=model500_501_555#equations):		      
                          + fact_conservative_u * (                                                                           &
-                             - zeta * BigR * BigR**2 * delta_g(mp,var_rho,ms,mt) * (v_x * u0_x + v_y * u0_y)  * xjac         &
+                             - zeta * BigR * BigR**2 * delta_rho_g           * (v_x * u0_x + v_y * u0_y)      * xjac         &
                              - BigR**2 * (r0_x_hat * u0_y - r0_y_hat * u0_x) * (v_x * u0_x + v_y * u0_y)      * xjac * tstep &
                              + BigR * F0 * (r0 * vpar0_p + vpar0 * r0_p) * (v_x * u0_x + v_y * u0_y)          * xjac * tstep &
                              + BigR**2 * r0 * (vpar0_x * ps0_y - vpar0_y * ps0_x) * (v_x * u0_x + v_y * u0_y) * xjac * tstep &
@@ -1647,7 +1668,7 @@ do i=1,n_vertex_max
                        + v * (r0+alpha_e*rimp0) * rn0 * BigR * Sion_T                                                     * xjac * tstep * factor(var_rho,8) &
                        - v * (r0+alpha_e*rimp0) * (r0-rimp0) * BigR * Srec_T                                              * xjac * tstep * factor(var_rho,9) &
                        
-                       + zeta * v * delta_g(mp,var_rho,ms,mt) * BigR                                                      * xjac         * factor(var_rho,10)&
+                       + zeta * v * delta_rho_g * BigR                                                                    * xjac         * factor(var_rho,10)&
 
                        - D_perp_num_psin*(v_xx + v_x/Bigr + v_yy)*(r0_xx + r0_x/Bigr + r0_yy) * BigR                                 * xjac * tstep * factor(var_rho,11)&
 
@@ -1697,7 +1718,7 @@ do i=1,n_vertex_max
                                  ! New terms coming from -(\partial_t \rho + \nabla \cdot (\rho \mathbf{v})) \mathbf{v} in RHS of momentum equation
                                  ! (see wiki: https://www.jorek.eu/wiki/doku.php?id=model500_501_555#equations):
                                  + fact_conservative_u * (                                                 &
-                                     + zeta * v * delta_g(mp,var_rho,ms,mt) * vpar0 * F0**2 / BigR * xjac  &
+                                     + zeta * v * delta_rho_g               * vpar0 * F0**2 / BigR * xjac  &
                                      + v * (r0_x_hat * u0_y - r0_y_hat * u0_x)       * vpar0 * BB2 * xjac * tstep  &
                                      - v * F0 / BigR * (r0 * vpar0_p + r0_p * vpar0) * vpar0 * BB2 * xjac * tstep  &
                                      - v * r0 * (vpar0_x * ps0_y - vpar0_y * ps0_x)  * vpar0 * BB2 * xjac * tstep  &
@@ -1826,7 +1847,7 @@ do i=1,n_vertex_max
                             !============================End perpendicular viscous heating terms=================
 
                          + zeta * v * (r0_corr + rimp0_corr*alpha_i) * delta_g(mp,var_Ti,ms,mt) * BigR * xjac         * factor(var_Ti,9)   &
-                         + zeta * v * Ti0      * delta_g(mp,var_rho,ms,mt) * BigR                * xjac         * factor(var_Ti,9)   &
+                         + zeta * v * Ti0      * delta_rho_g * BigR                                    * xjac         * factor(var_Ti,9)   &
                          ! Energy exchange term
                          + v * BigR * dTi_e                                                            * xjac * tstep * factor(var_Ti,11)   &
                          ! heating  source for small temperatures
@@ -1906,7 +1927,7 @@ do i=1,n_vertex_max
                                    * ( v_x * ps0_y -  v_y * ps0_x                        ) * xjac * tstep * tstep * factor(var_Te,8 )&
   
                          + zeta * v * (r0_corr+rimp0_corr*alpha_e_bis) * delta_g(mp,var_Te,ms,mt)* BigR  * xjac         * factor(var_Te,10)  &
-                         + zeta * v * Te0      * delta_g(mp,var_rho,ms,mt) * BigR                * xjac         * factor(var_Te,10)  &
+                         + zeta * v * Te0      * delta_rho_g* BigR                                       * xjac         * factor(var_Te,10)  &
                          ! Energy exchange term
                          + v * BigR * dTe_i                                                      * xjac * tstep * factor(var_Te,11)  &
                          ! implicit heating source
@@ -1923,7 +1944,7 @@ do i=1,n_vertex_max
               !===================== Additional terms from ionization energy terms============
                          + (GAMMA-1.) * zeta * v * E_ion * delta_g(mp,var_rhoimp,ms,mt) *BigR            * xjac * factor(var_Te,10) &
                          + (GAMMA-1.) * zeta * v * dE_ion_dT * rimp0 * delta_g(mp,var_Te,ms,mt) *BigR    * xjac * factor(var_Te,10) &
-                         + (GAMMA-1.) * zeta * v * E_ion_bg * (delta_g(mp,var_rho,ms,mt) - delta_g(mp,var_rhoimp,ms,mt))*BigR * xjac * factor(var_Te,10) &
+                         + (GAMMA-1.) * zeta * v * E_ion_bg * (delta_rho_g - delta_g(mp,var_rhoimp,ms,mt))*BigR * xjac * factor(var_Te,10) &
 
                          + (GAMMA-1.) * v * rimp0 * dE_ion_dT * BigR**2 * ( Te0_s * u0_t - Te0_t * u0_s) * tstep * factor(var_Te,17)&
                          + (GAMMA-1.) * v * E_ion * BigR**2 * (rimp0_s * u0_t - rimp0_t * u0_s)          * tstep * factor(var_Te,17)&
@@ -2045,7 +2066,7 @@ do i=1,n_vertex_max
                                        * ( v_x * ps0_y -  v_y * ps0_x                        )  * xjac * tstep * tstep * factor(var_T,8 )&
                             
                              + zeta * v * (r0_corr + rimp0_corr * alpha_imp_bis) * delta_g(mp,var_T,ms,mt)   * BigR * xjac * factor(var_T,10) &
-                             + zeta * v * T0      * delta_g(mp,var_rho,ms,mt) * BigR            * xjac * factor(var_T,10)                     &
+                             + zeta * v * T0      * delta_rho_g * BigR            * xjac * factor(var_T,10)                     &
                              +implicit_heat_source*(gamma-1.d0)*v &
                              * (0.5d0*T_min_neg*(1 + exp( (min(T0,T_min_neg)-T_min_neg)/(0.5d0*T_min_neg) )) -min(T0,T_min_neg)) &
                              *                                                                                 xjac*tstep*BigR  *factor(var_T,20)& 
@@ -2061,7 +2082,7 @@ do i=1,n_vertex_max
                 !===================== Additional terms from ionization energy terms============
                              + (GAMMA-1.) * zeta * v * E_ion * delta_g(mp,var_rhoimp,ms,mt) *BigR            * xjac * factor(var_T,10) &
                              + (GAMMA-1.) * zeta * v * dE_ion_dT * rimp0 * delta_g(mp,var_T,ms,mt) *BigR     * xjac * factor(var_T,10) &
-                             + (GAMMA-1.) * zeta * v * E_ion_bg * (delta_g(mp,var_rho,ms,mt) - delta_g(mp,var_rhoimp,ms,mt))*BigR * xjac * factor(var_T,10) &
+                             + (GAMMA-1.) * zeta * v * E_ion_bg * (delta_rho_g - delta_g(mp,var_rhoimp,ms,mt))*BigR * xjac * factor(var_T,10) &
     
                              + (GAMMA-1.) * v * rimp0 * dE_ion_dT * BigR**2 * ( T0_s * u0_t - T0_t * u0_s)   * tstep * factor(var_T,17)&
                              + (GAMMA-1.) * v * E_ion * BigR**2 * (rimp0_s * u0_t - rimp0_t * u0_s)          * tstep * factor(var_T,17)&

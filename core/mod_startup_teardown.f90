@@ -107,6 +107,46 @@ subroutine initialise(my_id, n_mpi, skip_help)
 end subroutine initialise
 
 
+!> Ensure that the prescribed density is compatible with a model that does not evolve density.
+subroutine check_flat_density_profile(my_id)
+  use phys_module, only: LOWER_XPOINT
+
+  integer, intent(in) :: my_id
+  integer, parameter :: n_profile_points = 201
+  real*8, parameter :: tolerance = 1.d-5
+
+  integer :: i, ierr
+  real*8 :: density_profile, derivatives(8), psi_n
+  real*8 :: max_deviation, psi_n_max_deviation
+
+  max_deviation = 0.d0
+  psi_n_max_deviation = 0.d0
+
+  do i = 1, n_profile_points
+    psi_n = 1.5d0 * dble(i-1) / dble(n_profile_points-1)
+    call density(.false., LOWER_XPOINT, 0.d0, (/0.d0, 0.d0/), psi_n, 0.d0, 1.d0, density_profile, &
+                 derivatives(1), derivatives(2), derivatives(3), derivatives(4), &
+                 derivatives(5), derivatives(6), derivatives(7), derivatives(8))
+
+    if (abs(density_profile - 1.d0) .gt. max_deviation) then
+      max_deviation = abs(density_profile - 1.d0)
+      psi_n_max_deviation = psi_n
+    endif
+  enddo
+
+  if (max_deviation .le. tolerance) return
+
+  if (my_id .eq. 0) then
+    write(*,*) 'ERROR:'
+    write(*,*) '  with_rho = .false. requires density() to return a flat profile of 1.'
+    write(*,*) '  Maximum deviation from 1: ', max_deviation
+    write(*,*) '  At normalized flux coordinate: ', psi_n_max_deviation
+  endif
+  call MPI_FINALIZE(ierr)
+  stop
+end subroutine check_flat_density_profile
+
+
 
 !> Verify that we are not doing stupid things. Run this after loading parameters
 !> from the input file.
@@ -120,6 +160,9 @@ subroutine sanity_checks(my_id, n_mpi, mpi_required, mpi_provided)
   integer :: nsolvers=0
   logical :: solvers(4), solvers_eq(3)
   integer :: mpi_required, mpi_provided
+
+  ! Check for a non-flat density profile when density is not evolved
+  if (.not. with_rho) call check_flat_density_profile(my_id)
 
   ! WARNING for axis treatment
   if(treat_axis .and. (fix_axis_nodes .or. force_central_node))then

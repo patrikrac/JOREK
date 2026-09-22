@@ -82,6 +82,9 @@ integer                       :: n_nodes, n_tri_wet, i_count
 real*8, allocatable           :: result(:,:,:,:), iangle(:,:), l_part(:), q_heat_perp_3d(:), field_wall_angle(:)
 real*8                        :: BR, BZ, Btor, Btot, Jpar, qpar, s_bnd
 logical                       :: s_const
+
+  ! --- Ensure that aux_node_list is associated
+if (.not. associated(aux_node_list)) allocate(aux_node_list)
  
 ! --- Read wall for collisions with octree
 max_depth = 6

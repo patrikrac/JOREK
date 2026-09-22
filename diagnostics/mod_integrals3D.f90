@@ -118,7 +118,7 @@ real*8  :: psi_as_coord
 real*8  :: AR0, AR0_p, AR0_s, AR0_t, AR0_sp, AR0_tp, AR0_Rp, AZ0, AZ0_p, AZ0_s, AZ0_t, AZ0_sp, AZ0_tp, AZ0_Zp, A30
 real*8  :: A30_p, A30_s, A30_t, A30_ss, A30_tt, A30_st, A30_R, A30_RR, A30_ZZ
 real*8  :: BR_Z, BZ_R
-real*8  :: r0_corr, T0_corr, Te0_corr, Ti0_corr, dTe0_corr_dT, T_or_Te, T_or_Te_corr, T_or_Te_0  
+real*8  :: r0_corr, T0_corr, Te0_corr, Ti0_corr, dTe0_corr_dT, T_or_Te, T_or_Te_corr, T_or_Te_0, r0_s, r0_t, r0_p  
 real*8  :: density_tot, density_in, density_out,  pressure, pressure_in, pressure_out, mag_pressure, mag_pressure_in, mag_pressure_out
 real*8  :: pressure_e, pressure_e_in, pressure_e_out, pressure_i, pressure_i_in, pressure_i_out
 real*8  :: current_in, current_out, D_int, D_ext, P_ext, mag_pres_ext, C_ext, delta_phi, phi, P_tot, mag_pres_tot, D_tot
@@ -487,12 +487,12 @@ Tie_min_neg = 0.5*T_min_neg
 #endif
 !$omp          T_1, T_max_eta, T_max_eta_ohm, eta_T_dependent,                                                & 
 !$omp          wgauss_copy, varmin, varmax)                                                                   &
-!$omp   private(ife,iv,inode,element,i,j, k,in, mp, ms, mt,                                                   &
+!$omp   private(ife,iv,inode,element,i,j, k,in, mp, ms, mt,                                             &
 !$omp           x_g, y_g, x_s, y_s, x_t, y_t, x_p, y_p, xjac, xjac_R, xjac_Z, eq_g, eq_s, eq_t, eq_p,         &
 !$omp           x_ss, x_tt, x_st, y_ss, y_tt, y_st, eq_ss, eq_tt, eq_st, eq_sp, eq_tp,                        &
-!$omp           eq_spp, eq_tpp, psi_axisym,s_norm, stel_current_source,eq_s_3d, eq_t_3d, wst, BigR,           &
-!$omp           r0, T0, Te0, zj0, ps0, dTdx, dTdy, drhodx, drhody, dpsidx, dpsidy, dpsidp, dudx, dudy,dudp,   &
-!$omp           dpsidx_3d, dpsidy_3d, saw_ene_dens, BB2_zero,                                                 &
+!$omp           eq_spp, eq_tpp, psi_axisym,s_norm, stel_current_source,eq_s_3d, eq_t_3d,                      &
+!$omp           wst, BigR, r0, T0, Te0, zj0, ps0, dTdx, dTdy, drhodx, drhody, dpsidx, dpsidy, dpsidp, dudx, dudy,dudp,  &
+!$omp           dpsidx_3d, dpsidy_3d, saw_ene_dens, BB2_zero, r0_s, r0_t, r0_p,                               &
 !$omp           w0, dwdx, dwdy, u0_xpp, u0_ypp, visco_T, visco_fact_old, visco_fact_new,                      &
 !$omp           dpdx, dpdy, phi, Ti0, psi_as_coord, vprp_disp,                                                &
 !$omp           source_pellet, source_volume, eq_zne, eq_zTe, vpar0, BB2, chi, Bv2,                           &
@@ -732,8 +732,19 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         Bv2 = chi(1,0,0)**2 + chi(0,1,0)**2 + chi(0,0,1)**2/BigR**2
 #endif
 
-        r0     = eq_g(mp,var_rho,ms,mt)
-        r0_corr = corr_neg_dens(r0)
+        if (with_rho) then
+          r0      = eq_g(mp,var_rho,ms,mt)
+          r0_corr = corr_neg_dens(r0)
+          r0_s    = eq_s(mp,var_rho,ms,mt)
+          r0_t    = eq_t(mp,var_rho,ms,mt)
+          r0_p    = eq_p(mp,var_rho,ms,mt)
+        else
+          r0      = 1.d0
+          r0_corr = 1.d0
+          r0_s    = 0.d0
+          r0_t    = 0.d0
+          r0_p    = 0.d0
+        endif
 #ifdef WITH_TiTe
         Ti0    = eq_g(mp,var_Ti,ms,mt)
         Te0    = eq_g(mp,var_Te,ms,mt)
@@ -837,8 +848,8 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         ! Some of these do not seem to be doing anything so I'm commenting them off !
         !dTdx   = (   y_t(mp,ms,mt) * eq_s(mp,var_T,ms,mt) - y_s(mp,ms,mt) * eq_t(mp,var_T,ms,mt) ) / xjac
         !dTdy   = ( - x_t(mp,ms,mt) * eq_s(mp,var_T,ms,mt) + x_s(mp,ms,mt) * eq_t(mp,var_T,ms,mt) ) / xjac
-        !drhodx = (   y_t(mp,ms,mt) * eq_s(mp,var_rho,ms,mt) - y_s(mp,ms,mt) * eq_t(mp,var_rho,ms,mt) ) / xjac
-        !drhody = ( - x_t(mp,ms,mt) * eq_s(mp,var_rho,ms,mt) + x_s(mp,ms,mt) * eq_t(mp,var_rho,ms,mt) ) / xjac
+        !drhodx = (   y_t(mp,ms,mt) * r0_s - y_s(mp,ms,mt) * r0_t ) / xjac
+        !drhody = ( - x_t(mp,ms,mt) * r0_s + x_s(mp,ms,mt) * r0_t ) / xjac
 
         dpsidx = (   y_t(mp,ms,mt) * eq_s(mp,var_psi,ms,mt) - y_s(mp,ms,mt) * eq_t(mp,var_psi,ms,mt) ) / xjac
         dpsidy = ( - x_t(mp,ms,mt) * eq_s(mp,var_psi,ms,mt) + x_s(mp,ms,mt) * eq_t(mp,var_psi,ms,mt) ) / xjac
@@ -1203,28 +1214,28 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         P_tot   = P_e_tot + P_i_tot
 
         p0_s   = (r0+alpha_i*rimp0)*eq_s(mp,var_Ti,ms,mt) &
-                 + Ti0 * (eq_s(mp,var_rho,ms,mt)+alpha_i*eq_s(mp,var_rhoimp,ms,mt))&
+                 + Ti0 * (r0_s+alpha_i*eq_s(mp,var_rhoimp,ms,mt))&
                  + (r0+alpha_e*rimp0+dalpha_e_dT*rimp0*Te0)*eq_s(mp,var_Te,ms,mt)&
-                 + Te0 * (eq_s(mp,var_rho,ms,mt)+alpha_e*eq_s(mp,var_rhoimp,ms,mt))
+                 + Te0 * (r0_s+alpha_e*eq_s(mp,var_rhoimp,ms,mt))
         p0_t   = (r0+alpha_i*rimp0)*eq_t(mp,var_Ti,ms,mt) &
-                 + Ti0 * (eq_t(mp,var_rho,ms,mt)+alpha_i*eq_t(mp,var_rhoimp,ms,mt))&
+                 + Ti0 * (r0_t+alpha_i*eq_t(mp,var_rhoimp,ms,mt))&
                  + (r0+alpha_e*rimp0+dalpha_e_dT*rimp0*Te0)*eq_t(mp,var_Te,ms,mt)&
-                 + Te0 * (eq_t(mp,var_rho,ms,mt)+alpha_e*eq_t(mp,var_rhoimp,ms,mt))
+                 + Te0 * (r0_t+alpha_e*eq_t(mp,var_rhoimp,ms,mt))
         p0_p   = (r0+alpha_i*rimp0)*eq_p(mp,var_Ti,ms,mt) &
-                 + Ti0 * (eq_p(mp,var_rho,ms,mt)+alpha_i*eq_p(mp,var_rhoimp,ms,mt))&
+                 + Ti0 * (r0_p+alpha_i*eq_p(mp,var_rhoimp,ms,mt))&
                  + (r0+alpha_e*rimp0+dalpha_e_dT*rimp0*Te0)*eq_p(mp,var_Te,ms,mt)&
-                 + Te0 * (eq_p(mp,var_rho,ms,mt)+alpha_e*eq_p(mp,var_rhoimp,ms,mt))
+                 + Te0 * (r0_p+alpha_e*eq_p(mp,var_rhoimp,ms,mt))
 #else /* WITH_TiTe */
         P_tot  = P_tot  + (r0+alpha_imp*rimp0) * T0 * xjac * BigR * wst * delta_phi
         P_e_tot = P_tot / 2.
         P_i_tot = P_e_tot
 
         p0_s   = (r0+alpha_imp*rimp0+dalpha_imp_dT*rimp0*T0)*eq_s(mp,var_T,ms,mt) &
-                 + T0 * (eq_s(mp,var_rho,ms,mt)+alpha_imp*eq_s(mp,var_rhoimp,ms,mt))
+                 + T0 * (r0_s+alpha_imp*eq_s(mp,var_rhoimp,ms,mt))
         p0_t   = (r0+alpha_imp*rimp0+dalpha_imp_dT*rimp0*T0)*eq_t(mp,var_T,ms,mt) &
-                 + T0 * (eq_t(mp,var_rho,ms,mt)+alpha_imp*eq_t(mp,var_rhoimp,ms,mt))
+                 + T0 * (r0_t+alpha_imp*eq_t(mp,var_rhoimp,ms,mt))
         p0_p   = (r0+alpha_imp*rimp0+dalpha_imp_dT*rimp0*T0)*eq_p(mp,var_T,ms,mt) &
-                 + T0 * (eq_p(mp,var_rho,ms,mt)+alpha_imp*eq_p(mp,var_rhoimp,ms,mt))
+                 + T0 * (r0_p+alpha_imp*eq_p(mp,var_rhoimp,ms,mt))
 #endif /* WITH_TiTe */
 #else /* WITH_Impurities */
         D_tot  = D_tot  + r0       * xjac * BigR * wst * delta_phi
@@ -1233,21 +1244,21 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         P_i_tot = P_i_tot + r0 * Ti0 * xjac * BigR * wst * delta_phi
         P_tot   = P_e_tot + P_i_tot
 
-        p0_s   = r0*eq_s(mp,var_Te,ms,mt) + Te0 * eq_s(mp,var_rho,ms,mt) &
-                 +r0*eq_s(mp,var_Ti,ms,mt) + Ti0 * eq_s(mp,var_rho,ms,mt)
-        p0_t   = r0*eq_t(mp,var_Te,ms,mt) + Te0 * eq_t(mp,var_rho,ms,mt) &
-                 +r0*eq_t(mp,var_Ti,ms,mt) + Ti0 * eq_t(mp,var_rho,ms,mt)
-        p0_p   = r0*eq_p(mp,var_Te,ms,mt) + Te0 * eq_p(mp,var_rho,ms,mt) &
-                 +r0*eq_p(mp,var_Ti,ms,mt) + Ti0 * eq_p(mp,var_rho,ms,mt)
+        p0_s   = r0*eq_s(mp,var_Te,ms,mt) + Te0 * r0_s &
+                 +r0*eq_s(mp,var_Ti,ms,mt) + Ti0 * r0_s
+        p0_t   = r0*eq_t(mp,var_Te,ms,mt) + Te0 * r0_t &
+                 +r0*eq_t(mp,var_Ti,ms,mt) + Ti0 * r0_t
+        p0_p   = r0*eq_p(mp,var_Te,ms,mt) + Te0 * r0_p &
+                 +r0*eq_p(mp,var_Ti,ms,mt) + Ti0 * r0_p
 #else /* WITH_TiTe */
 
         P_tot  = P_tot  + r0 * T0 * xjac * BigR * wst * delta_phi
         P_e_tot = P_tot / 2.
         P_i_tot = P_e_tot
 
-        p0_s   = r0*eq_s(mp,var_T,ms,mt) + T0 * eq_s(mp,var_rho,ms,mt) 
-        p0_t   = r0*eq_t(mp,var_T,ms,mt) + T0 * eq_t(mp,var_rho,ms,mt) 
-        p0_p   = r0*eq_p(mp,var_T,ms,mt) + T0 * eq_p(mp,var_rho,ms,mt) 
+        p0_s   = r0*eq_s(mp,var_T,ms,mt) + T0 * r0_s 
+        p0_t   = r0*eq_t(mp,var_T,ms,mt) + T0 * r0_t 
+        p0_p   = r0*eq_p(mp,var_T,ms,mt) + T0 * r0_p 
 #endif /* WITH_TiTe */
 #endif /* WITH_Impurities */
 
@@ -1750,8 +1761,13 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
       ps0_sbnd = eq_s_1D(mp,var_psi ,ms)
       u0_sbnd  = eq_s_1D(mp,var_u   ,ms)
       zj0      = eq_g_1D(mp,var_Zj  ,ms) 
-      r0       = eq_g_1D(mp,var_rho ,ms) 
-      r0_corr  = corr_neg_dens(r0)
+      if (with_rho) then
+        r0       = eq_g_1D(mp,var_rho ,ms) 
+        r0_corr  = corr_neg_dens(r0)
+      else 
+        r0       = 1.d0
+        r0_corr  = 1.d0
+      endif
       T0       = eq_g_1D(mp,var_T   ,ms) 
 #ifdef WITH_TiTe
       Ti0      = eq_g_1D(mp,var_Ti,ms)
@@ -1832,9 +1848,14 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
           u_p = 0.d0
         end if
 
-        call interp(node_list,element_list,m_elm,var_rho,in,sg,tg,RH,RH_s,RH_t,RH_st,RH_ss,RH_tt)
-        rho_s = rho_s + RH_s * HZ(in,mp)
-        rho_t = rho_t + RH_t * HZ(in,mp)
+        if (with_rho) then
+          call interp(node_list,element_list,m_elm,var_rho,in,sg,tg,RH,RH_s,RH_t,RH_st,RH_ss,RH_tt)
+          rho_s = rho_s + RH_s * HZ(in,mp)
+          rho_t = rho_t + RH_t * HZ(in,mp)
+        else
+          rho_s = 0.d0
+          rho_t = 0.d0
+        endif
 
 #ifdef WITH_TiTe
         call interp(node_list,element_list,m_elm,var_Ti,in,sg,tg,TT,TT_s,TT_t,TT_st,TT_ss,TT_tt)

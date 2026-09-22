@@ -202,6 +202,10 @@ ifeq (.true., $(shell ./util/config.sh -p with_neutrals))
   DEFINES  := $(DEFINES) -DWITH_Neutrals
 endif
 
+ifeq (.true., $(shell ./util/config.sh -p with_rho))
+  DEFINES  := $(DEFINES) -DWITH_Rho
+endif
+
 ifeq (.true., $(shell ./util/config.sh -p with_impurities))
   DEFINES  := $(DEFINES) -DWITH_Impurities
 endif

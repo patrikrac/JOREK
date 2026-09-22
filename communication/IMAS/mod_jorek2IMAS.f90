@@ -197,7 +197,7 @@ module mod_jorek2IMAS
       endif
   
       ! --- Mass density
-      if (variable_names(i) == 'rho') then      
+      if ((variable_names(i) == 'rho') .and. with_rho) then      
         allocate( plasma_profiles_ids%ggd(i_slice)%mass_density(n_grid_sub))
         ggd_scalar => plasma_profiles_ids%ggd(i_slice)%mass_density(grid_sub_ind)
         call fill_Bezier_coefficients( ggd_scalar, node_list, var_rho, grid_ind, grid_sub_ind, fact_rho )

@@ -72,7 +72,7 @@ write(*,*) '*****************************************'
 
 n_flux = n_grids(1)
 n_tht  = n_grids(2)
-if (n_tht .eq. 0) n_tht = n_pol
+if (include_axis .and. (n_tht .eq. 0)) n_tht = n_pol
 
 
 !-------------------------------------------------------------------------------------------!
@@ -362,15 +362,19 @@ if (include_xpoint) then
     node_list%n_nodes = 8+n_tht-2
     node_list%node(1:node_list%n_nodes) = newnode_list%node(1:node_list%n_nodes)
   endif
-else
+elseif (include_axis) then
   node_list%n_nodes = n_tht
   node_list%node(1:node_list%n_nodes) = newnode_list%node(1:node_list%n_nodes)
+else
+  node_list%n_nodes = 0
 endif
+
 do i_elm1 = 1,element_list%n_elements
   do i_vertex1 = 1,n_vertex_max
     i_node1 = newelement_list%element(i_elm1)%vertex(i_vertex1)
     if ( (i_node1 .le. 8+n_tht-2) .and. (xcase .eq. DOUBLE_NULL) .and. (include_xpoint) ) cycle
     if ( (i_node1 .le. 4+n_tht-1) .and. (xcase .ne. DOUBLE_NULL) .and. (include_xpoint) ) cycle
+    if ( (i_node1 .le. n_tht) .and. include_axis .and. (.not. include_xpoint) ) cycle
     i_node_save = 0
     do i_elm2 = 1,i_elm1-1
       do i_vertex2 = 1,n_vertex_max

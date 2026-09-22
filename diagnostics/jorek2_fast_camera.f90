@@ -786,8 +786,12 @@ program jorek2_fast_camera
           do i_tor=1,n_tor
             call interp(node_list,element_list,i_elm,var_psi,i_tor,ss,tt,P,P_s,P_t,P_st,P_ss,P_tt)
             psi = psi + P * HZ_tor(i_tor)
-            call interp(node_list,element_list,i_elm,var_rho,i_tor,ss,tt,P,P_s,P_t,P_st,P_ss,P_tt)
-            rho = rho + P * HZ_tor(i_tor)
+            if (with_rho) then
+              call interp(node_list,element_list,i_elm,var_rho,i_tor,ss,tt,P,P_s,P_t,P_st,P_ss,P_tt)
+              rho = rho + P * HZ_tor(i_tor)
+            else 
+              rho = 1.d0
+            endif
             if ( with_TiTe ) then
               call interp(node_list,element_list,i_elm,var_Te,i_tor,ss,tt,P,P_s,P_t,P_st,P_ss,P_tt)
               Te  = Te  + 0.5 * P * HZ_tor(i_tor)

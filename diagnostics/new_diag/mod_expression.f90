@@ -586,7 +586,7 @@ module mod_expression
     type(type_element)       :: element
     type(type_node)          :: nodes(n_vertex_max)
     type(type_node)          :: aux_nodes(n_vertex_max)
-    integer :: ipolpos, jpolpos, itorpos, iexpr, ielm, i, j, k, i_tor, n
+    integer :: ipolpos, jpolpos, itorpos, iexpr, ielm, i, j, k, i_tor, n, n_aux
     real*8  :: xjac, xjac_R, xjac_Z, R, R_s, R_t, R_st, R_ss, R_tt, Z, Z_s, Z_t, Z_st, Z_ss, Z_tt, &
       s, t, H(n_vertex_max,n_degrees), H_s(n_vertex_max,n_degrees), H_t(n_vertex_max,n_degrees),   &
       H_st(n_vertex_max,n_degrees), H_ss(n_vertex_max,n_degrees), H_tt(n_vertex_max,n_degrees),    &
@@ -851,11 +851,15 @@ module mod_expression
                 hhz    = HZ   (i_tor)
                 hhz_p  = HZ_p (i_tor)
                 hhz_pp = HZ_pp(i_tor)
-                vv(:)  = 0.d0
-                vv(1:n_var)  = nodes(i)%values(i_tor,j,:)
-		            va(:)  = 0.d0
-              if(export_aux_node_list .and. allocated(aux_node_list%node)) then
-                   va(1:n_var)  = aux_nodes(i)%values(i_tor,j,:)
+                vv(:) = 0.d0
+                vv(1:n_var) = nodes(i)%values(i_tor,j,:)
+                va(:) = 0.d0
+                n_aux = 0
+                if (export_aux_node_list .and. allocated(aux_node_list%node)) then
+                  if (allocated(aux_nodes(i)%values)) then
+                    n_aux = min(n_var, size(aux_nodes(i)%values, 3))
+                    if (n_aux > 0) va(1:n_aux) = aux_nodes(i)%values(i_tor,j,1:n_aux)
+                  endif
                 endif
                 
                 ! --- Poloidal Flux
@@ -969,8 +973,8 @@ module mod_expression
                 rimp0_pp  = rimp0_pp    + vv(var_rhoimp) * sz * hh    * hhz_pp
 
                 ! --- Particle projections
-                do n = 1, n_var
-                   aux(n) = aux(n) + va(n) * sz * hh    * hhz
+                do n = 1, n_aux
+                  aux(n) = aux(n) + va(n) * sz * hh * hhz
                 end do
 
                 ! --- AR
@@ -1020,6 +1024,17 @@ module mod_expression
               end do
             end do
           end do
+
+          if (.not. with_rho) then
+            r0       = 1.d0
+            r0_s     = 0.d0
+            r0_t     = 0.d0
+            r0_ss    = 0.d0
+            r0_tt    = 0.d0
+            r0_st    = 0.d0
+            r0_p     = 0.d0
+            r0_pp    = 0.d0
+          endif
           
           ! --- Construct Cartesian Derivatives of Variables.
           ps0_R    = (   Z_t * ps0_s - Z_s * ps0_t ) / xjac

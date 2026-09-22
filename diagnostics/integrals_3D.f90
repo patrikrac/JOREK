@@ -292,8 +292,13 @@ do ife = ife_min, ife_max
         xjac = x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
         BigR = x_g(ms,mt)
 
-        r0      = eq_g(mp,var_rho,ms,mt)
-        r0_corr = corr_neg_dens1(r0)
+        if (with_rho) then
+          r0      = eq_g(mp,var_rho,ms,mt)
+          r0_corr = corr_neg_dens1(r0)
+        else
+          r0      = 1.d0
+          r0_corr = 1.d0
+        endif
 #ifdef WITH_TiTe
         T0      = eq_g(mp,var_Ti,ms,mt)
         T0_corr = corr_neg_temp1(T0)
