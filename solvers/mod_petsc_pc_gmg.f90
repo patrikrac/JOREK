@@ -254,7 +254,7 @@ module mod_petsc_pc_gmg
   ! -log_view events (Workstream D cost audit). Registered here, not in the
   ! physics-PC ctx, so this module keeps no dependency on it.
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1, gev_axislu = -1
-  PetscLogEvent, save :: gev_axis = -1
+  PetscLogEvent, save :: gev_axis = -1, gev_prolong = -1
   ! Workstream G, finding D3: these are per INSTANCE, like gev_vcycle. While
   ! they were shared, no -log_view number could attribute line or axis time to
   ! pair_w rather than to Shat / rho / T, which is what left C1's rank soft.
@@ -808,6 +808,8 @@ contains
 
     ok = .false.
     gcomm = comm; gme = my_id
+    call gmg_register_events()
+    call PetscLogEventBegin(gev_prolong, ierr)
     if (present(opts)) then
       gopt = opts
     else
@@ -1064,14 +1066,7 @@ contains
           ar(na) = dt / max(dr, 1.d-300)        ! > 1: cell long in theta
         enddo
       enddo
-      do ii = 2, na                              ! insertion sort, na ~ 1e3-1e4
-        tmp = ar(ii); kk = ii - 1
-        do while (kk >= 1)
-          if (ar(kk) <= tmp) exit
-          ar(kk + 1) = ar(kk); kk = kk - 1
-        enddo
-        ar(kk + 1) = tmp
-      enddo
+      call sort_real(ar(1:na))                   ! na = (n_flux-2) n_tht cells
       if (my_id == 0) write(*,'(A,F8.2,A,F8.2,A,F8.2)') &
         "[Physics PC]   GMG grid cells, rdtheta/dr: median ", ar((na + 1) / 2), &
         ", max ", ar(na), ", min ", ar(1)
@@ -1091,14 +1086,7 @@ contains
             xc = node_list%node(ii * n_tht + mod(jj + 1, n_tht) + 1)%x(1, 1, 1:2)
             row(jj + 1) = norm2(xc - xa) / max(norm2(xb - xa), 1.d-300)
           enddo
-          do jj = 2, n_tht
-            tmp = row(jj); kk = jj - 1
-            do while (kk >= 1)
-              if (row(kk) <= tmp) exit
-              row(kk + 1) = row(kk); kk = kk - 1
-            enddo
-            row(kk + 1) = tmp
-          enddo
+          call sort_real(row)
           rm(ii) = row((n_tht + 1) / 2)
         enddo
         ring_is = n_flux - 1
@@ -1130,12 +1118,14 @@ contains
     endif
     p_ready = .true.
     ok = .true.
+    call PetscLogEventEnd(gev_prolong, ierr)
 
   contains
 
     subroutine fail(msg)
       character(len=*), intent(in) :: msg
       if (my_id == 0) write(*,'(A,A)') "[Physics PC]   GMG hierarchy REFUSED: ", msg
+      call PetscLogEventEnd(gev_prolong, ierr)
     end subroutine fail
 
     !> Packed global row of (field f, scalar DOF d, slot m) on layout level L.
@@ -1630,6 +1620,7 @@ contains
     PetscClassId, parameter :: cid = 0
     if (gev_ready) return
     call PetscLogEventRegister("GMG_PtAP",     cid, gev_ptap,     ierr)
+    call PetscLogEventRegister("GMG_Prolong",  cid, gev_prolong,  ierr)
     call PetscLogEventRegister("GMG_SmSetup",  cid, gev_smsetup,  ierr)
     call PetscLogEventRegister("GMG_CoarseLU", cid, gev_coarselu, ierr)
     call PetscLogEventRegister("GMG_AxisLU",   cid, gev_axislu,   ierr)
@@ -1804,14 +1795,7 @@ contains
       enddo
       ! stable sort of each block's rows by key (line coordinate), then positions
       do bb = 1, B%nb
-        do q = 2, B%sz(bb)
-          tmp = B%rows(B%off(bb) + q); kk = q - 1
-          do while (kk >= 1)
-            if (key(B%rows(B%off(bb) + kk) + 1) <= key(tmp + 1)) exit
-            B%rows(B%off(bb) + kk + 1) = B%rows(B%off(bb) + kk); kk = kk - 1
-          enddo
-          B%rows(B%off(bb) + kk + 1) = tmp
-        enddo
+        call sort_rows_by_key(B%rows(B%off(bb) + 1:B%off(bb) + B%sz(bb)), key)
         do q = 1, B%sz(bb)
           B%pos(B%rows(B%off(bb) + q) + 1) = q
         enddo
@@ -2463,6 +2447,77 @@ contains
       gb = gb(perm); gI = gI(perm)
     end subroutine sort_ghosts
   end subroutine ovl_extend
+
+  !> In-place ascending heapsort, O(n log n) (the setup's medians; an
+  !! insertion sort there was O(n^2) in the cell count).
+  subroutine sort_real(a)
+    real*8, intent(inout) :: a(:)
+    integer :: n, i, e
+    real*8  :: t
+    n = size(a)
+    do i = n / 2, 1, -1
+      call sift(i, n)
+    enddo
+    do e = n, 2, -1
+      t = a(1); a(1) = a(e); a(e) = t
+      call sift(1, e - 1)
+    enddo
+  contains
+    subroutine sift(i0, m)
+      integer, intent(in) :: i0, m
+      integer :: r, c
+      real*8  :: v
+      r = i0; v = a(r)
+      do
+        c = 2 * r
+        if (c > m) exit
+        if (c < m) then
+          if (a(c + 1) > a(c)) c = c + 1
+        endif
+        if (a(c) <= v) exit
+        a(r) = a(c); r = c
+      enddo
+      a(r) = v
+    end subroutine sift
+  end subroutine sort_real
+
+  !> Stable sort of the 0-based rows r(:) by key(r + 1): a bottom-up merge
+  !! sort, O(n log n) (a radial line has n_flux x 4 x fields rows; the
+  !! insertion sort it replaces was O(n^2) per line).
+  subroutine sort_rows_by_key(r, key)
+    integer, intent(inout) :: r(:)
+    integer, intent(in)    :: key(:)
+    integer, allocatable :: t(:)
+    integer :: n, w, lo, mid, hi, i, j, k
+    n = size(r)
+    if (n < 2) return
+    allocate(t(n))
+    w = 1
+    do while (w < n)
+      lo = 1
+      do while (lo <= n)
+        mid = min(lo + w - 1, n); hi = min(lo + 2 * w - 1, n)
+        i = lo; j = mid + 1; k = lo
+        do while (i <= mid .and. j <= hi)
+          if (key(r(j) + 1) < key(r(i) + 1)) then
+            t(k) = r(j); j = j + 1
+          else
+            t(k) = r(i); i = i + 1
+          endif
+          k = k + 1
+        enddo
+        do while (i <= mid)
+          t(k) = r(i); i = i + 1; k = k + 1
+        enddo
+        do while (j <= hi)
+          t(k) = r(j); j = j + 1; k = k + 1
+        enddo
+        lo = lo + 2 * w
+      enddo
+      r = t
+      w = 2 * w
+    enddo
+  end subroutine sort_rows_by_key
 
   !> x = A^-1 x for one right-hand side, A = the dgbtrf factors in LAPACK band
   !! storage (ldab = 2 kl + ku + 1, pivots ipiv): dgbtrs('N') written out.
