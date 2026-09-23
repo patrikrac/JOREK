@@ -3,8 +3,8 @@ module mod_petsc_pc_sf_solver
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: g_ctx, physics_pc_mumps_mem, pcev_psipc
-  use mod_petsc_pc_blocks,      only: pc_print_block_setup, report_operator_density
+  use mod_petsc_pc_physics_ctx, only: physics_pc_mumps_mem
+  use mod_petsc_pc_blocks,      only: pc_print_block_setup
   implicit none
   private
 
@@ -13,47 +13,39 @@ module mod_petsc_pc_sf_solver
   !!
   !! Every diagonal block of the LDU sweep is solved through ONE type, so
   !! "which solver does this block use" is a value rather than a code path.
-  !! That is what makes extending the M blocks to multigrid a configuration
-  !! change later: pick a different backend for that block, nothing else moves.
   !!
-  !! Backends
+  !! Backends -- exactly two, by design: one production method and the exact
+  !! reference it is gated against.
   !! --------
-  !!   SF_LU        PREONLY + LU (MUMPS). The reference, and the only backend
-  !!                that is exact.
-  !!   SF_GMG       FGMRES + PCSHELL on one V-cycle of the C1 geometric
-  !!                multigrid (mod_petsc_pc_gmg), hierarchy instance gmg_inst.
-  !!                On a packed pair (nfields = 2) the smoother's blocks hold
-  !!                both fields, so the pair is smoothed collectively rather
-  !!                than split.
-  !!   SF_ETASCHUR  pair_psi only: one application of the j-first lower block
-  !!                factorisation with the eta-scaled Schur approximation
+  !!   SF_GMG  FGMRES + PCSHELL on one V-cycle of the C1 geometric multigrid
+  !!           (mod_petsc_pc_gmg), hierarchy instance gmg_inst. On a packed
+  !!           pair (nfields = 2) the smoother's blocks hold both fields, so
+  !!           the pair is smoothed collectively rather than split.
+  !!   SF_LU   PREONLY + LU (MUMPS). The reference, and the only exact one.
   !!
-  !!                  z_j   = B_33^-1 r_j
-  !!                  z_psi = Shat^-1 (r_psi - B_13 z_j),
-  !!                  Shat  = B_11 - diag(B_13/B_33) B_31,
-  !!
-  !!                optionally wrapped in FGMRES on the raw pair. Shat is
-  !!                itself a block_solver_t, so LU-on-Shat and GMG-on-Shat are
-  !!                the same two backend values rather than two special cases.
-  !!                Requires eta_num = 0: with hyper-resistivity B_13 gains
-  !!                eta_num K_1, whose diagonal dominates the row ratio, and
-  !!                the true correction is a discrete biharmonic that no row
-  !!                scaling represents (workstream C S3.6).
-  !!
-  !! The GMG smoother, axis-ring extent and boundary-drop are compile-time
-  !! constants below rather than namelist entries. They are the values the
-  !! workstream D/G measurements were taken at; the production path does not
-  !! offer them as knobs.
+  !! The GMG smoother of each block, the axis-ring extent and the Krylov
+  !! budgets are compile-time constants below rather than namelist entries:
+  !! each is the value a recorded measurement was taken at, and the
+  !! production path does not offer them as knobs.
   !--------------------------------------------------------------------
 
-  integer, parameter, public :: SF_LU       = 1
-  integer, parameter, public :: SF_GMG      = 2
-  integer, parameter, public :: SF_ETASCHUR = 3
+  integer, parameter, public :: SF_LU  = 1
+  integer, parameter, public :: SF_GMG = 2
 
-  !--- Fixed GMG configuration for this path (workstream D S12, G S3) -------
-  integer, parameter, public :: SF_GMG_SMOOTHER   = 5   !< radial-line block Jacobi
+  !--- GMG smoothers (codes of mod_petsc_pc_gmg) ----------------------------
+  !> Collective radial-line block Jacobi: pair_w, rho, T. Workstream D S12:
+  !! the winner on pair_w; workstream H: at least as good as the point and
+  !! node smoothers on rho and T at 41x64 and tstep 0.1 / 1 / 10.
+  integer, parameter, public :: SF_GMG_SMOOTHER_LINES = 5
+  !> Zebra (red-black) radial-line block Gauss-Seidel on the split (psi, j)
+  !! pair: Chacon's collective smoothing of the split system (JCP 526 (2025)
+  !! S4.1) extended along lines, because on C1 Hermite elements a per-node
+  !! block does not dominate the operator (node blocks: 10-21 cycles and
+  !! capped; point Jacobi: diverges). Workstream H: half the V-cycles of
+  !! SF_GMG_SMOOTHER_LINES on pair_psi (3.3 -> 2.0) at unchanged outer counts.
+  integer, parameter, public :: SF_GMG_SMOOTHER_ZEBRA = 7
   integer, parameter, public :: SF_GMG_AXIS_RINGS = 3   !< rings folded into the axis block
-  integer, parameter, public :: SF_GMG_NSMOOTH    = 0   !< 0 = the smoother's own default
+  integer, parameter, public :: SF_GMG_NSMOOTH    = 0   !< 0 = the smoother's own default (4)
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (physics_pc_pair_maxits = 30 for the packed pairs, physics_pc_rhot_gmg =
@@ -75,17 +67,7 @@ module mod_petsc_pc_sf_solver
 
   public :: sf_solver_setup, sf_solver_apply, sf_solver_destroy
   public :: sf_solver_reset_counters, sf_solver_report
-  public :: sf_etaschur_setup, sf_backend_name, sf_split_halves
-
-  !--- SF_ETASCHUR state ---------------------------------------------------
-  ! A PCSHELL callback cannot carry a Fortran-typed context, so the operands
-  ! live here. Only pair_psi uses this backend, so one instance is enough --
-  ! the same reason the research path keeps its psc_* state at module scope.
-  Mat, save  :: es_Shat                    !< B_11 - diag(B_13/B_33) B_31
-  Vec, save  :: es_zpsi, es_zj, es_t, es_rp, es_rj
-  type(block_solver_t), save :: es_Sslv    !< the solver for Shat (LU or GMG)
-  type(block_solver_t), save :: es_Mj      !< the LU of B_33
-  logical, save :: es_ready = .false., es_vecs_ready = .false.
+  public :: sf_backend_name, sf_split_halves
 
 contains
 
@@ -94,10 +76,9 @@ contains
     integer, intent(in) :: backend
     character(len=64)   :: s
     select case (backend)
-    case (SF_LU);       s = "PREONLY + LU (MUMPS)"
-    case (SF_GMG);      s = "FGMRES + SHELL[C1 GMG V-cycle]"
-    case (SF_ETASCHUR); s = "SHELL[j-first eta-scaled Schur]"
-    case default;       s = "UNKNOWN"
+    case (SF_LU);  s = "PREONLY + LU (MUMPS)"
+    case (SF_GMG); s = "FGMRES + SHELL[C1 GMG V-cycle]"
+    case default;  s = "UNKNOWN"
     end select
   end function sf_backend_name
 
@@ -106,7 +87,8 @@ contains
   !! created once and re-pointed at the (refilled, pattern-frozen) operator,
   !! so MUMPS and the GMG both reuse their symbolic phases.
   !--------------------------------------------------------------------
-  subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, maxits, nfields)
+  subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
+                             nfields, smoother, maxits)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4
@@ -115,32 +97,22 @@ contains
     integer, intent(in)          :: backend, comm, my_id
     character(len=*), intent(in) :: label
     real*8, intent(in)           :: rtol
-    integer, intent(in), optional :: gmg_inst
-    integer, intent(in), optional :: maxits   !< SF_GMG only. 0 = PREONLY, i.e.
-                                              !< exactly one V-cycle with no
-                                              !< Krylov around it, which is what
-                                              !< Shat gets inside SF_ETASCHUR.
-    integer, intent(in), optional :: nfields  !< SF_GMG only: fields packed per node
-                                              !< in A -- 2 for the mixed pairs, 1
-                                              !< (default) for a scalar block. The
-                                              !< line and node blocks then hold
-                                              !< every field of the line or node,
-                                              !< i.e. the smoothing is collective.
+    integer, intent(in)          :: gmg_inst  !< SF_GMG: hierarchy instance (1..4)
+    integer, intent(in)          :: nfields   !< SF_GMG: fields packed per node in
+                                              !< A -- 2 for the mixed pairs, 1 for a
+                                              !< scalar block
+    integer, intent(in)          :: smoother  !< SF_GMG: SF_GMG_SMOOTHER_*
+    integer, intent(in)          :: maxits    !< SF_GMG: FGMRES budget
 
     PC :: pc
     PetscErrorCode :: ierr
     logical :: ok, fresh
-    integer :: mits, nf
     character(len=24) :: tstr
 
     fresh        = .not. slv%created
-    mits         = SF_GMG_MAXITS
-    if (present(maxits)) mits = maxits
-    nf           = 1
-    if (present(nfields)) nf = nfields
     slv%backend  = backend
     slv%label    = label
-    if (present(gmg_inst)) slv%gmg_inst = gmg_inst
+    slv%gmg_inst = gmg_inst
 
     select case (backend)
 
@@ -159,7 +131,7 @@ contains
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)
       if (.not. gmg_is_ready()) then
-        call gmg_build_prolongations(A, comm, my_id, nf, ok)
+        call gmg_build_prolongations(A, comm, my_id, nfields, ok)
         if (.not. ok) then
           if (my_id == 0) write(*,'(A,A,A)') &
             "[Physics PC]   FATAL: the GMG backend for ", trim(label), &
@@ -168,7 +140,7 @@ contains
         endif
       endif
       call gmg_setup_operator(A, comm, my_id, tag=trim(label), &
-                              smoother=SF_GMG_SMOOTHER, nsmooth=SF_GMG_NSMOOTH)
+                              smoother=smoother, nsmooth=SF_GMG_NSMOOTH)
       call gmg_select(1)
 
       !--- the Krylov wrapper. Rebuilt rather than re-pointed: the PCSHELL
@@ -176,13 +148,9 @@ contains
       if (.not. fresh) call KSPDestroy(slv%ksp, ierr)
       call KSPCreate(comm, slv%ksp, ierr)
       call KSPSetOperators(slv%ksp, A, A, ierr)
-      if (mits > 0) then
-        call KSPSetType(slv%ksp, KSPFGMRES, ierr)
-        call KSPGMRESSetRestart(slv%ksp, max(mits, 2), ierr)
-        call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, mits, ierr)
-      else
-        call KSPSetType(slv%ksp, KSPPREONLY, ierr)
-      endif
+      call KSPSetType(slv%ksp, KSPFGMRES, ierr)
+      call KSPGMRESSetRestart(slv%ksp, max(maxits, 2), ierr)
+      call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, maxits, ierr)
       call KSPGetPC(slv%ksp, pc, ierr)
       call PCSetType(pc, PCSHELL, ierr)
       select case (slv%gmg_inst)
@@ -193,13 +161,9 @@ contains
       end select
       call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       call KSPSetUp(slv%ksp, ierr)
-      if (mits > 0) then
-        write(tstr,'(ES9.2)') rtol
-        call pc_print_block_setup(comm, label, &
-          trim(sf_backend_name(backend))//", rtol "//trim(adjustl(tstr)))
-      else
-        call pc_print_block_setup(comm, label, "PREONLY + SHELL[one C1 GMG V-cycle]")
-      endif
+      write(tstr,'(ES9.2)') rtol
+      call pc_print_block_setup(comm, label, &
+        trim(sf_backend_name(backend))//", rtol "//trim(adjustl(tstr)))
 
     case default
       if (my_id == 0) write(*,'(A,I0)') &
@@ -258,159 +222,6 @@ contains
     if (slv%scaled) call VecDestroy(slv%dscale, ierr)
     slv%created = .false.; slv%scaled = .false.
   end subroutine sf_solver_destroy
-
-  !--------------------------------------------------------------------
-  !> Build the SF_ETASCHUR shell for pair_psi and point slv at it.
-  !!
-  !! K_pj is the shell KSP's nominal operator: FGMRES(psi_outer > 0) iterates
-  !! on the raw packed pair while the shell supplies the preconditioner. The
-  !! shell reads the UNSCALED g_ctx blocks, so the caller must not block-scale
-  !! K_pj when this backend is selected.
-  !--------------------------------------------------------------------
-  subroutine sf_etaschur_setup(slv, K_pj, shat_backend, comm, my_id, rtol, outer)
-    use phys_module, only: eta_num, tstep
-    type(block_solver_t), intent(inout) :: slv
-    Mat, intent(in)     :: K_pj
-    integer, intent(in) :: shat_backend, comm, my_id
-    real*8, intent(in)  :: rtol
-    integer, intent(in) :: outer          !< FGMRES budget on the pair; 0 = PREONLY
-
-    Vec :: d13, d33
-    Mat :: T31
-    PC  :: pc
-    PetscErrorCode :: ierr
-    PetscScalar, pointer :: a13(:), a33(:)
-    PetscInt :: n, k
-    real*8   :: dmax, emin, emax, ebuf(2), erbuf(2)
-    integer  :: mpierr
-    character(len=24) :: tstr
-
-    if (eta_num /= 0.d0) then
-      ! Not a fallback: refuse rather than mis-measure (workstream C S3.6).
-      if (my_id == 0) write(*,'(A)') &
-        "[Physics PC]   FATAL: the eta-Schur pair_psi backend needs eta_num = 0 "// &
-        "(it is invalid with hyper-resistivity)."
-      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
-    endif
-
-    !--- B_33^-1, exact. Its error re-enters through B_13 ~ dt, so it must be.
-    call sf_solver_setup(es_Mj, g_ctx%B_33, SF_LU, "pair_psi B_33 (1/R mass)", &
-                         comm, my_id, rtol)
-
-    !--- r = diag(B_13)/diag(B_33), zero on rows with no mass (boundary rows)
-    call MatGetLocalSize(g_ctx%B_33, n, PETSC_NULL_INTEGER, ierr)
-    call MatCreateVecs(g_ctx%B_33, d33, PETSC_NULL_VEC, ierr)
-    call VecDuplicate(d33, d13, ierr)
-    call MatGetDiagonal(g_ctx%B_33, d33, ierr)
-    call MatGetDiagonal(g_ctx%B_13, d13, ierr)
-    call VecNorm(d33, NORM_INFINITY, dmax, ierr)
-    call VecGetArray(d13, a13, ierr)
-    call VecGetArrayRead(d33, a33, ierr)
-    emin = huge(1.d0); emax = -huge(1.d0)
-    do k = 1, n
-      if (abs(a33(k)) > 1.d-12 * dmax) then
-        a13(k) = a13(k) / a33(k)
-        emin = min(emin, -a13(k) / tstep); emax = max(emax, -a13(k) / tstep)
-      else
-        a13(k) = 0.d0
-      endif
-    enddo
-    call VecRestoreArrayRead(d33, a33, ierr)
-    call VecRestoreArray(d13, a13, ierr)
-    ebuf = [-emin, emax]
-    call MPI_Allreduce(ebuf, erbuf, 2, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
-    emin = -erbuf(1); emax = erbuf(2)
-
-    !--- Shat = B_11 - diag(r) B_31. es_Shat lives for the run: the first build
-    !--- fixes the union pattern, later builds refill it in place, so the GMG
-    !--- sees the same Mat and reuses its PtAP symbolic phase.
-    call MatDuplicate(g_ctx%B_31, MAT_COPY_VALUES, T31, ierr)
-    call MatDiagonalScale(T31, d13, PETSC_NULL_VEC, ierr)
-    if (es_ready) then
-      call MatZeroEntries(es_Shat, ierr)
-      call MatAXPY(es_Shat, 1.0d0, g_ctx%B_11, SUBSET_NONZERO_PATTERN, ierr)
-      call MatAXPY(es_Shat, -1.0d0, T31, SUBSET_NONZERO_PATTERN, ierr)
-    else
-      call MatDuplicate(g_ctx%B_11, MAT_COPY_VALUES, es_Shat, ierr)
-      call MatAXPY(es_Shat, -1.0d0, T31, DIFFERENT_NONZERO_PATTERN, ierr)
-      call MatSetOption(es_Shat, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
-    endif
-    call MatDestroy(T31, ierr)
-    call VecDestroy(d13, ierr)
-    call VecDestroy(d33, ierr)
-
-    if (my_id == 0) write(*,'(A,ES10.3,A,ES10.3,A)') &
-      "[Physics PC]   pair_psi eta-Schur: theta*eta_T = -r/tstep in [", emin, ", ", emax, "]"
-    if (.not. es_ready) call report_operator_density(es_Shat, "Shat (eta-scaled psi Schur)", my_id)
-
-    if (.not. es_vecs_ready) then
-      call MatCreateVecs(es_Shat, es_zpsi, es_t, ierr)
-      call VecDuplicate(es_zpsi, es_zj, ierr)
-      call VecDuplicate(es_zpsi, es_rp, ierr)
-      call VecDuplicate(es_zpsi, es_rj, ierr)
-      es_vecs_ready = .true.
-    endif
-
-    !--- Shat's own solver: this is the whole point of the abstraction. LU and
-    !--- one GMG V-cycle differ only in this one value.
-    !--- maxits = 0: Shat gets exactly ONE V-cycle, with no Krylov of its own.
-    !--- The Krylov that matters is the FGMRES on the raw pair below; nesting a
-    !--- second one here would change the preconditioner, not just its cost.
-    call sf_solver_setup(es_Sslv, es_Shat, shat_backend, "pair_psi Shat", &
-                         comm, my_id, rtol, gmg_inst=2, maxits=0)
-
-    !--- the pair_psi KSP: FGMRES on the raw pair around the shell. One
-    !--- application of the factorisation alone loses ~10 outer its at tstep 10
-    !--- even with Shat exact, so outer > 0 is the production setting.
-    if (slv%created) call KSPDestroy(slv%ksp, ierr)
-    call KSPCreate(comm, slv%ksp, ierr)
-    call KSPSetOperators(slv%ksp, K_pj, K_pj, ierr)
-    if (outer > 0) then
-      call KSPSetType(slv%ksp, KSPFGMRES, ierr)
-      call KSPGMRESSetRestart(slv%ksp, max(outer, 2), ierr)
-      call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, outer, ierr)
-    else
-      call KSPSetType(slv%ksp, KSPPREONLY, ierr)
-    endif
-    call KSPGetPC(slv%ksp, pc, ierr)
-    call PCSetType(pc, PCSHELL, ierr)
-    call PCShellSetApply(pc, es_apply, ierr)
-    call PCShellSetName(pc, "pair_psi eta-scaled j-first Schur", ierr)
-    call KSPSetUp(slv%ksp, ierr)
-
-    slv%backend = SF_ETASCHUR
-    slv%created = .true.
-    slv%scaled  = .false.
-    es_ready    = .true.
-
-    write(tstr,'(ES9.2)') rtol
-    call pc_print_block_setup(comm, trim(slv%label), &
-      "FGMRES + "//trim(sf_backend_name(SF_ETASCHUR))//", Shat by "// &
-      trim(sf_backend_name(shat_backend))//", rtol "//trim(adjustl(tstr)))
-  end subroutine sf_etaschur_setup
-
-  !--------------------------------------------------------------------
-  !> PCSHELL apply for SF_ETASCHUR:  z = [Shat^-1 (r_psi - B_13 B_33^-1 r_j);
-  !!                                      B_33^-1 r_j]
-  !--------------------------------------------------------------------
-  subroutine es_apply(pc, rvec, zvec, ierr)
-    PC  :: pc
-    Vec :: rvec, zvec
-    PetscErrorCode :: ierr
-
-    call PetscLogEventBegin(pcev_psipc, ierr)
-    call sf_split_halves(rvec, es_rp, es_rj, .false.)
-    call sf_solver_apply(es_Mj, es_rj, es_zj, ierr)        ! z_j = B_33^-1 r_j
-
-    call MatMult(g_ctx%B_13, es_zj, es_t, ierr)
-    call VecAYPX(es_t, -1.0d0, es_rp, ierr)                ! t = r_psi - B_13 z_j
-
-    call sf_solver_apply(es_Sslv, es_t, es_zpsi, ierr)     ! z_psi = Shat^-1 t
-
-    call sf_split_halves(zvec, es_zpsi, es_zj, .true.)     ! z = [z_psi; z_j]
-    call PetscLogEventEnd(pcev_psipc, ierr)
-    ierr = 0
-  end subroutine es_apply
 
   !--------------------------------------------------------------------
   !> Move between a packed pair vector and its two field halves. The pack is

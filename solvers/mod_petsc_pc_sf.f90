@@ -25,6 +25,12 @@ module mod_petsc_pc_sf
   !!   pair_psi = [[B_11, B_13], [B_31, B_33]]      (psi, j)
   !!   pair_w   = [[S_uu, B_24], [B_42, B_44]]      (u, omega)
   !!
+  !! pair_psi is solved SPLIT: the C1 GMG runs on the (psi, j) pair itself,
+  !! psi and j kept separate through the whole cycle and smoothed together
+  !! (Chacon JCP 526 (2025) S4.1). No Schur approximation and no B_33 solve
+  !! enter, and eta_num > 0 is allowed: hyper-resistivity only adds
+  !! eta_num K_1 to B_13, so both rows stay second order.
+  !!
   !! and the momentum block taken in its COMPOSED form (workstream E; Chacon
   !! JCP 526 (2025) 113789, Eq. 17-19):
   !!
@@ -43,8 +49,7 @@ module mod_petsc_pc_sf
   !! the Ltil/Shat/channel chain, the sparse mass inverses and their FSAI
   !! machinery, the matrix-free pair_w MATSHELL, and -- because the SFM2 apply
   !! folds neither constraint -- the LU factorisations of B_33 and B_44 as
-  !! well. B_33 is factored here only when pair_psi uses the eta-Schur backend,
-  !! which genuinely reads it; B_44 never is.
+  !! well: neither mass matrix is ever factored on this path.
   !!
   !! WHERE IT IS VALID
   !! -----------------
@@ -56,10 +61,12 @@ module mod_petsc_pc_sf
   !! WHAT IS DELIBERATELY ABSENT
   !! ---------------------------
   !! Every verify_/probe_/report_/dump_ routine, every rejected arm, and every
-  !! knob that was a measurement variable rather than a design choice. The GMG
-  !! smoother, axis rings and boundary drop are fixed at their audited values
-  !! in mod_petsc_pc_sf_solver. Six namelist flags select the block solvers and
-  !! one shared inner tolerance; nothing else about this path is configurable.
+  !! knob that was a measurement variable rather than a design choice, and every
+  !! superseded method: each block has ONE production solver (GMG) plus the
+  !! exact LU it is gated against, nothing else. The GMG smoothers, axis rings
+  !! and boundary drop are fixed at their audited values in
+  !! mod_petsc_pc_sf_solver. Four namelist flags pick gmg | lu per block and
+  !! one sets the shared inner tolerance; nothing else is configurable.
   !!
   !! Of the ~61 research physics_pc_* flags, this path READS exactly one --
   !! physics_pc_force_operator, which must be 1 because W is assembled at
@@ -86,9 +93,8 @@ module mod_petsc_pc_sf
   type(block_solver_t), save :: slv_T
 
   !--- backends, resolved once from the namelist strings ------------------
-  integer, save :: bk_pj = SF_LU, bk_pj_shat = SF_LU, bk_w = SF_GMG
+  integer, save :: bk_pj = SF_GMG, bk_w = SF_GMG
   integer, save :: bk_rho = SF_LU, bk_T = SF_LU
-  logical, save :: pj_etaschur = .false.
 
   !--- work state owned by this path --------------------------------------
   Vec, save :: sv_x(6), sv_y(6)
@@ -96,12 +102,6 @@ module mod_petsc_pc_sf
   Vec, save :: w3, w4, w5, t_rho, t_T
   logical, save :: vecs_ready = .false.
   logical, save :: kpj_packed = .false., sw_packed = .false.
-
-  !> FGMRES budget on the raw pair_psi around the eta-Schur shell. One
-  !! application of the factorisation alone loses ~10 outer iterations at
-  !! tstep 10 even with Shat exact, so this is not optional when that backend
-  !! is selected.
-  integer, parameter :: SF_PSI_OUTER = 10
 
   public :: sf_enabled, sf_build, sf_apply, sf_report
 
@@ -125,28 +125,13 @@ contains
     use phys_module, only: physics_pc_sf_pair_psi, physics_pc_sf_pair_w, &
                            physics_pc_sf_rho, physics_pc_sf_T, physics_pc_sf_rtol, &
                            physics_pc_force_operator, physics_pc_harm_split, &
-                           physics_pc_gmg_smoother, physics_pc_gmg_axis_rings, &
-                           physics_pc_gmg_bnd_drop
+                           physics_pc_gmg_axis_rings, physics_pc_gmg_bnd_drop
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
 
     if (sf_init_done) return
 
-    !--- pair_psi
-    select case (trim(adjustl(physics_pc_sf_pair_psi)))
-    case ("lu")
-      bk_pj = SF_LU; pj_etaschur = .false.
-    case ("gmg")
-      bk_pj = SF_GMG; pj_etaschur = .false.
-    case ("etaschur_lu")
-      bk_pj = SF_ETASCHUR; bk_pj_shat = SF_LU;  pj_etaschur = .true.
-    case ("etaschur_gmg")
-      bk_pj = SF_ETASCHUR; bk_pj_shat = SF_GMG; pj_etaschur = .true.
-    case default
-      call fatal("physics_pc_sf_pair_psi must be lu | gmg | etaschur_lu | etaschur_gmg, got '"// &
-                 trim(physics_pc_sf_pair_psi)//"'")
-    end select
-
+    bk_pj  = backend_of(physics_pc_sf_pair_psi, "physics_pc_sf_pair_psi")
     bk_w   = backend_of(physics_pc_sf_pair_w, "physics_pc_sf_pair_w")
     bk_rho = backend_of(physics_pc_sf_rho,    "physics_pc_sf_rho")
     bk_T   = backend_of(physics_pc_sf_T,      "physics_pc_sf_T")
@@ -158,7 +143,6 @@ contains
 
     !--- settings this path implies. Forced, not offered.
     call force_int(physics_pc_harm_split,      1, "physics_pc_harm_split")
-    call force_int(physics_pc_gmg_smoother,    SF_GMG_SMOOTHER,   "physics_pc_gmg_smoother")
     call force_int(physics_pc_gmg_axis_rings,  SF_GMG_AXIS_RINGS, "physics_pc_gmg_axis_rings")
     call force_int(physics_pc_gmg_bnd_drop,    1, "physics_pc_gmg_bnd_drop")
 
@@ -295,47 +279,38 @@ contains
     call physics_pc_mem("SF build: S_uu / pair_w assembled", my_id)
 
     !--- symmetric block scaling, an exact similarity applied to the STORED
-    !--- operator. Skipped for pair_psi under the eta-Schur backend, which
-    !--- works on the UNSCALED g_ctx blocks and would not match a scaled pair.
-    if (.not. pj_etaschur) then
-      call MatGetLocalSize(g_ctx%B_11, n1_loc, PETSC_NULL_INTEGER, ierr)
-      if (slv_pj%scaled) call VecDestroy(slv_pj%dscale, ierr)
-      call make_pair_block_scale(g_ctx%K_pj_aij, n1_loc, slv_pj%dscale, comm, my_id, "pair_psi")
-      slv_pj%scaled = .true.
-    endif
+    !--- operator, on both pairs.
+    call MatGetLocalSize(g_ctx%B_11, n1_loc, PETSC_NULL_INTEGER, ierr)
+    if (slv_pj%scaled) call VecDestroy(slv_pj%dscale, ierr)
+    call make_pair_block_scale(g_ctx%K_pj_aij, n1_loc, slv_pj%dscale, comm, my_id, "pair_psi")
+    slv_pj%scaled = .true.
     call MatGetLocalSize(g_ctx%B_22, n1_loc, PETSC_NULL_INTEGER, ierr)
     if (slv_w%scaled) call VecDestroy(slv_w%dscale, ierr)
     call make_pair_block_scale(g_ctx%S_W_aij, n1_loc, slv_w%dscale, comm, my_id, "pair_w")
     slv_w%scaled = .true.
 
     !--- the four block solvers -------------------------------------------
+    ! pair_psi is solved SPLIT (see the module header): the GMG runs on the
+    ! packed (psi, j) pair, both fields in every smoother block.
     call PetscLogEventBegin(pcev_fact_pj, ierr)
-    slv_pj%label = "pair_psi KSP ([B_11,B_13;B_31,B_33])"
-    if (pj_etaschur) then
-      call sf_etaschur_setup(slv_pj, g_ctx%K_pj_aij, bk_pj_shat, comm, my_id, &
-                             physics_pc_sf_rtol, SF_PSI_OUTER)
-    else
-      ! GMG on the pair itself keeps psi and j split through the whole cycle
-      ! (Chacon JCP 526 (2025) S4.1): each smoother block holds both fields,
-      ! so no Schur approximation and no B_33 solve enter, and eta_num > 0 is
-      ! allowed -- hyper-resistivity keeps both rows second order.
-      call sf_solver_setup(slv_pj, g_ctx%K_pj_aij, bk_pj, slv_pj%label, &
-                           comm, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2)
-    endif
+    call sf_solver_setup(slv_pj, g_ctx%K_pj_aij, bk_pj, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
+                         comm, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2, &
+                         smoother=SF_GMG_SMOOTHER_ZEBRA, maxits=SF_GMG_MAXITS)
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
     call PetscLogEventBegin(pcev_fact_w, ierr)
     call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
-                         comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2)
+                         comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
+                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS)
     call PetscLogEventEnd(pcev_fact_w, ierr)
 
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
     call sf_solver_setup(slv_rho, g_ctx%B_55, bk_rho, "rho-block KSP", &
-                         comm, my_id, physics_pc_sf_rtol, gmg_inst=3, &
-                         maxits=SF_GMG_MAXITS_RHOT)
+                         comm, my_id, physics_pc_sf_rtol, gmg_inst=3, nfields=1, &
+                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
     call sf_solver_setup(slv_T,   g_ctx%B_66, bk_T,   "T-block KSP", &
-                         comm, my_id, physics_pc_sf_rtol, gmg_inst=4, &
-                         maxits=SF_GMG_MAXITS_RHOT)
+                         comm, my_id, physics_pc_sf_rtol, gmg_inst=4, nfields=1, &
+                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
     call PetscLogEventEnd(pcev_fact_rhot, ierr)
     call physics_pc_mem("SF build: solvers set up", my_id)
 
@@ -514,7 +489,7 @@ contains
     PetscErrorCode :: ierr
     call MPI_Comm_size(comm, np, mpierr)
     if (np == 1) return
-    if (bk_w /= SF_GMG .and. bk_pj /= SF_GMG .and. bk_pj_shat /= SF_GMG .and. &
+    if (bk_w /= SF_GMG .and. bk_pj /= SF_GMG .and. &
         bk_rho /= SF_GMG .and. bk_T /= SF_GMG) return
     if (my_id == 0) write(*,'(A,I0,A)') &
       "[Physics PC]   FATAL: the GMG backends need np = 1 (got ", np, ")."
