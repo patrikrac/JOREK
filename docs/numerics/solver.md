@@ -163,7 +163,7 @@ for the search direction, once for the stabilizer), which is more expensive per
 step than GMRES but avoids restarting costs.  Enable it at compile time with the
 `USE_BICGSTAB` preprocessor flag.
 
-> <b><font color="red">Hint:</font></b> Use of BiSCSTAB is generally not recommended.
+> <b><font color="red">Hint:</font></b> Use of BiCGSTAB is generally not recommended.
 
 ---
 
@@ -191,10 +191,11 @@ The preconditioner is set up and applied by
 
 ### Concept
 
-For a purely axisymmetric geometry, toroidal harmonics decouple completely: the
-mode-$n$ rows of the system matrix have no coupling to mode-$m \ne n$ columns.
-JOREK's matrix does contain inter-harmonic coupling terms (from inter-harmonic coupling terms in the system),
-but in many cases the dominant, physics-relevant coupling is intra-harmonic.  The
+For a problem linearised about an axisymmetric equilibrium, toroidal
+harmonics decouple completely: the mode-$n$ rows of the system matrix have no
+coupling to mode-$m \ne n$ columns. Nonlinear terms and non-axisymmetric
+geometry (e.g. stellarators) do couple harmonics, but in many cases the
+dominant coupling is still within a harmonic.  The
 preconditioner $M$ is therefore built by **grouping the toroidal modes into
 families** and assembling one block-diagonal preconditioner matrix per family
 that retains all intra-family coupling while discarding the inter-family terms.
@@ -299,15 +300,18 @@ Each GMRES / BiCGSTAB preconditioner application performs the following steps:
 
 ### Factorisation Reuse
 
-Refactoring the preconditioner at every time step is expensive. Thus, we can reuse the factorized preconditioner matrices over multiple timesteps, where they still provide a good approximation of the linear system.  JOREK reuses the existing factorisation (the `solve_only` path) when:
+Refactoring the preconditioner at every time step is expensive. Thus, we can reuse the factorized preconditioner matrices over multiple timesteps, where they still provide a good approximation of the linear system.  After the first time step, JOREK reuses the existing factorisation (the
+`solve_only` path) when both
 
 $$\texttt{iter_gmres} + \texttt{iter_prev} \le 2 \times \texttt{iter_precon}
 \quad \text{and} \quad
 \texttt{n_since_update} < \texttt{max_steps_noUpdate}$$
 
-where `iter_precon` and `max_steps_noUpdate` are input parameters.  When
-neither condition is satisfied, the preconditioner matrix is reassembled and
-refactorised.
+hold, i.e. the last two solves averaged at most `iter_precon` GMRES iterations
+and the factorisation is younger than `max_steps_noUpdate` steps (both are
+input parameters). If either condition fails, the preconditioner matrix is
+reassembled and refactorised. Within a Newton loop the preconditioner is never
+updated after the first Newton iteration.
 
 ### Preconditioner Matrix Assembly
 
