@@ -505,6 +505,7 @@ render_with_liquid: false
 | **gmres_m** | 20 | gmres restart parameter (dimension) | x | x | x | x | x | x | x | x |
 | **gmres_4** | 1.d3 | see gmres manual (error ratio between preconditioned and non-preconditioned error) | x | x | x | x | x | x | x | x |
 | **gmres_tol** | 1.d-8 | the tolerance for the gmres iterations to be seen as converged | x | x | x | x | x | x | x | x |
+| **gmres_right_prec** | .true. | GMRES preconditioning side: right (.true., minimises the true residual) or left (.false.) | x | x | x | x | x | x | x | x |
 | **tgnum** | 0. | Coefficients for Taylor Galerkin stabilization for each equation separately | x | x | x |  |  |  |  |  |
 | **tgnum_psi** | 0. | Same as previous line, but avoiding equation indexing for model families |  |  |  | x |  |  |  |  |
 | **tgnum_u** | 0. |  |  |  |  | x |  |  |  |  |
