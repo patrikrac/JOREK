@@ -4,6 +4,8 @@ module mod_petsc_pc_sf_gather
   use iso_c_binding
 #include "petsc/finclude/petsc.h"
   use petsc
+  use mod_petsc_raw_csr, only: split_parts, get_ij, put_ij, &
+                               c_baij_get, c_baij_restore, c_aij_get, c_aij_restore
   implicit none
   private
 
@@ -28,45 +30,9 @@ module mod_petsc_pc_sf_gather
   !! The maps assume the frozen pattern. If A's or W's nonzero state or object
   !! changes, sfg_gather stops loudly rather than silently dropping entries.
   !!
-  !! PETSc exposes the SeqBAIJ value array and the MPIBAIJ/MPIAIJ split only in
-  !! C (the Fortran binding of MatMPIBAIJGetSeqBAIJ mishandles its colmap), so
-  !! those four calls go through iso_c_binding on the handles' addresses.
+  !! The raw CSR access (value arrays, diagonal/off-diagonal split) is in
+  !! mod_petsc_raw_csr.
   !--------------------------------------------------------------------
-
-  interface
-    integer(c_int) function c_mpibaij_seq(A, Ad, Ao, cmap) bind(C, name="MatMPIBAIJGetSeqBAIJ")
-      use, intrinsic :: iso_c_binding, only: c_int, c_intptr_t, c_ptr
-      integer(c_intptr_t), value :: A
-      integer(c_intptr_t)        :: Ad, Ao
-      type(c_ptr)                :: cmap
-    end function c_mpibaij_seq
-    integer(c_int) function c_mpiaij_seq(A, Ad, Ao, cmap) bind(C, name="MatMPIAIJGetSeqAIJ")
-      use, intrinsic :: iso_c_binding, only: c_int, c_intptr_t, c_ptr
-      integer(c_intptr_t), value :: A
-      integer(c_intptr_t)        :: Ad, Ao
-      type(c_ptr)                :: cmap
-    end function c_mpiaij_seq
-    integer(c_int) function c_baij_get(M, arr) bind(C, name="MatSeqBAIJGetArray")
-      use, intrinsic :: iso_c_binding, only: c_int, c_intptr_t, c_ptr
-      integer(c_intptr_t), value :: M
-      type(c_ptr)                :: arr
-    end function c_baij_get
-    integer(c_int) function c_baij_restore(M, arr) bind(C, name="MatSeqBAIJRestoreArray")
-      use, intrinsic :: iso_c_binding, only: c_int, c_intptr_t, c_ptr
-      integer(c_intptr_t), value :: M
-      type(c_ptr)                :: arr
-    end function c_baij_restore
-    integer(c_int) function c_aij_get(M, arr) bind(C, name="MatSeqAIJGetArray")
-      use, intrinsic :: iso_c_binding, only: c_int, c_intptr_t, c_ptr
-      integer(c_intptr_t), value :: M
-      type(c_ptr)                :: arr
-    end function c_aij_get
-    integer(c_int) function c_aij_restore(M, arr) bind(C, name="MatSeqAIJRestoreArray")
-      use, intrinsic :: iso_c_binding, only: c_int, c_intptr_t, c_ptr
-      integer(c_intptr_t), value :: M
-      type(c_ptr)                :: arr
-    end function c_aij_restore
-  end interface
 
   !> One target operator and its map. md/mo index the target's diagonal and
   !! off-diagonal CSR values; each entry is +k (k-th value of A's diagonal
@@ -200,60 +166,6 @@ contains
     call MatGetNonzeroState(M, st, ierr)
     id = int(pid, 8); nz = int(st, 8)
   end subroutine source_state
-
-  !> Diagonal/off-diagonal sequential parts, their block CSR and garray.
-  subroutine split_parts(M, is_baij, Md, Mo, garr)
-    Mat, intent(in)  :: M
-    logical, intent(in) :: is_baij
-    Mat, intent(out) :: Md, Mo
-    PetscInt, pointer, intent(out) :: garr(:)
-    integer(c_intptr_t) :: pd, po
-    type(c_ptr) :: cm
-    integer(c_int) :: rc
-    PetscInt :: nr, nc, bs
-    PetscErrorCode :: ierr
-    if (is_baij) then
-      rc = c_mpibaij_seq(transfer(M%v, 0_c_intptr_t), pd, po, cm)
-    else
-      rc = c_mpiaij_seq(transfer(M%v, 0_c_intptr_t), pd, po, cm)
-    endif
-    Md%v = transfer(pd, Md%v); Mo%v = transfer(po, Mo%v)
-    call MatGetSize(Mo, nr, nc, ierr)
-    bs = 1
-    if (is_baij) call MatGetBlockSize(Mo, bs, ierr)
-    if (nc / bs > 0) then
-      call c_f_pointer(cm, garr, [nc / bs])
-    else
-      garr => null()
-    endif
-  end subroutine split_parts
-
-  !> Block CSR (BAIJ) or CSR (AIJ) of a sequential part, 0-based.
-  subroutine get_ij(M, blocked, n, ia, ja)
-    Mat, intent(in) :: M
-    logical, intent(in) :: blocked
-    PetscInt, intent(out) :: n
-    PetscInt, pointer :: ia(:), ja(:)
-    PetscBool :: done, bc
-    PetscErrorCode :: ierr
-    PetscInt, parameter :: zero = 0
-    bc = PETSC_FALSE
-    if (blocked) bc = PETSC_TRUE
-    call MatGetRowIJ(M, zero, PETSC_FALSE, bc, n, ia, ja, done, ierr)
-  end subroutine get_ij
-
-  subroutine put_ij(M, blocked, n, ia, ja)
-    Mat, intent(in) :: M
-    logical, intent(in) :: blocked
-    PetscInt, intent(inout) :: n
-    PetscInt, pointer :: ia(:), ja(:)
-    PetscBool :: done, bc
-    PetscErrorCode :: ierr
-    PetscInt, parameter :: zero = 0
-    bc = PETSC_FALSE
-    if (blocked) bc = PETSC_TRUE
-    call MatRestoreRowIJ(M, zero, PETSC_FALSE, bc, n, ia, ja, done, ierr)
-  end subroutine put_ij
 
   !--------------------------------------------------------------------
   !> The map of one target. Coordinates: a sub-block index s = node*n_tor + m

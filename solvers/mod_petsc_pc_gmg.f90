@@ -31,7 +31,9 @@
 !! fine layout is read off the operator (gmg_build_prolongations' Aref); a
 !! coarse DOF belongs to the rank owning the fine node it is injected into, so
 !! P is nearly block-diagonal across ranks. On one rank every map reduces to the
-!! serial numbering. Smoother blocks are built from OWNED rows only: a radial
+!! serial numbering. Smoother blocks are built from the OWNED rows, extended by
+!! gmg_opts_t%line_overlap nodes into the ranks that own a radial line's
+!! continuation (restricted additive Schwarz, see blk_t); without overlap a
 !! line cut by the partition becomes one block per rank (block Jacobi, no
 !! communication in the smoother).
 module mod_petsc_pc_gmg
@@ -40,6 +42,8 @@ module mod_petsc_pc_gmg
   !$ use omp_lib
 #include "petsc/finclude/petsc.h"
   use petsc
+  use iso_c_binding, only: c_ptr, c_double
+  use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done
   implicit none
   private
 
@@ -62,6 +66,9 @@ module mod_petsc_pc_gmg
     integer :: ring_diag    = 0      !< diagnostic samples per rebuild (0 = off)
     integer :: bnd_drop     = 0      !< drop Dirichlet DOFs from the coarse spaces
     integer :: harm_split   = 0      !< operator is block-diagonal in |n|
+    integer :: line_overlap = 0      !< smoothers 5/7: radial lines extended by this many
+                                     !< nodes into the ranks owning their continuation
+                                     !< (restricted additive Schwarz); 0 = local segments
     real*8  :: omega        = 0.7d0  !< Richardson damping (smoothers 1, 2)
     real*8  :: axis_droptol = 0.d0   !< relative drop tolerance of the axis block
     real*8  :: ring_aspect  = 1.d0   !< smoother 6 / axis_rings -1 switch radius
@@ -158,6 +165,33 @@ module mod_petsc_pc_gmg
     ! over the rank's rows (zp 1-based pointers, zc 0-based local columns).
     integer, allocatable :: bcol(:), zp(:), zc(:)
     real*8, allocatable  :: zv(:)
+    ! Overlapping line segments (restricted additive Schwarz, Cai & Sarkis,
+    ! SISC 21 (1999) 792). The partition is ring-major, so every rank boundary
+    ! cuts every radial line; with lovl > 0 each local line segment is
+    ! extended by up to lovl nodes (all DOFs, fields, same slot) into the
+    ! ranks that own the line's continuation, solved whole, and only the
+    ! rank's own rows are written back. Row indices of the blocks live in a
+    ! COMBINED space: 0..nrow-1 the rank's own rows, nrow..nrow+ngh-1 its
+    ! ghost rows, in ascending global index gidx. xg receives the input's
+    ! ghost values (scatter sct, neighbour ranks only); yg keeps the zebra's
+    ! colour-0 ghost solutions, which the colour-1 lines couple to; sg(1) =
+    ! A(ghost rows, all columns). With lovl = 0 nothing of this exists.
+    logical :: ovl = .false.
+    integer :: ngh = 0
+    PetscInt, allocatable :: gidx(:)
+    IS  :: isg, isall
+    Vec :: xg
+    VecScatter :: sct
+    real*8, allocatable :: yg(:)
+    Mat, pointer :: sg(:) => null()
+    ! Value maps, built once per operator pattern (pat_id/pat_nz): the k-th
+    ! entry of the source goes to lu(dst) (dst > 0) or zv(-dst) (dst < 0).
+    ! Sources: vs = +k A's diagonal part, -k its off-diagonal part; gs = k in
+    ! sg(1). A rebuild is then one gather per level, no MatGetRow.
+    integer, allocatable    :: vs(:), gs(:)
+    integer(8), allocatable :: vd(:), gd(:)
+    integer(8) :: nvd = 0, nvo = 0, nvg = 0          !< source value-array lengths
+    integer(8) :: pat_id = -1, pat_nz = -1
   end type blk_t
   type(blk_t), save, target :: gBk(0:MAX_LEV-1)
   type(rds_t), save :: gcrs                  !< the coarsest level's direct solve
@@ -176,6 +210,7 @@ module mod_petsc_pc_gmg
   ! circle couplings dominate there, so smoother 6 uses ring blocks inside and
   ! radial lines outside (GMGPolar). Rings 0..axis_k form the axis block.
   integer, save :: ring_is = 1, axis_k = 0, axis_mult = 0
+  integer, save :: lovl = 0                 !< line overlap in nodes (gmg_opts_t%line_overlap)
   logical, save :: axis_split = .false.     !< stage Q: per-|n| axis solves on distinct ranks
   real*8, save  :: axis_droptol = 0.d0      !< stage Q: relative drop tolerance of the axis block
   integer, save :: diag_left = 0            !< ring-diag samples left in this rebuild
@@ -199,7 +234,7 @@ module mod_petsc_pc_gmg
   integer, parameter :: MAX_INST = 4
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
-    integer :: ring_is = 1, axis_k = 0, axis_mult = 0, diag_left = 0
+    integer :: ring_is = 1, axis_k = 0, axis_mult = 0, diag_left = 0, lovl = 0
     logical :: axis_split = .false.
     real*8  :: axis_droptol = 0.d0
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
@@ -262,6 +297,7 @@ contains
     associate (S => inst(cur_inst))
       S%nlev = nlev; S%nth0 = nth0; S%nf_s = nf_s; S%sm_type = sm_type; S%sm_nstep = sm_nstep
       S%ring_is = ring_is; S%axis_k = axis_k; S%axis_mult = axis_mult; S%diag_left = diag_left
+      S%lovl = lovl
       S%axis_split = axis_split; S%axis_droptol = axis_droptol
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready; S%sm_blocks = sm_blocks
@@ -280,6 +316,7 @@ contains
     associate (S => inst(k))
       nlev = S%nlev; nth0 = S%nth0; nf_s = S%nf_s; sm_type = S%sm_type; sm_nstep = S%sm_nstep
       ring_is = S%ring_is; axis_k = S%axis_k; axis_mult = S%axis_mult; diag_left = S%diag_left
+      lovl = S%lovl
       axis_split = S%axis_split; axis_droptol = S%axis_droptol
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready; sm_blocks = S%sm_blocks
@@ -324,6 +361,17 @@ contains
     if (allocated(a%zp))   call move_alloc(a%zp,   b%zp)
     if (allocated(a%zc))   call move_alloc(a%zc,   b%zc)
     if (allocated(a%zv))   call move_alloc(a%zv,   b%zv)
+    b%ovl = a%ovl; b%ngh = a%ngh; a%ovl = .false.; a%ngh = 0
+    b%isg = a%isg; b%isall = a%isall; b%xg = a%xg; b%sct = a%sct
+    b%sg => a%sg; a%sg => null()
+    if (allocated(a%gidx)) call move_alloc(a%gidx, b%gidx)
+    if (allocated(a%yg))   call move_alloc(a%yg,   b%yg)
+    if (allocated(a%vs))   call move_alloc(a%vs,   b%vs)
+    if (allocated(a%gs))   call move_alloc(a%gs,   b%gs)
+    if (allocated(a%vd))   call move_alloc(a%vd,   b%vd)
+    if (allocated(a%gd))   call move_alloc(a%gd,   b%gd)
+    b%nvd = a%nvd; b%nvo = a%nvo; b%nvg = a%nvg
+    b%pat_id = a%pat_id; b%pat_nz = a%pat_nz; a%pat_id = -1; a%pat_nz = -1
   end subroutine move_blk
 
   subroutine move_rds(a, b)
@@ -1344,6 +1392,8 @@ contains
     axis_mult = 0
     if (axis_k /= 0) axis_mult = min(max(o%axis_mult, 0), 3)
     axis_droptol = max(o%axis_droptol, 0.d0)
+    lovl = 0
+    if (sm_type == 5 .or. sm_type == 7) lovl = max(o%line_overlap, 0)
     ! per-|n| axis solves need the block to be block-diagonal in |n|
     axis_split = (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split > 0)
     if (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split == 0 .and. my_id == 0) &
@@ -1662,26 +1712,30 @@ contains
     endif
   end subroutine smooth
 
-  !> Block map of level g (0 = fine, from fine_node/fine_harm; g > 0 from
-  !! glv(g)%rnode/rharm), then LU of every block of the Pmat A. Only the rows
-  !! this rank owns take part (rows/bid/pos are LOCAL, 0-based in rows), so a
-  !! block cut by the partition is solved as its local part. Rows inside a block are ordered by
-  !! their coordinate along the line (I for radial lines, J for rings), so a
-  !! radial line is banded; a block whose band is narrow is factored banded
-  !! (dgbtrf), otherwise dense (dgetrf). A singular block falls back to its
-  !! diagonal (counted in nsing).
+  !> The smoother blocks of level g and their LU factors, in three parts:
+  !!  - mesh part, first build only: the block map (0 = fine, from
+  !!    fine_node/fine_harm; g > 0 from glv(g)%rnode/rharm) over the rank's
+  !!    rows, the axis groups, and with a line overlap the ghost rows
+  !!    (ovl_extend). Rows inside a block are ordered by their coordinate along
+  !!    the line (I for radial lines, J for rings), so a radial line is banded.
+  !!  - pattern part, once per operator pattern (blk_pattern): band widths,
+  !!    storage (banded dgbtrf where the band is narrow, else dense dgetrf),
+  !!    the zebra coupling CSR, and the value maps from A's CSR.
+  !!  - numeric part, every rebuild: gather through the maps (blk_fill), then
+  !!    factor. A singular block falls back to its diagonal (nsing).
   subroutine build_blocks(g, A)
     use mod_parameters, only: n_tor
     integer, intent(in) :: g
     Mat, intent(in)     :: A
     type(blk_t), pointer :: B
-    PetscInt :: nr, r, ncols, rst, ren, lc
+    PetscInt :: nr, r, ncols, rst, ren
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
-    integer :: nc, I, J, m, bb, q, pr, pcn, info, n, ldab, kk, tmp, nthr, ngrp, gnp, mpierr
+    PetscInt, parameter :: one = 1
+    integer :: nc, I, J, m, bb, q, pcn, info, n, ldab, kk, tmp, nthr, ngrp, gnp, mpierr
     integer, allocatable :: cnt(:), key(:)
-    integer(8) :: tot, ix
+    integer(8) :: ix
     PetscInt, allocatable :: axr(:)
     integer, allocatable :: binfo(:)
     character(len=24) :: axname
@@ -1830,6 +1884,7 @@ contains
         enddo
         deallocate(axr, key)
       endif
+      if (lovl > 0) call ovl_extend(g, A, B, rst, ren)
       nthr = 1
       !$ nthr = omp_get_max_threads()
       if (allocated(blk_t_work)) then
@@ -1838,77 +1893,28 @@ contains
       if (.not. allocated(blk_t_work)) allocate(blk_t_work(maxval(B%sz), 0:nthr - 1))
     endif
 
-    ! band widths of the blocks as stored in A (pattern fixed across rebuilds,
-    ! but recomputed: cheap next to the factorizations)
-    B%kl = 0; B%ku = 0
-    if (sm_type == 7) then
-      if (allocated(B%zp)) deallocate(B%zp)
-      allocate(B%zp(nr + 1))
-      B%zp = 0
-    endif
-    do r = 0, nr - 1
-      bb = B%bid(r + 1); pr = B%pos(r + 1)
-      call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
-      do q = 1, int(ncols)
-        lc = cols(q) - rst
-        if (lc < 0 .or. lc >= nr) cycle              ! off-rank column: not in any local block
-        if (sm_type == 7) then
-          if (B%bcol(bb) == 1 .and. B%bcol(B%bid(lc + 1)) == 0) B%zp(r + 2) = B%zp(r + 2) + 1
-        endif
-        if (B%bid(lc + 1) /= bb) cycle
-        pcn = B%pos(lc + 1)
-        B%kl(bb) = max(B%kl(bb), pr - pcn)
-        B%ku(bb) = max(B%ku(bb), pcn - pr)
-      enddo
-      call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
-    enddo
-    tot = 0
-    do bb = 1, B%nb
-      n = B%sz(bb)
-      B%band(bb) = (2 * (2 * B%kl(bb) + B%ku(bb) + 1) < n)
-      B%loff(bb) = tot
-      if (B%axblk(bb)) then
-        B%band(bb) = .false.                   ! sparse axis solve: no dense storage
-      else if (B%band(bb)) then
-        tot = tot + int(2 * B%kl(bb) + B%ku(bb) + 1, 8) * n
-      else
-        tot = tot + int(n, 8)**2
+    ! Pattern part, once per operator pattern: band widths and storage of the
+    ! blocks, the zebra coupling CSR and the value maps. The fine operand and
+    ! the Galerkin chain keep their Mats and patterns for the run, so this
+    ! runs on the first build only; a rebuild refills the ghost rows and
+    ! gathers (numeric part).
+    block
+      PetscObjectState :: nzst
+      PetscInt64 :: aid
+      logical :: newpat
+      call MatGetNonzeroState(A, nzst, ierr)
+      call PetscObjectGetId(A, aid, ierr)
+      newpat = (int(aid, 8) /= B%pat_id .or. int(nzst, 8) /= B%pat_nz)
+      call MPI_Allreduce(MPI_IN_PLACE, newpat, 1, MPI_LOGICAL, MPI_LOR, gcomm, mpierr)
+      if (newpat) then
+        call blk_pattern(B, A, rst, ren)
+        B%pat_id = int(aid, 8); B%pat_nz = int(nzst, 8)
+      else if (B%ovl) then
+        call MatCreateSubMatrices(A, one, [B%isg], [B%isall], MAT_REUSE_MATRIX, B%sg, ierr)
       endif
-    enddo
-    if (allocated(B%lu)) then
-      if (size(B%lu, kind=8) /= tot) deallocate(B%lu)
-    endif
-    if (.not. allocated(B%lu)) allocate(B%lu(tot))
+    end block
+    call blk_fill(B, A)
 
-    if (sm_type == 7) then
-      B%zp(1) = 1
-      do r = 1, nr
-        B%zp(r + 1) = B%zp(r + 1) + B%zp(r)
-      enddo
-      if (allocated(B%zc)) deallocate(B%zc, B%zv)
-      allocate(B%zc(B%zp(nr + 1) - 1), B%zv(B%zp(nr + 1) - 1))
-    endif
-    B%lu = 0.0d0
-    do r = 0, nr - 1
-      bb = B%bid(r + 1)
-      if (B%axblk(bb)) cycle
-      pr = B%pos(r + 1)
-      call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
-      kk = 0
-      do q = 1, int(ncols)
-        lc = cols(q) - rst
-        if (lc < 0 .or. lc >= nr) cycle
-        if (sm_type == 7) then
-          if (B%bcol(bb) == 1 .and. B%bcol(B%bid(lc + 1)) == 0) then
-            B%zc(B%zp(r + 1) + kk) = int(lc); B%zv(B%zp(r + 1) + kk) = vals(q); kk = kk + 1
-          endif
-        endif
-        if (B%bid(lc + 1) /= bb) cycle
-        pcn = B%pos(lc + 1)
-        B%lu(lu_index(B, bb, pr, pcn)) = vals(q)
-      enddo
-      call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
-    enddo
     ! The blocks are independent: factor them on the rank's OpenMP threads
     ! (hybrid runs leave them idle in the PETSc parts). The singular-block
     ! fallback reads A (MatGetRow is not thread-safe), so it runs afterwards.
@@ -1942,11 +1948,19 @@ contains
         do q = 1, n
           r = B%rows(B%off(bb) + q)
           ix = lu_index(B, bb, q, q)
-          call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
-          do pcn = 1, int(ncols)
-            if (cols(pcn) == rst + r) B%lu(ix) = vals(pcn)
-          enddo
-          call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
+          if (r < B%nrow) then
+            call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
+            do pcn = 1, int(ncols)
+              if (cols(pcn) == rst + r) B%lu(ix) = vals(pcn)
+            enddo
+            call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
+          else                                          ! ghost row: from sg(1), global columns
+            call MatGetRow(B%sg(1), r - B%nrow, ncols, cols, vals, ierr)
+            do pcn = 1, int(ncols)
+              if (cols(pcn) == B%gidx(r - B%nrow + 1)) B%lu(ix) = vals(pcn)
+            enddo
+            call MatRestoreRow(B%sg(1), r - B%nrow, ncols, cols, vals, ierr)
+          endif
           if (abs(B%lu(ix)) < tiny(1.0d0)) B%lu(ix) = 1.0d0
           B%piv(B%off(bb) + q) = q
         enddo
@@ -1988,6 +2002,467 @@ contains
       B%gsready = .true.
     endif
   end subroutine build_blocks
+
+  !> Pattern part of build_blocks: band widths and storage layout of the
+  !! blocks, the zebra's coupling CSR, and the value maps from A's CSR (and
+  !! the ghost rows' sg(1)) into them. Two passes over the combined rows:
+  !! count, then place. Row entries are visited in CSR order (ascending
+  !! column), so the zebra coupling sums run in the same order as before.
+  subroutine blk_pattern(B, A, rst, ren)
+    type(blk_t), intent(inout) :: B
+    Mat, intent(in)      :: A
+    PetscInt, intent(in) :: rst, ren
+    PetscInt, parameter :: one = 1
+    Mat :: Ad, Ao
+    PetscInt, pointer :: garr(:), dia(:), dja(:), oia(:), oja(:), sia(:), sja(:)
+    PetscInt :: nd, no, ns
+    logical :: has_o
+    integer :: pass, R, nall, bb, n, kz, nva, nvg
+    PetscInt :: k
+    integer(8) :: tot
+    PetscErrorCode :: ierr
+
+    if (B%ovl) then
+      if (associated(B%sg)) call MatDestroySubMatrices(one, B%sg, ierr)
+      call MatCreateSubMatrices(A, one, [B%isg], [B%isall], MAT_INITIAL_MATRIX, B%sg, ierr)
+    endif
+    call aij_parts(A, Ad, Ao, garr, has_o)
+    call get_ij(Ad, .false., nd, dia, dja)
+    B%nvd = dia(nd + 1); B%nvo = 0; B%nvg = 0
+    if (has_o) then
+      call get_ij(Ao, .false., no, oia, oja)
+      B%nvo = oia(no + 1)
+    endif
+    if (B%ovl) then
+      call get_ij(B%sg(1), .false., ns, sia, sja)
+      B%nvg = sia(ns + 1)
+    endif
+    if (max(B%nvd, B%nvo, B%nvg) >= int(huge(0), 8)) then
+      write(*,'(A)') "[Physics PC]   FATAL: a GMG level's value array exceeds the 32-bit map index."
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    endif
+    nall = B%nrow + B%ngh
+    B%kl = 0; B%ku = 0
+    if (allocated(B%zp)) deallocate(B%zp)
+    allocate(B%zp(nall + 1))
+    B%zp = 0
+    do pass = 1, 2
+      nva = 0; nvg = 0
+      do R = 0, nall - 1
+        bb = B%bid(R + 1)
+        kz = 0
+        if (R < B%nrow) then
+          do k = dia(R + 1), dia(R + 2) - 1
+            call visit(int(dja(k + 1)), int(k) + 1, .false.)
+          enddo
+          if (has_o) then
+            do k = oia(R + 1), oia(R + 2) - 1
+              call visit(comb(garr(oja(k + 1) + 1)), -(int(k) + 1), .false.)
+            enddo
+          endif
+        else
+          do k = sia(R - B%nrow + 1), sia(R - B%nrow + 2) - 1
+            call visit(comb(sja(k + 1)), int(k) + 1, .true.)
+          enddo
+        endif
+      enddo
+      if (pass == 2) exit
+      ! storage: banded where the band is narrow, dense otherwise
+      tot = 0
+      do bb = 1, B%nb
+        n = B%sz(bb)
+        B%band(bb) = (2 * (2 * B%kl(bb) + B%ku(bb) + 1) < n)
+        B%loff(bb) = tot
+        if (B%axblk(bb)) then
+          B%band(bb) = .false.                   ! sparse axis solve: no dense storage
+        else if (B%band(bb)) then
+          tot = tot + int(2 * B%kl(bb) + B%ku(bb) + 1, 8) * n
+        else
+          tot = tot + int(n, 8)**2
+        endif
+      enddo
+      if (allocated(B%lu)) deallocate(B%lu)
+      allocate(B%lu(tot))
+      B%zp(1) = 1
+      do R = 1, nall
+        B%zp(R + 1) = B%zp(R + 1) + B%zp(R)
+      enddo
+      if (allocated(B%zc)) deallocate(B%zc, B%zv)
+      allocate(B%zc(B%zp(nall + 1) - 1), B%zv(B%zp(nall + 1) - 1))
+      if (allocated(B%vs)) deallocate(B%vs, B%vd, B%gs, B%gd)
+      allocate(B%vs(nva), B%vd(nva), B%gs(nvg), B%gd(nvg))
+    enddo
+    call put_ij(Ad, .false., nd, dia, dja)
+    if (has_o) call put_ij(Ao, .false., no, oia, oja)
+    if (B%ovl) call put_ij(B%sg(1), .false., ns, sia, sja)
+
+  contains
+
+    !> entry (R, C) with source src: into the zebra CSR, into the block, or nowhere
+    subroutine visit(C, src, ghost)
+      integer, intent(in) :: C, src
+      logical, intent(in) :: ghost
+      integer :: cb, pr, pc
+      if (C < 0) return                           ! outside the rank's rows and ghosts
+      cb = B%bid(C + 1)
+      if (sm_type == 7 .and. B%bcol(bb) == 1 .and. B%bcol(cb) == 0) then
+        if (pass == 1) then
+          B%zp(R + 2) = B%zp(R + 2) + 1
+        else
+          B%zc(B%zp(R + 1) + kz) = C
+        endif
+        call put(src, -int(B%zp(R + 1) + kz, 8), ghost)
+        kz = kz + 1
+      else if (cb == bb) then
+        pr = B%pos(R + 1); pc = B%pos(C + 1)
+        if (pass == 1) then
+          B%kl(bb) = max(B%kl(bb), pr - pc)
+          B%ku(bb) = max(B%ku(bb), pc - pr)
+        endif
+        if (.not. B%axblk(bb)) then
+          if (pass == 1) then
+            call put(src, 0_8, ghost)
+          else
+            call put(src, lu_index(B, bb, pr, pc), ghost)
+          endif
+        endif
+      endif
+    end subroutine visit
+
+    subroutine put(src, dst, ghost)
+      integer, intent(in)    :: src
+      integer(8), intent(in) :: dst
+      logical, intent(in)    :: ghost
+      if (ghost) then
+        nvg = nvg + 1
+        if (pass == 2) then
+          B%gs(nvg) = src; B%gd(nvg) = dst
+        endif
+      else
+        nva = nva + 1
+        if (pass == 2) then
+          B%vs(nva) = src; B%vd(nva) = dst
+        endif
+      endif
+    end subroutine put
+
+    !> combined row index of global column gc, or -1
+    integer function comb(gc)
+      PetscInt, intent(in) :: gc
+      integer :: lo, hi, mid
+      comb = -1
+      if (gc >= rst .and. gc < ren) then
+        comb = int(gc - rst)
+        return
+      endif
+      lo = 1; hi = B%ngh
+      do while (lo <= hi)
+        mid = (lo + hi) / 2
+        if (B%gidx(mid) == gc) then
+          comb = B%nrow + mid - 1
+          return
+        else if (B%gidx(mid) < gc) then
+          lo = mid + 1
+        else
+          hi = mid - 1
+        endif
+      enddo
+    end function comb
+  end subroutine blk_pattern
+
+  !> Numeric part of build_blocks: the blocks' values (and the zebra
+  !! couplings) gathered from A and sg(1) through the value maps.
+  subroutine blk_fill(B, A)
+    type(blk_t), intent(inout) :: B
+    Mat, intent(in) :: A
+    Mat :: Ad, Ao
+    PetscInt, pointer :: garr(:)
+    logical :: has_o
+    type(c_ptr) :: pd, po, ps
+    real(c_double), pointer :: vd_(:), vo_(:), vg_(:)
+    integer :: k
+    integer(8) :: d
+    real*8 :: v
+
+    call aij_parts(A, Ad, Ao, garr, has_o)
+    call aij_vals_read(Ad, B%nvd, pd, vd_)
+    if (has_o) then
+      call aij_vals_read(Ao, B%nvo, po, vo_)
+    else
+      vo_ => vd_(1:0)
+    endif
+    if (B%ovl) then
+      call aij_vals_read(B%sg(1), B%nvg, ps, vg_)
+    else
+      vg_ => vd_(1:0)
+    endif
+    B%lu = 0.0d0
+    !$omp parallel do private(v, d) schedule(static)
+    do k = 1, size(B%vs)
+      if (B%vs(k) > 0) then
+        v = vd_(B%vs(k))
+      else
+        v = vo_(-B%vs(k))
+      endif
+      d = B%vd(k)
+      if (d > 0) then
+        B%lu(d) = v
+      else
+        B%zv(-d) = v
+      endif
+    enddo
+    !$omp end parallel do
+    !$omp parallel do private(v, d) schedule(static)
+    do k = 1, size(B%gs)
+      v = vg_(B%gs(k))
+      d = B%gd(k)
+      if (d > 0) then
+        B%lu(d) = v
+      else
+        B%zv(-d) = v
+      endif
+    enddo
+    !$omp end parallel do
+    call aij_vals_done(Ad, pd)
+    if (has_o) call aij_vals_done(Ao, po)
+    if (B%ovl) call aij_vals_done(B%sg(1), ps)
+  end subroutine blk_fill
+
+  !> Mesh part of the line overlap (first build only; see blk_t). The ghost
+  !! rows of a local line segment (J, slot m, rings Ia..Ib) are the rows of
+  !! the nodes (I, J), I in Ia-lovl..Ia-1 or Ib+1..Ib+lovl outside the axis
+  !! block, that other ranks own. They are found by a breadth-first walk of
+  !! A's graph from the rank's off-diagonal columns, lovl steps deep, each
+  !! step reading the candidates' (I, J, m) from their owners through a
+  !! scatter of a code vector; then they are inserted into their blocks in
+  !! line order (rings, then global index, the owners' own row order), and
+  !! the ghost scatter is built. Collective on A's communicator.
+  subroutine ovl_extend(g, A, B, rst, ren)
+    use mod_parameters, only: n_tor
+    integer, intent(in) :: g
+    Mat, intent(in) :: A
+    type(blk_t), intent(inout) :: B
+    PetscInt, intent(in) :: rst, ren
+    PetscInt, parameter :: one = 1, zero = 0
+    Mat :: Ad, Ao
+    Mat, pointer :: sub(:)
+    PetscInt, pointer :: garr(:), sia(:), sja(:)
+    PetscInt :: nglob, ns, nn, k
+    PetscScalar, pointer :: kp(:), cp(:)
+    Vec :: kv, cv
+    IS  :: isc, isn
+    VecScatter :: sc
+    PetscErrorCode :: ierr
+    logical :: has_o
+    integer :: nc, nr, r, bb, I, J, m, ilim, d, q, t, ngh, nlo, mpierr, code
+    integer :: gtot(2), gloc(2)
+    integer, allocatable :: Ia(:), Ib(:), blkof(:), gb(:), gI(:), nsz(:), noff(:), nrows(:), fill(:)
+    integer, allocatable :: tb(:), tI(:), lst(:)
+    PetscInt, allocatable :: cand(:), gl(:), tl(:), perm(:)
+
+    nr = B%nrow
+    if (g == 0) then
+      nc = nth0
+    else
+      nc = glv(g)%nj
+    endif
+    ilim = 0
+    if (axis_k /= 0) ilim = axis_lim(g)
+    ! the local line segments
+    allocate(Ia(B%nb), Ib(B%nb), blkof(0:nc * n_tor - 1))
+    Ia = -1; Ib = -1; blkof = 0
+    do bb = 1, B%nb
+      if (B%axblk(bb)) cycle
+      call node_of(B%rows(B%off(bb) + 1) + 1, I, J, m)
+      if (I <= ilim) cycle                           ! the per-slot I = 0 blocks
+      Ia(bb) = I
+      call node_of(B%rows(B%off(bb) + B%sz(bb)) + 1, I, J, m)
+      Ib(bb) = I
+      blkof(J * n_tor + m) = bb
+    enddo
+    ! (I, J, m) of every owned row, as a vector the walk can read remotely
+    call MatCreateVecs(A, kv, PETSC_NULL_VEC, ierr)
+    call VecGetArray(kv, kp, ierr)
+    do r = 1, nr
+      call node_of(r, I, J, m)
+      kp(r) = dble((I * nc + J) * n_tor + m)
+    enddo
+    call VecRestoreArray(kv, kp, ierr)
+    call MatGetSize(A, nglob, PETSC_NULL_INTEGER, ierr)
+    call ISCreateStride(PETSC_COMM_SELF, nglob, zero, one, B%isall, ierr)
+
+    ! step 1: the off-diagonal columns of the rank's rows (sorted, unique)
+    call aij_parts(A, Ad, Ao, garr, has_o)
+    nn = 0
+    if (has_o .and. associated(garr)) nn = size(garr)
+    allocate(cand(nn))
+    if (nn > 0) cand = garr
+    allocate(gl(0), gb(0), gI(0))
+    do d = 1, lovl
+      ! drop the candidates already accepted
+      allocate(tl(nn))
+      ns = 0
+      do k = 1, nn
+        if (find(gl, cand(k)) > 0) cycle
+        ns = ns + 1; tl(ns) = cand(k)
+      enddo
+      ! their (I, J, m) from the owners
+      call ISCreateGeneral(PETSC_COMM_SELF, ns, tl(1:ns), PETSC_COPY_VALUES, isc, ierr)
+      call VecCreateSeq(PETSC_COMM_SELF, ns, cv, ierr)
+      call VecScatterCreate(kv, isc, cv, PETSC_NULL_IS, sc, ierr)
+      call VecScatterBegin(sc, kv, cv, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd(sc, kv, cv, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecGetArrayRead(cv, cp, ierr)
+      allocate(tb(ns), tI(ns))
+      q = 0
+      do k = 1, ns
+        code = nint(cp(k))
+        m = mod(code, n_tor); J = mod(code / n_tor, nc); I = code / n_tor / nc
+        bb = blkof(J * n_tor + m)
+        if (bb == 0 .or. I <= ilim) cycle
+        if (.not. ((I < Ia(bb) .and. Ia(bb) - I <= lovl) .or. (I > Ib(bb) .and. I - Ib(bb) <= lovl))) cycle
+        q = q + 1
+        tl(q) = tl(k); tb(q) = bb; tI(q) = I
+      enddo
+      call VecRestoreArrayRead(cv, cp, ierr)
+      call VecScatterDestroy(sc, ierr); call VecDestroy(cv, ierr); call ISDestroy(isc, ierr)
+      gl = [gl, tl(1:q)]; gb = [gb, tb(1:q)]; gI = [gI, tI(1:q)]
+      call sort_ghosts()
+      ! next step's candidates: the off-rank columns of the rows just accepted
+      if (d < lovl) then
+        call ISCreateGeneral(PETSC_COMM_SELF, int(q, kind(nn)), tl(1:q), PETSC_COPY_VALUES, isn, ierr)
+        call MatCreateSubMatrices(A, one, [isn], [B%isall], MAT_INITIAL_MATRIX, sub, ierr)
+        call get_ij(sub(1), .false., ns, sia, sja)
+        deallocate(cand)
+        allocate(cand(sia(ns + 1)))
+        nn = 0
+        do k = 1, sia(ns + 1)
+          if (sja(k) >= rst .and. sja(k) < ren) cycle
+          nn = nn + 1; cand(nn) = sja(k)
+        enddo
+        call put_ij(sub(1), .false., ns, sia, sja)
+        call MatDestroySubMatrices(one, sub, ierr)
+        call ISDestroy(isn, ierr)
+        call PetscSortRemoveDupsInt(nn, cand, ierr)
+      endif
+      deallocate(tl, tb, tI)
+    enddo
+    ngh = size(gl)
+
+    ! insert the ghosts into their blocks: below the segment, own rows, above;
+    ! each side by ring, then global index
+    allocate(nsz(B%nb), noff(B%nb), fill(B%nb), nrows(nr + ngh))
+    nsz = B%sz
+    do k = 1, ngh
+      nsz(gb(k)) = nsz(gb(k)) + 1
+    enddo
+    noff(1) = 0
+    do bb = 2, B%nb
+      noff(bb) = noff(bb - 1) + nsz(bb - 1)
+    enddo
+    allocate(lst(ngh))
+    fill = 0
+    do bb = 1, B%nb                                     ! ghosts of block bb, ascending k
+      if (nsz(bb) == B%sz(bb)) cycle
+      nlo = 0
+      q = 0
+      do k = 1, ngh
+        if (gb(k) /= bb) cycle
+        q = q + 1; lst(q) = int(k)
+      enddo
+      do t = 2, q                                       ! stable by ring
+        r = lst(t); m = t - 1
+        do while (m >= 1)
+          if (gI(lst(m)) <= gI(r)) exit
+          lst(m + 1) = lst(m); m = m - 1
+        enddo
+        lst(m + 1) = r
+      enddo
+      do t = 1, q
+        if (gI(lst(t)) < Ia(bb)) nlo = nlo + 1
+      enddo
+      do t = 1, nlo
+        nrows(noff(bb) + t) = nr + lst(t) - 1
+      enddo
+      nrows(noff(bb) + nlo + 1 : noff(bb) + nlo + B%sz(bb)) = B%rows(B%off(bb) + 1 : B%off(bb) + B%sz(bb))
+      do t = nlo + 1, q
+        nrows(noff(bb) + B%sz(bb) + t) = nr + lst(t) - 1
+      enddo
+    enddo
+    do bb = 1, B%nb
+      if (nsz(bb) == B%sz(bb)) nrows(noff(bb) + 1 : noff(bb) + nsz(bb)) = B%rows(B%off(bb) + 1 : B%off(bb) + B%sz(bb))
+    enddo
+    call move_alloc(nrows, B%rows)
+    B%sz = nsz; B%off = noff
+    deallocate(B%pos, B%piv)
+    allocate(B%pos(nr + ngh), B%piv(nr + ngh))
+    B%bid = [B%bid(1:nr), gb]
+    do bb = 1, B%nb
+      do q = 1, B%sz(bb)
+        B%pos(B%rows(B%off(bb) + q) + 1) = q
+      enddo
+    enddo
+
+    ! the ghost scatter (neighbour ranks only)
+    B%ngh = ngh
+    allocate(B%gidx(ngh), B%yg(ngh))
+    B%gidx = gl
+    call ISCreateGeneral(PETSC_COMM_SELF, int(ngh, kind(nn)), gl, PETSC_COPY_VALUES, B%isg, ierr)
+    call VecCreateSeq(PETSC_COMM_SELF, int(ngh, kind(nn)), B%xg, ierr)
+    call VecScatterCreate(kv, B%isg, B%xg, PETSC_NULL_IS, B%sct, ierr)
+    call VecDestroy(kv, ierr)
+    B%ovl = .true.
+    gloc = [ngh, nr]
+    call MPI_Allreduce(gloc, gtot, 2, MPI_INTEGER, MPI_SUM, gcomm, mpierr)
+    if (gme == 0 .and. g == 0) write(*,'(A,I0,A,I0,A,F5.1,A)') "[Physics PC]   GMG line overlap ", lovl, &
+      " node(s): ", gtot(1), " ghost rows on level 0 (", 100.d0 * gtot(1) / max(gtot(2), 1), "% of the rows)"
+
+  contains
+
+    subroutine node_of(r_, I_, J_, m_)
+      integer, intent(in)  :: r_
+      integer, intent(out) :: I_, J_, m_
+      if (g == 0) then
+        I_ = fine_node(r_) / nth0; J_ = mod(fine_node(r_), nth0); m_ = fine_harm(r_)
+      else
+        I_ = glv(g)%rnode(r_) / nc; J_ = mod(glv(g)%rnode(r_), nc); m_ = glv(g)%rharm(r_)
+      endif
+    end subroutine node_of
+
+    !> position of x in the sorted list l (1-based), or 0
+    integer function find(l, x)
+      PetscInt, intent(in) :: l(:), x
+      integer :: lo, hi, mid
+      find = 0
+      lo = 1; hi = size(l)
+      do while (lo <= hi)
+        mid = (lo + hi) / 2
+        if (l(mid) == x) then
+          find = mid
+          return
+        else if (l(mid) < x) then
+          lo = mid + 1
+        else
+          hi = mid - 1
+        endif
+      enddo
+    end function find
+
+    !> gl ascending, gb/gI permuted along
+    subroutine sort_ghosts()
+      integer :: n_
+      PetscCount :: nn_
+      n_ = size(gl)
+      nn_ = n_
+      if (allocated(perm)) deallocate(perm)
+      allocate(perm(n_))
+      do k = 1, n_
+        perm(k) = k
+      enddo
+      call PetscSortIntWithArray(nn_, gl, perm, ierr)
+      gb = gb(perm); gI = gI(perm)
+    end subroutine sort_ghosts
+  end subroutine ovl_extend
 
   !> x = A^-1 x for one right-hand side, A = the dgbtrf factors in LAPACK band
   !! storage (ldab = 2 kl + ku + 1, pivots ipiv): dgbtrs('N') written out.
@@ -2125,24 +2600,33 @@ contains
 
     !> y(rows outside the axis block) = dense/banded block solves of x. The
     !! blocks own disjoint rows, so they run on the rank's OpenMP threads.
+    !! With the line overlap the ghost rows' input comes from the neighbours
+    !! (one scatter) and only the rank's own rows are written back.
     subroutine lines_solve(xx, yy)
       Vec :: xx, yy
-      PetscScalar, pointer :: xp(:), yp(:)
+      PetscScalar, pointer :: xp(:), yp(:), gp(:)
       PetscErrorCode :: ie
-      integer :: bb, q, n, info, t
+      integer :: bb, q, n, info, t, r, nr
       external :: dgetrs
       call PetscLogEventBegin(gev_lines(cur_inst), ie)
+      call ghosts_in(xx, gp)
       call VecGetArrayRead(xx, xp, ie)
       call VecGetArray(yy, yp, ie)
+      nr = B%nrow
       ! small (coarse) levels stay serial: fork/join would cost more than the work
-      !$omp parallel do schedule(dynamic, 4) private(bb, q, n, info, t) if (B%nrow >= LINES_OMP_MIN)
+      !$omp parallel do schedule(dynamic, 4) private(bb, q, n, info, t, r) if (B%nrow >= LINES_OMP_MIN)
       do bb = 1, B%nb
         if (B%axblk(bb)) cycle
         t = 0
         !$ t = omp_get_thread_num()
         n = B%sz(bb)
         do q = 1, n
-          blk_t_work(q, t) = xp(B%rows(B%off(bb) + q) + 1)
+          r = B%rows(B%off(bb) + q)
+          if (r < nr) then
+            blk_t_work(q, t) = xp(r + 1)
+          else
+            blk_t_work(q, t) = gp(r - nr + 1)
+          endif
         enddo
         if (B%band(bb)) then
           call band_solve(n, B%kl(bb), B%ku(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), &
@@ -2151,12 +2635,14 @@ contains
           call dgetrs('N', n, 1, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), blk_t_work(1, t), n, info)
         endif
         do q = 1, n
-          yp(B%rows(B%off(bb) + q) + 1) = blk_t_work(q, t)
+          r = B%rows(B%off(bb) + q)
+          if (r < nr) yp(r + 1) = blk_t_work(q, t)
         enddo
       enddo
       !$omp end parallel do
       call VecRestoreArrayRead(xx, xp, ie)
       call VecRestoreArray(yy, yp, ie)
+      call ghosts_done(gp)
       call PetscLogEventEnd(gev_lines(cur_inst), ie)
     end subroutine lines_solve
 
@@ -2166,30 +2652,43 @@ contains
     !! (odd J) from x - A(odd, colour 0) y. A radial line couples only to the
     !! lines at J +- 1, so odd lines never couple to each other and the sweep
     !! is exact block Gauss-Seidel on the rank's rows. Same line factors and one
-    !! line pass as smoother 5, plus half a local matvec.
+    !! line pass as smoother 5, plus half a local matvec. With the line overlap
+    !! the colour-0 solutions on the ghost rows are kept (yg), and the
+    !! extended colour-1 lines couple to them: no second communication.
     subroutine zebra_solve(xx, yy)
       Vec :: xx, yy
-      PetscScalar, pointer :: xp(:), yp(:)
+      PetscScalar, pointer :: xp(:), yp(:), gp(:)
       PetscErrorCode :: ie
-      integer :: bb, q, n, info, t, c, k, r
+      integer :: bb, q, n, info, t, c, k, r, nr, zc_
       external :: dgetrs
+      nr = B%nrow
+      call ghosts_in(xx, gp)
       do c = 0, 1
         if (c == 1 .and. B%axsparse) call ax_solve(xx, yy)
         call PetscLogEventBegin(gev_lines(cur_inst), ie)
         call VecGetArrayRead(xx, xp, ie)
         call VecGetArray(yy, yp, ie)
-        !$omp parallel do schedule(dynamic, 4) private(bb, q, n, info, t, k, r) if (B%nrow >= LINES_OMP_MIN)
+        !$omp parallel do schedule(dynamic, 4) private(bb, q, n, info, t, k, r, zc_) if (B%nrow >= LINES_OMP_MIN)
         do bb = 1, B%nb
           if (B%axblk(bb) .or. B%bcol(bb) /= c) cycle
           t = 0
           !$ t = omp_get_thread_num()
           n = B%sz(bb)
           do q = 1, n
-            r = B%rows(B%off(bb) + q) + 1
-            blk_t_work(q, t) = xp(r)
+            r = B%rows(B%off(bb) + q)
+            if (r < nr) then
+              blk_t_work(q, t) = xp(r + 1)
+            else
+              blk_t_work(q, t) = gp(r - nr + 1)
+            endif
             if (c == 1) then
-              do k = B%zp(r), B%zp(r + 1) - 1
-                blk_t_work(q, t) = blk_t_work(q, t) - B%zv(k) * yp(B%zc(k) + 1)
+              do k = B%zp(r + 1), B%zp(r + 2) - 1
+                zc_ = B%zc(k)
+                if (zc_ < nr) then
+                  blk_t_work(q, t) = blk_t_work(q, t) - B%zv(k) * yp(zc_ + 1)
+                else
+                  blk_t_work(q, t) = blk_t_work(q, t) - B%zv(k) * B%yg(zc_ - nr + 1)
+                endif
               enddo
             endif
           enddo
@@ -2200,7 +2699,12 @@ contains
             call dgetrs('N', n, 1, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), blk_t_work(1, t), n, info)
           endif
           do q = 1, n
-            yp(B%rows(B%off(bb) + q) + 1) = blk_t_work(q, t)
+            r = B%rows(B%off(bb) + q)
+            if (r < nr) then
+              yp(r + 1) = blk_t_work(q, t)
+            else if (c == 0) then
+              B%yg(r - nr + 1) = blk_t_work(q, t)
+            endif
           enddo
         enddo
         !$omp end parallel do
@@ -2208,7 +2712,26 @@ contains
         call VecRestoreArray(yy, yp, ie)
         call PetscLogEventEnd(gev_lines(cur_inst), ie)
       enddo
+      call ghosts_done(gp)
     end subroutine zebra_solve
+
+    !> gp = the input's values on the ghost rows (empty without overlap)
+    subroutine ghosts_in(xx, gp)
+      Vec :: xx
+      PetscScalar, pointer :: gp(:)
+      PetscErrorCode :: ie
+      gp => null()
+      if (.not. B%ovl) return
+      call VecScatterBegin(B%sct, xx, B%xg, INSERT_VALUES, SCATTER_FORWARD, ie)
+      call VecScatterEnd(B%sct, xx, B%xg, INSERT_VALUES, SCATTER_FORWARD, ie)
+      call VecGetArrayRead(B%xg, gp, ie)
+    end subroutine ghosts_in
+
+    subroutine ghosts_done(gp)
+      PetscScalar, pointer :: gp(:)
+      PetscErrorCode :: ie
+      if (B%ovl) call VecRestoreArrayRead(B%xg, gp, ie)
+    end subroutine ghosts_done
 
     !> y(axis rows) = axis-block solve of x(axis rows), on the axis ranks only
     subroutine ax_solve(xx, yy)

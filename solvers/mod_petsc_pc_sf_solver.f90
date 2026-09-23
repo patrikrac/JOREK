@@ -46,6 +46,15 @@ module mod_petsc_pc_sf_solver
   integer, parameter, public :: SF_GMG_SMOOTHER_ZEBRA = 7
   integer, parameter, public :: SF_GMG_AXIS_RINGS = 3   !< rings folded into the axis block
   integer, parameter, public :: SF_GMG_NSMOOTH    = 0   !< 0 = the smoother's own default (4)
+  !> Line smoothers across rank boundaries: each local radial-line segment is
+  !! extended by this many nodes into the neighbouring ranks' rows
+  !! (restricted additive Schwarz, Cai & Sarkis, SISC 21 (1999) 792). JOREK
+  !! partitions ring by ring, so without it every rank boundary cuts every
+  !! line. Workstream H2, 41x64, tstep 1, mean V-cycles per solve at np 8
+  !! (~5 rings per rank): pair_psi 5.3-6.5 without overlap, 2.3-2.4 with 1,
+  !! 2.0-2.2 with 2 or 3 (np 1: 2.0-2.2); pair_w 3.1-3.4 -> 2.1. 2 is the
+  !! smallest overlap that keeps the counts flat in np.
+  integer, parameter, public :: SF_GMG_LINE_OVERLAP = 2
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (physics_pc_pair_maxits = 30 for the packed pairs, physics_pc_rhot_gmg =
@@ -134,6 +143,7 @@ contains
       o%smoother     = smoother
       o%nsmooth      = SF_GMG_NSMOOTH
       o%axis_rings   = SF_GMG_AXIS_RINGS
+      o%line_overlap = SF_GMG_LINE_OVERLAP
       o%bnd_drop     = 1               ! Dirichlet DOFs out of the coarse spaces
       o%harm_split   = 1               ! the extracted blocks are |n|-diagonal
       o%axis_mult    = 0;  o%axis_split = 0;  o%smooth_op = 0;  o%ring_diag = 0
