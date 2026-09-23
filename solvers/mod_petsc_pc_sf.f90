@@ -348,6 +348,19 @@ contains
           call MatDestroy(M(k), ierr)
         enddo
       end block
+
+#if defined(PETSC_HAVE_MKL_SPARSE)
+      !--- threaded SpMV: PETSc's AIJ matvec is single-threaded per rank, and
+      !--- the level-0 matvecs are most of a V-cycle, so the operators the
+      !--- multigrid multiplies with become MKL's inspector-executor type (in
+      !--- place: same CSR arrays, so the value maps stay valid; the gather's
+      !--- assembly refreshes MKL's handle). LU backends keep plain AIJ.
+      if (bk_pj  == SF_GMG) call MatConvert(g_ctx%K_pj_aij, MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%K_pj_aij, ierr)
+      if (bk_w   == SF_GMG) call MatConvert(g_ctx%S_W_aij,  MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%S_W_aij,  ierr)
+      if (bk_rho == SF_GMG) call MatConvert(g_ctx%B_55,     MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%B_55,     ierr)
+      if (bk_T   == SF_GMG) call MatConvert(g_ctx%B_66,     MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%B_66,     ierr)
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: GMG operators converted to AIJMKL (threaded SpMV)"
+#endif
     end subroutine first_build_operators
 
   end subroutine sf_build
