@@ -132,6 +132,12 @@ module mod_petsc_pc_gmg
     IS  :: rest_is
     Mat :: Bra, Bar
     Vec :: xw, xw2, tr, ta
+    ! Smoother 7 (zebra radial lines): colour of each block (0 = even J lines,
+    ! the axis block and the I = 0 block; 1 = odd J lines), and the coupling of
+    ! the odd lines' rows to colour-0 columns, A(odd, even+axis), as local CSR
+    ! over the rank's rows (zp 1-based pointers, zc 0-based local columns).
+    integer, allocatable :: bcol(:), zp(:), zc(:)
+    real*8, allocatable  :: zv(:)
   end type blk_t
   type(blk_t), save, target :: gBk(0:MAX_LEV-1)
   type(rds_t), save :: gcrs                  !< the coarsest level's direct solve
@@ -279,6 +285,10 @@ contains
     if (allocated(a%band)) call move_alloc(a%band, b%band)
     if (allocated(a%loff)) call move_alloc(a%loff, b%loff)
     if (allocated(a%lu))   call move_alloc(a%lu,   b%lu)
+    if (allocated(a%bcol)) call move_alloc(a%bcol, b%bcol)
+    if (allocated(a%zp))   call move_alloc(a%zp,   b%zp)
+    if (allocated(a%zc))   call move_alloc(a%zc,   b%zc)
+    if (allocated(a%zv))   call move_alloc(a%zv,   b%zv)
   end subroutine move_blk
 
   subroutine move_rds(a, b)
@@ -1637,7 +1647,7 @@ contains
           I = glv(g)%rnode(r) / nc; J = mod(glv(g)%rnode(r), nc); m = glv(g)%rharm(r)
         endif
         B%bid(r) = blk_id(g, I, J, m, nc)
-        if (sm_type == 5) key(r) = I
+        if (sm_type == 5 .or. sm_type == 7) key(r) = I
         if (sm_type == 4) key(r) = J
         if (sm_type == 6) then                     ! rings run along J, radial lines along I
           if (I < ring_lim(g)) then
@@ -1712,6 +1722,19 @@ contains
         enddo
       endif
       B%axsparse = (axis_k /= 0)
+      allocate(B%bcol(B%nb))
+      B%bcol = 0
+      if (sm_type == 7) then
+        do bb = 1, B%nb
+          r = B%rows(B%off(bb) + 1) + 1
+          if (g == 0) then
+            I = fine_node(r) / nth0; J = mod(fine_node(r), nth0)
+          else
+            I = glv(g)%rnode(r) / glv(g)%nj; J = mod(glv(g)%rnode(r), glv(g)%nj)
+          endif
+          if (I /= 0 .and. .not. B%axblk(bb)) B%bcol(bb) = mod(J, 2)
+        enddo
+      endif
       if (B%axsparse) then
         allocate(axr(sum(B%sz, mask=B%axblk)))
         n = 0
@@ -1762,12 +1785,20 @@ contains
     ! band widths of the blocks as stored in A (pattern fixed across rebuilds,
     ! but recomputed: cheap next to the factorizations)
     B%kl = 0; B%ku = 0
+    if (sm_type == 7) then
+      if (allocated(B%zp)) deallocate(B%zp)
+      allocate(B%zp(nr + 1))
+      B%zp = 0
+    endif
     do r = 0, nr - 1
       bb = B%bid(r + 1); pr = B%pos(r + 1)
       call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
       do q = 1, int(ncols)
         lc = cols(q) - rst
         if (lc < 0 .or. lc >= nr) cycle              ! off-rank column: not in any local block
+        if (sm_type == 7) then
+          if (B%bcol(bb) == 1 .and. B%bcol(B%bid(lc + 1)) == 0) B%zp(r + 2) = B%zp(r + 2) + 1
+        endif
         if (B%bid(lc + 1) /= bb) cycle
         pcn = B%pos(lc + 1)
         B%kl(bb) = max(B%kl(bb), pr - pcn)
@@ -1793,15 +1824,29 @@ contains
     endif
     if (.not. allocated(B%lu)) allocate(B%lu(tot))
 
+    if (sm_type == 7) then
+      B%zp(1) = 1
+      do r = 1, nr
+        B%zp(r + 1) = B%zp(r + 1) + B%zp(r)
+      enddo
+      if (allocated(B%zc)) deallocate(B%zc, B%zv)
+      allocate(B%zc(B%zp(nr + 1) - 1), B%zv(B%zp(nr + 1) - 1))
+    endif
     B%lu = 0.0d0
     do r = 0, nr - 1
       bb = B%bid(r + 1)
       if (B%axblk(bb)) cycle
       pr = B%pos(r + 1)
       call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
+      kk = 0
       do q = 1, int(ncols)
         lc = cols(q) - rst
         if (lc < 0 .or. lc >= nr) cycle
+        if (sm_type == 7) then
+          if (B%bcol(bb) == 1 .and. B%bcol(B%bid(lc + 1)) == 0) then
+            B%zc(B%zp(r + 1) + kk) = int(lc); B%zv(B%zp(r + 1) + kk) = vals(q); kk = kk + 1
+          endif
+        endif
         if (B%bid(lc + 1) /= bb) cycle
         pcn = B%pos(lc + 1)
         B%lu(lu_index(B, bb, pr, pcn)) = vals(q)
@@ -1952,7 +1997,7 @@ contains
       blk_id = m + 1
     else if (sm_type == 4) then
       blk_id = n_tor + (I - 1) * n_tor + m + 1
-    else if (sm_type == 5) then
+    else if (sm_type == 5 .or. sm_type == 7) then
       blk_id = n_tor + J * n_tor + m + 1
     else if (sm_type == 6) then
       is_g = ring_lim(g)
@@ -2000,7 +2045,9 @@ contains
     type(blk_t), pointer :: B
 
     B => gBk(cur_lev)
-    if (.not. B%axsparse .or. axis_mult == 0) then
+    if (sm_type == 7) then
+      call zebra_solve(x, y)
+    else if (.not. B%axsparse .or. axis_mult == 0) then
       call lines_solve(x, y)
       if (B%axsparse) call ax_solve(x, y)
     else if (axis_mult == 2) then
@@ -2056,6 +2103,56 @@ contains
       call VecRestoreArray(yy, yp, ie)
       call PetscLogEventEnd(gev_lines(cur_inst), ie)
     end subroutine lines_solve
+
+    !> Smoother 7: one forward block Gauss-Seidel sweep over two colours of
+    !! radial lines (zebra line relaxation, Trottenberg-Oosterlee-Schueller
+    !! S5.1). Colour 0 (even J, plus the axis block) is solved from x; colour 1
+    !! (odd J) from x - A(odd, colour 0) y. A radial line couples only to the
+    !! lines at J +- 1, so odd lines never couple to each other and the sweep
+    !! is exact block Gauss-Seidel on the rank's rows. Same line factors and one
+    !! line pass as smoother 5, plus half a local matvec.
+    subroutine zebra_solve(xx, yy)
+      Vec :: xx, yy
+      PetscScalar, pointer :: xp(:), yp(:)
+      PetscErrorCode :: ie
+      integer :: bb, q, n, info, t, c, k, r
+      external :: dgetrs
+      do c = 0, 1
+        if (c == 1 .and. B%axsparse) call ax_solve(xx, yy)
+        call PetscLogEventBegin(gev_lines(cur_inst), ie)
+        call VecGetArrayRead(xx, xp, ie)
+        call VecGetArray(yy, yp, ie)
+        !$omp parallel do schedule(dynamic, 4) private(bb, q, n, info, t, k, r) if (B%nrow >= LINES_OMP_MIN)
+        do bb = 1, B%nb
+          if (B%axblk(bb) .or. B%bcol(bb) /= c) cycle
+          t = 0
+          !$ t = omp_get_thread_num()
+          n = B%sz(bb)
+          do q = 1, n
+            r = B%rows(B%off(bb) + q) + 1
+            blk_t_work(q, t) = xp(r)
+            if (c == 1) then
+              do k = B%zp(r), B%zp(r + 1) - 1
+                blk_t_work(q, t) = blk_t_work(q, t) - B%zv(k) * yp(B%zc(k) + 1)
+              enddo
+            endif
+          enddo
+          if (B%band(bb)) then
+            call band_solve(n, B%kl(bb), B%ku(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), &
+                            blk_t_work(1, t))
+          else
+            call dgetrs('N', n, 1, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), blk_t_work(1, t), n, info)
+          endif
+          do q = 1, n
+            yp(B%rows(B%off(bb) + q) + 1) = blk_t_work(q, t)
+          enddo
+        enddo
+        !$omp end parallel do
+        call VecRestoreArrayRead(xx, xp, ie)
+        call VecRestoreArray(yy, yp, ie)
+        call PetscLogEventEnd(gev_lines(cur_inst), ie)
+      enddo
+    end subroutine zebra_solve
 
     !> y(axis rows) = axis-block solve of x(axis rows), on the axis ranks only
     subroutine ax_solve(xx, yy)

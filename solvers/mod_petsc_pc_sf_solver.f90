@@ -22,6 +22,9 @@ module mod_petsc_pc_sf_solver
   !!                that is exact.
   !!   SF_GMG       FGMRES + PCSHELL on one V-cycle of the C1 geometric
   !!                multigrid (mod_petsc_pc_gmg), hierarchy instance gmg_inst.
+  !!                On a packed pair (nfields = 2) the smoother's blocks hold
+  !!                both fields, so the pair is smoothed collectively rather
+  !!                than split.
   !!   SF_ETASCHUR  pair_psi only: one application of the j-first lower block
   !!                factorisation with the eta-scaled Schur approximation
   !!
@@ -103,7 +106,7 @@ contains
   !! created once and re-pointed at the (refilled, pattern-frozen) operator,
   !! so MUMPS and the GMG both reuse their symbolic phases.
   !--------------------------------------------------------------------
-  subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, maxits)
+  subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, maxits, nfields)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4
@@ -117,16 +120,24 @@ contains
                                               !< exactly one V-cycle with no
                                               !< Krylov around it, which is what
                                               !< Shat gets inside SF_ETASCHUR.
+    integer, intent(in), optional :: nfields  !< SF_GMG only: fields packed per node
+                                              !< in A -- 2 for the mixed pairs, 1
+                                              !< (default) for a scalar block. The
+                                              !< line and node blocks then hold
+                                              !< every field of the line or node,
+                                              !< i.e. the smoothing is collective.
 
     PC :: pc
     PetscErrorCode :: ierr
     logical :: ok, fresh
-    integer :: mits
+    integer :: mits, nf
     character(len=24) :: tstr
 
     fresh        = .not. slv%created
     mits         = SF_GMG_MAXITS
     if (present(maxits)) mits = maxits
+    nf           = 1
+    if (present(nfields)) nf = nfields
     slv%backend  = backend
     slv%label    = label
     if (present(gmg_inst)) slv%gmg_inst = gmg_inst
@@ -148,7 +159,7 @@ contains
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)
       if (.not. gmg_is_ready()) then
-        call gmg_build_prolongations(A, comm, my_id, nfields(slv%gmg_inst), ok)
+        call gmg_build_prolongations(A, comm, my_id, nf, ok)
         if (.not. ok) then
           if (my_id == 0) write(*,'(A,A,A)') &
             "[Physics PC]   FATAL: the GMG backend for ", trim(label), &
@@ -197,14 +208,6 @@ contains
     end select
 
     slv%created = .true.
-
-  contains
-    !> Fields per node in hierarchy k's operator: the packed pairs carry two,
-    !! the scalar blocks one. Drives the prolongation's block size.
-    integer function nfields(k)
-      integer, intent(in) :: k
-      nfields = merge(2, 1, k == 1)
-    end function nfields
   end subroutine sf_solver_setup
 
   !--------------------------------------------------------------------

@@ -136,12 +136,14 @@ contains
     select case (trim(adjustl(physics_pc_sf_pair_psi)))
     case ("lu")
       bk_pj = SF_LU; pj_etaschur = .false.
+    case ("gmg")
+      bk_pj = SF_GMG; pj_etaschur = .false.
     case ("etaschur_lu")
       bk_pj = SF_ETASCHUR; bk_pj_shat = SF_LU;  pj_etaschur = .true.
     case ("etaschur_gmg")
       bk_pj = SF_ETASCHUR; bk_pj_shat = SF_GMG; pj_etaschur = .true.
     case default
-      call fatal("physics_pc_sf_pair_psi must be lu | etaschur_lu | etaschur_gmg, got '"// &
+      call fatal("physics_pc_sf_pair_psi must be lu | gmg | etaschur_lu | etaschur_gmg, got '"// &
                  trim(physics_pc_sf_pair_psi)//"'")
     end select
 
@@ -313,14 +315,18 @@ contains
       call sf_etaschur_setup(slv_pj, g_ctx%K_pj_aij, bk_pj_shat, comm, my_id, &
                              physics_pc_sf_rtol, SF_PSI_OUTER)
     else
+      ! GMG on the pair itself keeps psi and j split through the whole cycle
+      ! (Chacon JCP 526 (2025) S4.1): each smoother block holds both fields,
+      ! so no Schur approximation and no B_33 solve enter, and eta_num > 0 is
+      ! allowed -- hyper-resistivity keeps both rows second order.
       call sf_solver_setup(slv_pj, g_ctx%K_pj_aij, bk_pj, slv_pj%label, &
-                           comm, my_id, physics_pc_sf_rtol, gmg_inst=2)
+                           comm, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2)
     endif
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
     call PetscLogEventBegin(pcev_fact_w, ierr)
     call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
-                         comm, my_id, physics_pc_sf_rtol, gmg_inst=1)
+                         comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2)
     call PetscLogEventEnd(pcev_fact_w, ierr)
 
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
@@ -508,7 +514,7 @@ contains
     PetscErrorCode :: ierr
     call MPI_Comm_size(comm, np, mpierr)
     if (np == 1) return
-    if (bk_w /= SF_GMG .and. bk_pj_shat /= SF_GMG .and. &
+    if (bk_w /= SF_GMG .and. bk_pj /= SF_GMG .and. bk_pj_shat /= SF_GMG .and. &
         bk_rho /= SF_GMG .and. bk_T /= SF_GMG) return
     if (my_id == 0) write(*,'(A,I0,A)') &
       "[Physics PC]   FATAL: the GMG backends need np = 1 (got ", np, ")."
