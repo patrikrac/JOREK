@@ -56,14 +56,17 @@ contains
   !--------------------------------------------------------------------
   logical function physics_pc_needs_commutator_blocks()
     use phys_module, only: use_physics_pc, physics_pc_multi_step, &
-                          physics_pc_schur_variant
+                          physics_pc_schur_variant, physics_pc_sf
 
     ! "SFM" (Workstream B, the mixed-pair arm) is like "SF" here: it is built
     ! from raw B_ij blocks and mass inverses only, so it needs none of the
     ! assembled commutator element blocks. Without this exclusion every SFM run
     ! would pay for an assembly it never reads.
+    ! Same reasoning for the production path: it reads no commutator block and
+    ! does not read physics_pc_schur_variant at all, so it is excluded by name.
     physics_pc_needs_commutator_blocks = use_physics_pc .and. &
                                          physics_pc_multi_step .and. &
+                                         .not. physics_pc_sf .and. &
                                          trim(physics_pc_schur_variant) /= "SF" .and. &
                                          trim(physics_pc_schur_variant) /= "SFM" .and. &
                                          trim(physics_pc_schur_variant) /= "SFM2"
@@ -108,6 +111,7 @@ contains
                            physics_pc_psi_rtol
     use mod_petsc_matrix_analysis, only: petsc_mat_convert_spectrum, petsc_mat_equilibrate, &
                                          petsc_mat_diff_norm
+    use mod_petsc_pc_sf, only: sf_enabled, sf_build
 
     Mat, intent(in) :: A_full
 
@@ -125,6 +129,14 @@ contains
 
     call PetscObjectGetComm(A_full, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    ! The production path builds its own operators and its own solvers. It
+    ! branches BEFORE the mode check and before the extraction, so nothing in
+    ! this routine -- including its per-rebuild diagnostics -- runs on it.
+    if (sf_enabled()) then
+      call sf_build(A_full, comm, my_id)
+      return
+    endif
 
     ! --- PC mode mutual exclusivity check: exactly one mode must be set ---
     block

@@ -45,6 +45,7 @@ module mod_petsc_pc_gmg
 
   public :: gmg_build_prolongations, gmg_setup_operator, gmg_vcycle_apply, gmg_is_ready
   public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4
+  public :: gmg_pc_apply_1, gmg_pc_apply_2
 
   integer, parameter :: MAX_LEV   = 6
   integer, parameter :: SM_STEPS  = 4      !< GMRES iterations per smoothing (the paper's, and stage C1's)
@@ -193,7 +194,10 @@ module mod_petsc_pc_gmg
   ! physics-PC ctx, so this module keeps no dependency on it.
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1, gev_axislu = -1
   PetscLogEvent, save :: gev_axis = -1
-  PetscLogEvent, save :: gev_lines = -1, gev_axsolve = -1   !< the block smoother's two halves
+  ! Workstream G, finding D3: these are per INSTANCE, like gev_vcycle. While
+  ! they were shared, no -log_view number could attribute line or axis time to
+  ! pair_w rather than to Shat / rho / T, which is what left C1's rank soft.
+  PetscLogEvent, save :: gev_lines(4) = -1, gev_axsolve(4) = -1   !< the block smoother's two halves
   ! per hierarchy instance (1 = pair_w keeps the original names, 2 = GMG2_*)
   PetscLogEvent, save :: gev_vcycle(4) = -1, gev_smooth0(4) = -1, gev_smooth(4) = -1, gev_coarse(4) = -1
   logical, save       :: gev_ready = .false.
@@ -627,7 +631,25 @@ contains
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
   end subroutine gmg_vcycle
 
-  !> PC-shell entry points of the rho (3) and T (4) hierarchies.
+  !> PC-shell entry points of the pair_w (1), Shat (2), rho (3) and T (4)
+  !! hierarchies. gmg_vcycle_apply is instance 1's historical name and is kept
+  !! so the research path's PCShellSetApply is unchanged; gmg_pc_apply_1 is the
+  !! same callback under the uniform name the production path selects by index.
+  subroutine gmg_pc_apply_1(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call gmg_vcycle_apply(pc, b, x, ierr)
+  end subroutine gmg_pc_apply_1
+
+  subroutine gmg_pc_apply_2(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call gmg_vcycle(2, b, x)
+    ierr = 0
+  end subroutine gmg_pc_apply_2
+
   subroutine gmg_pc_apply_3(pc, b, x, ierr)
     PC  :: pc
     Vec :: b, x
@@ -1343,8 +1365,15 @@ contains
     endif
     call rds_setup(gcrs, gA(nlev - 1), "coarse", "coarse level")
     call PetscLogEventEnd(gev_coarselu, ierr)
-    ! Wiring gate at every build (one coarse solve): the redundant solve must
-    ! be exact. Printed on the first build, and loudly whenever it is not.
+    ! Wiring gate (one coarse solve): the redundant solve must be exact.
+    ! Workstream G, finding A1: FIRST BUILD ONLY. It used to run on every PC
+    ! rebuild -- a random vector, two MatMults, a full coarse solve and four
+    ! VecNorms (four collectives) -- while printing only on the first build or
+    ! on failure. What it gates is the WIRING of rds_t against the coarse
+    ! operator, and the pattern is frozen after the first build, so a later
+    ! rebuild cannot break the wiring without also changing the pattern (which
+    ! pattern_sig catches on its own). Apply-neutral either way.
+    if (.not. op_ready) then
     block
         Vec :: cb, cx, cr
         real*8 :: rn, bn, xn, en
@@ -1369,6 +1398,7 @@ contains
           rn > 1.d-8 * bn), rn / max(bn, 1.d-300), " (residual), ", xn / max(en, 1.d-300)
         call VecDestroy(cb, ierr); call VecDestroy(cx, ierr); call VecDestroy(cr, ierr)
     end block
+    endif
 
     ! The exact axis patch is only applied with the point-Jacobi smoothers; the
     ! block smoothers carry the axis ring as one block of their own.
@@ -1395,6 +1425,11 @@ contains
       vec_ready = .true.
     endif
     if (.not. sm_blocks) call MatDestroy(Aax, ierr)        ! gAxis holds its own reference
+    ! Workstream G, findings A2/A3: the boundary-row scans and the C_op report
+    ! are FIRST BUILD ONLY. Both describe the hierarchy's STRUCTURE -- which is
+    ! frozen after the first build -- yet re-ran every rebuild, the C_op loop
+    ! costing 2*nlev collectives each time. Apply-neutral.
+    if (op_ready) return
     op_ready = .true.
     if (diag_left > 0) call report_bnd_rows(gA(0))
     if (physics_pc_gmg_bnd_drop > 0) call check_bnd_rows(gA(0))
@@ -1499,8 +1534,14 @@ contains
     call PetscLogEventRegister("GMG4_SmoothC", cid, gev_smooth(4),  ierr)
     call PetscLogEventRegister("GMG4_Coarse",  cid, gev_coarse(4),  ierr)
     call PetscLogEventRegister("GMG_Axis",     cid, gev_axis,     ierr)
-    call PetscLogEventRegister("GMG_Lines",    cid, gev_lines,    ierr)
-    call PetscLogEventRegister("GMG_AxSolve",  cid, gev_axsolve,  ierr)
+    call PetscLogEventRegister("GMG_Lines",    cid, gev_lines(1),   ierr)
+    call PetscLogEventRegister("GMG_AxSolve",  cid, gev_axsolve(1), ierr)
+    call PetscLogEventRegister("GMG2_Lines",   cid, gev_lines(2),   ierr)
+    call PetscLogEventRegister("GMG2_AxSolve", cid, gev_axsolve(2), ierr)
+    call PetscLogEventRegister("GMG3_Lines",   cid, gev_lines(3),   ierr)
+    call PetscLogEventRegister("GMG3_AxSolve", cid, gev_axsolve(3), ierr)
+    call PetscLogEventRegister("GMG4_Lines",   cid, gev_lines(4),   ierr)
+    call PetscLogEventRegister("GMG4_AxSolve", cid, gev_axsolve(4), ierr)
     gev_ready = .true.
   end subroutine gmg_register_events
 
@@ -1987,7 +2028,7 @@ contains
       PetscErrorCode :: ie
       integer :: bb, q, n, info, t
       external :: dgetrs
-      call PetscLogEventBegin(gev_lines, ie)
+      call PetscLogEventBegin(gev_lines(cur_inst), ie)
       call VecGetArrayRead(xx, xp, ie)
       call VecGetArray(yy, yp, ie)
       ! small (coarse) levels stay serial: fork/join would cost more than the work
@@ -2013,7 +2054,7 @@ contains
       !$omp end parallel do
       call VecRestoreArrayRead(xx, xp, ie)
       call VecRestoreArray(yy, yp, ie)
-      call PetscLogEventEnd(gev_lines, ie)
+      call PetscLogEventEnd(gev_lines(cur_inst), ie)
     end subroutine lines_solve
 
     !> y(axis rows) = axis-block solve of x(axis rows), on the axis ranks only
@@ -2022,13 +2063,13 @@ contains
       PetscErrorCode :: ie
       PetscScalar, pointer :: xp(:), yp(:)
       if (.not. any(B%axg(:)%member)) return
-      call PetscLogEventBegin(gev_axsolve, ie)
+      call PetscLogEventBegin(gev_axsolve(cur_inst), ie)
       call VecGetArrayRead(xx, xp, ie)
       call VecGetArray(yy, yp, ie)
       call rds_solve_groups(B%axg, xp, yp)
       call VecRestoreArray(yy, yp, ie)
       call VecRestoreArrayRead(xx, xp, ie)
-      call PetscLogEventEnd(gev_axsolve, ie)
+      call PetscLogEventEnd(gev_axsolve(cur_inst), ie)
     end subroutine ax_solve
 
     !> w = x, then w(to rows) -= C y(from rows), C = A(to, from)

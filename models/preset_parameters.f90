@@ -679,6 +679,12 @@ subroutine preset_parameters
   physics_pc_dump_blocks     = 0            ! Workstream C: dump SFM2 operators + grid for the offline GMG probe (0=off)
   physics_pc_force_operator  = 0            ! Workstream E: assemble the composed force operator W (0=off, 1=assemble+dump)
   physics_pc_suu_form        = 0            ! Workstream E: pair_w (1,1) block (0=triple product, 1=composed B_22 + W)
+  physics_pc_sf              = .false.       ! Production SFM2 path (mod_petsc_pc_sf); ignores every research physics_pc_* flag
+  physics_pc_sf_pair_psi     = "lu"          ! pair_psi backend: lu | etaschur_lu | etaschur_gmg
+  physics_pc_sf_pair_w       = "gmg"         ! pair_w backend: gmg | lu
+  physics_pc_sf_rho          = "lu"          ! rho block backend: lu | gmg
+  physics_pc_sf_T            = "lu"          ! T block backend: lu | gmg
+  physics_pc_sf_rtol         = 1.d-1         ! shared inner rtol for the iterative backends
   physics_pc_psi_rtol        = -1.d0        ! Workstream F: pair_psi-only rtol; < 0 = fall back to physics_pc_pair_rtol
   physics_pc_corrector_form  = 0            ! Workstream F: LDU step 3 (0=full pair_psi solve/Eq.16, 1=diagonal surrogate/Eq.17)
   physics_pc_psi_schur       = 0            ! Workstream C: pair_psi by the eta-scaled j-first Schur (0=off, 1=LU Shat, 2=Jacobi+axis patch)

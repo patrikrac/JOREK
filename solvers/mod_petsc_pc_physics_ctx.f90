@@ -324,9 +324,16 @@ contains
   !! Atilde from an unassembled correction.
   !--------------------------------------------------------------------
   logical function physics_pc_mixed_arm()
-    use phys_module, only: physics_pc_schur_variant
+    use phys_module, only: physics_pc_schur_variant, physics_pc_sf
 
-    physics_pc_mixed_arm = (trim(physics_pc_schur_variant) == "SFM" .or. &
+    ! The production path (physics_pc_sf) is the same mixed-pair sweep and
+    ! likewise reads none of the Atilde_* / commutator element blocks. It must
+    ! be listed here explicitly: physics_pc_schur_variant is a RESEARCH flag
+    ! that the production path ignores, so it still holds its default "SF",
+    ! which would otherwise put a full element-loop assembly -- one this path
+    ! never reads -- into every Newton step.
+    physics_pc_mixed_arm = physics_pc_sf .or. &
+                           (trim(physics_pc_schur_variant) == "SFM" .or. &
                             trim(physics_pc_schur_variant) == "SFM2")
   end function physics_pc_mixed_arm
 

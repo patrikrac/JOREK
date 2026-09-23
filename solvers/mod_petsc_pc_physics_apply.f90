@@ -3,6 +3,8 @@ module mod_petsc_pc_physics_apply
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
+  use mod_petsc_pc_blocks, only: split_vars, merge_vars
+  use mod_petsc_pc_sf,     only: sf_enabled, sf_apply
   use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
        pcev_apply, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, &
        pw_its_sum, pw_its_max, pw_nsolve, pp_its_sum, pp_its_max, pp_nsolve, &
@@ -934,6 +936,14 @@ contains
       return
     endif
 
+    ! The production path owns its own sweep, its own work vectors and its own
+    ! block solvers, so it branches here rather than threading flags through
+    ! the research dispatch below.
+    if (sf_enabled()) then
+      call sf_apply(x, y, ierr)
+      return
+    endif
+
     ! Begin AFTER the early return, so an aborted apply cannot leave the event
     ! stack unbalanced.
     call PetscLogEventBegin(pcev_apply, ierr)
@@ -1051,54 +1061,8 @@ contains
     ierr = 0
   end subroutine physics_pc_apply
 
-  !> v(k) = variable k of the full-system vector x (k = 1..6): local rows
-  !! node*bs + (k-1)*n_tor + m -> node*n_tor + m, bs = n_var*n_tor, exactly the
-  !! map of create_variable_index_sets. Rank-local, no communication.
-  subroutine split_vars(x, v)
-    use mod_parameters, only: n_var, n_tor
-    Vec :: x
-    Vec :: v(6)
-    PetscScalar, pointer :: xa(:), va(:)
-    PetscErrorCode :: ierr
-    PetscInt :: nl
-    integer :: k, i, bs, nn
-    call VecGetLocalSize(x, nl, ierr)
-    bs = n_var * n_tor
-    nn = int(nl) / bs
-    call VecGetArrayRead(x, xa, ierr)
-    do k = 1, 6
-      call VecGetArray(v(k), va, ierr)
-      do i = 0, nn - 1
-        va(i * n_tor + 1 : (i + 1) * n_tor) = xa(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor)
-      enddo
-      call VecRestoreArray(v(k), va, ierr)
-    enddo
-    call VecRestoreArrayRead(x, xa, ierr)
-  end subroutine split_vars
-
-  !> Inverse of split_vars: variables 1..6 of y from v(k); any further
-  !! variables of y (n_var > 6) are left untouched, as before.
-  subroutine merge_vars(v, y)
-    use mod_parameters, only: n_var, n_tor
-    Vec :: v(6)
-    Vec :: y
-    PetscScalar, pointer :: ya(:), va(:)
-    PetscErrorCode :: ierr
-    PetscInt :: nl
-    integer :: k, i, bs, nn
-    call VecGetLocalSize(y, nl, ierr)
-    bs = n_var * n_tor
-    nn = int(nl) / bs
-    call VecGetArray(y, ya, ierr)
-    do k = 1, 6
-      call VecGetArrayRead(v(k), va, ierr)
-      do i = 0, nn - 1
-        ya(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor) = va(i * n_tor + 1 : (i + 1) * n_tor)
-      enddo
-      call VecRestoreArrayRead(v(k), va, ierr)
-    enddo
-    call VecRestoreArray(y, ya, ierr)
-  end subroutine merge_vars
+  ! split_vars / merge_vars moved to mod_petsc_pc_blocks (shared with the
+  ! production path; the bodies are unchanged).
 
 #endif
 end module mod_petsc_pc_physics_apply

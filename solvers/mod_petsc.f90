@@ -380,6 +380,7 @@ contains
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
     use mod_petsc_pc_commutator_analysis, only: petsc_commutator_run_analysis
     use mod_petsc_pc_physics_ctx, only: physics_pc_report_inner, physics_pc_mem
+    use mod_petsc_pc_sf, only: sf_enabled, sf_report
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -404,8 +405,14 @@ contains
     ! at 81x32) is never made. A_aij then ALIASES A, which JOREK creates once and
     ! refills in place every step; the extra reference keeps petsc_cleanup's
     ! MatDestroy(A_aij) balanced.
-    no_aij = use_physics_pc .and. physics_pc_lean_setup >= 3 .and. &
-             physics_pc_harm_split /= 0 .and. .not. commutator_analysis
+    ! The production path always qualifies and does not read
+    ! physics_pc_lean_setup: it reads its blocks row by row and forces
+    ! physics_pc_harm_split = 1, so the AIJ copy has no reader on it. Note the
+    ! forcing happens in sf_init, which runs LATER than this line, so the test
+    ! here must be sf_enabled() rather than the flag it will set.
+    no_aij = use_physics_pc .and. .not. commutator_analysis .and. &
+             (sf_enabled() .or. (physics_pc_lean_setup >= 3 .and. &
+                                 physics_pc_harm_split /= 0))
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
     if (.not. petsc_sys%ksp_ready) then
@@ -518,7 +525,14 @@ contains
     ! reported, so a run's cost could only be read off the wall time.
     if (my_id == 0) write(*,'(A,I5,A,I0)') &
       "[PETSc] outer iterations: ", n_iter, "   converged reason: ", reason%v
-    if (use_physics_pc) call physics_pc_report_inner(my_id)
+    if (use_physics_pc) then
+      ! The production path keeps its counters in its own block solvers.
+      if (sf_enabled()) then
+        call sf_report(my_id)
+      else
+        call physics_pc_report_inner(my_id)
+      endif
+    endif
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
