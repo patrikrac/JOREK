@@ -153,23 +153,23 @@ contains
       call gmg_setup_operator(A, comm, my_id, tag=trim(label), opts=o)
       call gmg_select(1)
 
-      !--- the Krylov wrapper. Rebuilt rather than re-pointed: the PCSHELL
-      !--- holds no operator reference, so there is nothing to keep.
-      if (.not. fresh) call KSPDestroy(slv%ksp, ierr)
-      call KSPCreate(comm, slv%ksp, ierr)
+      !--- the Krylov wrapper: created once, re-pointed at every rebuild
+      if (fresh) then
+        call KSPCreate(comm, slv%ksp, ierr)
+        call KSPSetType(slv%ksp, KSPFGMRES, ierr)
+        call KSPGMRESSetRestart(slv%ksp, max(maxits, 2), ierr)
+        call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, maxits, ierr)
+        call KSPGetPC(slv%ksp, pc, ierr)
+        call PCSetType(pc, PCSHELL, ierr)
+        select case (slv%gmg_inst)
+        case (1); call PCShellSetApply(pc, gmg_pc_apply_1, ierr)
+        case (2); call PCShellSetApply(pc, gmg_pc_apply_2, ierr)
+        case (3); call PCShellSetApply(pc, gmg_pc_apply_3, ierr)
+        case (4); call PCShellSetApply(pc, gmg_pc_apply_4, ierr)
+        end select
+        call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
+      endif
       call KSPSetOperators(slv%ksp, A, A, ierr)
-      call KSPSetType(slv%ksp, KSPFGMRES, ierr)
-      call KSPGMRESSetRestart(slv%ksp, max(maxits, 2), ierr)
-      call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, maxits, ierr)
-      call KSPGetPC(slv%ksp, pc, ierr)
-      call PCSetType(pc, PCSHELL, ierr)
-      select case (slv%gmg_inst)
-      case (1); call PCShellSetApply(pc, gmg_pc_apply_1, ierr)
-      case (2); call PCShellSetApply(pc, gmg_pc_apply_2, ierr)
-      case (3); call PCShellSetApply(pc, gmg_pc_apply_3, ierr)
-      case (4); call PCShellSetApply(pc, gmg_pc_apply_4, ierr)
-      end select
-      call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       call KSPSetUp(slv%ksp, ierr)
       write(tstr,'(ES9.2)') rtol
       call pc_print_block_setup(comm, label, &

@@ -399,15 +399,23 @@ contains
       call ISCreateGeneral(PETSC_COMM_SELF, int(ntot, kind(rst)), int(gl, kind(rst)), &
                            PETSC_COPY_VALUES, R%isq, ierr)
       deallocate(gl)
-    else
-      ! Re-extracted at every rebuild. MAT_REUSE_MATRIX refills of this
-      ! gathered submatrix left it out of date at np > 1 (coarse self-check
-      ! residual 1e-6 .. 6 from the second build on, exact at np = 1); the
-      ! extraction and the symbolic LU of these small blocks cost little.
-      call MatDestroySubMatrices(one, R%sub, ierr)
     endif
     ! collective on A's communicator (non-members pass an empty IS)
-    call MatCreateSubMatrices(A, one, [R%isq], [R%isq], MAT_INITIAL_MATRIX, R%sub, ierr)
+    ! Extracted and analysed ONCE; later rebuilds refill the values in place
+    ! and refactor numerically only. The assembly after the refill is not
+    ! optional: at np > 1 MAT_REUSE_MATRIX refills the values WITHOUT advancing
+    ! the submatrix's object state, so PCSetUp would silently keep the old
+    ! factor (measured: coarse self-check error 2e-3 from the second build on,
+    ! and two numeric factorisations missing per rebuild). That missing state
+    ! bump was the whole of the old "stale at np > 1" bug, previously worked
+    ! around by re-extracting and re-analysing at every rebuild.
+    if (.not. R%ready) then
+      call MatCreateSubMatrices(A, one, [R%isq], [R%isq], MAT_INITIAL_MATRIX, R%sub, ierr)
+    else
+      call MatCreateSubMatrices(A, one, [R%isq], [R%isq], MAT_REUSE_MATRIX, R%sub, ierr)
+      call MatAssemblyBegin(R%sub(1), MAT_FINAL_ASSEMBLY, ierr)
+      call MatAssemblyEnd(R%sub(1), MAT_FINAL_ASSEMBLY, ierr)
+    endif
     if (R%solver .and. axis_droptol > 0.d0 .and. what(1:2) == "ax") then
       if (R%filtered) call MatDestroy(R%flt, ierr)
       call rds_filter(R, tag, .not. R%ready)
@@ -1294,9 +1302,7 @@ contains
           call MatDestroy(gA(g), ierr)
         enddo
       endif
-      do g = 0, nlev - 2
-        call KSPDestroy(gSm(g), ierr)
-      enddo
+      ! the level smoothers' KSPs are kept (created once, re-pointed below)
       if (.not. sm_blocks) call KSPDestroy(gAxis, ierr)   ! sm_blocks: still last setup's
     endif
 
@@ -1344,7 +1350,9 @@ contains
       write(*,'(A)') "[Physics PC]   GMG: physics_pc_gmg_axis_split needs physics_pc_harm_split = 1; ignored"
     diag_left = max(o%ring_diag, 0)
     do g = 0, nlev - 2
-      call KSPCreate(comm, gSm(g), ierr)
+      ! Created and configured once per hierarchy; a rebuild only re-points
+      ! the operators and refactors the smoother blocks.
+      if (.not. op_ready) call KSPCreate(comm, gSm(g), ierr)
       if (g == 0 .and. o%smooth_op == 0) then
         call KSPSetOperators(gSm(g), gF, gA(g), ierr)     ! Jacobi reads the Pmat
       else
@@ -1353,27 +1361,29 @@ contains
         ! -- one exact-mass solve per matvec there instead of per GMRES step
         call KSPSetOperators(gSm(g), gA(g), gA(g), ierr)
       endif
-      if (sm_type == 1 .or. sm_type == 2) then
-        call KSPSetType(gSm(g), KSPRICHARDSON, ierr)
-        call KSPRichardsonSetScale(gSm(g), o%omega, ierr)
-        call KSPSetNormType(gSm(g), KSP_NORM_NONE, ierr)
-        call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, sm_nstep, ierr)
-      else
-        call KSPSetType(gSm(g), KSPGMRES, ierr)
-        call KSPGMRESSetRestart(gSm(g), sm_nstep, ierr)
-        call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, sm_nstep, ierr)
-        call KSPSetPCSide(gSm(g), PC_RIGHT, ierr)
+      if (.not. op_ready) then
+        if (sm_type == 1 .or. sm_type == 2) then
+          call KSPSetType(gSm(g), KSPRICHARDSON, ierr)
+          call KSPRichardsonSetScale(gSm(g), o%omega, ierr)
+          call KSPSetNormType(gSm(g), KSP_NORM_NONE, ierr)
+          call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, sm_nstep, ierr)
+        else
+          call KSPSetType(gSm(g), KSPGMRES, ierr)
+          call KSPGMRESSetRestart(gSm(g), sm_nstep, ierr)
+          call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, sm_nstep, ierr)
+          call KSPSetPCSide(gSm(g), PC_RIGHT, ierr)
+        endif
+        call KSPSetInitialGuessNonzero(gSm(g), PETSC_TRUE, ierr)
+        call KSPGetPC(gSm(g), pc, ierr)
+        if (sm_blocks) then
+          call PCSetType(pc, PCSHELL, ierr)
+          call PCShellSetApply(pc, blk_apply, ierr)
+          call PCShellSetName(pc, "C1 node-block Jacobi", ierr)
+        else
+          call PCSetType(pc, PCJACOBI, ierr)
+        endif
       endif
-      call KSPSetInitialGuessNonzero(gSm(g), PETSC_TRUE, ierr)
-      call KSPGetPC(gSm(g), pc, ierr)
-      if (sm_blocks) then
-        call build_blocks(g, gA(g))
-        call PCSetType(pc, PCSHELL, ierr)
-        call PCShellSetApply(pc, blk_apply, ierr)
-        call PCShellSetName(pc, "C1 node-block Jacobi", ierr)
-      else
-        call PCSetType(pc, PCJACOBI, ierr)
-      endif
+      if (sm_blocks) call build_blocks(g, gA(g))
       call KSPSetUp(gSm(g), ierr)
     enddo
     call PetscLogEventEnd(gev_smsetup, ierr)
