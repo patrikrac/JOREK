@@ -33,8 +33,7 @@ subroutine gmres2_driver(a_mat,b,x,n,solver,converged)
   logical :: right_prec
   !> Relative threshold below which h_{j+1,j} is treated as a (happy) breakdown
   real(kind=8), parameter :: bd_tol = 1.d-14
-  !> Smallest relative residual ||r||/||b|| that is attainable in double precision. The
-  !> convergence target is never set below this, otherwise we chase round-off until iter_max.
+  !> Floor on the relative residual ||r||/||b||. The convergence target is never set below this.
   real(kind=8), parameter :: res_floor = 1.d-14
   !> V : Arnoldi basis (restart+1 columns), Z : M^-1 V (restart columns, right prec. only),
   !> w_ : scratch vector of length n
@@ -222,6 +221,9 @@ subroutine gmres2_driver(a_mat,b,x,n,solver,converged)
         ! A hard breakdown zeroes rho as well -> no convergence.
         converged = ((rho .le. res_target) .or. (rho .lt. atol)) .and. (.not. hard_breakdown)
         nrit = it-1
+        ! The last column of the triangular factor is zero after a hard breakdown: drop it
+        ! and keep the iterate of the previous step instead of dividing by zero.
+        if (hard_breakdown) nrit = it-2
         exit
       endif
 
