@@ -70,9 +70,11 @@ module mod_petsc_pc_sf
   !!
   !! Of the ~61 research physics_pc_* flags, this path READS exactly one --
   !! physics_pc_force_operator, which must be 1 because W is assembled at
-  !! element level -- and FORCES four (harm_split and the three GMG structure
-  !! knobs) to the values it implies, loudly, in sf_init. Every other one is
-  !! ignored, so a production deck cannot inherit a research setting.
+  !! element level -- and FORCES one, physics_pc_harm_split = 1, which the
+  !! block extraction reads. Every other one is ignored: the GMG receives its
+  !! whole configuration explicitly (gmg_opts_t, from the constants in
+  !! mod_petsc_pc_sf_solver), so a production deck cannot inherit a research
+  !! setting.
   !!
   !! It is also excluded, by name rather than by a flag it happens to leave at
   !! a default, from three costs elsewhere in the solver: the commutator
@@ -124,8 +126,7 @@ contains
   subroutine sf_init(my_id)
     use phys_module, only: physics_pc_sf_pair_psi, physics_pc_sf_pair_w, &
                            physics_pc_sf_rho, physics_pc_sf_T, physics_pc_sf_rtol, &
-                           physics_pc_force_operator, physics_pc_harm_split, &
-                           physics_pc_gmg_axis_rings, physics_pc_gmg_bnd_drop
+                           physics_pc_force_operator, physics_pc_harm_split
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
 
@@ -143,8 +144,6 @@ contains
 
     !--- settings this path implies. Forced, not offered.
     call force_int(physics_pc_harm_split,      1, "physics_pc_harm_split")
-    call force_int(physics_pc_gmg_axis_rings,  SF_GMG_AXIS_RINGS, "physics_pc_gmg_axis_rings")
-    call force_int(physics_pc_gmg_bnd_drop,    1, "physics_pc_gmg_bnd_drop")
 
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] ================ production SFM2 path ================"
@@ -209,8 +208,6 @@ contains
 
     call sf_init(my_id)
     first = sf_first
-
-    call require_serial(comm, my_id)
 
     !--- index sets ------------------------------------------------------
     if (.not. g_ctx%is_created) call create_variable_index_sets(A_full, comm)
@@ -478,23 +475,6 @@ contains
     call sf_solver_reset_counters(slv_rho)
     call sf_solver_reset_counters(slv_T)
   end subroutine sf_report
-
-  !> The packed-pair layout assumes rank-contiguous [field-1 | field-2] rows,
-  !! which pack_pair_aij produces at any np; but the C1 GMG's hierarchy is
-  !! built from the serial flux-surface grid. Kept as one explicit gate rather
-  !! than discovered as a wrong answer.
-  subroutine require_serial(comm, my_id)
-    integer, intent(in) :: comm, my_id
-    integer :: np, mpierr
-    PetscErrorCode :: ierr
-    call MPI_Comm_size(comm, np, mpierr)
-    if (np == 1) return
-    if (bk_w /= SF_GMG .and. bk_pj /= SF_GMG .and. &
-        bk_rho /= SF_GMG .and. bk_T /= SF_GMG) return
-    if (my_id == 0) write(*,'(A,I0,A)') &
-      "[Physics PC]   FATAL: the GMG backends need np = 1 (got ", np, ")."
-    call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
-  end subroutine require_serial
 
 #endif
 end module mod_petsc_pc_sf

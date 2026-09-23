@@ -91,7 +91,7 @@ contains
                              nfields, smoother, maxits)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
-                                gmg_pc_apply_3, gmg_pc_apply_4
+                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_opts_t
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
     integer, intent(in)          :: backend, comm, my_id
@@ -108,6 +108,7 @@ contains
     PetscErrorCode :: ierr
     logical :: ok, fresh
     character(len=24) :: tstr
+    type(gmg_opts_t) :: o
 
     fresh        = .not. slv%created
     slv%backend  = backend
@@ -128,10 +129,20 @@ contains
       if (fresh) call physics_pc_mumps_mem(slv%ksp, label, my_id)
 
     case (SF_GMG)
+      !--- the complete hierarchy configuration, from this module's constants
+      !--- only: no physics_pc_gmg_* namelist entry reaches this path.
+      o%smoother     = smoother
+      o%nsmooth      = SF_GMG_NSMOOTH
+      o%axis_rings   = SF_GMG_AXIS_RINGS
+      o%bnd_drop     = 1               ! Dirichlet DOFs out of the coarse spaces
+      o%harm_split   = 1               ! the extracted blocks are |n|-diagonal
+      o%axis_mult    = 0;  o%axis_split = 0;  o%smooth_op = 0;  o%ring_diag = 0
+      o%omega        = 0.7d0;  o%axis_droptol = 0.d0;  o%ring_aspect = 1.d0
+
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)
       if (.not. gmg_is_ready()) then
-        call gmg_build_prolongations(A, comm, my_id, nfields, ok)
+        call gmg_build_prolongations(A, comm, my_id, nfields, ok, opts=o)
         if (.not. ok) then
           if (my_id == 0) write(*,'(A,A,A)') &
             "[Physics PC]   FATAL: the GMG backend for ", trim(label), &
@@ -139,8 +150,7 @@ contains
           call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
         endif
       endif
-      call gmg_setup_operator(A, comm, my_id, tag=trim(label), &
-                              smoother=smoother, nsmooth=SF_GMG_NSMOOTH)
+      call gmg_setup_operator(A, comm, my_id, tag=trim(label), opts=o)
       call gmg_select(1)
 
       !--- the Krylov wrapper. Rebuilt rather than re-pointed: the PCSHELL

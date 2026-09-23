@@ -46,6 +46,26 @@ module mod_petsc_pc_gmg
   public :: gmg_build_prolongations, gmg_setup_operator, gmg_vcycle_apply, gmg_is_ready
   public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4
   public :: gmg_pc_apply_1, gmg_pc_apply_2
+  public :: gmg_opts_t, gmg_opts_from_namelist
+
+  !> Everything that configures a hierarchy, passed EXPLICITLY. A caller that
+  !! passes it (the production SF path) is independent of every
+  !! physics_pc_gmg_* namelist entry; a caller that does not gets
+  !! gmg_opts_from_namelist(), i.e. exactly the research path's behaviour.
+  type :: gmg_opts_t
+    integer :: smoother     = 0      !< level smoother code (see physics_pc_gmg_smoother)
+    integer :: nsmooth      = 0      !< smoothing steps; <= 0 = the smoother's default
+    integer :: axis_rings   = 0      !< axis block extent: rings 0..k; -1 = by physical radius
+    integer :: axis_mult    = 0      !< axis/lines coupling (0 = additive)
+    integer :: axis_split   = 0      !< one axis solve per |n| group, on distinct ranks
+    integer :: smooth_op    = 0      !< 1 = fine smoother on the assembled surrogate
+    integer :: ring_diag    = 0      !< diagnostic samples per rebuild (0 = off)
+    integer :: bnd_drop     = 0      !< drop Dirichlet DOFs from the coarse spaces
+    integer :: harm_split   = 0      !< operator is block-diagonal in |n|
+    real*8  :: omega        = 0.7d0  !< Richardson damping (smoothers 1, 2)
+    real*8  :: axis_droptol = 0.d0   !< relative drop tolerance of the axis block
+    real*8  :: ring_aspect  = 1.d0   !< smoother 6 / axis_rings -1 switch radius
+  end type gmg_opts_t
 
   integer, parameter :: MAX_LEV   = 6
   integer, parameter :: SM_STEPS  = 4      !< GMRES iterations per smoothing (the paper's, and stage C1's)
@@ -217,6 +237,21 @@ module mod_petsc_pc_gmg
   integer, parameter :: PQ_J(0:3) = [0, 0, 1, 1]   !< ... and in j
 
 contains
+
+  !> The research path's configuration: every field from its namelist entry.
+  function gmg_opts_from_namelist() result(o)
+    use phys_module, only: physics_pc_gmg_smoother, physics_pc_gmg_nsmooth, physics_pc_gmg_omega, &
+                           physics_pc_gmg_axis_rings, physics_pc_gmg_ring_diag, physics_pc_gmg_axis_mult, &
+                           physics_pc_gmg_bnd_drop, physics_pc_gmg_smooth_op, physics_pc_gmg_axis_split, &
+                           physics_pc_harm_split, physics_pc_gmg_axis_droptol, physics_pc_gmg_ring_aspect
+    type(gmg_opts_t) :: o
+    o%smoother = physics_pc_gmg_smoother;    o%nsmooth = physics_pc_gmg_nsmooth
+    o%axis_rings = physics_pc_gmg_axis_rings; o%axis_mult = physics_pc_gmg_axis_mult
+    o%axis_split = physics_pc_gmg_axis_split; o%smooth_op = physics_pc_gmg_smooth_op
+    o%ring_diag = physics_pc_gmg_ring_diag;   o%bnd_drop = physics_pc_gmg_bnd_drop
+    o%harm_split = physics_pc_harm_split;     o%omega = physics_pc_gmg_omega
+    o%axis_droptol = physics_pc_gmg_axis_droptol; o%ring_aspect = physics_pc_gmg_ring_aspect
+  end function gmg_opts_from_namelist
 
   !> Make hierarchy k the active one (see gmg_inst_t).
   subroutine gmg_select(k)
@@ -688,14 +723,16 @@ contains
   !! operator (2 for pair_w). ok = .false. if the grid is not the structured
   !! flux-surface layout this construction needs.
   !--------------------------------------------------------------------
-  subroutine gmg_build_prolongations(Aref, comm, my_id, n_fields, ok)
+  subroutine gmg_build_prolongations(Aref, comm, my_id, n_fields, ok, opts)
     use nodes_elements, only: node_list, element_list
-    use phys_module,    only: n_flux, n_tht, physics_pc_gmg_ring_aspect, physics_pc_gmg_bnd_drop
+    use phys_module,    only: n_flux, n_tht
     use mod_parameters, only: n_tor, n_degrees
 
     Mat, intent(in)      :: Aref
     integer, intent(in)  :: comm, my_id, n_fields
     logical, intent(out) :: ok
+    type(gmg_opts_t), intent(in), optional :: opts
+    type(gmg_opts_t) :: gopt
 
     type(lvl_t), allocatable :: lv(:)
     integer, allocatable :: o(:,:)
@@ -715,6 +752,11 @@ contains
 
     ok = .false.
     gcomm = comm; gme = my_id
+    if (present(opts)) then
+      gopt = opts
+    else
+      gopt = gmg_opts_from_namelist()
+    endif
     eps_s = [1, -1, -1, 1]
     eps_t = [1, 1, -1, -1]
 
@@ -769,7 +811,7 @@ contains
       if (mod(ni - 1, 2) /= 0 .or. mod(nj, 2) /= 0 .or. nj < 4) exit
       ni = (ni - 1) / 2 + 1
       nj = nj / 2
-      call make_level(lv(g), ni, nj, physics_pc_gmg_bnd_drop > 0)
+      call make_level(lv(g), ni, nj, gopt%bnd_drop > 0)
       nlev = nlev + 1
     enddo
     if (nlev < 2) then
@@ -1005,14 +1047,14 @@ contains
         enddo
         ring_is = n_flux - 1
         do ii = 1, n_flux - 2
-          if (rm(ii) >= physics_pc_gmg_ring_aspect) then
+          if (rm(ii) >= gopt%ring_aspect) then
             ring_is = ii; exit
           endif
         enddo
         if (my_id == 0) then
           nshow = min(n_flux - 2, ring_is + 2)
           write(*,'(A,F5.2,A,I0,A)', advance="no") "[Physics PC]   GMG ring medians rdtheta/dr (switch at ", &
-            physics_pc_gmg_ring_aspect, ": rings I < ", ring_is, "):"
+            gopt%ring_aspect, ": rings I < ", ring_is, "):"
           do ii = 1, nshow
             write(*,'(A,F6.2)', advance="no") " ", rm(ii)
           enddo
@@ -1201,11 +1243,7 @@ contains
   !! at every PC rebuild with new values in A; P is reused, and with an
   !! unchanged pattern so are the coarse operators and the LUs' symbolic phase.
   !--------------------------------------------------------------------
-  subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, smoother, nsmooth)
-    use phys_module, only: physics_pc_gmg_smoother, physics_pc_gmg_nsmooth, physics_pc_gmg_omega, &
-                           physics_pc_gmg_axis_rings, physics_pc_gmg_ring_diag, physics_pc_gmg_axis_mult, &
-                           physics_pc_gmg_bnd_drop, physics_pc_gmg_smooth_op, physics_pc_gmg_axis_split, &
-                           physics_pc_harm_split, physics_pc_gmg_axis_droptol
+  subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, smoother, nsmooth, opts)
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
     Mat, intent(in), optional :: Afine  !< Workstream D: applies the fine operator
@@ -1213,6 +1251,9 @@ contains
                                         !< Galerkin chain, Jacobi diagonal and axis block
     character(len=*), intent(in), optional :: tag   !< label for the prints
     integer, intent(in), optional :: smoother, nsmooth   !< override the physics_pc_gmg_* knobs
+    type(gmg_opts_t), intent(in), optional :: opts    !< the whole configuration; absent =
+                                                      !< gmg_opts_from_namelist()
+    type(gmg_opts_t) :: o
     PetscErrorCode :: ierr
     PC   :: pc
     Mat  :: Aax
@@ -1274,8 +1315,13 @@ contains
     call PetscLogEventEnd(gev_ptap, ierr)
 
     call PetscLogEventBegin(gev_smsetup, ierr)
-    sm_type = physics_pc_gmg_smoother
-    sm_nstep = physics_pc_gmg_nsmooth
+    if (present(opts)) then
+      o = opts
+    else
+      o = gmg_opts_from_namelist()
+    endif
+    sm_type = o%smoother
+    sm_nstep = o%nsmooth
     if (present(smoother)) then
       if (smoother >= 0) sm_type = smoother
     endif
@@ -1288,18 +1334,18 @@ contains
     endif
     sm_blocks = (sm_type >= 2)
     axis_k = 0
-    if (sm_type >= 4) axis_k = max(physics_pc_gmg_axis_rings, -1)
+    if (sm_type >= 4) axis_k = max(o%axis_rings, -1)
     axis_mult = 0
-    if (axis_k /= 0) axis_mult = min(max(physics_pc_gmg_axis_mult, 0), 3)
-    axis_droptol = max(physics_pc_gmg_axis_droptol, 0.d0)
+    if (axis_k /= 0) axis_mult = min(max(o%axis_mult, 0), 3)
+    axis_droptol = max(o%axis_droptol, 0.d0)
     ! per-|n| axis solves need the block to be block-diagonal in |n|
-    axis_split = (axis_k /= 0 .and. physics_pc_gmg_axis_split > 0 .and. physics_pc_harm_split > 0)
-    if (axis_k /= 0 .and. physics_pc_gmg_axis_split > 0 .and. physics_pc_harm_split == 0 .and. my_id == 0) &
+    axis_split = (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split > 0)
+    if (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split == 0 .and. my_id == 0) &
       write(*,'(A)') "[Physics PC]   GMG: physics_pc_gmg_axis_split needs physics_pc_harm_split = 1; ignored"
-    diag_left = max(physics_pc_gmg_ring_diag, 0)
+    diag_left = max(o%ring_diag, 0)
     do g = 0, nlev - 2
       call KSPCreate(comm, gSm(g), ierr)
-      if (g == 0 .and. physics_pc_gmg_smooth_op == 0) then
+      if (g == 0 .and. o%smooth_op == 0) then
         call KSPSetOperators(gSm(g), gF, gA(g), ierr)     ! Jacobi reads the Pmat
       else
         ! smooth_op 1: the fine smoother iterates on the assembled surrogate;
@@ -1309,7 +1355,7 @@ contains
       endif
       if (sm_type == 1 .or. sm_type == 2) then
         call KSPSetType(gSm(g), KSPRICHARDSON, ierr)
-        call KSPRichardsonSetScale(gSm(g), physics_pc_gmg_omega, ierr)
+        call KSPRichardsonSetScale(gSm(g), o%omega, ierr)
         call KSPSetNormType(gSm(g), KSP_NORM_NONE, ierr)
         call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, sm_nstep, ierr)
       else
@@ -1342,7 +1388,7 @@ contains
       if (my_id == 0) then
         if (present(tag)) write(*,'(A,A,A)', advance="no") "[Physics PC]   GMG (", tag, ")"
         write(*,'(A,I0,A,I0,A,F5.2)', advance="no") "[Physics PC]   GMG smoother ", sm_type, &
-          ": steps = ", sm_nstep, ", omega = ", physics_pc_gmg_omega
+          ": steps = ", sm_nstep, ", omega = ", o%omega
         if (sm_blocks) then
           write(*,'(A,I0,A,I0,A,I0,A,I0,A)') ", blocks ", ibg(1), " on level 0 (", &
             ibg(2), " banded, max kl ", ib(1), "; ", ibg(3), " singular -> point)"
@@ -1442,7 +1488,7 @@ contains
     if (op_ready) return
     op_ready = .true.
     if (diag_left > 0) call report_bnd_rows(gA(0))
-    if (physics_pc_gmg_bnd_drop > 0) call check_bnd_rows(gA(0))
+    if (o%bnd_drop > 0) call check_bnd_rows(gA(0))
 
     ! Operator complexity: the whole point against GAMG's C_op ~ 1.00 (T2).
     call MatGetInfo(gA(0), MAT_GLOBAL_SUM, minfo, ierr)
