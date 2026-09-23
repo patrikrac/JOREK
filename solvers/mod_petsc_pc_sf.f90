@@ -10,6 +10,7 @@ module mod_petsc_pc_sf
        pack_pair_aij, make_pair_block_scale, report_operator_density, &
        split_vars, merge_vars
   use mod_petsc_pc_sf_solver
+  use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather
   implicit none
   private
 
@@ -202,7 +203,6 @@ contains
     integer, intent(in) :: comm, my_id
 
     PetscErrorCode :: ierr
-    Mat      :: S_uu
     PetscInt :: n1_loc
     logical  :: first
 
@@ -212,76 +212,24 @@ contains
     !--- index sets ------------------------------------------------------
     if (.not. g_ctx%is_created) call create_variable_index_sets(A_full, comm)
 
-    !--- the 21 blocks this path reads, in ONE pass over A_full's rows.
-    !--- MatGetRow on JOREK's BAIJ matrix expands the whole n_var*n_tor-wide
-    !--- block row, so reading each equation row once and dispatching its
-    !--- entries costs a fraction of one extraction per block.
-    call PetscLogEventBegin(pcev_extract, ierr)
-    block
-      integer, parameter :: NBLK = 21
-      integer :: eqs(NBLK), vrs(NBLK)
-      Mat :: M(NBLK)
-      eqs = [var_zj, var_w, var_zj, var_w, &
-             var_psi, var_u, var_u, var_T, &
-             var_psi, var_u, var_rho, var_T, &
-             var_psi, var_psi, var_u, var_u, var_u, var_rho, var_rho, var_T, var_T]
-      vrs = [var_zj, var_w, var_psi, var_u, &
-             var_zj, var_zj, var_w, var_zj, &
-             var_psi, var_u, var_rho, var_T, &
-             var_u, var_T, var_psi, var_rho, var_T, var_psi, var_u, var_psi, var_u]
-      if (.not. first) then
-        M = [g_ctx%B_33, g_ctx%B_44, g_ctx%B_31, g_ctx%B_42, &
-             g_ctx%B_13, g_ctx%B_23, g_ctx%B_24, g_ctx%B_63, &
-             g_ctx%B_11, g_ctx%B_22, g_ctx%B_55, g_ctx%B_66, &
-             g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_25, g_ctx%B_26, &
-             g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62]
-      endif
-      call extract_sub_blocks_h(A_full, eqs, vrs, M, first)
-      g_ctx%B_33 = M(1);  g_ctx%B_44 = M(2);  g_ctx%B_31 = M(3);  g_ctx%B_42 = M(4)
-      g_ctx%B_13 = M(5);  g_ctx%B_23 = M(6);  g_ctx%B_24 = M(7);  g_ctx%B_63 = M(8)
-      g_ctx%B_11 = M(9);  g_ctx%B_22 = M(10); g_ctx%B_55 = M(11); g_ctx%B_66 = M(12)
-      g_ctx%B_12 = M(13); g_ctx%B_16 = M(14); g_ctx%B_21 = M(15); g_ctx%B_25 = M(16)
-      g_ctx%B_26 = M(17); g_ctx%B_51 = M(18); g_ctx%B_52 = M(19); g_ctx%B_61 = M(20)
-      g_ctx%B_62 = M(21)
-    end block
-    call PetscLogEventEnd(pcev_extract, ierr)
-    call physics_pc_mem("SF build: blocks extracted", my_id)
-
-    !--- pair_psi = [[B_11, B_13], [B_31, B_33]] -------------------------
-    ! Row 2 IS Jacobian row 3 verbatim, so this pair carries the j constraint
-    ! EXACTLY. That is what lets the apply drop the M_j pre-solve and the j
-    ! back-substitution: the pair's second component already IS
-    ! j* = M_j^-1 (x_j - B_31 psi*).
-    call PetscLogEventBegin(pcev_convert, ierr)
-    call pack_pair_aij(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%B_33, &
-                       g_ctx%K_pj_aij, kpj_packed, comm)
-    call PetscLogEventEnd(pcev_convert, ierr)
-
-    !--- S_uu = B_22 + W, then pair_w = [[S_uu, B_24], [B_42, B_44]] ------
-    call PetscLogEventBegin(pcev_build_suu, ierr)
-    if (.not. g_ctx%w_force_ready) then
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: W_force was never assembled "// &
-        "(petsc_assemble_pc_matrices did not run?)."
-      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    !--- the operators. Their patterns are fixed for the run, so the first
+    !--- build constructs them and precomputes a VALUE MAP from JOREK's BAIJ
+    !--- matrix (and W) into them; every later rebuild is one gather.
+    if (first) then
+      call first_build_operators()
+    else
+      call PetscLogEventBegin(pcev_extract, ierr)
+      call sfg_gather(A_full, g_ctx%W_force, my_id)
+      call PetscLogEventEnd(pcev_extract, ierr)
     endif
-    ! Duplicated rather than refilled in place: W's pattern is not a subset of
-    ! B_22's, and one MatDuplicate per rebuild is negligible against the whole
-    ! channel chain this form exists to avoid.
-    call MatDuplicate(g_ctx%B_22, MAT_COPY_VALUES, S_uu, ierr)
-    call MatAXPY(S_uu, 1.0d0, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
-    call pack_pair_aij(S_uu, g_ctx%B_24, g_ctx%B_42, g_ctx%B_44, &
-                       g_ctx%S_W_aij, sw_packed, comm)
-    call MatDestroy(S_uu, ierr)          ! safe: pack_pair_aij copied the values out
-    call PetscLogEventEnd(pcev_build_suu, ierr)
-    call physics_pc_mem("SF build: S_uu / pair_w assembled", my_id)
+    call physics_pc_mem("SF build: operators filled", my_id)
 
     !--- symmetric block scaling, an exact similarity applied to the STORED
     !--- operator, on both pairs.
-    call MatGetLocalSize(g_ctx%B_11, n1_loc, PETSC_NULL_INTEGER, ierr)
+    call MatGetLocalSize(g_ctx%B_55, n1_loc, PETSC_NULL_INTEGER, ierr)
     if (slv_pj%scaled) call VecDestroy(slv_pj%dscale, ierr)
     call make_pair_block_scale(g_ctx%K_pj_aij, n1_loc, slv_pj%dscale, comm, my_id, "pair_psi")
     slv_pj%scaled = .true.
-    call MatGetLocalSize(g_ctx%B_22, n1_loc, PETSC_NULL_INTEGER, ierr)
     if (slv_w%scaled) call VecDestroy(slv_w%dscale, ierr)
     call make_pair_block_scale(g_ctx%S_W_aij, n1_loc, slv_w%dscale, comm, my_id, "pair_w")
     slv_w%scaled = .true.
@@ -315,7 +263,7 @@ contains
     if (.not. vecs_ready) then
       call MatCreateVecs(g_ctx%K_pj_aij, rhs_PJ, sol_PJ, ierr)
       call MatCreateVecs(g_ctx%S_W_aij,  rhs_W,  sol_W,  ierr)
-      call MatCreateVecs(g_ctx%B_11, sv_x(1), PETSC_NULL_VEC, ierr)
+      call MatCreateVecs(g_ctx%B_55, sv_x(1), PETSC_NULL_VEC, ierr)
       block
         integer :: k
         do k = 2, 6
@@ -333,10 +281,75 @@ contains
       vecs_ready = .true.
     endif
 
-    if (first) call sf_selfcheck(my_id)
-
     g_ctx%reduced_ready = .true.
     sf_first = .false.
+
+  contains
+
+    !> First build: the operators with their frozen patterns, the value maps
+    !! into them, and the release of the blocks that only fed the packing.
+    subroutine first_build_operators()
+      integer, parameter :: NBLK = 21, NKEEP = 13
+      integer :: eqs(NBLK), vrs(NBLK)
+      Mat :: M(NBLK), S_uu
+
+      if (.not. g_ctx%w_force_ready) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: W_force was never assembled "// &
+          "(petsc_assemble_pc_matrices did not run?)."
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+
+      !--- the 21 blocks in ONE pass over A_full's rows. The first 13 are the
+      !--- ones the apply and the rho/T solvers read; the last 8 only feed the
+      !--- two packed pairs and are released once the maps exist.
+      call PetscLogEventBegin(pcev_extract, ierr)
+      eqs = [var_psi, var_psi, var_u, var_u, var_u, var_u, var_rho, var_rho, var_rho, &
+             var_T, var_T, var_T, var_T, &
+             var_psi, var_psi, var_zj, var_zj, var_u, var_u, var_w, var_w]
+      vrs = [var_u, var_T, var_psi, var_zj, var_rho, var_T, var_psi, var_u, var_rho, &
+             var_psi, var_u, var_zj, var_T, &
+             var_psi, var_zj, var_psi, var_zj, var_u, var_w, var_u, var_w]
+      call extract_sub_blocks_h(A_full, eqs, vrs, M, .true.)
+      g_ctx%B_12 = M(1);  g_ctx%B_16 = M(2);  g_ctx%B_21 = M(3);  g_ctx%B_23 = M(4)
+      g_ctx%B_25 = M(5);  g_ctx%B_26 = M(6);  g_ctx%B_51 = M(7);  g_ctx%B_52 = M(8)
+      g_ctx%B_55 = M(9);  g_ctx%B_61 = M(10); g_ctx%B_62 = M(11); g_ctx%B_63 = M(12)
+      g_ctx%B_66 = M(13)
+      g_ctx%B_11 = M(14); g_ctx%B_13 = M(15); g_ctx%B_31 = M(16); g_ctx%B_33 = M(17)
+      g_ctx%B_22 = M(18); g_ctx%B_24 = M(19); g_ctx%B_42 = M(20); g_ctx%B_44 = M(21)
+      call PetscLogEventEnd(pcev_extract, ierr)
+
+      !--- pair_psi = [[B_11, B_13], [B_31, B_33]]. Row 2 IS Jacobian row 3
+      !--- verbatim, so the pair carries the j constraint EXACTLY: its second
+      !--- component already is j* = M_j^-1 (x_j - B_31 psi*).
+      call PetscLogEventBegin(pcev_convert, ierr)
+      call pack_pair_aij(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%B_33, &
+                         g_ctx%K_pj_aij, kpj_packed, comm)
+      call PetscLogEventEnd(pcev_convert, ierr)
+
+      !--- S_uu = B_22 + W, then pair_w = [[S_uu, B_24], [B_42, B_44]]. W's
+      !--- pattern is not a subset of B_22's; the union is fixed here, once.
+      call PetscLogEventBegin(pcev_build_suu, ierr)
+      call MatDuplicate(g_ctx%B_22, MAT_COPY_VALUES, S_uu, ierr)
+      call MatAXPY(S_uu, 1.0d0, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
+      call pack_pair_aij(S_uu, g_ctx%B_24, g_ctx%B_42, g_ctx%B_44, &
+                         g_ctx%S_W_aij, sw_packed, comm)
+      call MatDestroy(S_uu, ierr)
+      call PetscLogEventEnd(pcev_build_suu, ierr)
+
+      call sf_selfcheck(my_id)
+
+      !--- the value maps, gated against what was just extracted
+      call sfg_build(A_full, g_ctx%W_force, M(1:NKEEP), eqs(1:NKEEP), vrs(1:NKEEP), &
+                     g_ctx%K_pj_aij, [var_psi, var_zj], [var_psi, var_zj], &
+                     g_ctx%S_W_aij, [var_u, var_w], [var_u, var_w], comm, my_id)
+      block
+        integer :: k
+        do k = NKEEP + 1, NBLK
+          call MatDestroy(M(k), ierr)
+        enddo
+      end block
+    end subroutine first_build_operators
+
   end subroutine sf_build
 
   !--------------------------------------------------------------------

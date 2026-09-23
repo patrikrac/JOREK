@@ -178,8 +178,19 @@ contains
     ! linearisation state), which only this routine is given. Purely diagnostic:
     ! dump_sfm2_blocks writes it out, nothing in the apply reads it yet.
     if (physics_pc_force_operator /= 0) then
-      if (g_ctx%w_force_ready) PetscCallA(MatDestroy(g_ctx%W_force, ierr))
-      call petsc_create_pc_matrix(g_ctx%W_force, a_mat, 1)
+      ! Created once and zeroed before every refill: the element routine only
+      ! ADDs, so this is the same operator as a fresh matrix, and W keeps its
+      ! identity and pattern for the run -- which the production path's value
+      ! maps (mod_petsc_pc_sf_gather) rely on.
+      if (g_ctx%w_force_ready) then
+        PetscCallA(MatZeroEntries(g_ctx%W_force, ierr))
+      else
+        call petsc_create_pc_matrix(g_ctx%W_force, a_mat, 1)
+        ! The boundary rows are zeroed by MatZeroRows after every assembly;
+        ! without this it also DELETES their pattern, so the next assembly
+        ! would insert outside the (compressed) structure.
+        PetscCallA(MatSetOption(g_ctx%W_force, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
+      endif
 
       call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
                                            mhd_sim, g_ctx%W_force)
