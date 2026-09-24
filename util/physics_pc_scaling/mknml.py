@@ -2,19 +2,22 @@
 """Write a JOREK namelist for one physics-PC scaling case.
 
     mknml.py <arm> <n_flux> <n_tht> <out_file> [key=value ...]
+    mknml.py nodes <arm> <n_flux> <n_tht>     # nodes the case needs (n_nodes_max check)
 
-Starts from namelist/model199/intear_island_demo (the committed benchmark),
+Starts from the arm's base namelist -- namelist/model199/intear_island_demo
+(the committed benchmark), or inxflow_shaped_pcbench for the sf_* arms --
 applies the arm's physics-PC flags, the mesh, and a short tstep ramp, then any
 extra key=value overrides. Existing keys are replaced in place; new keys are
 inserted before the closing '/'. A new key that is not a physics_pc_* flag is
 refused, so a typo fails loudly instead of being ignored by the namelist read.
 
 Environment:
-  PCS_BASE     base namelist (default: <repo>/namelist/model199/intear_island_demo)
-  PCS_TSTEP_N  tstep ramp   (default: 1.d-1,1.d0,1.d1)
-  PCS_NSTEP_N  steps per tstep (default: 3,3,3)
+  PCS_BASE     base namelist (default: the arm's, see above)
+  PCS_TSTEP_N  tstep ramp   (default: 1.d-1,1.d0,1.d1; sf_* arms 1.d-3,1.d-2,1.d-1,1.d0)
+  PCS_NSTEP_N  steps per tstep (default: 3,3,3; sf_* arms 2,2,3,3)
   PCS_NOUT     restart/field output every N steps (default: 1000)
-  PCS_N_RADIAL / PCS_N_POL   initial equilibrium grid (default: n_flux+10, n_tht)
+  PCS_N_RADIAL / PCS_N_POL   initial equilibrium grid (default: n_flux+10, n_tht;
+               sf_* arms 2 n_flux - 1, 2 n_tht, the shaped case's own ratio)
   PCS_RESTART  if set, the case restarts (restart = .t.) from that file
 """
 import os
@@ -118,6 +121,48 @@ ARMS['sfm2_gmg_d12'] = dict(ARMS['sfm2_gmg'], **{
 })
 
 
+# The production SF path (mod_petsc_pc_sf*, workstream H) on the reference
+# physics case, inxflow_shaped_pcbench. Its composed force operator W is valid
+# up to tstep ~ 1 (Chacon 2025 Eq. 17-19; at tstep 10 even the all-LU SF path
+# diverges), so these arms ramp from a fresh equilibrium up to tstep 1 only.
+# Every block has two backends: gmg (production) and lu (the exact
+# reference). The multigrid configuration is fixed in mod_petsc_pc_sf_solver
+# (smoothers, line overlap, axis block), not in the namelist.
+SF_BASE = 'inxflow_shaped_pcbench'
+SF_COMMON = {
+    'use_physics_pc': '.t.',
+    'physics_pc_monolithic': '.f.',
+    'physics_pc_reduced_pde': '.f.',
+    'eliminate_boundary_dofs': '.t.',
+    'physics_pc_force_operator': '1',
+    'physics_pc_sf': '.t.',
+    'physics_pc_sf_rtol': '1.d-1',
+}
+ARMS['sf_gmg'] = dict(SF_COMMON, **{
+    'physics_pc_sf_pair_psi': '"gmg"', 'physics_pc_sf_pair_w': '"gmg"',
+    'physics_pc_sf_rho': '"gmg"', 'physics_pc_sf_T': '"gmg"',
+})
+ARMS['sf_lu'] = dict(SF_COMMON, **{
+    'physics_pc_sf_pair_psi': '"lu"', 'physics_pc_sf_pair_w': '"lu"',
+    'physics_pc_sf_rho': '"lu"', 'physics_pc_sf_T': '"lu"',
+})
+# JOREK's default PC on the same case and ramp
+ARMS['sf_jorek'] = {'use_physics_pc': '.f.'}
+
+
+def is_sf(arm):
+    return arm.startswith('sf_')
+
+
+def grids(arm, n_flux, n_tht):
+    """(n_radial, n_pol) of the initial equilibrium grid for this arm."""
+    if is_sf(arm):
+        return (int(os.environ.get('PCS_N_RADIAL', 2 * n_flux - 1)),
+                int(os.environ.get('PCS_N_POL', 2 * n_tht)))
+    return (int(os.environ.get('PCS_N_RADIAL', n_flux + 10)),
+            int(os.environ.get('PCS_N_POL', n_tht)))
+
+
 def gmg_levels(n_flux, n_tht):
     """Number of GMG levels the C1 hierarchy will build (mod_petsc_pc_gmg)."""
     ni, nj, nlev = n_flux, n_tht, 1
@@ -127,15 +172,27 @@ def gmg_levels(n_flux, n_tht):
 
 
 def main(argv):
+    if len(argv) == 5 and argv[1] == 'nodes':
+        nr, npol = grids(argv[2], int(argv[3]), int(argv[4]))
+        print(max(nr * npol, int(argv[3]) * int(argv[4])))
+        return
     if len(argv) < 5:
         sys.exit(__doc__)
     arm, n_flux, n_tht, out = argv[1], int(argv[2]), int(argv[3]), argv[4]
     if arm not in ARMS:
         sys.exit('unknown arm %r; choose from %s' % (arm, ', '.join(sorted(ARMS))))
-    if arm.startswith('sfm2_gmg') and gmg_levels(n_flux, n_tht) < 3:
+    if (arm.startswith('sfm2_gmg') or arm == 'sf_gmg') and gmg_levels(n_flux, n_tht) < 3:
         sys.exit('mesh %dx%d gives fewer than 3 GMG levels: use (n_flux-1) divisible '
                  'by 4 or more powers of 2 and n_tht divisible by 8 (e.g. 81x32, '
                  '161x64, 321x128)' % (n_flux, n_tht))
+    if arm == 'sf_gmg' and gmg_levels(n_flux, n_tht) < 4:
+        # a shallow hierarchy leaves a large coarse level, solved by one
+        # sequential LU on every rank that owns part of it (61x96 stopped at
+        # 3 levels with an 8646-row coarse LU). Full depth needs
+        # n_flux = 2^L k + 1 and n_tht = 2^L m.
+        print('mknml.py: WARNING: %dx%d gives only %d GMG levels; prefer n_flux = 2^L k + 1, '
+              'n_tht = 2^L m with L >= 3' % (n_flux, n_tht, gmg_levels(n_flux, n_tht)),
+              file=sys.stderr)
 
     ov = dict(ARMS[arm])
     ov['n_flux'] = str(n_flux)
@@ -145,10 +202,11 @@ def main(argv):
     # only the latter leaves the equilibrium on the base namelist's 51x16, and
     # the post-equilibrium check fails on every larger mesh. Keep the base
     # namelist's ratio: n_radial = n_flux + 10, n_pol = n_tht.
-    ov['n_radial'] = os.environ.get('PCS_N_RADIAL', str(n_flux + 10))
-    ov['n_pol'] = os.environ.get('PCS_N_POL', str(n_tht))
-    ov['tstep_n'] = os.environ.get('PCS_TSTEP_N', '1.d-1,1.d0,1.d1')
-    ov['nstep_n'] = os.environ.get('PCS_NSTEP_N', '3,3,3')
+    nr, npol = grids(arm, n_flux, n_tht)
+    ov['n_radial'] = str(nr)
+    ov['n_pol'] = str(npol)
+    ov['tstep_n'] = os.environ.get('PCS_TSTEP_N', '1.d-3,1.d-2,1.d-1,1.d0' if is_sf(arm) else '1.d-1,1.d0,1.d1')
+    ov['nstep_n'] = os.environ.get('PCS_NSTEP_N', '2,2,3,3' if is_sf(arm) else '3,3,3')
     ov['nout'] = os.environ.get('PCS_NOUT', '1000')   # 1000: no field output during timing
     if os.environ.get('PCS_RESTART'):         # pc_case.sh copied the restart file in
         ov['restart'] = '.t.'
@@ -157,7 +215,7 @@ def main(argv):
         ov[k.strip()] = v.strip()
 
     base = os.environ.get('PCS_BASE', os.path.join(REPO, 'namelist', 'model199',
-                                                   'intear_island_demo'))
+                                                   SF_BASE if is_sf(arm) else 'intear_island_demo'))
     lines = open(base).read().split('\n')
     out_lines = []
     for line in lines:

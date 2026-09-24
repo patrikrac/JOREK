@@ -122,6 +122,81 @@ case the study does not cover (see `docs/physics_pc/workstream_D_matrix_free.md`
   tol·sqrt(|a_ii a_jj|) from the axis block before its LU: −47% factor entries
   and −23% `GMG_AxSolve` at 41×16, with unchanged counts.
 
+## The production SF path (`sf_gmg`, `sf_lu`, `sf_jorek`)
+
+The split-field preconditioner of `mod_petsc_pc_sf*` (workstream H) runs on the
+reference physics case `namelist/model199/inxflow_shaped_pcbench`, not on the
+island demo. Its composed force operator is valid up to tstep ~1 (at tstep 10
+even the all-LU SF path diverges), so these arms start from a fresh
+equilibrium and ramp 1e-3, 1e-2, 1e-1, 1 (2, 2, 3, 3 steps). The initial grid
+keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
+161×64 needs 41k nodes and 321×128 needs 164k: a build with a larger
+`n_nodes_max` (`pc_case.sh` warns).
+
+| arm | blocks |
+|---|---|
+| `sf_gmg` | every block on its C¹ GMG: pair_psi split (ψ, j) with the zebra line smoother, pair_w / ρ / T radial lines |
+| `sf_lu` | every block by MUMPS LU: the exact reference, for approximation quality |
+| `sf_jorek` | JOREK's default PC on the same case and ramp |
+
+The multigrid configuration is compiled in (`mod_petsc_pc_sf_solver.f90`),
+so one binary is one configuration. On the first build the log prints what
+the parallel parts actually do; check it before reading any timing:
+
+- `GMG line overlap <k> node(s): ... ghost rows on level 0 (x% of the rows)`:
+  the overlapping line segments across rank boundaries. They keep the
+  V-cycle counts flat in np (41×64: pair_psi 2.0 at np 1; without overlap
+  5.3–6.5 at np 8, with overlap 2 2.0–2.2).
+- `GMGk axis block level g: cyclic reduction, ... error e (LU e_LU) with r
+  refinement step(s) -> in use`: the axis block solved by threaded block
+  cyclic reduction instead of a sequential LU. `LU kept` means the gate
+  refused it for that block.
+- `SF: GMG operators converted to AIJMKL (threaded SpMV)`: only on a PETSc
+  with MKL sparse (`grep PETSC_HAVE_MKL_SPARSE $PETSC_DIR/$PETSC_ARCH/include/petscconf.h`).
+  Without it the matvecs run on one thread per rank.
+- `GMGk axis block level g group 0: n J-sectors ...` and `J-sector solve vs
+  LU ... -> in use`: only in a binary built with `SF_GMG_AXIS_SECTORS = -1`
+  (see below).
+
+**Two things only the cluster can decide.** Both are compile-time constants
+in `mod_petsc_pc_sf_solver.f90`, so each needs its own binary; give the
+second one's cases a `PCS_TAG`.
+
+- **The axis block.** Every GMG level has an exact axis block (rings 0..3,
+  all J), solved by a sequential LU on the ranks that own it — rank 0, and
+  from 161×64 at np ≈ 43 on also its neighbours, each repeating the whole
+  LU. Its size depends on n_tht only, so at the strong-scaling end it is the
+  critical path: watch `t_GMG<k>_AxSolve` against `t_GMG<k>_Lines`.
+  `SF_GMG_AXIS_SECTORS = -1` solves it over J-sector ranks instead (exact,
+  gated against the LU on the first build). On the laptop it halved the axis
+  time on the critical rank but lost as much to synchronisation, so it is
+  off; run the 161×64 series up to np 64–128 with both binaries.
+- **The line overlap.** `SF_GMG_LINE_OVERLAP = 2` kept the V-cycles flat to
+  np 8 at 41×64 (~5 rings per rank). Its cost is the ghost fraction the log
+  prints: 29% at np 4, 112% at 21×64 np 8, and more at ~2 rings per rank.
+  If the counts stay flat but `t_GMG<k>_Lines` stops scaling there, compare
+  a binary with overlap 1.
+
+Local check (laptop, 41×32, np 2, `PCS_NSTEP_N=1,1,2,2`): all three arms
+finish, and `sf_gmg`'s outer counts match `sf_lu`'s (3 3 6 5 38 39 against
+2 2 6 5 37 39); `sf_jorek` needs 1–3.
+
+```bash
+PCS_ROOT=$PWD/sf_strong_161 PCS_MESH=161x64  PCS_NPS="1 2 4 8 16 32 64" \
+  PCS_ARMS="sf_jorek sf_lu sf_gmg" ./pc_study.sh strong
+PCS_ROOT=$PWD/sf_strong_321 PCS_MESH=321x128 PCS_NPS="8 16 32 64 128" \
+  PCS_ARMS="sf_jorek sf_gmg"       ./pc_study.sh strong
+PCS_ROOT=$PWD/sf_weak PCS_WEAK="81x32:1 161x64:4 321x128:16" \
+  PCS_ARMS="sf_jorek sf_gmg"       ./pc_study.sh weak
+```
+
+Columns: `sf_pj_mean`, `sf_w_mean`, `sf_rho_mean`, `sf_T_mean` are the mean
+inner iterations (V-cycles) per solve, per time step; they, and `outer_its`,
+must stay flat in np. The time per part is in `t_GMG<k>_Lines` (line
+smoothing including the overlap scatter), `t_GMG<k>_AxSolve` (axis blocks),
+`t_GMG_Prolong` / `t_GMG_SmSetup` / `t_PhysPC_Extract` (setup), and
+`t_MatMult`; hierarchy k = 1 pair_w, 2 pair_psi, 3 ρ, 4 T.
+
 ## Motivation figures (`plot_motivation.py`)
 
 Five figures for the case for a scalable physics PC. Each comes from one

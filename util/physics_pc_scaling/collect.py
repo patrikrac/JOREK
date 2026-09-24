@@ -25,6 +25,10 @@ EVENTS = [
     'PhysPC_SolveRhoT', 'PhysPC_ShellMult', 'PhysPC_MjSolve', 'PhysPC_PsiPC',
     'GMG_VCycle', 'GMG_Smooth0', 'GMG_Lines', 'GMG_AxSolve', 'GMG_Coarse', 'GMG2_VCycle', 'GMG3_VCycle',
     'GMG4_VCycle', 'MatMult', 'KSPSolve',
+    # the SF path's four hierarchies (1 pair_w, 2 pair_psi, 3 rho, 4 T): line
+    # smoothing (with the overlap scatter), axis-block solves, and the setup
+    'GMG2_Lines', 'GMG2_AxSolve', 'GMG3_Lines', 'GMG3_AxSolve', 'GMG4_Lines', 'GMG4_AxSolve',
+    'GMG_Prolong', 'GMG_SmSetup', 'GMG_CoarseLU',
     # the LU factorisations and triangular solves (JOREK's default PC, and the
     # MUMPS inner solves of sfm2_lu)
     'MatLUFactorSym', 'MatLUFactorNum', 'MatSolve', 'PCSetUp', 'PCApply',
@@ -32,7 +36,8 @@ EVENTS = [
 COLS = (['case', 'arm', 'n_flux', 'n_tht', 'np', 'omp', 'cores', 'nodes', 'n_tor', 'n_period',
          'status', 'ndof', 'wall_s',
          'step_s_sum', 'setup_s_sum', 'solve_s_sum', 'outer_its', 'outer_sum', 'rebuilds',
-         'pw_cycles_mean', 'pp_its_mean', 'rt_its_mean', 'mem_max_total_GB',
+         'pw_cycles_mean', 'pp_its_mean', 'rt_its_mean',
+         'sf_pj_mean', 'sf_w_mean', 'sf_rho_mean', 'sf_T_mean', 'mem_max_total_GB',
          'mem_max_rank_GB'] + ['t_' + e for e in EVENTS] + ['n_' + e for e in EVENTS])
 STEP_ONLY = {'MatLUFactorSym', 'MatLUFactorNum', 'MatSolve', 'PCSetUp', 'PCApply', 'KSPSolve', 'MatMult'}
 STEP_COLS = ['step', 'tstep', 't_now', 'outer_its', 'rebuild', 'step_s', 'setup_s', 'solve_s',
@@ -67,6 +72,15 @@ def parse_log(path, row):
     row['pw_cycles_mean'] = means('pair_w')
     row['pp_its_mean'] = means('pair_psi')
     row['rt_its_mean'] = means('rho/T')
+
+    # the SF path: "[Physics PC]   inner pair_psi KSP (...): mean 2.00 its, ..." per step
+    def sf_means(tag):
+        v = re.findall(r'inner ' + re.escape(tag) + r'[^\n]*?: mean\s+' + RE_FLOAT + r' its', txt)
+        return ' '.join('%.2f' % fnum(x) for x in v)
+    row['sf_pj_mean'] = sf_means('pair_psi')
+    row['sf_w_mean'] = sf_means('pair_w')
+    row['sf_rho_mean'] = sf_means('rho-block')
+    row['sf_T_mean'] = sf_means('T-block')
 
     def tsum(pat):
         v = re.findall(pat + r'\s*' + RE_FLOAT, txt)

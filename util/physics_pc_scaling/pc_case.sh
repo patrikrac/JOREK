@@ -4,7 +4,8 @@
 #
 #    pc_case.sh <arm> <n_flux> <n_tht> <np> [key=value ...]
 #
-#  arm     jorek | jorek_fresh | sfm2_lu | sfm2_lu_hs0 | sfm2_gmg | sfm2_gmg_* (see mknml.py)
+#  arm     jorek | jorek_fresh | sfm2_lu | sfm2_lu_hs0 | sfm2_gmg | sfm2_gmg_* |
+#          sf_gmg | sf_lu | sf_jorek (see mknml.py)
 #  np      MPI ranks for this case (<= ranks of the allocation); every rank
 #          runs PCS_OMP OpenMP threads (hybrid MPI+OpenMP, as JOREK is run)
 #  extra key=value pairs are passed to mknml.py as namelist overrides.
@@ -43,7 +44,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # n_nodes_max / n_elements_max are compile-time (models/mod_settings.f90) and
 # JOREK stops in the grid generation when the mesh needs more nodes than the
 # binary was built for. Warn here, where it is cheap, instead of in the job.
-NODES_NEEDED=$(( (NF + 10) * NT ))     # the initial equilibrium grid, the larger of the two
+NODES_NEEDED=$(python3 "$HERE/mknml.py" nodes "$ARM" "$NF" "$NT")   # the larger of the two grids
 if [ "$NODES_NEEDED" -gt "${PCS_NODES_MAX:-60001}" ]; then
   echo "[pc_case] WARNING: ${NF}x${NT} needs $NODES_NEEDED nodes, more than n_nodes_max"
   echo "[pc_case]          (assumed ${PCS_NODES_MAX:-60001}). Rebuild with larger n_nodes_max and"
@@ -88,8 +89,9 @@ NODES=${SLURM_JOB_NUM_NODES:-1}
 
 cd "$DIR" || exit 1
 # Hybrid MPI+OpenMP: OMP threads per rank for JOREK's threaded parts (matrix
-# construction) and a threaded BLAS inside MUMPS. The physics PC itself has no
-# OpenMP regions; PETSc kernels run on one thread per rank.
+# construction), a threaded BLAS inside MUMPS, and the SF path's GMG (line and
+# axis-block solves, value-map gathers; MKL's SpMV where PETSc has it). PETSc's
+# own AIJ kernels run on one thread per rank.
 export OMP_NUM_THREADS=$OMP MKL_NUM_THREADS=$OMP OPENBLAS_NUM_THREADS=$OMP
 export OMP_PLACES=${OMP_PLACES:-cores} OMP_PROC_BIND=${OMP_PROC_BIND:-close}
 export PETSC_OPTIONS="-log_view :prof.txt -memory_view ${PCS_PETSC_OPTS:-}"
