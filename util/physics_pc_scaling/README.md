@@ -147,16 +147,13 @@ the parallel parts actually do; check it before reading any timing:
   the overlapping line segments across rank boundaries. They keep the
   V-cycle counts flat in np (41×64: pair_psi 2.0 at np 1; without overlap
   5.3–6.5 at np 8, with overlap 2 2.0–2.2).
-- `GMGk axis block level g: cyclic reduction, ... error e (LU e_LU) with r
-  refinement step(s) -> in use`: the axis block solved by threaded block
-  cyclic reduction instead of a sequential LU. `LU kept` means the gate
-  refused it for that block.
 - `SF: GMG operators converted to AIJMKL (threaded SpMV)`: only on a PETSc
   with MKL sparse (`grep PETSC_HAVE_MKL_SPARSE $PETSC_DIR/$PETSC_ARCH/include/petscconf.h`).
   Without it the matvecs run on one thread per rank.
-- `GMGk axis block level g group 0: n J-sectors ...` and `J-sector solve vs
-  LU ... -> in use`: only in a binary built with `SF_GMG_AXIS_SECTORS = -1`
-  (see below).
+- `... n J-sectors (... rows, reduced system ...)` and `J-sector solve vs
+  LU e -> in use`: only in a binary built with `SF_GMG_AXIS_SECTORS = -1`
+  (see below). `-> LU kept` means the exactness gate (1e-8) refused the
+  sector solve for that level and the sequential LU stays.
 
 **Two things only the cluster can decide.** Both are compile-time constants
 in `mod_petsc_pc_sf_solver.f90`, so each needs its own binary; give the
