@@ -44,6 +44,7 @@ module mod_petsc_pc_gmg
   use petsc
   use iso_c_binding, only: c_ptr, c_double
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done
+  use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_numeric, axd_solve
   implicit none
   private
 
@@ -69,6 +70,9 @@ module mod_petsc_pc_gmg
     integer :: line_overlap = 0      !< smoothers 5/7: radial lines extended by this many
                                      !< nodes into the ranks owning their continuation
                                      !< (restricted additive Schwarz); 0 = local segments
+    integer :: axis_sectors = 0      !< axis blocks solved over this many J-sector ranks
+                                     !< (mod_petsc_pc_gmg_axis); -1 = its cost optimum,
+                                     !< 0 = the sequential LU on the owning ranks
     real*8  :: omega        = 0.7d0  !< Richardson damping (smoothers 1, 2)
     real*8  :: axis_droptol = 0.d0   !< relative drop tolerance of the axis block
     real*8  :: ring_aspect  = 1.d0   !< smoother 6 / axis_rings -1 switch radius
@@ -184,6 +188,10 @@ module mod_petsc_pc_gmg
     VecScatter :: sct
     real*8, allocatable :: yg(:)
     Mat, pointer :: sg(:) => null()
+    ! axis groups solved over J-sectors (axsec /= 0 and past the first-build
+    ! gate against their LU): one axd_t per group, all or none
+    logical :: axdon = .false.
+    type(axd_t), allocatable :: axd(:)
     ! Value maps, built once per operator pattern (pat_id/pat_nz): the k-th
     ! entry of the source goes to lu(dst) (dst > 0) or zv(-dst) (dst < 0).
     ! Sources: vs = +k A's diagonal part, -k its off-diagonal part; gs = k in
@@ -211,6 +219,7 @@ module mod_petsc_pc_gmg
   ! radial lines outside (GMGPolar). Rings 0..axis_k form the axis block.
   integer, save :: ring_is = 1, axis_k = 0, axis_mult = 0
   integer, save :: lovl = 0                 !< line overlap in nodes (gmg_opts_t%line_overlap)
+  integer, save :: axsec = 0                !< axis J-sectors (gmg_opts_t%axis_sectors)
   logical, save :: axis_split = .false.     !< stage Q: per-|n| axis solves on distinct ranks
   real*8, save  :: axis_droptol = 0.d0      !< stage Q: relative drop tolerance of the axis block
   integer, save :: diag_left = 0            !< ring-diag samples left in this rebuild
@@ -234,7 +243,7 @@ module mod_petsc_pc_gmg
   integer, parameter :: MAX_INST = 4
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
-    integer :: ring_is = 1, axis_k = 0, axis_mult = 0, diag_left = 0, lovl = 0
+    integer :: ring_is = 1, axis_k = 0, axis_mult = 0, diag_left = 0, lovl = 0, axsec = 0
     logical :: axis_split = .false.
     real*8  :: axis_droptol = 0.d0
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
@@ -297,7 +306,7 @@ contains
     associate (S => inst(cur_inst))
       S%nlev = nlev; S%nth0 = nth0; S%nf_s = nf_s; S%sm_type = sm_type; S%sm_nstep = sm_nstep
       S%ring_is = ring_is; S%axis_k = axis_k; S%axis_mult = axis_mult; S%diag_left = diag_left
-      S%lovl = lovl
+      S%lovl = lovl; S%axsec = axsec
       S%axis_split = axis_split; S%axis_droptol = axis_droptol
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready; S%sm_blocks = sm_blocks
@@ -316,7 +325,7 @@ contains
     associate (S => inst(k))
       nlev = S%nlev; nth0 = S%nth0; nf_s = S%nf_s; sm_type = S%sm_type; sm_nstep = S%sm_nstep
       ring_is = S%ring_is; axis_k = S%axis_k; axis_mult = S%axis_mult; diag_left = S%diag_left
-      lovl = S%lovl
+      lovl = S%lovl; axsec = S%axsec
       axis_split = S%axis_split; axis_droptol = S%axis_droptol
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready; sm_blocks = S%sm_blocks
@@ -371,6 +380,8 @@ contains
     if (allocated(a%vd))   call move_alloc(a%vd,   b%vd)
     if (allocated(a%gd))   call move_alloc(a%gd,   b%gd)
     b%nvd = a%nvd; b%nvo = a%nvo; b%nvg = a%nvg
+    b%axdon = a%axdon; a%axdon = .false.
+    if (allocated(a%axd))  call move_alloc(a%axd,  b%axd)
     b%pat_id = a%pat_id; b%pat_nz = a%pat_nz; a%pat_id = -1; a%pat_nz = -1
   end subroutine move_blk
 
@@ -1384,6 +1395,8 @@ contains
     axis_droptol = max(o%axis_droptol, 0.d0)
     lovl = 0
     if (sm_type == 5 .or. sm_type == 7) lovl = max(o%line_overlap, 0)
+    axsec = 0
+    if (axis_k /= 0 .and. axis_mult == 0) axsec = o%axis_sectors
     ! per-|n| axis solves need the block to be block-diagonal in |n|
     axis_split = (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split > 0)
     if (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split == 0 .and. my_id == 0) &
@@ -1951,7 +1964,11 @@ contains
       endif
     enddo
 
-    if (B%axsparse) then
+    if (B%axsparse .and. B%axdon) then
+      do kk = 1, size(B%axd)
+        call axd_numeric(B%axd(kk), A)
+      enddo
+    else if (B%axsparse) then
       if (size(B%axg) == 1) then
         write(axname, '(A,I0)') "axblk", g
         write(axtag, '(A,I0)') "axis block level ", g
@@ -1965,6 +1982,7 @@ contains
           call rds_setup(B%axg(kk), A, trim(axname), trim(axtag), mod(kk - 1, gnp))
         enddo
       endif
+      if (axsec /= 0 .and. .not. allocated(B%axd)) call axd_try(g, A, B)
     endif
 
     if (B%axsparse .and. axis_mult > 0) then
@@ -2448,6 +2466,76 @@ contains
     end subroutine sort_ghosts
   end subroutine ovl_extend
 
+  !> First build: the axis groups of level g over J-sectors, gated against
+  !! the LUs just set up. Both solve the same random right-hand side; the
+  !! sector solve is used (for all groups, or none) if the solutions agree to
+  !! 1e-8 relative, far below any smoother's accuracy and above the pair
+  !! blocks' LU round-off (kappa ~ 1e7). Collective on gcomm.
+  subroutine axd_try(g, A, B)
+    integer, intent(in) :: g
+    Mat, intent(in) :: A
+    type(blk_t), intent(inout) :: B
+    integer :: kk, q, r, nsec, gnp, mpierr, nc
+    integer, allocatable :: jl(:)
+    character(len=64) :: axtag
+    Vec :: x, y1, y2
+    PetscScalar, pointer :: yp(:)
+    real*8 :: dn, yn
+    logical :: pass
+    PetscErrorCode :: ierr
+
+    call MPI_Comm_size(gcomm, gnp, mpierr)
+    if (g == 0) then
+      nc = nth0
+    else
+      nc = glv(g)%nj
+    endif
+    nsec = axsec
+    if (nsec < 0) nsec = axd_nsec(nc, gnp)
+    nsec = min(nsec, gnp, nc / 4)
+    if (nsec < 2) return
+    allocate(B%axd(size(B%axg)))
+    pass = .true.
+    do kk = 1, size(B%axg)
+      allocate(jl(size(B%axg(kk)%loc)))
+      do q = 1, size(jl)
+        r = B%axg(kk)%loc(q) + 1
+        if (g == 0) then
+          jl(q) = mod(fine_node(r), nth0)
+        else
+          jl(q) = mod(glv(g)%rnode(r), nc)
+        endif
+      enddo
+      write(axtag, '(A,I0,A,I0,A,I0)') "GMG", cur_inst, " axis block level ", g, " group ", kk - 1
+      call axd_setup(B%axd(kk), A, B%axg(kk)%loc, jl, nc, nsec, gcomm, trim(axtag))
+      deallocate(jl)
+      if (.not. B%axd(kk)%on) then
+        pass = .false.
+        exit
+      endif
+      call axd_numeric(B%axd(kk), A)
+      call MatCreateVecs(A, x, y1, ierr)
+      call VecDuplicate(y1, y2, ierr)
+      call VecSetRandom(x, PETSC_NULL_RANDOM, ierr)
+      call VecZeroEntries(y1, ierr); call VecZeroEntries(y2, ierr)
+      call rds_solve(B%axg(kk), x, y1)
+      ! only the LU's members wrote y1: without touching it everywhere, the
+      ! others keep y1's cached zero norm and skip VecNorm's Allreduce
+      call VecGetArray(y1, yp, ierr)
+      call VecRestoreArray(y1, yp, ierr)
+      call axd_solve(B%axd(kk), x, y2)
+      call VecNorm(y1, NORM_2, yn, ierr)
+      call VecAXPY(y2, -1.0d0, y1, ierr)
+      call VecNorm(y2, NORM_2, dn, ierr)
+      call VecDestroy(x, ierr); call VecDestroy(y1, ierr); call VecDestroy(y2, ierr)
+      if (gme == 0) write(*,'(A,A,A,ES9.2,A)') "[Physics PC]   ", trim(axtag), &
+        ": J-sector solve vs LU ", dn / max(yn, 1.d-300), merge(" -> in use ", " -> LU kept", &
+        dn <= 1.d-8 * yn)
+      if (dn > 1.d-8 * yn) pass = .false.
+    enddo
+    B%axdon = pass
+  end subroutine axd_try
+
   !> In-place ascending heapsort, O(n log n) (the setup's medians; an
   !! insertion sort there was O(n^2) in the cell count).
   subroutine sort_real(a)
@@ -2634,8 +2722,11 @@ contains
     if (sm_type == 7) then
       call zebra_solve(x, y)
     else if (.not. B%axsparse .or. axis_mult == 0) then
-      call lines_solve(x, y)
+      ! axis first: it depends on x only, and the ranks enter here in step
+      ! (GMRES's reductions just synchronised them), which a J-sector solve
+      ! needs; after the lines it would wait for the slowest rank's lines
       if (B%axsparse) call ax_solve(x, y)
+      call lines_solve(x, y)
     else if (axis_mult == 2) then
       call lines_solve(x, y)
       call update_rhs(x, y, B%xw, B%axis_is, B%rest_is, B%Bar, B%ta)
@@ -2703,7 +2794,7 @@ contains
 
     !> Smoother 7: one forward block Gauss-Seidel sweep over two colours of
     !! radial lines (zebra line relaxation, Trottenberg-Oosterlee-Schueller
-    !! S5.1). Colour 0 (even J, plus the axis block) is solved from x; colour 1
+    !! S5.1). Colour 0 (the axis block, then even J) is solved from x; colour 1
     !! (odd J) from x - A(odd, colour 0) y. A radial line couples only to the
     !! lines at J +- 1, so odd lines never couple to each other and the sweep
     !! is exact block Gauss-Seidel on the rank's rows. Same line factors and one
@@ -2717,9 +2808,11 @@ contains
       integer :: bb, q, n, info, t, c, k, r, nr, zc_
       external :: dgetrs
       nr = B%nrow
+      ! the axis block belongs to colour 0 and depends on x only: solved
+      ! first, while the ranks are in step (see blk_apply)
+      if (B%axsparse) call ax_solve(xx, yy)
       call ghosts_in(xx, gp)
       do c = 0, 1
-        if (c == 1 .and. B%axsparse) call ax_solve(xx, yy)
         call PetscLogEventBegin(gev_lines(cur_inst), ie)
         call VecGetArrayRead(xx, xp, ie)
         call VecGetArray(yy, yp, ie)
@@ -2793,6 +2886,15 @@ contains
       Vec :: xx, yy
       PetscErrorCode :: ie
       PetscScalar, pointer :: xp(:), yp(:)
+      integer :: kk
+      if (B%axdon) then                         ! collective: every rank enters the scatters
+        call PetscLogEventBegin(gev_axsolve(cur_inst), ie)
+        do kk = 1, size(B%axd)
+          call axd_solve(B%axd(kk), xx, yy)
+        enddo
+        call PetscLogEventEnd(gev_axsolve(cur_inst), ie)
+        return
+      endif
       if (.not. any(B%axg(:)%member)) return
       call PetscLogEventBegin(gev_axsolve(cur_inst), ie)
       call VecGetArrayRead(xx, xp, ie)

@@ -55,6 +55,17 @@ module mod_petsc_pc_sf_solver
   !! 2.0-2.2 with 2 or 3 (np 1: 2.0-2.2); pair_w 3.1-3.4 -> 2.1. 2 is the
   !! smallest overlap that keeps the counts flat in np.
   integer, parameter, public :: SF_GMG_LINE_OVERLAP = 2
+  !> Axis blocks solved over J-sector ranks (mod_petsc_pc_gmg_axis: an exact
+  !! one-level nested dissection in J, gated against the LU on the first
+  !! build); -1 = the cost model's sector count, 0 = the sequential LU on the
+  !! ranks owning the block. OFF until the cluster decides. Workstream H2 on
+  !! the laptop: exact (1e-12..1e-15 against the LU, identical counts) and it
+  !! halves the axis LU time on the critical rank (np 4 / 8 at 21x64: 11.8 ->
+  !! 6.5 s, 24.7 -> 11.0 s), but the extra synchronisation cancels that: wall
+  !! 44 -> 48 s, 93 -> 106 s, 138 -> 143 s at 41x64 np 4. The LU's rank only
+  !! becomes the bottleneck once the axis block no longer fits in one rank's
+  !! rows (161x64 from np ~43), where every owner repeats the whole LU.
+  integer, parameter, public :: SF_GMG_AXIS_SECTORS = 0
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (physics_pc_pair_maxits = 30 for the packed pairs, physics_pc_rhot_gmg =
@@ -144,6 +155,7 @@ contains
       o%nsmooth      = SF_GMG_NSMOOTH
       o%axis_rings   = SF_GMG_AXIS_RINGS
       o%line_overlap = SF_GMG_LINE_OVERLAP
+      o%axis_sectors = SF_GMG_AXIS_SECTORS
       o%bnd_drop     = 1               ! Dirichlet DOFs out of the coarse spaces
       o%harm_split   = 1               ! the extracted blocks are |n|-diagonal
       o%axis_mult    = 0;  o%axis_split = 0;  o%smooth_op = 0;  o%ring_diag = 0
