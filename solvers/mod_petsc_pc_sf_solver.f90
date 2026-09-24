@@ -68,6 +68,11 @@ module mod_petsc_pc_sf_solver
   !! 138 -> 143 s at 41x64 np 4. The first build's exactness gate still keeps
   !! the LU for any level whose sector solve disagrees with it.
   integer, parameter, public :: SF_GMG_AXIS_SECTORS = -1
+  !> Matvec kernel of the SF operators, the GMG levels and the SFM2 coupling
+  !! blocks: 0 = PETSc's (one thread per rank; AIJMKL where PETSc has MKL
+  !! sparse), 1 = jorek_blockmv_attach.c (OpenMP, reads each n_tor harmonic block's
+  !! column indices once; exact, gated against MatMult on first attach).
+  integer, parameter, public :: SF_BLOCKMV = 1
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (physics_pc_pair_maxits = 30 for the packed pairs, physics_pc_rhot_gmg =
@@ -158,6 +163,7 @@ contains
       o%axis_rings   = SF_GMG_AXIS_RINGS
       o%line_overlap = SF_GMG_LINE_OVERLAP
       o%axis_sectors = SF_GMG_AXIS_SECTORS
+      o%blockmv      = SF_BLOCKMV
       o%bnd_drop     = 1               ! Dirichlet DOFs out of the coarse spaces
       o%harm_split   = 1               ! the extracted blocks are |n|-diagonal
       o%axis_mult    = 0;  o%axis_split = 0;  o%smooth_op = 0;  o%ring_diag = 0

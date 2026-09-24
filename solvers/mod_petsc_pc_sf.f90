@@ -11,6 +11,7 @@ module mod_petsc_pc_sf
        split_vars, merge_vars
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather
+  use mod_petsc_raw_csr, only: blockmv_attach
   implicit none
   private
 
@@ -349,17 +350,34 @@ contains
         enddo
       end block
 
+      !--- the SFM2 apply's coupling blocks: fixed patterns, refilled in place
+      !--- by the value map, so one attach holds for the run
+      if (SF_BLOCKMV == 1) then
+        block
+          use mod_parameters, only: n_tor
+          logical :: okb
+          okb = blockmv_attach(g_ctx%B_12, int(n_tor)); okb = blockmv_attach(g_ctx%B_16, int(n_tor))
+          okb = blockmv_attach(g_ctx%B_21, int(n_tor)); okb = blockmv_attach(g_ctx%B_23, int(n_tor))
+          okb = blockmv_attach(g_ctx%B_25, int(n_tor)); okb = blockmv_attach(g_ctx%B_26, int(n_tor))
+          okb = blockmv_attach(g_ctx%B_51, int(n_tor)); okb = blockmv_attach(g_ctx%B_52, int(n_tor))
+          okb = blockmv_attach(g_ctx%B_61, int(n_tor)); okb = blockmv_attach(g_ctx%B_62, int(n_tor))
+          okb = blockmv_attach(g_ctx%B_63, int(n_tor))
+        end block
+      endif
 #if defined(PETSC_HAVE_MKL_SPARSE)
       !--- threaded SpMV: PETSc's AIJ matvec is single-threaded per rank, and
       !--- the level-0 matvecs are most of a V-cycle, so the operators the
       !--- multigrid multiplies with become MKL's inspector-executor type (in
       !--- place: same CSR arrays, so the value maps stay valid; the gather's
       !--- assembly refreshes MKL's handle). LU backends keep plain AIJ.
-      if (bk_pj  == SF_GMG) call MatConvert(g_ctx%K_pj_aij, MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%K_pj_aij, ierr)
-      if (bk_w   == SF_GMG) call MatConvert(g_ctx%S_W_aij,  MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%S_W_aij,  ierr)
-      if (bk_rho == SF_GMG) call MatConvert(g_ctx%B_55,     MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%B_55,     ierr)
-      if (bk_T   == SF_GMG) call MatConvert(g_ctx%B_66,     MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%B_66,     ierr)
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: GMG operators converted to AIJMKL (threaded SpMV)"
+      !--- (SF_BLOCKMV = 1 does this with its own kernel, in the GMG setup)
+      if (SF_BLOCKMV == 0) then
+        if (bk_pj  == SF_GMG) call MatConvert(g_ctx%K_pj_aij, MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%K_pj_aij, ierr)
+        if (bk_w   == SF_GMG) call MatConvert(g_ctx%S_W_aij,  MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%S_W_aij,  ierr)
+        if (bk_rho == SF_GMG) call MatConvert(g_ctx%B_55,     MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%B_55,     ierr)
+        if (bk_T   == SF_GMG) call MatConvert(g_ctx%B_66,     MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%B_66,     ierr)
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: GMG operators converted to AIJMKL (threaded SpMV)"
+      endif
 #endif
     end subroutine first_build_operators
 

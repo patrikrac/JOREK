@@ -43,7 +43,7 @@ module mod_petsc_pc_gmg
 #include "petsc/finclude/petsc.h"
   use petsc
   use iso_c_binding, only: c_ptr, c_double
-  use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done
+  use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach
   use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_numeric, axd_solve
   implicit none
   private
@@ -73,6 +73,8 @@ module mod_petsc_pc_gmg
     integer :: axis_sectors = 0      !< axis blocks solved over this many J-sector ranks
                                      !< (mod_petsc_pc_gmg_axis); -1 = its cost optimum,
                                      !< 0 = the sequential LU on the owning ranks
+    integer :: blockmv      = 0      !< 1 = level operators and prolongations multiply
+                                     !< with jorek_blockmv_attach.c's OpenMP kernel
     real*8  :: omega        = 0.7d0  !< Richardson damping (smoothers 1, 2)
     real*8  :: axis_droptol = 0.d0   !< relative drop tolerance of the axis block
     real*8  :: ring_aspect  = 1.d0   !< smoother 6 / axis_rings -1 switch radius
@@ -1368,6 +1370,22 @@ contains
       endif
     enddo
     call PetscLogEventEnd(gev_ptap, ierr)
+    ! the multiply kernel each level's matvecs actually run: MatPtAP decides
+    ! the coarse types, whatever the fine operator was converted to
+    if (.not. op_ready .and. my_id == 0) then
+      block
+        character(len=80) :: ta, tp
+        integer :: gg
+        write(*,'(A,I0,A)', advance="no") "[Physics PC]   GMG", cur_inst, " level types (A/P):"
+        do gg = 0, nlev - 1
+          call MatGetType(gA(gg), ta, ierr)
+          tp = "-"
+          if (gg > 0) call MatGetType(gP(gg), tp, ierr)
+          write(*,'(A,I0,A,A,A,A)', advance="no") "  ", gg, "=", trim(ta), "/", trim(tp)
+        enddo
+        write(*,*)
+      end block
+    endif
 
     call PetscLogEventBegin(gev_smsetup, ierr)
     if (present(opts)) then
@@ -1377,6 +1395,23 @@ contains
     endif
     sm_type = o%smoother
     sm_nstep = o%nsmooth
+    ! threaded matvecs: after the Galerkin chain, on every rebuild (the attach
+    ! is idempotent and only re-plans on a new pattern). gA(0) is the caller's
+    ! operator; P serves the V-cycle's prolongation (MatMultAdd).
+    if (o%blockmv == 1) then
+      block
+        use mod_parameters, only: n_tor
+        integer :: gg
+        logical :: okb
+        do gg = 0, nlev - 1
+          okb = blockmv_attach(gA(gg), int(n_tor))
+          if (gg > 0) okb = blockmv_attach(gP(gg), 1)
+        enddo
+        if (gF /= gA(0)) okb = blockmv_attach(gF, int(n_tor))   ! a shell: left alone
+        if (.not. op_ready .and. my_id == 0) write(*,'(A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, &
+          ": level matvecs on the OpenMP block kernel (bs ", n_tor, ", ", nlev, " levels)"
+      end block
+    endif
     if (present(smoother)) then
       if (smoother >= 0) sm_type = smoother
     endif

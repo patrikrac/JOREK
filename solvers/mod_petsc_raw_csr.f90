@@ -62,12 +62,36 @@ module mod_petsc_raw_csr
       integer(c_intptr_t), value :: M
       type(c_ptr)                :: arr
     end function c_aij_restore_read
+    ! the threaded block matvec of jorek_blockmv_attach.c (this declaration's
+    ! form is what util/makedepend links the C file by)
+    function jorek_blockmv_attach(M, bs, ok) bind(C)
+      use, intrinsic :: iso_c_binding, only: c_int, c_intptr_t
+      integer(c_int)             :: jorek_blockmv_attach
+      integer(c_intptr_t), value :: M
+      integer(c_int), value      :: bs
+      integer(c_int)             :: ok
+    end function jorek_blockmv_attach
   end interface
 
   public :: c_baij_get, c_baij_restore, c_aij_get, c_aij_restore
   public :: split_parts, get_ij, put_ij, aij_parts, aij_vals_read, aij_vals_done
+  public :: blockmv_attach
 
 contains
+
+  !> Replace M's MatMult / MatMultAdd by the OpenMP kernel of jorek_blockmv_attach.c
+  !! (bs consecutive rows sharing one column pattern read it once). Only for
+  !! (MPI/Seq)AIJ; returns .false. and leaves M alone otherwise. Collective;
+  !! idempotent, so it can follow every refill of M.
+  logical function blockmv_attach(M, bs)
+    Mat, intent(in)     :: M
+    integer, intent(in) :: bs
+    integer(c_int) :: ok
+    ok = 0
+    if (jorek_blockmv_attach(transfer(M%v, 0_c_intptr_t), int(bs, c_int), ok) /= 0) &
+      stop "blockmv_attach: PETSc error"
+    blockmv_attach = (ok /= 0)
+  end function blockmv_attach
 
   !> Diagonal/off-diagonal sequential parts of an MPI(B)AIJ matrix, and the
   !! off-diagonal part's global (block) column of each local column.

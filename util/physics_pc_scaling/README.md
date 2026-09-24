@@ -147,9 +147,21 @@ the parallel parts actually do; check it before reading any timing:
   the overlapping line segments across rank boundaries. They keep the
   V-cycle counts flat in np (41×64: pair_psi 2.0 at np 1; without overlap
   5.3–6.5 at np 8, with overlap 2 2.0–2.2).
-- `SF: GMG operators converted to AIJMKL (threaded SpMV)`: only on a PETSc
-  with MKL sparse (`grep PETSC_HAVE_MKL_SPARSE $PETSC_DIR/$PETSC_ARCH/include/petscconf.h`).
-  Without it the matvecs run on one thread per rank.
+- `GMG<k>: level matvecs on the OpenMP block kernel (bs 3, ... levels)`: the
+  SF operators, every GMG level, the prolongations and the SFM2 coupling
+  blocks multiply with `solvers/jorek_blockmv_attach.c` (`SF_BLOCKMV = 1`),
+  which threads over the rank's OpenMP threads and reads each harmonic
+  block's column indices once. It is gated against PETSc's `MatMult` on first
+  attach and shows up as `PC_BlockMV` in `prof.txt`. The comparison binary is
+  `SF_BLOCKMV = 0`: PETSc's kernel, one thread per rank, except that the
+  fine-level GMG operators become AIJMKL on a PETSc with MKL sparse
+  (`SF: GMG operators converted to AIJMKL (threaded SpMV)`). The laptop cannot
+  judge the kernel: its memory bandwidth saturates at 2 threads
+  (81×32 np 1×4: MatMult 23.5 → 20.2 s, KSP 41.9 → 38.3 s; np 2×2 even;
+  one thread per rank ~10% slower). Compare the two binaries on the cluster
+  over the thread sweep.
+- `GMG<k> level types (A/P)`: the PETSc type of every level operator and
+  prolongation (`MatPtAP` decides the coarse ones).
 - `... n J-sectors (... rows, reduced system ...)` and `J-sector solve vs
   LU e -> in use`: the axis blocks' J-sector solve (see below). `-> LU kept`
   means the exactness gate (1e-8) refused the sector solve for that level
