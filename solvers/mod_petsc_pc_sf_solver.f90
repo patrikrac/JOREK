@@ -58,14 +58,16 @@ module mod_petsc_pc_sf_solver
   !> Axis blocks solved over J-sector ranks (mod_petsc_pc_gmg_axis: an exact
   !! one-level nested dissection in J, gated against the LU on the first
   !! build); -1 = the cost model's sector count, 0 = the sequential LU on the
-  !! ranks owning the block. OFF until the cluster decides. Workstream H2 on
-  !! the laptop: exact (1e-12..1e-15 against the LU, identical counts) and it
-  !! halves the axis LU time on the critical rank (np 4 / 8 at 21x64: 11.8 ->
-  !! 6.5 s, 24.7 -> 11.0 s), but the extra synchronisation cancels that: wall
-  !! 44 -> 48 s, 93 -> 106 s, 138 -> 143 s at 41x64 np 4. The LU's rank only
-  !! becomes the bottleneck once the axis block no longer fits in one rank's
-  !! rows (161x64 from np ~43), where every owner repeats the whole LU.
-  integer, parameter, public :: SF_GMG_AXIS_SECTORS = 0
+  !! ranks owning the block. ON: the first cluster runs of the scaling kit
+  !! (2026-09-24) call for it, since there the sequential axis LU on rank 0
+  !! is the strong-scaling critical path. On the laptop it does NOT pay, and
+  !! those numbers are no argument against it: exact (1e-12..1e-15 against
+  !! the LU, identical counts), it halves the axis LU time on the critical
+  !! rank (np 4 / 8 at 21x64: 11.8 -> 6.5 s, 24.7 -> 11.0 s), but the extra
+  !! synchronisation cancels that there: wall 44 -> 48 s, 93 -> 106 s,
+  !! 138 -> 143 s at 41x64 np 4. The first build's exactness gate still keeps
+  !! the LU for any level whose sector solve disagrees with it.
+  integer, parameter, public :: SF_GMG_AXIS_SECTORS = -1
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (physics_pc_pair_maxits = 30 for the packed pairs, physics_pc_rhot_gmg =

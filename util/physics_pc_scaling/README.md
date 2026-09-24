@@ -151,23 +151,25 @@ the parallel parts actually do; check it before reading any timing:
   with MKL sparse (`grep PETSC_HAVE_MKL_SPARSE $PETSC_DIR/$PETSC_ARCH/include/petscconf.h`).
   Without it the matvecs run on one thread per rank.
 - `... n J-sectors (... rows, reduced system ...)` and `J-sector solve vs
-  LU e -> in use`: only in a binary built with `SF_GMG_AXIS_SECTORS = -1`
-  (see below). `-> LU kept` means the exactness gate (1e-8) refused the
-  sector solve for that level and the sequential LU stays.
+  LU e -> in use`: the axis blocks' J-sector solve (see below). `-> LU kept`
+  means the exactness gate (1e-8) refused the sector solve for that level
+  and the sequential LU stays.
 
-**Two things only the cluster can decide.** Both are compile-time constants
-in `mod_petsc_pc_sf_solver.f90`, so each needs its own binary; give the
-second one's cases a `PCS_TAG`.
+**The axis block** (decided). Every GMG level has an exact axis block (rings
+0..3, all J). Its size depends on n_tht only, so a sequential LU on the ranks
+that own it (rank 0, and from 161×64 at np ≈ 43 on also its neighbours, each
+repeating the whole LU) is the strong-scaling critical path. The first
+cluster runs settled it: `SF_GMG_AXIS_SECTORS = -1` (the default) solves it
+over J-sector ranks, exact and gated against the LU on the first build. On
+the laptop the sector solve loses about as much to synchronisation as it
+saves; that is expected there and no reason to switch it off. A binary with
+`SF_GMG_AXIS_SECTORS = 0` restores the sequential LU for comparison
+(`t_GMG<k>_AxSolve` against `t_GMG<k>_Lines`).
 
-- **The axis block.** Every GMG level has an exact axis block (rings 0..3,
-  all J), solved by a sequential LU on the ranks that own it — rank 0, and
-  from 161×64 at np ≈ 43 on also its neighbours, each repeating the whole
-  LU. Its size depends on n_tht only, so at the strong-scaling end it is the
-  critical path: watch `t_GMG<k>_AxSolve` against `t_GMG<k>_Lines`.
-  `SF_GMG_AXIS_SECTORS = -1` solves it over J-sector ranks instead (exact,
-  gated against the LU on the first build). On the laptop it halved the axis
-  time on the critical rank but lost as much to synchronisation, so it is
-  off; run the 161×64 series up to np 64–128 with both binaries.
+**One thing only the cluster can decide.** It is a compile-time constant in
+`mod_petsc_pc_sf_solver.f90`, so it needs its own binary; give its cases a
+`PCS_TAG`.
+
 - **The line overlap.** `SF_GMG_LINE_OVERLAP = 2` kept the V-cycles flat to
   np 8 at 41×64 (~5 rings per rank). Its cost is the ghost fraction the log
   prints: 29% at np 4, 112% at 21×64 np 8, and more at ~2 rings per rank.
