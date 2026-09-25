@@ -7,6 +7,7 @@ module mod_petsc_pc_physics_construction
        pcev_massinv, pcev_shat, pcev_channel, pcev_convert, pcev_builddiag, &
        pcev_shellmult, pcev_mjsolve, physics_pc_mumps_mem, physics_pc_mem, pcev_psipc
   use mod_petsc_pc_toroidal, only: petsc_setup_toroidal_harmonic_pc_blocked
+  use mod_petsc_pc_mass_slot, only: mass_slot_t, mass_slot_setup, mass_slot_solve
   use mod_petsc_pc_physics_apply, only: k_a_exact_mult, s_pbp_diag_mult, physics_pc_apply, &
                                         pack_2v, unpack_2v
   use mod_petsc_pc_blocks, only: pc_print_block_setup, create_variable_index_sets, &
@@ -89,19 +90,8 @@ module mod_petsc_pc_physics_construction
   ! (mode 2). Dh = diag(Shat^-1) is saved by build_schur_mixed_prod (pairinv 2).
   Mat, save     :: shw_A
   ! Workstream D1 (physics_pc_mass_split = 1): per-slot constraint-mass
-  ! factors. ms(1) = B_33 (ksp_Mj), ms(2) = B_44 (ksp_Mw). Slots with an
-  ! identical matrix form one group sharing one factor; a group of k slots is
-  ! solved as one k-column dense RHS (rhs/sol), so the factor is read once.
-  type :: ms_t
-    logical :: ready = .false.
-    integer :: ngrp = 0
-    integer, allocatable :: gn(:)        !< slots in group g
-    integer, allocatable :: gm(:,:)      !< gm(g, c) = c-th slot (0-based) of group g
-    KSP, allocatable     :: ksp(:)       !< factor of group g's slot matrix
-    Mat, allocatable     :: rhs(:), sol(:)
-    PetscInt :: nloc_s = 0
-  end type ms_t
-  type(ms_t), save, target :: ms(2)
+  ! factors (mod_petsc_pc_mass_slot). ms(1) = B_33 (ksp_Mj), ms(2) = B_44 (ksp_Mw).
+  type(mass_slot_t), save :: ms(2)
   ! Stage Q (physics_pc_mass_solver = 1 | 2): the same masses by a Krylov
   ! iteration instead of a factor. mc(1) = B_33, mc(2) = B_44. The node-block
   ! Jacobi preconditioner keeps one dense inverse per (JOREK node, slot) block
@@ -1024,126 +1014,23 @@ contains
   end subroutine setup_constraint_mass_ksp
 
   !--------------------------------------------------------------------
-  !> Workstream D1: the constraint mass B (B_33 or B_44) factored per toroidal
-  !! slot. JOREK's mass matrices are exactly slot-block-diagonal (the stored
-  !! cross-slot entries are 0, even between cos and sin of one n), and the
-  !! cos/sin slots of every n >= 1 carry the SAME matrix (n = 0 differs: 2x on
-  !! the interior, not on the boundary ring). So one factor per DISTINCT slot
-  !! matrix serves every slot, and ksp_block becomes PREONLY + a PCSHELL that
-  !! gathers the slots of a group into a dense multi-column RHS. Callers of
-  !! KSPSolve(ksp_Mj / ksp_Mw) are unchanged.
-  !!
-  !! Both structural facts are GATED here, not assumed: a mass with cross-slot
-  !! content aborts (not a fallback -- silently factoring a different operator
-  !! would be measuring the wrong thing), and slot identity is MatEqual (exact).
-  !! Factor memory: (#distinct slots) x one 2D factor, i.e. 2 for any n_tor.
+  !> Workstream D1: the constraint mass factored per distinct toroidal slot
+  !! (mod_petsc_pc_mass_slot), behind a PREONLY + PCSHELL KSP so the callers
+  !! of KSPSolve(ksp_Mj / ksp_Mw) are unchanged.
   !--------------------------------------------------------------------
   subroutine setup_mass_split(ksp_block, B_block, comm, id, label)
-    use mod_parameters, only: n_tor
     KSP, intent(inout)  :: ksp_block
     Mat, intent(in)     :: B_block
     integer, intent(in) :: comm, id
     character(len=*), intent(in), optional :: label
-    type(ms_t), pointer :: MS_
-    Mat, allocatable :: S(:)
-    IS             :: ism
     PC             :: pc
     PetscErrorCode :: ierr
-    PetscInt       :: rstart, rend, nloc, nglo, i, ncols
-    PetscInt, pointer    :: cols(:)
-    PetscScalar, pointer :: vals(:)
-    PetscBool      :: eq, symm
-    real*8         :: fB, fs, cross
-    integer        :: m, g, k, rank, grp(0:n_tor - 1), maxn
-    character(len=160) :: line
 
-    call MPI_Comm_rank(comm, rank, ierr)
-    MS_ => ms(id)
-    call MatGetOwnershipRange(B_block, rstart, rend, ierr)
-    call MatGetSize(B_block, nglo, PETSC_NULL_INTEGER, ierr)
-    nloc = rend - rstart
-    if (mod(rstart, n_tor) /= 0 .or. mod(nloc, n_tor) /= 0) then
-      if (rank == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_mass_split needs "// &
-        "slot-aligned row ownership."
-      flush(6)
-      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    if (present(label)) then
+      call mass_slot_setup(ms(id), B_block, comm, label)
+    else
+      call mass_slot_setup(ms(id), B_block, comm, "constraint mass")
     endif
-    MS_%nloc_s = nloc / n_tor
-
-    !--- cross-slot gate, summed entry by entry (a difference of Frobenius
-    !--- norms would cancel to ~sqrt(eps) and could not tell 0 from round-off)
-    fs = 0.d0
-    do i = rstart, rend - 1
-      call MatGetRow(B_block, i, ncols, cols, vals, ierr)
-      do k = 1, ncols
-        if (mod(cols(k), n_tor) /= mod(i, n_tor)) fs = fs + abs(vals(k))**2
-      enddo
-      call MatRestoreRow(B_block, i, ncols, cols, vals, ierr)
-    enddo
-    call MatNorm(B_block, NORM_FROBENIUS, fB, ierr)
-    cross = sqrt(fs) / fB
-    if (cross > 1.d-13) then
-      if (rank == 0) write(*,'(A,ES10.3,A)') "[Physics PC]   FATAL: physics_pc_mass_split: "// &
-        "the mass has cross-slot content (||cross||/||B|| = ", cross, ")."
-      flush(6)
-      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
-    endif
-
-    !--- slot matrices
-    allocate(S(0:n_tor - 1))
-    do m = 0, n_tor - 1
-      call ISCreateStride(comm, MS_%nloc_s, rstart + m, int(n_tor, kind=kind(rstart)), ism, ierr)
-      call MatCreateSubMatrix(B_block, ism, ism, MAT_INITIAL_MATRIX, S(m), ierr)
-      call ISDestroy(ism, ierr)
-    enddo
-
-    !--- group identical slots (exact MatEqual against each group's first slot)
-    grp = 0; MS_%ngrp = 0
-    allocate(MS_%gn(n_tor), MS_%gm(n_tor, n_tor))
-    MS_%gn = 0; MS_%gm = -1
-    do m = 0, n_tor - 1
-      do g = 1, MS_%ngrp
-        call MatEqual(S(m), S(MS_%gm(g, 1)), eq, ierr)
-        if (eq) exit
-      enddo
-      if (g > MS_%ngrp) then
-        MS_%ngrp = MS_%ngrp + 1; g = MS_%ngrp
-      endif
-      grp(m) = g
-      MS_%gn(g) = MS_%gn(g) + 1
-      MS_%gm(g, MS_%gn(g)) = m
-    enddo
-
-    !--- one factor per group (Cholesky when symmetric, as the whole-mass path)
-    allocate(MS_%ksp(MS_%ngrp), MS_%rhs(MS_%ngrp), MS_%sol(MS_%ngrp))
-    maxn = 0
-    do g = 1, MS_%ngrp
-      call KSPCreate(comm, MS_%ksp(g), ierr)
-      call KSPSetOperators(MS_%ksp(g), S(MS_%gm(g, 1)), S(MS_%gm(g, 1)), ierr)
-      call KSPSetType(MS_%ksp(g), KSPPREONLY, ierr)
-      call KSPGetPC(MS_%ksp(g), pc, ierr)
-      call MatIsSymmetric(S(MS_%gm(g, 1)), 1.d-12, symm, ierr)
-      if (symm) then
-        call MatSetOption(S(MS_%gm(g, 1)), MAT_SPD, PETSC_TRUE, ierr)
-        call PCSetType(pc, PCCHOLESKY, ierr)
-      else
-        call PCSetType(pc, PCLU, ierr)
-      endif
-      call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
-      call KSPSetUp(MS_%ksp(g), ierr)
-      call MatCreateDense(comm, MS_%nloc_s, PETSC_DECIDE, nglo / n_tor, int(MS_%gn(g), kind=kind(nglo)), &
-                          PETSC_NULL_SCALAR_ARRAY, MS_%rhs(g), ierr)
-      call MatDuplicate(MS_%rhs(g), MAT_DO_NOT_COPY_VALUES, MS_%sol(g), ierr)
-      write(line,'(A,I0,A,I0,A)') "slot group ", g, " (", MS_%gn(g), " slots)"
-      if (present(label)) call physics_pc_mumps_mem(MS_%ksp(g), trim(label)//" "//trim(line), rank)
-      maxn = max(maxn, MS_%gn(g))
-    enddo
-    do m = 0, n_tor - 1
-      call MatDestroy(S(m), ierr)       ! each group KSP holds its own reference
-    enddo
-    deallocate(S)
-
-    !--- the KSP every caller uses
     call KSPCreate(comm, ksp_block, ierr)
     call KSPSetOperators(ksp_block, B_block, B_block, ierr)
     call KSPSetType(ksp_block, KSPPREONLY, ierr)
@@ -1156,11 +1043,6 @@ contains
     endif
     call PCShellSetName(pc, "per-slot constraint mass (D1)", ierr)
     call KSPSetUp(ksp_block, ierr)
-    MS_%ready = .true.
-
-    if (rank == 0) write(*,'(A,A,A,I0,A,I0,A,ES9.2,A)') "[Physics PC]   ", trim(label), &
-      ": PREONLY + per-slot MUMPS factors, ", MS_%ngrp, " distinct of ", n_tor, &
-      " slots (cross-slot ||.||/||B|| = ", cross, "), factored once"
   end subroutine setup_mass_split
 
   subroutine ms_apply_1(pc, x, y, ierr)
@@ -1177,43 +1059,11 @@ contains
     call ms_apply(2, x, y, ierr)
   end subroutine ms_apply_2
 
-  !> y = B^-1 x slot by slot: gather each group's slots into its dense RHS
-  !! (row i of slot m is local entry i*n_tor + m), one multi-RHS solve per
-  !! group, scatter back.
   subroutine ms_apply(id, x, y, ierr)
-    use mod_parameters, only: n_tor
     integer, intent(in) :: id
     Vec :: x, y
     PetscErrorCode :: ierr
-    type(ms_t), pointer :: MS_
-    PetscScalar, pointer :: xa(:), ya(:), a2(:,:)
-    integer :: g, c, m
-    PetscInt :: i
-
-    MS_ => ms(id)
-    call VecGetArrayRead(x, xa, ierr)
-    call VecGetArray(y, ya, ierr)
-    do g = 1, MS_%ngrp
-      call MatDenseGetArray(MS_%rhs(g), a2, ierr)
-      do c = 1, MS_%gn(g)
-        m = MS_%gm(g, c)
-        do i = 1, MS_%nloc_s
-          a2(i, c) = xa((i - 1) * n_tor + m + 1)
-        enddo
-      enddo
-      call MatDenseRestoreArray(MS_%rhs(g), a2, ierr)
-      call KSPMatSolve(MS_%ksp(g), MS_%rhs(g), MS_%sol(g), ierr)
-      call MatDenseGetArrayRead(MS_%sol(g), a2, ierr)
-      do c = 1, MS_%gn(g)
-        m = MS_%gm(g, c)
-        do i = 1, MS_%nloc_s
-          ya((i - 1) * n_tor + m + 1) = a2(i, c)
-        enddo
-      enddo
-      call MatDenseRestoreArrayRead(MS_%sol(g), a2, ierr)
-    enddo
-    call VecRestoreArrayRead(x, xa, ierr)
-    call VecRestoreArray(y, ya, ierr)
+    call mass_slot_solve(ms(id), x, y)
     ierr = 0
   end subroutine ms_apply
 

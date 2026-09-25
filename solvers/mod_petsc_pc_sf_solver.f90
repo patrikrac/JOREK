@@ -33,9 +33,9 @@ module mod_petsc_pc_sf_solver
   integer, parameter, public :: SF_GMG = 2
 
   !--- GMG smoothers (codes of mod_petsc_pc_gmg) ----------------------------
-  !> Collective radial-line block Jacobi: pair_w, rho, T. Workstream D S12:
-  !! the winner on pair_w; workstream H: at least as good as the point and
-  !! node smoothers on rho and T at 41x64 and tstep 0.1 / 1 / 10.
+  !> Collective radial-line block Jacobi: rho, T. Workstream H: at least as
+  !! good as the point and node smoothers on rho and T at 41x64 and tstep
+  !! 0.1 / 1 / 10.
   integer, parameter, public :: SF_GMG_SMOOTHER_LINES = 5
   !> Zebra (red-black) radial-line block Gauss-Seidel on the split (psi, j)
   !! pair: Chacon's collective smoothing of the split system (JCP 526 (2025)
@@ -43,6 +43,8 @@ module mod_petsc_pc_sf_solver
   !! block does not dominate the operator (node blocks: 10-21 cycles and
   !! capped; point Jacobi: diverges). Workstream H: half the V-cycles of
   !! SF_GMG_SMOOTHER_LINES on pair_psi (3.3 -> 2.0) at unchanged outer counts.
+  !! On pair_w (exact-mass S_uu, blocks from the diagonal-mass channel) flat
+  !! at ~2.0 V-cycles from 81x32 to 121x48 where lines take 3.1-3.4.
   integer, parameter, public :: SF_GMG_SMOOTHER_ZEBRA = 7
   integer, parameter, public :: SF_GMG_AXIS_RINGS = 3   !< rings folded into the axis block
   integer, parameter, public :: SF_GMG_NSMOOTH    = 0   !< 0 = the smoother's own default (4)
@@ -115,7 +117,7 @@ contains
   !! so MUMPS and the GMG both reuse their symbolic phases.
   !--------------------------------------------------------------------
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
-                             nfields, smoother, maxits)
+                             nfields, smoother, maxits, Aop, Ablk)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_opts_t
@@ -129,7 +131,11 @@ contains
                                               !< A -- 2 for the mixed pairs, 1 for a
                                               !< scalar block
     integer, intent(in)          :: smoother  !< SF_GMG: SF_GMG_SMOOTHER_*
-    integer, intent(in)          :: maxits    !< SF_GMG: FGMRES budget
+    integer, intent(in)          :: maxits    !< FGMRES budget (SF_GMG, or SF_LU with Aop)
+    Mat, intent(in), optional    :: Aop       !< the operator to solve when it is not A
+                                              !< (a MATSHELL); A then only preconditions:
+                                              !< its LU (SF_LU) or its Galerkin chain (SF_GMG)
+    Mat, intent(in), optional    :: Ablk      !< SF_GMG: level-0 smoother blocks from Ablk
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -146,13 +152,28 @@ contains
 
     case (SF_LU)
       if (fresh) call KSPCreate(comm, slv%ksp, ierr)
-      call KSPSetOperators(slv%ksp, A, A, ierr)
-      call KSPSetType(slv%ksp, KSPPREONLY, ierr)
+      if (present(Aop)) then
+        ! the exact reference for an operator that is not assembled: Krylov
+        ! on it, preconditioned by the exact LU of the assembled A
+        call KSPSetOperators(slv%ksp, Aop, A, ierr)
+        call KSPSetType(slv%ksp, KSPFGMRES, ierr)
+        call KSPGMRESSetRestart(slv%ksp, max(maxits, 2), ierr)
+        call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, maxits, ierr)
+      else
+        call KSPSetOperators(slv%ksp, A, A, ierr)
+        call KSPSetType(slv%ksp, KSPPREONLY, ierr)
+      endif
       call KSPGetPC(slv%ksp, pc, ierr)
       call PCSetType(pc, PCLU, ierr)
       call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
       call KSPSetUp(slv%ksp, ierr)
-      call pc_print_block_setup(comm, label, trim(sf_backend_name(backend)))
+      if (present(Aop)) then
+        write(tstr,'(ES9.2)') rtol
+        call pc_print_block_setup(comm, label, "FGMRES + LU (MUMPS) of the assembled surrogate, rtol "// &
+                                  trim(adjustl(tstr)))
+      else
+        call pc_print_block_setup(comm, label, trim(sf_backend_name(backend)))
+      endif
       if (fresh) call physics_pc_mumps_mem(slv%ksp, label, my_id)
 
     case (SF_GMG)
@@ -180,7 +201,7 @@ contains
           call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
         endif
       endif
-      call gmg_setup_operator(A, comm, my_id, tag=trim(label), opts=o)
+      call gmg_setup_operator(A, comm, my_id, Afine=Aop, tag=trim(label), opts=o, Ablk=Ablk)
       call gmg_select(1)
 
       !--- the Krylov wrapper: created once, re-pointed at every rebuild
@@ -199,7 +220,11 @@ contains
         end select
         call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       endif
-      call KSPSetOperators(slv%ksp, A, A, ierr)
+      if (present(Aop)) then
+        call KSPSetOperators(slv%ksp, Aop, A, ierr)
+      else
+        call KSPSetOperators(slv%ksp, A, A, ierr)
+      endif
       call KSPSetUp(slv%ksp, ierr)
       write(tstr,'(ES9.2)') rtol
       call pc_print_block_setup(comm, label, &

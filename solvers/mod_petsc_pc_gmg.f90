@@ -1302,12 +1302,15 @@ contains
   !! at every PC rebuild with new values in A; P is reused, and with an
   !! unchanged pattern so are the coarse operators and the LUs' symbolic phase.
   !--------------------------------------------------------------------
-  subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, smoother, nsmooth, opts)
+  subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, smoother, nsmooth, opts, Ablk)
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
     Mat, intent(in), optional :: Afine  !< Workstream D: applies the fine operator
                                         !< for every level-0 matvec; A still gives the
                                         !< Galerkin chain, Jacobi diagonal and axis block
+    Mat, intent(in), optional :: Ablk   !< the level-0 smoother blocks (lines, zebra
+                                        !< coupling, axis block) from Ablk instead of A;
+                                        !< same layout as A, frozen pattern
     character(len=*), intent(in), optional :: tag   !< label for the prints
     integer, intent(in), optional :: smoother, nsmooth   !< override the physics_pc_gmg_* knobs
     type(gmg_opts_t), intent(in), optional :: opts    !< the whole configuration; absent =
@@ -1471,7 +1474,13 @@ contains
           call PCSetType(pc, PCJACOBI, ierr)
         endif
       endif
-      if (sm_blocks) call build_blocks(g, gA(g))
+      if (sm_blocks) then
+        if (g == 0 .and. present(Ablk)) then
+          call build_blocks(g, Ablk)
+        else
+          call build_blocks(g, gA(g))
+        endif
+      endif
       call KSPSetUp(gSm(g), ierr)
     enddo
     call PetscLogEventEnd(gev_smsetup, ierr)

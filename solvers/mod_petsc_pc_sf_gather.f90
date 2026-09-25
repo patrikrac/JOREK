@@ -45,7 +45,7 @@ module mod_petsc_pc_sf_gather
     integer(c_int32_t), allocatable :: md(:), mo(:), wd(:), wo(:)
   end type tgt_t
 
-  integer, parameter :: MAXT = 16
+  integer, parameter :: MAXT = 20
   type(tgt_t), save :: tg(MAXT)
   integer, save     :: ntg = 0
   integer(8), save  :: a_nzst = -1, w_nzst = -1, a_id = -1, w_id = -1
@@ -62,12 +62,13 @@ contains
 
   !--------------------------------------------------------------------
   !> Build the maps (first build only). blocks(k) = A(eqs(k), vrs(k)) in the
-  !! sub-block layout; Kpj / Sw the packed pairs (pair_psi, pair_w). All of
-  !! them already hold the conventionally extracted values.
+  !! sub-block layout; Kpj / Sw the packed pairs (pair_psi, pair_w = B_22 + W)
+  !! and Pw(:) further operators in pair_w's layout without W. All of them
+  !! already hold the conventionally extracted values.
   !--------------------------------------------------------------------
-  subroutine sfg_build(A, W, blocks, eqs, vrs, Kpj, pj_e, pj_v, Sw, w_e, w_v, comm, my_id)
+  subroutine sfg_build(A, W, blocks, eqs, vrs, Kpj, pj_e, pj_v, Sw, Pw, w_e, w_v, comm, my_id)
     Mat, intent(in)     :: A, W
-    Mat, intent(in)     :: blocks(:), Kpj, Sw
+    Mat, intent(in)     :: blocks(:), Kpj, Sw, Pw(:)
     integer, intent(in) :: eqs(:), vrs(:), pj_e(2), pj_v(2), w_e(2), w_v(2)
     integer, intent(in) :: comm, my_id
     integer :: k
@@ -86,6 +87,10 @@ contains
     ntg = ntg + 1
     tg(ntg)%T = Sw;  tg(ntg)%e = w_e;  tg(ntg)%v = w_v;  tg(ntg)%pair = .true.
     tg(ntg)%with_w = .true.
+    do k = 1, size(Pw)
+      ntg = ntg + 1
+      tg(ntg)%T = Pw(k); tg(ntg)%e = w_e; tg(ntg)%v = w_v; tg(ntg)%pair = .true.
+    enddo
 
     do k = 1, ntg
       call build_map(tg(k), A, W, comm)

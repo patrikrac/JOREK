@@ -11,6 +11,7 @@ module mod_petsc_pc_sf
        split_vars, merge_vars
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather
+  use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_lines
   use mod_petsc_raw_csr, only: blockmv_attach
   implicit none
   private
@@ -33,32 +34,40 @@ module mod_petsc_pc_sf
   !! enter, and eta_num > 0 is allowed: hyper-resistivity only adds
   !! eta_num K_1 to B_13, so both rows stay second order.
   !!
-  !! and the momentum block taken in its COMPOSED form (workstream E; Chacon
-  !! JCP 526 (2025) 113789, Eq. 17-19):
+  !! and the momentum block S_uu taken as the psi-channel Schur complement
+  !! with the EXACT constraint mass, applied matrix-free
+  !! (mod_petsc_pc_sf_pairw):
   !!
-  !!   S_uu := B_22 + (theta dt)^2/opz * W(psi_0, p_0; n)
+  !!   S_uu u = B_22 u - B_21 p + B_23 B_33^-1 B_31 p,   p = Dh B_12 u
   !!
-  !! rather than as the triple product B_22 - Ltil Shat^-1 B_12. W is assembled
-  !! at element level (construct_force_operator_matrix) already carrying its
-  !! prefactor, its toroidal channels and its zeroed Dirichlet rows, so forming
-  !! S_uu here is one MatAXPY.
+  !! Its multigrid keeps the COMPOSED operator (workstream E; Chacon JCP 526
+  !! (2025) 113789, Eq. 17-19) for the Galerkin chain,
   !!
-  !! WHAT THAT BUYS, AND WHY THIS PATH EXISTS
-  !! ----------------------------------------
-  !! The composed form has NO mass inverse. The triple product needs B_33^-1
-  !! inside it, and PhysPC_MjSolve is the measured cluster blocker (90 s at
-  !! np 1 -> 312 s at np 32 at 161x64). Dropping it also drops, for this path:
-  !! the Ltil/Shat/channel chain, the sparse mass inverses and their FSAI
-  !! machinery, the matrix-free pair_w MATSHELL, and -- because the SFM2 apply
-  !! folds neither constraint -- the LU factorisations of B_33 and B_44 as
-  !! well: neither mass matrix is ever factored on this path.
+  !!   B_22 + (theta dt)^2/opz * W(psi_0, p_0; n)       (S_W_aij)
+  !!
+  !! and smooths level 0 with zebra lines on the same channel with a diagonal
+  !! mass, assembled only where the smoother reads it. W is assembled at
+  !! element level (construct_force_operator_matrix) already carrying its
+  !! prefactor, its toroidal channels and its zeroed Dirichlet rows.
+  !!
+  !! WHY THE EXACT MASS
+  !! ------------------
+  !! With S_uu = B_22 + W alone the outer iterations grow with the mesh (shaped
+  !! pcbench, tstep 1: 21 -> 55 from 21x16 to 121x48): W is the continuum
+  !! operator and lacks the discrete projection M_j^-1 of the Jacobian's Schur
+  !! complement, an O(1) error at grid scale that grows as (dt v_A / h)^2. With
+  !! the exact mass the count is flat (17-24). B_33 is geometry-only and
+  !! factored once per run, per distinct toroidal slot (mod_petsc_pc_mass_slot);
+  !! each shell matvec costs one pair of triangular solves.
   !!
   !! WHERE IT IS VALID
   !! -----------------
-  !! The composed operator is a SMALL-dt method. Measured on the shaped-limiter
-  !! ballooning case: a 1.66x win at tstep 0.1, a wash at tstep 1, and NO
-  !! convergence at tstep 10, where the exact-mass shell still converges. Do
-  !! not read a failure at large dt as a bug in this module.
+  !! Measured up to tstep 1 (the shaped pcbench ramp). On its own the composed
+  !! operator is a SMALL-dt method -- no convergence at tstep 10 on the
+  !! ballooning case, where the exact-mass shell still converges; here it only
+  !! builds the coarse levels, and that combination is not yet measured at
+  !! tstep 10. The zebra smoother degrades on poloidally heavy meshes (n_flux
+  !! well below n_tht); the production meshes are radially heavy.
   !!
   !! WHAT IS DELIBERATELY ABSENT
   !! ---------------------------
@@ -105,7 +114,8 @@ module mod_petsc_pc_sf
   Vec, save :: rhs_PJ, sol_PJ, rhs_W, sol_W
   Vec, save :: w3, w4, w5, t_rho, t_T
   logical, save :: vecs_ready = .false.
-  logical, save :: kpj_packed = .false., sw_packed = .false.
+  logical, save :: kpj_packed = .false., sw_packed = .false., pw0_packed = .false.
+  Mat, save     :: pw0                 !< pair_w without W: [[B_22, B_24], [B_42, B_44]]
 
   public :: sf_enabled, sf_build, sf_apply, sf_report
 
@@ -149,7 +159,7 @@ contains
 
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] ================ production SFM2 path ================"
-      write(*,'(A)') "[Physics PC]   S_uu = B_22 + W (composed force operator)"
+      write(*,'(A)') "[Physics PC]   S_uu = exact-mass psi-channel Schur (shell); GMG chain on B_22 + W"
       write(*,'(A,A)') "[Physics PC]   pair_psi : ", trim(physics_pc_sf_pair_psi)
       write(*,'(A,A)') "[Physics PC]   pair_w   : ", trim(physics_pc_sf_pair_w)
       write(*,'(A,A,A,A)') "[Physics PC]   rho / T  : ", trim(physics_pc_sf_rho), " / ", &
@@ -231,8 +241,19 @@ contains
     if (slv_pj%scaled) call VecDestroy(slv_pj%dscale, ierr)
     call make_pair_block_scale(g_ctx%K_pj_aij, n1_loc, slv_pj%dscale, comm, my_id, "pair_psi")
     slv_pj%scaled = .true.
+    ! pair_w: the scaling balances the operator pair_w SOLVES, the exact-mass
+    ! S_uu, whose diagonal sfw_lines carries (the LU reference: S_W_aij's)
+    call PetscLogEventBegin(pcev_build_suu, ierr)
+    call sfw_numeric(bk_w == SF_GMG, comm, my_id)
+    call PetscLogEventEnd(pcev_build_suu, ierr)
     if (slv_w%scaled) call VecDestroy(slv_w%dscale, ierr)
-    call make_pair_block_scale(g_ctx%S_W_aij, n1_loc, slv_w%dscale, comm, my_id, "pair_w")
+    if (bk_w == SF_GMG) then
+      call make_pair_block_scale(sfw_lines, n1_loc, slv_w%dscale, comm, my_id, "pair_w")
+      call MatDiagonalScale(g_ctx%S_W_aij, slv_w%dscale, slv_w%dscale, ierr)
+    else
+      call make_pair_block_scale(g_ctx%S_W_aij, n1_loc, slv_w%dscale, comm, my_id, "pair_w")
+    endif
+    call MatDiagonalScale(pw0, slv_w%dscale, slv_w%dscale, ierr)
     slv_w%scaled = .true.
 
     !--- the four block solvers -------------------------------------------
@@ -244,10 +265,12 @@ contains
                          smoother=SF_GMG_SMOOTHER_ZEBRA, maxits=SF_GMG_MAXITS)
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
+    ! pair_w solves the exact-mass S_uu (a shell); B_22 + W only preconditions
     call PetscLogEventBegin(pcev_fact_w, ierr)
-    call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
+    call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP (exact-mass S_uu; B_22+W)", &
                          comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
-                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS)
+                         smoother=SF_GMG_SMOOTHER_ZEBRA, maxits=SF_GMG_MAXITS, &
+                         Aop=sfw_shell, Ablk=sfw_lines)
     call PetscLogEventEnd(pcev_fact_w, ierr)
 
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
@@ -290,7 +313,7 @@ contains
     !> First build: the operators with their frozen patterns, the value maps
     !! into them, and the release of the blocks that only fed the packing.
     subroutine first_build_operators()
-      integer, parameter :: NBLK = 21, NKEEP = 13
+      integer, parameter :: NBLK = 21, NKEEP = 16
       integer :: eqs(NBLK), vrs(NBLK)
       Mat :: M(NBLK), S_uu
 
@@ -300,22 +323,22 @@ contains
         call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
       endif
 
-      !--- the 21 blocks in ONE pass over A_full's rows. The first 13 are the
-      !--- ones the apply and the rho/T solvers read; the last 8 only feed the
-      !--- two packed pairs and are released once the maps exist.
+      !--- the 21 blocks in ONE pass over A_full's rows. The first 16 are the
+      !--- ones the apply, the rho/T solvers and the pair_w shell read; the
+      !--- last 5 only feed the packed pairs and are released once the maps exist.
       call PetscLogEventBegin(pcev_extract, ierr)
       eqs = [var_psi, var_psi, var_u, var_u, var_u, var_u, var_rho, var_rho, var_rho, &
-             var_T, var_T, var_T, var_T, &
-             var_psi, var_psi, var_zj, var_zj, var_u, var_u, var_w, var_w]
+             var_T, var_T, var_T, var_T, var_psi, var_zj, var_zj, &
+             var_psi, var_u, var_u, var_w, var_w]
       vrs = [var_u, var_T, var_psi, var_zj, var_rho, var_T, var_psi, var_u, var_rho, &
-             var_psi, var_u, var_zj, var_T, &
-             var_psi, var_zj, var_psi, var_zj, var_u, var_w, var_u, var_w]
+             var_psi, var_u, var_zj, var_T, var_zj, var_psi, var_zj, &
+             var_psi, var_u, var_w, var_u, var_w]
       call extract_sub_blocks_h(A_full, eqs, vrs, M, .true.)
       g_ctx%B_12 = M(1);  g_ctx%B_16 = M(2);  g_ctx%B_21 = M(3);  g_ctx%B_23 = M(4)
       g_ctx%B_25 = M(5);  g_ctx%B_26 = M(6);  g_ctx%B_51 = M(7);  g_ctx%B_52 = M(8)
       g_ctx%B_55 = M(9);  g_ctx%B_61 = M(10); g_ctx%B_62 = M(11); g_ctx%B_63 = M(12)
       g_ctx%B_66 = M(13)
-      g_ctx%B_11 = M(14); g_ctx%B_13 = M(15); g_ctx%B_31 = M(16); g_ctx%B_33 = M(17)
+      g_ctx%B_13 = M(14); g_ctx%B_31 = M(15); g_ctx%B_33 = M(16); g_ctx%B_11 = M(17)
       g_ctx%B_22 = M(18); g_ctx%B_24 = M(19); g_ctx%B_42 = M(20); g_ctx%B_44 = M(21)
       call PetscLogEventEnd(pcev_extract, ierr)
 
@@ -335,14 +358,24 @@ contains
       call pack_pair_aij(S_uu, g_ctx%B_24, g_ctx%B_42, g_ctx%B_44, &
                          g_ctx%S_W_aij, sw_packed, comm)
       call MatDestroy(S_uu, ierr)
+      call pack_pair_aij(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, g_ctx%B_44, pw0, pw0_packed, comm)
+      call sfw_structure(pw0, bk_w == SF_GMG, comm, my_id)
       call PetscLogEventEnd(pcev_build_suu, ierr)
 
       call sf_selfcheck(my_id)
 
       !--- the value maps, gated against what was just extracted
-      call sfg_build(A_full, g_ctx%W_force, M(1:NKEEP), eqs(1:NKEEP), vrs(1:NKEEP), &
-                     g_ctx%K_pj_aij, [var_psi, var_zj], [var_psi, var_zj], &
-                     g_ctx%S_W_aij, [var_u, var_w], [var_u, var_w], comm, my_id)
+      !--- (sfw_lines, the pair_w smoother operator, is refilled like pw0; its
+      !--- channel is added on top by sfw_numeric)
+      if (bk_w == SF_GMG) then
+        call sfg_build(A_full, g_ctx%W_force, M(1:NKEEP), eqs(1:NKEEP), vrs(1:NKEEP), &
+                       g_ctx%K_pj_aij, [var_psi, var_zj], [var_psi, var_zj], &
+                       g_ctx%S_W_aij, [pw0, sfw_lines], [var_u, var_w], [var_u, var_w], comm, my_id)
+      else
+        call sfg_build(A_full, g_ctx%W_force, M(1:NKEEP), eqs(1:NKEEP), vrs(1:NKEEP), &
+                       g_ctx%K_pj_aij, [var_psi, var_zj], [var_psi, var_zj], &
+                       g_ctx%S_W_aij, [pw0], [var_u, var_w], [var_u, var_w], comm, my_id)
+      endif
       block
         integer :: k
         do k = NKEEP + 1, NBLK
@@ -361,7 +394,8 @@ contains
           okb = blockmv_attach(g_ctx%B_25, int(n_tor)); okb = blockmv_attach(g_ctx%B_26, int(n_tor))
           okb = blockmv_attach(g_ctx%B_51, int(n_tor)); okb = blockmv_attach(g_ctx%B_52, int(n_tor))
           okb = blockmv_attach(g_ctx%B_61, int(n_tor)); okb = blockmv_attach(g_ctx%B_62, int(n_tor))
-          okb = blockmv_attach(g_ctx%B_63, int(n_tor))
+          okb = blockmv_attach(g_ctx%B_63, int(n_tor)); okb = blockmv_attach(g_ctx%B_31, int(n_tor))
+          okb = blockmv_attach(pw0, int(n_tor))
         end block
       endif
 #if defined(PETSC_HAVE_MKL_SPARSE)
