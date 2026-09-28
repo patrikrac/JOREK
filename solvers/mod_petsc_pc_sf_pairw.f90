@@ -4,8 +4,9 @@ module mod_petsc_pc_sf_pairw
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx, pcev_shellmult, pcev_mjsolve
-  use mod_petsc_pc_mass_slot, only: mass_slot_t, mass_slot_setup, mass_slot_solve
-  use mod_petsc_pc_sf_solver, only: SF_GMG_AXIS_RINGS
+  use mod_petsc_pc_sf_solver, only: SF_GMG_AXIS_RINGS, sf_split_halves
+  use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
+  use mod_petsc_pc_gmg, only: gmg_push, gmg_pop, gmg_vcycle
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, &
                                c_aij_get, c_aij_restore
   use, intrinsic :: iso_c_binding, only: c_double, c_ptr, c_intptr_t, c_int, c_f_pointer
@@ -13,45 +14,54 @@ module mod_petsc_pc_sf_pairw
   private
 
   !--------------------------------------------------------------------
-  !> The pair_w operator of the production path: the psi-channel Schur
-  !! complement with the EXACT constraint mass, applied matrix-free,
+  !> pair_w of the schur arm (physics_pc_sf_suu = "schur"): S_uu as the
+  !! psi-channel Schur complement of the Jacobian, applied matrix-free,
   !!
-  !!   S_uu u = B_22 u - B_21 p + B_23 B_33^-1 B_31 p,    p = Dh B_12 u,
-  !!   Dh     = 1 / (opz diag(B_33) - diag(B_13 Qi B_31)),  Qi = 1 / diag(B_33),
+  !!   S_uu u = B_22 u - B_21 psi - B_23 j,   [psi; j] = pair_psi^-1 [B_12 u; 0],
   !!
-  !! and the assembled operator its multigrid smoother needs. The Galerkin
-  !! chain stays on the composed B_22 + W (the caller's S_W_aij): W is the
-  !! continuum limit of the channel and good enough on the coarse levels.
+  !! and the operators its multigrid needs.
   !!
-  !! WHY. With S_uu = B_22 + W the outer iterations grow with the mesh: W
-  !! lacks the discrete projection M_j^-1 that the Jacobian's Schur complement
-  !! contains, and the gap is O(1) at grid scale (rho ~ (dt v_A / h)^2). With
-  !! the exact mass in the fine operator the outer count is flat (shaped
-  !! pcbench, tstep 1, 21x16 .. 121x48: 17-24 against 21-55). B_33 is
-  !! geometry-only, so its per-slot factor is built once per run.
+  !! THREE OPERATORS
+  !! ---------------
+  !!  sfw_shell  the Krylov operator of pair_w: the channel through ONE
+  !!             application of pair_psi's own solver -- one V-cycle of its
+  !!             multigrid (instance 2), or its exact LU on the lu arm. Once
+  !!             per pair_w iteration.
+  !!  sfw_dh     the V-cycle's level-0 operator: the same channel with the
+  !!             psi row inverted by its diagonal and the constraint mass by
+  !!             Chebyshev (mod_petsc_pc_mass_cheb),
+  !!               psi = Dh B_12 u,  j = -B_33^-1 B_31 psi,
+  !!               Dh = 1 / (opz diag(B_33) - diag(B_13 Qi B_31)), Qi = 1/diag(B_33).
+  !!  sfw_lines  the level-0 smoother blocks' source: the Dh channel with Qi
+  !!             for the mass, assembled only on the entries the zebra
+  !!             smoother reads (see keep()).
+  !! The Galerkin chain stays on the composed B_22 + W (the caller's S_W_aij).
   !!
-  !! THE SMOOTHER OPERATOR (sfw_lines). The level-0 zebra line smoother
-  !! (mod_petsc_pc_gmg, smoother 7) needs the grid-scale part of S, which the
-  !! same channel with Qi in place of B_33^-1 carries. It reads only its line
-  !! blocks (same J, same slot), its axis block (rings 0..SF_GMG_AXIS_RINGS,
-  !! all slots) and the coupling of odd-J lines to colour-0 columns (the axis
-  !! and the even lines at J +- 1), so sfw_lines = P0 + C holds the channel C
-  !! ONLY there: the full two-hop product (and Ltil) is never formed.
+  !! WHY THE NESTED SOLVE. With Dh as the psi-row inverse the outer count
+  !! still grows with the mesh (shaped pcbench, np 4: 60/53/72/103 over
+  !! 41x32 .. 161x64): hyper-resistivity (eta_num K M^-1 K_1, fourth order)
+  !! dominates the psi row at grid scale, and no diagonal or sparse surrogate
+  !! of its inverse is uniform in h (Dh; B_11 - B_13 Qi B_31 exactly: 43; the
+  !! mass-only model: 98). pair_psi's own multigrid treats it: with the exact
+  !! pair_psi inside the channel the count is 18 on every mesh. Applying it
+  !! only where Krylov needs the operator -- once per pair_w iteration, not
+  !! in every smoothing step -- costs one pair_psi V-cycle per matvec, and one
+  !! fixed V-cycle suffices once pair_psi's cycle converges in one
+  !! (SF_PJ_POST0_SCHUR): 21/20/19/21/22 outer its over 41x32 .. 161x64.
   !!
   !! STRUCTURE ONCE, NUMBERS PER REBUILD. sfw_structure (first build, before
   !! the value maps) fixes the halo index sets, the position maps and the
   !! pattern of sfw_lines, which then becomes a value-map target of the SF
   !! gather: every rebuild refills its P0 part like any other operator, and
-  !! sfw_numeric adds C straight into its CSR values on the OpenMP threads.
-  !! The pair_w block scaling is taken from sfw_lines' diagonal: it balances
-  !! the operator pair_w solves, not the Galerkin surrogate (whose W inflates
-  !! the u diagonal 2-2.4x and doubled the V-cycles at 61x48).
-  !! The B_31 and B_12 rows a rank needs from its neighbours are re-extracted
-  !! per rebuild (MatCreateSubMatrices, MAT_INITIAL_MATRIX: a MAT_REUSE_MATRIX
+  !! sfw_numeric adds the channel straight into its CSR values on the OpenMP
+  !! threads. The pair_w block scaling is taken from sfw_lines' diagonal. The
+  !! B_31 and B_12 rows a rank needs from its neighbours are re-extracted per
+  !! rebuild (MatCreateSubMatrices, MAT_INITIAL_MATRIX: a MAT_REUSE_MATRIX
   !! refill returned stale values at np > 1).
   !--------------------------------------------------------------------
 
   Mat, save, public :: sfw_shell            !< the pair_w operator (MATSHELL)
+  Mat, save, public :: sfw_dh               !< the V-cycle's level-0 operator (MATSHELL)
   Mat, save, public :: sfw_lines            !< the level-0 smoother blocks' source
 
   !> raw CSR rows of a (Seq|MPI)AIJ matrix: diagonal part, then off-diagonal
@@ -64,11 +74,21 @@ module mod_petsc_pc_sf_pairw
     PetscInt :: nr = 0
   end type raw_t
 
-  logical, save :: use_qi = .false., gated = .false.
-  type(mass_slot_t), save :: mj
+  !--- how the channel inverts the psi row (apply_suu) ----------------------
+  integer, parameter :: CH_NESTED = 1       !< pair_psi's solver (sfw_shell)
+  integer, parameter :: CH_DH     = 2       !< Dh, and B_33^-1 by Chebyshev (sfw_dh)
+  integer, parameter :: CH_QI     = 3       !< Dh, and Qi for B_33^-1 (sfw_lines' gate)
+
+  logical, save :: blk = .false., gated = .false.
+  type(mass_cheb_t), save :: mcheb
   Mat, save :: p0                           !< the caller's scaled [B_22,B_24;B_42,B_44]
   Mat, save :: b31t                         !< B_31^T, for diag(B_13 Qi B_31)
   Vec, save :: qi, dh, xu, yu, tu, pp, j1, j2
+  !--- the nested pair_psi solve: packed (psi, j) work vectors, pair_psi's
+  !--- block scale D (a new Vec every rebuild) and, on its lu arm, its KSP
+  Vec, save :: zr, zs, dpj
+  KSP, save :: kpj
+  logical, save :: pj_gmg = .true.
 
   !--- the masked channel's structure, built once --------------------------
   PetscInt, allocatable, save :: r1(:), r2(:)     !< fetched rows of B_31 / B_12 (global)
@@ -87,10 +107,11 @@ module mod_petsc_pc_sf_pairw
 contains
 
   !--------------------------------------------------------------------
-  !> First build: the mass factor, the shell and, with blocks (the GMG
-  !! backend), the structure of sfw_lines -- filled with P0's values, as the
-  !! value-map gate expects of every target. Pw is P0, unscaled here; the
-  !! caller scales it in place, every rebuild.
+  !> First build: the shells and, with blocks (pair_w on the GMG backend),
+  !! the V-cycle's Dh operator, the Chebyshev mass and the structure of
+  !! sfw_lines -- filled with P0's values, as the value-map gate expects of
+  !! every target. Pw is P0, unscaled here; the caller scales it in place,
+  !! every rebuild.
   !--------------------------------------------------------------------
   subroutine sfw_structure(Pw, blocks, comm, my_id)
     Mat, intent(in)     :: Pw
@@ -99,51 +120,82 @@ contains
     PetscErrorCode :: ierr
 
     p0 = Pw
-    call mass_slot_setup(mj, g_ctx%B_33, comm, "pair_w shell mass B_33")
-    call MatCreateVecs(g_ctx%B_33, PETSC_NULL_VEC, qi, ierr)
-    call MatGetDiagonal(g_ctx%B_33, qi, ierr)
-    call VecReciprocal(qi, ierr)
-    call VecDuplicate(qi, dh, ierr)                            ! psi and j share the layout
-    call MatTranspose(g_ctx%B_31, MAT_INITIAL_MATRIX, b31t, ierr)
+    blk = blocks
     call MatCreateShell(comm, local_rows(p0), local_rows(p0), global_rows(p0), &
                         global_rows(p0), PETSC_NULL_INTEGER, sfw_shell, ierr)
     call MatShellSetOperation(sfw_shell, MATOP_MULT, sfw_mult, ierr)
     call MatCreateVecs(g_ctx%B_21, pp, xu, ierr)               ! psi / u layouts
     call VecDuplicate(xu, yu, ierr)
     call VecDuplicate(xu, tu, ierr)
-    call VecDuplicate(qi, j1, ierr)
-    call VecDuplicate(qi, j2, ierr)
-    if (blocks) call lines_structure(comm, my_id)
+    call MatCreateVecs(g_ctx%B_33, PETSC_NULL_VEC, j1, ierr)
+    call VecDuplicate(j1, j2, ierr)
+    call MatCreateVecs(g_ctx%K_pj_aij, zr, zs, ierr)
+    if (.not. blk) return
+
+    call mass_cheb_setup(mcheb, g_ctx%B_33, comm, "pair_w Dh channel: mass B_33")
+    call VecDuplicate(j1, qi, ierr)
+    call MatGetDiagonal(g_ctx%B_33, qi, ierr)
+    call VecReciprocal(qi, ierr)
+    call VecDuplicate(qi, dh, ierr)                            ! psi and j share the layout
+    call MatTranspose(g_ctx%B_31, MAT_INITIAL_MATRIX, b31t, ierr)
+    call MatCreateShell(comm, local_rows(p0), local_rows(p0), global_rows(p0), &
+                        global_rows(p0), PETSC_NULL_INTEGER, sfw_dh, ierr)
+    call MatShellSetOperation(sfw_dh, MATOP_MULT, sfw_mult_dh, ierr)
+    call lines_structure(comm, my_id)
   end subroutine sfw_structure
 
   !--------------------------------------------------------------------
-  !> Every rebuild, after the gather and BEFORE the pair scaling: Dh and,
-  !! with blocks, sfw_lines = P0 + C. The caller then takes the pair_w scaling
-  !! from sfw_lines -- the diagonal of the operator pair_w solves -- and
-  !! applies it to sfw_lines, P0 and S_W_aij alike.
+  !> Every rebuild, after the gather and pair_psi's scaling, BEFORE the
+  !! pair_w scaling: hand over pair_psi's solver, then (with blocks) Dh and
+  !! sfw_lines = P0 + C. The caller then takes the pair_w scaling from
+  !! sfw_lines -- the diagonal of the operator pair_w solves -- and applies it
+  !! to sfw_lines, P0 and S_W_aij alike.
   !--------------------------------------------------------------------
-  subroutine sfw_numeric(blocks, comm, my_id)
-    logical, intent(in) :: blocks
+  subroutine sfw_numeric(comm, my_id, dscale_pj, gmg_pj, ksp_pj)
     integer, intent(in) :: comm, my_id
+    Vec, intent(in)     :: dscale_pj   !< pair_psi's block scale D (D = 1 on psi)
+    logical, intent(in) :: gmg_pj      !< pair_psi on its multigrid (else ksp_pj, its LU)
+    KSP, intent(in)     :: ksp_pj
     PetscErrorCode :: ierr
 
+    dpj = dscale_pj
+    pj_gmg = gmg_pj
+    kpj = ksp_pj
+    if (.not. blk) return
     call MatTranspose(g_ctx%B_31, MAT_REUSE_MATRIX, b31t, ierr)
     call make_dh(comm, my_id)
-    if (.not. blocks) return
     call lines_numeric()
     if (.not. gated) call lines_gate(comm, my_id)
     gated = .true.
   end subroutine sfw_numeric
 
-  !--------------------------------------------------------------------
-  !> y = S x on the packed pair: P0 x, plus the channel on the u half (the
-  !! rank-local leading block of the pair, viewed in place).
-  !--------------------------------------------------------------------
   subroutine sfw_mult(A, x, y, ierr)
     Mat :: A
     Vec :: x, y
     PetscErrorCode :: ierr
+    call apply_suu(x, y, CH_NESTED)
+    ierr = 0
+  end subroutine sfw_mult
+
+  subroutine sfw_mult_dh(A, x, y, ierr)
+    Mat :: A
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    call apply_suu(x, y, CH_DH)
+    ierr = 0
+  end subroutine sfw_mult_dh
+
+  !--------------------------------------------------------------------
+  !> y = S x on the packed pair: P0 x, plus the channel on the u half (the
+  !! rank-local leading block of the pair, viewed in place),
+  !!   y_u += -B_21 psi - B_23 j,   [psi; j] from B_12 x_u as mode says.
+  !! j2 holds -j throughout.
+  !--------------------------------------------------------------------
+  subroutine apply_suu(x, y, mode)
+    Vec :: x, y
+    integer, intent(in) :: mode
     PetscScalar, pointer :: xa(:), ya(:)
+    PetscErrorCode :: ierr
 
     call PetscLogEventBegin(pcev_shellmult, ierr)
     call MatMult(p0, x, y, ierr)
@@ -152,15 +204,33 @@ contains
     call MatMult(g_ctx%B_12, xu, pp, ierr)
     call VecResetArray(xu, ierr)
     call VecRestoreArrayRead(x, xa, ierr)
-    call VecPointwiseMult(pp, pp, dh, ierr)                    ! p = Dh B_12 x_u
-    call MatMult(g_ctx%B_31, pp, j1, ierr)
-    if (use_qi) then                                           ! lines_gate only
-      call VecPointwiseMult(j2, j1, qi, ierr)
-    else
-      call PetscLogEventBegin(pcev_mjsolve, ierr)
-      call mass_slot_solve(mj, j1, j2)                         ! B_33^-1 B_31 p
-      call PetscLogEventEnd(pcev_mjsolve, ierr)
-    endif
+    select case (mode)
+    case (CH_NESTED)
+      ! pair_psi is stored scaled, Kt = D K D with D = 1 on psi, so for the
+      ! right-hand side [f; 0] (= D [f; 0]) the solution is D Kt^-1 [f; 0]
+      call VecSet(j1, 0.0d0, ierr)
+      call sf_split_halves(zr, pp, j1, .true.)
+      if (pj_gmg) then
+        call gmg_push()
+        call gmg_vcycle(2, zr, zs)
+        call gmg_pop()
+      else
+        call KSPSolve(kpj, zr, zs, ierr)
+      endif
+      call VecPointwiseMult(zs, zs, dpj, ierr)
+      call sf_split_halves(zs, pp, j2, .false.)
+      call VecScale(j2, -1.0d0, ierr)
+    case (CH_DH, CH_QI)
+      call VecPointwiseMult(pp, pp, dh, ierr)                  ! psi = Dh B_12 x_u
+      call MatMult(g_ctx%B_31, pp, j1, ierr)
+      if (mode == CH_QI) then
+        call VecPointwiseMult(j2, j1, qi, ierr)
+      else
+        call PetscLogEventBegin(pcev_mjsolve, ierr)
+        call mass_cheb_solve(mcheb, j1, j2)                    ! -j = B_33^-1 B_31 psi
+        call PetscLogEventEnd(pcev_mjsolve, ierr)
+      endif
+    end select
     call MatMult(g_ctx%B_21, pp, tu, ierr)
     call VecGetArray(y, ya, ierr)
     call VecPlaceArray(yu, ya, ierr)
@@ -169,8 +239,7 @@ contains
     call VecResetArray(yu, ierr)
     call VecRestoreArray(y, ya, ierr)
     call PetscLogEventEnd(pcev_shellmult, ierr)
-    ierr = 0
-  end subroutine sfw_mult
+  end subroutine apply_suu
 
   !--------------------------------------------------------------------
   !> Dh = 1 / (opz diag(B_33) - diag(B_13 Qi B_31)), the product's diagonal
@@ -628,9 +697,7 @@ contains
     enddo
     call VecRestoreArray(x, xa, ierr)
     call MatMult(sfw_lines, x, y1, ierr)
-    use_qi = .true.
-    call MatMult(sfw_shell, x, y2, ierr)
-    use_qi = .false.
+    call apply_suu(x, y2, CH_QI)
     call VecGetArrayRead(y1, a1, ierr)
     call VecGetArrayRead(y2, a2, ierr)
     e = 0.d0

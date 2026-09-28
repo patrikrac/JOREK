@@ -51,6 +51,7 @@ module mod_petsc_pc_gmg
   public :: gmg_build_prolongations, gmg_setup_operator, gmg_vcycle_apply, gmg_is_ready
   public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4
   public :: gmg_pc_apply_1, gmg_pc_apply_2
+  public :: gmg_push, gmg_pop
   public :: gmg_opts_t, gmg_opts_from_namelist
 
   !> Everything that configures a hierarchy, passed EXPLICITLY. A caller that
@@ -60,6 +61,9 @@ module mod_petsc_pc_gmg
   type :: gmg_opts_t
     integer :: smoother     = 0      !< level smoother code (see physics_pc_gmg_smoother)
     integer :: nsmooth      = 0      !< smoothing steps; <= 0 = the smoother's default
+    integer :: pre0         = -1     !< level-0 pre-smoothing steps; < 0 = nsmooth (0 = none)
+    integer :: post0        = -1     !< level-0 post-smoothing steps; < 0 = nsmooth (0 = none)
+    integer :: nsmooth_c    = -1     !< pre and post steps on the coarse levels; <= 0 = nsmooth
     integer :: axis_rings   = 0      !< axis block extent: rings 0..k; -1 = by physical radius
     integer :: axis_mult    = 0      !< axis/lines coupling (0 = additive)
     integer :: axis_split   = 0      !< one axis solve per |n| group, on distinct ranks
@@ -211,6 +215,7 @@ module mod_petsc_pc_gmg
   integer, allocatable, save :: fine_harm(:) !< level-0 row -> toroidal slot m
   integer, save :: nth0 = 0                  !< n_tht (level-0 nj)
   integer, save :: nf_s = 0, cur_lev = 0
+  integer, save :: stk_inst(8), stk_lev(8), nstk = 0
   integer, save :: sm_type = 0, sm_nstep = 4
   logical, save :: sm_blocks = .false.
   real*8, allocatable, save :: blk_t_work(:,:)   !< (max block size, 0:threads-1)
@@ -261,6 +266,11 @@ module mod_petsc_pc_gmg
   end type gmg_inst_t
   type(gmg_inst_t), save :: inst(MAX_INST)
   integer, save :: cur_inst = 1
+  !> The V-cycle's shape per instance (gmg_opts_t pre0 / post0 / nsmooth_c,
+  !! resolved against nsmooth at setup): level-0 pre and post steps, and the
+  !! steps of every coarser level. Kept by instance, like the hierarchy.
+  integer, save :: st_pre0(MAX_INST) = SM_STEPS, st_post0(MAX_INST) = SM_STEPS
+  integer, save :: st_crs(MAX_INST) = SM_STEPS
 
   ! -log_view events (Workstream D cost audit). Registered here, not in the
   ! physics-PC ctx, so this module keeps no dependency on it.
@@ -298,6 +308,22 @@ contains
     o%harm_split = physics_pc_harm_split;     o%omega = physics_pc_gmg_omega
     o%axis_droptol = physics_pc_gmg_axis_droptol; o%ring_aspect = physics_pc_gmg_ring_aspect
   end function gmg_opts_from_namelist
+
+  !> Save / restore the active hierarchy and level around a NESTED use of
+  !! another hierarchy -- the pair_w shell applying pair_psi's V-cycle
+  !! (instance 2) while instance 1 is active.
+  subroutine gmg_push()
+    nstk = nstk + 1
+    if (nstk > size(stk_inst)) stop "gmg_push: stack overflow"
+    stk_inst(nstk) = cur_inst; stk_lev(nstk) = cur_lev
+  end subroutine gmg_push
+
+  subroutine gmg_pop()
+    if (nstk < 1) stop "gmg_pop: empty stack"
+    call gmg_select(stk_inst(nstk))
+    cur_lev = stk_lev(nstk)
+    nstk = nstk - 1
+  end subroutine gmg_pop
 
   !> Make hierarchy k the active one (see gmg_inst_t).
   subroutine gmg_select(k)
@@ -1425,6 +1451,14 @@ contains
       sm_nstep = SM_STEPS
       if (sm_type == 1 .or. sm_type == 2) sm_nstep = 3
     endif
+    st_pre0(cur_inst) = sm_nstep; st_post0(cur_inst) = sm_nstep; st_crs(cur_inst) = sm_nstep
+    if (o%pre0 >= 0)     st_pre0(cur_inst)  = o%pre0
+    if (o%post0 >= 0)    st_post0(cur_inst) = o%post0
+    if (o%nsmooth_c > 0) st_crs(cur_inst)   = o%nsmooth_c
+    if (st_pre0(cur_inst) + st_post0(cur_inst) == 0) then
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: GMG level 0 needs pre0 + post0 > 0"
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    endif
     sm_blocks = (sm_type >= 2)
     axis_k = 0
     if (sm_type >= 4) axis_k = max(o%axis_rings, -1)
@@ -1460,7 +1494,11 @@ contains
           call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, sm_nstep, ierr)
         else
           call KSPSetType(gSm(g), KSPGMRES, ierr)
-          call KSPGMRESSetRestart(gSm(g), sm_nstep, ierr)
+          if (g == 0) then
+            call KSPGMRESSetRestart(gSm(g), max(st_pre0(cur_inst), st_post0(cur_inst)), ierr)
+          else
+            call KSPGMRESSetRestart(gSm(g), st_crs(cur_inst), ierr)
+          endif
           call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, sm_nstep, ierr)
           call KSPSetPCSide(gSm(g), PC_RIGHT, ierr)
         endif
@@ -1494,8 +1532,9 @@ contains
       call MPI_Allreduce(MPI_IN_PLACE, ib(1), 1, MPI_INTEGER, MPI_MAX, comm, mpierr)
       if (my_id == 0) then
         if (present(tag)) write(*,'(A,A,A)', advance="no") "[Physics PC]   GMG (", tag, ")"
-        write(*,'(A,I0,A,I0,A,F5.2)', advance="no") "[Physics PC]   GMG smoother ", sm_type, &
-          ": steps = ", sm_nstep, ", omega = ", o%omega
+        write(*,'(A,I0,A,I0,A,I0,A,I0,A,F5.2)', advance="no") "[Physics PC]   GMG smoother ", sm_type, &
+          ": V(", st_pre0(cur_inst), ",", st_post0(cur_inst), ") on level 0, ", st_crs(cur_inst), &
+          " steps per side below, omega = ", o%omega
         if (sm_blocks) then
           write(*,'(A,I0,A,I0,A,I0,A,I0,A)') ", blocks ", ibg(1), " on level 0 (", &
             ibg(2), " banded, max kl ", ib(1), "; ", ibg(3), " singular -> point)"
@@ -1709,10 +1748,14 @@ contains
     gev_ready = .true.
   end subroutine gmg_register_events
 
+  !> One V-cycle from level g (x out, zero initial guess). Level 0 takes
+  !! st_pre0 / st_post0 steps, the coarse levels st_crs each side. Without
+  !! pre-smoothing x is still 0 at the restriction, so r = b needs no matvec.
   recursive subroutine vcycle(g, b, x)
     integer, intent(in) :: g
     Vec :: b, x
     PetscErrorCode :: ierr
+    integer :: npre, npost
 
     if (g == nlev - 1) then
       call PetscLogEventBegin(gev_coarse(cur_inst), ierr)
@@ -1721,27 +1764,43 @@ contains
       return
     endif
     call VecZeroEntries(x, ierr)
-    call smooth(g, b, x, .true.)                         ! pre-smooth (zero guess: no b - A*0)
-    if (g == 0 .and. .not. sm_blocks) call axis_patch(b, x)
     if (g == 0) then
-      call MatMult(gF, x, gr(g), ierr)
+      npre = st_pre0(cur_inst); npost = st_post0(cur_inst)
     else
-      call MatMult(gA(g), x, gr(g), ierr)
+      npre = st_crs(cur_inst);  npost = st_crs(cur_inst)
     endif
-    call VecAYPX(gr(g), -1.0d0, b, ierr)                  ! r = b - A x
+    if (npre > 0) call smooth(g, b, x, .true., npre)     ! pre-smooth (zero guess: no b - A*0)
+    if (g == 0 .and. .not. sm_blocks) call axis_patch(b, x)
+    if (npre == 0 .and. .not. (g == 0 .and. .not. sm_blocks)) then
+      call VecCopy(b, gr(g), ierr)                        ! x is still 0: r = b
+    else
+      if (g == 0) then
+        call MatMult(gF, x, gr(g), ierr)
+      else
+        call MatMult(gA(g), x, gr(g), ierr)
+      endif
+      call VecAYPX(gr(g), -1.0d0, b, ierr)                ! r = b - A x
+    endif
     call MatMultTranspose(gP(g + 1), gr(g), gb(g + 1), ierr)
     call vcycle(g + 1, gb(g + 1), gx(g + 1))
     call MatMultAdd(gP(g + 1), gx(g + 1), x, x, ierr)     ! x += P e_c
-    call smooth(g, b, x, .false.)                        ! post-smooth
+    if (npost > 0) call smooth(g, b, x, .false., npost)  ! post-smooth
     if (g == 0 .and. .not. sm_blocks) call axis_patch(b, x)
   end subroutine vcycle
 
-  subroutine smooth(g, b, x, zero_guess)
+  !> nstep smoother iterations on level g. The level's GMRES restart is the
+  !! larger of its two step counts (set once, at setup), so switching between
+  !! the pre and post counts only moves the iteration cap.
+  subroutine smooth(g, b, x, zero_guess, nstep)
     integer, intent(in) :: g
     Vec :: b, x
     logical, intent(in) :: zero_guess
+    integer, intent(in) :: nstep
     PetscErrorCode :: ierr
+    PetscInt :: ns
     cur_lev = g
+    ns = nstep
+    call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, ns, ierr)
     if (zero_guess) then
       call KSPSetInitialGuessNonzero(gSm(g), PETSC_FALSE, ierr)
     else

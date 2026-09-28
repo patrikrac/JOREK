@@ -127,7 +127,9 @@ ARMS['sfm2_gmg_d12'] = dict(ARMS['sfm2_gmg'], **{
 # diverges), so these arms ramp from a fresh equilibrium up to tstep 1 only.
 # Every block has two backends: gmg (production) and lu (the exact
 # reference). The multigrid configuration is fixed in mod_petsc_pc_sf_solver
-# (smoothers, line overlap, axis block), not in the namelist.
+# (smoothers, V-cycle shapes, line overlap, axis block), not in the namelist.
+# pair_w's S_uu has two production forms (physics_pc_sf_suu): the arms
+# without a suffix run "schur" (the default), the _w arms "w" = B_22 + W.
 SF_BASE = 'inxflow_shaped_pcbench'
 SF_COMMON = {
     'use_physics_pc': '.t.',
@@ -146,6 +148,8 @@ ARMS['sf_lu'] = dict(SF_COMMON, **{
     'physics_pc_sf_pair_psi': '"lu"', 'physics_pc_sf_pair_w': '"lu"',
     'physics_pc_sf_rho': '"lu"', 'physics_pc_sf_T': '"lu"',
 })
+ARMS['sf_gmg_w'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"w"')
+ARMS['sf_lu_w'] = dict(ARMS['sf_lu'], physics_pc_sf_suu='"w"')
 # JOREK's default PC on the same case and ramp
 ARMS['sf_jorek'] = {'use_physics_pc': '.f.'}
 
@@ -181,11 +185,11 @@ def main(argv):
     arm, n_flux, n_tht, out = argv[1], int(argv[2]), int(argv[3]), argv[4]
     if arm not in ARMS:
         sys.exit('unknown arm %r; choose from %s' % (arm, ', '.join(sorted(ARMS))))
-    if (arm.startswith('sfm2_gmg') or arm == 'sf_gmg') and gmg_levels(n_flux, n_tht) < 3:
+    if (arm.startswith('sfm2_gmg') or arm.startswith('sf_gmg')) and gmg_levels(n_flux, n_tht) < 3:
         sys.exit('mesh %dx%d gives fewer than 3 GMG levels: use (n_flux-1) divisible '
                  'by 4 or more powers of 2 and n_tht divisible by 8 (e.g. 81x32, '
                  '161x64, 321x128)' % (n_flux, n_tht))
-    if arm == 'sf_gmg' and gmg_levels(n_flux, n_tht) < 4:
+    if arm.startswith('sf_gmg') and gmg_levels(n_flux, n_tht) < 4:
         # a shallow hierarchy leaves a large coarse level, solved by one
         # sequential LU on every rank that owns part of it (61x96 stopped at
         # 3 levels with an 8646-row coarse LU). Full depth needs

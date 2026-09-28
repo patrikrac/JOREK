@@ -75,6 +75,41 @@ module mod_petsc_pc_sf_solver
   !! sparse), 1 = jorek_blockmv_attach.c (OpenMP, reads each n_tor harmonic block's
   !! column indices once; exact, gated against MatMult on first attach).
   integer, parameter, public :: SF_BLOCKMV = 1
+  !--- the two pair_w operators (physics_pc_sf_suu) -------------------------
+  !> "w": S_uu = B_22 + W, assembled; pair_w's GMG and Krylov both on it.
+  !> "schur": S_uu = the psi-channel Schur complement, matrix-free
+  !! (mod_petsc_pc_sf_pairw); its multigrid on B_22 + W with a Dh-channel
+  !! fine level.
+  integer, parameter, public :: SF_SUU_W     = 1
+  integer, parameter, public :: SF_SUU_SCHUR = 2
+
+  !--- V-cycle shapes (gmg_opts_t pre0 / post0 / nsmooth_c) -----------------
+  !> pair_psi: no level-0 pre-smoothing, 12 (schur) / 10 (w) post-smoothing
+  !! steps, 2 steps per side on the coarse levels. From a psi-row
+  !! right-hand side (the corrector's [B_12 u; 0], every nested solve of the
+  !! schur shell) the coarse correction leaves a large j-row residual at the
+  !! edge (20-60x ||b|| after one V(4,4), rings 113-118 of 121x48) that only
+  !! level-0 POST-smoothing removes: W/F-cycles, a wider line overlap and
+  !! pre-smoothing (V(6,0): still 23-63x) leave it. Measured at 121x48,
+  !! np 4, shaped pcbench, tstep 1, 3 steps:
+  !!   schur: V(4,4) 2-3 cycles per solve (the first one stalls), 93.7 s;
+  !!          V(0,12) one cycle in every solve, 69.9 s -- which the nested
+  !!          solve's single fixed cycle needs; V(0,8) 2 cycles, V(0,10)
+  !!          1.05, V(0,16) / V(2,12) / V(12,12) one at more cost.
+  !!   w:     V(4,4) 1.48 cycles, 99.4 s -> V(0,10) 1.00, 94.4 s; V(0,8)
+  !!          1.16 at the same time.
+  !! Coarse levels at 2 steps instead of 4: same counts, ~2 s less.
+  integer, parameter, public :: SF_PJ_PRE0 = 0, SF_PJ_NSC = 2
+  integer, parameter, public :: SF_PJ_POST0_SCHUR = 12, SF_PJ_POST0_W = 10
+  !> pair_w on both arms: the zebra smoother, V(0,6). schur: 4.8 -> 4.05
+  !! pair_w its per solve against V(4,4) (121x48 np 4, V-cycle time 20.8 ->
+  !! 13.0 s); V(0,8) the same counts at more cost, V(0,4) 4.9 its, V(1,5)
+  !! 4.4. w (B_22 + W): radial lines V(4,4) 1.48 its, 17.4 s -> zebra V(0,6)
+  !! 1.07 its, 14.6 s; zebra V(4,4) 1.20 / 21.2 s, zebra V(0,4) and lines
+  !! V(0,4) / V(0,6) slower. The coarse levels keep 4 steps (2: no gain).
+  !! (rho / T keep radial lines V(4,4): V(0,4) / V(0,6) save ~1.5 s of 12
+  !! but raise T's cycles 1.43 -> 2.28 / 1.84.)
+  integer, parameter, public :: SF_W_PRE0 = 0, SF_W_POST0 = 6, SF_W_NSC = 0
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (physics_pc_pair_maxits = 30 for the packed pairs, physics_pc_rhot_gmg =
@@ -117,7 +152,7 @@ contains
   !! so MUMPS and the GMG both reuse their symbolic phases.
   !--------------------------------------------------------------------
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
-                             nfields, smoother, maxits, Aop, Ablk)
+                             nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_opts_t
@@ -136,6 +171,10 @@ contains
                                               !< (a MATSHELL); A then only preconditions:
                                               !< its LU (SF_LU) or its Galerkin chain (SF_GMG)
     Mat, intent(in), optional    :: Ablk      !< SF_GMG: level-0 smoother blocks from Ablk
+    Mat, intent(in), optional    :: Amg       !< SF_GMG: the V-cycle's level-0 operator, when
+                                              !< it is neither A nor Aop (default: Aop, else A)
+    integer, intent(in), optional :: pre0, post0, nsmooth_c   !< SF_GMG: V-cycle shape
+                                              !< (gmg_opts_t); absent = SF_GMG_NSMOOTH everywhere
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -183,6 +222,9 @@ contains
       o%nsmooth      = SF_GMG_NSMOOTH
       o%axis_rings   = SF_GMG_AXIS_RINGS
       o%line_overlap = SF_GMG_LINE_OVERLAP
+      if (present(pre0))      o%pre0      = pre0
+      if (present(post0))     o%post0     = post0
+      if (present(nsmooth_c)) o%nsmooth_c = nsmooth_c
       o%axis_sectors = SF_GMG_AXIS_SECTORS
       o%blockmv      = SF_BLOCKMV
       o%bnd_drop     = 1               ! Dirichlet DOFs out of the coarse spaces
@@ -201,7 +243,11 @@ contains
           call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
         endif
       endif
-      call gmg_setup_operator(A, comm, my_id, Afine=Aop, tag=trim(label), opts=o, Ablk=Ablk)
+      if (present(Amg)) then
+        call gmg_setup_operator(A, comm, my_id, Afine=Amg, tag=trim(label), opts=o, Ablk=Ablk)
+      else
+        call gmg_setup_operator(A, comm, my_id, Afine=Aop, tag=trim(label), opts=o, Ablk=Ablk)
+      endif
       call gmg_select(1)
 
       !--- the Krylov wrapper: created once, re-pointed at every rebuild

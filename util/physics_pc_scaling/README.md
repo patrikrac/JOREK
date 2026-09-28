@@ -122,7 +122,7 @@ case the study does not cover (see `docs/physics_pc/workstream_D_matrix_free.md`
   tol·sqrt(|a_ii a_jj|) from the axis block before its LU: −47% factor entries
   and −23% `GMG_AxSolve` at 41×16, with unchanged counts.
 
-## The production SF path (`sf_gmg`, `sf_lu`, `sf_jorek`)
+## The production SF path (`sf_gmg`, `sf_gmg_w`, `sf_lu`, `sf_lu_w`, `sf_jorek`)
 
 The split-field preconditioner of `mod_petsc_pc_sf*` (workstream H) runs on the
 reference physics case `namelist/model199/inxflow_shaped_pcbench`, not on the
@@ -135,9 +135,49 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 
 | arm | blocks |
 |---|---|
-| `sf_gmg` | every block on its C¹ GMG: pair_psi split (ψ, j) with the zebra line smoother, pair_w / ρ / T radial lines |
-| `sf_lu` | every block by MUMPS LU: the exact reference, for approximation quality |
+| `sf_gmg` | S_uu = `schur` (the default): every block on its C¹ GMG, pair_psi split (ψ, j) and pair_w on zebra lines, ρ / T on radial lines |
+| `sf_gmg_w` | the same with S_uu = `w`, B₂₂ + W assembled |
+| `sf_lu` / `sf_lu_w` | every block by MUMPS LU: the exact references, for approximation quality |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
+
+**The two pair_w operators** (`physics_pc_sf_suu`, the only namelist entry
+that picks the method; the rest of the sweep is shared):
+
+- `schur`: S_uu is the ψ-channel Schur complement of the Jacobian, applied
+  matrix-free, with pair_psi's own solver inside (one V-cycle per pair_w
+  iteration; its LU on `sf_lu`). Its multigrid keeps B₂₂ + W for the Galerkin
+  chain and runs level 0 on the channel with a diagonal ψ-row inverse and a
+  Chebyshev constraint mass. The outer count is flat in the mesh.
+- `w`: S_uu = B₂₂ + W, assembled. No mass inverse and no nested solve, so
+  the cheapest per outer iteration, but W lacks the discrete M_j⁻¹ projection
+  and the outer count grows with the mesh.
+
+Both pairs run asymmetric V-cycles, all level-0 smoothing after the coarse
+correction (`SF_PJ_*`, `SF_W_*` in `mod_petsc_pc_sf_solver.f90`): pair_psi
+V(0,12) on `schur` and V(0,10) on `w` with 2 coarse steps per side, pair_w
+V(0,6). From a ψ-row right-hand side (the corrector's, and every nested solve)
+the coarse correction leaves a large j-row residual at the edge that only
+post-smoothing removes; with it every pair_psi solve converges in one cycle.
+The setup line `GMG smoother 7: V(a,b) on level 0, c steps per side below`
+shows the shape each hierarchy runs.
+
+Laptop reference (M4 Mac mini, np 4 × 1 thread, shaped pcbench, tstep 1,
+3 steps; outer its summed, wall in s; "before" = the configurations of
+commit `d28fafa86` / `e0b9f7855`):
+
+| mesh | `sf_gmg` (schur) | schur before | `sf_gmg_w` | w before |
+|---|---|---|---|---|
+| 41×32 | 21 / 13.8 | 60 / 21.5* | 112 / 15.8 | 112 / 21.3* |
+| 61×48 | 20 / 30.2 | 52 / 47.7* | 164 / 44.8 | 164 / 64.1* |
+| 81×32 | 19 / 21.3 | 53 / 37.7* | 116 / 30.3 | 116 / 41.9* |
+| 121×48 | 21 / 58.6 | 73 / 109.3 | 166 / 92.0 | 166 / 109.5 |
+| 161×64 | 22 / 148.3 | 104 / 348.9 | 201 / 258.6 † | 203 / 285.0 † |
+
+\* np 1 × 4. † back to back; at 161×64 the laptop runs near its memory
+limit and the outer Jacobian matvec varies between runs (the previous `w`
+configuration took 227 s on another day). The exact references at 41×32:
+`sf_lu` 20 its, `sf_lu_w` 112 — `w`'s count is its operator's, not its
+solvers'.
 
 The multigrid configuration is compiled in (`mod_petsc_pc_sf_solver.f90`),
 so one binary is one configuration. On the first build the log prints what
@@ -167,6 +207,45 @@ the parallel parts actually do; check it before reading any timing:
   means the exactness gate (1e-8) refused the sector solve for that level
   and the sequential LU stays.
 
+**The constraint mass on `schur`** (decided on the laptop, to confirm on the
+cluster). The level-0 operator of pair_w's multigrid applies B_33⁻¹ in every
+smoother step and V-cycle residual. A MUMPS factor with a centralized RHS grew
+with np on the cluster, so it is a Chebyshev iteration on additive Schwarz
+(`mod_petsc_pc_mass_cheb`: overlap 1, local ICC(0) on an ND ordering), with
+the degree taken from the κ measured on the first build. The log prints:
+
+- `pair_w Dh channel: mass B_33: Chebyshev(<d>) + ASM(ovl 1, ICC(0) ND), ..., kappa
+  <k>, ..., B-norm err <e> (bound <b>)`. On the laptop κ is 3.25 at np 1 and
+  4.7 at np 4, and d = 3. κ should stay bounded in np, since overlap only
+  raises λ_max. A κ that keeps growing with np, and d with it, is the thing
+  to watch for.
+
+`t_PhysPC_MjSolve` / `n_PhysPC_MjSolve` is the time per mass solve.
+
+Laptop audit that chose it (shaped pcbench, tstep 1, 3 steps; outer its
+summed; MjSolve in ms per call; at the time the mass sat in pair_w's Krylov
+operator too, and MUMPS was a run-time option):
+
+| variant | 61×48 np 1×4 | 61×48 np 4×1 | 121×48 np 1×4 |
+|---|---|---|---|
+| MUMPS factor | 52 its, 2.3 ms | 52 its, 2.8 ms | 72 its, 4.2 ms |
+| Chebyshev(3) + ASM/ICC(0) ND | 52 its, 3.8 ms | 53 its, **1.9 ms** | 72 its, 7.8 ms |
+| Chebyshev(3) + ASM/ICC(0) natural (κ 18 → 34) | 50 its | **77 its** (degree 5: 55) | 70 its |
+| diagonal Qi only | 126 its (pair_w 25 its/solve) | | |
+| Chebyshev(8) + point Jacobi (κ 552) | 98 its | | |
+| Chebyshev + rank-local FSAI (κ 21) | 57 (deg 6), **130** (deg 3) | 57 (deg 4) | |
+| Chebyshev + hypre ParaSails (κ 39) | 53 (deg 12), **218** (deg 4) | | |
+
+- At np 1 each Chebyshev call costs more than a MUMPS one, because its ICC(0)
+  triangular solves run on one thread. The KSP time is still equal or lower
+  (121×48: 81 s against 90 s, 81×32: 25 s against 22 s), and the cost per
+  call falls with np.
+- Below its degree floor a Chebyshev mass fails abruptly, not gradually,
+  which is why the degree follows κ.
+- Rejected too: a cheaper mass (Chebyshev(1) or Qi) only in the smoother's
+  operator, which gave fewer mass solves per V-cycle but more V-cycles:
+  +4..6 outer its and a higher KSP time at np 4.
+
 **The axis block** (decided). Every GMG level has an exact axis block (rings
 0..3, all J). Its size depends on n_tht only, so a sequential LU on the ranks
 that own it (rank 0, and from 161×64 at np ≈ 43 on also its neighbours, each
@@ -194,11 +273,11 @@ finish, and `sf_gmg`'s outer counts match `sf_lu`'s (3 3 6 5 38 39 against
 
 ```bash
 PCS_ROOT=$PWD/sf_strong_161 PCS_MESH=161x64  PCS_NPS="1 2 4 8 16 32 64" \
-  PCS_ARMS="sf_jorek sf_lu sf_gmg" ./pc_study.sh strong
+  PCS_ARMS="sf_jorek sf_lu sf_gmg sf_gmg_w" ./pc_study.sh strong
 PCS_ROOT=$PWD/sf_strong_321 PCS_MESH=321x128 PCS_NPS="8 16 32 64 128" \
-  PCS_ARMS="sf_jorek sf_gmg"       ./pc_study.sh strong
+  PCS_ARMS="sf_jorek sf_gmg sf_gmg_w"       ./pc_study.sh strong
 PCS_ROOT=$PWD/sf_weak PCS_WEAK="81x32:1 161x64:4 321x128:16" \
-  PCS_ARMS="sf_jorek sf_gmg"       ./pc_study.sh weak
+  PCS_ARMS="sf_jorek sf_gmg sf_gmg_w"       ./pc_study.sh weak
 ```
 
 Columns: `sf_pj_mean`, `sf_w_mean`, `sf_rho_mean`, `sf_T_mean` are the mean
@@ -314,9 +393,11 @@ arm to the `probes` series.
   and the Krylov solves, summed over steps.
 - `t_<event>`: `-log_view` times (max over ranks, all stages). The ones to watch:
   - `PhysPC_SolveW`, `GMG_VCycle`: the pair_w multigrid.
-  - `PhysPC_MjSolve`: the exact-mass MUMPS solve inside every matrix-free
-    pair_w matvec. **This is the component that stopped scaling on the
-    8-core laptop.**
+  - `PhysPC_MjSolve`: the constraint-mass solve inside the matrix-free pair_w
+    operators. On the `sfm2_*` arms it is MUMPS with a centralized RHS, which
+    stopped scaling on the laptop and on the cluster. On `sf_gmg` it is the
+    Chebyshev solve in the level-0 operator of pair_w's multigrid (see the
+    SF path section); `sf_gmg_w` has none.
   - `GMG_Coarse`, `GMG_AxSolve`: the coarsest level and the axis blocks. Both
     are exact LUs solved redundantly on the few ranks that own their rows
     (rank 0 for the axis), so they involve no collective over all ranks. A

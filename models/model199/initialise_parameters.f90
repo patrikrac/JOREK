@@ -106,6 +106,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 physics_pc_force_operator,                          &
                 physics_pc_suu_form,                                &
                 physics_pc_sf,                                      &
+                physics_pc_sf_suu,                                  &
                 physics_pc_sf_pair_psi,                             &
                 physics_pc_sf_pair_w,                               &
                 physics_pc_sf_rho,                                  &
