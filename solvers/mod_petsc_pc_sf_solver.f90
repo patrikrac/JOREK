@@ -46,6 +46,21 @@ module mod_petsc_pc_sf_solver
   !! On pair_w (exact-mass S_uu, blocks from the diagonal-mass channel) flat
   !! at ~2.0 V-cycles from 81x32 to 121x48 where lines take 3.1-3.4.
   integer, parameter, public :: SF_GMG_SMOOTHER_ZEBRA = 7
+  !> Zebra over rings between the axis block and the switch ring I_s (median
+  !! r*dtheta/dr = 1, about n_tht/(2 pi) rings), zebra radial lines outside:
+  !! GMGPolar's circle/radial split (Bourne et al., JCP 488 (2023)) with its
+  !! colouring. The fixed axis block (rings 0..3) leaves rings 4..I_s-1 to
+  !! radial lines, the weak direction there; solving rings 0..I_s-1 exactly
+  !! instead (axis_rings = -1) bounds the gain: 321x128 w arm np 64, pair_w
+  !! 3.17 -> 2.16 V-cycles. Smoother 8 reaches 2.23 at O(N) cost (solve 89.1
+  !! -> 78.3 s, setup unchanged); pair_psi 1.58 -> 1.49 (its bound 1.49).
+  !! At 161x64 (I_s = 10) it is neutral (pair_w 2.27 -> 2.21, bound 2.27).
+  !! schur arm's pair_w, 321x128 np 64, 5 runs each: neutral within the
+  !! run-to-run spread (outer its 91-115 vs 93-109, mean solve 216 vs 230 s;
+  !! pair_w hits its 30-iteration cap at tstep 1, which makes that arm's
+  !! outer count vary by +-10% between identical runs). Kept for uniformity.
+  !! Not on rho / T (line Jacobi there; smoother 8: T 2.0 -> 8.8 V-cycles).
+  integer, parameter, public :: SF_GMG_SMOOTHER_ZEBRA_RINGS = 8
   integer, parameter, public :: SF_GMG_AXIS_RINGS = 3   !< rings folded into the axis block
   integer, parameter, public :: SF_GMG_NSMOOTH    = 0   !< 0 = the smoother's own default (4)
   !> Line smoothers across rank boundaries: each local radial-line segment is
@@ -56,7 +71,15 @@ module mod_petsc_pc_sf_solver
   !! (~5 rings per rank): pair_psi 5.3-6.5 without overlap, 2.3-2.4 with 1,
   !! 2.0-2.2 with 2 or 3 (np 1: 2.0-2.2); pair_w 3.1-3.4 -> 2.1. 2 is the
   !! smallest overlap that keeps the counts flat in np.
-  integer, parameter, public :: SF_GMG_LINE_OVERLAP = 2
+  !! On the cluster the ghosts cost more than the counts save: a rank always
+  !! holds n_tht lines, so only their length shrinks with np, and at 2-5
+  !! rings per rank overlap 2 adds 150% / 60% ghost rows. 2026-09-28
+  !! (sf_runs/sf_iter, np 64 x 8 on 2 nodes, coarse Richardson on): w arm
+  !! 161x64 solve 28.1 -> 23.6 s, 321x128 107.2 -> 85.0 s, outer its +1-2%;
+  !! overlap 0 does not converge (rho / T 5-10 V-cycles). The schur arm's
+  !! pair_w (Dh-channel level 0, couplings to J +- 2) keeps 2.
+  integer, parameter, public :: SF_GMG_LINE_OVERLAP = 1
+  integer, parameter, public :: SF_GMG_LINE_OVERLAP_SCHUR_W = 2
   !> Axis blocks solved over J-sector ranks (mod_petsc_pc_gmg_axis: an exact
   !! one-level nested dissection in J, gated against the LU on the first
   !! build); -1 = the cost model's sector count, 0 = the sequential LU on the
@@ -70,6 +93,12 @@ module mod_petsc_pc_sf_solver
   !! 138 -> 143 s at 41x64 np 4. The first build's exactness gate still keeps
   !! the LU for any level whose sector solve disagrees with it.
   integer, parameter, public :: SF_GMG_AXIS_SECTORS = -1
+  !> ... except the schur arm's pair_w: its level-0 axis block carries the Dh
+  !! channel's J +- 2 couplings, so half its rows become separator / border
+  !! and the reduced system is ~3.3k rows (161x64) -- more work than the
+  !! sequential LU it replaces. 161x64 np 64 x 8 (2026-09-28): setup 17.8 ->
+  !! 7.2 s, solve 17.8 -> 14.1 s with the sequential LU, outer its 45 -> 44.
+  integer, parameter, public :: SF_GMG_AXIS_SECTORS_SCHUR_W = 0
   !> Matvec kernel of the SF operators, the GMG levels and the SFM2 coupling
   !! blocks: 0 = PETSc's (one thread per rank; AIJMKL where PETSc has MKL
   !! sparse), 1 = jorek_blockmv_attach.c (OpenMP, reads each n_tor harmonic block's
@@ -110,6 +139,29 @@ module mod_petsc_pc_sf_solver
   !! (rho / T keep radial lines V(4,4): V(0,4) / V(0,6) save ~1.5 s of 12
   !! but raise T's cycles 1.43 -> 2.28 / 1.84.)
   integer, parameter, public :: SF_W_PRE0 = 0, SF_W_POST0 = 6, SF_W_NSC = 0
+  !> Coarse levels (1 and below) smooth with Richardson on the same zebra /
+  !! line blocks instead of GMRES: no norms or inner products, so no global
+  !! reduction below level 0. GMRES there cost two allreduces over all ranks
+  !! per step on levels with a few hundred rows per rank (none on many), and
+  !! made the coarse smoothing flat in np: at 321x128 (w arm, v3) it went
+  !! 51 -> 34 -> 44 -> 43 s from np 8 to np 128, 62% of the solve at np 128.
+  !! 161x64 w arm, shaped pcbench, 10 steps (2026-09-28, sf_runs/sf_iter):
+  !!   np 16 x 16: solve 31.8 -> 25.9 s; np 64 x 8 (2 nodes): 35.3 -> 28.1 s;
+  !!   outer its 241-243 in all; pair_w inner its 2.5 -> 2.0.
+  !! The zebra sweep takes the full step; the rho / T line-Jacobi blocks need
+  !! damping (scale 1: T inner its 1.42 -> 1.85; 0.8: 1.47).
+  !! At 321x128 np 64 x 8 it pays only together with SF_GMG_LINE_OVERLAP = 1
+  !! (solve: reference 106.1 s; Richardson alone 107.2; overlap 1 alone
+  !! 111.6; both 85.0 / 88.3 in two runs; Richardson from level 2 97.0): the
+  !! pairs take a few more V-cycles (pair_w 2.5 -> 3.0), which the reduction-
+  !! free coarse levels and the shorter lines pay for only jointly.
+  !! Not on the schur arm's pair_w: its V-cycle needs GMRES on the coarse
+  !! levels (161x64 np 64: 4.5 -> 16 V-cycles per solve with Richardson).
+  !! Nor on its pair_psi, which also runs nested in the S_uu shell: with
+  !! overlap 1 + Richardson there, 321x128 np 64 went from 16/12/10 outer its
+  !! at tstep 1 to 71/38/52 (pair_w 25.6 V-cycles per solve); 161x64 held.
+  integer, parameter, public :: SF_GMG_RICH_FROM = 1, SF_GMG_RICH_NONE = -1
+  real*8,  parameter, public :: SF_GMG_RICH_OMEGA_ZEBRA = 1.0d0, SF_GMG_RICH_OMEGA_LINES = 0.8d0
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (physics_pc_pair_maxits = 30 for the packed pairs, physics_pc_rhot_gmg =
@@ -152,7 +204,8 @@ contains
   !! so MUMPS and the GMG both reuse their symbolic phases.
   !--------------------------------------------------------------------
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
-                             nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c)
+                             nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
+                             line_overlap, axis_sectors, rich_from)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_opts_t
@@ -175,6 +228,9 @@ contains
                                               !< it is neither A nor Aop (default: Aop, else A)
     integer, intent(in), optional :: pre0, post0, nsmooth_c   !< SF_GMG: V-cycle shape
                                               !< (gmg_opts_t); absent = SF_GMG_NSMOOTH everywhere
+    integer, intent(in), optional :: line_overlap, axis_sectors, rich_from  !< SF_GMG: per-block
+                                              !< overrides of SF_GMG_LINE_OVERLAP, SF_GMG_AXIS_SECTORS,
+                                              !< SF_GMG_RICH_FROM
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -231,6 +287,12 @@ contains
       o%harm_split   = 1               ! the extracted blocks are |n|-diagonal
       o%axis_mult    = 0;  o%axis_split = 0;  o%smooth_op = 0;  o%ring_diag = 0
       o%omega        = 0.7d0;  o%axis_droptol = 0.d0;  o%ring_aspect = 1.d0
+      o%rich_from    = SF_GMG_RICH_FROM
+      o%rich_omega   = SF_GMG_RICH_OMEGA_ZEBRA
+      if (smoother == SF_GMG_SMOOTHER_LINES) o%rich_omega = SF_GMG_RICH_OMEGA_LINES
+      if (present(line_overlap)) o%line_overlap = line_overlap
+      if (present(axis_sectors)) o%axis_sectors = axis_sectors
+      if (present(rich_from))    o%rich_from    = rich_from
 
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)
@@ -252,10 +314,19 @@ contains
 
       !--- the Krylov wrapper: created once, re-pointed at every rebuild
       if (fresh) then
-        call KSPCreate(comm, slv%ksp, ierr)
-        call KSPSetType(slv%ksp, KSPFGMRES, ierr)
-        call KSPGMRESSetRestart(slv%ksp, max(maxits, 2), ierr)
-        call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, maxits, ierr)
+        ! -sf_gmg<k>_maxits: the FGMRES budget of hierarchy k, for experiments
+        block
+          PetscInt :: mx
+          PetscBool :: set
+          character(len=32) :: nm
+          mx = maxits
+          write(nm, '(A,I0,A)') "-sf_gmg", slv%gmg_inst, "_maxits"
+          call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), mx, set, ierr)
+          call KSPCreate(comm, slv%ksp, ierr)
+          call KSPSetType(slv%ksp, KSPFGMRES, ierr)
+          call KSPGMRESSetRestart(slv%ksp, max(int(mx), 2), ierr)
+          call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, mx, ierr)
+        end block
         call KSPGetPC(slv%ksp, pc, ierr)
         call PCSetType(pc, PCSHELL, ierr)
         select case (slv%gmg_inst)

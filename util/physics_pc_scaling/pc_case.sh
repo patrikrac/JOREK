@@ -5,7 +5,7 @@
 #    pc_case.sh <arm> <n_flux> <n_tht> <np> [key=value ...]
 #
 #  arm     jorek | jorek_fresh | sfm2_lu | sfm2_lu_hs0 | sfm2_gmg | sfm2_gmg_* |
-#          sf_gmg | sf_lu | sf_jorek (see mknml.py)
+#          sf_gmg | sf_lu | sf_jorek | sf_direct (see mknml.py)
 #  np      MPI ranks for this case (<= ranks of the allocation); every rank
 #          runs PCS_OMP OpenMP threads (hybrid MPI+OpenMP, as JOREK is run)
 #  extra key=value pairs are passed to mknml.py as namelist overrides.
@@ -82,7 +82,7 @@ fi
 NODES=${SLURM_JOB_NUM_NODES:-1}
 {
   echo "arm=$ARM"; echo "n_flux=$NF"; echo "n_tht=$NT"; echo "np=$NP"; echo "omp=$OMP"; echo "nodes=$NODES"
-  echo "overrides=$*"; echo "bin=$JOREK_BIN"; echo "launch=$LAUNCH"; echo "restart_from=${PCS_RESTART:-}"
+  echo "overrides=$*"; echo "petsc_opts=$(python3 "$HERE/mknml.py" petscopts "$ARM") ${PCS_PETSC_OPTS:-}"; echo "bin=$JOREK_BIN"; echo "launch=$LAUNCH"; echo "restart_from=${PCS_RESTART:-}"
   echo "slurm_job=${SLURM_JOB_ID:-}"; echo "host=$(hostname)"; echo "start=$(date '+%Y-%m-%dT%H:%M:%S')"
   echo "git=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null)"
 } > "$DIR/case.meta"
@@ -94,7 +94,8 @@ cd "$DIR" || exit 1
 # own AIJ kernels run on one thread per rank.
 export OMP_NUM_THREADS=$OMP MKL_NUM_THREADS=$OMP OPENBLAS_NUM_THREADS=$OMP
 export OMP_PLACES=${OMP_PLACES:-cores} OMP_PROC_BIND=${OMP_PROC_BIND:-close}
-export PETSC_OPTIONS="-log_view :prof.txt -memory_view ${PCS_PETSC_OPTS:-}"
+ARM_OPTS=$(python3 "$HERE/mknml.py" petscopts "$ARM")
+export PETSC_OPTIONS="-log_view :prof.txt -memory_view $ARM_OPTS ${PCS_PETSC_OPTS:-}"
 T0=$(python3 -c "import time; print(time.time())")
 $LAUNCH "$JOREK_BIN" < in > log 2>&1
 RC=$?

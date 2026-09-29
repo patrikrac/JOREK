@@ -397,6 +397,7 @@ contains
     PetscReal :: petsc_norm
     PetscViewerAndFormat :: vf
     logical :: no_aij
+    PetscBool :: full_lu
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     ! Memory audit (physics_pc_lean_setup >= 3): the physics PC reads its blocks
@@ -446,9 +447,23 @@ contains
       ! Set the maximum iterations and restart
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
+      ! -jorek_outer_restart k: the outer FGMRES restart length (default 40)
+      block
+        PetscInt :: rs
+        PetscBool :: set
+        rs = 40
+        PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_restart", rs, set, ierr))
+        if (set) PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, rs, ierr))
+      end block
 
+      ! -jorek_pc_full_lu: one MUMPS LU of the whole coupled system instead of
+      ! the per-harmonic fieldsplit (the direct-solve reference; with
+      ! iter_precon = 0 it is refactorised every step).
+      PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_pc_full_lu", full_lu, ierr))
       if (use_physics_pc) then
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + Physics PCSHELL"
+      else if (full_lu) then
+        if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + full-system LU (MUMPS)"
       else
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + PCFIELDSPLIT + MUMPS"
       endif
@@ -457,6 +472,8 @@ contains
       if (use_physics_pc) then
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_PHYSICS)
         call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
+      else if (full_lu) then
+        call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_FULL_LU)
       else
         call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
       endif
@@ -585,7 +602,8 @@ contains
     PetscInt :: n_global, n_local
     PetscInt :: row(1), col(1)
     PetscScalar :: v(1)
-    PetscInt, allocatable :: d_nnz(:)
+    PetscInt, allocatable :: d_nnz(:), o_nnz(:), cnt(:)
+    PetscInt :: r_start, r_end
     PetscErrorCode :: ierr
 
     comm = a_mat%comm
@@ -610,10 +628,33 @@ contains
       call MatSeqAIJSetPreallocation(petsc_sys%A, 0, d_nnz, ierr)
       deallocate(d_nnz)
     else
-      call MatSetSizes(petsc_sys%A, PETSC_DECIDE, PETSC_DECIDE, n_global, n_global, ierr)
+      ! Preallocating n_global per row overflows PetscInt (local rows x n_global
+      ! > 2^31 at 161x64 on np <= 8) and reserves O(n_local*n_global) otherwise.
+      ! Count the COO entries per row on rank 0 instead, broadcast, and bound each
+      ! rank's diagonal/off-diagonal counts by the block widths.
+      n_local = PETSC_DECIDE
+      call PetscSplitOwnership(comm, n_local, n_global, ierr)
+      call MPI_Scan(n_local, r_end, 1, MPIU_INTEGER, MPI_SUM, comm, mpierr)
+      r_start = r_end - n_local
+      allocate(cnt(n_global))
+      cnt = 0
+      if (my_id .eq. 0) then
+        do k = 1, a_mat%nnz
+          r = a_mat%irn(k)
+          cnt(r) = cnt(r) + 1
+        enddo
+      endif
+      call MPI_Bcast(cnt, int(n_global), MPIU_INTEGER, 0, comm, mpierr)
+      allocate(d_nnz(n_local), o_nnz(n_local))
+      do k = 1, int(n_local)
+        d_nnz(k) = min(cnt(r_start + k), n_local)
+        o_nnz(k) = min(cnt(r_start + k), n_global - n_local)
+      enddo
+      deallocate(cnt)
+      call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
       call MatSetType(petsc_sys%A, MATAIJ, ierr)
-      call MatMPIAIJSetPreallocation(petsc_sys%A, n_global, PETSC_NULL_INTEGER_ARRAY, &
-                                      n_global, PETSC_NULL_INTEGER_ARRAY, ierr)
+      call MatMPIAIJSetPreallocation(petsc_sys%A, 0, d_nnz, 0, o_nnz, ierr)
+      deallocate(d_nnz, o_nnz)
     endif
 
     call MatSetOption(petsc_sys%A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)

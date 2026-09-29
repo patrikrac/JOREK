@@ -233,12 +233,18 @@ contains
     PetscErrorCode :: ierr
     PetscInt :: n1_loc
     logical  :: first
-    integer  :: pj_post0
+    integer  :: pj_post0, pj_ovl, pj_rich, pj_sm
 
     call sf_init(my_id)
     first = sf_first
     pj_post0 = SF_PJ_POST0_SCHUR
     if (suu == SF_SUU_W) pj_post0 = SF_PJ_POST0_W
+    ! schur: pair_psi also runs nested inside pair_w's S_uu shell, one fixed
+    ! cycle per matvec, so it keeps the stronger V-cycle (see SF_GMG_RICH_FROM)
+    pj_ovl = SF_GMG_LINE_OVERLAP;  pj_rich = SF_GMG_RICH_FROM;  pj_sm = SF_GMG_SMOOTHER_ZEBRA_RINGS
+    if (suu == SF_SUU_SCHUR) then
+      pj_ovl = SF_GMG_LINE_OVERLAP_SCHUR_W;  pj_rich = SF_GMG_RICH_NONE;  pj_sm = SF_GMG_SMOOTHER_ZEBRA
+    endif
 
     !--- index sets ------------------------------------------------------
     if (.not. g_ctx%is_created) call create_variable_index_sets(A_full, comm)
@@ -268,8 +274,9 @@ contains
     call PetscLogEventBegin(pcev_fact_pj, ierr)
     call sf_solver_setup(slv_pj, g_ctx%K_pj_aij, bk_pj, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
                          comm, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2, &
-                         smoother=SF_GMG_SMOOTHER_ZEBRA, maxits=SF_GMG_MAXITS, &
-                         pre0=SF_PJ_PRE0, post0=pj_post0, nsmooth_c=SF_PJ_NSC)
+                         smoother=pj_sm, maxits=SF_GMG_MAXITS, &
+                         pre0=SF_PJ_PRE0, post0=pj_post0, nsmooth_c=SF_PJ_NSC, &
+                         line_overlap=pj_ovl, rich_from=pj_rich)
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
     !--- pair_w: the scaling balances the operator pair_w SOLVES -- schur on
@@ -299,9 +306,11 @@ contains
       if (bk_w == SF_GMG) then
         call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP (schur S_uu)", &
                              comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
-                             smoother=SF_GMG_SMOOTHER_ZEBRA, maxits=SF_GMG_MAXITS, &
+                             smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
                              Aop=sfw_shell, Ablk=sfw_lines, Amg=sfw_dh, &
-                             pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC)
+                             pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC, &
+                             line_overlap=SF_GMG_LINE_OVERLAP_SCHUR_W, rich_from=SF_GMG_RICH_NONE, &
+                             axis_sectors=SF_GMG_AXIS_SECTORS_SCHUR_W)
       else
         call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP (schur S_uu)", &
                              comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
@@ -310,7 +319,7 @@ contains
     else
       call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
                            comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
-                           smoother=SF_GMG_SMOOTHER_ZEBRA, maxits=SF_GMG_MAXITS, &
+                           smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
                            pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC)
     endif
     call PetscLogEventEnd(pcev_fact_w, ierr)

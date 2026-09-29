@@ -122,7 +122,7 @@ case the study does not cover (see `docs/physics_pc/workstream_D_matrix_free.md`
   tol·sqrt(|a_ii a_jj|) from the axis block before its LU: −47% factor entries
   and −23% `GMG_AxSolve` at 41×16, with unchanged counts.
 
-## The production SF path (`sf_gmg`, `sf_gmg_w`, `sf_lu`, `sf_lu_w`, `sf_jorek`)
+## The production SF path (`sf_gmg`, `sf_gmg_w`, `sf_lu`, `sf_lu_w`, `sf_jorek`, `sf_direct`)
 
 The split-field preconditioner of `mod_petsc_pc_sf*` (workstream H) runs on the
 reference physics case `namelist/model199/inxflow_shaped_pcbench`, not on the
@@ -139,6 +139,7 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 | `sf_gmg_w` | the same with S_uu = `w`, B₂₂ + W assembled |
 | `sf_lu` / `sf_lu_w` | every block by MUMPS LU: the exact references, for approximation quality |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
+| `sf_direct` | full-system direct solve: one MUMPS LU of the whole coupled Jacobian (`-jorek_pc_full_lu`, in-core), refactorised every step (`iter_precon = 0`); FGMRES only checks it |
 
 **The two pair_w operators** (`physics_pc_sf_suu`, the only namelist entry
 that picks the method; the rest of the sweep is shared):
@@ -159,7 +160,16 @@ V(0,6). From a ψ-row right-hand side (the corrector's, and every nested solve)
 the coarse correction leaves a large j-row residual at the edge that only
 post-smoothing removes; with it every pair_psi solve converges in one cycle.
 The setup line `GMG smoother 7: V(a,b) on level 0, c steps per side below`
-shows the shape each hierarchy runs.
+shows the shape each hierarchy runs. pair_w on both arms and pair_psi on
+`w` run smoother 8 (`SF_GMG_SMOOTHER_ZEBRA_RINGS`): GMGPolar's circle/radial split, a zebra over
+the rings between the axis block and the switch ring I_s ≈ n_tht/2π, zebra
+radial lines outside. Its setup line adds `GMG hybrid smoother: ring blocks on
+fine rings I < I_s, radial lines outside`. At 321×128 np 64 it cut pair_w from
+3.17 to 2.23 V-cycles (the exact solve of rings 0..I_s−1 reaches 2.16) and the
+solve from 89 to 78 s (three runs); on the schur arm's pair_w it is neutral
+within that arm's ±10% run-to-run spread (five runs each). At 161×64
+(I_s = 10) it is neutral. ρ and T keep radial
+line Jacobi (smoother 8 there: T 2.0 → 8.8 V-cycles).
 
 Laptop reference (M4 Mac mini, np 4 × 1 thread, shaped pcbench, tstep 1,
 3 steps; outer its summed, wall in s; "before" = the configurations of
@@ -187,6 +197,13 @@ the parallel parts actually do; check it before reading any timing:
   the overlapping line segments across rank boundaries. They keep the
   V-cycle counts flat in np (41×64: pair_psi 2.0 at np 1; without overlap
   5.3–6.5 at np 8, with overlap 2 2.0–2.2).
+- `GMG<k>: Richardson smoothing on levels >= 1 (scale s, no reductions)`:
+  the coarse levels smooth with Richardson on the same zebra / line blocks
+  (`SF_GMG_RICH_FROM`; scale 1 for zebra, 0.8 for the ρ / T lines), not
+  GMRES, whose two allreduces per step over all ranks made the coarse
+  smoothing flat in np (`t_GMG*_SmoothC` in `prof.txt`). Every hierarchy
+  prints it except the schur arm's pair_w (GMG1) and pair_psi (GMG2): pair_w's
+  V-cycle needs GMRES there, and pair_psi also runs nested in the S_uu shell.
 - `GMG<k>: level matvecs on the OpenMP block kernel (bs 3, ... levels)`: the
   SF operators, every GMG level, the prolongations and the SFM2 coupling
   blocks multiply with `solvers/jorek_blockmv_attach.c` (`SF_BLOCKMV = 1`),
@@ -258,14 +275,25 @@ saves; that is expected there and no reason to switch it off. A binary with
 (`t_GMG<k>_AxSolve` against `t_GMG<k>_Lines`).
 
 **One thing only the cluster can decide.** It is a compile-time constant in
-`mod_petsc_pc_sf_solver.f90`, so it needs its own binary; give its cases a
-`PCS_TAG`.
+`mod_petsc_pc_sf_solver.f90`; for experiments the PETSc options below
+override it without a new binary. Give such cases a `PCS_TAG`.
 
-- **The line overlap.** `SF_GMG_LINE_OVERLAP = 2` kept the V-cycles flat to
-  np 8 at 41×64 (~5 rings per rank). Its cost is the ghost fraction the log
-  prints: 29% at np 4, 112% at 21×64 np 8, and more at ~2 rings per rank.
-  If the counts stay flat but `t_GMG<k>_Lines` stops scaling there, compare
-  a binary with overlap 1.
+Runtime overrides of the V-cycle (`PCS_PETSC_OPTS`), for scaling
+experiments only: `-sf_gmg_<name> v` sets every hierarchy,
+`-sf_gmg<k>_<name> v` hierarchy k (1 pair_w, 2 pair_psi, 3 ρ, 4 T), with
+`<name>` one of `line_overlap`, `axis_sectors`, `axis_rings`, `rich_from` (first Richardson level; 0 =
+all, a level count above the hierarchy's = none), `rich_omega`, `pre0`,
+`post0`, `nsc` (coarse steps per side) and `nlev` (cap on the hierarchy
+depth). The setup lines print what is in effect.
+
+- **The line overlap.** Overlap 2 kept the V-cycles flat to np 8 at 41×64
+  (~5 rings per rank), but its ghost fraction (150% at 161×64 np 64) made
+  `t_GMG<k>_Lines` flat in np on the cluster. `SF_GMG_LINE_OVERLAP = 1` since
+  2026-09-28 (np 64 × 8, 2 nodes: w arm solve −17% at 161×64, −20% at
+  321×128, outer its +1–2%; overlap 0 does not converge). The schur arm's
+  pair_w and pair_psi keep overlap 2 and GMRES coarse smoothing
+  (`SF_GMG_LINE_OVERLAP_SCHUR_W`, `SF_GMG_RICH_NONE`), and its pair_w axis
+  block the sequential LU (`SF_GMG_AXIS_SECTORS_SCHUR_W = 0`).
 
 Local check (laptop, 41×32, np 2, `PCS_NSTEP_N=1,1,2,2`): all three arms
 finish, and `sf_gmg`'s outer counts match `sf_lu`'s (3 3 6 5 38 39 against

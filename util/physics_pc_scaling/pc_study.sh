@@ -32,6 +32,9 @@
 #                                               [<PCS_ROOT>/../pc_scaling_nl/jorek_<mesh>_np1x<omp>]
 #    PCS_PROBE_ARMS   probes: arms              [sfm2_lu_hs0]
 #    PCS_PROBE_STEPS  probes: first:stride:last [40:10:230]
+#    PCS_PROBE_LIST   probes: explicit restart steps, overrides PCS_PROBE_STEPS []
+#                     (sf_* arms: e.g. PCS_TSTEP_N=1.d0 PCS_NSTEP_N=5, since their
+#                     force operator is only valid to tstep ~ 1)
 #    PCS_PROBE_NP     probes: MPI ranks         [1]
 #    PCS_MAXNP   upper limit on np (MPI ranks)  [$SLURM_NTASKS, else 8]
 #    PCS_OMP     OpenMP threads per rank        [$SLURM_CPUS_PER_TASK, else 1]
@@ -92,15 +95,18 @@ case "$MODE" in
       exit 1
     fi
     base=$(basename "$REF")                     # <arm>_<n_flux>x<n_tht>_np<np>x<omp>
-    mesh=${base#*_}; mesh=${mesh%%_*}
+    mesh=$(grep -o '_[0-9]*x[0-9]*_np' <<< "$base" | head -1)   # arm names contain '_'
+    mesh=${mesh#_}; mesh=${mesh%_np}
     NF=${mesh%x*}; NT=${mesh#*x}
     IFS=: read -r p0 dp p1 <<< "${PCS_PROBE_STEPS:-40:10:230}"
     export PCS_TSTEP_N=${PCS_TSTEP_N:-1.d3} PCS_NSTEP_N=${PCS_NSTEP_N:-1}
     export PCS_OMP=${PCS_OMP:-${SLURM_CPUS_PER_TASK:-1}}
     np=${PCS_PROBE_NP:-1}
-    echo "[pc_study] probes from $REF ($NF x $NT), steps $p0:$dp:$p1, np=$np x $PCS_OMP"
+    STEPS=${PCS_PROBE_LIST:-$(seq "$p0" "$dp" "$p1")}
+    echo "[pc_study] probes from $REF ($NF x $NT), steps" $STEPS", np=$np x $PCS_OMP"
     for arm in ${PCS_PROBE_ARMS:-sfm2_lu_hs0}; do
-      for s in $(seq "$p0" "$dp" "$p1"); do
+      for s in $STEPS; do
+        s=$((10#$s))
         f=$(printf '%s/jorek%06d.h5' "$REF" "$s")
         [ -f "$f" ] || continue
         if [ "${PCS_DRYRUN:-0}" = 1 ]; then

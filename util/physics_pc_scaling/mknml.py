@@ -3,6 +3,7 @@
 
     mknml.py <arm> <n_flux> <n_tht> <out_file> [key=value ...]
     mknml.py nodes <arm> <n_flux> <n_tht>     # nodes the case needs (n_nodes_max check)
+    mknml.py petscopts <arm>                  # PETSc options the arm adds (pc_case.sh)
 
 Starts from the arm's base namelist -- namelist/model199/intear_island_demo
 (the committed benchmark), or inxflow_shaped_pcbench for the sf_* arms --
@@ -152,6 +153,12 @@ ARMS['sf_gmg_w'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"w"')
 ARMS['sf_lu_w'] = dict(ARMS['sf_lu'], physics_pc_sf_suu='"w"')
 # JOREK's default PC on the same case and ramp
 ARMS['sf_jorek'] = {'use_physics_pc': '.f.'}
+# Full-system direct solve: one MUMPS LU of the whole coupled Jacobian,
+# refactorised every step (iter_precon = 0), so FGMRES only checks it (1 it).
+ARMS['sf_direct'] = {'use_physics_pc': '.f.', 'iter_precon': '0'}
+
+# PETSc options an arm needs besides its namelist (`mknml.py petscopts <arm>`).
+ARM_PETSC_OPTS = {'sf_direct': '-jorek_pc_full_lu'}
 
 
 def is_sf(arm):
@@ -179,6 +186,9 @@ def main(argv):
     if len(argv) == 5 and argv[1] == 'nodes':
         nr, npol = grids(argv[2], int(argv[3]), int(argv[4]))
         print(max(nr * npol, int(argv[3]) * int(argv[4])))
+        return
+    if len(argv) == 3 and argv[1] == 'petscopts':
+        print(ARM_PETSC_OPTS.get(argv[2], ''))
         return
     if len(argv) < 5:
         sys.exit(__doc__)

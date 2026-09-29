@@ -79,7 +79,11 @@ module mod_petsc_pc_gmg
                                      !< 0 = the sequential LU on the owning ranks
     integer :: blockmv      = 0      !< 1 = level operators and prolongations multiply
                                      !< with jorek_blockmv_attach.c's OpenMP kernel
+    integer :: rich_from    = -1     !< levels >= rich_from smooth with Richardson on the
+                                     !< smoother's blocks (no reductions); < 0 = none
     real*8  :: omega        = 0.7d0  !< Richardson damping (smoothers 1, 2)
+    real*8  :: rich_omega   = 0.d0   !< Richardson scale on levels >= rich_from;
+                                     !< <= 0 = 1 (smoothers 1, 2: omega)
     real*8  :: axis_droptol = 0.d0   !< relative drop tolerance of the axis block
     real*8  :: ring_aspect  = 1.d0   !< smoother 6 / axis_rings -1 switch radius
   end type gmg_opts_t
@@ -838,7 +842,7 @@ contains
     integer, allocatable :: rs(:), cs(:)
     real*8,  allocatable :: ws(:)
     logical, allocatable :: done(:)
-    integer :: ns
+    integer :: ns, nlev_cap
     type(lay_t), allocatable :: ly(:)
     integer, allocatable :: rstarts(:)
     integer :: me, np, mpierr, r, first, ci, cj, dd, own_, ff, mm, lr, nloc
@@ -904,7 +908,9 @@ contains
     !--- coarse levels
     allocate(lv(1:MAX_LEV - 1))
     ni = n_flux; nj = n_tht; nlev = 1
-    do g = 1, MAX_LEV - 1
+    nlev_cap = MAX_LEV
+    call opt_int("nlev", nlev_cap)
+    do g = 1, min(MAX_LEV, max(nlev_cap, 2)) - 1
       if (mod(ni - 1, 2) /= 0 .or. mod(nj, 2) /= 0 .or. nj < 4) exit
       ni = (ni - 1) / 2 + 1
       nj = nj / 2
@@ -1347,8 +1353,8 @@ contains
     Mat  :: Aax
     MatInfo :: minfo
     PetscInt :: nr
-    integer :: g
-    real*8 :: nz0, nzt, nzg
+    integer :: g, rich_from
+    real*8 :: nz0, nzt, nzg, rich_omega
     integer(8) :: sig(2)
     logical :: reuse
 
@@ -1444,6 +1450,7 @@ contains
     if (present(smoother)) then
       if (smoother >= 0) sm_type = smoother
     endif
+    call opt_int("smoother", sm_type)
     if (present(nsmooth)) then
       if (nsmooth > 0) sm_nstep = nsmooth
     endif
@@ -1455,6 +1462,9 @@ contains
     if (o%pre0 >= 0)     st_pre0(cur_inst)  = o%pre0
     if (o%post0 >= 0)    st_post0(cur_inst) = o%post0
     if (o%nsmooth_c > 0) st_crs(cur_inst)   = o%nsmooth_c
+    call opt_int("pre0", st_pre0(cur_inst))
+    call opt_int("post0", st_post0(cur_inst))
+    call opt_int("nsc", st_crs(cur_inst))
     if (st_pre0(cur_inst) + st_post0(cur_inst) == 0) then
       if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: GMG level 0 needs pre0 + post0 > 0"
       call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
@@ -1462,18 +1472,33 @@ contains
     sm_blocks = (sm_type >= 2)
     axis_k = 0
     if (sm_type >= 4) axis_k = max(o%axis_rings, -1)
+    if (sm_type >= 4) call opt_int("axis_rings", axis_k)
     axis_mult = 0
     if (axis_k /= 0) axis_mult = min(max(o%axis_mult, 0), 3)
     axis_droptol = max(o%axis_droptol, 0.d0)
     lovl = 0
-    if (sm_type == 5 .or. sm_type == 7) lovl = max(o%line_overlap, 0)
+    if (sm_type == 5 .or. sm_type >= 7) lovl = max(o%line_overlap, 0)
+    if (sm_type == 5 .or. sm_type >= 7) call opt_int("line_overlap", lovl)
     axsec = 0
     if (axis_k /= 0 .and. axis_mult == 0) axsec = o%axis_sectors
+    if (axis_k /= 0 .and. axis_mult == 0) call opt_int("axis_sectors", axsec)
     ! per-|n| axis solves need the block to be block-diagonal in |n|
     axis_split = (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split > 0)
     if (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split == 0 .and. my_id == 0) &
       write(*,'(A)') "[Physics PC]   GMG: physics_pc_gmg_axis_split needs physics_pc_harm_split = 1; ignored"
     diag_left = max(o%ring_diag, 0)
+    ! Levels g >= rich_from smooth with Richardson on the same blocks instead
+    ! of GMRES: no norm, no inner product, so no global reduction below that
+    ! level. GMRES costs two allreduces over the whole communicator per step,
+    ! on coarse levels with a few hundred rows per rank and on ranks owning
+    ! none -- the V-cycle's strong-scaling floor at np >= 32.
+    rich_from = nlev
+    if (o%rich_from >= 0) rich_from = o%rich_from
+    rich_omega = 1.d0
+    if (sm_type == 1 .or. sm_type == 2) rich_omega = o%omega
+    if (o%rich_omega > 0.d0) rich_omega = o%rich_omega
+    call opt_int("rich_from", rich_from)
+    call opt_real("rich_omega", rich_omega)
     do g = 0, nlev - 2
       ! Created and configured once per hierarchy; a rebuild only re-points
       ! the operators and refactors the smoother blocks.
@@ -1487,9 +1512,9 @@ contains
         call KSPSetOperators(gSm(g), gA(g), gA(g), ierr)
       endif
       if (.not. op_ready) then
-        if (sm_type == 1 .or. sm_type == 2) then
+        if (sm_type == 1 .or. sm_type == 2 .or. g >= rich_from) then
           call KSPSetType(gSm(g), KSPRICHARDSON, ierr)
-          call KSPRichardsonSetScale(gSm(g), o%omega, ierr)
+          call KSPRichardsonSetScale(gSm(g), rich_omega, ierr)
           call KSPSetNormType(gSm(g), KSP_NORM_NONE, ierr)
           call KSPSetTolerances(gSm(g), 1.d-30, 1.d-50, 1.d30, sm_nstep, ierr)
         else
@@ -1541,7 +1566,7 @@ contains
         else
           write(*,*)
         endif
-        if (sm_type == 6) write(*,'(A,I0,A)', advance="no") &
+        if (sm_type == 6 .or. sm_type == 8) write(*,'(A,I0,A)', advance="no") &
           "[Physics PC]   GMG hybrid smoother: ring blocks on fine rings I < ", ring_is, &
           ", radial lines outside"
         if (sm_type >= 4 .and. axis_k > 0) write(*,'(A,I0,A)', advance="no") &
@@ -1549,7 +1574,10 @@ contains
         if (sm_type >= 4 .and. axis_k < 0) write(*,'(A,I0,A)', advance="no") &
           "[Physics PC]   GMG axis block = rings 0..I_s-1 of every level (fine: 0..", axis_lim(0), ")"
         if (axis_mult > 0) write(*,'(A,I0)', advance="no") ", axis/lines Gauss-Seidel mode ", axis_mult
-        if (sm_type == 6 .or. (sm_type >= 4 .and. axis_k /= 0)) write(*,*)
+        if (sm_type == 6 .or. sm_type == 8 .or. (sm_type >= 4 .and. axis_k /= 0)) write(*,*)
+        if (rich_from < nlev - 1 .and. sm_type /= 1 .and. sm_type /= 2) write(*,'(A,I0,A,I0,A,F5.2,A)') &
+          "[Physics PC]   GMG", cur_inst, ": Richardson smoothing on levels >= ", rich_from, &
+          " (scale ", rich_omega, ", no reductions)"
       endif
     end block
 
@@ -1679,6 +1707,37 @@ contains
     sig = [h1, h2]
     call MPI_Allreduce(MPI_IN_PLACE, sig, 2, MPI_INTEGER8, MPI_SUM, comm, mpierr)
   end function pattern_sig
+
+  !> Runtime overrides of the V-cycle shape for scaling experiments:
+  !! -sf_gmg_<name>, then -sf_gmg<k>_<name> for hierarchy instance k
+  !! (1 pair_w, 2 pair_psi, 3 rho, 4 T). Absent = v unchanged.
+  subroutine opt_int(name, v)
+    character(len=*), intent(in) :: name
+    integer, intent(inout) :: v
+    PetscInt :: pv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    character(len=64) :: nm
+    pv = v
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gmg_"//name, pv, set, ierr)
+    write(nm, '(A,I0,A,A)') "-sf_gmg", cur_inst, "_", name
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), pv, set, ierr)
+    v = int(pv)
+  end subroutine opt_int
+
+  subroutine opt_real(name, v)
+    character(len=*), intent(in) :: name
+    real*8, intent(inout) :: v
+    PetscReal :: pv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    character(len=64) :: nm
+    pv = v
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gmg_"//name, pv, set, ierr)
+    write(nm, '(A,I0,A,A)') "-sf_gmg", cur_inst, "_", name
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), pv, set, ierr)
+    v = pv
+  end subroutine opt_real
 
   !> Options prefix gmg<k>_<what>_ for a direct-solve KSP of hierarchy k, and
   !! MUMPS' centralized RHS under that prefix unless the user set it: PETSc's
@@ -1873,6 +1932,20 @@ contains
             key(r) = I
           endif
         endif
+        if (sm_type == 8) then
+          ! a ring is periodic in J: ordered 0, nc-1, 1, nc-2, ... its J +- 1
+          ! couplings, the wrap included, lie within two nodes -- a narrow band
+          ! instead of a dense block
+          if (I < ring_lim(g)) then
+            if (J < nc - J) then
+              key(r) = 2 * J
+            else
+              key(r) = 2 * (nc - 1 - J) + 1
+            endif
+          else
+            key(r) = I
+          endif
+        endif
         if (I <= axis_lim(g) .and. axis_k /= 0) key(r) = I * nc + J
       enddo
       ! compress to contiguous ids (the fine map leaves the axis nodes' slots unused)
@@ -1934,7 +2007,7 @@ contains
       B%axsparse = (axis_k /= 0)
       allocate(B%bcol(B%nb))
       B%bcol = 0
-      if (sm_type == 7) then
+      if (sm_type == 7 .or. sm_type == 8) then
         do bb = 1, B%nb
           r = B%rows(B%off(bb) + 1) + 1
           if (g == 0) then
@@ -1943,6 +2016,8 @@ contains
             I = glv(g)%rnode(r) / glv(g)%nj; J = mod(glv(g)%rnode(r), glv(g)%nj)
           endif
           if (I /= 0 .and. .not. B%axblk(bb)) B%bcol(bb) = mod(J, 2)
+          ! smoother 8: ring blocks alternate in I (zebra over rings)
+          if (sm_type == 8 .and. I < ring_lim(g) .and. .not. B%axblk(bb)) B%bcol(bb) = mod(I, 2)
         enddo
       endif
       if (B%axsparse) then
@@ -2210,7 +2285,7 @@ contains
       integer :: cb, pr, pc
       if (C < 0) return                           ! outside the rank's rows and ghosts
       cb = B%bid(C + 1)
-      if (sm_type == 7 .and. B%bcol(bb) == 1 .and. B%bcol(cb) == 0) then
+      if (sm_type >= 7 .and. B%bcol(bb) == 1 .and. B%bcol(cb) == 0) then
         if (pass == 1) then
           B%zp(R + 2) = B%zp(R + 2) + 1
         else
@@ -2380,6 +2455,7 @@ contains
       if (B%axblk(bb)) cycle
       call node_of(B%rows(B%off(bb) + 1) + 1, I, J, m)
       if (I <= ilim) cycle                           ! the per-slot I = 0 blocks
+      if (sm_type == 8 .and. I < ring_lim(g)) cycle  ! ring blocks: whole rings, on one rank
       Ia(bb) = I
       call node_of(B%rows(B%off(bb) + B%sz(bb)) + 1, I, J, m)
       Ib(bb) = I
@@ -2776,7 +2852,7 @@ contains
       blk_id = n_tor + (I - 1) * n_tor + m + 1
     else if (sm_type == 5 .or. sm_type == 7) then
       blk_id = n_tor + J * n_tor + m + 1
-    else if (sm_type == 6) then
+    else if (sm_type == 6 .or. sm_type == 8) then
       is_g = ring_lim(g)
       if (I < is_g) then
         blk_id = n_tor + (I - 1) * n_tor + m + 1
@@ -2822,7 +2898,7 @@ contains
     type(blk_t), pointer :: B
 
     B => gBk(cur_lev)
-    if (sm_type == 7) then
+    if (sm_type >= 7) then
       call zebra_solve(x, y)
     else if (.not. B%axsparse .or. axis_mult == 0) then
       ! axis first: it depends on x only, and the ranks enter here in step

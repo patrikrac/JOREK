@@ -5,7 +5,10 @@
 !! near the axis, where the circle couplings dominate. An element couples
 !! column J only to J +- 1, so the block is a periodic chain of columns plus a
 !! small BORDER: the axis value DOFs force_central_node shares between all J,
-!! which couple to every column.
+!! which couple to every column. An operator product reaches further (pair_w's
+!! Schur channel -Ltil Dh B_12 couples J +- 2 or 3 in the axis rings): the
+!! chain then has half-width w > 1, measured from the pattern, and every
+!! separator below is w columns wide instead of one.
 !!
 !! WHY. The sparse LU of rds_t solves the whole block on the ranks that own it
 !! (rank 0: the partition is ring by ring). Its size depends on n_tht only, so
@@ -13,7 +16,7 @@
 !!
 !! THE METHOD: one level of nested dissection in J (the partitioned solvers of
 !! Wang, ACM TOMS 7 (1981), and SPIKE). nsec sector ranks each take a
-!! contiguous range of columns; one column between neighbouring sectors is a
+!! contiguous range of columns; w columns between neighbouring sectors are a
 !! separator S_s, the border is B. Ordering interiors I_s first,
 !!   A = [ A_II  A_IG ]   (A_II block-diagonal over sectors),
 !!       [ A_GI  A_GG ]   G = S_0 .. S_nsec-1, B,
@@ -87,26 +90,26 @@ contains
   !! n_tht of the level; nsec from axd_nsec. Leaves D%on = .false. (the same
   !! on every rank) if the block is not a chain the method applies to.
   !--------------------------------------------------------------------
-  subroutine axd_setup(D, A, loc, jl, nj, nsec, comm, tag)
+  subroutine axd_setup(D, A, loc, jl, nj, nsec_req, comm, tag)
     type(axd_t), intent(inout) :: D
     Mat, intent(in)      :: A
-    integer, intent(in)  :: loc(:), jl(:), nj, nsec, comm
+    integer, intent(in)  :: loc(:), jl(:), nj, nsec_req, comm
     character(len=*), intent(in) :: tag
     PetscInt :: rst, ren, ncols, nn
     PetscInt, pointer :: cols(:)
     PetscInt, parameter :: izero = 0, four = 4
     PetscErrorCode :: ierr
-    integer :: me, np, mpierr, nl, ntot, k, q, c, s, nd, j, color, t
+    integer, parameter :: WMAX = 3         !< widest chain the separators handle
+    integer :: me, np, mpierr, nl, ntot, k, q, c, s, nd, j, color, t, nsec, w, thr
     integer, allocatable :: cnts(:), dsps(:), gall(:), jall(:), ball(:), bmine(:), seen(:)
     integer, allocatable :: cls(:), csec(:), rid(:), jsep(:), nnz(:)
     PetscInt, allocatable :: li(:), lg(:), lo(:)
-    logical :: ok
     Vec :: tmpl
 
     D%on = .false.
     call MPI_Comm_rank(comm, me, mpierr)
     call MPI_Comm_size(comm, np, mpierr)
-    if (nsec < 2) return
+    if (nsec_req < 2) return
     call MatGetOwnershipRange(A, rst, ren, ierr)
 
     ! all rows of the block with their column, on every rank
@@ -121,10 +124,13 @@ contains
     allocate(gall(ntot), jall(ntot), ball(ntot), bmine(nl))
     call MPI_Allgatherv(int(rst) + loc, nl, MPI_INTEGER, gall, cnts, dsps(0:np - 1), MPI_INTEGER, comm, mpierr)
     call MPI_Allgatherv(jl, nl, MPI_INTEGER, jall, cnts, dsps(0:np - 1), MPI_INTEGER, comm, mpierr)
-    ! border rows: couple to more than four distinct columns (a chain row
-    ! couples to J-1, J, J+1 and to the border rows, which all report one J)
+    ! border rows: couple to more than 2 WMAX + 2 distinct columns (a chain
+    ! row of half-width w couples to J-w .. J+w and to the border rows, which
+    ! all report one J; the border couples to every column). On a short
+    ! ring the threshold drops to nj - 1, which keeps the w = 1 classification
     allocate(seen(0:nj - 1))
     seen = -1
+    thr = max(4, min(2 * WMAX + 2, nj - 1))
     do q = 1, nl
       nd = 0
       call MatGetRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
@@ -136,11 +142,39 @@ contains
         endif
       enddo
       call MatRestoreRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
-      bmine(q) = merge(1, 0, nd > 4)
+      bmine(q) = merge(1, 0, nd > thr)
     enddo
     call MPI_Allgatherv(bmine, nl, MPI_INTEGER, ball, cnts, dsps(0:np - 1), MPI_INTEGER, comm, mpierr)
 
-    ! classes: 0 interior, 1 separator, 2 border; csec = the sector
+    ! the chain's half-width w: the widest chain-chain coupling, measured on
+    ! the owners. 1 for an element operator; an operator product reaches
+    ! further (pair_w's Schur channel -Ltil Dh B_12 in the axis rings)
+    w = 0
+    do q = 1, nl
+      k = dsps(me) + q
+      if (ball(k) == 1) cycle
+      call MatGetRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      do c = 1, int(ncols)
+        t = find(gall, int(cols(c)))
+        if (t == 0) cycle
+        if (ball(t) == 1) cycle
+        w = max(w, min(abs(jall(t) - jall(k)), nj - abs(jall(t) - jall(k))))
+      enddo
+      call MatRestoreRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+    enddo
+    call MPI_Allreduce(MPI_IN_PLACE, w, 1, MPI_INTEGER, MPI_MAX, comm, mpierr)
+    w = max(w, 1)
+    if (w > WMAX) then
+      if (me == 0) write(*,'(A,A,A,I0,A)') "[Physics PC]   GMG ", tag, &
+        ": not a chain of columns (half-width ", w, "), no sector solve"
+      return
+    endif
+    ! a sector keeps a separator of w columns and at least w + 2 interior
+    ! ones, so its interior couples only to its own two separators
+    nsec = min(nsec_req, nj / (2 * w + 2))
+    if (nsec < 2) return
+
+    ! classes: 0 interior, 1 separator (w columns), 2 border; csec = the sector
     allocate(jsep(0:nsec), cls(ntot), csec(ntot))
     do s = 0, nsec
       jsep(s) = (s * nj) / nsec
@@ -152,36 +186,15 @@ contains
       endif
       j = jall(k)
       do s = 0, nsec - 1
-        if (j == jsep(s)) then
+        if (j >= jsep(s) .and. j < jsep(s) + w) then
           cls(k) = 1; csec(k) = s
           exit
-        else if (j > jsep(s) .and. j < jsep(s + 1)) then
+        else if (j >= jsep(s) + w .and. j < jsep(s + 1)) then
           cls(k) = 0; csec(k) = s
           exit
         endif
       enddo
     enddo
-    ! a chain-chain coupling across more than one column would break the
-    ! dissection: check on the owners
-    ok = .true.
-    do q = 1, nl
-      k = dsps(me) + q
-      if (cls(k) == 2) cycle
-      call MatGetRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
-      do c = 1, int(ncols)
-        t = find(gall, int(cols(c)))
-        if (t == 0) cycle
-        if (cls(t) == 2) cycle
-        if (min(abs(jall(t) - jall(k)), nj - abs(jall(t) - jall(k))) > 1) ok = .false.
-      enddo
-      call MatRestoreRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
-    enddo
-    call MPI_Allreduce(MPI_IN_PLACE, ok, 1, MPI_LOGICAL, MPI_LAND, comm, mpierr)
-    if (.not. ok) then
-      if (me == 0) write(*,'(A,A,A)') "[Physics PC]   GMG ", tag, &
-        ": not a chain of columns, no sector solve"
-      return
-    endif
 
     ! the reduced system: S_0 .. S_nsec-1, then B, each ascending
     allocate(rid(ntot))
@@ -289,8 +302,9 @@ contains
     call MatCreateSubMatrices(A, four, [D%isI, D%isI, D%isG, D%isG], &
                               [D%isI, D%isG, D%isI, D%isG], MAT_INITIAL_MATRIX, D%sub, ierr)
     D%on = .true.
-    if (me == 0) write(*,'(A,A,A,I0,A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG ", tag, ": ", nsec, &
-      " J-sectors (", ntot, " rows, reduced system ", D%nred, ", ", count(cls == 2), " shared rows)"
+    if (me == 0) write(*,'(A,A,A,I0,A,I0,A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG ", tag, ": ", nsec, &
+      " J-sectors (", ntot, " rows, reduced system ", D%nred, ", ", count(cls == 2), &
+      " shared rows, separators ", w, " column(s))"
 
   contains
 
