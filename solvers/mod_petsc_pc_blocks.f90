@@ -24,8 +24,8 @@ module mod_petsc_pc_blocks
   public :: create_variable_index_sets
   public :: extract_sub_block
   public :: extract_sub_block_h, extract_sub_blocks_h
-  public :: pack_pair_aij
-  public :: make_pair_block_scale
+  public :: pack_pair_aij, pack_blocks_aij
+  public :: make_pair_block_scale, make_field_block_scale
   public :: report_operator_density
   public :: split_vars, merge_vars
 
@@ -380,10 +380,25 @@ contains
 
   !--------------------------------------------------------------------
   !> C = [[A11, A12], [A21, A22]] as one MPIAIJ in the packed layout of
-  !! MatConvert(MatNest -> MPIAIJ): rank r owns [its field-1 rows | its field-2
-  !! rows], and a field-j column c owned by rank p sits at packed column
-  !! c + rg2(p) (field 1) or c + rg1(p+1) (field 2), rg = the fields'
-  !! ownership starts. Replaces that MatConvert, whose parallel path
+  !! MatConvert(MatNest -> MPIAIJ); pack_blocks_aij with two fields.
+  !--------------------------------------------------------------------
+  subroutine pack_pair_aij(A11, A12, A21, A22, C, ready, comm)
+    Mat, intent(in)        :: A11, A12, A21, A22
+    Mat, intent(inout)     :: C
+    logical, intent(inout) :: ready
+    integer, intent(in)    :: comm
+    Mat :: blk(2, 2)
+    blk(1, 1) = A11; blk(1, 2) = A12; blk(2, 1) = A21; blk(2, 2) = A22
+    call pack_blocks_aij(blk, reshape([.true., .true., .true., .true.], [2, 2]), C, ready, comm)
+  end subroutine pack_pair_aij
+
+  !--------------------------------------------------------------------
+  !> C = [A_fg], f, g = 1..nf, as one MPIAIJ in the packed layout of
+  !! MatConvert(MatNest -> MPIAIJ): rank r owns [its field-1 rows | ... | its
+  !! field-nf rows], and a field-g column c owned by rank p sits at packed
+  !! column c + sum_{h<g} rg_h(p+1) + sum_{h>g} rg_h(p), rg_h = field h's
+  !! ownership starts. Block (f, g) is read only where have(f, g); an absent
+  !! block is zero. Replaces that MatConvert, whose parallel path
   !! ISAllGathers every global column index onto every rank -- O(N) memory and
   !! traffic per rank, twice per PC rebuild.
   !!
@@ -392,34 +407,49 @@ contains
   !! place, so C keeps its identity across rebuilds and every consumer (the
   !! GMG's PtAP, the coarse/axis LUs, MUMPS) reuses its symbolic phase. The
   !! stored values and each row's column order are those of the MatConvert.
+  !! Field f's row and column layout is taken from its diagonal block
+  !! blk(f, f), which must therefore be present.
   !--------------------------------------------------------------------
-  subroutine pack_pair_aij(A11, A12, A21, A22, C, ready, comm)
-    Mat, intent(in)        :: A11, A12, A21, A22
+  subroutine pack_blocks_aij(blk, have, C, ready, comm)
+    Mat, intent(in)        :: blk(:, :)
+    logical, intent(in)    :: have(:, :)
     Mat, intent(inout)     :: C
     logical, intent(inout) :: ready
     integer, intent(in)    :: comm
     PetscErrorCode :: ierr
-    PetscInt :: s1, e1, s2, e2, n1, n2, ps, r, ncols, k, pr
+    PetscInt :: ps, r, ncols, k, pr, nloc, ng
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
-    PetscInt, allocatable :: dnz(:), onz(:), pc_(:)
-    integer, allocatable :: rg1(:), rg2(:)
-    integer :: np, me, mpierr, pass
+    PetscInt, allocatable :: dnz(:), onz(:), pc_(:), s(:), n(:)
+    integer, allocatable :: rg(:, :)
+    PetscInt, allocatable :: coff(:, :)   !< packed column offset of field g's columns on rank p
+    integer :: np, me, mpierr, pass, nf, f, g, p
 
+    nf = size(blk, 1)
     call MPI_Comm_size(comm, np, mpierr)
     call MPI_Comm_rank(comm, me, mpierr)
-    call MatGetOwnershipRange(A11, s1, e1, ierr)
-    call MatGetOwnershipRange(A22, s2, e2, ierr)
-    n1 = e1 - s1; n2 = e2 - s2
-    allocate(rg1(0:np), rg2(0:np))
-    call MPI_Allgather(int(s1), 1, MPI_INTEGER, rg1, 1, MPI_INTEGER, comm, mpierr)
-    call MPI_Allgather(int(s2), 1, MPI_INTEGER, rg2, 1, MPI_INTEGER, comm, mpierr)
-    call MatGetSize(A11, k, PETSC_NULL_INTEGER, ierr); rg1(np) = int(k)
-    call MatGetSize(A22, k, PETSC_NULL_INTEGER, ierr); rg2(np) = int(k)
-    ps = s1 + s2                                    ! first packed row of this rank
+    allocate(s(nf), n(nf), rg(0:np, nf), coff(0:np - 1, nf))
+    do f = 1, nf
+      call MatGetOwnershipRange(blk(f, f), s(f), k, ierr)
+      n(f) = k - s(f)
+      call MPI_Allgather(int(s(f)), 1, MPI_INTEGER, rg(0:np - 1, f), 1, MPI_INTEGER, comm, mpierr)
+      call MatGetSize(blk(f, f), k, PETSC_NULL_INTEGER, ierr); rg(np, f) = int(k)
+    enddo
+    do p = 0, np - 1
+      do g = 1, nf
+        coff(p, g) = 0
+        do f = 1, nf
+          if (f < g) coff(p, g) = coff(p, g) + rg(p + 1, f)
+          if (f > g) coff(p, g) = coff(p, g) + rg(p, f)
+        enddo
+      enddo
+    enddo
+    ps   = sum(s)                                   ! first packed row of this rank
+    nloc = sum(n)
+    ng   = sum(rg(np, :))
 
     if (.not. ready) then
-      allocate(dnz(n1 + n2), onz(n1 + n2))
+      allocate(dnz(nloc), onz(nloc))
       dnz = 0; onz = 0
     else
       call MatZeroEntries(C, ierr)
@@ -427,22 +457,22 @@ contains
     allocate(pc_(64))
     ! pass 1 counts (first call only), pass 2 inserts
     do pass = merge(2, 1, ready), 2
-      do r = 0, n1 - 1
-        pr = ps + r
-        call put_row(A11, s1 + r, 1, pr, pass)
-        call put_row(A12, s1 + r, 2, pr, pass)
-      enddo
-      do r = 0, n2 - 1
-        pr = ps + n1 + r
-        call put_row(A21, s2 + r, 1, pr, pass)
-        call put_row(A22, s2 + r, 2, pr, pass)
+      pr = ps
+      do f = 1, nf
+        do r = 0, n(f) - 1
+          do g = 1, nf
+            if (have(f, g)) call put_row(blk(f, g), s(f) + r, g, pr, pass)
+          enddo
+          pr = pr + 1
+        enddo
       enddo
       if (pass == 1) then
         call MatCreate(comm, C, ierr)
-        call MatSetSizes(C, n1 + n2, n1 + n2, int(rg1(np) + rg2(np), kind(n1)), &
-                         int(rg1(np) + rg2(np), kind(n1)), ierr)
+        call MatSetSizes(C, nloc, nloc, ng, ng, ierr)
         call MatSetType(C, MATMPIAIJ, ierr)
         call MatMPIAIJSetPreallocation(C, PETSC_DEFAULT_INTEGER, dnz, PETSC_DEFAULT_INTEGER, onz, ierr)
+        ! every packed row is the rank's own: assembly skips the stash exchange
+        call MatSetOption(C, MAT_NO_OFF_PROC_ENTRIES, PETSC_TRUE, ierr)
         deallocate(dnz, onz)
       endif
     enddo
@@ -450,7 +480,7 @@ contains
     call MatAssemblyEnd(C, MAT_FINAL_ASSEMBLY, ierr)
     if (.not. ready) call MatSetOption(C, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
     ready = .true.
-    deallocate(rg1, rg2, pc_)
+    deallocate(s, n, rg, coff, pc_)
 
   contains
 
@@ -461,25 +491,20 @@ contains
       PetscInt, intent(in) :: row, prow
       integer, intent(in)  :: fc, pass_
       PetscInt :: q, cg
-      integer :: p
+      integer :: p_
       call MatGetRow(Ab, row, ncols, cols, vals, ierr)
       if (ncols > size(pc_)) then
         deallocate(pc_); allocate(pc_(2 * ncols))
       endif
-      p = me
+      p_ = me
       do q = 1, ncols
         cg = cols(q)
-        if (fc == 1) then
-          if (cg < rg1(p) .or. cg >= rg1(p + 1)) p = owner(rg1, int(cg))
-          pc_(q) = cg + rg2(p)
-        else
-          if (cg < rg2(p) .or. cg >= rg2(p + 1)) p = owner(rg2, int(cg))
-          pc_(q) = cg + rg1(p + 1)
-        endif
+        if (cg < rg(p_, fc) .or. cg >= rg(p_ + 1, fc)) p_ = owner(rg(:, fc), int(cg))
+        pc_(q) = cg + coff(p_, fc)
       enddo
       if (pass_ == 1) then
         do q = 1, ncols
-          if (pc_(q) >= ps .and. pc_(q) < ps + n1 + n2) then
+          if (pc_(q) >= ps .and. pc_(q) < ps + nloc) then
             dnz(prow - ps + 1) = dnz(prow - ps + 1) + 1
           else
             onz(prow - ps + 1) = onz(prow - ps + 1) + 1
@@ -491,14 +516,14 @@ contains
       call MatRestoreRow(Ab, row, ncols, cols, vals, ierr)
     end subroutine put_row
 
-    !> Rank owning index ix of a field with ownership starts rg(0:np).
-    integer function owner(rg, ix)
-      integer, intent(in) :: rg(0:), ix
+    !> Rank owning index ix of a field with ownership starts rg_(0:np).
+    integer function owner(rg_, ix)
+      integer, intent(in) :: rg_(0:), ix
       integer :: lo, hi, mid
       lo = 0; hi = np - 1
       do while (lo < hi)
         mid = (lo + hi + 1) / 2
-        if (rg(mid) <= ix) then
+        if (rg_(mid) <= ix) then
           lo = mid
         else
           hi = mid - 1
@@ -507,7 +532,7 @@ contains
       owner = lo
     end function owner
 
-  end subroutine pack_pair_aij
+  end subroutine pack_blocks_aij
 
   !--------------------------------------------------------------------
   !> Workstream B, Step 2: symmetric BLOCK scaling of a packed 2-field pair.
@@ -559,57 +584,72 @@ contains
     integer, intent(in)          :: comm
     integer, intent(in)          :: my_id
     character(len=*), intent(in) :: label
+    PetscInt :: rstart, rend
+    PetscErrorCode :: ierr
+    call MatGetOwnershipRange(A, rstart, rend, ierr)
+    call make_field_block_scale(A, [n1_loc, rend - rstart - n1_loc], dvec, comm, my_id, label)
+  end subroutine make_pair_block_scale
+
+  !--------------------------------------------------------------------
+  !> make_pair_block_scale for nf packed fields: D = diag(I, s_2 I, ..., s_nf I),
+  !! s_f = sqrt(mean|diag| of field 1 / mean|diag| of field f).
+  !--------------------------------------------------------------------
+  subroutine make_field_block_scale(A, nloc, dvec, comm, my_id, label)
+    Mat, intent(inout)           :: A
+    PetscInt, intent(in)         :: nloc(:)  !< LOCAL rows of each field, in pack order
+    Vec, intent(inout)           :: dvec     !< out: D, kept for the apply
+    integer, intent(in)          :: comm
+    integer, intent(in)          :: my_id
+    character(len=*), intent(in) :: label
 
     PetscErrorCode :: ierr
-    PetscInt  :: rstart, rend, ii
-    integer   :: kk, mpierr
+    integer   :: kk, f, nf, mpierr
     PetscScalar, pointer :: dptr(:)
-    real*8    :: acc(4), m1, m2, s
+    real*8, allocatable :: acc(:), m(:), sc(:)
+    integer, allocatable :: fld(:)
     PetscReal :: dmin, dmax
     Vec       :: chk
+    character(len=256) :: ss, sm
+    character(len=16)  :: t1
+
+    nf = size(nloc)
+    allocate(acc(2 * nf), m(nf), sc(nf), fld(sum(nloc)))
+    kk = 0
+    do f = 1, nf
+      fld(kk + 1:kk + nloc(f)) = f
+      kk = kk + int(nloc(f))
+    enddo
 
     call MatCreateVecs(A, dvec, PETSC_NULL_VEC, ierr)
     call MatGetDiagonal(A, dvec, ierr)
-    call MatGetOwnershipRange(A, rstart, rend, ierr)
 
     !--- mean |diag| of each field, over owned rows, then reduced.
     acc = 0.d0
     call VecGetArray(dvec, dptr, ierr)
-    do kk = 1, int(rend - rstart)
-      if (kk <= n1_loc) then
-        acc(1) = acc(1) + abs(dptr(kk))
-        acc(3) = acc(3) + 1.d0
-      else
-        acc(2) = acc(2) + abs(dptr(kk))
-        acc(4) = acc(4) + 1.d0
-      endif
+    do kk = 1, size(fld)
+      acc(fld(kk))      = acc(fld(kk)) + abs(dptr(kk))
+      acc(nf + fld(kk)) = acc(nf + fld(kk)) + 1.d0
     enddo
     call VecRestoreArray(dvec, dptr, ierr)
-    call MPI_Allreduce(MPI_IN_PLACE, acc, 4, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
-
-    m1 = acc(1) / max(acc(3), 1.d0)
-    m2 = acc(2) / max(acc(4), 1.d0)
+    call MPI_Allreduce(MPI_IN_PLACE, acc, 2 * nf, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+    m = acc(1:nf) / max(acc(nf + 1:2 * nf), 1.d0)
 
     ! Fall back to the identity rather than guessing. A zero mean means the block
     ! is not the shape this routine assumes, and a silently wrong scaling would be
     ! indistinguishable from a bad preconditioner in every downstream number.
-    if (m1 > 0.d0 .and. m2 > 0.d0) then
-      s = sqrt(m1 / m2)
+    if (all(m > 0.d0)) then
+      sc = sqrt(m(1) / m)
     else
-      s = 1.d0
+      sc = 1.d0
       if (my_id == 0) write(*,'(A,A,A)') &
         "[Physics PC]   WARNING: ", trim(label), &
         " block scaling SKIPPED (a field has zero mean |diag|); D = I"
     endif
 
-    !--- D itself: 1 on the first field, s on the second.
+    !--- D itself: s_f on field f (s_1 = 1).
     call VecGetArray(dvec, dptr, ierr)
-    do kk = 1, int(rend - rstart)
-      if (kk <= n1_loc) then
-        dptr(kk) = 1.d0
-      else
-        dptr(kk) = s
-      endif
+    do kk = 1, size(fld)
+      dptr(kk) = sc(fld(kk))
     enddo
     call VecRestoreArray(dvec, dptr, ierr)
 
@@ -624,11 +664,22 @@ contains
     call VecMin(chk, PETSC_NULL_INTEGER, dmin, ierr)
     call VecDestroy(chk, ierr)
 
-    if (my_id == 0) write(*,'(A,A,A,ES11.4,A,ES11.4,A,ES11.4,A,ES11.4)') &
-      "[Physics PC]   ", trim(label), " block scale: s = ", s, &
-      ", mean|diag| ", m1, " / ", m2, " -> scaled |diag| spread = ", dmax/max(dmin, 1.d-300)
+    if (my_id == 0) then
+      ss = ""; sm = ""
+      do f = 1, nf
+        write(t1, '(ES11.4)') m(f)
+        sm = trim(sm)//merge("   ", " / ", f == 1)//t1
+        if (f > 1) then
+          write(t1, '(ES11.4)') sc(f)
+          ss = trim(ss)//merge("   ", " / ", f == 2)//t1
+        endif
+      enddo
+      write(*,'(A,A,A,A,A,A,A,ES11.4)') "[Physics PC]   ", trim(label), " block scale: s = ", &
+        trim(adjustl(ss)), ", mean|diag| ", trim(adjustl(sm)), " -> scaled |diag| spread = ", &
+        dmax / max(dmin, 1.d-300)
+    endif
 
-  end subroutine make_pair_block_scale
+  end subroutine make_field_block_scale
 
   !> v(k) = variable k of the full-system vector x (k = 1..6): local rows
   !! node*bs + (k-1)*n_tor + m -> node*n_tor + m, bs = n_var*n_tor, exactly the

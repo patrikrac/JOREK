@@ -680,7 +680,7 @@ subroutine preset_parameters
   physics_pc_force_operator  = 0            ! Workstream E: assemble the composed force operator W (0=off, 1=assemble+dump)
   physics_pc_suu_form        = 0            ! Workstream E: pair_w (1,1) block (0=triple product, 1=composed B_22 + W)
   physics_pc_sf              = .false.       ! Production SFM2 path (mod_petsc_pc_sf); ignores every research physics_pc_* flag
-  physics_pc_sf_suu          = "schur"       ! pair_w's S_uu: schur | w
+  physics_pc_sf_suu          = "schur"       ! pair_w's S_uu: schur | w | wj | wpj (+ gate ablations, phys_module)
   physics_pc_sf_pair_psi     = "gmg"         ! pair_psi backend: gmg | lu
   physics_pc_sf_pair_w       = "gmg"         ! pair_w backend: gmg | lu
   physics_pc_sf_rho          = "lu"          ! rho block backend: lu | gmg

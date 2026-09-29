@@ -61,6 +61,20 @@ module mod_petsc_pc_sf_solver
   !! outer count vary by +-10% between identical runs). Kept for uniformity.
   !! Not on rho / T (line Jacobi there; smoother 8: T 2.0 -> 8.8 V-cycles).
   integer, parameter, public :: SF_GMG_SMOOTHER_ZEBRA_RINGS = 8
+  !> Flux-surface ring blocks (all J at one I), block Jacobi inside the
+  !! level-0 GMRES smoothing: the mixed pair_w ("wj" / "wpj"). At large dt its
+  !! psi - u coupling (theta dt Bpar, first order) runs along the field lines,
+  !! i.e. around the rings, and must lie inside the blocks. 41x32, tstep 10,
+  !! pair_w to 1e-8 (harmonics paired): rings 9-11 FGMRES its and the LU's
+  !! outer count (6); zebra radial lines (smoother 8) and zebra over all rings
+  !! (8 with the switch ring moved out) both stall at a 1e-2 .. 3e-3 reduction.
+  integer, parameter, public :: SF_GMG_SMOOTHER_RINGS = 4
+  !> ... and a ring cut by a rank boundary is completed from the neighbours
+  !! (restricted additive Schwarz along J). 41x32 np 4, tstep 10: without it
+  !! pair_w hits its 30-its cap (three cut rings on level 0), with it 8-10
+  !! its to 1e-8 as at np 1. Depth 2 already fetches every cut ring whole
+  !! (7.4% ghost rows): the rings next to a cut one couple radially to all of it.
+  integer, parameter, public :: SF_GMG_RING_OVERLAP = 2
   integer, parameter, public :: SF_GMG_AXIS_RINGS = 3   !< rings folded into the axis block
   integer, parameter, public :: SF_GMG_NSMOOTH    = 0   !< 0 = the smoother's own default (4)
   !> Line smoothers across rank boundaries: each local radial-line segment is
@@ -104,13 +118,28 @@ module mod_petsc_pc_sf_solver
   !! sparse), 1 = jorek_blockmv_attach.c (OpenMP, reads each n_tor harmonic block's
   !! column indices once; exact, gated against MatMult on first attach).
   integer, parameter, public :: SF_BLOCKMV = 1
-  !--- the two pair_w operators (physics_pc_sf_suu) -------------------------
+  !--- the pair_w operators (physics_pc_sf_suu) -----------------------------
   !> "w": S_uu = B_22 + W, assembled; pair_w's GMG and Krylov both on it.
   !> "schur": S_uu = the psi-channel Schur complement, matrix-free
   !! (mod_petsc_pc_sf_pairw); its multigrid on B_22 + W with a Dh-channel
   !! fine level.
+  !> "wj", "wpj": pair_w MIXED, assembled (mod_petsc_pc_sf_mixed): W without
+  !! its bending term, and the psi channel back through explicit j ("wj":
+  !! (u, omega, j), psi eliminated by the lumped mass) or explicit psi and j
+  !! ("wpj": (u, omega, psi, j), the small-flow psi row).
   integer, parameter, public :: SF_SUU_W     = 1
   integer, parameter, public :: SF_SUU_SCHUR = 2
+  integer, parameter, public :: SF_SUU_WJ    = 3
+  integer, parameter, public :: SF_SUU_WPJ   = 4
+
+  !> physics_pc_sf_suu, parsed: the form and the variant of a mixed form
+  type, public :: suu_form_t
+    integer :: form = SF_SUU_SCHUR
+    logical :: diag_mass = .false.   !< wj_diag:  psi mass lumped to its diagonal, not node blocks
+    logical :: no_res    = .false.   !< wj_nores: no resistive psi response (B_31 D B_13 dropped)
+    logical :: flow      = .false.   !< wpj_flow: psi row B_11 (u0 advection kept), not opz M_psi
+    logical :: kink_disc = .false.   !< wj_kd:    kink discrete (-B_21 D B_12, -B_21 D B_13), not W's
+  end type suu_form_t
 
   !--- V-cycle shapes (gmg_opts_t pre0 / post0 / nsmooth_c) -----------------
   !> pair_psi: no level-0 pre-smoothing, 12 (schur) / 10 (w) post-smoothing
@@ -139,6 +168,40 @@ module mod_petsc_pc_sf_solver
   !! (rho / T keep radial lines V(4,4): V(0,4) / V(0,6) save ~1.5 s of 12
   !! but raise T's cycles 1.43 -> 2.28 / 1.84.)
   integer, parameter, public :: SF_W_PRE0 = 0, SF_W_POST0 = 6, SF_W_NSC = 0
+  !> The mixed pair_w ("wj" / "wpj"): its psi - u coupling carries theta dt
+  !! F0/R d_phi, first order, which maps a harmonic's cos slot to its sin slot
+  !! and outgrows the psi mass as dt grows. With one smoother block per slot
+  !! it sits outside every block: 41x32, tstep 1, pair_w stalls at a 1e-4
+  !! reduction after 150 FGMRES its with ANY smoother (zebra lines, rings,
+  !! GMRES coarse levels) and the outer iteration with it; with cos and sin in
+  !! one block it reaches 1e-8 in ~20 and the outer count is the LU's (3).
+  integer, parameter, public :: SF_GMG_HARM_PAIR_MIXED = 1
+  !> The mixed pair_w's hierarchy coarsens radially only (J kept) until the
+  !! median cell aspect r dtheta/dr is 2, then in both directions (-1 = that
+  !! count from the grid: 1 level at 41x32, aspect 3.75; 2 at 121x48 and
+  !! 161x64, 7.6). The ring blocks solve along theta but leave the radial
+  !! couplings, which dominate on these cells, to the coarse grid; a 2:1 grid
+  !! in both directions cannot take that error. Two-grid with an exact coarse
+  !! solve converged at the full V-cycle's rate (rho 0.46 vs 0.45), and no
+  !! smoothing change on the full-coarsening chain reached the 41x32 rate.
+  !! pair_w to 1e-8 (np 4, tstep 0.1 / 1 / 10), rho per cycle, s per decade:
+  !!   41x32:  full 0.112 (8-10 its), semi 0.043 (5-7 its)
+  !!   121x48: full 0.450 (20-26 its, 0.70 s), semi 1 level 0.124 (0.36 s),
+  !!           2 levels 0.045 (6-7 its, 0.29 s), all levels 0.045 (0.51 s)
+  !! (full coarsening, 121x48: GMRES or damping 0.7 on the coarse levels,
+  !! nsc 2 / 8, nlev 3 left rho at 0.45-0.47; post0 4 / 10: 0.62 / 0.30;
+  !! V(2,4) 0.59; zebra rings 0.33 at post0 6, 0.19 at post0 10, and with
+  !! semi-coarsening stalled at tstep 10.)
+  !! Production ramp (np 4, tstep 1e-3 .. 10), full -> semi (auto):
+  !!   81x32:  outer its 65 -> 53, pair_w V-cycles at tstep 1 / 10 3.5 / 4.5
+  !!           -> 2.0 / 2.0, KSPSolve 31.7 -> 20.4 s, wall 55.6 -> 48.4 s;
+  !!   121x48: 69 -> 55, 3.7 / 5.6 -> 2.0 / 2.0, but wall 144 -> 191 s: 120 =
+  !!           8*15 ends the radial coarsening at 16 surfaces, and the 16x24
+  !!           coarsest LU (17k rows) costs 39 s over 20 rebuilds. Meshes with
+  !!           n_flux - 1 = 5*2^k (the study's) end at 6x8.
+  !! (Richardson 8/9 on levels >= 1, predicted to fix the full chain, left
+  !! rho at 0.457.)
+  integer, parameter, public :: SF_GMG_SEMI_R_MIXED = -1
   !> Coarse levels (1 and below) smooth with Richardson on the same zebra /
   !! line blocks instead of GMRES: no norms or inner products, so no global
   !! reduction below level 0. GMRES there cost two allreduces over all ranks
@@ -183,9 +246,46 @@ module mod_petsc_pc_sf_solver
 
   public :: sf_solver_setup, sf_solver_apply, sf_solver_destroy
   public :: sf_solver_reset_counters, sf_solver_report
-  public :: sf_backend_name, sf_split_halves
+  public :: sf_backend_name, sf_split_halves, sf_split_parts
+  public :: sf_suu_parse, sf_force_terms
 
 contains
+
+  !> physics_pc_sf_suu -> form and variant; ok = .false. for an unknown string.
+  subroutine sf_suu_parse(str, f, ok)
+    character(len=*), intent(in)  :: str
+    type(suu_form_t), intent(out) :: f
+    logical, intent(out)          :: ok
+    ok = .true.
+    select case (trim(adjustl(str)))
+    case ("schur");    f%form = SF_SUU_SCHUR
+    case ("w");        f%form = SF_SUU_W
+    case ("wj");       f%form = SF_SUU_WJ
+    case ("wj_diag");  f%form = SF_SUU_WJ;  f%diag_mass = .true.
+    case ("wj_nores"); f%form = SF_SUU_WJ;  f%no_res = .true.
+    case ("wj_kd");    f%form = SF_SUU_WJ;  f%kink_disc = .true.
+    case ("wpj");      f%form = SF_SUU_WPJ
+    case ("wpj_flow"); f%form = SF_SUU_WPJ; f%flow = .true.
+    case default;      ok = .false.
+    end select
+  end subroutine sf_suu_parse
+
+  !> The W terms the SF path's pair_w needs (pc_elt_matrix_force_fft's
+  !! selection): the mixed forms carry the bending term (wj) or the whole psi
+  !! channel (wpj) through explicit fields, so W keeps only the rest. Every
+  !! other configuration assembles what physics_pc_force_operator says.
+  integer function sf_force_terms()
+    use phys_module, only: physics_pc_sf, physics_pc_sf_suu, physics_pc_force_operator
+    type(suu_form_t) :: f
+    logical :: ok
+    sf_force_terms = physics_pc_force_operator
+    if (.not. physics_pc_sf) return
+    call sf_suu_parse(physics_pc_sf_suu, f, ok)
+    if (.not. ok) return
+    if (f%form == SF_SUU_WJ)  sf_force_terms = 5      ! kink + curvature
+    if (f%kink_disc)          sf_force_terms = 6      ! curvature
+    if (f%form == SF_SUU_WPJ) sf_force_terms = 6      ! curvature
+  end function sf_force_terms
 
   !> Human-readable backend name, for the one setup line each block prints.
   function sf_backend_name(backend) result(s)
@@ -205,7 +305,8 @@ contains
   !--------------------------------------------------------------------
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
                              nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
-                             line_overlap, axis_sectors, rich_from)
+                             line_overlap, axis_sectors, rich_from, harm_pair, ring_overlap, &
+                             semi_r)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_opts_t
@@ -231,6 +332,9 @@ contains
     integer, intent(in), optional :: line_overlap, axis_sectors, rich_from  !< SF_GMG: per-block
                                               !< overrides of SF_GMG_LINE_OVERLAP, SF_GMG_AXIS_SECTORS,
                                               !< SF_GMG_RICH_FROM
+    integer, intent(in), optional :: harm_pair  !< SF_GMG: 1 = cos/sin slots share the smoother blocks
+    integer, intent(in), optional :: ring_overlap !< SF_GMG: ring blocks cut by a rank boundary, extended
+    integer, intent(in), optional :: semi_r     !< SF_GMG: radial-only coarse levels (gmg_opts_t)
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -293,6 +397,9 @@ contains
       if (present(line_overlap)) o%line_overlap = line_overlap
       if (present(axis_sectors)) o%axis_sectors = axis_sectors
       if (present(rich_from))    o%rich_from    = rich_from
+      if (present(harm_pair))    o%harm_pair    = harm_pair
+      if (present(ring_overlap)) o%ring_overlap = ring_overlap
+      if (present(semi_r))       o%semi_r       = semi_r
 
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)
@@ -326,6 +433,10 @@ contains
           call KSPSetType(slv%ksp, KSPFGMRES, ierr)
           call KSPGMRESSetRestart(slv%ksp, max(int(mx), 2), ierr)
           call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, mx, ierr)
+          ! -sf_gmg<k>_ksp_monitor etc.: this block's Krylov, for experiments
+          write(nm, '(A,I0,A)') "sf_gmg", slv%gmg_inst, "_"
+          call KSPSetOptionsPrefix(slv%ksp, trim(nm), ierr)
+          call KSPSetFromOptions(slv%ksp, ierr)
         end block
         call KSPGetPC(slv%ksp, pc, ierr)
         call PCSetType(pc, PCSHELL, ierr)
@@ -439,6 +550,50 @@ contains
       call VecRestoreArrayRead(p, pa, ierr)
     endif
   end subroutine sf_split_halves
+
+  !> sf_split_halves for any number of fields: p = [h(1) local | h(2) local | ...].
+  !! On the way out a part may be skipped (keep(k) = .false.).
+  subroutine sf_split_parts(p, h, to_p, keep)
+    Vec :: p
+    Vec :: h(:)
+    logical, intent(in) :: to_p
+    logical, intent(in), optional :: keep(:)
+    PetscScalar, pointer :: pa(:), a(:)
+    PetscErrorCode :: ierr
+    PetscInt :: n, o
+    integer :: k
+
+    if (to_p) then
+      call VecGetArray(p, pa, ierr)
+    else
+      call VecGetArrayRead(p, pa, ierr)
+    endif
+    o = 0
+    do k = 1, size(h)
+      call VecGetLocalSize(h(k), n, ierr)
+      if (to_p) then
+        call VecGetArrayRead(h(k), a, ierr)
+        pa(o + 1:o + n) = a(1:n)
+        call VecRestoreArrayRead(h(k), a, ierr)
+      else
+        if (present(keep)) then
+          if (.not. keep(k)) then
+            o = o + n
+            cycle
+          endif
+        endif
+        call VecGetArray(h(k), a, ierr)
+        a(1:n) = pa(o + 1:o + n)
+        call VecRestoreArray(h(k), a, ierr)
+      endif
+      o = o + n
+    enddo
+    if (to_p) then
+      call VecRestoreArray(p, pa, ierr)
+    else
+      call VecRestoreArrayRead(p, pa, ierr)
+    endif
+  end subroutine sf_split_parts
 
 #endif
 end module mod_petsc_pc_sf_solver

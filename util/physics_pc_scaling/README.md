@@ -122,7 +122,7 @@ case the study does not cover (see `docs/physics_pc/workstream_D_matrix_free.md`
   tol·sqrt(|a_ii a_jj|) from the axis block before its LU: −47% factor entries
   and −23% `GMG_AxSolve` at 41×16, with unchanged counts.
 
-## The production SF path (`sf_gmg`, `sf_gmg_w`, `sf_lu`, `sf_lu_w`, `sf_jorek`, `sf_direct`)
+## The production SF path (`sf_gmg`, `sf_gmg_w`, `sf_gmg_wpj`, `sf_lu`, `sf_lu_w`, `sf_lu_wpj`, `sf_jorek`, `sf_direct`)
 
 The split-field preconditioner of `mod_petsc_pc_sf*` (workstream H) runs on the
 reference physics case `namelist/model199/inxflow_shaped_pcbench`, not on the
@@ -137,7 +137,8 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 |---|---|
 | `sf_gmg` | S_uu = `schur` (the default): every block on its C¹ GMG, pair_psi split (ψ, j) and pair_w on zebra lines, ρ / T on radial lines |
 | `sf_gmg_w` | the same with S_uu = `w`, B₂₂ + W assembled |
-| `sf_lu` / `sf_lu_w` | every block by MUMPS LU: the exact references, for approximation quality |
+| `sf_gmg_wpj` | the same with pair_w mixed (u, ω, ψ, j), ring smoother |
+| `sf_lu` / `sf_lu_w` / `sf_lu_wpj` | every block by MUMPS LU: the exact references, for approximation quality (`sf_lu_wj*`, `sf_lu_wpj_flow`: the gate's ablations; `sf_lugw_wpj`: LU except pair_w) |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
 | `sf_direct` | full-system direct solve: one MUMPS LU of the whole coupled Jacobian (`-jorek_pc_full_lu`, in-core), refactorised every step (`iter_precon = 0`); FGMRES only checks it |
 
@@ -152,6 +153,119 @@ that picks the method; the rest of the sweep is shared):
 - `w`: S_uu = B₂₂ + W, assembled. No mass inverse and no nested solve, so
   the cheapest per outer iteration, but W lacks the discrete M_j⁻¹ projection
   and the outer count grows with the mesh.
+- `wpj` / `wj` (mixed, `mod_petsc_pc_sf_mixed`): pair_w assembled with the
+  ψ channel back in explicit fields instead of composed into W. `wpj` packs
+  (u, ω, ψ, j) with the small-flow ψ row (opz M_ψ, B₁₂, B₁₃) and keeps only
+  W's curvature term; `wj` packs (u, ω, j) with ψ eliminated by the
+  node-lumped ψ mass and keeps W's kink and curvature. See below.
+
+**The mixed pair_w** (2026-09-29). W composes the ψ channel in the continuum,
+so it misses the M_ψ⁻¹ and M_j⁻¹ projections and the resistive damping of the
+ψ response, all growing with dt: `w` needs 37 its per step at tstep 1 and
+diverges at 10. Keeping ψ and j explicit restores all three with every block
+sparse and C¹-stencil (175 nnz/row, no products). Its multigrid needs two
+things the other pairs do not: the smoother blocks are flux-surface RINGS
+(`SF_GMG_SMOOTHER_RINGS`, block Jacobi in the level-0 GMRES), because at large
+dt the ψ–u coupling θdt·B∥ runs along the field lines; and a harmonic's cos
+and sin slots share each block (`SF_GMG_HARM_PAIR_MIXED`), because its
+toroidal part θdt F₀/R ∂φ maps cos to sin. Without the pairing pair_w stalls
+at a 1e-4 reduction at tstep 1 with any smoother; with radial or ring zebra
+it stalls at tstep 10.
+
+Outer its per step, np 1 × 4, ramp 1e-3 / 1e-2 / 1e-1 / 1 / 10 (2/2/3/3/3
+steps), pair_w V-cycles per solve in parentheses:
+
+| arm | mesh | tstep 1e-1 | tstep 1 | tstep 10 |
+|---|---|---|---|---|
+| `sf_lu` (schur, exact) | 41×32 | 4/3/3 | 6/6/7 | 15/13/12 |
+| `sf_lu_w` | 41×32 | 6/5/5 | 37/39/37 | diverges |
+| `sf_lu_wpj` | 41×32 | 2/2/2 | 3/3/4 | 6/6/6 |
+| `sf_gmg` (schur) | 41×32 | 4/4/4 | 7/7/7 (4.2) | 388/314/357 (30, capped) |
+| `sf_gmg_w` | 41×32 | 6/5/6 | 38/39/37 | diverges |
+| `sf_gmg_wpj` | 41×32 | 4/4/4 (1.3) | 4/5/4 (2.0) | 14/9/12 (2.1) |
+| `sf_lu` | 121×48 | 4/4/4 | 6/7/7 | 20/17/17 |
+| `sf_lu_wpj` | 121×48 | 2/2/3 | 3/3/4 | 6/6/6 |
+| `sf_gmg_wpj` | 121×48 | 4/4/5 (2.6) | 5/5/5 (3.7) | 9/18/10 (5.0) |
+
+- `wpj` beats the exact schur arm because it keeps W's curvature term, a
+  pressure channel the schur arm does not have (2–3× at tstep 10).
+- The whole 41×32 ramp: `sf_gmg_wpj` 41.5 s, `sf_gmg` 2198 s (its tstep 10).
+- With full 2:1 coarsening pair_w's V-cycles grow with the mesh (2.0 → 3.7
+  at tstep 1; to 1e-8: 8–10 → 20–29 FGMRES its): ring blocks leave the
+  radial coupling to the coarse grid. Alternating rings with radial-line
+  blocks (smoother 9, multiplicative) is WORSE (121×48: no convergence at
+  tstep 1): at large dt radial-line Jacobi amplifies the poloidal ψ–u
+  coupling instead of smoothing it. The fix is radial semi-coarsening, below.
+- np > 1: JOREK partitions ring by ring, so a rank boundary cuts some rings
+  (3 on level 0 at 41×32 np 4); cut ring blocks lose the poloidal coupling
+  and pair_w hits its cap at tstep 10. `SF_GMG_RING_OVERLAP` completes a cut
+  ring from the neighbours (restricted additive Schwarz along J, 7.4% ghost
+  rows): back to the np 1 counts (8–10 its to 1e-8). The walk runs until
+  every ring is whole, on every level (coarse rings lie 2^g fine rings apart,
+  so their owners rarely hold a whole neighbouring ring); a ring still cut
+  prints a `GMG WARNING`.
+- The rings are ordered 0, nc−1, 1, nc−2, … so the periodic wrap stays in a
+  narrow band: 121×48 np 4, `GMG_Lines` 103 → 20 s. Completed rings keep
+  that order (ghosts sorted in with the own rows); before, every cut ring was
+  factored dense (at 321×128, 4096 rows per cos/sin block).
+
+np 4 × 1, outer its per step (pair_w V-cycles), wall s:
+
+| arm | mesh | tstep 1 | tstep 10 | wall, ramp to tstep 1 |
+|---|---|---|---|---|
+| `sf_gmg_wpj` | 41×32 | 4/4/4 (2.0) | 9/9/14 (2.2) | |
+| `sf_gmg_wpj` | 121×48 | 6/5/5 (3.7) | 11/14/8 (5.2) | 107.9 |
+| `sf_gmg` (schur) | 121×48 | 7/7/7 (4.1) | | 85.5 |
+| `sf_gmg_w` | 121×48 | 56/58/55 | | 115.2 |
+
+**The mixed pair_w's V-cycle: radial semi-coarsening** (`SF_GMG_SEMI_R_MIXED`,
+`-sf_gmg1_semi_r k`). On these grids the cells are long in θ (median
+r·dθ/dr 3.75 at 41×32, 7.6 at 81×32, 121×48 and 161×64), so the elliptic
+couplings are strongest radially; the ring blocks do not smooth them and a
+2:1 grid in both directions cannot take what they leave. The first levels
+therefore coarsen in I only (J kept), until the median aspect is 2 (−1 =
+that count from the grid: 1 level at 41×32, 2 at 81×32 – 161×64); line
+relaxation with semi-coarsening across the lines is the standard robust
+pairing (Schaffer; Trottenberg et al. §5.1). Semi-coarsened hierarchies may
+use up to 8 levels (full ones keep 6, as all tuned arms ran).
+
+pair_w to 1e-8, np 4, tstep 0.1 / 1 / 10 (`diag` runs): ρ per V-cycle, V-cycle
+seconds per decade of reduction.
+
+| 121×48 | ρ | s/decade |
+|---|---|---|
+| full coarsening, V(0,6), rings (was the default) | 0.450 | 0.70 |
+| GMRES / damping 0.7 / 8⁄9 on levels ≥ 1, nsc 2 / 8, nlev 3 | 0.45–0.47 | 0.64–0.89 |
+| two-grid, exact coarse solve (nlev 2) | 0.461 | – |
+| V(0,4) / V(0,10) / V(2,4) | 0.62 / 0.30 / 0.59 | 0.90 / 0.66 / 1.16 |
+| zebra rings, V(0,6) / V(0,10) | 0.33 / 0.19 | 0.54 / 0.57 |
+| semi-coarsening, 1 radial level | 0.124 | 0.36 |
+| **semi-coarsening, 2 radial levels (auto)** | **0.045** | **0.25** |
+
+The two-grid cycle converging at the V-cycle's rate is the diagnosis: the
+coarse-level smoothing is irrelevant, the fine smoother and the coarse space
+do not fit. At 41×32: full 0.112, auto (1 level) 0.043; 161×64 full 0.51.
+Semi-coarsening with zebra rings stalled at tstep 10 (np 4; smoother 8 has no
+ring completion). np 8 gives the np 4 rates at both meshes.
+
+Production ramp, np 4 × 1 (outer its per step, pair_w V-cycles):
+
+| mesh | cycle | tstep 1e-1 | tstep 1 | tstep 10 | outer its | KSPSolve | wall s |
+|---|---|---|---|---|---|---|---|
+| 81×32 | full | 4/4/4 (2.7) | 5/5/5 (3.5) | 8/8/9 (4.5) | 65 | 31.7 | 55.6 |
+| 81×32 | auto (2) | 3/3/3 (1.3) | 4/4/4 (2.0) | 7/7/7 (2.0) | 53 | 20.4 | 48.4 |
+| 121×48 | full | 4/4/5 (2.6) | 6/5/5 (3.7) | 9/10/8 (5.6) | 69 | 88.5 | 144.4 |
+| 121×48 | auto (2) | 3/3/3 (1.4) | 5/5/5 (2.0) | 7/7/7 (2.0) | 55 | 85.0 | 191.3 |
+
+121×48 is a poor mesh for this hierarchy: 120 = 8·15 stops the radial
+coarsening at 16 surfaces, leaving a 16×24 coarsest level (17k rows, LU
+factorised at each of the 20 rebuilds: 39 s). The study meshes have n_flux −
+1 = 5·2^k and end at 6×8 (1.9k rows at 81×32).
+- `wpj_flow` (ψ row B₁₁) is identical to `wpj` on this case: in its linear
+  phase B₁₁ = opz M_ψ to 5 digits, so the small-flow assumption is untested.
+- The (u, ω, j) forms, i.e. parabolized with ψ eliminated by the lumped mass,
+  are limited by that lumping (κ ≈ 58 for bicubic Hermite): `sf_lu_wj_kd`
+  12–17 its at tstep 1; with W's continuum kink (`wj`) they diverge at 10.
 
 Both pairs run asymmetric V-cycles, all level-0 smoothing after the coarse
 correction (`SF_PJ_*`, `SF_W_*` in `mod_petsc_pc_sf_solver.f90`): pair_psi

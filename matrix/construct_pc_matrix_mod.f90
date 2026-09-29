@@ -1111,7 +1111,7 @@ end subroutine construct_reduced_pde_matrix
 !! needs mhd_sim for the same reason (the operator is built on the linearisation
 !! state, not on the Jacobian).
 !--------------------------------------------------------------------
-subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, mhd_sim, W_force)
+subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, mhd_sim, W_force, terms)
 
   use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_force_fft
   use mod_parameters,  only: n_tor, n_degrees, n_vertex_max, var_u
@@ -1131,6 +1131,8 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
 #ifdef USE_PETSC
   Mat, intent(inout) :: W_force
 #endif
+  !> term selection (pc_elt_matrix_force_fft); absent = physics_pc_force_operator's
+  integer, intent(in), optional :: terms
 
   integer :: my_ind_min, my_ind_max
 
@@ -1230,7 +1232,7 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
     call pc_elt_matrix_force_fft(element_thr(omp_tid), nodes_thr(:,omp_tid), &
                                  xpoint2, xcase2, R_axis, Z_axis,           &
                                  psi_axis, psi_bnd, R_xpoint, Z_xpoint,     &
-                                 ELM_thr(:,:,omp_tid))
+                                 ELM_thr(:,:,omp_tid), terms)
 
 #ifdef USE_PETSC
     do i = 1, n_vertex_max

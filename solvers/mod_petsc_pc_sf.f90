@@ -7,11 +7,12 @@ module mod_petsc_pc_sf
        pcev_extract, pcev_convert, pcev_build_suu, pcev_fact_pj, pcev_fact_w, &
        pcev_fact_rhot, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, pcev_apply
   use mod_petsc_pc_blocks, only: create_variable_index_sets, extract_sub_blocks_h, &
-       pack_pair_aij, make_pair_block_scale, report_operator_density, &
+       pack_pair_aij, make_pair_block_scale, make_field_block_scale, report_operator_density, &
        split_vars, merge_vars
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather
   use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_dh, sfw_lines
+  use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf
   use mod_petsc_raw_csr, only: blockmv_attach
   implicit none
   private
@@ -62,6 +63,21 @@ module mod_petsc_pc_sf
   !! mass. Outer count flat in the mesh (21/20/19/21/22 over 41x32 .. 161x64,
   !! np 4, against 112 .. 201 for "w"); at 161x64 ~148 s against ~250 s.
   !!
+  !! "wj" / "wpj": pair_w MIXED, assembled (mod_petsc_pc_sf_mixed). W with
+  !! its bending term ("wj") or its whole psi channel ("wpj") taken back out,
+  !! and the channel put back through explicit fields, the way pair_psi keeps
+  !! j explicit: (u, omega, j) with psi eliminated by the node-lumped psi mass,
+  !! or (u, omega, psi, j) with the small-flow psi row. Restores the discrete
+  !! projections and the resistive damping of the psi response that W lacks,
+  !! with every block sparse and every row second order. Its multigrid
+  !! smooths with flux-surface ring blocks, a harmonic's cos and sin slots in
+  !! one block (SF_GMG_SMOOTHER_RINGS, SF_GMG_HARM_PAIR_MIXED): at large dt
+  !! the psi - u coupling runs along the field lines, toroidally as well.
+  !! The rings leave the radial couplings, strongest on cells long in theta,
+  !! to the coarse grid, so its first levels coarsen radially only
+  !! (SF_GMG_SEMI_R_MIXED): pair_w then converges at the same rate from
+  !! 41x32 to 121x48 and from tstep 0.1 to 10 (rho 0.043-0.045 per cycle).
+  !!
   !! Both pairs smooth with zebra lines and run asymmetric V-cycles, all
   !! smoothing after the coarse correction (SF_PJ_*, SF_W_*): pair_psi
   !! converges in one cycle per solve, pair_w in ~1 (w) / ~4 (schur).
@@ -87,7 +103,9 @@ module mod_petsc_pc_sf
   !!
   !! Of the ~61 research physics_pc_* flags, this path READS exactly one --
   !! physics_pc_force_operator, which must be 1 because W is assembled at
-  !! element level -- and FORCES one, physics_pc_harm_split = 1, which the
+  !! element level (the mixed arms then assemble only W's terms they do not
+  !! carry through explicit fields: sf_force_terms) -- and FORCES one,
+  !! physics_pc_harm_split = 1, which the
   !! block extraction reads. Every other one is ignored: the GMG receives its
   !! whole configuration explicitly (gmg_opts_t, from the constants in
   !! mod_petsc_pc_sf_solver), so a production deck cannot inherit a research
@@ -115,11 +133,14 @@ module mod_petsc_pc_sf
   integer, save :: bk_pj = SF_GMG, bk_w = SF_GMG
   integer, save :: bk_rho = SF_LU, bk_T = SF_LU
   integer, save :: suu = SF_SUU_SCHUR          !< pair_w's S_uu (physics_pc_sf_suu)
+  type(suu_form_t), save :: sform              !< ... with its variant (the mixed forms)
+  logical, save :: mixed = .false.             !< pair_w mixed: "wj" / "wpj"
 
   !--- work state owned by this path --------------------------------------
   Vec, save :: sv_x(6), sv_y(6)
   Vec, save :: rhs_PJ, sol_PJ, rhs_W, sol_W
   Vec, save :: w3, w4, w5, t_rho, t_T
+  Vec, save :: zv                      !< mixed: a zero field (the psi / j right-hand sides)
   logical, save :: vecs_ready = .false.
   logical, save :: kpj_packed = .false., sw_packed = .false., pw0_packed = .false.
   Mat, save     :: pw0                 !< schur: pair_w without W, [[B_22, B_24], [B_42, B_44]]
@@ -151,12 +172,14 @@ contains
 
     if (sf_init_done) return
 
-    select case (trim(adjustl(physics_pc_sf_suu)))
-    case ("schur"); suu = SF_SUU_SCHUR
-    case ("w");     suu = SF_SUU_W
-    case default
-      call fatal("physics_pc_sf_suu must be schur | w, got '"//trim(physics_pc_sf_suu)//"'")
-    end select
+    block
+      logical :: ok
+      call sf_suu_parse(physics_pc_sf_suu, sform, ok)
+      if (.not. ok) call fatal("physics_pc_sf_suu must be schur | w | wj | wj_diag | wj_nores | wj_kd | "// &
+                               "wpj | wpj_flow, got '"//trim(physics_pc_sf_suu)//"'")
+    end block
+    suu   = sform%form
+    mixed = (suu == SF_SUU_WJ .or. suu == SF_SUU_WPJ)
     bk_pj  = backend_of(physics_pc_sf_pair_psi, "physics_pc_sf_pair_psi")
     bk_w   = backend_of(physics_pc_sf_pair_w, "physics_pc_sf_pair_w")
     bk_rho = backend_of(physics_pc_sf_rho,    "physics_pc_sf_rho")
@@ -172,11 +195,18 @@ contains
 
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] ================ production SFM2 path ================"
-      if (suu == SF_SUU_SCHUR) then
+      select case (suu)
+      case (SF_SUU_SCHUR)
         write(*,'(A)') "[Physics PC]   S_uu     : schur (psi-channel Schur complement, matrix-free; GMG chain on B_22 + W)"
-      else
+      case (SF_SUU_W)
         write(*,'(A)') "[Physics PC]   S_uu     : w (B_22 + W, assembled)"
-      endif
+      case (SF_SUU_WJ)
+        write(*,'(A,A,A)') "[Physics PC]   S_uu     : ", trim(physics_pc_sf_suu), &
+          " (pair_w mixed (u, omega, j): B_22 + W's kink and curvature, bending through j)"
+      case (SF_SUU_WPJ)
+        write(*,'(A,A,A)') "[Physics PC]   S_uu     : ", trim(physics_pc_sf_suu), &
+          " (pair_w mixed (u, omega, psi, j): B_22 + W's curvature, psi channel through psi, j)"
+      end select
       write(*,'(A,A)') "[Physics PC]   pair_psi : ", trim(physics_pc_sf_pair_psi)
       write(*,'(A,A)') "[Physics PC]   pair_w   : ", trim(physics_pc_sf_pair_w)
       write(*,'(A,A,A,A)') "[Physics PC]   rho / T  : ", trim(physics_pc_sf_rho), " / ", &
@@ -238,7 +268,7 @@ contains
     call sf_init(my_id)
     first = sf_first
     pj_post0 = SF_PJ_POST0_SCHUR
-    if (suu == SF_SUU_W) pj_post0 = SF_PJ_POST0_W
+    if (suu /= SF_SUU_SCHUR) pj_post0 = SF_PJ_POST0_W
     ! schur: pair_psi also runs nested inside pair_w's S_uu shell, one fixed
     ! cycle per matvec, so it keeps the stronger V-cycle (see SF_GMG_RICH_FROM)
     pj_ovl = SF_GMG_LINE_OVERLAP;  pj_rich = SF_GMG_RICH_FROM;  pj_sm = SF_GMG_SMOOTHER_ZEBRA_RINGS
@@ -258,6 +288,11 @@ contains
       call PetscLogEventBegin(pcev_extract, ierr)
       call sfg_gather(A_full, g_ctx%W_force, my_id)
       call PetscLogEventEnd(pcev_extract, ierr)
+      if (mixed) then
+        call PetscLogEventBegin(pcev_build_suu, ierr)
+        call sfm_refill(comm, my_id)
+        call PetscLogEventEnd(pcev_build_suu, ierr)
+      endif
     endif
     call physics_pc_mem("SF build: operators filled", my_id)
 
@@ -294,6 +329,8 @@ contains
         call make_pair_block_scale(g_ctx%S_W_aij, n1_loc, slv_w%dscale, comm, my_id, "pair_w")
       endif
       call MatDiagonalScale(pw0, slv_w%dscale, slv_w%dscale, ierr)
+    else if (mixed) then
+      call make_field_block_scale(sfm_op, spread(n1_loc, 1, sfm_nf), slv_w%dscale, comm, my_id, "pair_w")
     else
       call make_pair_block_scale(g_ctx%S_W_aij, n1_loc, slv_w%dscale, comm, my_id, "pair_w")
     endif
@@ -316,6 +353,13 @@ contains
                              comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
                              smoother=SF_GMG_SMOOTHER_ZEBRA, maxits=SF_GMG_MAXITS, Aop=sfw_shell)
       endif
+    else if (mixed) then
+      call sf_solver_setup(slv_w, sfm_op, bk_w, "pair_w KSP (mixed)", &
+                           comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=sfm_nf, &
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC, &
+                           harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
+                           semi_r=SF_GMG_SEMI_R_MIXED)
     else
       call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
                            comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
@@ -337,7 +381,11 @@ contains
     !--- work vectors: the operators keep their layout for the run.
     if (.not. vecs_ready) then
       call MatCreateVecs(g_ctx%K_pj_aij, rhs_PJ, sol_PJ, ierr)
-      call MatCreateVecs(g_ctx%S_W_aij,  rhs_W,  sol_W,  ierr)
+      if (mixed) then
+        call MatCreateVecs(sfm_op, rhs_W, sol_W, ierr)
+      else
+        call MatCreateVecs(g_ctx%S_W_aij, rhs_W, sol_W, ierr)
+      endif
       call MatCreateVecs(g_ctx%B_55, sv_x(1), PETSC_NULL_VEC, ierr)
       block
         integer :: k
@@ -351,6 +399,8 @@ contains
       call VecDuplicate(sv_x(1), w3, ierr)
       call VecDuplicate(sv_x(1), w4, ierr)
       call VecDuplicate(sv_x(1), w5, ierr)
+      call VecDuplicate(sv_x(1), zv, ierr)
+      call VecSet(zv, 0.0d0, ierr)
       call MatCreateVecs(g_ctx%B_55, t_rho, PETSC_NULL_VEC, ierr)
       call MatCreateVecs(g_ctx%B_66, t_T,   PETSC_NULL_VEC, ierr)
       vecs_ready = .true.
@@ -380,6 +430,7 @@ contains
       !--- pairs and are released once the maps exist.
       nkeep = 13
       if (suu == SF_SUU_SCHUR) nkeep = 16
+      if (mixed) nkeep = NBLK                 ! the mixed pair_w repacks from all of them
       call PetscLogEventBegin(pcev_extract, ierr)
       eqs = [var_psi, var_psi, var_u, var_u, var_u, var_u, var_rho, var_rho, var_rho, &
              var_T, var_T, var_T, var_T, var_psi, var_zj, var_zj, &
@@ -412,6 +463,7 @@ contains
       call pack_pair_aij(S_uu, g_ctx%B_24, g_ctx%B_42, g_ctx%B_44, &
                          g_ctx%S_W_aij, sw_packed, comm)
       call MatDestroy(S_uu, ierr)
+      if (mixed) call sfm_build(sform, comm, my_id)
       if (suu == SF_SUU_SCHUR) then
         call pack_pair_aij(g_ctx%B_22, g_ctx%B_24, g_ctx%B_42, g_ctx%B_44, pw0, pw0_packed, comm)
         call sfw_structure(pw0, bk_w == SF_GMG, comm, my_id)
@@ -423,7 +475,7 @@ contains
       !--- the value maps, gated against what was just extracted (schur:
       !--- pw0 and sfw_lines, the pair_w smoother operator, are refilled like
       !--- S_W_aij; sfw_numeric adds the channel on top of sfw_lines)
-      if (suu == SF_SUU_W) then
+      if (suu /= SF_SUU_SCHUR) then
         call sfg_build(A_full, g_ctx%W_force, M(1:nkeep), eqs(1:nkeep), vrs(1:nkeep), &
                        g_ctx%K_pj_aij, [var_psi, var_zj], [var_psi, var_zj], &
                        g_ctx%S_W_aij, none, [var_u, var_w], [var_u, var_w], comm, my_id)
@@ -509,6 +561,8 @@ contains
 
     Vec :: x_psi, x_u, x_j, x_w, x_rho, x_T
     Vec :: y_psi, y_u, y_j, y_w, y_rho, y_T
+    Vec :: parts(4)
+    logical, parameter :: keep_uw(4) = [.true., .true., .false., .false.]
 
     ierr = 0
     call PetscLogEventBegin(pcev_apply, ierr)
@@ -563,11 +617,24 @@ contains
     call VecAXPY(w5, -1.0d0, w3, ierr)
     call MatMult(g_ctx%B_26, t_T, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
-    call sf_split_halves(rhs_W, w5, x_w, .true.)
+    ! mixed: the psi / j rows' right-hand side is zero (the predictor has
+    ! consumed x_psi, x_j) and their solution is discarded -- the corrector
+    ! below recomputes psi and j exactly
+    if (mixed) then
+      parts = [w5, x_w, zv, zv]
+      call sf_split_parts(rhs_W, parts(1:sfm_nf), .true.)
+    else
+      call sf_split_halves(rhs_W, w5, x_w, .true.)
+    endif
     call PetscLogEventBegin(pcev_solve_w, ierr)
     call sf_solver_apply(slv_w, rhs_W, sol_W, ierr)
     call PetscLogEventEnd(pcev_solve_w, ierr)
-    call sf_split_halves(sol_W, y_u, y_w, .false.)        ! BOTH final; y_w is DONE
+    if (mixed) then
+      parts = [y_u, y_w, zv, zv]
+      call sf_split_parts(sol_W, parts(1:sfm_nf), .false., keep=keep_uw(1:sfm_nf))
+    else
+      call sf_split_halves(sol_W, y_u, y_w, .false.)      ! BOTH final; y_w is DONE
+    endif
 
     !--- Step 3: corrector psi-pair --------------------------------------
     ! Here the j-component of the RHS IS zero, because the j-row of the upper

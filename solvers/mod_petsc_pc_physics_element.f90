@@ -99,6 +99,7 @@ contains
     use mod_simulation_data, only: type_MHD_SIM
     use phys_module,     only: debug_physics_pc, physics_pc_reduced_pde, &
                                physics_pc_force_operator
+    use mod_petsc_pc_sf_solver, only: sf_force_terms
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
@@ -192,8 +193,10 @@ contains
         PetscCallA(MatSetOption(g_ctx%W_force, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
       endif
 
+      ! the SF path's mixed pair_w arms carry the bending term (or the whole
+      ! psi channel) through explicit fields, and take it out of W here
       call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
-                                           mhd_sim, g_ctx%W_force)
+                                           mhd_sim, g_ctx%W_force, terms=sf_force_terms())
       g_ctx%w_force_ready = .true.
 
       if (my_id .eq. 0) write(*,'(A)') &

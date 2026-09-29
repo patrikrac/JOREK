@@ -45,7 +45,7 @@ module mod_petsc_pc_sf_gather
     integer(c_int32_t), allocatable :: md(:), mo(:), wd(:), wo(:)
   end type tgt_t
 
-  integer, parameter :: MAXT = 20
+  integer, parameter :: MAXT = 32      !< the mixed pair_w arms keep all 21 blocks + 2 pairs
   type(tgt_t), save :: tg(MAXT)
   integer, save     :: ntg = 0
   integer(8), save  :: a_nzst = -1, w_nzst = -1, a_id = -1, w_id = -1
@@ -77,6 +77,11 @@ contains
     PetscErrorCode :: ierr
 
     call require_baij(A, "A"); call require_baij(W, "W")
+    if (size(blocks) + 2 + size(Pw) > MAXT) then
+      if (my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   FATAL: the SF value maps hold at most ", &
+        MAXT, " operators (MAXT)."
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    endif
     ntg = 0
     do k = 1, size(blocks)
       ntg = ntg + 1

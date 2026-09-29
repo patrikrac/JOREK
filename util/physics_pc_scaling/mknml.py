@@ -151,6 +151,16 @@ ARMS['sf_lu'] = dict(SF_COMMON, **{
 })
 ARMS['sf_gmg_w'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"w"')
 ARMS['sf_lu_w'] = dict(ARMS['sf_lu'], physics_pc_sf_suu='"w"')
+# pair_w mixed (mod_petsc_pc_sf_mixed): B_22 + W with W's psi-channel terms
+# taken out and the channel put back through explicit j (wj: psi by the lumped
+# mass) or psi and j (wpj: the small-flow psi row). LU on pair_w only, as the
+# gate before any multigrid; _diag / _nores / _flow are its ablations.
+for _v in ('wj', 'wj_diag', 'wj_nores', 'wj_kd', 'wpj', 'wpj_flow'):
+    ARMS['sf_lu_' + _v] = dict(ARMS['sf_lu'], physics_pc_sf_suu='"%s"' % _v)
+# ... and on the multigrid: pair_w alone (sf_lugw_*: everything else on its
+# LU, isolating the V-cycle) and the whole path (sf_gmg_*)
+ARMS['sf_lugw_wpj'] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_pair_w='"gmg"')
+ARMS['sf_gmg_wpj'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"wpj"')
 # JOREK's default PC on the same case and ramp
 ARMS['sf_jorek'] = {'use_physics_pc': '.f.'}
 # Full-system direct solve: one MUMPS LU of the whole coupled Jacobian,
