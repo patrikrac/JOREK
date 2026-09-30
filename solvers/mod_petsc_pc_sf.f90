@@ -175,8 +175,8 @@ contains
     block
       logical :: ok
       call sf_suu_parse(physics_pc_sf_suu, sform, ok)
-      if (.not. ok) call fatal("physics_pc_sf_suu must be schur | w | wj | wj_diag | wj_nores | wj_kd | "// &
-                               "wpj | wpj_flow, got '"//trim(physics_pc_sf_suu)//"'")
+      if (.not. ok) call fatal("physics_pc_sf_suu must be schur | w | wj | wpj, got '"// &
+                               trim(physics_pc_sf_suu)//"'")
     end block
     suu   = sform%form
     mixed = (suu == SF_SUU_WJ .or. suu == SF_SUU_WPJ)
@@ -494,22 +494,38 @@ contains
           call MatDestroy(M(k), ierr)
         enddo
       end block
+      ! g_ctx held copies of the released handles: null them, so nothing can
+      ! reach a freed Mat through them
+      if (nkeep < 16) then
+        g_ctx%B_13 = PETSC_NULL_MAT; g_ctx%B_31 = PETSC_NULL_MAT; g_ctx%B_33 = PETSC_NULL_MAT
+      endif
+      if (nkeep < NBLK) then
+        g_ctx%B_11 = PETSC_NULL_MAT; g_ctx%B_22 = PETSC_NULL_MAT; g_ctx%B_24 = PETSC_NULL_MAT
+        g_ctx%B_42 = PETSC_NULL_MAT; g_ctx%B_44 = PETSC_NULL_MAT
+      endif
 
       !--- the SFM2 apply's coupling blocks: fixed patterns, refilled in place
       !--- by the value map, so one attach holds for the run
       if (SF_BLOCKMV == 1) then
         block
           use mod_parameters, only: n_tor
-          logical :: okb
-          okb = blockmv_attach(g_ctx%B_12, int(n_tor)); okb = blockmv_attach(g_ctx%B_16, int(n_tor))
-          okb = blockmv_attach(g_ctx%B_21, int(n_tor)); okb = blockmv_attach(g_ctx%B_23, int(n_tor))
-          okb = blockmv_attach(g_ctx%B_25, int(n_tor)); okb = blockmv_attach(g_ctx%B_26, int(n_tor))
-          okb = blockmv_attach(g_ctx%B_51, int(n_tor)); okb = blockmv_attach(g_ctx%B_52, int(n_tor))
-          okb = blockmv_attach(g_ctx%B_61, int(n_tor)); okb = blockmv_attach(g_ctx%B_62, int(n_tor))
-          okb = blockmv_attach(g_ctx%B_63, int(n_tor))
+          integer :: nno, ncb, k
+          Mat :: cb(13)
+          ! a refused attach (not AIJ) keeps PETSc's own matvec: correct, but
+          ! single-threaded, so it is reported
+          cb(1:11) = [g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_23, g_ctx%B_25, g_ctx%B_26, &
+                      g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62, g_ctx%B_63]
+          ncb = 11
           if (suu == SF_SUU_SCHUR) then
-            okb = blockmv_attach(g_ctx%B_31, int(n_tor)); okb = blockmv_attach(pw0, int(n_tor))
+            cb(12:13) = [g_ctx%B_31, pw0]
+            ncb = 13
           endif
+          nno = 0
+          do k = 1, ncb
+            if (.not. blockmv_attach(cb(k), int(n_tor))) nno = nno + 1
+          enddo
+          if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   SF: WARNING ", nno, &
+            " coupling block(s) not AIJ, left on PETSc's single-threaded matvec"
         end block
       endif
 #if defined(PETSC_HAVE_MKL_SPARSE)

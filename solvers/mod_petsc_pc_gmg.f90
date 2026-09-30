@@ -44,7 +44,7 @@ module mod_petsc_pc_gmg
   use petsc
   use iso_c_binding, only: c_ptr, c_double
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach
-  use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_numeric, axd_refill, axd_factor, axd_solve
+  use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_refill, axd_factor, axd_solve
   implicit none
   private
 
@@ -269,6 +269,10 @@ module mod_petsc_pc_gmg
   ! a fresh product.
   integer(8), save :: a0_sig(2) = 0
   integer(8), save :: a0_id = 0, a0_nzst = -1   !< the last fine operand and its nonzero state
+  ! Set for one setup when a rebuild's fine pattern differs from the last one's:
+  ! the redundant LUs (rds_setup) then extract and analyse anew, and a level's
+  ! J-sector axis solve, whose submatrices are pattern-bound, gives way to the LU.
+  logical, save :: pat_fresh = .false.
 
   ! Workstream D (pair_psi): several independent hierarchies in one module.
   ! The routines below work on the module-level state; gmg_select(k) parks
@@ -478,8 +482,22 @@ contains
     integer :: color, mpierr, k, nl, ntot
     integer, allocatable :: gl(:)
     character(len=64) :: pre
+    logical :: fresh
 
     call MatGetOwnershipRange(A, rst, ren, ierr)
+    ! a new operator pattern: the submatrix and the factorisation's symbolic
+    ! phase are pattern-bound, the members and the row set are not
+    fresh = .not. R%ready .or. pat_fresh
+    if (R%ready .and. pat_fresh) then
+      call MatDestroySubMatrices(one, R%sub, ierr)
+      if (R%filtered) call MatDestroy(R%flt, ierr)
+      R%filtered = .false.
+      if (R%solver) then
+        call KSPDestroy(R%ksp, ierr)
+        call VecDestroy(R%x, ierr)
+        call VecDestroy(R%b, ierr)
+      endif
+    endif
     if (.not. R%ready) then
       ! members, and the whole row set (global, ascending = rank order) on each
       nl = size(R%loc)
@@ -530,7 +548,7 @@ contains
     ! and two numeric factorisations missing per rebuild). That missing state
     ! bump was the whole of the old "stale at np > 1" bug, previously worked
     ! around by re-extracting and re-analysing at every rebuild.
-    if (.not. R%ready) then
+    if (fresh) then
       call MatCreateSubMatrices(A, one, [R%isq], [R%isq], MAT_INITIAL_MATRIX, R%sub, ierr)
     else
       call MatCreateSubMatrices(A, one, [R%isq], [R%isq], MAT_REUSE_MATRIX, R%sub, ierr)
@@ -539,11 +557,11 @@ contains
     endif
     if (R%solver .and. axis_droptol > 0.d0 .and. what(1:2) == "ax") then
       if (R%filtered) call MatDestroy(R%flt, ierr)
-      call rds_filter(R, tag, .not. R%ready)
+      call rds_filter(R, tag, fresh)
       R%filtered = .true.
     endif
     if (R%solver) then
-      if (.not. R%ready) then
+      if (fresh) then
         call rds_make_ksp(MATSOLVERPETSC)
         call MatCreateVecs(rds_op(R), R%x, R%b, ierr)
       else
@@ -688,10 +706,7 @@ contains
     call VecRestoreArrayRead(xx, xp, ie)
   end subroutine rds_solve
 
-  !> rds_solve on the arrays of xx and yy. blk_apply calls it from the
-  !! master thread while the other threads run the line blocks, so it must
-  !! not touch xx/yy as PETSc objects (VecGetArray is not thread-safe); its
-  !! own R%b/R%x and R%comm are used by this thread alone.
+  !> rds_solve on the arrays of xx and yy (blk_apply holds them already).
   subroutine rds_solve_arr(R, xp, yp)
     type(rds_t), intent(inout) :: R
     PetscScalar, intent(in)    :: xp(:)
@@ -1130,7 +1145,9 @@ contains
         enddo
       enddo
     enddo
-    if (any(fine_node < 0)) then
+    ! rank-local tests: every rank must refuse together, or the others run on
+    ! into the collectives below
+    if (any_rank(any(fine_node < 0))) then
       call fail("row -> node map does not cover every row")
       return
     endif
@@ -1154,7 +1171,7 @@ contains
           enddo
         enddo
       enddo
-      if (any(lv(g)%rnode < 0)) then
+      if (any_rank(any(lv(g)%rnode < 0))) then
         call fail("coarse row -> node map does not cover every row")
         return
       endif
@@ -1249,6 +1266,12 @@ contains
       if (my_id == 0) write(*,'(A,A)') "[Physics PC]   GMG hierarchy REFUSED: ", msg
       call PetscLogEventEnd(gev_prolong, ierr)
     end subroutine fail
+
+    logical function any_rank(bad)
+      logical, intent(in) :: bad
+      any_rank = bad
+      call MPI_Allreduce(MPI_IN_PLACE, any_rank, 1, MPI_LOGICAL, MPI_LOR, comm, mpierr)
+    end function any_rank
 
     !> Packed global row of (field f, scalar DOF d, slot m) on layout level L.
     integer function prow(L, f, d, m)
@@ -1463,6 +1486,9 @@ contains
       endif
       a0_id = int(aid, 8); a0_nzst = int(nzst, 8)
     end block
+    pat_fresh = op_ready .and. .not. reuse
+    if (pat_fresh .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   GMG", cur_inst, &
+      ": operator pattern changed, coarse operators and LUs rebuilt from scratch"
 
     if (op_ready) then
       if (.not. reuse) then
@@ -1783,6 +1809,7 @@ contains
     ! are FIRST BUILD ONLY. Both describe the hierarchy's STRUCTURE -- which is
     ! frozen after the first build -- yet re-ran every rebuild, the C_op loop
     ! costing 2*nlev collectives each time. Apply-neutral.
+    pat_fresh = .false.
     if (op_ready) return
     op_ready = .true.
     if (diag_left > 0) call report_bnd_rows(gA(0))
@@ -2113,7 +2140,7 @@ contains
         cnt(B%bid(r)) = cnt(B%bid(r)) + 1
       enddo
       B%sz = cnt
-      B%off(1) = 0
+      if (B%nb > 0) B%off(1) = 0                ! a rank may own no rows on a coarse level
       do bb = 2, B%nb
         B%off(bb) = B%off(bb - 1) + B%sz(bb - 1)
       enddo
@@ -2289,6 +2316,12 @@ contains
     enddo
 
     call PetscLogEventEnd(gev_blknum, ierr)
+    if (B%axsparse .and. B%axdon .and. pat_fresh) then
+      ! the sector solve's submatrices hold the old pattern: the LU takes over
+      B%axdon = .false.
+      if (gme == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, " level ", g, &
+        ": axis J-sector solve dropped for the LU after a pattern change"
+    endif
     if (B%axsparse .and. B%axdon) then
       ! refill only: the factorisations of all levels run together after the
       ! level loop (axd_factor_pending), on each level's own sector ranks
@@ -2297,6 +2330,7 @@ contains
         call axd_refill(B%axd(kk), A)
       enddo
       B%axpend = .true.
+      B%axA = A                                  ! for the LU, should a factorisation fail
       call PetscLogEventEnd(gev_axnum, ierr)
     else if (B%axsparse) then
       ! first build: the J-sector solve is set up before any LU of the whole
@@ -2722,7 +2756,7 @@ contains
     do k = 1, ngh
       nsz(gb(k)) = nsz(gb(k)) + 1
     enddo
-    noff(1) = 0
+    if (B%nb > 0) noff(1) = 0
     do bb = 2, B%nb
       noff(bb) = noff(bb - 1) + nsz(bb - 1)
     enddo
@@ -2893,16 +2927,20 @@ contains
         do kk = 1, size(gBk(g)%axd)
           call axd_factor(gBk(g)%axd(kk))
         enddo
-        gBk(g)%axpend = .false.
       endif
       if (gBk2(g)%axpend) then
         do kk = 1, size(gBk2(g)%axd)
           call axd_factor(gBk2(g)%axd(kk))
         enddo
-        gBk2(g)%axpend = .false.
       endif
     enddo
     call PetscLogEventEnd(gev_axnum, ierr)
+    ! a failed sector factorisation (zero pivot) on any rank: that level's
+    ! block goes to the LU. Every rank walks the same levels (axpend agrees).
+    do g = 0, nlev - 2
+      if (gBk(g)%axpend) call check(gBk(g))
+      if (gBk2(g)%axpend) call check(gBk2(g))
+    enddo
     ! first build: the gates, and the LU where a sector solve failed its gate
     do g = 0, nlev - 2
       if (gBk(g)%axnew) call finish(gBk(g))
@@ -2910,6 +2948,21 @@ contains
     enddo
 
   contains
+
+    subroutine check(B)
+      type(blk_t), intent(inout) :: B
+      logical :: bad
+      integer :: mpierr
+      B%axpend = .false.
+      bad = any(B%axd(:)%failed)
+      call MPI_Allreduce(MPI_IN_PLACE, bad, 1, MPI_LOGICAL, MPI_LOR, gcomm, mpierr)
+      if (.not. bad) return
+      if (gme == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, " level ", g, &
+        ": axis J-sector factorisation failed (zero pivot), LU used"
+      B%axdon = .false.
+      B%axnew = .false.                          ! first build: nothing left to gate
+      call ax_lu(g, B%axA, B)
+    end subroutine check
 
     subroutine finish(B)
       type(blk_t), intent(inout) :: B
@@ -3068,7 +3121,7 @@ contains
       call VecDestroy(x, ierr); call VecDestroy(y1, ierr); call VecDestroy(y2, ierr)
       if (gme == 0) write(*,'(A,A,A,ES9.2,A)') "[Physics PC]   ", trim(axtag), &
         ": J-sector solve backward error ", dn, merge(" -> in use ", " -> LU used", dn <= 1.d-8)
-      if (dn > 1.d-8) pass = .false.
+      if (.not. (dn <= 1.d-8)) pass = .false.        ! a NaN fails too
     enddo
     B%axdon = pass
   end subroutine axd_gate

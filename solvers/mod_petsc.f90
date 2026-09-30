@@ -38,17 +38,19 @@ contains
     call PetscInitialize(PETSC_NULL_CHARACTER, ierr)
     if (ierr /= 0) print *, "Error initializing PETSc"
 #endif
-    call petsc_default_mumps_central_rhs()
   end subroutine
 
 
   !> Default every MUMPS factor to a centralized dense RHS (ICNTL(20) = 0).
   !! In parallel PETSc defaults to the distributed-RHS path (10), which reads out
-  !! of bounds and corrupts the heap on our builds (np > 1 bus error even with
-  !! JOREK's default PC). PETSc reads this value only from the options database
-  !! at the symbolic factorisation, so MatMumpsSetIcntl cannot set it. Covers the
-  !! un-prefixed factors and the fieldsplit sub-solvers; a value given by the
-  !! user (command line, PETSC_OPTIONS) is left alone.
+  !! of bounds and corrupts the heap on some MUMPS builds (seen as an np > 1 bus
+  !! error, also with JOREK's default PC). PETSc reads this value only from the
+  !! options database at the symbolic factorisation, so MatMumpsSetIcntl cannot
+  !! set it. Covers the un-prefixed factors and the fieldsplit sub-solvers; a
+  !! value given by the user (command line, PETSC_OPTIONS) is left alone.
+  !! Applied by the physics PC and the full-LU reference, whose setups need it;
+  !! the default path only with -jorek_mumps_central_rhs, since it is a
+  !! workaround for a build, not a solver choice.
   subroutine petsc_default_mumps_central_rhs()
     PetscErrorCode :: ierr
     PetscBool      :: has
@@ -397,7 +399,7 @@ contains
     PetscReal :: petsc_norm
     PetscViewerAndFormat :: vf
     logical :: no_aij
-    PetscBool :: full_lu
+    PetscBool :: full_lu, central_rhs
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     ! Memory audit (physics_pc_lean_setup >= 3): the physics PC reads its blocks
@@ -418,6 +420,12 @@ contains
 
     if (.not. petsc_sys%ksp_ready) then
       ! First solve: create AIJ matrix, vecs, KSP, and set up PCFIELDSPLIT+MUMPS
+      ! -jorek_pc_full_lu: one MUMPS LU of the whole coupled system instead of
+      ! the per-harmonic fieldsplit (the direct-solve reference; with
+      ! iter_precon = 0 it is refactorised every step).
+      PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_pc_full_lu", full_lu, ierr))
+      PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_mumps_central_rhs", central_rhs, ierr))
+      if (use_physics_pc .or. full_lu .or. central_rhs) call petsc_default_mumps_central_rhs()
       PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
       PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
@@ -456,10 +464,6 @@ contains
         if (set) PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, rs, ierr))
       end block
 
-      ! -jorek_pc_full_lu: one MUMPS LU of the whole coupled system instead of
-      ! the per-harmonic fieldsplit (the direct-solve reference; with
-      ! iter_precon = 0 it is refactorised every step).
-      PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_pc_full_lu", full_lu, ierr))
       if (use_physics_pc) then
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + Physics PCSHELL"
       else if (full_lu) then

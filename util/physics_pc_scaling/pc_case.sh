@@ -95,7 +95,7 @@ cd "$DIR" || exit 1
 export OMP_NUM_THREADS=$OMP MKL_NUM_THREADS=$OMP OPENBLAS_NUM_THREADS=$OMP
 export OMP_PLACES=${OMP_PLACES:-cores} OMP_PROC_BIND=${OMP_PROC_BIND:-close}
 ARM_OPTS=$(python3 "$HERE/mknml.py" petscopts "$ARM")
-export PETSC_OPTIONS="-log_view :prof.txt -memory_view $ARM_OPTS ${PCS_PETSC_OPTS:-}"
+export PETSC_OPTIONS="-log_view :prof.txt -memory_view -jorek_mumps_central_rhs $ARM_OPTS ${PCS_PETSC_OPTS:-}"
 T0=$(python3 -c "import time; print(time.time())")
 $LAUNCH "$JOREK_BIN" < in > log 2>&1
 RC=$?

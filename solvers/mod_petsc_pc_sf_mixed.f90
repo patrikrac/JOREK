@@ -5,7 +5,7 @@ module mod_petsc_pc_sf_mixed
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx
   use mod_petsc_pc_blocks,      only: pack_blocks_aij, report_operator_density
-  use mod_petsc_pc_sf_solver,   only: suu_form_t, SF_SUU_WJ, SF_SUU_WPJ, sf_split_parts
+  use mod_petsc_pc_sf_solver,   only: suu_form_t, SF_SUU_WJ, SF_SUU_WPJ, sf_split_parts, sf_opz
   implicit none
   private
 
@@ -46,17 +46,12 @@ module mod_petsc_pc_sf_mixed
   !!           [B_42,        B_44,  0,           0   ],
   !!           [B_12,        0,     opz M_psi,   B_13],
   !!           [0,           0,     B_31,        B_33]]
-  !!        W_c = W's curvature term. Exact up to the small-flow psi row;
-  !!        "wpj_flow" keeps B_11 there, i.e. the schur arm's S_uu plus W_c.
+  !!        W_c = W's curvature term. Exact up to the small-flow psi row
+  !!        (keeping B_11 there instead was identical on the pcbench cases).
   !!
   !! M_psi is B_33: the psi row's mass (amat_11) and the constraint mass
   !! (amat_33) are the same integrand, and every variable carries the same
   !! boundary rows.
-  !!
-  !! Variants for the gate (physics_pc_sf_suu): wj_diag (D the point diagonal),
-  !! wj_nores (no B_31 D B_13: sizes (c)), wj_kd (the kink discrete as well:
-  !! B_22 + W_c - B_21 D B_12 and B_23 - B_21 D B_13 in the u row, i.e. exactly
-  !! "wpj" with psi eliminated by D).
   !!
   !! STRUCTURE ONCE, NUMBERS PER REBUILD. sfm_build (first build) fixes D's
   !! node groups and every pattern; sfm_refill (every later rebuild, after the
@@ -73,7 +68,6 @@ module mod_petsc_pc_sf_mixed
   Mat, save :: dpsi                        !< wj: the lumped (opz M_psi)^-1
   Mat, save :: p12, p13                    !< wj: B_31 D B_12, B_31 D B_13
   Mat, save :: jju, jjj                    !< wj: -B_31 D B_12, B_33 - B_31 D B_13
-  Mat, save :: q12, q13, juj               !< wj_kd: B_21 D B_12, B_21 D B_13, B_23 - B_21 D B_13
   Mat, save :: mpsi                        !< wpj: opz M_psi
   logical, save :: packed = .false.
 
@@ -105,28 +99,14 @@ contains
       call MatMatMatMult(g_ctx%B_31, dpsi, g_ctx%B_12, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, p12, ierr)
       call MatDuplicate(p12, MAT_COPY_VALUES, jju, ierr)
       call MatScale(jju, -1.0d0, ierr)
-      if (fm%no_res) then
-        call MatDuplicate(g_ctx%B_33, MAT_COPY_VALUES, jjj, ierr)
-      else
-        call MatMatMatMult(g_ctx%B_31, dpsi, g_ctx%B_13, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, p13, ierr)
-        call MatDuplicate(p13, MAT_COPY_VALUES, jjj, ierr)
-        call MatScale(jjj, -1.0d0, ierr)
-        call MatAXPY(jjj, 1.0d0, g_ctx%B_33, DIFFERENT_NONZERO_PATTERN, ierr)
-      endif
-      if (fm%kink_disc) then
-        call MatMatMatMult(g_ctx%B_21, dpsi, g_ctx%B_12, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, q12, ierr)
-        call MatMatMatMult(g_ctx%B_21, dpsi, g_ctx%B_13, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, q13, ierr)
-        call MatAXPY(suu, -1.0d0, q12, DIFFERENT_NONZERO_PATTERN, ierr)
-        call MatDuplicate(q13, MAT_COPY_VALUES, juj, ierr)
-        call MatScale(juj, -1.0d0, ierr)
-        call MatAXPY(juj, 1.0d0, g_ctx%B_23, DIFFERENT_NONZERO_PATTERN, ierr)
-      endif
+      call MatMatMatMult(g_ctx%B_31, dpsi, g_ctx%B_13, MAT_INITIAL_MATRIX, PETSC_DEFAULT_REAL, p13, ierr)
+      call MatDuplicate(p13, MAT_COPY_VALUES, jjj, ierr)
+      call MatScale(jjj, -1.0d0, ierr)
+      call MatAXPY(jjj, 1.0d0, g_ctx%B_33, DIFFERENT_NONZERO_PATTERN, ierr)
     case (SF_SUU_WPJ)
       sfm_nf = 4
-      if (.not. fm%flow) then
-        call MatDuplicate(g_ctx%B_33, MAT_COPY_VALUES, mpsi, ierr)
-        call MatScale(mpsi, opz(), ierr)
-      endif
+      call MatDuplicate(g_ctx%B_33, MAT_COPY_VALUES, mpsi, ierr)
+      call MatScale(mpsi, sf_opz(), ierr)
     end select
 
     call pack_op()
@@ -153,24 +133,12 @@ contains
       call MatCopy(p12, jju, SAME_NONZERO_PATTERN, ierr)
       call MatScale(jju, -1.0d0, ierr)
       call MatZeroEntries(jjj, ierr)
-      if (.not. fm%no_res) then
-        call MatMatMatMult(g_ctx%B_31, dpsi, g_ctx%B_13, MAT_REUSE_MATRIX, PETSC_DEFAULT_REAL, p13, ierr)
-        call MatAXPY(jjj, -1.0d0, p13, SUBSET_NONZERO_PATTERN, ierr)
-      endif
+      call MatMatMatMult(g_ctx%B_31, dpsi, g_ctx%B_13, MAT_REUSE_MATRIX, PETSC_DEFAULT_REAL, p13, ierr)
+      call MatAXPY(jjj, -1.0d0, p13, SUBSET_NONZERO_PATTERN, ierr)
       call MatAXPY(jjj, 1.0d0, g_ctx%B_33, SUBSET_NONZERO_PATTERN, ierr)
-      if (fm%kink_disc) then
-        call MatMatMatMult(g_ctx%B_21, dpsi, g_ctx%B_12, MAT_REUSE_MATRIX, PETSC_DEFAULT_REAL, q12, ierr)
-        call MatMatMatMult(g_ctx%B_21, dpsi, g_ctx%B_13, MAT_REUSE_MATRIX, PETSC_DEFAULT_REAL, q13, ierr)
-        call MatAXPY(suu, -1.0d0, q12, SUBSET_NONZERO_PATTERN, ierr)
-        call MatZeroEntries(juj, ierr)
-        call MatAXPY(juj, -1.0d0, q13, SUBSET_NONZERO_PATTERN, ierr)
-        call MatAXPY(juj, 1.0d0, g_ctx%B_23, SUBSET_NONZERO_PATTERN, ierr)
-      endif
     case (SF_SUU_WPJ)
-      if (.not. fm%flow) then
-        call MatCopy(g_ctx%B_33, mpsi, SAME_NONZERO_PATTERN, ierr)
-        call MatScale(mpsi, opz(), ierr)
-      endif
+      call MatCopy(g_ctx%B_33, mpsi, SAME_NONZERO_PATTERN, ierr)
+      call MatScale(mpsi, sf_opz(), ierr)
     end select
 
     call pack_op()
@@ -191,19 +159,13 @@ contains
     blk(2, 2) = g_ctx%B_44;  have(2, 2) = .true.
     if (fm%form == SF_SUU_WJ) then
       blk(1, 3) = g_ctx%B_23;  have(1, 3) = .true.
-      if (fm%kink_disc) blk(1, 3) = juj
       blk(3, 1) = jju;         have(3, 1) = .true.
       blk(3, 3) = jjj;         have(3, 3) = .true.
     else
       blk(1, 3) = g_ctx%B_21;  have(1, 3) = .true.
       blk(1, 4) = g_ctx%B_23;  have(1, 4) = .true.
       blk(3, 1) = g_ctx%B_12;  have(3, 1) = .true.
-      if (fm%flow) then
-        blk(3, 3) = g_ctx%B_11
-      else
-        blk(3, 3) = mpsi
-      endif
-      have(3, 3) = .true.
+      blk(3, 3) = mpsi;        have(3, 3) = .true.
       blk(3, 4) = g_ctx%B_13;  have(3, 4) = .true.
       blk(4, 3) = g_ctx%B_31;  have(4, 3) = .true.
       blk(4, 4) = g_ctx%B_33;  have(4, 4) = .true.
@@ -212,11 +174,6 @@ contains
     call pack_blocks_aij(blk(1:nf, 1:nf), have(1:nf, 1:nf), sfm_op, packed, comm_)
   end subroutine pack_op
 
-  !> 1 + zeta, as the Jacobian's element matrix forms it (mod_elt_matrix_fft)
-  real*8 function opz()
-    use phys_module, only: time_evol_zeta, tstep, tstep_prev
-    opz = 1.0d0 + time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
-  end function opz
 
   !--------------------------------------------------------------------
   !> D's groups: the rank's rows of each node, all harmonics (an axis node
@@ -336,11 +293,7 @@ contains
       nb = gptr(g + 1) - gptr(g)
       call block_of(g, a, comp)
       do i = 1, nb
-        if (fm%diag_mass) then
-          dnz(grow(gptr(g) + i) + 1) = 1
-        else
-          dnz(grow(gptr(g) + i) + 1) = count([(comp(j) == comp(i), j = 1, nb)])
-        endif
+        dnz(grow(gptr(g) + i) + 1) = count([(comp(j) == comp(i), j = 1, nb)])
       enddo
     enddo
     call MatCreate(comm, dpsi, ierr)
@@ -366,19 +319,13 @@ contains
     external :: dgesv
 
     call MatGetOwnershipRange(g_ctx%B_33, rs, re, ierr)
-    s = opz()
+    s = sf_opz()
     nbad = 0; emax = 0.d0
     do g = 1, size(gptr) - 1
       nb = gptr(g + 1) - gptr(g)
       gr = [(rs + grow(gptr(g) + i), i = 1, nb)]
       call block_of(g, a, comp)
       a = s * a
-      if (fm%diag_mass) then
-        do i = 1, nb
-          call MatSetValue(dpsi, gr(i), gr(i), 1.0d0 / a(i, i), INSERT_VALUES, ierr)
-        enddo
-        cycle
-      endif
       do c = 1, maxval(comp)
         sel = pack([(i, i = 1, nb)], comp == c)
         m = size(sel)
@@ -510,25 +457,17 @@ contains
       call MatMultAdd(g_ctx%B_23, xs(3), ys(1), ys(1), ierr)
       ! j row: -B_31 D (B_12 x_u + B_13 x_j) + B_33 x_j
       call MatMult(g_ctx%B_12, xs(1), t1, ierr)
-      if (.not. fm%no_res) call MatMultAdd(g_ctx%B_13, xs(3), t1, t1, ierr)
+      call MatMultAdd(g_ctx%B_13, xs(3), t1, t1, ierr)
       call MatMult(dpsi, t1, t2, ierr)
       call MatMult(g_ctx%B_31, t2, ys(3), ierr)
-      if (fm%kink_disc) then                  ! u row: - B_21 D (B_12 x_u + B_13 x_j)
-        call MatMult(g_ctx%B_21, t2, t1, ierr)
-        call VecAXPY(ys(1), -1.0d0, t1, ierr)
-      endif
       call VecScale(ys(3), -1.0d0, ierr)
       call MatMultAdd(g_ctx%B_33, xs(3), ys(3), ys(3), ierr)
     else
       call MatMultAdd(g_ctx%B_21, xs(3), ys(1), ys(1), ierr)
       call MatMultAdd(g_ctx%B_23, xs(4), ys(1), ys(1), ierr)
       call MatMult(g_ctx%B_12, xs(1), ys(3), ierr)
-      if (fm%flow) then
-        call MatMultAdd(g_ctx%B_11, xs(3), ys(3), ys(3), ierr)
-      else
-        call MatMult(g_ctx%B_33, xs(3), t1, ierr)
-        call VecAXPY(ys(3), opz(), t1, ierr)
-      endif
+      call MatMult(g_ctx%B_33, xs(3), t1, ierr)
+      call VecAXPY(ys(3), sf_opz(), t1, ierr)
       call MatMultAdd(g_ctx%B_13, xs(4), ys(3), ys(3), ierr)
       call MatMult(g_ctx%B_31, xs(3), ys(4), ierr)
       call MatMultAdd(g_ctx%B_33, xs(4), ys(4), ys(4), ierr)
@@ -558,12 +497,8 @@ contains
     select case (fm%form)
     case (SF_SUU_WJ)
       label = "pair_w mixed (u,omega,j), psi by lumped mass"
-      if (fm%diag_mass) label = "pair_w mixed (u,omega,j), psi by diagonal mass"
-      if (fm%no_res)    label = "pair_w mixed (u,omega,j), no resistive psi"
-      if (fm%kink_disc) label = "pair_w mixed (u,omega,j), kink discrete"
     case default
       label = "pair_w mixed (u,omega,psi,j), small-flow psi"
-      if (fm%flow) label = "pair_w mixed (u,omega,psi,j), psi row B_11"
     end select
   end function label
 

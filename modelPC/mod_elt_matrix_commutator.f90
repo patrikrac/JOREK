@@ -94,7 +94,7 @@ subroutine element_matrix_commutator(element, nodes, ELM_blk)
   use phys_module, only: fftw_plan, eta_T_dependent, T_max_eta, T_0, F0
   use corr_neg,    only: corr_neg_temp
   use mod_pc_fft_scatter, only: scatter_fft_to_elm, scatter_fft_to_elm_n, &
-                                scatter_fft_to_elm_k, scatter_fft_to_elm_kn
+                                scatter_fft_to_elm_k, scatter_fft_to_elm_kn, pc_my_fft
 
   implicit none
 
@@ -320,6 +320,8 @@ subroutine element_matrix_commutator(element, nodes, ELM_blk)
         in_fft = ELM_p(1:n_plane, i, j, ib)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_blk(:,:,ib), D1V)
       enddo
@@ -336,18 +338,24 @@ subroutine element_matrix_commutator(element, nodes, ELM_blk)
       in_fft = ELM_n(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+      call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm_n(out_fft, i, j, ELM_aux, D1V)
 
       in_fft = ELM_k(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+      call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm_k(out_fft, i, j, ELM_aux, D1V)
 
       in_fft = ELM_kn(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+      call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm_kn(out_fft, i, j, ELM_aux, D1V)
     enddo

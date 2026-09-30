@@ -28,7 +28,8 @@
 !!   y_Is = A_Is^-1 (x_Is - A_Is,G y_G)        (in parallel)
 !! with sparse LUs throughout (PETSc's, as rds_t). It is
 !! the same elimination as a sparse LU with the separators ordered last, so
-!! it is exact; the first build checks its backward error (axd_try).
+!! it is exact; the first build checks its backward error (axd_gate in
+!! mod_petsc_pc_gmg).
 !!
 !! Its cost per solve on a sector rank is ~ 4 nnz(L_Is) + 2 nnz(L_R): the
 !! interiors shrink like n_tht/nsec while the separator chain grows like nsec,
@@ -40,8 +41,8 @@
 !! the sectors and without axis rows only enter the (empty) scatters.
 !!
 !! Structure (row classes, index sets, scatters, the reduced pattern) once per
-!! run; values and numeric factorisations per rebuild (axd_numeric), in two
-!! parts: the collective refill of the sector's couplings (axd_refill) and the
+!! run; values and numeric factorisations per rebuild, in two parts: the
+!! collective refill of the sector's couplings (axd_refill) and the
 !! factorisations, local to the sector ranks (axd_factor).
 !!
 !! The sector ranks are roff .. roff + nsec - 1 (mod np). The caller gives the
@@ -56,7 +57,7 @@ module mod_petsc_pc_gmg_axis
   implicit none
   private
 
-  public :: axd_t, axd_nsec, axd_setup, axd_numeric, axd_refill, axd_factor, axd_solve
+  public :: axd_t, axd_nsec, axd_setup, axd_refill, axd_factor, axd_solve
 
   type :: axd_t
     logical :: on = .false.                !< in use (the same on every rank)
@@ -79,6 +80,7 @@ module mod_petsc_pc_gmg_axis
     Vec :: xl, yo, wI, tI, yI, rG, yG, gr, yr
     VecScatter :: sin, sout
     logical :: numeric_done = .false.
+    logical :: failed = .false.            !< this rank's last factorisation failed (zero pivot)
   end type axd_t
 
 contains
@@ -359,20 +361,9 @@ contains
     end function find
   end subroutine axd_setup
 
-  !--------------------------------------------------------------------
-  !> Numeric part, every rebuild (collective on A's communicator): refill
-  !! the sector's couplings, factor A_Is, form its Schur block
-  !! A_G,Is A_Is^-1 A_Is,G, gather all blocks, assemble and factor R.
-  !--------------------------------------------------------------------
-  subroutine axd_numeric(D, A)
-    type(axd_t), intent(inout) :: D
-    Mat, intent(in) :: A
-    call axd_refill(D, A)
-    call axd_factor(D)
-  end subroutine axd_numeric
-
-  !> Collective part of axd_numeric: the sector's couplings refilled from A
-  !! (nothing on the first build, axd_setup extracted them).
+  !> Numeric part, every rebuild, collective on A's communicator: the
+  !! sector's couplings refilled from A (nothing on the first build,
+  !! axd_setup extracted them). axd_factor follows.
   subroutine axd_refill(D, A)
     type(axd_t), intent(inout) :: D
     Mat, intent(in) :: A
@@ -390,7 +381,7 @@ contains
     enddo
   end subroutine axd_refill
 
-  !> Sector-rank part of axd_numeric (others return): factor A_Is, form the
+  !> Sector-rank part of the numeric phase (others return): factor A_Is, form the
   !! Schur block, gather all blocks among the sector ranks, assemble and
   !! factor R.
   subroutine axd_factor(D)
@@ -408,6 +399,7 @@ contains
 
     fresh = .not. D%numeric_done
     D%numeric_done = .true.
+    D%failed = .false.
     if (.not. D%sector) return
 
     ! the interior LU
@@ -417,6 +409,7 @@ contains
       call KSPSetOperators(D%kI, D%sub(1), D%sub(1), ierr)
     endif
     call KSPSetUp(D%kI, ierr)
+    call check_failed(D%kI)
 
     ! this sector's Schur block C = A_GG(owned part) - A_GI A_II^-1 A_IG
     call MatConvert(D%sub(2), MATSEQDENSE, MAT_INITIAL_MATRIX, Bd, ierr)
@@ -463,8 +456,21 @@ contains
       call KSPSetOperators(D%kR, D%R, D%R, ierr)
     endif
     call KSPSetUp(D%kR, ierr)
+    call check_failed(D%kR)
 
   contains
+
+    !> PETSc's LU does not pivot: a zero pivot leaves a failed factor, which the
+    !! caller must replace (axd_factor_pending falls back to the block's LU).
+    !! The rest of the factorisation still runs, keeping the sector collectives
+    !! matched.
+    subroutine check_failed(ksp)
+      KSP :: ksp
+      PCFailedReason :: why
+      call KSPGetPC(ksp, pc, ierr)
+      call PCGetFailedReason(pc, why, ierr)
+      if (why /= PC_NOERROR) D%failed = .true.
+    end subroutine check_failed
 
     !> entry (row k, column c) of A_GG belongs to this sector's block: the
     !! rows of its left separator, the border's couplings to that separator,

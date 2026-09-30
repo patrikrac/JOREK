@@ -26,6 +26,7 @@ module mod_pc_fft_scatter
   public :: scatter_fft_to_elm_n
   public :: scatter_fft_to_elm_k
   public :: scatter_fft_to_elm_kn
+  public :: pc_my_fft
 
 contains
 
@@ -254,5 +255,29 @@ subroutine scatter_fft_to_elm_kn(out_fft, i, j, ELM, ndim)
   enddo    ! k
 
 end subroutine scatter_fft_to_elm_kn
+
+!-----------------------------------------------------------------
+!> Real-to-complex transform of one n-plane channel without FFTW (RFT2), the
+!! fallback the element matrices take when JOREK is built without USE_FFTW.
+!! Same output layout as dfftw_execute_dft_r2c: out_fft(k) holds harmonic k-1.
+!-----------------------------------------------------------------
+subroutine pc_my_fft(in_fft, out_fft, n)
+
+  implicit none
+
+  integer,    intent(in)  :: n
+  real*8,     intent(in)  :: in_fft(n)
+  complex*16, intent(out) :: out_fft(*)
+
+  real*8  :: tmp_fft(2*n+2)
+  integer :: i
+
+  tmp_fft(1:n) = in_fft(1:n)
+  call RFT2(tmp_fft, n, 1)
+  do i = 1, n/2 + 1
+    out_fft(i) = cmplx(tmp_fft(2*i-1), tmp_fft(2*i), kind=8)
+  enddo
+
+end subroutine pc_my_fft
 
 end module mod_pc_fft_scatter

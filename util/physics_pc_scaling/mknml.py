@@ -154,8 +154,8 @@ ARMS['sf_lu_w'] = dict(ARMS['sf_lu'], physics_pc_sf_suu='"w"')
 # pair_w mixed (mod_petsc_pc_sf_mixed): B_22 + W with W's psi-channel terms
 # taken out and the channel put back through explicit j (wj: psi by the lumped
 # mass) or psi and j (wpj: the small-flow psi row). LU on pair_w only, as the
-# gate before any multigrid; _diag / _nores / _flow are its ablations.
-for _v in ('wj', 'wj_diag', 'wj_nores', 'wj_kd', 'wpj', 'wpj_flow'):
+# gate before any multigrid.
+for _v in ('wj', 'wpj'):
     ARMS['sf_lu_' + _v] = dict(ARMS['sf_lu'], physics_pc_sf_suu='"%s"' % _v)
 # ... and on the multigrid: pair_w alone (sf_lugw_*: everything else on its
 # LU, isolating the V-cycle) and the whole path (sf_gmg_*)

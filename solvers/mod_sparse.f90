@@ -198,8 +198,7 @@ module mod_sparse
       if (solver%verbose) tag = my_id
 
       ! condition for no PC update
-      solver%solve_only = (solver%istep.gt.1) .and. ((solver%iter_gmres + solver%iter_prev <= 2*solver%iter_precon) &
-                                              .and.  (solver%n_since_update < solver%max_steps_noUpdate))
+      solver%solve_only = solver%keep_pc(solver%istep)
       if (solver%newton%it.lt.2) then ! no counter within Newton loop
         if (solver%solve_only) then
           solver%n_since_update = solver%n_since_update + 1

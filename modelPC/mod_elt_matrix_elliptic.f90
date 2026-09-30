@@ -19,7 +19,7 @@ module mod_elt_matrix_elliptic
 ! also uses ELM_n (mode-off-diagonal, multiplied by toroidal mode number at scatter).
 ! FFT reconstruction is performed to obtain the mode-space blocks.
 !----------------------------------------------------------------
-use mod_pc_fft_scatter, only: scatter_fft_to_elm, scatter_fft_to_elm_n, scatter_fft_to_elm_kn
+use mod_pc_fft_scatter, only: scatter_fft_to_elm, scatter_fft_to_elm_n, scatter_fft_to_elm_kn, pc_my_fft
 
 implicit none
 public :: element_matrix_elliptic, scatter_fft_to_elm
@@ -536,6 +536,8 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
       in_fft = ELM_p_j(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+      call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm(out_fft, i, j, ELM_j, D1V)
 
@@ -543,6 +545,8 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         in_fft = ELM_p_psi_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_psi_correction, D1V)
       endif
@@ -550,12 +554,16 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         in_fft = ELM_p_u_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_u_correction, D1V)
 
         in_fft = ELM_kn_u_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm_kn(out_fft, i, j, ELM_u_correction, D1V)
       endif
@@ -563,12 +571,16 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         in_fft = ELM_p_21_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_21_correction, D1V)
 
         in_fft = ELM_n_21_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm_n(out_fft, i, j, ELM_21_correction, D1V)
       endif
@@ -576,6 +588,8 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
         in_fft = ELM_p_61_correction(1:n_plane, i, j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM_61_correction, D1V)
       endif
@@ -585,6 +599,8 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
           in_fft = ELM_p_schur_inertia(1:n_plane, i, j)
 #ifdef USE_FFTW
           call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+          call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
           call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
 
@@ -594,6 +610,8 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
           in_fft = ELM_p_schur_geo(1:n_plane, i, j)
 #ifdef USE_FFTW
           call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+          call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
           call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
 
@@ -601,18 +619,24 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
           in_fft = ELM_p_schur(1:n_plane, i, j)
 #ifdef USE_FFTW
           call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+          call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
           call scatter_fft_to_elm(out_fft, i, j, ELM_tension, D1V)
 
           in_fft = ELM_p_schur_n(1:n_plane, i, j)
 #ifdef USE_FFTW
           call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+          call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
           call scatter_fft_to_elm_n(out_fft, i, j, ELM_tension, D1V)
 
           in_fft = ELM_p_schur_kn(1:n_plane, i, j)
 #ifdef USE_FFTW
           call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+          call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
           call scatter_fft_to_elm_kn(out_fft, i, j, ELM_tension, D1V)
 
@@ -620,12 +644,16 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
           in_fft = ELM_p_visco(1:n_plane, i, j)
 #ifdef USE_FFTW
           call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+          call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
           call scatter_fft_to_elm(out_fft, i, j, ELM_schur_PBP, D1V)
 
           in_fft = ELM_kn_visco(1:n_plane, i, j)
 #ifdef USE_FFTW
           call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+          call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
           call scatter_fft_to_elm_kn(out_fft, i, j, ELM_schur_PBP, D1V)
         endif
@@ -663,12 +691,16 @@ subroutine element_matrix_elliptic(element, nodes, ELM_j, ELM_w, ELM_jpsi, ELM_w
       in_fft = ELM_p_jpsi(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+      call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm(out_fft, i, j, ELM_jpsi, D1V)
 
       in_fft = ELM_p_wu(1:n_plane, i, j)
 #ifdef USE_FFTW
       call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+      call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
       call scatter_fft_to_elm(out_fft, i, j, ELM_wu, D1V)
 

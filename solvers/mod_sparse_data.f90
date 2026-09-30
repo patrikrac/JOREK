@@ -78,10 +78,24 @@ module mod_sparse_data
   contains
     procedure :: setup
     procedure :: finalize
+    procedure :: keep_pc
 
   end type type_SP_SOLVER
 
   contains
+
+!> The iterative solver keeps its preconditioner (no rebuild) at step istep:
+!! after the first step, while the last two solves stayed within 2*iter_precon
+!! iterations and fewer than max_steps_noUpdate steps have passed since the
+!! last update. Newton iterations beyond the first keep it regardless (see
+!! solve_sparse_system).
+  logical function keep_pc(self, istep)
+    class(type_SP_SOLVER), intent(in) :: self
+    integer, intent(in)               :: istep
+
+    keep_pc = (istep > 1) .and. (self%iter_gmres + self%iter_prev <= 2*self%iter_precon) &
+                          .and. (self%n_since_update < self%max_steps_noUpdate)
+  end function keep_pc
 
 !> Set solver parameters
   subroutine setup(self)

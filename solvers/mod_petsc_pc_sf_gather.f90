@@ -50,15 +50,10 @@ module mod_petsc_pc_sf_gather
   integer, save     :: ntg = 0
   integer(8), save  :: a_nzst = -1, w_nzst = -1, a_id = -1, w_id = -1
   integer(8), save  :: na_d = 0, na_o = 0, nw_d = 0, nw_o = 0   !< value-array lengths
-  logical, save     :: ready = .false.
 
-  public :: sfg_build, sfg_gather, sfg_ready
+  public :: sfg_build, sfg_gather
 
 contains
-
-  logical function sfg_ready()
-    sfg_ready = ready
-  end function sfg_ready
 
   !--------------------------------------------------------------------
   !> Build the maps (first build only). blocks(k) = A(eqs(k), vrs(k)) in the
@@ -102,7 +97,6 @@ contains
     enddo
     call source_state(A, a_id, a_nzst)
     call source_state(W, w_id, w_nzst)
-    ready = .true.
 
     ! the gate: a gather must reproduce what the conventional path stored
     dmax = 0.d0

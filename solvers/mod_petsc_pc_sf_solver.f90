@@ -132,13 +132,9 @@ module mod_petsc_pc_sf_solver
   integer, parameter, public :: SF_SUU_WJ    = 3
   integer, parameter, public :: SF_SUU_WPJ   = 4
 
-  !> physics_pc_sf_suu, parsed: the form and the variant of a mixed form
+  !> physics_pc_sf_suu, parsed
   type, public :: suu_form_t
     integer :: form = SF_SUU_SCHUR
-    logical :: diag_mass = .false.   !< wj_diag:  psi mass lumped to its diagonal, not node blocks
-    logical :: no_res    = .false.   !< wj_nores: no resistive psi response (B_31 D B_13 dropped)
-    logical :: flow      = .false.   !< wpj_flow: psi row B_11 (u0 advection kept), not opz M_psi
-    logical :: kink_disc = .false.   !< wj_kd:    kink discrete (-B_21 D B_12, -B_21 D B_13), not W's
   end type suu_form_t
 
   !--- V-cycle shapes (gmg_opts_t pre0 / post0 / nsmooth_c) -----------------
@@ -241,17 +237,18 @@ module mod_petsc_pc_sf_solver
     logical :: created  = .false.
     integer :: gmg_inst = 0                !< hierarchy id when backend == SF_GMG
     integer :: its_sum  = 0, its_max = 0, nsolve = 0
+    integer :: nfail    = 0                !< solves that stopped unconverged (its cap, failed PC)
     character(len=56) :: label = ""
   end type block_solver_t
 
   public :: sf_solver_setup, sf_solver_apply, sf_solver_destroy
   public :: sf_solver_reset_counters, sf_solver_report
   public :: sf_backend_name, sf_split_halves, sf_split_parts
-  public :: sf_suu_parse, sf_force_terms
+  public :: sf_suu_parse, sf_force_terms, sf_opz
 
 contains
 
-  !> physics_pc_sf_suu -> form and variant; ok = .false. for an unknown string.
+  !> physics_pc_sf_suu -> form; ok = .false. for an unknown string.
   subroutine sf_suu_parse(str, f, ok)
     character(len=*), intent(in)  :: str
     type(suu_form_t), intent(out) :: f
@@ -261,11 +258,7 @@ contains
     case ("schur");    f%form = SF_SUU_SCHUR
     case ("w");        f%form = SF_SUU_W
     case ("wj");       f%form = SF_SUU_WJ
-    case ("wj_diag");  f%form = SF_SUU_WJ;  f%diag_mass = .true.
-    case ("wj_nores"); f%form = SF_SUU_WJ;  f%no_res = .true.
-    case ("wj_kd");    f%form = SF_SUU_WJ;  f%kink_disc = .true.
     case ("wpj");      f%form = SF_SUU_WPJ
-    case ("wpj_flow"); f%form = SF_SUU_WPJ; f%flow = .true.
     case default;      ok = .false.
     end select
   end subroutine sf_suu_parse
@@ -283,7 +276,6 @@ contains
     call sf_suu_parse(physics_pc_sf_suu, f, ok)
     if (.not. ok) return
     if (f%form == SF_SUU_WJ)  sf_force_terms = 5      ! kink + curvature
-    if (f%kink_disc)          sf_force_terms = 6      ! curvature
     if (f%form == SF_SUU_WPJ) sf_force_terms = 6      ! curvature
   end function sf_force_terms
 
@@ -479,6 +471,7 @@ contains
     Vec, intent(in) :: rhs, sol
     PetscErrorCode, intent(inout) :: ierr
     PetscInt :: its
+    KSPConvergedReason :: reason
 
     if (slv%scaled) call VecPointwiseMult(rhs, rhs, slv%dscale, ierr)
     call KSPSolve(slv%ksp, rhs, sol, ierr)
@@ -488,11 +481,15 @@ contains
     slv%its_sum = slv%its_sum + int(its)
     slv%its_max = max(slv%its_max, int(its))
     slv%nsolve  = slv%nsolve + 1
+    ! local query, no collective: an unconverged inner solve is still a usable
+    ! (weaker) preconditioner application, so it is counted, not raised
+    call KSPGetConvergedReason(slv%ksp, reason, ierr)
+    if (reason%v < 0) slv%nfail = slv%nfail + 1
   end subroutine sf_solver_apply
 
   subroutine sf_solver_reset_counters(slv)
     type(block_solver_t), intent(inout) :: slv
-    slv%its_sum = 0; slv%its_max = 0; slv%nsolve = 0
+    slv%its_sum = 0; slv%its_max = 0; slv%nsolve = 0; slv%nfail = 0
   end subroutine sf_solver_reset_counters
 
   !> One line: mean and max inner iterations since the last reset. An exact
@@ -502,9 +499,14 @@ contains
     type(block_solver_t), intent(in) :: slv
     integer, intent(in) :: my_id
     if (my_id /= 0 .or. slv%nsolve == 0) return
-    write(*,'(A,A,A,F7.2,A,I0,A,I0,A)') "[Physics PC]   inner ", trim(slv%label), &
+    write(*,'(A,A,A,F7.2,A,I0,A,I0,A)', advance="no") "[Physics PC]   inner ", trim(slv%label), &
       ": mean ", dble(slv%its_sum) / dble(slv%nsolve), " its, max ", slv%its_max, &
       " (", slv%nsolve, " solves)"
+    if (slv%nfail > 0) then
+      write(*,'(A,I0,A)') ", WARNING ", slv%nfail, " not converged"
+    else
+      write(*,*)
+    endif
   end subroutine sf_solver_report
 
   subroutine sf_solver_destroy(slv)
@@ -596,4 +598,12 @@ contains
   end subroutine sf_split_parts
 
 #endif
+
+  !> 1 + zeta, as the Jacobian's element matrix forms it (mod_elt_matrix_fft:
+  !! zeta rescaled for variable dt)
+  real*8 function sf_opz()
+    use phys_module, only: time_evol_zeta, tstep, tstep_prev
+    sf_opz = 1.0d0 + time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
+  end function sf_opz
+
 end module mod_petsc_pc_sf_solver

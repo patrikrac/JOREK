@@ -123,11 +123,14 @@ static PetscErrorCode part_apply(Mat M, const bmv_part *p, const PetscScalar *x,
   #pragma omp parallel num_threads(p->nt) if (p->nt > 1)
 #endif
   {
+    /* The runtime may start fewer than p->nt threads (nesting, OMP_DYNAMIC,
+       a thread limit), so each thread takes every nth partition. */
 #if defined(_OPENMP)
-    const PetscInt t = omp_get_thread_num();
+    const PetscInt t0 = omp_get_thread_num(), dt = omp_get_num_threads();
 #else
-    const PetscInt t = 0;
+    const PetscInt t0 = 0, dt = 1;
 #endif
+    for (PetscInt t = t0; t < p->nt; t += dt)
     for (PetscInt b = p->tb[t]; b < p->tb[t + 1]; b++) {
       const PetscInt i0 = p->bst[b], w = p->bst[b + 1] - i0;
       const PetscInt k0 = ia[i0], len = ia[i0 + 1] - k0;

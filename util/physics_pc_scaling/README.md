@@ -138,7 +138,7 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 | `sf_gmg` | S_uu = `schur` (the default): every block on its C¹ GMG, pair_psi split (ψ, j) and pair_w on zebra lines, ρ / T on radial lines |
 | `sf_gmg_w` | the same with S_uu = `w`, B₂₂ + W assembled |
 | `sf_gmg_wpj` | the same with pair_w mixed (u, ω, ψ, j), ring smoother |
-| `sf_lu` / `sf_lu_w` / `sf_lu_wpj` | every block by MUMPS LU: the exact references, for approximation quality (`sf_lu_wj*`, `sf_lu_wpj_flow`: the gate's ablations; `sf_lugw_wpj`: LU except pair_w) |
+| `sf_lu` / `sf_lu_w` / `sf_lu_wpj` | every block by MUMPS LU: the exact references, for approximation quality (`sf_lu_wj`: the lumped-mass form; `sf_lugw_wpj`: LU except pair_w) |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
 | `sf_direct` | full-system direct solve: one MUMPS LU of the whole coupled Jacobian (`-jorek_pc_full_lu`, in-core), refactorised every step (`iter_precon = 0`); FGMRES only checks it |
 
@@ -261,10 +261,11 @@ Production ramp, np 4 × 1 (outer its per step, pair_w V-cycles):
 coarsening at 16 surfaces, leaving a 16×24 coarsest level (17k rows, LU
 factorised at each of the 20 rebuilds: 39 s). The study meshes have n_flux −
 1 = 5·2^k and end at 6×8 (1.9k rows at 81×32).
-- `wpj_flow` (ψ row B₁₁) is identical to `wpj` on this case: in its linear
-  phase B₁₁ = opz M_ψ to 5 digits, so the small-flow assumption is untested.
+- A `wpj` variant with the ψ row B₁₁ (the flow kept) was identical to `wpj` on
+  this case: in its linear phase B₁₁ = opz M_ψ to 5 digits, so the small-flow
+  assumption is untested. It and the `wj` ablations below have been removed.
 - The (u, ω, j) forms, i.e. parabolized with ψ eliminated by the lumped mass,
-  are limited by that lumping (κ ≈ 58 for bicubic Hermite): `sf_lu_wj_kd`
+  are limited by that lumping (κ ≈ 58 for bicubic Hermite): the discrete-kink ablation
   12–17 its at tstep 1; with W's continuum kink (`wj`) they diverge at 10.
 
 Both pairs run asymmetric V-cycles, all level-0 smoothing after the coarse

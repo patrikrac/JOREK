@@ -4,7 +4,7 @@ module mod_petsc_pc_sf_pairw
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx, pcev_shellmult, pcev_mjsolve
-  use mod_petsc_pc_sf_solver, only: SF_GMG_AXIS_RINGS, sf_split_halves
+  use mod_petsc_pc_sf_solver, only: SF_GMG_AXIS_RINGS, sf_split_halves, sf_opz
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
   use mod_petsc_pc_gmg, only: gmg_push, gmg_pop, gmg_vcycle
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, &
@@ -247,7 +247,6 @@ contains
   !! vanishing denominator are floored to 1 (and counted).
   !--------------------------------------------------------------------
   subroutine make_dh(comm, my_id)
-    use phys_module, only: time_evol_zeta
     integer, intent(in) :: comm, my_id
     PetscInt :: i, n, rs, nl, nr, a, b
     PetscInt, pointer :: cl(:), cr(:)
@@ -259,7 +258,7 @@ contains
 
     call MatDiagonalScale(b31t, PETSC_NULL_VEC, qi, ierr)
     call MatGetDiagonal(g_ctx%B_33, dh, ierr)
-    call VecScale(dh, 1.0d0 + time_evol_zeta, ierr)
+    call VecScale(dh, sf_opz(), ierr)
     call MatGetOwnershipRange(g_ctx%B_13, rs, PETSC_NULL_INTEGER, ierr)
     call VecGetLocalSize(dh, n, ierr)
     call VecGetArray(dh, dp, ierr)

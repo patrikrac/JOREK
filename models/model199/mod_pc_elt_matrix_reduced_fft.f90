@@ -71,7 +71,7 @@
 module mod_pc_elt_matrix_reduced_fft
 
   use mod_pc_fft_scatter, only: scatter_fft_to_elm,   scatter_fft_to_elm_n, &
-                                scatter_fft_to_elm_k, scatter_fft_to_elm_kn
+                                scatter_fft_to_elm_k, scatter_fft_to_elm_kn, pc_my_fft
 
   implicit none
   private
@@ -662,6 +662,8 @@ subroutine pc_elt_matrix_reduced_fft(element, nodes, xpoint2, xcase2, &
         in_fft = ELM_p(1:n_plane,i,j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm(out_fft, i, j, ELM, DRV)
       endif
@@ -670,6 +672,8 @@ subroutine pc_elt_matrix_reduced_fft(element, nodes, xpoint2, xcase2, &
         in_fft = ELM_n(1:n_plane,i,j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm_n(out_fft, i, j, ELM, DRV)
       endif
@@ -678,6 +682,8 @@ subroutine pc_elt_matrix_reduced_fft(element, nodes, xpoint2, xcase2, &
         in_fft = ELM_k(1:n_plane,i,j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm_k(out_fft, i, j, ELM, DRV)
       endif
@@ -686,6 +692,8 @@ subroutine pc_elt_matrix_reduced_fft(element, nodes, xpoint2, xcase2, &
         in_fft = ELM_kn(1:n_plane,i,j)
 #ifdef USE_FFTW
         call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+        call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
         call scatter_fft_to_elm_kn(out_fft, i, j, ELM, DRV)
       endif
