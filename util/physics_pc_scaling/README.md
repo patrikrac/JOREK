@@ -333,10 +333,11 @@ the parallel parts actually do; check it before reading any timing:
   over the thread sweep.
 - `GMG<k> level types (A/P)`: the PETSc type of every level operator and
   prolongation (`MatPtAP` decides the coarse ones).
-- `... n J-sectors (... rows, reduced system ...)` and `J-sector solve vs
-  LU e -> in use`: the axis blocks' J-sector solve (see below). `-> LU kept`
-  means the exactness gate (1e-8) refused the sector solve for that level
-  and the sequential LU stays.
+- `... n J-sectors (... rows, reduced system ...)` and `J-sector solve
+  backward error e -> in use`: the axis blocks' J-sector solve (see below).
+  `-> LU used` means the exactness gate (row-wise backward error 1e-8)
+  refused the sector solve for that level; only then is the sequential LU
+  of the whole block built (`[Mem] ... axis block level g LU`).
 
 **The constraint mass on `schur`** (decided on the laptop, to confirm on the
 cluster). The level-0 operator of pair_w's multigrid applies B_33⁻¹ in every
@@ -382,7 +383,7 @@ operator too, and MUMPS was a run-time option):
 that own it (rank 0, and from 161×64 at np ≈ 43 on also its neighbours, each
 repeating the whole LU) is the strong-scaling critical path. The first
 cluster runs settled it: `SF_GMG_AXIS_SECTORS = -1` (the default) solves it
-over J-sector ranks, exact and gated against the LU on the first build. On
+over J-sector ranks, exact and gated on its backward error on the first build. On
 the laptop the sector solve loses about as much to synchronisation as it
 saves; that is expected there and no reason to switch it off. A binary with
 `SF_GMG_AXIS_SECTORS = 0` restores the sequential LU for comparison

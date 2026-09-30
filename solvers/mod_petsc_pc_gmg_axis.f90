@@ -26,9 +26,9 @@
 !!   g   = x_G - sum_s A_G,Is w_s              (one Allreduce, size |G|)
 !!   y_G = R^-1 g                              (redundant on every sector rank)
 !!   y_Is = A_Is^-1 (x_Is - A_Is,G y_G)        (in parallel)
-!! with sparse LUs throughout (PETSc's, nested dissection, as rds_t). It is
+!! with sparse LUs throughout (PETSc's, as rds_t). It is
 !! the same elimination as a sparse LU with the separators ordered last, so
-!! it is exact; the first build compares it with the rds_t LU.
+!! it is exact; the first build checks its backward error (axd_try).
 !!
 !! Its cost per solve on a sector rank is ~ 4 nnz(L_Is) + 2 nnz(L_R): the
 !! interiors shrink like n_tht/nsec while the separator chain grows like nsec,
@@ -40,7 +40,14 @@
 !! the sectors and without axis rows only enter the (empty) scatters.
 !!
 !! Structure (row classes, index sets, scatters, the reduced pattern) once per
-!! run; values and numeric factorisations per rebuild (axd_numeric).
+!! run; values and numeric factorisations per rebuild (axd_numeric), in two
+!! parts: the collective refill of the sector's couplings (axd_refill) and the
+!! factorisations, local to the sector ranks (axd_factor).
+!!
+!! The sector ranks are roff .. roff + nsec - 1 (mod np). The caller gives the
+!! levels of a hierarchy different offsets and factors them after all refills,
+!! so their factorisations run at the same time on different ranks instead of
+!! one after the other on ranks 0 .. nsec - 1.
 module mod_petsc_pc_gmg_axis
 #ifdef USE_PETSC
   use mpi_mod
@@ -49,7 +56,7 @@ module mod_petsc_pc_gmg_axis
   implicit none
   private
 
-  public :: axd_t, axd_nsec, axd_setup, axd_numeric, axd_solve
+  public :: axd_t, axd_nsec, axd_setup, axd_numeric, axd_refill, axd_factor, axd_solve
 
   type :: axd_t
     logical :: on = .false.                !< in use (the same on every rank)
@@ -90,17 +97,18 @@ contains
   !! n_tht of the level; nsec from axd_nsec. Leaves D%on = .false. (the same
   !! on every rank) if the block is not a chain the method applies to.
   !--------------------------------------------------------------------
-  subroutine axd_setup(D, A, loc, jl, nj, nsec_req, comm, tag)
+  subroutine axd_setup(D, A, loc, jl, nj, nsec_req, comm, tag, roff)
     type(axd_t), intent(inout) :: D
     Mat, intent(in)      :: A
     integer, intent(in)  :: loc(:), jl(:), nj, nsec_req, comm
     character(len=*), intent(in) :: tag
+    integer, intent(in), optional :: roff   !< first sector rank (default 0)
     PetscInt :: rst, ren, ncols, nn
     PetscInt, pointer :: cols(:)
     PetscInt, parameter :: izero = 0, four = 4
     PetscErrorCode :: ierr
     integer, parameter :: WMAX = 3         !< widest chain the separators handle
-    integer :: me, np, mpierr, nl, ntot, k, q, c, s, nd, j, color, t, nsec, w, thr
+    integer :: me, np, mpierr, nl, ntot, k, q, c, s, nd, j, color, t, nsec, w, thr, vme
     integer, allocatable :: cnts(:), dsps(:), gall(:), jall(:), ball(:), bmine(:), seen(:)
     integer, allocatable :: cls(:), csec(:), rid(:), jsep(:), nnz(:)
     PetscInt, allocatable :: li(:), lg(:), lo(:)
@@ -227,12 +235,15 @@ contains
 
     ! this rank's sector
     D%nsec = nsec
-    D%sector = (me < nsec)
+    vme = me
+    if (present(roff)) vme = modulo(me - roff, np)
+    D%sector = (vme < nsec)
     D%sec = -1
-    if (D%sector) D%sec = me
+    if (D%sector) D%sec = vme
     color = MPI_UNDEFINED
     if (D%sector) color = 1
-    call MPI_Comm_split(comm, color, me, D%comm, mpierr)
+    ! keyed by the sector: the Allgatherv of the Schur blocks is in sector order
+    call MPI_Comm_split(comm, color, vme, D%comm, mpierr)
     D%ni = 0; D%nga = 0; D%nout = 0
     if (D%sector) then
       s = D%sec
@@ -356,8 +367,35 @@ contains
   subroutine axd_numeric(D, A)
     type(axd_t), intent(inout) :: D
     Mat, intent(in) :: A
+    call axd_refill(D, A)
+    call axd_factor(D)
+  end subroutine axd_numeric
+
+  !> Collective part of axd_numeric: the sector's couplings refilled from A
+  !! (nothing on the first build, axd_setup extracted them).
+  subroutine axd_refill(D, A)
+    type(axd_t), intent(inout) :: D
+    Mat, intent(in) :: A
     PetscErrorCode :: ierr
     PetscInt, parameter :: four = 4
+    integer :: k
+    if (.not. D%numeric_done) return
+    call MatCreateSubMatrices(A, four, [D%isI, D%isI, D%isG, D%isG], [D%isI, D%isG, D%isI, D%isG], &
+                              MAT_REUSE_MATRIX, D%sub, ierr)
+    ! MAT_REUSE_MATRIX does not advance the submatrices' state: without the
+    ! assembly the LU would not be refactored (the rds_t trap)
+    do k = 1, 4
+      call MatAssemblyBegin(D%sub(k), MAT_FINAL_ASSEMBLY, ierr)
+      call MatAssemblyEnd(D%sub(k), MAT_FINAL_ASSEMBLY, ierr)
+    enddo
+  end subroutine axd_refill
+
+  !> Sector-rank part of axd_numeric (others return): factor A_Is, form the
+  !! Schur block, gather all blocks among the sector ranks, assemble and
+  !! factor R.
+  subroutine axd_factor(D)
+    type(axd_t), intent(inout) :: D
+    PetscErrorCode :: ierr
     PC  :: pc
     Mat :: Bd, Zd, Cd
     PetscScalar, pointer :: a2(:,:)
@@ -369,22 +407,12 @@ contains
     logical :: fresh
 
     fresh = .not. D%numeric_done
-    if (.not. fresh) then
-      call MatCreateSubMatrices(A, four, [D%isI, D%isI, D%isG, D%isG], [D%isI, D%isG, D%isI, D%isG], &
-                                MAT_REUSE_MATRIX, D%sub, ierr)
-      ! MAT_REUSE_MATRIX does not advance the submatrices' state: without the
-      ! assembly the LU would not be refactored (the rds_t trap)
-      do k = 1, 4
-        call MatAssemblyBegin(D%sub(k), MAT_FINAL_ASSEMBLY, ierr)
-        call MatAssemblyEnd(D%sub(k), MAT_FINAL_ASSEMBLY, ierr)
-      enddo
-    endif
     D%numeric_done = .true.
     if (.not. D%sector) return
 
     ! the interior LU
     if (fresh) then
-      call make_lu(D%kI, D%sub(1), "gmg_axsec_")
+      call make_lu(D%kI, D%sub(1), "gmg_axsec_", MATORDERINGQMD)
     else
       call KSPSetOperators(D%kI, D%sub(1), D%sub(1), ierr)
     endif
@@ -430,7 +458,7 @@ contains
     call MatAssemblyEnd(D%R, MAT_FINAL_ASSEMBLY, ierr)
     if (fresh) then
       call MatSetOption(D%R, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
-      call make_lu(D%kR, D%R, "gmg_axred_")
+      call make_lu(D%kR, D%R, "gmg_axred_", MATORDERINGND)
     else
       call KSPSetOperators(D%kR, D%R, D%R, ierr)
     endif
@@ -447,21 +475,24 @@ contains
              .or. (D%gcls(k_) == 3 .and. D%gcls(c_) == 3 .and. D%sec == 0)
     end function take
 
-    subroutine make_lu(ksp, M, pre)
+    !> ord: quotient minimum degree for the interiors (less fill than nested
+    !! dissection on the mixed pair_w block: factorisation, Schur block and
+    !! triangular solves all cheaper), nested dissection for R
+    subroutine make_lu(ksp, M, pre, ord)
       KSP :: ksp
       Mat :: M
-      character(len=*), intent(in) :: pre
+      character(len=*), intent(in) :: pre, ord
       call KSPCreate(PETSC_COMM_SELF, ksp, ierr)
       call KSPSetOperators(ksp, M, M, ierr)
       call KSPSetType(ksp, KSPPREONLY, ierr)
       call KSPGetPC(ksp, pc, ierr)
       call PCSetType(pc, PCLU, ierr)
       call PCFactorSetMatSolverType(pc, MATSOLVERPETSC, ierr)
-      call PCFactorSetMatOrderingType(pc, MATORDERINGND, ierr)
+      call PCFactorSetMatOrderingType(pc, ord, ierr)
       call KSPSetOptionsPrefix(ksp, pre, ierr)
       call KSPSetFromOptions(ksp, ierr)
     end subroutine make_lu
-  end subroutine axd_numeric
+  end subroutine axd_factor
 
   !> yy(axis rows) = A_ax^-1 xx(axis rows). Collective on the vectors'
   !! communicator (the two scatters); the rest runs on the sector ranks.

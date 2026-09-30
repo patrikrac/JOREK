@@ -44,7 +44,7 @@ module mod_petsc_pc_gmg
   use petsc
   use iso_c_binding, only: c_ptr, c_double
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach
-  use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_numeric, axd_solve
+  use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_numeric, axd_refill, axd_factor, axd_solve
   implicit none
   private
 
@@ -218,6 +218,9 @@ module mod_petsc_pc_gmg
     ! axis groups solved over J-sectors (axsec /= 0 and past the first-build
     ! gate against their LU): one axd_t per group, all or none
     logical :: axdon = .false.
+    logical :: axpend = .false.            !< sector couplings refilled, factorisation pending (one setup)
+    logical :: axnew = .false.             !< first build: factorisation and gate pending
+    Mat :: axA                             !< the operator of the pending first build
     type(axd_t), allocatable :: axd(:)
     ! Value maps, built once per operator pattern (pat_id/pat_nz): the k-th
     ! entry of the source goes to lu(dst) (dst > 0) or zv(-dst) (dst < 0).
@@ -303,6 +306,7 @@ module mod_petsc_pc_gmg
   ! physics-PC ctx, so this module keeps no dependency on it.
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1, gev_axislu = -1
   PetscLogEvent, save :: gev_axis = -1, gev_prolong = -1
+  PetscLogEvent, save :: gev_blkmesh = -1, gev_blkpat = -1, gev_blknum = -1, gev_axnum = -1, gev_axtry = -1
   ! Workstream G, finding D3: these are per INSTANCE, like gev_vcycle. While
   ! they were shared, no -log_view number could attribute line or axis time to
   ! pair_w rather than to Shat / rho / T, which is what left C1's rank soft.
@@ -581,8 +585,9 @@ contains
 
   contains
 
-    !> Sequential LU KSP of R%sub(1). Default PETSc's own LU with a
-    !! nested-dissection ordering: on these few-thousand-row blocks its
+    !> Sequential LU KSP of R%sub(1). Default PETSc's own LU (ordering:
+    !! nested dissection, quotient minimum degree for the axis blocks): on
+    !! these few-thousand-row blocks its
     !! triangular solve is ~2.5x cheaper per call than MUMPS'. Options under
     !! gmg<k>_<what>_ override both choices.
     subroutine rds_make_ksp(stype)
@@ -593,7 +598,17 @@ contains
       call KSPGetPC(R%ksp, pc, ierr)
       call PCSetType(pc, PCLU, ierr)
       call PCFactorSetMatSolverType(pc, stype, ierr)
-      if (stype == MATSOLVERPETSC) call PCFactorSetMatOrderingType(pc, MATORDERINGND, ierr)
+      if (stype == MATSOLVERPETSC) then
+        ! axis blocks: quotient minimum degree. On the mixed pair_w block
+        ! (161x64, 11532 rows) it leaves 6.2e6 factor entries where nested
+        ! dissection leaves 1.7e7: the numeric factorisation is 9x cheaper
+        ! and the triangular solve 2x
+        if (what(1:2) == "ax") then
+          call PCFactorSetMatOrderingType(pc, MATORDERINGQMD, ierr)
+        else
+          call PCFactorSetMatOrderingType(pc, MATORDERINGND, ierr)
+        endif
+      endif
       write(pre, '(A,I0,A,A,A)') "gmg", cur_inst, "_", what, "_"   ! sequential: no ICNTL(20) needed
       call KSPSetOptionsPrefix(R%ksp, trim(pre), ierr)
       call KSPSetFromOptions(R%ksp, ierr)
@@ -1654,6 +1669,7 @@ contains
       endif
       call KSPSetUp(gSm(g), ierr)
     enddo
+    call axd_factor_pending()
     call PetscLogEventEnd(gev_smsetup, ierr)
     block
       integer :: ib(3), ibg(3), mpierr
@@ -1886,6 +1902,11 @@ contains
     call PetscLogEventRegister("GMG_Prolong",  cid, gev_prolong,  ierr)
     call PetscLogEventRegister("GMG_SmSetup",  cid, gev_smsetup,  ierr)
     call PetscLogEventRegister("GMG_CoarseLU", cid, gev_coarselu, ierr)
+    call PetscLogEventRegister("GMG_BlkMesh",  cid, gev_blkmesh,  ierr)
+    call PetscLogEventRegister("GMG_BlkPat",   cid, gev_blkpat,   ierr)
+    call PetscLogEventRegister("GMG_BlkNum",   cid, gev_blknum,   ierr)
+    call PetscLogEventRegister("GMG_AxNum",    cid, gev_axnum,    ierr)
+    call PetscLogEventRegister("GMG_AxTry",    cid, gev_axtry,    ierr)
     call PetscLogEventRegister("GMG_AxisLU",   cid, gev_axislu,   ierr)
     call PetscLogEventRegister("GMG_VCycle",   cid, gev_vcycle(1),  ierr)
     call PetscLogEventRegister("GMG_Smooth0",  cid, gev_smooth0(1), ierr)
@@ -2008,13 +2029,11 @@ contains
     PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
     PetscInt, parameter :: one = 1
-    integer :: nc, I, J, m, bb, q, pcn, info, n, ldab, kk, tmp, nthr, ngrp, gnp, mpierr
+    integer :: nc, I, J, m, bb, q, pcn, info, n, ldab, kk, tmp, nthr, ngrp, mpierr
     integer, allocatable :: cnt(:), key(:)
     integer(8) :: ix
     PetscInt, allocatable :: axr(:)
     integer, allocatable :: binfo(:)
-    character(len=24) :: axname
-    character(len=64) :: axtag
     external :: dgetrf, dgbtrf
 
     B => gBk(g)
@@ -2024,6 +2043,7 @@ contains
     call MatGetLocalSize(A, nr, PETSC_NULL_INTEGER, ierr)
     call MatGetOwnershipRange(A, rst, ren, ierr)
     if (.not. allocated(B%bid)) then
+      call PetscLogEventBegin(gev_blkmesh, ierr)
       B%nrow = int(nr)
       allocate(B%bid(B%nrow), key(B%nrow))
       key = 0
@@ -2188,6 +2208,7 @@ contains
         if (size(blk_t_work, 1) < maxval(B%sz) .or. size(blk_t_work, 2) < nthr) deallocate(blk_t_work)
       endif
       if (.not. allocated(blk_t_work)) allocate(blk_t_work(maxval(B%sz), 0:nthr - 1))
+      call PetscLogEventEnd(gev_blkmesh, ierr)
     endif
 
     ! Pattern part, once per operator pattern: band widths and storage of the
@@ -2204,12 +2225,15 @@ contains
       newpat = (int(aid, 8) /= B%pat_id .or. int(nzst, 8) /= B%pat_nz)
       call MPI_Allreduce(MPI_IN_PLACE, newpat, 1, MPI_LOGICAL, MPI_LOR, gcomm, mpierr)
       if (newpat) then
+        call PetscLogEventBegin(gev_blkpat, ierr)
         call blk_pattern(B, A, rst, ren)
+        call PetscLogEventEnd(gev_blkpat, ierr)
         B%pat_id = int(aid, 8); B%pat_nz = int(nzst, 8)
       else if (B%ovl) then
         call MatCreateSubMatrices(A, one, [B%isg], [B%isall], MAT_REUSE_MATRIX, B%sg, ierr)
       endif
     end block
+    call PetscLogEventBegin(gev_blknum, ierr)
     call blk_fill(B, A)
 
     ! The blocks are independent: factor them on the rank's OpenMP threads
@@ -2264,26 +2288,27 @@ contains
       endif
     enddo
 
+    call PetscLogEventEnd(gev_blknum, ierr)
     if (B%axsparse .and. B%axdon) then
+      ! refill only: the factorisations of all levels run together after the
+      ! level loop (axd_factor_pending), on each level's own sector ranks
+      call PetscLogEventBegin(gev_axnum, ierr)
       do kk = 1, size(B%axd)
-        call axd_numeric(B%axd(kk), A)
+        call axd_refill(B%axd(kk), A)
       enddo
+      B%axpend = .true.
+      call PetscLogEventEnd(gev_axnum, ierr)
     else if (B%axsparse) then
-      if (size(B%axg) == 1) then
-        write(axname, '(A,I0)') "axblk", g
-        write(axtag, '(A,I0)') "axis block level ", g
-        call rds_setup(B%axg(1), A, trim(axname), trim(axtag))
-      else
-        call MPI_Comm_size(gcomm, gnp, mpierr)
-        do kk = 1, size(B%axg)
-          write(axname, '(A,I0,A,I0)') "axblk", g, "n", kk - 1
-          write(axtag, '(A,I0,A,I0,A,I0)') "axis block level ", g, " |n|-group ", kk - 1, &
-                                           " on rank ", mod(kk - 1, gnp)
-          call rds_setup(B%axg(kk), A, trim(axname), trim(axtag), mod(kk - 1, gnp))
-        enddo
+      ! first build: the J-sector solve is set up before any LU of the whole
+      ! block; its factorisation and gate follow the level loop
+      ! (axd_factor_pending), and the LU is only built where it is not in use
+      if (axsec /= 0 .and. .not. allocated(B%axd)) then
+        call PetscLogEventBegin(gev_axtry, ierr)
+        call axd_prepare(g, A, B)
+        call PetscLogEventEnd(gev_axtry, ierr)
       endif
-      if (axsec /= 0 .and. .not. allocated(B%axd)) call axd_try(g, A, B)
     endif
+    if (B%axsparse .and. .not. B%axdon .and. .not. B%axnew) call ax_lu(g, A, B)
 
     if (B%axsparse .and. axis_mult > 0) then
       if (B%gsready) then
@@ -2856,23 +2881,99 @@ contains
     end subroutine sort_ghosts
   end subroutine ovl_extend
 
-  !> First build: the axis groups of level g over J-sectors, gated against
-  !! the LUs just set up. Both solve the same random right-hand side; the
-  !! sector solve is used (for all groups, or none) if the solutions agree to
-  !! 1e-8 relative, far below any smoother's accuracy and above the pair
-  !! blocks' LU round-off (kappa ~ 1e7). Collective on gcomm.
-  subroutine axd_try(g, A, B)
+  !> The sector factorisations the level loop left pending (rebuilds): every
+  !! level's sector ranks work at the same time. Levels in ascending order on
+  !! every rank, so the gathers among a level's sector ranks cannot deadlock.
+  subroutine axd_factor_pending()
+    integer :: g, kk
+    PetscErrorCode :: ierr
+    call PetscLogEventBegin(gev_axnum, ierr)
+    do g = 0, nlev - 2
+      if (gBk(g)%axpend) then
+        do kk = 1, size(gBk(g)%axd)
+          call axd_factor(gBk(g)%axd(kk))
+        enddo
+        gBk(g)%axpend = .false.
+      endif
+      if (gBk2(g)%axpend) then
+        do kk = 1, size(gBk2(g)%axd)
+          call axd_factor(gBk2(g)%axd(kk))
+        enddo
+        gBk2(g)%axpend = .false.
+      endif
+    enddo
+    call PetscLogEventEnd(gev_axnum, ierr)
+    ! first build: the gates, and the LU where a sector solve failed its gate
+    do g = 0, nlev - 2
+      if (gBk(g)%axnew) call finish(gBk(g))
+      if (gBk2(g)%axnew) call finish(gBk2(g))
+    enddo
+
+  contains
+
+    subroutine finish(B)
+      type(blk_t), intent(inout) :: B
+      B%axnew = .false.
+      call axd_gate(g, B%axA, B)
+      if (.not. B%axdon) call ax_lu(g, B%axA, B)
+    end subroutine finish
+  end subroutine axd_factor_pending
+
+  !> The LU of the whole axis block(s) of level g (rds_t): where no sector
+  !! solve is in use. First build and every rebuild.
+  subroutine ax_lu(g, A, B)
+    integer, intent(in) :: g
+    Mat, intent(in) :: A
+    type(blk_t), intent(inout) :: B
+    integer :: kk, gnp, mpierr
+    character(len=24) :: axname
+    character(len=64) :: axtag
+    if (size(B%axg) == 1) then
+      write(axname, '(A,I0)') "axblk", g
+      write(axtag, '(A,I0)') "axis block level ", g
+      call rds_setup(B%axg(1), A, trim(axname), trim(axtag))
+    else
+      call MPI_Comm_size(gcomm, gnp, mpierr)
+      do kk = 1, size(B%axg)
+        write(axname, '(A,I0,A,I0)') "axblk", g, "n", kk - 1
+        write(axtag, '(A,I0,A,I0,A,I0)') "axis block level ", g, " |n|-group ", kk - 1, &
+                                         " on rank ", mod(kk - 1, gnp)
+        call rds_setup(B%axg(kk), A, trim(axname), trim(axtag), mod(kk - 1, gnp))
+      enddo
+    endif
+  end subroutine ax_lu
+
+  !> First sector rank of level g: the levels' sector sets follow each other
+  !! over the ranks (wrapping at np), so their factorisations overlap in time.
+  integer function axd_offset(g, gnp)
+    integer, intent(in) :: g, gnp
+    integer :: h, nc, ns
+    axd_offset = 0
+    do h = 0, g - 1
+      if (h == 0) then
+        nc = nth0
+      else
+        nc = glv(h)%nj
+      endif
+      ns = axsec
+      if (ns < 0) ns = axd_nsec(nc, gnp)
+      ns = min(ns, gnp, nc / 4)
+      if (ns >= 2) axd_offset = axd_offset + ns
+    enddo
+    axd_offset = modulo(axd_offset, gnp)
+  end function axd_offset
+
+  !> First build: the structure of the J-sector solve of level g's axis
+  !! groups (axd_setup). If every group is a chain the method applies to, the
+  !! factorisation and the gate are left pending (B%axnew); otherwise the
+  !! caller builds the LU. Collective on gcomm.
+  subroutine axd_prepare(g, A, B)
     integer, intent(in) :: g
     Mat, intent(in) :: A
     type(blk_t), intent(inout) :: B
     integer :: kk, q, r, nsec, gnp, mpierr, nc
     integer, allocatable :: jl(:)
     character(len=64) :: axtag
-    Vec :: x, y1, y2
-    PetscScalar, pointer :: yp(:)
-    real*8 :: dn, yn
-    logical :: pass
-    PetscErrorCode :: ierr
 
     call MPI_Comm_size(gcomm, gnp, mpierr)
     if (g == 0) then
@@ -2885,7 +2986,6 @@ contains
     nsec = min(nsec, gnp, nc / 4)
     if (nsec < 2) return
     allocate(B%axd(size(B%axg)))
-    pass = .true.
     do kk = 1, size(B%axg)
       allocate(jl(size(B%axg(kk)%loc)))
       do q = 1, size(jl)
@@ -2897,34 +2997,81 @@ contains
         endif
       enddo
       write(axtag, '(A,I0,A,I0,A,I0)') "GMG", cur_inst, " axis block level ", g, " group ", kk - 1
-      call axd_setup(B%axd(kk), A, B%axg(kk)%loc, jl, nc, nsec, gcomm, trim(axtag))
+      call axd_setup(B%axd(kk), A, B%axg(kk)%loc, jl, nc, nsec, gcomm, trim(axtag), axd_offset(g, gnp))
       deallocate(jl)
-      if (.not. B%axd(kk)%on) then
-        pass = .false.
-        exit
-      endif
-      call axd_numeric(B%axd(kk), A)
-      call MatCreateVecs(A, x, y1, ierr)
-      call VecDuplicate(y1, y2, ierr)
+      if (.not. B%axd(kk)%on) return
+    enddo
+    B%axnew = .true.; B%axpend = .true.
+    B%axA = A
+  end subroutine axd_prepare
+
+  !> First build, after the factorisations: the gate of level g's sector
+  !! solves, their row-wise backward error for a random right-hand side on
+  !! each group's rows. The sector solve is used (for all groups, or none) if
+  !! that is below 1e-8. Not the error: the blocks are ill-conditioned (a
+  !! manufactured solution comes back to 1e-4 only). No LU of the whole
+  !! block is needed for the gate: that factorisation (sequential, on the
+  !! ranks owning the axis rows) was the first build's critical path.
+  !! Collective on gcomm.
+  subroutine axd_gate(g, A, B)
+    integer, intent(in) :: g
+    Mat, intent(in) :: A
+    type(blk_t), intent(inout) :: B
+    integer :: kk, q, mpierr
+    logical, allocatable :: ing(:)
+    character(len=64) :: axtag
+    Vec :: x, y1, y2
+    PetscScalar, pointer :: yp(:), xp(:), vals(:)
+    PetscInt :: rst, ren, ncols
+    real*8 :: dn, yn, sc
+    logical :: pass
+    PetscErrorCode :: ierr
+
+    pass = .true.
+    do kk = 1, size(B%axg)
+      write(axtag, '(A,I0,A,I0,A,I0)') "GMG", cur_inst, " axis block level ", g, " group ", kk - 1
+      ! random b on the group's rows, y = sector solve, residual b - A y there
+      ! (y is zero outside the group, so A y on its rows is the block times y)
+      call MatCreateVecs(A, y2, x, ierr)
+      call VecDuplicate(x, y1, ierr)
       call VecSetRandom(x, PETSC_NULL_RANDOM, ierr)
-      call VecZeroEntries(y1, ierr); call VecZeroEntries(y2, ierr)
-      call rds_solve(B%axg(kk), x, y1)
-      ! only the LU's members wrote y1: without touching it everywhere, the
-      ! others keep y1's cached zero norm and skip VecNorm's Allreduce
-      call VecGetArray(y1, yp, ierr)
-      call VecRestoreArray(y1, yp, ierr)
+      allocate(ing(B%nrow))
+      ing = .false.
+      ing(B%axg(kk)%loc + 1) = .true.
+      call VecGetArray(x, yp, ierr)
+      do q = 1, B%nrow
+        if (.not. ing(q)) yp(q) = 0.0d0
+      enddo
+      call VecRestoreArray(x, yp, ierr)
+      call VecZeroEntries(y2, ierr)
       call axd_solve(B%axd(kk), x, y2)
-      call VecNorm(y1, NORM_2, yn, ierr)
-      call VecAXPY(y2, -1.0d0, y1, ierr)
-      call VecNorm(y2, NORM_2, dn, ierr)
+      call MatMult(A, y2, y1, ierr)
+      call VecNorm(y2, NORM_INFINITY, yn, ierr)
+      ! row-wise backward error max_i |r_i| / (max_j |a_ij| |y|_inf + |b_i|):
+      ! the rows' scales differ by decades (boundary rows), so a plain
+      ! residual norm would measure the largest rows' round-off only
+      call MatGetOwnershipRange(A, rst, ren, ierr)
+      call VecGetArrayRead(y1, yp, ierr)
+      call VecGetArrayRead(x, xp, ierr)
+      dn = 0.0d0
+      do q = 1, B%nrow
+        if (.not. ing(q)) cycle
+        call MatGetRow(A, rst + q - 1, ncols, PETSC_NULL_INTEGER_POINTER, vals, ierr)
+        sc = maxval(abs(vals(1:ncols)))
+        call MatRestoreRow(A, rst + q - 1, ncols, PETSC_NULL_INTEGER_POINTER, vals, ierr)
+        dn = max(dn, abs(xp(q) - yp(q)) / max(sc * yn + abs(xp(q)), 1.d-300))
+      enddo
+      call VecRestoreArrayRead(x, xp, ierr)
+      call VecRestoreArrayRead(y1, yp, ierr)
+      deallocate(ing)
+      call MPI_Allreduce(MPI_IN_PLACE, dn, 1, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
       call VecDestroy(x, ierr); call VecDestroy(y1, ierr); call VecDestroy(y2, ierr)
       if (gme == 0) write(*,'(A,A,A,ES9.2,A)') "[Physics PC]   ", trim(axtag), &
-        ": J-sector solve vs LU ", dn / max(yn, 1.d-300), merge(" -> in use ", " -> LU kept", &
-        dn <= 1.d-8 * yn)
-      if (dn > 1.d-8 * yn) pass = .false.
+        ": J-sector solve backward error ", dn, merge(" -> in use ", " -> LU used", dn <= 1.d-8)
+      if (dn > 1.d-8) pass = .false.
     enddo
     B%axdon = pass
-  end subroutine axd_try
+  end subroutine axd_gate
 
   !> In-place ascending heapsort, O(n log n) (the setup's medians; an
   !! insertion sort there was O(n^2) in the cell count).
