@@ -75,6 +75,7 @@ module mod_petsc_raw_csr
 
   public :: c_baij_get, c_baij_restore, c_aij_get, c_aij_restore
   public :: split_parts, get_ij, put_ij, aij_parts, aij_vals_read, aij_vals_done
+  public :: aij_vals_write, aij_vals_written
   public :: blockmv_attach
 
 contains
@@ -188,6 +189,25 @@ contains
     integer(c_int) :: rc
     rc = c_aij_restore_read(transfer(M%v, 0_c_intptr_t), p)
   end subroutine aij_vals_done
+
+  !> Writable value array (length n) of a sequential AIJ matrix. Through
+  !! PETSc's accessor, so a device matrix type knows its host values changed.
+  subroutine aij_vals_write(M, n, p, v)
+    Mat, intent(in) :: M
+    integer(8), intent(in) :: n
+    type(c_ptr), intent(out) :: p
+    real(c_double), pointer, intent(out) :: v(:)
+    integer(c_int) :: rc
+    rc = c_aij_get(transfer(M%v, 0_c_intptr_t), p)
+    call c_f_pointer(p, v, [max(n, 1_8)])
+  end subroutine aij_vals_write
+
+  subroutine aij_vals_written(M, p)
+    Mat, intent(in) :: M
+    type(c_ptr), intent(inout) :: p
+    integer(c_int) :: rc
+    rc = c_aij_restore(transfer(M%v, 0_c_intptr_t), p)
+  end subroutine aij_vals_written
 
 #endif
 end module mod_petsc_raw_csr

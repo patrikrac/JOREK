@@ -42,8 +42,10 @@ module mod_petsc_pc_gmg
   !$ use omp_lib
 #include "petsc/finclude/petsc.h"
   use petsc
-  use iso_c_binding, only: c_ptr, c_double
-  use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach
+  use iso_c_binding, only: c_ptr, c_double, c_null_ptr, c_associated
+  use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach, &
+                               aij_vals_write, aij_vals_written
+  use mod_petsc_blk_dev, only: blk_dev_available, blk_dev_pattern, blk_dev_values, blk_dev_apply, blk_dev_free
   use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_refill, axd_factor, axd_solve
   implicit none
   private
@@ -135,6 +137,14 @@ module mod_petsc_pc_gmg
   Mat, save         :: gF                   !< fine-level matvec operator: gA(0), or a
                                             !< matrix-free equivalent (Workstream D)
   logical, save     :: p_ready = .false., op_ready = .false., vec_ready = .false.
+  ! Device path (-sf_gpu 1, dev_operators): the V-cycle multiplies with device
+  ! copies of the level operators and prolongations and keeps its vectors on
+  ! the device. The host matrices above stay what the setup works on (Galerkin
+  ! chain, smoother blocks, value maps), so the setup is the CPU path's.
+  logical, save     :: dev = .false.
+  logical, save     :: dev_blocks = .true.    !< -sf_gpu_blocks: block smoothers on the device too
+  logical, save     :: blk_host = .false.     !< blk_apply on the host factors (the gate's reference)
+  Mat, save         :: gAd(0:MAX_LEV-1), gPd(1:MAX_LEV-1), gFd
 
   !> A direct solve of A(rows, rows) done REDUNDANTLY on the ranks that own
   !! some of those rows (sub-communicator comm; mostly one rank, since JOREK
@@ -230,6 +240,11 @@ module mod_petsc_pc_gmg
     integer(8), allocatable :: vd(:), gd(:)
     integer(8) :: nvd = 0, nvo = 0, nvg = 0          !< source value-array lengths
     integer(8) :: pat_id = -1, pat_nz = -1
+    ! Device path: the factors' copy on the device (mod_petsc_blk_dev), which
+    ! then does the solves of every block but the axis blocks; null = host.
+    ! dstat = largest block, widest band, multiply-adds of one pass.
+    type(c_ptr) :: dh = c_null_ptr
+    real*8 :: dstat(3) = 0.d0
   end type blk_t
   type(blk_t), save, target :: gBk(0:MAX_LEV-1)
   !> Smoother 9 (alternating): the radial-line blocks; gBk holds the rings
@@ -290,6 +305,8 @@ module mod_petsc_pc_gmg
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false., sm_blocks = .false.
     Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gF
+    logical :: dev = .false.
+    Mat :: gAd(0:MAX_LEV-1), gPd(1:MAX_LEV-1), gFd
     KSP :: gSm(0:MAX_LEV-1), gAxis
     type(rds_t) :: gcrs
     Vec :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1), gzax
@@ -309,7 +326,7 @@ module mod_petsc_pc_gmg
   ! -log_view events (Workstream D cost audit). Registered here, not in the
   ! physics-PC ctx, so this module keeps no dependency on it.
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1, gev_axislu = -1
-  PetscLogEvent, save :: gev_axis = -1, gev_prolong = -1
+  PetscLogEvent, save :: gev_axis = -1, gev_prolong = -1, gev_dev = -1
   PetscLogEvent, save :: gev_blkmesh = -1, gev_blkpat = -1, gev_blknum = -1, gev_axnum = -1, gev_axtry = -1
   ! Workstream G, finding D3: these are per INSTANCE, like gev_vcycle. While
   ! they were shared, no -log_view number could attribute line or axis time to
@@ -375,6 +392,7 @@ contains
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready; S%sm_blocks = sm_blocks
       S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm; S%gAxis = gAxis
+      S%dev = dev; S%gAd = gAd; S%gPd = gPd; S%gFd = gFd
       S%gx = gx; S%gb = gb; S%gr = gr; S%gzax = gzax; S%gisAxis = gisAxis
       do g = 0, MAX_LEV - 1
         call move_blk(gBk(g), S%gBk(g))
@@ -395,6 +413,7 @@ contains
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready; sm_blocks = S%sm_blocks
       gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm; gAxis = S%gAxis
+      dev = S%dev; gAd = S%gAd; gPd = S%gPd; gFd = S%gFd
       gx = S%gx; gb = S%gb; gr = S%gr; gzax = S%gzax; gisAxis = S%gisAxis
       do g = 0, MAX_LEV - 1
         call move_blk(S%gBk(g), gBk(g))
@@ -449,6 +468,7 @@ contains
     b%axdon = a%axdon; a%axdon = .false.
     if (allocated(a%axd))  call move_alloc(a%axd,  b%axd)
     b%pat_id = a%pat_id; b%pat_nz = a%pat_nz; a%pat_id = -1; a%pat_nz = -1
+    b%dh = a%dh; a%dh = c_null_ptr; b%dstat = a%dstat
   end subroutine move_blk
 
   subroutine move_rds(a, b)
@@ -827,9 +847,24 @@ contains
     call gmg_select(k)
     if (diag_left > 0 .and. cur_inst <= 2) call ring_diag(b)
     call PetscLogEventBegin(gev_vcycle(cur_inst), ierr)
-    call vcycle(0, b, x)
+    call vcycle_top(b, x)
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
   end subroutine gmg_vcycle
+
+  !> The V-cycle on the caller's vectors. On the device path they are host
+  !! vectors (the block's Krylov solver owns them): level 0's own pair, unused
+  !! by the cycle otherwise, carries them to the device and back.
+  subroutine vcycle_top(b, x)
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    if (dev) then
+      call VecCopy(b, gb(0), ierr)
+      call vcycle(0, gb(0), gx(0))
+      call VecCopy(gx(0), x, ierr)
+    else
+      call vcycle(0, b, x)
+    endif
+  end subroutine vcycle_top
 
   !> PC-shell entry points of the pair_w (1), Shat (2), rho (3) and T (4)
   !! hierarchies. gmg_vcycle_apply is instance 1's historical name and is kept
@@ -1538,10 +1573,12 @@ contains
     endif
     sm_type = o%smoother
     sm_nstep = o%nsmooth
+    call dev_operators(my_id, reuse)
     ! threaded matvecs: after the Galerkin chain, on every rebuild (the attach
     ! is idempotent and only re-plans on a new pattern). gA(0) is the caller's
-    ! operator; P serves the V-cycle's prolongation (MatMultAdd).
-    if (o%blockmv == 1) then
+    ! operator; P serves the V-cycle's prolongation (MatMultAdd). Not on the
+    ! device path, whose V-cycle multiplies with the device copies.
+    if (o%blockmv == 1 .and. .not. dev) then
       block
         use mod_parameters, only: n_tor
         integer :: gg
@@ -1617,12 +1654,12 @@ contains
       ! the operators and refactors the smoother blocks.
       if (.not. op_ready) call KSPCreate(comm, gSm(g), ierr)
       if (g == 0 .and. o%smooth_op == 0) then
-        call KSPSetOperators(gSm(g), gF, gA(g), ierr)     ! Jacobi reads the Pmat
+        call KSPSetOperators(gSm(g), gFd, gAd(g), ierr)   ! Jacobi reads the Pmat
       else
         ! smooth_op 1: the fine smoother iterates on the assembled surrogate;
         ! only the V-cycle residual and the outer Krylov apply gF (the shell)
         ! -- one exact-mass solve per matvec there instead of per GMRES step
-        call KSPSetOperators(gSm(g), gA(g), gA(g), ierr)
+        call KSPSetOperators(gSm(g), gAd(g), gAd(g), ierr)
       endif
       if (.not. op_ready) then
         if (sm_type == 1 .or. sm_type == 2 .or. g >= rich_from) then
@@ -1696,6 +1733,7 @@ contains
       call KSPSetUp(gSm(g), ierr)
     enddo
     call axd_factor_pending()
+    if (dev .and. .not. op_ready) call blk_dev_gate(my_id)
     call PetscLogEventEnd(gev_smsetup, ierr)
     block
       integer :: ib(3), ibg(3), mpierr
@@ -1798,7 +1836,7 @@ contains
 
     if (.not. vec_ready) then
       do g = 0, nlev - 1
-        call MatCreateVecs(gA(g), gx(g), gb(g), ierr)
+        call MatCreateVecs(gAd(g), gx(g), gb(g), ierr)
         call VecDuplicate(gx(g), gr(g), ierr)
       enddo
       if (.not. sm_blocks) call MatCreateVecs(Aax, gzax, PETSC_NULL_VEC, ierr)
@@ -1828,6 +1866,170 @@ contains
     enddo
     if (my_id == 0) write(*,'(A,F6.3)') "   C_op = ", nzt / max(nz0, 1.d0)
   end subroutine gmg_setup_operator
+
+  !> The operators the V-cycle multiplies with: gAd / gPd / gFd. Host path:
+  !! the level operators themselves. Device path (-sf_gpu 1, or -sf_gmg<k>_gpu
+  !! for one hierarchy): copies of type -sf_gpu_mat_type (default aijkokkos,
+  !! PETSc's portable backend), created at the first build or for a new
+  !! pattern and refilled from the host values at every other rebuild. A
+  !! matrix-free gF stays as it is.
+  subroutine dev_operators(my_id, reuse)
+    integer, intent(in) :: my_id
+    logical, intent(in) :: reuse
+    character(len=64), save :: mtype = "aijkokkos"
+    character(len=80) :: tf
+    PetscErrorCode :: ierr
+    PetscInt :: pv
+    PetscBool :: set
+    integer :: g, idev
+    logical :: fresh, own_f
+
+    if (.not. op_ready) then
+      pv = 0
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu", pv, set, ierr)
+      idev = int(pv)
+      call opt_int("gpu", idev)
+      dev = (idev > 0)
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_mat_type", mtype, set, ierr)
+      pv = 1
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_blocks", pv, set, ierr)
+      dev_blocks = (pv > 0 .and. blk_dev_available())
+    endif
+    if (.not. dev) then
+      gAd = gA; gPd = gP; gFd = gF
+      return
+    endif
+    call PetscLogEventBegin(gev_dev, ierr)
+    fresh = .not. (op_ready .and. reuse)
+    call MatGetType(gF, tf, ierr)
+    own_f = (gF /= gA(0) .and. index(tf, "aij") > 0)
+    do g = 0, nlev - 1
+      if (fresh) then
+        if (op_ready) call MatDestroy(gAd(g), ierr)
+        call dev_copy(gA(g), gAd(g))
+      else
+        call dev_refill(gA(g), gAd(g))
+      endif
+    enddo
+    if (.not. op_ready) then
+      do g = 1, nlev - 1
+        call dev_copy(gP(g), gPd(g))
+      enddo
+    endif
+    if (own_f) then
+      if (fresh) then
+        if (op_ready) call MatDestroy(gFd, ierr)
+        call dev_copy(gF, gFd)
+      else
+        call dev_refill(gF, gFd)
+      endif
+    else if (gF == gA(0)) then
+      gFd = gAd(0)
+    else
+      gFd = gF
+    endif
+    call PetscLogEventEnd(gev_dev, ierr)
+    if (.not. op_ready .and. my_id == 0) then
+      call MatGetType(gAd(0), tf, ierr)
+      write(*,'(A,I0,A,A,A,I0,A)') "[Physics PC]   GMG", cur_inst, ": V-cycle operators on the device path (", &
+        trim(tf), ", ", nlev, " levels)"
+    endif
+
+  contains
+
+    !> D = a device-type copy of S. Not MatConvert(S, ..., MAT_INITIAL_MATRIX):
+    !! PETSc 3.25.3's MPIAIJ -> MPIAIJKokkos conversion then retypes the
+    !! SOURCE's diagonal/off-diagonal parts and ghost vector instead of the
+    !! copy's (mpiaijkok.kokkos.cxx, MatConvert_MPIAIJ_MPIAIJKokkos), which
+    !! breaks the host operator the setup keeps using. In place it is right.
+    subroutine dev_copy(S, D)
+      Mat, intent(in)  :: S
+      Mat, intent(out) :: D
+      call MatDuplicate(S, MAT_COPY_VALUES, D, ierr)
+      call MatConvert(D, trim(mtype), MAT_INPLACE_MATRIX, D, ierr)
+    end subroutine dev_copy
+  end subroutine dev_operators
+
+  !> First build: the device block solves of every level against the host
+  !! factors they were copied from, on a random vector. Same algorithm, so the
+  !! difference is round-off; a level that misses DEV_GATE_TOL goes back to the
+  !! host solves (on every rank).
+  subroutine blk_dev_gate(my_id)
+    integer, intent(in) :: my_id
+    real*8, parameter :: DEV_GATE_TOL = 1.d-10
+    PC  :: nopc
+    Vec :: x, y1, y2
+    PetscErrorCode :: ierr
+    real*8 :: dn, yn, st(3), sm
+    logical :: has
+    integer :: g, lev0, mpierr
+
+    lev0 = cur_lev
+    do g = 0, nlev - 2
+      has = c_associated(gBk(g)%dh)
+      call MPI_Allreduce(MPI_IN_PLACE, has, 1, MPI_LOGICAL, MPI_LOR, gcomm, mpierr)
+      if (.not. has) cycle
+      call MatCreateVecs(gAd(g), x, y1, ierr)
+      call VecDuplicate(y1, y2, ierr)
+      call VecSetRandom(x, PETSC_NULL_RANDOM, ierr)
+      call VecZeroEntries(y1, ierr)
+      call VecZeroEntries(y2, ierr)
+      cur_lev = g
+      blk_host = .true.
+      call blk_apply(nopc, x, y1, ierr)
+      blk_host = .false.
+      call blk_apply(nopc, x, y2, ierr)
+      call VecNorm(y1, NORM_2, yn, ierr)
+      call VecAXPY(y1, -1.0d0, y2, ierr)
+      call VecNorm(y1, NORM_2, dn, ierr)
+      call VecDestroy(x, ierr); call VecDestroy(y1, ierr); call VecDestroy(y2, ierr)
+      dn = dn / max(yn, 1.d-300)
+      st = 0.d0
+      if (c_associated(gBk(g)%dh)) st = gBk(g)%dstat
+      sm = st(3)
+      call MPI_Allreduce(MPI_IN_PLACE, st(1:2), 2, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
+      call MPI_Allreduce(MPI_IN_PLACE, sm, 1, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
+      if (.not. (dn <= DEV_GATE_TOL)) call blk_dev_free(gBk(g)%dh)
+      if (my_id == 0) write(*,'(A,I0,A,I0,A,ES9.2,A,A,I0,A,I0,A,ES9.2,A)') "[Physics PC]   GMG", cur_inst, &
+        " level ", g, ": device block solves vs host ", dn, &
+        merge(" -> in use       ", " -> WARNING: host", dn <= DEV_GATE_TOL), &
+        " (largest block ", nint(st(1)), ", widest band ", nint(st(2)), ", ", sm, " mult-adds per pass)"
+    enddo
+    cur_lev = lev0
+  end subroutine blk_dev_gate
+
+  !> D's values = S's, D a converted copy of S (same CSR, entry by entry).
+  subroutine dev_refill(S, D)
+    Mat, intent(in) :: S, D
+    Mat :: Sd, So, Dd, Do_
+    PetscInt, pointer :: garr(:)
+    logical :: has_o
+
+    call aij_parts(S, Sd, So, garr, has_o)
+    call aij_parts(D, Dd, Do_, garr, has_o)
+    call copy_part(Sd, Dd)
+    if (has_o) call copy_part(So, Do_)
+
+  contains
+
+    subroutine copy_part(Ms, Md)
+      Mat, intent(in) :: Ms, Md
+      PetscInt :: n
+      PetscInt, pointer :: ia(:), ja(:)
+      integer(8) :: nz
+      type(c_ptr) :: ps, pd
+      real(c_double), pointer :: vs(:), vd(:)
+      call get_ij(Ms, .false., n, ia, ja)
+      nz = int(ia(n + 1), 8)
+      call put_ij(Ms, .false., n, ia, ja)
+      if (nz == 0) return
+      call aij_vals_read(Ms, nz, ps, vs)
+      call aij_vals_write(Md, nz, pd, vd)
+      vd(1:nz) = vs(1:nz)
+      call aij_vals_written(Md, pd)
+      call aij_vals_done(Ms, ps)
+    end subroutine copy_part
+  end subroutine dev_refill
 
   !> Two hashes of A's sparsity pattern (row lengths and global column indices
   !! of the owned rows), summed over the ranks. Equal signatures between two
@@ -1916,7 +2118,7 @@ contains
     call gmg_select(1)                  ! the PC-shell entry point is pair_w's
     if (diag_left > 0) call ring_diag(b)
     call PetscLogEventBegin(gev_vcycle(cur_inst), ierr)
-    call vcycle(0, b, x)
+    call vcycle_top(b, x)
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
     ierr = 0
   end subroutine gmg_vcycle_apply
@@ -1927,6 +2129,7 @@ contains
     if (gev_ready) return
     call PetscLogEventRegister("GMG_PtAP",     cid, gev_ptap,     ierr)
     call PetscLogEventRegister("GMG_Prolong",  cid, gev_prolong,  ierr)
+    call PetscLogEventRegister("GMG_DevOps",   cid, gev_dev,      ierr)
     call PetscLogEventRegister("GMG_SmSetup",  cid, gev_smsetup,  ierr)
     call PetscLogEventRegister("GMG_CoarseLU", cid, gev_coarselu, ierr)
     call PetscLogEventRegister("GMG_BlkMesh",  cid, gev_blkmesh,  ierr)
@@ -1990,15 +2193,15 @@ contains
       call VecCopy(b, gr(g), ierr)                        ! x is still 0: r = b
     else
       if (g == 0) then
-        call MatMult(gF, x, gr(g), ierr)
+        call MatMult(gFd, x, gr(g), ierr)
       else
-        call MatMult(gA(g), x, gr(g), ierr)
+        call MatMult(gAd(g), x, gr(g), ierr)
       endif
       call VecAYPX(gr(g), -1.0d0, b, ierr)                ! r = b - A x
     endif
-    call MatMultTranspose(gP(g + 1), gr(g), gb(g + 1), ierr)
+    call MatMultTranspose(gPd(g + 1), gr(g), gb(g + 1), ierr)
     call vcycle(g + 1, gb(g + 1), gx(g + 1))
-    call MatMultAdd(gP(g + 1), gx(g + 1), x, x, ierr)     ! x += P e_c
+    call MatMultAdd(gPd(g + 1), gx(g + 1), x, x, ierr)    ! x += P e_c
     if (npost > 0) call smooth(g, b, x, .false., npost)  ! post-smooth
     if (g == 0 .and. .not. sm_blocks) call axis_patch(b, x)
   end subroutine vcycle
@@ -2054,6 +2257,7 @@ contains
     PetscInt :: nr, r, ncols, rst, ren
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
+    logical :: devpat
     PetscErrorCode :: ierr
     PetscInt, parameter :: one = 1
     integer :: nc, I, J, m, bb, q, pcn, info, n, ldab, kk, tmp, nthr, ngrp, mpierr
@@ -2251,6 +2455,7 @@ contains
       call PetscObjectGetId(A, aid, ierr)
       newpat = (int(aid, 8) /= B%pat_id .or. int(nzst, 8) /= B%pat_nz)
       call MPI_Allreduce(MPI_IN_PLACE, newpat, 1, MPI_LOGICAL, MPI_LOR, gcomm, mpierr)
+      devpat = newpat
       if (newpat) then
         call PetscLogEventBegin(gev_blkpat, ierr)
         call blk_pattern(B, A, rst, ren)
@@ -2314,6 +2519,13 @@ contains
         enddo
       endif
     enddo
+
+    ! device path: the factors' copy (smoother 9's two block sets stay on the host)
+    if (dev .and. dev_blocks .and. sm_type /= 9 .and. count(.not. B%axblk) > 0) then
+      if (devpat .or. .not. c_associated(B%dh)) call blk_dev_pattern(B%dh, B%nrow, B%ngh, B%off, B%sz, B%kl, B%ku, &
+        B%band, B%loff, B%axblk, B%rows, B%bcol, B%zp, B%zc, B%dstat)
+      call blk_dev_values(B%dh, B%lu, B%piv, B%zv)
+    endif
 
     call PetscLogEventEnd(gev_blknum, ierr)
     if (B%axsparse .and. B%axdon .and. pat_fresh) then
@@ -2855,7 +3067,17 @@ contains
     allocate(B%gidx(ngh), B%yg(ngh))
     B%gidx = gl
     call ISCreateGeneral(PETSC_COMM_SELF, int(ngh, kind(nn)), gl, PETSC_COPY_VALUES, B%isg, ierr)
-    call VecCreateSeq(PETSC_COMM_SELF, int(ngh, kind(nn)), B%xg, ierr)
+    call VecCreate(PETSC_COMM_SELF, B%xg, ierr)
+    call VecSetSizes(B%xg, int(ngh, kind(nn)), int(ngh, kind(nn)), ierr)
+    if (dev) then                                 ! the ghost values stay on the device
+      block
+        character(len=64) :: vt
+        call MatGetVecType(gAd(g), vt, ierr)
+        call VecSetType(B%xg, trim(vt), ierr)
+      end block
+    else
+      call VecSetType(B%xg, VECSEQ, ierr)
+    endif
     call VecScatterCreate(kv, B%isg, B%xg, PETSC_NULL_IS, B%sct, ierr)
     call VecDestroy(kv, ierr)
     B%ovl = .true.
@@ -3322,7 +3544,18 @@ contains
 
     B => gBk(cur_lev)
     if (blk_set2) B => gBk2(cur_lev)
-    if (sm_type == 7 .or. sm_type == 8) then
+    if (c_associated(B%dh) .and. .not. blk_host .and. &
+        (sm_type == 7 .or. sm_type == 8 .or. .not. B%axsparse .or. axis_mult == 0)) then
+      ! device factors: the axis block first (on the host), as below
+      if (B%axsparse) call ax_solve(x, y)
+      call PetscLogEventBegin(gev_lines(cur_inst), ierr)
+      if (B%ovl) then
+        call VecScatterBegin(B%sct, x, B%xg, INSERT_VALUES, SCATTER_FORWARD, ierr)
+        call VecScatterEnd(B%sct, x, B%xg, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      endif
+      call blk_dev_apply(B%dh, x, y, B%xg)
+      call PetscLogEventEnd(gev_lines(cur_inst), ierr)
+    else if (sm_type == 7 .or. sm_type == 8) then
       call zebra_solve(x, y)
     else if (.not. B%axsparse .or. axis_mult == 0) then
       ! axis first: it depends on x only, and the ranks enter here in step

@@ -134,7 +134,12 @@ $(OBJDIR)/%.o:: $(1)%.c
 
 $(OBJDIR)/%.o:: $(1)%.cpp
 	$$(CXX) $$(FLAGS) $$(CXXFLAGS) $$(DEFINES) $$(INCLUDES) $$(EXTRA_FLAGS) -c $$< -o $(OBJDIR)/$$*.o
+
+# Kokkos sources (*_kokkos.cpp): compiled the way PETSc compiles its own, see USE_GPU_PC
+$(OBJDIR)/%_kokkos.o:: $(1)%_kokkos.cpp
+	$$(KOKKOS_CXX) $$(DEFINES) $$(INCLUDES) -c $$< -o $(OBJDIR)/$$*_kokkos.o
 endef
+KOKKOS_CXX = $(CXX) $(FLAGS) $(CXXFLAGS) $(EXTRA_FLAGS)
 # Template for generating dependencies from source file
 define F90_D_TEMPLATE
 $(DEPDIR)/%.d: $(1)%.f90 | $(MODDIR)/version.h
@@ -346,6 +351,23 @@ ifeq (1, $(USE_PETSC))
   include ${PETSC_DIR}/lib/petsc/conf/variables
   LIBS     := $(LIBS) $(PETSC_LIB)
   INCLUDES := $(INCLUDES) $(PETSC_FC_INCLUDES)
+endif
+
+# Device path of the physics preconditioner (solvers/*_kokkos.cpp): needs a
+# PETSc built with Kokkos and Kokkos Kernels. The Kokkos sources are compiled
+# with PETSc's own compiler and flags (Kokkos fixes the C++ standard and, on a
+# CUDA build, needs its nvcc_wrapper), as in PETSc's lib/petsc/conf/rules;
+# without -fvisibility=hidden, which would hide their C entry points.
+ifeq (1, $(USE_GPU_PC))
+  DEFINES  := $(DEFINES) -DUSE_GPU_PC
+  ifneq ($(KOKKOS_USE_CUDA_COMPILER),)
+    KOKKOS_CXX_RAW = PATH=`dirname $(CUDAC)`:$(PATH) NVCC_WRAPPER_DEFAULT_COMPILER="$(CUDA_CXX)" $(KOKKOS_BIN)/nvcc_wrapper \
+                     --expt-extended-lambda --expt-relaxed-constexpr $(CUDAC_FLAGS) $(PETSC_CCPPFLAGS) $(CUDACPPFLAGS) \
+                     $(CUDA_CXXFLAGS) $(MPICXX_INCLUDES)
+  else
+    KOKKOS_CXX_RAW = $(CXX) $(CXX_FLAGS) $(CXXPP_FLAGS) $(PETSC_CCPPFLAGS)
+  endif
+  KOKKOS_CXX = $(filter-out -fvisibility=hidden,$(subst -Xcompiler -fvisibility=hidden ,,$(strip $(KOKKOS_CXX_RAW))))
 endif
 
 ifeq (1, $(USE_SLEPC))
