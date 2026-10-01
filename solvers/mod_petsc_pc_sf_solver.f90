@@ -76,6 +76,18 @@ module mod_petsc_pc_sf_solver
   !! (7.4% ghost rows): the rings next to a cut one couple radially to all of it.
   integer, parameter, public :: SF_GMG_RING_OVERLAP = 2
   integer, parameter, public :: SF_GMG_AXIS_RINGS = 3   !< rings folded into the axis block
+  !> ... on the mixed arms ("wj", "wpj"), per block: pair_w and pair_psi keep
+  !! only ring 0 (the shared axis value and its angular DOFs, one ordinary
+  !! local block per harmonic, no J-sector solve), rho / T rings 0..1. The
+  !! exact block of rings 0..3 was the strong-scaling floor: fixed size, on the
+  !! 7 J-sector ranks that also own the axis rows (GMG_AxSolve max/min 2318 at
+  !! np 128). 161x64, tstep 3, 10 steps, identical outer and inner its in all
+  !! (2026-10-01, sf_runs/sf_ss): n_tor 7 np 32 x 16 solve 21.3 -> 11.0 s
+  !! (saturated 69.1 -> 35.6 s), setup 11.0 -> 7.9 s; n_tor 3 np 64 x 8 7.15 ->
+  !! 4.78 s. Ring 0 only on rho / T too: T inner its 3.1 -> 6.6, outer +26%.
+  !! (The schur and w arms keep SF_GMG_AXIS_RINGS: not measured.)
+  integer, parameter, public :: SF_GMG_AXIS_RINGS_MIXED_PAIRS = 0
+  integer, parameter, public :: SF_GMG_AXIS_RINGS_MIXED_RHOT  = 1
   integer, parameter, public :: SF_GMG_NSMOOTH    = 0   !< 0 = the smoother's own default (4)
   !> Line smoothers across rank boundaries: each local radial-line segment is
   !! extended by this many nodes into the neighbouring ranks' rows
@@ -164,6 +176,14 @@ module mod_petsc_pc_sf_solver
   !! (rho / T keep radial lines V(4,4): V(0,4) / V(0,6) save ~1.5 s of 12
   !! but raise T's cycles 1.43 -> 2.28 / 1.84.)
   integer, parameter, public :: SF_W_PRE0 = 0, SF_W_POST0 = 6, SF_W_NSC = 0
+  !> ... on the mixed arms 2 coarse-level steps per side (the default 4 above):
+  !! each step is a neighbour exchange on levels with few rows per rank, the
+  !! strong-scaling floor at high rank counts. 161x64 n_tor 7, tstep 3, 10
+  !! steps (2026-10-01, sf_runs/sf_ss, 4 nodes, two runs each): solve np 128 x 8
+  !! 9.44 -> 7.99 / 8.00 s, np 64 x 16 7.62 -> 7.12 / 7.29 s, pair_w V-cycles
+  !! 1.86 -> 2.05, outer its unchanged. 1 step: pair_w 2.7 V-cycles, no faster.
+  !! rho / T stay at 4 (2: outer its 50 -> 60).
+  integer, parameter, public :: SF_W_NSC_MIXED = 2
   !> The mixed pair_w ("wj" / "wpj"): its psi - u coupling carries theta dt
   !! F0/R d_phi, first order, which maps a harmonic's cos slot to its sin slot
   !! and outgrows the psi mass as dt grows. With one smoother block per slot
@@ -298,7 +318,7 @@ contains
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
                              nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
                              line_overlap, axis_sectors, rich_from, harm_pair, ring_overlap, &
-                             semi_r)
+                             semi_r, axis_rings)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_opts_t
@@ -327,6 +347,7 @@ contains
     integer, intent(in), optional :: harm_pair  !< SF_GMG: 1 = cos/sin slots share the smoother blocks
     integer, intent(in), optional :: ring_overlap !< SF_GMG: ring blocks cut by a rank boundary, extended
     integer, intent(in), optional :: semi_r     !< SF_GMG: radial-only coarse levels (gmg_opts_t)
+    integer, intent(in), optional :: axis_rings !< SF_GMG: per-block override of SF_GMG_AXIS_RINGS
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -392,6 +413,7 @@ contains
       if (present(harm_pair))    o%harm_pair    = harm_pair
       if (present(ring_overlap)) o%ring_overlap = ring_overlap
       if (present(semi_r))       o%semi_r       = semi_r
+      if (present(axis_rings))   o%axis_rings   = axis_rings
 
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)

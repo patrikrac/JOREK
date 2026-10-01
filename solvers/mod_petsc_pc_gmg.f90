@@ -103,6 +103,7 @@ module mod_petsc_pc_gmg
   !> the level cap of a full-coarsening hierarchy (as all tuned arms ran);
   !! semi-coarsened ones keep more rows per level and may use MAX_LEV
   integer, parameter :: MAX_LEV_FULL = 6
+  integer, parameter :: CRS_MUMPS_MIN = 2000  !< coarsest LU rows from which MUMPS (SCOTCH) factors
   integer, parameter :: SM_STEPS  = 4      !< GMRES iterations per smoothing (the paper's, and stage C1's)
   integer, parameter :: MAX_ENT   = 16     !< max nonzeros per scalar row of P (2x2 sources x 4 DOFs)
   !> semi_r < 0: levels coarsen radially only while the median r dtheta/dr of
@@ -562,7 +563,22 @@ contains
     endif
     if (R%solver) then
       if (fresh) then
-        call rds_make_ksp(MATSOLVERPETSC)
+        ! the coarsest level from CRS_MUMPS_MIN rows on: MUMPS with SCOTCH
+        ! ordering (ICNTL(7) = 3), threaded and with half the fill of PETSc's
+        ! ND LU. 161x64 n_tor 7, pair_w 4508 rows (2026-10-01, sf_runs/sf_ss,
+        ! 10 steps): factor entries 7.2e6 -> 3.8e6, setup np 64 x 16 6.23 ->
+        ! 4.21 s, np 128 x 8 5.56 -> 3.24 s, solve unchanged or -2%. MUMPS'
+        ! default ordering instead: 1.7e7 entries, solve +4-8%. The smaller
+        ! coarsest levels (287-574 rows) cost < 0.1 s in all and keep PETSc's.
+        block
+          PetscInt :: nsub
+          call MatGetSize(rds_op(R), nsub, PETSC_NULL_INTEGER, ierr)
+          if (what == "coarse" .and. nsub >= CRS_MUMPS_MIN) then
+            call rds_make_ksp(MATSOLVERMUMPS)
+          else
+            call rds_make_ksp(MATSOLVERPETSC)
+          endif
+        end block
         call MatCreateVecs(rds_op(R), R%x, R%b, ierr)
       else
         call KSPSetOperators(R%ksp, rds_op(R), rds_op(R), ierr)
@@ -628,6 +644,16 @@ contains
         endif
       endif
       write(pre, '(A,I0,A,A,A)') "gmg", cur_inst, "_", what, "_"   ! sequential: no ICNTL(20) needed
+      if (stype == MATSOLVERMUMPS) then
+        ! SCOTCH ordering unless the user chose one (see CRS_MUMPS_MIN)
+        block
+          character(len=80) :: nm
+          PetscBool :: has
+          nm = "-"//trim(pre)//"mat_mumps_icntl_7"
+          call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), has, ierr)
+          if (.not. has) call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(nm), "3", ierr)
+        end block
+      endif
       call KSPSetOptionsPrefix(R%ksp, trim(pre), ierr)
       call KSPSetFromOptions(R%ksp, ierr)
     end subroutine rds_make_ksp

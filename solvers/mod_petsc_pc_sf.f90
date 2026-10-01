@@ -263,7 +263,7 @@ contains
     PetscErrorCode :: ierr
     PetscInt :: n1_loc
     logical  :: first
-    integer  :: pj_post0, pj_ovl, pj_rich, pj_sm
+    integer  :: pj_post0, pj_ovl, pj_rich, pj_sm, ax_pair, ax_rhot
 
     call sf_init(my_id)
     first = sf_first
@@ -274,6 +274,11 @@ contains
     pj_ovl = SF_GMG_LINE_OVERLAP;  pj_rich = SF_GMG_RICH_FROM;  pj_sm = SF_GMG_SMOOTHER_ZEBRA_RINGS
     if (suu == SF_SUU_SCHUR) then
       pj_ovl = SF_GMG_LINE_OVERLAP_SCHUR_W;  pj_rich = SF_GMG_RICH_NONE;  pj_sm = SF_GMG_SMOOTHER_ZEBRA
+    endif
+    ! exact axis extent per block (see SF_GMG_AXIS_RINGS_MIXED_PAIRS)
+    ax_pair = SF_GMG_AXIS_RINGS;  ax_rhot = SF_GMG_AXIS_RINGS
+    if (mixed) then
+      ax_pair = SF_GMG_AXIS_RINGS_MIXED_PAIRS;  ax_rhot = SF_GMG_AXIS_RINGS_MIXED_RHOT
     endif
 
     !--- index sets ------------------------------------------------------
@@ -311,7 +316,7 @@ contains
                          comm, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2, &
                          smoother=pj_sm, maxits=SF_GMG_MAXITS, &
                          pre0=SF_PJ_PRE0, post0=pj_post0, nsmooth_c=SF_PJ_NSC, &
-                         line_overlap=pj_ovl, rich_from=pj_rich)
+                         line_overlap=pj_ovl, rich_from=pj_rich, axis_rings=ax_pair)
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
     !--- pair_w: the scaling balances the operator pair_w SOLVES -- schur on
@@ -357,9 +362,9 @@ contains
       call sf_solver_setup(slv_w, sfm_op, bk_w, "pair_w KSP (mixed)", &
                            comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=sfm_nf, &
                            smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
-                           pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC, &
+                           pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC_MIXED, &
                            harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
-                           semi_r=SF_GMG_SEMI_R_MIXED)
+                           semi_r=SF_GMG_SEMI_R_MIXED, axis_rings=ax_pair)
     else
       call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
                            comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
@@ -371,10 +376,10 @@ contains
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
     call sf_solver_setup(slv_rho, g_ctx%B_55, bk_rho, "rho-block KSP", &
                          comm, my_id, physics_pc_sf_rtol, gmg_inst=3, nfields=1, &
-                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
+                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
     call sf_solver_setup(slv_T,   g_ctx%B_66, bk_T,   "T-block KSP", &
                          comm, my_id, physics_pc_sf_rtol, gmg_inst=4, nfields=1, &
-                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
+                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
     call PetscLogEventEnd(pcev_fact_rhot, ierr)
     call physics_pc_mem("SF build: solvers set up", my_id)
 
