@@ -4,6 +4,7 @@ module mod_petsc_pc_sf_gather
   use iso_c_binding
 #include "petsc/finclude/petsc.h"
   use petsc
+  use mod_petsc_pc_blocks, only: harm_kept
   use mod_petsc_raw_csr, only: split_parts, get_ij, put_ij, &
                                c_baij_get, c_baij_restore, c_aij_get, c_aij_restore
   implicit none
@@ -51,7 +52,7 @@ module mod_petsc_pc_sf_gather
   integer(8), save  :: a_nzst = -1, w_nzst = -1, a_id = -1, w_id = -1
   integer(8), save  :: na_d = 0, na_o = 0, nw_d = 0, nw_o = 0   !< value-array lengths
 
-  public :: sfg_build, sfg_gather
+  public :: sfg_build, sfg_gather, sfg_cross_weights
 
 contains
 
@@ -142,6 +143,125 @@ contains
       call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     end subroutine frozen_fail
   end subroutine sfg_gather
+
+  !--------------------------------------------------------------------
+  !> How much cross-|n| coupling A carries (every build, diagnostic only).
+  !! One pass over A's BAIJ values: for every (equation, variable) block B_ev
+  !! and |n|-group distance d, r_ev(d) = ||A_ev,d||_F / ||A_ev,0||_F, with
+  !! A_ev,d the entries between slots whose groups (m+1)/2 are d apart. One
+  !! rank-0 line: per d, the largest r_ev(d) (and its block) and the median
+  !! over the blocks with a same-|n| part. The ratio is per block, so it is
+  !! free of the equations' units. Collective on comm.
+  !--------------------------------------------------------------------
+  subroutine sfg_cross_weights(A, comm, my_id)
+    use mod_parameters, only: n_tor, n_var
+    use mod_petsc_pc_blocks, only: harm_band
+    Mat, intent(in)     :: A
+    integer, intent(in) :: comm, my_id
+    Mat :: Ad, Ao
+    PetscInt, pointer :: ga(:), aia(:), aja(:), oia(:), oja(:)
+    PetscInt :: nad, nao
+    type(c_ptr) :: pad, pao
+    real(c_double), pointer :: va(:)
+    integer(c_int) :: rc
+    integer :: bs, ngrp, part, nblk, k, rw, cw, e, v, d, nr, mpierr, i
+    integer(8) :: off
+    integer, allocatable :: fe(:), gp(:)
+    real*8, allocatable :: sl(:,:,:), sg(:,:,:), r(:)
+    real*8 :: x, rmax, rmed
+    integer :: imax(2)
+    character(len=400) :: line
+    character(len=40) :: item
+
+    bs = n_var * n_tor
+    ngrp = (n_tor + 1) / 2
+    if (ngrp < 2) return
+    allocate(fe(0:bs - 1), gp(0:bs - 1))
+    do k = 0, bs - 1                                  ! in-block index -> (field, |n| group)
+      fe(k) = k / n_tor + 1; gp(k) = (mod(k, n_tor) + 1) / 2
+    enddo
+    allocate(sl(n_var, n_var, 0:ngrp - 1), sg(n_var, n_var, 0:ngrp - 1))
+    sl = 0.d0
+
+    call split_parts(A, .true., Ad, Ao, ga)
+    call get_ij(Ad, .true., nad, aia, aja)
+    call get_ij(Ao, .true., nao, oia, oja)
+    do part = 1, 2
+      if (part == 1) then
+        nblk = int(aia(nad + 1))
+        rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pad)
+        call c_f_pointer(pad, va, [max(int(nblk, 8) * bs * bs, 1_8)])
+      else
+        nblk = int(oia(nao + 1))
+        rc = c_baij_get(transfer(Ao%v, 0_c_intptr_t), pao)
+        call c_f_pointer(pao, va, [max(int(nblk, 8) * bs * bs, 1_8)])
+      endif
+      !$omp parallel do private(off, cw, rw, x) reduction(+:sl) schedule(static)
+      do k = 1, nblk                                  ! blocks are column-major
+        off = int(k - 1, 8) * bs * bs
+        do cw = 0, bs - 1
+          do rw = 0, bs - 1
+            x = va(off + cw * bs + rw + 1)
+            sl(fe(rw), fe(cw), abs(gp(rw) - gp(cw))) = sl(fe(rw), fe(cw), abs(gp(rw) - gp(cw))) + x * x
+          enddo
+        enddo
+      enddo
+      !$omp end parallel do
+      if (part == 1) then
+        rc = c_baij_restore(transfer(Ad%v, 0_c_intptr_t), pad)
+      else
+        rc = c_baij_restore(transfer(Ao%v, 0_c_intptr_t), pao)
+      endif
+    enddo
+    call put_ij(Ad, .true., nad, aia, aja); call put_ij(Ao, .true., nao, oia, oja)
+    call MPI_Allreduce(sl, sg, size(sl), MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+
+    if (my_id == 0) then
+      allocate(r(n_var * n_var))
+      write(line, '(A,I0,A)') "[Physics PC]   SF: cross-|n| weight (band ", harm_band, &
+        " kept), ||A_d||/||A_0|| per block:"
+      do d = 1, ngrp - 1
+        nr = 0; rmax = -1.d0; imax = 0
+        do v = 1, n_var
+          do e = 1, n_var
+            if (sg(e, v, 0) <= 0.d0) cycle
+            nr = nr + 1
+            r(nr) = sqrt(sg(e, v, d) / sg(e, v, 0))
+            if (r(nr) > rmax) then
+              rmax = r(nr); imax = [e, v]
+            endif
+          enddo
+        enddo
+        if (nr == 0) cycle
+        call sort_r(r(1:nr))
+        rmed = r((nr + 1) / 2)
+        write(item, '(A,I0,A,ES8.1,A,I0,I0,A,ES8.1)') " d=", d, " max ", rmax, " (B_", imax(1), &
+          imax(2), ") med ", rmed
+        line = trim(line)//trim(item)//";"
+      enddo
+      i = len_trim(line)
+      write(*,'(A)') line(1:i - 1)
+      deallocate(r)
+    endif
+    deallocate(fe, gp, sl, sg)
+
+  contains
+
+    subroutine sort_r(a)                              ! insertion sort, <= n_var**2 entries
+      real*8, intent(inout) :: a(:)
+      integer :: p, q
+      real*8 :: t
+      do p = 2, size(a)
+        t = a(p); q = p - 1
+        do while (q >= 1)
+          if (a(q) <= t) exit
+          a(q + 1) = a(q); q = q - 1
+        enddo
+        a(q + 1) = t
+      enddo
+    end subroutine sort_r
+
+  end subroutine sfg_cross_weights
 
   !====================================================================
   ! internals
@@ -314,11 +434,12 @@ contains
       m = int(mod(sr_, int(n_tor, 8))); q = int(mod(sc_, int(n_tor, 8)))
       arow = (sr_ / n_tor) * bsa + (e - 1) * n_tor + m
       acol = (sc_ / n_tor) * bsa + (v - 1) * n_tor + q
-      ! A contributes only between slots of the same |n| (cos and sin of one n
-      ! together): the extraction's harm_split filter. W is NOT filtered, so
-      ! pair_w's S_uu holds cross-|n| entries that come from W alone.
+      ! A contributes only between the slots the extraction's harm_split filter
+      ! keeps (harm_kept: |n| groups at most harm_band apart; band 0 = cos and
+      ! sin of one n). W is NOT filtered, so pair_w's S_uu holds cross-|n|
+      ! entries from W at any band.
       mk = 0
-      if ((q + 1) / 2 == (m + 1) / 2) mk = find_baij(arow, acol, bsa, rs_node(), aia, aja, oia, oja, ga)
+      if (harm_kept(m, q)) mk = find_baij(arow, acol, bsa, rs_node(), aia, aja, oia, oja, ga)
       if (t%with_w .and. fr == 1 .and. fc == 1) &
         wmap(k) = find_baij(sr_, sc_, int(n_tor), rs_node(), wia, wja, woia, woja, gw)
     end subroutine locate

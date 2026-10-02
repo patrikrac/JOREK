@@ -161,6 +161,12 @@ for _v in ('wj', 'wpj'):
 # LU, isolating the V-cycle) and the whole path (sf_gmg_*)
 ARMS['sf_lugw_wpj'] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_pair_w='"gmg"')
 ARMS['sf_gmg_wpj'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"wpj"')
+# Cross-|n| couplings kept in the SF blocks (physics_pc_sf_harm_couple):
+# hc1 = |n| groups at most 1 apart, hcall = all; fixed for the run. The LU arm
+# with all couplings is the exact-block floor of the coupled path.
+for _b, _k in (('hc1', '1'), ('hcall', '-1')):
+    ARMS['sf_gmg_wpj_' + _b] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple=_k)
+    ARMS['sf_lu_wpj_' + _b] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple=_k)
 # JOREK's default PC on the same case and ramp
 ARMS['sf_jorek'] = {'use_physics_pc': '.f.'}
 # Full-system direct solve: one MUMPS LU of the whole coupled Jacobian,

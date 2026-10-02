@@ -8,9 +8,9 @@ module mod_petsc_pc_sf
        pcev_fact_rhot, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, pcev_apply
   use mod_petsc_pc_blocks, only: create_variable_index_sets, extract_sub_blocks_h, &
        pack_pair_aij, make_pair_block_scale, make_field_block_scale, report_operator_density, &
-       split_vars, merge_vars
+       split_vars, merge_vars, harm_band
   use mod_petsc_pc_sf_solver
-  use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather
+  use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather, sfg_cross_weights
   use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_dh, sfw_lines
   use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf
   use mod_petsc_raw_csr, only: blockmv_attach
@@ -106,7 +106,10 @@ module mod_petsc_pc_sf
   !! element level (the mixed arms then assemble only W's terms they do not
   !! carry through explicit fields: sf_force_terms) -- and FORCES one,
   !! physics_pc_harm_split = 1, which the
-  !! block extraction reads. Every other one is ignored: the GMG receives its
+  !! block extraction reads. Its filter keeps the |n| groups within
+  !! physics_pc_sf_harm_couple of each other (0, the default: the same |n|
+  !! only; harm_band in mod_petsc_pc_blocks), fixed for the run because the
+  !! band fixes every pattern. Every other one is ignored: the GMG receives its
   !! whole configuration explicitly (gmg_opts_t, from the constants in
   !! mod_petsc_pc_sf_solver), so a production deck cannot inherit a research
   !! setting.
@@ -166,7 +169,8 @@ contains
   subroutine sf_init(my_id)
     use phys_module, only: physics_pc_sf_suu, physics_pc_sf_pair_psi, physics_pc_sf_pair_w, &
                            physics_pc_sf_rho, physics_pc_sf_T, physics_pc_sf_rtol, &
-                           physics_pc_force_operator, physics_pc_harm_split
+                           physics_pc_force_operator, physics_pc_harm_split, &
+                           physics_pc_sf_harm_couple
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
 
@@ -193,6 +197,11 @@ contains
     !--- settings this path implies. Forced, not offered.
     call force_int(physics_pc_harm_split,      1, "physics_pc_harm_split")
 
+    !--- the cross-|n| band of that filter: one value for the run
+    if (physics_pc_sf_harm_couple < -1) &
+      call fatal("physics_pc_sf_harm_couple must be -1 (all), 0 or a band k > 0")
+    harm_band = physics_pc_sf_harm_couple
+
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] ================ production SFM2 path ================"
       select case (suu)
@@ -212,6 +221,15 @@ contains
       write(*,'(A,A,A,A)') "[Physics PC]   rho / T  : ", trim(physics_pc_sf_rho), " / ", &
                            trim(physics_pc_sf_T)
       write(*,'(A,ES9.2)') "[Physics PC]   inner rtol: ", physics_pc_sf_rtol
+      select case (harm_band)
+      case (-1)
+        write(*,'(A)') "[Physics PC]   cross-|n|: all kept (physics_pc_sf_harm_couple = -1)"
+      case (0)
+        write(*,'(A)') "[Physics PC]   cross-|n|: none, |n|-diagonal blocks (physics_pc_sf_harm_couple = 0)"
+      case default
+        write(*,'(A,I0,A)') "[Physics PC]   cross-|n|: |n| groups at most ", harm_band, &
+          " apart kept (physics_pc_sf_harm_couple)"
+      end select
     endif
 
     sf_init_done = .true.
@@ -283,6 +301,9 @@ contains
 
     !--- index sets ------------------------------------------------------
     if (.not. g_ctx%is_created) call create_variable_index_sets(A_full, comm)
+
+    !--- how much cross-|n| coupling this Jacobian carries (one line)
+    call sfg_cross_weights(A_full, comm, my_id)
 
     !--- the operators. Their patterns are fixed for the run, so the first
     !--- build constructs them and precomputes a VALUE MAP from JOREK's BAIJ

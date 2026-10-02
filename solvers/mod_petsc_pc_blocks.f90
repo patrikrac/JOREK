@@ -15,7 +15,9 @@ module mod_petsc_pc_blocks
   !! ONE implementation rather than a copy each. Nothing here decides anything:
   !! every routine is a pure operation on PETSc objects plus g_ctx%is_var, and
   !! none of them reads a physics_pc_* flag except physics_pc_harm_split, which
-  !! selects the harmonic-block filter inside the extraction.
+  !! selects the harmonic-block filter inside the extraction. The filter keeps
+  !! the |n| groups at most harm_band apart (harm_kept); the production path
+  !! sets harm_band from physics_pc_sf_harm_couple, everything else leaves 0.
   !!
   !! Moving them was value-neutral by construction: the bodies are unchanged.
   !--------------------------------------------------------------------
@@ -28,8 +30,20 @@ module mod_petsc_pc_blocks
   public :: make_pair_block_scale, make_field_block_scale
   public :: report_operator_density
   public :: split_vars, merge_vars
+  public :: harm_band, harm_kept
+
+  !> Cross-|n| band of the harm_split filter: 0 = same |n| group only (cos and
+  !! sin of one n together), k > 0 = groups at most k apart, < 0 = all.
+  integer, save :: harm_band = 0
 
 contains
+
+  !> Does the harm_split filter keep the entry between toroidal slots m and q?
+  !! Slot m belongs to |n| group (m+1)/2 (slot 0 = n = 0, then cos/sin pairs).
+  pure logical function harm_kept(m, q)
+    integer, intent(in) :: m, q
+    harm_kept = (harm_band < 0) .or. (abs((m + 1) / 2 - (q + 1) / 2) <= harm_band)
+  end function harm_kept
 
   !--------------------------------------------------------------------
   !> Print one coherent setup line on rank 0:  "[Physics PC]   <label>: <method>"
@@ -186,7 +200,7 @@ contains
           do k = 1, ncols
             q = mod(cols(k), bs) - col0
             if (q < 0 .or. q >= n_tor) cycle
-            if ((q + 1) / 2 /= (m + 1) / 2) cycle
+            if (.not. harm_kept(int(m), int(q))) cycle
             sc = (cols(k) / bs) * n_tor + q
             if (sc >= cstart .and. sc < cend) then
               dcnt(sr) = dcnt(sr) + 1
@@ -221,7 +235,7 @@ contains
         do k = 1, ncols
           q = mod(cols(k), bs) - col0
           if (q < 0 .or. q >= n_tor) cycle
-          if ((q + 1) / 2 /= (m + 1) / 2) cycle
+          if (.not. harm_kept(int(m), int(q))) cycle
           c = c + 1; cc(c) = (cols(k) / bs) * n_tor + q; vv(c) = vals(k)
         enddo
         call MatRestoreRow(A_full, i, ncols, cols, vals, ierr)
@@ -308,7 +322,7 @@ contains
               kb = tgt(e, v)
               if (kb == 0) cycle
               q = cb - (v - 1) * n_tor
-              if ((q + 1) / 2 /= (m + 1) / 2) cycle
+              if (.not. harm_kept(int(m), int(q))) cycle
               sc = (cols(k) / bs) * n_tor + q
               if (pass == 1) then
                 if (sc >= cstart .and. sc < cend) then

@@ -4,7 +4,7 @@ module mod_petsc_pc_sf_solver
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: physics_pc_mumps_mem
-  use mod_petsc_pc_blocks,      only: pc_print_block_setup
+  use mod_petsc_pc_blocks,      only: pc_print_block_setup, harm_band
   implicit none
   private
 
@@ -401,7 +401,9 @@ contains
       o%axis_sectors = SF_GMG_AXIS_SECTORS
       o%blockmv      = SF_BLOCKMV
       o%bnd_drop     = 1               ! Dirichlet DOFs out of the coarse spaces
-      o%harm_split   = 1               ! the extracted blocks are |n|-diagonal
+      ! the extracted blocks are |n|-diagonal unless physics_pc_sf_harm_couple
+      ! keeps a cross-|n| band (the GMG reads it only to allow axis_split)
+      o%harm_split   = merge(1, 0, harm_band == 0)
       o%axis_mult    = 0;  o%axis_split = 0;  o%smooth_op = 0;  o%ring_diag = 0
       o%omega        = 0.7d0;  o%axis_droptol = 0.d0;  o%ring_aspect = 1.d0
       o%rich_from    = SF_GMG_RICH_FROM
