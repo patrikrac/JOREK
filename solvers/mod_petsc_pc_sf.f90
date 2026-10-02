@@ -138,6 +138,7 @@ module mod_petsc_pc_sf
   integer, save :: suu = SF_SUU_SCHUR          !< pair_w's S_uu (physics_pc_sf_suu)
   type(suu_form_t), save :: sform              !< ... with its variant (the mixed forms)
   logical, save :: mixed = .false.             !< pair_w mixed: "wj" / "wpj"
+  integer, save :: corr = 0                    !< step-3 corrector (physics_pc_sf_corrector)
 
   !--- work state owned by this path --------------------------------------
   Vec, save :: sv_x(6), sv_y(6)
@@ -170,7 +171,7 @@ contains
     use phys_module, only: physics_pc_sf_suu, physics_pc_sf_pair_psi, physics_pc_sf_pair_w, &
                            physics_pc_sf_rho, physics_pc_sf_T, physics_pc_sf_rtol, &
                            physics_pc_force_operator, physics_pc_harm_split, &
-                           physics_pc_sf_harm_couple
+                           physics_pc_sf_harm_couple, physics_pc_sf_corrector
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
 
@@ -202,6 +203,17 @@ contains
       call fatal("physics_pc_sf_harm_couple must be -1 (all), 0 or a band k > 0")
     harm_band = physics_pc_sf_harm_couple
 
+    !--- the corrector: Eq. (17) reads (psi, j) off pair_w, so it needs the
+    !--- one form that carries both explicitly
+    corr = physics_pc_sf_corrector
+    if (corr < -1 .or. corr > 2) call fatal("physics_pc_sf_corrector must be -1 (auto), 0, 1 or 2")
+    if (corr == -1) then
+      corr = 0
+      if (suu == SF_SUU_WPJ) corr = 1
+    endif
+    if (corr /= 0 .and. suu /= SF_SUU_WPJ) &
+      call fatal("physics_pc_sf_corrector = 1 | 2 needs physics_pc_sf_suu = wpj (pair_w must carry psi and j)")
+
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] ================ production SFM2 path ================"
       select case (suu)
@@ -229,6 +241,14 @@ contains
       case default
         write(*,'(A,I0,A)') "[Physics PC]   cross-|n|: |n| groups at most ", harm_band, &
           " apart kept (physics_pc_sf_harm_couple)"
+      end select
+      select case (corr)
+      case (0)
+        write(*,'(A)') "[Physics PC]   corrector: Eq. (16), second pair_psi solve"
+      case (1)
+        write(*,'(A)') "[Physics PC]   corrector: Eq. (17), (psi, j) from pair_w, B_16 T* on its psi row"
+      case (2)
+        write(*,'(A)') "[Physics PC]   corrector: Eq. (17), (psi, j) from pair_w, B_16 T* dropped"
       end select
     endif
 
@@ -595,6 +615,8 @@ contains
   !!      then       rho* , T*  against that explicit predictor
   !!   2. the ONE packed wave solve, pair_w (u, omega)
   !!   3. corrector  pair_psi (dpsi, dj) = (B_12 u + B_16 T*, 0);  psi -= dpsi
+  !!      (Eq. (16)), or on "wpj" (default) psi += psi_w, j += j_w from
+  !!      pair_w's own solution (Eq. (17), physics_pc_sf_corrector)
   !--------------------------------------------------------------------
   subroutine sf_apply(x, y, ierr)
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
@@ -660,10 +682,19 @@ contains
     call MatMult(g_ctx%B_26, t_T, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
     ! mixed: the psi / j rows' right-hand side is zero (the predictor has
-    ! consumed x_psi, x_j) and their solution is discarded -- the corrector
-    ! below recomputes psi and j exactly
+    ! consumed x_psi, x_j). With the Eq. (16) corrector their solution is
+    ! discarded -- step 3 recomputes psi and j by a pair_psi solve. With
+    ! Eq. (17) (wpj) it IS the correction: rows 3-4 of pair_w read
+    ! M~ (psi_w, j_w) = -(B_12 u + b, 0), M~ the small-flow pair_psi, so
+    ! (psi_w, j_w) = -M~^-1 U (u, T*) with b = B_16 T* (corr 1) or 0 (corr 2).
     if (mixed) then
-      parts = [w5, x_w, zv, zv]
+      if (corr == 1) then
+        call MatMult(g_ctx%B_16, t_T, w4, ierr)
+        call VecScale(w4, -1.0d0, ierr)
+        parts = [w5, x_w, w4, zv]
+      else
+        parts = [w5, x_w, zv, zv]
+      endif
       call sf_split_parts(rhs_W, parts(1:sfm_nf), .true.)
     else
       call sf_split_halves(rhs_W, w5, x_w, .true.)
@@ -671,7 +702,10 @@ contains
     call PetscLogEventBegin(pcev_solve_w, ierr)
     call sf_solver_apply(slv_w, rhs_W, sol_W, ierr)
     call PetscLogEventEnd(pcev_solve_w, ierr)
-    if (mixed) then
+    if (corr /= 0) then
+      parts = [y_u, y_w, w3, w4]                          ! w3, w4 = psi_w, j_w
+      call sf_split_parts(sol_W, parts, .false.)
+    else if (mixed) then
       parts = [y_u, y_w, zv, zv]
       call sf_split_parts(sol_W, parts(1:sfm_nf), .false., keep=keep_uw(1:sfm_nf))
     else
@@ -679,20 +713,26 @@ contains
     endif
 
     !--- Step 3: corrector psi-pair --------------------------------------
-    ! Here the j-component of the RHS IS zero, because the j-row of the upper
-    ! coupling U is identically zero. (Contrast the predictor above.)
-    call MatMult(g_ctx%B_12, y_u, w3, ierr)
-    call MatMult(g_ctx%B_16, t_T, w4, ierr)
-    call VecAXPY(w3, 1.0d0, w4, ierr)                     ! B_12 u + B_16 T*
-    call VecZeroEntries(w4, ierr)
-    call sf_split_halves(rhs_PJ, w3, w4, .true.)
-    call PetscLogEventBegin(pcev_solve_pj, ierr)
-    call sf_solver_apply(slv_pj, rhs_PJ, sol_PJ, ierr)
-    call PetscLogEventEnd(pcev_solve_pj, ierr)
-    call sf_split_halves(sol_PJ, w3, w4, .false.)         ! dpsi, dj
+    if (corr /= 0) then
+      ! Eq. (17): psi = psi* + psi_w, j = j* + j_w, no solve
+      call VecAXPY(y_psi, 1.0d0, w3, ierr)
+      call VecAXPY(y_j,   1.0d0, w4, ierr)
+    else
+      ! Here the j-component of the RHS IS zero, because the j-row of the upper
+      ! coupling U is identically zero. (Contrast the predictor above.)
+      call MatMult(g_ctx%B_12, y_u, w3, ierr)
+      call MatMult(g_ctx%B_16, t_T, w4, ierr)
+      call VecAXPY(w3, 1.0d0, w4, ierr)                     ! B_12 u + B_16 T*
+      call VecZeroEntries(w4, ierr)
+      call sf_split_halves(rhs_PJ, w3, w4, .true.)
+      call PetscLogEventBegin(pcev_solve_pj, ierr)
+      call sf_solver_apply(slv_pj, rhs_PJ, sol_PJ, ierr)
+      call PetscLogEventEnd(pcev_solve_pj, ierr)
+      call sf_split_halves(sol_PJ, w3, w4, .false.)         ! dpsi, dj
 
-    call VecAXPY(y_psi, -1.0d0, w3, ierr)
-    call VecAXPY(y_j,   -1.0d0, w4, ierr)
+      call VecAXPY(y_psi, -1.0d0, w3, ierr)
+      call VecAXPY(y_j,   -1.0d0, w4, ierr)
+    endif
 
     !--- Step 3: rho / T correctors. Only u enters -- U's omega COLUMN is zero.
     call MatMult(g_ctx%B_52, y_u, w3, ierr)

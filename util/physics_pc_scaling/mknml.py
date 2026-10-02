@@ -167,6 +167,10 @@ ARMS['sf_gmg_wpj'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"wpj"')
 for _b, _k in (('hc1', '1'), ('hcall', '-1')):
     ARMS['sf_gmg_wpj_' + _b] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple=_k)
     ARMS['sf_lu_wpj_' + _b] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple=_k)
+# The wpj corrector (physics_pc_sf_corrector): the default (auto) is Chacon
+# Eq. (17), (psi, j) read off pair_w; this arm keeps Eq. (16), the second
+# pair_psi solve, for the A/B comparison.
+ARMS['sf_gmg_wpj_eq16'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_corrector='0')
 # JOREK's default PC on the same case and ramp
 ARMS['sf_jorek'] = {'use_physics_pc': '.f.'}
 # Full-system direct solve: one MUMPS LU of the whole coupled Jacobian,
