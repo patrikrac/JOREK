@@ -14,8 +14,8 @@ module mod_petsc_pc_sf
   use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_dh, sfw_lines
   use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf
   use mod_petsc_raw_csr, only: blockmv_attach
-  use mod_petsc_pc_sf_fam, only: fam_mat_t, sff_on, sff_comm, sff_decompose, sff_mat_refresh, &
-       sff_vec_setup, sff_scatter_in, sff_scatter_out
+  use mod_petsc_pc_sf_fam, only: fam_op_t, fam_mat_t, sff_on, sff_comm, sff_decompose, sff_op_build, &
+       sff_op_fill, sff_mat_refresh, sff_mat_free, sff_compare, sff_vec_setup, sff_scatter_in, sff_scatter_out
   implicit none
   private
 
@@ -153,12 +153,14 @@ module mod_petsc_pc_sf
 
   !--- the operators the solvers and the sweep work on, and their communicator:
   !--- the global ones, or under physics_pc_sf_mode_split this rank's |n|
-  !--- family's copies (mod_petsc_pc_sf_fam), refreshed after every build
+  !--- family's, extracted straight from A and W (mod_petsc_pc_sf_fam) at
+  !--- every build; no global operator exists then
   logical, save :: famode = .false.
   integer, save :: comm_s = MPI_COMM_NULL
+  integer, save :: nf_w = 0                    !< pair_w's packed fields
   Mat, save :: a_pj, a_w, a_rho, a_T
   Mat, save :: a_12, a_16, a_21, a_23, a_25, a_26, a_51, a_52, a_61, a_62, a_63
-  type(fam_mat_t), save :: f_pj, f_w, f_rho, f_T, f_cb(11)
+  type(fam_op_t), save :: o_pj, o_w, o_rho, o_T, o_cb(11)
 
   public :: sf_enabled, sf_build, sf_apply, sf_report
 
@@ -231,8 +233,9 @@ contains
     famode = physics_pc_sf_mode_split
     if (famode .and. harm_band /= 0) &
       call fatal("physics_pc_sf_mode_split needs physics_pc_sf_harm_couple = 0 (|n|-diagonal blocks)")
-    if (famode .and. suu == SF_SUU_SCHUR) &
-      call fatal("physics_pc_sf_mode_split needs an assembled pair_w: physics_pc_sf_suu = w | wj | wpj")
+    if (famode .and. (suu == SF_SUU_SCHUR .or. suu == SF_SUU_WJ)) &
+      call fatal("physics_pc_sf_mode_split needs pair_w assembled entry by entry from A and W: "// &
+                 "physics_pc_sf_suu = w | wpj")
 
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] ================ production SFM2 path ================"
@@ -349,34 +352,36 @@ contains
 
     !--- the operators. Their patterns are fixed for the run, so the first
     !--- build constructs them and precomputes a VALUE MAP from JOREK's BAIJ
-    !--- matrix (and W) into them; every later rebuild is one gather.
-    if (first) then
-      call first_build_operators()
-    else
-      call PetscLogEventBegin(pcev_extract, ierr)
-      call sfg_gather(A_full, g_ctx%W_force, my_id)
-      call PetscLogEventEnd(pcev_extract, ierr)
-      if (mixed) then
-        call PetscLogEventBegin(pcev_build_suu, ierr)
-        call sfm_refill(comm, my_id)
-        call PetscLogEventEnd(pcev_build_suu, ierr)
-      endif
-    endif
-    call physics_pc_mem("SF build: operators filled", my_id)
-
-    !--- the operators the solvers and the sweep use
+    !--- matrix (and W) into them; every later rebuild is one gather. Under
+    !--- the mode split they are extracted straight into the family layout
+    !--- instead, and no global operator exists.
     if (famode) then
       call family_operators(first)
       comm_s = sff_comm
     else
+      if (first) then
+        call first_build_operators()
+      else
+        call PetscLogEventBegin(pcev_extract, ierr)
+        call sfg_gather(A_full, g_ctx%W_force, my_id)
+        call PetscLogEventEnd(pcev_extract, ierr)
+        if (mixed) then
+          call PetscLogEventBegin(pcev_build_suu, ierr)
+          call sfm_refill(comm, my_id)
+          call PetscLogEventEnd(pcev_build_suu, ierr)
+        endif
+      endif
       a_pj = g_ctx%K_pj_aij;  a_rho = g_ctx%B_55;  a_T = g_ctx%B_66
       a_w  = g_ctx%S_W_aij
       if (mixed) a_w = sfm_op
+      nf_w = 2
+      if (mixed) nf_w = sfm_nf
       a_12 = g_ctx%B_12; a_16 = g_ctx%B_16; a_21 = g_ctx%B_21; a_23 = g_ctx%B_23
       a_25 = g_ctx%B_25; a_26 = g_ctx%B_26; a_51 = g_ctx%B_51; a_52 = g_ctx%B_52
       a_61 = g_ctx%B_61; a_62 = g_ctx%B_62; a_63 = g_ctx%B_63
       comm_s = comm
     endif
+    call physics_pc_mem("SF build: operators filled", my_id)
 
     !--- symmetric block scaling, an exact similarity applied to the STORED
     !--- operator, on both pairs.
@@ -412,7 +417,7 @@ contains
       endif
       call MatDiagonalScale(pw0, slv_w%dscale, slv_w%dscale, ierr)
     else if (mixed) then
-      call make_field_block_scale(a_w, spread(n1_loc, 1, sfm_nf), slv_w%dscale, comm_s, my_id, "pair_w")
+      call make_field_block_scale(a_w, spread(n1_loc, 1, nf_w), slv_w%dscale, comm_s, my_id, "pair_w")
     else
       call make_pair_block_scale(a_w, n1_loc, slv_w%dscale, comm_s, my_id, "pair_w")
     endif
@@ -437,7 +442,7 @@ contains
       endif
     else if (mixed) then
       call sf_solver_setup(slv_w, a_w, bk_w, "pair_w KSP (mixed)", &
-                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=sfm_nf, &
+                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=nf_w, &
                            smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
                            pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC_MIXED, &
                            harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
@@ -501,50 +506,146 @@ contains
 
   contains
 
-    !> physics_pc_sf_mode_split: this rank's |n| family's copies of every
-    !! operator the solvers and the sweep use, from the global ones just
-    !! filled. The first call splits the ranks and builds the copies; later
-    !! calls refresh their values (fixed patterns).
+    !> physics_pc_sf_mode_split: this rank's |n| family's operators, extracted
+    !! straight from A and W. The first call splits the ranks, defines the
+    !! operators and builds them (structure, plans, values); later calls
+    !! refill their values (fixed patterns).
     subroutine family_operators(first_)
       logical, intent(in) :: first_
       integer :: k
-      Mat :: src(11)
-      if (first_) call sff_decompose(A_full, comm, my_id)
-      call PetscLogEventBegin(pcev_convert, ierr)
-      call sff_mat_refresh(f_pj, g_ctx%K_pj_aij, 2, "pair_psi", my_id)
-      if (mixed) then
-        call sff_mat_refresh(f_w, sfm_op, sfm_nf, "pair_w", my_id)
+      if (first_) then
+        if (.not. g_ctx%w_force_ready) then
+          if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: W_force was never assembled "// &
+            "(petsc_assemble_pc_matrices did not run?)."
+          call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+        endif
+        call sff_decompose(A_full, comm, my_id)
+        call define_family_operators()
+        call PetscLogEventBegin(pcev_extract, ierr)
+        call sff_op_build(o_pj,  A_full, g_ctx%W_force, sf_opz(), my_id)
+        call sff_op_build(o_w,   A_full, g_ctx%W_force, sf_opz(), my_id)
+        call sff_op_build(o_rho, A_full, g_ctx%W_force, sf_opz(), my_id)
+        call sff_op_build(o_T,   A_full, g_ctx%W_force, sf_opz(), my_id)
+        do k = 1, 11
+          call sff_op_build(o_cb(k), A_full, g_ctx%W_force, sf_opz(), my_id)
+        enddo
+        call PetscLogEventEnd(pcev_extract, ierr)
+        call verify_family_operators()
       else
-        call sff_mat_refresh(f_w, g_ctx%S_W_aij, 2, "pair_w", my_id)
+        call PetscLogEventBegin(pcev_extract, ierr)
+        call sff_op_fill(o_pj,  A_full, g_ctx%W_force, sf_opz())
+        call sff_op_fill(o_w,   A_full, g_ctx%W_force, sf_opz())
+        call sff_op_fill(o_rho, A_full, g_ctx%W_force, sf_opz())
+        call sff_op_fill(o_T,   A_full, g_ctx%W_force, sf_opz())
+        do k = 1, 11
+          call sff_op_fill(o_cb(k), A_full, g_ctx%W_force, sf_opz())
+        enddo
+        call PetscLogEventEnd(pcev_extract, ierr)
       endif
-      call sff_mat_refresh(f_rho, g_ctx%B_55, 1, "B_55", my_id)
-      call sff_mat_refresh(f_T,   g_ctx%B_66, 1, "B_66", my_id)
-      src = [g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_23, g_ctx%B_25, g_ctx%B_26, &
-             g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62, g_ctx%B_63]
-      do k = 1, 11
-        call sff_mat_refresh(f_cb(k), src(k), 1, "coupling block", my_id)
-      enddo
-      call PetscLogEventEnd(pcev_convert, ierr)
-      a_pj = f_pj%fam;  a_w = f_w%fam;  a_rho = f_rho%fam;  a_T = f_T%fam
-      a_12 = f_cb(1)%fam; a_16 = f_cb(2)%fam; a_21 = f_cb(3)%fam;  a_23 = f_cb(4)%fam
-      a_25 = f_cb(5)%fam; a_26 = f_cb(6)%fam; a_51 = f_cb(7)%fam;  a_52 = f_cb(8)%fam
-      a_61 = f_cb(9)%fam; a_62 = f_cb(10)%fam; a_63 = f_cb(11)%fam
+      a_pj = o_pj%fam;  a_w = o_w%fam;  a_rho = o_rho%fam;  a_T = o_T%fam
+      nf_w = o_w%nf
+      a_12 = o_cb(1)%fam; a_16 = o_cb(2)%fam; a_21 = o_cb(3)%fam;  a_23 = o_cb(4)%fam
+      a_25 = o_cb(5)%fam; a_26 = o_cb(6)%fam; a_51 = o_cb(7)%fam;  a_52 = o_cb(8)%fam
+      a_61 = o_cb(9)%fam; a_62 = o_cb(10)%fam; a_63 = o_cb(11)%fam
       !--- the sweep's coupling blocks on the threaded block kernel, as on the
       !--- global path; the kernel reads the CSR arrays in place, so one
-      !--- attach holds across the refreshes
+      !--- attach holds across the refills
       if (first_ .and. SF_BLOCKMV == 1) then
         block
           use mod_petsc_pc_harm, only: pc_ntor
           integer :: nno
           nno = 0
           do k = 1, 11
-            if (.not. blockmv_attach(f_cb(k)%fam, int(pc_ntor))) nno = nno + 1
+            if (.not. blockmv_attach(o_cb(k)%fam, int(pc_ntor))) nno = nno + 1
           enddo
           if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   SF: WARNING ", nno, &
             " family coupling block(s) not AIJ, left on PETSc's single-threaded matvec"
         end block
       endif
     end subroutine family_operators
+
+    !> The family operators' blocks, as the global path packs them: pair_psi
+    !! [[B_11, B_13], [B_31, B_33]]; pair_w [[B_22 + W, B_24], [B_42, B_44]]
+    !! or, wpj, [[B_22 + W, B_24, B_21, B_23], [B_42, B_44, 0, 0],
+    !! [B_12, 0, opz B_33, B_13], [0, 0, B_31, B_33]] (mod_petsc_pc_sf_mixed);
+    !! rho, T and the sweep's 11 coupling blocks.
+    subroutine define_family_operators()
+      integer, parameter :: ce(11) = [var_psi, var_psi, var_u, var_u, var_u, var_u, &
+                                      var_rho, var_rho, var_T, var_T, var_T]
+      integer, parameter :: cv(11) = [var_u, var_T, var_psi, var_zj, var_rho, var_T, &
+                                      var_psi, var_u, var_psi, var_u, var_zj]
+      character(len=4), parameter :: cn(11) = ["B_12", "B_16", "B_21", "B_23", "B_25", "B_26", &
+                                                "B_51", "B_52", "B_61", "B_62", "B_63"]
+      integer :: k
+      call full_op(o_pj, "pair_psi", 1, [var_psi, var_zj])
+      if (suu == SF_SUU_WPJ) then
+        call full_op(o_w, "pair_w (wpj)", 2, [var_u, var_w, var_psi, var_zj])
+        o_w%se(2, 3:4) = 0; o_w%se(3, 2) = 0; o_w%se(4, 1:2) = 0
+        o_w%se(3, 3) = var_zj; o_w%sv(3, 3) = var_zj; o_w%scl(3, 3) = 1     ! opz M_psi = opz B_33
+      else
+        call full_op(o_w, "pair_w", 2, [var_u, var_w])
+      endif
+      o_w%has_w = .true.
+      call full_op(o_rho, "B_55", 3, [var_rho])
+      call full_op(o_T,   "B_66", 4, [var_T])
+      do k = 1, 11
+        o_cb(k)%label = cn(k); o_cb(k)%nf = 1; o_cb(k)%tagb = 4 + k
+        o_cb(k)%se(1, 1) = ce(k); o_cb(k)%sv(1, 1) = cv(k)
+      enddo
+    end subroutine define_family_operators
+
+    subroutine full_op(op, label, tagb, vars)
+      type(fam_op_t), intent(inout) :: op
+      character(len=*), intent(in) :: label
+      integer, intent(in) :: tagb, vars(:)
+      integer :: a, b
+      op%label = label; op%nf = size(vars); op%tagb = tagb
+      do a = 1, size(vars)
+        do b = 1, size(vars)
+          op%se(a, b) = vars(a); op%sv(a, b) = vars(b)
+        enddo
+      enddo
+    end subroutine full_op
+
+    !> -sf_ms_verify 1: build the global operators and their family copies
+    !! the old way once, and require the direct extraction to match them.
+    subroutine verify_family_operators()
+      type(fam_mat_t) :: cp
+      PetscInt :: iv
+      PetscBool :: set
+      Mat :: srcm(11)
+      real*8 :: worst
+      integer :: k
+      iv = 0
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_ms_verify", iv, set, ierr)
+      if (iv == 0) return
+      call first_build_operators()
+      worst = 0.d0
+      call sff_mat_refresh(cp, g_ctx%K_pj_aij, 2);  call sff_compare(o_pj, cp%fam, my_id, worst)
+      call sff_mat_free(cp)
+      if (mixed) then
+        call sff_mat_refresh(cp, sfm_op, sfm_nf)
+      else
+        call sff_mat_refresh(cp, g_ctx%S_W_aij, 2)
+      endif
+      call sff_compare(o_w, cp%fam, my_id, worst);  call sff_mat_free(cp)
+      call sff_mat_refresh(cp, g_ctx%B_55, 1);  call sff_compare(o_rho, cp%fam, my_id, worst)
+      call sff_mat_free(cp)
+      call sff_mat_refresh(cp, g_ctx%B_66, 1);  call sff_compare(o_T, cp%fam, my_id, worst)
+      call sff_mat_free(cp)
+      srcm = [g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_23, g_ctx%B_25, g_ctx%B_26, &
+              g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62, g_ctx%B_63]
+      do k = 1, 11
+        call sff_mat_refresh(cp, srcm(k), 1);  call sff_compare(o_cb(k), cp%fam, my_id, worst)
+        call sff_mat_free(cp)
+      enddo
+      if (worst > 0.d0) then
+        if (my_id == 0) write(*,'(A,ES9.2)') "[Physics PC]   FATAL: SF mode split verify: the direct "// &
+          "extraction differs from the copied operators, worst ", worst
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   SF mode split verify: all 15 operators identical"
+    end subroutine verify_family_operators
 
     !> First build: the operators with their frozen patterns, the value maps
     !! into them, and the release of the blocks that only fed the packing.
@@ -788,7 +889,7 @@ contains
       else
         parts = [w5, x_w, zv, zv]
       endif
-      call sf_split_parts(rhs_W, parts(1:sfm_nf), .true.)
+      call sf_split_parts(rhs_W, parts(1:nf_w), .true.)
     else
       call sf_split_halves(rhs_W, w5, x_w, .true.)
     endif
@@ -800,7 +901,7 @@ contains
       call sf_split_parts(sol_W, parts, .false.)
     else if (mixed) then
       parts = [y_u, y_w, zv, zv]
-      call sf_split_parts(sol_W, parts(1:sfm_nf), .false., keep=keep_uw(1:sfm_nf))
+      call sf_split_parts(sol_W, parts(1:nf_w), .false., keep=keep_uw(1:nf_w))
     else
       call sf_split_halves(sol_W, y_u, y_w, .false.)      ! BOTH final; y_w is DONE
     endif
