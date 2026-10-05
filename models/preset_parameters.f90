@@ -688,6 +688,7 @@ subroutine preset_parameters
   physics_pc_sf_rtol         = 1.d-1         ! shared inner rtol for the iterative backends
   physics_pc_sf_corrector    = -1            ! corrector: -1 = auto (1 on wpj, else 0), 0 = Eq.16 pair_psi solve, 1 = Eq.17 from pair_w (B_16 T* folded), 2 = Eq.17, B_16 dropped
   physics_pc_sf_harm_couple  = 0             ! cross-|n| band kept in the blocks: 0 | k | -1 = all
+  physics_pc_sf_cross_weights = .false.     ! per-build cross-|n| weight report (diagnostic, one pass over A)
   physics_pc_psi_rtol        = -1.d0        ! Workstream F: pair_psi-only rtol; < 0 = fall back to physics_pc_pair_rtol
   physics_pc_corrector_form  = 0            ! Workstream F: LDU step 3 (0=full pair_psi solve/Eq.16, 1=diagonal surrogate/Eq.17)
   physics_pc_psi_schur       = 0            ! Workstream C: pair_psi by the eta-scaled j-first Schur (0=off, 1=LU Shat, 2=Jacobi+axis patch)

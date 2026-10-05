@@ -292,7 +292,7 @@ contains
   !! place, so MUMPS and the GMG reuse their symbolic phases.
   !--------------------------------------------------------------------
   subroutine sf_build(A_full, comm, my_id)
-    use phys_module,    only: physics_pc_sf_rtol
+    use phys_module,    only: physics_pc_sf_rtol, physics_pc_sf_cross_weights
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
 
     Mat, intent(in)     :: A_full
@@ -322,8 +322,8 @@ contains
     !--- index sets ------------------------------------------------------
     if (.not. g_ctx%is_created) call create_variable_index_sets(A_full, comm)
 
-    !--- how much cross-|n| coupling this Jacobian carries (one line)
-    call sfg_cross_weights(A_full, comm, my_id)
+    !--- how much cross-|n| coupling this Jacobian carries (diagnostic, off by default)
+    if (physics_pc_sf_cross_weights) call sfg_cross_weights(A_full, comm, my_id)
 
     !--- the operators. Their patterns are fixed for the run, so the first
     !--- build constructs them and precomputes a VALUE MAP from JOREK's BAIJ

@@ -145,32 +145,34 @@ contains
   end subroutine sfg_gather
 
   !--------------------------------------------------------------------
-  !> How much cross-|n| coupling A carries (every build, diagnostic only).
+  !> How much cross-|n| coupling A carries (diagnostic only; every build when
+  !! physics_pc_sf_cross_weights is set).
   !! One pass over A's BAIJ values: for every (equation, variable) block B_ev
   !! and |n|-group distance d, r_ev(d) = ||A_ev,d||_F / ||A_ev,0||_F, with
-  !! A_ev,d the entries between slots whose groups (m+1)/2 are d apart. One
-  !! rank-0 line: per d, the largest r_ev(d) (and its block) and the median
-  !! over the blocks with a same-|n| part. The ratio is per block, so it is
-  !! free of the equations' units. Collective on comm.
+  !! A_ev,d the entries between slots whose groups (m+1)/2 are d apart. The
+  !! ratio is per block, so it is free of the equations' units. Rank 0 prints
+  !! the band in use and, per d, the median over the blocks with a same-|n|
+  !! part and every block above CW_SHOW, largest first. Collective on comm.
   !--------------------------------------------------------------------
   subroutine sfg_cross_weights(A, comm, my_id)
     use mod_parameters, only: n_tor, n_var
     use mod_petsc_pc_blocks, only: harm_band
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
+    real*8, parameter :: CW_SHOW = 0.1d0       !< blocks listed individually above this
+    integer, parameter :: CW_MAXLIST = 12      !< at most this many per d
     Mat :: Ad, Ao
     PetscInt, pointer :: ga(:), aia(:), aja(:), oia(:), oja(:)
     PetscInt :: nad, nao
     type(c_ptr) :: pad, pao
     real(c_double), pointer :: va(:)
     integer(c_int) :: rc
-    integer :: bs, ngrp, part, nblk, k, rw, cw, e, v, d, nr, mpierr, i
+    integer :: bs, ngrp, part, nblk, k, rw, cw, e, v, d, nr, mpierr, j, nshow
     integer(8) :: off
-    integer, allocatable :: fe(:), gp(:)
-    real*8, allocatable :: sl(:,:,:), sg(:,:,:), r(:)
-    real*8 :: x, rmax, rmed
-    integer :: imax(2)
-    character(len=400) :: line
+    integer, allocatable :: fe(:), gp(:), ie(:), iv(:), ord(:)
+    real*8, allocatable :: sl(:,:,:), sg(:,:,:), r(:), rs_(:)
+    real*8 :: x
+    character(len=1200) :: line
     character(len=40) :: item
 
     bs = n_var * n_tor
@@ -217,49 +219,57 @@ contains
     call MPI_Allreduce(sl, sg, size(sl), MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
 
     if (my_id == 0) then
-      allocate(r(n_var * n_var))
-      write(line, '(A,I0,A)') "[Physics PC]   SF: cross-|n| weight (band ", harm_band, &
-        " kept), ||A_d||/||A_0|| per block:"
+      write(*,'(A,I0,A)') "[Physics PC]   SF: cross-|n| weight ||A_d||/||A_0|| per block (band ", &
+        harm_band, " kept):"
+      allocate(r(n_var * n_var), rs_(n_var * n_var), ie(n_var * n_var), iv(n_var * n_var), &
+               ord(n_var * n_var))
       do d = 1, ngrp - 1
-        nr = 0; rmax = -1.d0; imax = 0
+        nr = 0
         do v = 1, n_var
           do e = 1, n_var
             if (sg(e, v, 0) <= 0.d0) cycle
             nr = nr + 1
-            r(nr) = sqrt(sg(e, v, d) / sg(e, v, 0))
-            if (r(nr) > rmax) then
-              rmax = r(nr); imax = [e, v]
-            endif
+            r(nr) = sqrt(sg(e, v, d) / sg(e, v, 0)); ie(nr) = e; iv(nr) = v
           enddo
         enddo
         if (nr == 0) cycle
-        call sort_r(r(1:nr))
-        rmed = r((nr + 1) / 2)
-        write(item, '(A,I0,A,ES8.1,A,I0,I0,A,ES8.1)') " d=", d, " max ", rmax, " (B_", imax(1), &
-          imax(2), ") med ", rmed
-        line = trim(line)//trim(item)//";"
+        ord(1:nr) = [(j, j = 1, nr)]
+        call sort_desc(r(1:nr), ord(1:nr))
+        rs_(1:nr) = r(ord(1:nr))
+        write(line, '(A,I0,A,ES8.1,A)') "[Physics PC]     d=", d, ": median ", rs_((nr + 1) / 2), ";"
+        nshow = 0
+        do j = 1, nr
+          if (rs_(j) < CW_SHOW .or. nshow == CW_MAXLIST) exit
+          nshow = nshow + 1
+          write(item, '(A,I0,I0,A,ES8.1)') " B_", ie(ord(j)), iv(ord(j)), " ", rs_(j)
+          line = trim(line)//trim(item)
+        enddo
+        if (nshow == 0) then
+          write(item, '(A,ES8.1)') " none above ", CW_SHOW
+          line = trim(line)//trim(item)
+        endif
+        write(*,'(A)') trim(line)
       enddo
-      i = len_trim(line)
-      write(*,'(A)') line(1:i - 1)
-      deallocate(r)
+      deallocate(r, rs_, ie, iv, ord)
     endif
     deallocate(fe, gp, sl, sg)
 
   contains
 
-    subroutine sort_r(a)                              ! insertion sort, <= n_var**2 entries
-      real*8, intent(inout) :: a(:)
-      integer :: p, q
-      real*8 :: t
-      do p = 2, size(a)
-        t = a(p); q = p - 1
+    !> ord := the permutation sorting a descending (insertion sort, <= n_var**2)
+    subroutine sort_desc(a, ord)
+      real*8, intent(in)     :: a(:)
+      integer, intent(inout) :: ord(:)
+      integer :: p, q, t
+      do p = 2, size(ord)
+        t = ord(p); q = p - 1
         do while (q >= 1)
-          if (a(q) <= t) exit
-          a(q + 1) = a(q); q = q - 1
+          if (a(ord(q)) >= a(t)) exit
+          ord(q + 1) = ord(q); q = q - 1
         enddo
-        a(q + 1) = t
+        ord(q + 1) = t
       enddo
-    end subroutine sort_r
+    end subroutine sort_desc
 
   end subroutine sfg_cross_weights
 

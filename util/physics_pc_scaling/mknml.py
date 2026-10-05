@@ -165,8 +165,10 @@ ARMS['sf_gmg_wpj'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"wpj"')
 # hc1 = |n| groups at most 1 apart, hcall = all; fixed for the run. The LU arm
 # with all couplings is the exact-block floor of the coupled path.
 for _b, _k in (('hc1', '1'), ('hcall', '-1')):
-    ARMS['sf_gmg_wpj_' + _b] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple=_k)
-    ARMS['sf_lu_wpj_' + _b] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple=_k)
+    ARMS['sf_gmg_wpj_' + _b] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple=_k,
+                                    physics_pc_sf_cross_weights='.t.')
+    ARMS['sf_lu_wpj_' + _b] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple=_k,
+                                   physics_pc_sf_cross_weights='.t.')
 # The wpj corrector (physics_pc_sf_corrector): the default (auto) is Chacon
 # Eq. (17), (psi, j) read off pair_w; this arm keeps Eq. (16), the second
 # pair_psi solve, for the A/B comparison.
