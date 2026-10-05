@@ -154,7 +154,7 @@ contains
       if (f == 1) then
         write(*,'(A,I0,A,I0,A)') "[Physics PC]     family ", f, ": ", nrk(f), " rank(s), slot 0 (n = 0)"
       else
-        write(*,'(A,I0,A,I0,A,I0,A,I0,A)') "[Physics PC]     family ", f, ": ", nrk(f), " rank(s), slots ", &
+        write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A)') "[Physics PC]     family ", f, ": ", nrk(f), " rank(s), slots ", &
           2 * f - 3, ", ", 2 * f - 2, " (|n| group ", f - 1, ")"
       endif
     enddo
