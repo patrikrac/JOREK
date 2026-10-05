@@ -907,7 +907,8 @@ contains
   subroutine gmg_build_prolongations(Aref, comm, my_id, n_fields, ok, opts)
     use nodes_elements, only: node_list, element_list
     use phys_module,    only: n_flux, n_tht
-    use mod_parameters, only: n_tor, n_degrees
+    use mod_parameters, only: n_degrees
+    use mod_petsc_pc_harm, only: pc_ntor
 
     Mat, intent(in)      :: Aref
     integer, intent(in)  :: comm, my_id, n_fields
@@ -1052,7 +1053,7 @@ contains
     call MPI_Comm_size(comm, np, mpierr)
     call MatGetOwnershipRange(Aref, rs0, re0, ierr)
     call MatGetSize(Aref, nglob, PETSC_NULL_INTEGER, ierr)
-    if (nglob /= int(n_fields, 8) * n_idx * n_tor) then
+    if (nglob /= int(n_fields, 8) * n_idx * pc_ntor) then
       call fail("operator size /= n_fields * n_index * n_tor")
       return
     endif
@@ -1063,11 +1064,11 @@ contains
     ly(0)%n = n_idx
     allocate(ly(0)%own(0:n_idx - 1), ly(0)%lpos(0:n_idx - 1), ly(0)%nl(0:np - 1), ly(0)%ps(0:np))
     do r = 0, np - 1
-      if (mod(rstarts(r + 1) - rstarts(r), n_fields * n_tor) /= 0) then
+      if (mod(rstarts(r + 1) - rstarts(r), n_fields * pc_ntor) /= 0) then
         call fail("a rank's rows are not whole (field x toroidal slot) groups")
         return
       endif
-      ly(0)%nl(r) = (rstarts(r + 1) - rstarts(r)) / (n_fields * n_tor)
+      ly(0)%nl(r) = (rstarts(r + 1) - rstarts(r)) / (n_fields * pc_ntor)
       ly(0)%ps(r) = rstarts(r)
     enddo
     ly(0)%ps(np) = rstarts(np)
@@ -1100,7 +1101,7 @@ contains
       enddo
       ly(g)%ps(0) = 0
       do r = 0, np - 1
-        ly(g)%ps(r + 1) = ly(g)%ps(r) + n_fields * n_tor * ly(g)%nl(r)
+        ly(g)%ps(r + 1) = ly(g)%ps(r) + n_fields * pc_ntor * ly(g)%nl(r)
       enddo
     enddo
 
@@ -1154,7 +1155,7 @@ contains
     !--- smoothers, fine level (fine_node/fine_harm) and every coarse level
     nf_s = n_fields
     nth0 = n_tht
-    nloc = n_fields * n_tor * ly(0)%nl(me)
+    nloc = n_fields * pc_ntor * ly(0)%nl(me)
     allocate(fine_node(nloc), fine_harm(nloc), fine_kf(nloc))
     fine_node = -1
     do n = 1, node_list%n_nodes
@@ -1162,8 +1163,8 @@ contains
         idx = node_list%node(n)%index(k) - 1
         if (ly(0)%own(idx) /= me) cycle
         do ff = 0, n_fields - 1
-          do mm = 0, n_tor - 1
-            lr = (ff * ly(0)%nl(me) + ly(0)%lpos(idx)) * n_tor + mm + 1
+          do mm = 0, pc_ntor - 1
+            lr = (ff * ly(0)%nl(me) + ly(0)%lpos(idx)) * pc_ntor + mm + 1
             fine_node(lr) = n - 1
             fine_harm(lr) = mm
             fine_kf(lr) = (k - 1) + 4 * ff
@@ -1178,7 +1179,7 @@ contains
       return
     endif
     do g = 1, nlev - 1
-      nloc = n_fields * n_tor * ly(g)%nl(me)
+      nloc = n_fields * pc_ntor * ly(g)%nl(me)
       allocate(lv(g)%rnode(nloc), lv(g)%rharm(nloc))
       lv(g)%rnode = -1
       do ci = 0, lv(g)%ni - 1
@@ -1188,8 +1189,8 @@ contains
             if (dd < 0) cycle
             if (ly(g)%own(dd) /= me) cycle
             do ff = 0, n_fields - 1
-              do mm = 0, n_tor - 1
-                lr = (ff * ly(g)%nl(me) + ly(g)%lpos(dd)) * n_tor + mm + 1
+              do mm = 0, pc_ntor - 1
+                lr = (ff * ly(g)%nl(me) + ly(g)%lpos(dd)) * pc_ntor + mm + 1
                 lv(g)%rnode(lr) = ci * lv(g)%nj + cj
                 lv(g)%rharm(lr) = mm
               enddo
@@ -1205,8 +1206,8 @@ contains
     if (my_id == 0 .and. np > 1) then
       write(*,'(A,I0,A)', advance="no") "[Physics PC]   GMG parallel layout on ", np, " ranks, rows/rank min-max per level:"
       do g = 0, nlev - 1
-        write(*,'(A,I0,A,I0)', advance="no") " ", n_fields * n_tor * minval(ly(g)%nl), "-", &
-                                             n_fields * n_tor * maxval(ly(g)%nl)
+        write(*,'(A,I0,A,I0)', advance="no") " ", n_fields * pc_ntor * minval(ly(g)%nl), "-", &
+                                             n_fields * pc_ntor * maxval(ly(g)%nl)
       enddo
       write(*,*)
     endif
@@ -1304,7 +1305,7 @@ contains
       integer, intent(in) :: L, f, d, m
       integer :: ow
       ow = ly(L)%own(d)
-      prow = ly(L)%ps(ow) + (f * ly(L)%nl(ow) + ly(L)%lpos(d)) * n_tor + m
+      prow = ly(L)%ps(ow) + (f * ly(L)%nl(ow) + ly(L)%lpos(d)) * pc_ntor + m
     end function prow
 
     !> Expand a scalar (one field, one harmonic) P into the packed operators'
@@ -1318,8 +1319,8 @@ contains
       PetscErrorCode :: ierr_
       integer :: f, m, q
 
-      nrl = n_fields * n_tor * ly(lr_)%nl(me); ncl = n_fields * n_tor * ly(lc_)%nl(me)
-      nrg = n_fields * n_tor * ly(lr_)%n;      ncg = n_fields * n_tor * ly(lc_)%n
+      nrl = n_fields * pc_ntor * ly(lr_)%nl(me); ncl = n_fields * pc_ntor * ly(lc_)%nl(me)
+      nrg = n_fields * pc_ntor * ly(lr_)%n;      ncg = n_fields * pc_ntor * ly(lc_)%n
       call MatCreate(comm, P, ierr_)
       call MatSetSizes(P, nrl, ncl, nrg, ncg, ierr_)
       call MatSetType(P, MATMPIAIJ, ierr_)       ! the packed pairs are MPIAIJ even on one rank
@@ -1329,7 +1330,7 @@ contains
       do q = 1, size(r_)
         if (ly(lr_)%own(r_(q)) /= me) cycle
         do f = 0, n_fields - 1
-          do m = 0, n_tor - 1
+          do m = 0, pc_ntor - 1
             row = prow(lr_, f, r_(q), m)
             col = prow(lc_, f, c(q), m)
             call MatSetValue(P, row, col, v(q), ADD_VALUES, ierr_)
@@ -1347,7 +1348,7 @@ contains
       PetscErrorCode :: ierr_
       integer :: nn, kk, f, m, nax, id
 
-      allocate(seen(n_idx_), ax(n_fields * n_tor * 4 * n_tht * 2))
+      allocate(seen(n_idx_), ax(n_fields * pc_ntor * 4 * n_tht * 2))
       seen = .false.; nax = 0
       do nn = 1, node_list%n_nodes
         if ((nn - 1) / n_tht /= 0) cycle          ! first ring = the axis
@@ -1357,7 +1358,7 @@ contains
           seen(id) = .true.
           if (ly(0)%own(id - 1) /= me) cycle      ! owned rows only: no duplicates at np > 1
           do f = 0, n_fields - 1
-            do m = 0, n_tor - 1
+            do m = 0, pc_ntor - 1
               nax = nax + 1
               ax(nax) = prow(0, f, id - 1, m)
             enddo
@@ -1569,16 +1570,16 @@ contains
     ! operator; P serves the V-cycle's prolongation (MatMultAdd).
     if (o%blockmv == 1) then
       block
-        use mod_parameters, only: n_tor
+        use mod_petsc_pc_harm, only: pc_ntor
         integer :: gg
         logical :: okb
         do gg = 0, nlev - 1
-          okb = blockmv_attach(gA(gg), int(n_tor))
+          okb = blockmv_attach(gA(gg), int(pc_ntor))
           if (gg > 0) okb = blockmv_attach(gP(gg), 1)
         enddo
-        if (gF /= gA(0)) okb = blockmv_attach(gF, int(n_tor))   ! a shell: left alone
+        if (gF /= gA(0)) okb = blockmv_attach(gF, int(pc_ntor))   ! a shell: left alone
         if (.not. op_ready .and. my_id == 0) write(*,'(A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, &
-          ": level matvecs on the OpenMP block kernel (bs ", n_tor, ", ", nlev, " levels)"
+          ": level matvecs on the OpenMP block kernel (bs ", pc_ntor, ", ", nlev, " levels)"
       end block
     endif
     if (present(smoother)) then
@@ -2072,7 +2073,7 @@ contains
   !!  - numeric part, every rebuild: gather through the maps (blk_fill), then
   !!    factor. A singular block falls back to its diagonal (nsing).
   subroutine build_blocks(g, A, set2)
-    use mod_parameters, only: n_tor
+    use mod_petsc_pc_harm, only: pc_ntor, pc_ngrp, pc_grp
     integer, intent(in) :: g
     Mat, intent(in)     :: A
     logical, intent(in), optional :: set2   !< build into gBk2 (smoother 9's lines)
@@ -2228,7 +2229,7 @@ contains
         call ISSort(B%axis_is, ierr)
         ! the same rows, local and ascending, per axis group (key = group + 1)
         ngrp = 1
-        if (axis_split) ngrp = (n_tor + 1) / 2
+        if (axis_split) ngrp = pc_ngrp()
         allocate(B%axg(ngrp), key(B%nrow))
         key = 0
         do q = 1, n
@@ -2240,7 +2241,7 @@ contains
             else
               m = glv(g)%rharm(r)
             endif
-            key(r) = (m + 1) / 2 + 1                 ! |n| group of slot m (cos/sin together)
+            key(r) = pc_grp(m) + 1                   ! |n| group of slot m (cos/sin together)
           endif
         enddo
         do kk = 1, ngrp
@@ -2625,7 +2626,7 @@ contains
   !! line order (rings, then global index, the owners' own row order), and
   !! the ghost scatter is built. Collective on A's communicator.
   subroutine ovl_extend(g, A, B, rst, ren, depth, rings)
-    use mod_parameters, only: n_tor
+    use mod_petsc_pc_harm, only: pc_ntor
     integer, intent(in) :: g
     Mat, intent(in) :: A
     type(blk_t), intent(inout) :: B
@@ -2668,7 +2669,7 @@ contains
         nkey = max(nkey, I + 1)
       enddo
     endif
-    allocate(Ia(B%nb), Ib(B%nb), blkof(0:nkey * n_tor - 1))
+    allocate(Ia(B%nb), Ib(B%nb), blkof(0:nkey * pc_ntor - 1))
     Ia = -1; Ib = -1; blkof = 0
     do bb = 1, B%nb
       if (B%axblk(bb)) cycle
@@ -2681,9 +2682,9 @@ contains
         call node_of(B%rows(B%off(bb) + q) + 1, I, J, m)
         if (.not. rings) Ib(bb) = max(Ib(bb), I)
         if (rings) then
-          blkof(I * n_tor + m) = bb
+          blkof(I * pc_ntor + m) = bb
         else
-          blkof(J * n_tor + m) = bb
+          blkof(J * pc_ntor + m) = bb
         endif
       enddo
     enddo
@@ -2692,7 +2693,7 @@ contains
     call VecGetArray(kv, kp, ierr)
     do r = 1, nr
       call node_of(r, I, J, m)
-      kp(r) = dble((I * nc + J) * n_tor + m)
+      kp(r) = dble((I * nc + J) * pc_ntor + m)
     enddo
     call VecRestoreArray(kv, kp, ierr)
     call MatGetSize(A, nglob, PETSC_NULL_INTEGER, ierr)
@@ -2729,15 +2730,15 @@ contains
       q = 0
       do k = 1, ns
         code = nint(cp(k))
-        m = mod(code, n_tor); J = mod(code / n_tor, nc); I = code / n_tor / nc
+        m = mod(code, pc_ntor); J = mod(code / pc_ntor, nc); I = code / pc_ntor / nc
         if (I <= ilim) cycle
         if (rings) then
           ! same ring and slot as a local ring block; the walk bounds the reach
           if (I >= nkey) cycle
-          bb = blkof(I * n_tor + m)
+          bb = blkof(I * pc_ntor + m)
           if (bb == 0) cycle
         else
-          bb = blkof(J * n_tor + m)
+          bb = blkof(J * pc_ntor + m)
           if (bb == 0) cycle
           if (.not. ((I < Ia(bb) .and. Ia(bb) - I <= lovl) .or. (I > Ib(bb) .and. I - Ib(bb) <= lovl))) cycle
         endif
@@ -3280,26 +3281,26 @@ contains
   !! I > axis_k at one J), 6 rings for I < ring_lim(g) and radial lines
   !! outside. Ids have gaps; build_blocks compresses them.
   integer function blk_id(g, I, J, m_, nj)
-    use mod_parameters, only: n_tor
+    use mod_petsc_pc_harm, only: pc_ntor, pc_grp
     integer, intent(in) :: g, I, J, m_, nj
     integer :: is_g, m
     m = m_
-    if (hpair > 0) m = (m_ + 1) / 2        ! slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs
+    if (hpair > 0) m = pc_grp(m_)          ! slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs
     if (I == 0 .or. (sm_type >= 4 .and. I <= axis_lim(g))) then
       blk_id = m + 1
     else if (sm_type == 4) then
-      blk_id = n_tor + (I - 1) * n_tor + m + 1
+      blk_id = pc_ntor + (I - 1) * pc_ntor + m + 1
     else if (sm_type == 5 .or. sm_type == 7) then
-      blk_id = n_tor + J * n_tor + m + 1
+      blk_id = pc_ntor + J * pc_ntor + m + 1
     else if (sm_type == 6 .or. sm_type == 8) then
       is_g = ring_lim(g)
       if (I < is_g) then
-        blk_id = n_tor + (I - 1) * n_tor + m + 1
+        blk_id = pc_ntor + (I - 1) * pc_ntor + m + 1
       else
-        blk_id = n_tor + max(is_g - 1, 0) * n_tor + J * n_tor + m + 1
+        blk_id = pc_ntor + max(is_g - 1, 0) * pc_ntor + J * pc_ntor + m + 1
       endif
     else
-      blk_id = n_tor + ((I - 1) * nj + J) * n_tor + m + 1
+      blk_id = pc_ntor + ((I - 1) * nj + J) * pc_ntor + m + 1
     endif
   end function blk_id
 

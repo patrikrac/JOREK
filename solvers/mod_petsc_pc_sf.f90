@@ -14,6 +14,8 @@ module mod_petsc_pc_sf
   use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_dh, sfw_lines
   use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf
   use mod_petsc_raw_csr, only: blockmv_attach
+  use mod_petsc_pc_sf_fam, only: fam_mat_t, sff_on, sff_comm, sff_decompose, sff_mat_refresh, &
+       sff_vec_setup, sff_scatter_in, sff_scatter_out
   implicit none
   private
 
@@ -149,6 +151,15 @@ module mod_petsc_pc_sf
   logical, save :: kpj_packed = .false., sw_packed = .false., pw0_packed = .false.
   Mat, save     :: pw0                 !< schur: pair_w without W, [[B_22, B_24], [B_42, B_44]]
 
+  !--- the operators the solvers and the sweep work on, and their communicator:
+  !--- the global ones, or under physics_pc_sf_mode_split this rank's |n|
+  !--- family's copies (mod_petsc_pc_sf_fam), refreshed after every build
+  logical, save :: famode = .false.
+  integer, save :: comm_s = MPI_COMM_NULL
+  Mat, save :: a_pj, a_w, a_rho, a_T
+  Mat, save :: a_12, a_16, a_21, a_23, a_25, a_26, a_51, a_52, a_61, a_62, a_63
+  type(fam_mat_t), save :: f_pj, f_w, f_rho, f_T, f_cb(11)
+
   public :: sf_enabled, sf_build, sf_apply, sf_report
 
 contains
@@ -171,7 +182,8 @@ contains
     use phys_module, only: physics_pc_sf_suu, physics_pc_sf_pair_psi, physics_pc_sf_pair_w, &
                            physics_pc_sf_rho, physics_pc_sf_T, physics_pc_sf_rtol, &
                            physics_pc_force_operator, physics_pc_harm_split, &
-                           physics_pc_sf_harm_couple, physics_pc_sf_corrector
+                           physics_pc_sf_harm_couple, physics_pc_sf_corrector, &
+                           physics_pc_sf_mode_split
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
 
@@ -214,6 +226,14 @@ contains
     if (corr /= 0 .and. suu /= SF_SUU_WPJ) &
       call fatal("physics_pc_sf_corrector = 1 | 2 needs physics_pc_sf_suu = wpj (pair_w must carry psi and j)")
 
+    !--- one |n| family per rank: only where every block is |n|-diagonal, and
+    !--- only for the assembled pair_w forms (the schur shell is not split)
+    famode = physics_pc_sf_mode_split
+    if (famode .and. harm_band /= 0) &
+      call fatal("physics_pc_sf_mode_split needs physics_pc_sf_harm_couple = 0 (|n|-diagonal blocks)")
+    if (famode .and. suu == SF_SUU_SCHUR) &
+      call fatal("physics_pc_sf_mode_split needs an assembled pair_w: physics_pc_sf_suu = w | wj | wpj")
+
     if (my_id == 0) then
       write(*,'(A)') "[Physics PC] ================ production SFM2 path ================"
       select case (suu)
@@ -242,6 +262,8 @@ contains
         write(*,'(A,I0,A)') "[Physics PC]   cross-|n|: |n| groups at most ", harm_band, &
           " apart kept (physics_pc_sf_harm_couple)"
       end select
+      if (famode) write(*,'(A)') "[Physics PC]   layout   : one |n| family per rank, families concurrent "// &
+                                 "(physics_pc_sf_mode_split)"
       select case (corr)
       case (0)
         write(*,'(A)') "[Physics PC]   corrector: Eq. (16), second pair_psi solve"
@@ -342,19 +364,33 @@ contains
     endif
     call physics_pc_mem("SF build: operators filled", my_id)
 
+    !--- the operators the solvers and the sweep use
+    if (famode) then
+      call family_operators(first)
+      comm_s = sff_comm
+    else
+      a_pj = g_ctx%K_pj_aij;  a_rho = g_ctx%B_55;  a_T = g_ctx%B_66
+      a_w  = g_ctx%S_W_aij
+      if (mixed) a_w = sfm_op
+      a_12 = g_ctx%B_12; a_16 = g_ctx%B_16; a_21 = g_ctx%B_21; a_23 = g_ctx%B_23
+      a_25 = g_ctx%B_25; a_26 = g_ctx%B_26; a_51 = g_ctx%B_51; a_52 = g_ctx%B_52
+      a_61 = g_ctx%B_61; a_62 = g_ctx%B_62; a_63 = g_ctx%B_63
+      comm_s = comm
+    endif
+
     !--- symmetric block scaling, an exact similarity applied to the STORED
     !--- operator, on both pairs.
-    call MatGetLocalSize(g_ctx%B_55, n1_loc, PETSC_NULL_INTEGER, ierr)
+    call MatGetLocalSize(a_rho, n1_loc, PETSC_NULL_INTEGER, ierr)
     if (slv_pj%scaled) call VecDestroy(slv_pj%dscale, ierr)
-    call make_pair_block_scale(g_ctx%K_pj_aij, n1_loc, slv_pj%dscale, comm, my_id, "pair_psi")
+    call make_pair_block_scale(a_pj, n1_loc, slv_pj%dscale, comm_s, my_id, "pair_psi")
     slv_pj%scaled = .true.
 
     !--- pair_psi is solved SPLIT (see the module header): the GMG runs on the
     !--- packed (psi, j) pair, both fields in every smoother block. Set up
     !--- before pair_w, whose schur shell applies it.
     call PetscLogEventBegin(pcev_fact_pj, ierr)
-    call sf_solver_setup(slv_pj, g_ctx%K_pj_aij, bk_pj, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
-                         comm, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2, &
+    call sf_solver_setup(slv_pj, a_pj, bk_pj, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
+                         comm_s, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2, &
                          smoother=pj_sm, maxits=SF_GMG_MAXITS, &
                          pre0=SF_PJ_PRE0, post0=pj_post0, nsmooth_c=SF_PJ_NSC, &
                          line_overlap=pj_ovl, rich_from=pj_rich, axis_rings=ax_pair)
@@ -376,9 +412,9 @@ contains
       endif
       call MatDiagonalScale(pw0, slv_w%dscale, slv_w%dscale, ierr)
     else if (mixed) then
-      call make_field_block_scale(sfm_op, spread(n1_loc, 1, sfm_nf), slv_w%dscale, comm, my_id, "pair_w")
+      call make_field_block_scale(a_w, spread(n1_loc, 1, sfm_nf), slv_w%dscale, comm_s, my_id, "pair_w")
     else
-      call make_pair_block_scale(g_ctx%S_W_aij, n1_loc, slv_w%dscale, comm, my_id, "pair_w")
+      call make_pair_block_scale(a_w, n1_loc, slv_w%dscale, comm_s, my_id, "pair_w")
     endif
     slv_w%scaled = .true.
 
@@ -400,39 +436,35 @@ contains
                              smoother=SF_GMG_SMOOTHER_ZEBRA, maxits=SF_GMG_MAXITS, Aop=sfw_shell)
       endif
     else if (mixed) then
-      call sf_solver_setup(slv_w, sfm_op, bk_w, "pair_w KSP (mixed)", &
-                           comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=sfm_nf, &
+      call sf_solver_setup(slv_w, a_w, bk_w, "pair_w KSP (mixed)", &
+                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=sfm_nf, &
                            smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
                            pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC_MIXED, &
                            harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
                            semi_r=SF_GMG_SEMI_R_MIXED, axis_rings=ax_pair)
     else
-      call sf_solver_setup(slv_w, g_ctx%S_W_aij, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
-                           comm, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
+      call sf_solver_setup(slv_w, a_w, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
+                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
                            smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
                            pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC)
     endif
     call PetscLogEventEnd(pcev_fact_w, ierr)
 
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
-    call sf_solver_setup(slv_rho, g_ctx%B_55, bk_rho, "rho-block KSP", &
-                         comm, my_id, physics_pc_sf_rtol, gmg_inst=3, nfields=1, &
+    call sf_solver_setup(slv_rho, a_rho, bk_rho, "rho-block KSP", &
+                         comm_s, my_id, physics_pc_sf_rtol, gmg_inst=3, nfields=1, &
                          smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
-    call sf_solver_setup(slv_T,   g_ctx%B_66, bk_T,   "T-block KSP", &
-                         comm, my_id, physics_pc_sf_rtol, gmg_inst=4, nfields=1, &
+    call sf_solver_setup(slv_T,   a_T,   bk_T,   "T-block KSP", &
+                         comm_s, my_id, physics_pc_sf_rtol, gmg_inst=4, nfields=1, &
                          smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
     call PetscLogEventEnd(pcev_fact_rhot, ierr)
     call physics_pc_mem("SF build: solvers set up", my_id)
 
     !--- work vectors: the operators keep their layout for the run.
     if (.not. vecs_ready) then
-      call MatCreateVecs(g_ctx%K_pj_aij, rhs_PJ, sol_PJ, ierr)
-      if (mixed) then
-        call MatCreateVecs(sfm_op, rhs_W, sol_W, ierr)
-      else
-        call MatCreateVecs(g_ctx%S_W_aij, rhs_W, sol_W, ierr)
-      endif
-      call MatCreateVecs(g_ctx%B_55, sv_x(1), PETSC_NULL_VEC, ierr)
+      call MatCreateVecs(a_pj, rhs_PJ, sol_PJ, ierr)
+      call MatCreateVecs(a_w, rhs_W, sol_W, ierr)
+      call MatCreateVecs(a_rho, sv_x(1), PETSC_NULL_VEC, ierr)
       block
         integer :: k
         do k = 2, 6
@@ -447,15 +479,72 @@ contains
       call VecDuplicate(sv_x(1), w5, ierr)
       call VecDuplicate(sv_x(1), zv, ierr)
       call VecSet(zv, 0.0d0, ierr)
-      call MatCreateVecs(g_ctx%B_55, t_rho, PETSC_NULL_VEC, ierr)
-      call MatCreateVecs(g_ctx%B_66, t_T,   PETSC_NULL_VEC, ierr)
+      call MatCreateVecs(a_rho, t_rho, PETSC_NULL_VEC, ierr)
+      call MatCreateVecs(a_T,   t_T,   PETSC_NULL_VEC, ierr)
+      if (famode) then
+        block
+          Vec :: xt
+          call MatCreateVecs(A_full, xt, PETSC_NULL_VEC, ierr)
+          call sff_vec_setup(xt)
+          call VecDestroy(xt, ierr)
+        end block
+      endif
       vecs_ready = .true.
     endif
 
     g_ctx%reduced_ready = .true.
     sf_first = .false.
+    ! the families finish their setups at different times; wait for the
+    ! slowest here, so the setup timer holds all of them rather than the
+    ! first apply's scatter
+    if (famode) call MPI_Barrier(comm, ierr)
 
   contains
+
+    !> physics_pc_sf_mode_split: this rank's |n| family's copies of every
+    !! operator the solvers and the sweep use, from the global ones just
+    !! filled. The first call splits the ranks and builds the copies; later
+    !! calls refresh their values (fixed patterns).
+    subroutine family_operators(first_)
+      logical, intent(in) :: first_
+      integer :: k
+      Mat :: src(11)
+      if (first_) call sff_decompose(A_full, comm, my_id)
+      call PetscLogEventBegin(pcev_convert, ierr)
+      call sff_mat_refresh(f_pj, g_ctx%K_pj_aij, 2, "pair_psi", my_id)
+      if (mixed) then
+        call sff_mat_refresh(f_w, sfm_op, sfm_nf, "pair_w", my_id)
+      else
+        call sff_mat_refresh(f_w, g_ctx%S_W_aij, 2, "pair_w", my_id)
+      endif
+      call sff_mat_refresh(f_rho, g_ctx%B_55, 1, "B_55", my_id)
+      call sff_mat_refresh(f_T,   g_ctx%B_66, 1, "B_66", my_id)
+      src = [g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_23, g_ctx%B_25, g_ctx%B_26, &
+             g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62, g_ctx%B_63]
+      do k = 1, 11
+        call sff_mat_refresh(f_cb(k), src(k), 1, "coupling block", my_id)
+      enddo
+      call PetscLogEventEnd(pcev_convert, ierr)
+      a_pj = f_pj%fam;  a_w = f_w%fam;  a_rho = f_rho%fam;  a_T = f_T%fam
+      a_12 = f_cb(1)%fam; a_16 = f_cb(2)%fam; a_21 = f_cb(3)%fam;  a_23 = f_cb(4)%fam
+      a_25 = f_cb(5)%fam; a_26 = f_cb(6)%fam; a_51 = f_cb(7)%fam;  a_52 = f_cb(8)%fam
+      a_61 = f_cb(9)%fam; a_62 = f_cb(10)%fam; a_63 = f_cb(11)%fam
+      !--- the sweep's coupling blocks on the threaded block kernel, as on the
+      !--- global path; the kernel reads the CSR arrays in place, so one
+      !--- attach holds across the refreshes
+      if (first_ .and. SF_BLOCKMV == 1) then
+        block
+          use mod_petsc_pc_harm, only: pc_ntor
+          integer :: nno
+          nno = 0
+          do k = 1, 11
+            if (.not. blockmv_attach(f_cb(k)%fam, int(pc_ntor))) nno = nno + 1
+          enddo
+          if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   SF: WARNING ", nno, &
+            " family coupling block(s) not AIJ, left on PETSc's single-threaded matvec"
+        end block
+      endif
+    end subroutine family_operators
 
     !> First build: the operators with their frozen patterns, the value maps
     !! into them, and the release of the blocks that only fed the packing.
@@ -631,7 +720,11 @@ contains
     ierr = 0
     call PetscLogEventBegin(pcev_apply, ierr)
 
-    call split_vars(x, sv_x)
+    if (famode) then
+      call sff_scatter_in(x, sv_x)
+    else
+      call split_vars(x, sv_x)
+    endif
     x_psi = sv_x(var_psi); x_u   = sv_x(var_u);   x_j = sv_x(var_zj)
     x_w   = sv_x(var_w);   x_rho = sv_x(var_rho); x_T = sv_x(var_T)
     y_psi = sv_y(var_psi); y_u   = sv_y(var_u);   y_j = sv_y(var_zj)
@@ -648,7 +741,7 @@ contains
     call sf_split_halves(sol_PJ, y_psi, y_j, .false.)     ! psi*, j*
 
     !--- Step 1: predictor density   rho* = B_55^-1 (x_rho - B_51 psi*) ---
-    call MatMult(g_ctx%B_51, y_psi, w3, ierr)
+    call MatMult(a_51, y_psi, w3, ierr)
     call VecWAXPY(w4, -1.0d0, w3, x_rho, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call sf_solver_apply(slv_rho, w4, t_rho, ierr)
@@ -657,9 +750,9 @@ contains
     !--- Step 1: predictor temperature  T* = B_66^-1 (x_T - B_61 psi* - B_63 j*)
     ! B_61 and B_63 act against the EXPLICIT predictor pair. No j-folded
     ! lower-triangular block is needed or wanted here.
-    call MatMult(g_ctx%B_61, y_psi, w3, ierr)
+    call MatMult(a_61, y_psi, w3, ierr)
     call VecWAXPY(w4, -1.0d0, w3, x_T, ierr)
-    call MatMult(g_ctx%B_63, y_j, w3, ierr)
+    call MatMult(a_63, y_j, w3, ierr)
     call VecAXPY(w4, -1.0d0, w3, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call sf_solver_apply(slv_T, w4, t_T, ierr)
@@ -673,13 +766,13 @@ contains
     !   RHS_om = x_w VERBATIM -- the omega row of the lower coupling is
     ! identically zero, so no fold and no correction term.
     call VecCopy(x_u, w5, ierr)
-    call MatMult(g_ctx%B_21, y_psi, w3, ierr)
+    call MatMult(a_21, y_psi, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
-    call MatMult(g_ctx%B_23, y_j, w3, ierr)
+    call MatMult(a_23, y_j, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
-    call MatMult(g_ctx%B_25, t_rho, w3, ierr)
+    call MatMult(a_25, t_rho, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
-    call MatMult(g_ctx%B_26, t_T, w3, ierr)
+    call MatMult(a_26, t_T, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
     ! mixed: the psi / j rows' right-hand side is zero (the predictor has
     ! consumed x_psi, x_j). With the Eq. (16) corrector their solution is
@@ -689,7 +782,7 @@ contains
     ! (psi_w, j_w) = -M~^-1 U (u, T*) with b = B_16 T* (corr 1) or 0 (corr 2).
     if (mixed) then
       if (corr == 1) then
-        call MatMult(g_ctx%B_16, t_T, w4, ierr)
+        call MatMult(a_16, t_T, w4, ierr)
         call VecScale(w4, -1.0d0, ierr)
         parts = [w5, x_w, w4, zv]
       else
@@ -720,8 +813,8 @@ contains
     else
       ! Here the j-component of the RHS IS zero, because the j-row of the upper
       ! coupling U is identically zero. (Contrast the predictor above.)
-      call MatMult(g_ctx%B_12, y_u, w3, ierr)
-      call MatMult(g_ctx%B_16, t_T, w4, ierr)
+      call MatMult(a_12, y_u, w3, ierr)
+      call MatMult(a_16, t_T, w4, ierr)
       call VecAXPY(w3, 1.0d0, w4, ierr)                     ! B_12 u + B_16 T*
       call VecZeroEntries(w4, ierr)
       call sf_split_halves(rhs_PJ, w3, w4, .true.)
@@ -735,19 +828,23 @@ contains
     endif
 
     !--- Step 3: rho / T correctors. Only u enters -- U's omega COLUMN is zero.
-    call MatMult(g_ctx%B_52, y_u, w3, ierr)
+    call MatMult(a_52, y_u, w3, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call sf_solver_apply(slv_rho, w3, w5, ierr)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
     call VecWAXPY(y_rho, -1.0d0, w5, t_rho, ierr)
 
-    call MatMult(g_ctx%B_62, y_u, w3, ierr)
+    call MatMult(a_62, y_u, w3, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call sf_solver_apply(slv_T, w3, w5, ierr)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
     call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
 
-    call merge_vars(sv_y, y)
+    if (famode) then
+      call sff_scatter_out(sv_y, y)
+    else
+      call merge_vars(sv_y, y)
+    endif
     call PetscLogEventEnd(pcev_apply, ierr)
     ierr = 0
   end subroutine sf_apply
