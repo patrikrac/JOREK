@@ -20,6 +20,8 @@ Environment:
   PCS_N_RADIAL / PCS_N_POL   initial equilibrium grid (default: n_flux+10, n_tht;
                sf_* arms 2 n_flux - 1, 2 n_tht, the shaped case's own ratio)
   PCS_RESTART  if set, the case restarts (restart = .t.) from that file
+  PCS_DROP_KEYS  comma list of base-namelist keys to comment out (binary from
+               a branch that lacks them, e.g. numerics_develop)
 """
 import os
 import sys
@@ -161,14 +163,50 @@ for _v in ('wj', 'wpj'):
 # LU, isolating the V-cycle) and the whole path (sf_gmg_*)
 ARMS['sf_lugw_wpj'] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_pair_w='"gmg"')
 ARMS['sf_gmg_wpj'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"wpj"')
+# Cross-|n| couplings kept in the SF blocks (physics_pc_sf_harm_couple):
+# hc1 = |n| groups at most 1 apart, hcall = all; fixed for the run. The LU arm
+# with all couplings is the exact-block floor of the coupled path.
+for _b, _k in (('hc1', '1'), ('hcall', '-1')):
+    ARMS['sf_gmg_wpj_' + _b] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple=_k,
+                                    physics_pc_sf_cross_weights='.t.')
+    ARMS['sf_lu_wpj_' + _b] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple=_k,
+                                   physics_pc_sf_cross_weights='.t.')
+# The wpj corrector (physics_pc_sf_corrector): the default (auto) is Chacon
+# Eq. (17), (psi, j) read off pair_w; this arm keeps Eq. (16), the second
+# pair_psi solve, for the A/B comparison.
+ARMS['sf_gmg_wpj_eq16'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_corrector='0')
 # JOREK's default PC on the same case and ramp
 ARMS['sf_jorek'] = {'use_physics_pc': '.f.'}
 # Full-system direct solve: one MUMPS LU of the whole coupled Jacobian,
 # refactorised every step (iter_precon = 0), so FGMRES only checks it (1 it).
 ARMS['sf_direct'] = {'use_physics_pc': '.f.', 'iter_precon': '0'}
 
+# SF arms rebuilt at EVERY step (iter_precon = 0), like jorek_fresh: the
+# like-for-like comparison of per-step setup + solve against JOREK's PC.
+# The cross-|n| weight report is a diagnostic pass over A: off in these timing arms.
+ARMS['sf_gmg_wpj_fresh'] = dict(ARMS['sf_gmg_wpj'], iter_precon='0',
+                                physics_pc_sf_cross_weights='.f.')
+ARMS['sf_gmg_wpj_hcall_fresh'] = dict(ARMS['sf_gmg_wpj_hcall'], iter_precon='0',
+                                      physics_pc_sf_cross_weights='.f.')
+# ... and the SF solvers on one |n| family per rank, the families concurrent
+# (physics_pc_sf_mode_split; np >= (n_tor+1)/2). With a cross-|n| band (_hc1,
+# _hcall: the same band on every operator, W included) the block solves become
+# FGMRES over all families, the family solvers as block-Jacobi preconditioner.
+ARMS['sf_gmg_wpj_ms'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_mode_split='.t.')
+ARMS['sf_gmg_wpj_fresh_ms'] = dict(ARMS['sf_gmg_wpj_fresh'], physics_pc_sf_mode_split='.t.')
+for _b in ('hc1', 'hcall'):
+    ARMS['sf_gmg_wpj_ms_' + _b] = dict(ARMS['sf_gmg_wpj_' + _b], physics_pc_sf_mode_split='.t.',
+                                       physics_pc_sf_cross_weights='.f.')
+    ARMS['sf_gmg_wpj_fresh_ms_' + _b] = dict(ARMS['sf_gmg_wpj_ms_' + _b], iter_precon='0')
+
+# JOREK's PC with each mode family on its own sub-communicator, so the family
+# blocks are factorised and solved concurrently instead of one after another
+# (-jorek_pc_mode_split, branch numerics_develop only; needs np >= n_mode_families).
+ARMS['jorek_fresh_ms'] = dict(ARMS['jorek_fresh'])
+
 # PETSc options an arm needs besides its namelist (`mknml.py petscopts <arm>`).
-ARM_PETSC_OPTS = {'sf_direct': '-jorek_pc_full_lu'}
+ARM_PETSC_OPTS = {'sf_direct': '-jorek_pc_full_lu',
+                  'jorek_fresh_ms': '-jorek_pc_mode_split'}
 
 
 def is_sf(arm):
@@ -241,6 +279,9 @@ def main(argv):
     base = os.environ.get('PCS_BASE', os.path.join(REPO, 'namelist', 'model199',
                                                    SF_BASE if is_sf(arm) else 'intear_island_demo'))
     lines = open(base).read().split('\n')
+    # keys a binary from another branch does not know (its namelist read would
+    # abort): commented out, so they must be at their defaults there
+    drop = [k.strip() for k in os.environ.get('PCS_DROP_KEYS', '').split(',') if k.strip()]
     out_lines = []
     for line in lines:
         st = line.strip()
@@ -248,6 +289,10 @@ def main(argv):
             out_lines.append(line)
             continue
         k = st.split('=')[0].strip()
+        if k in drop:                         # ... and the arm's value for it
+            out_lines.append('!' + line + '   ! PCS_DROP_KEYS')
+            ov.pop(k, None)
+            continue
         if k in ov:
             out_lines.append(' %s = %s' % (k, ov.pop(k)))
         else:

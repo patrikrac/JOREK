@@ -138,9 +138,22 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 | `sf_gmg` | S_uu = `schur` (the default): every block on its C¹ GMG, pair_psi split (ψ, j) and pair_w on zebra lines, ρ / T on radial lines |
 | `sf_gmg_w` | the same with S_uu = `w`, B₂₂ + W assembled |
 | `sf_gmg_wpj` | the same with pair_w mixed (u, ω, ψ, j), ring smoother |
+| `sf_gmg_wpj_eq16` | `sf_gmg_wpj` with the Eq. (16) corrector (a second pair_psi solve) instead of the default Eq. (17) |
 | `sf_lu` / `sf_lu_w` / `sf_lu_wpj` | every block by MUMPS LU: the exact references, for approximation quality (`sf_lu_wj`: the lumped-mass form; `sf_lugw_wpj`: LU except pair_w) |
+| `sf_gmg_wpj_hc1` / `_hcall`, `sf_lu_wpj_hc1` / `_hcall` | `sf_gmg_wpj` / `sf_lu_wpj` keeping the cross-\|n\| couplings of the \|n\| groups at most 1 apart / all (`physics_pc_sf_harm_couple` = 1 / -1, fixed for the run), with the per-build cross-\|n\| weight report on (`physics_pc_sf_cross_weights`) |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
 | `sf_direct` | full-system direct solve: one MUMPS LU of the whole coupled Jacobian (`-jorek_pc_full_lu`, in-core), refactorised every step (`iter_precon = 0`); FGMRES only checks it |
+
+**The wpj corrector** (`physics_pc_sf_corrector`, 2026-10-02). Step 3 of the
+sweep needs M⁻¹ U δv. Chacon's Eq. (16) applies the full M⁻¹ (a second pair_psi
+solve); Eq. (17) replaces it by the surrogate P_SF is built on. On `wpj` that
+surrogate is pair_w's own small-flow ψ row, so the correction is the ψ, j part
+of pair_w's solution, which the sweep used to discard: no extra solve. `B₁₆ T*`
+goes onto pair_w's ψ-row right-hand side (2 drops it). The default (−1) picks
+Eq. (17) on `wpj` and Eq. (16) elsewhere. 41×32, np 1 × 4, ramp 1e-3 … 10:
+identical outer counts (53 in 13 steps) with Eq. (16), (17) and (17) without
+B₁₆; pair_psi solves 106 → 53, PC apply 7.55 → 6.49 s. The tables below
+predate it (Eq. 16).
 
 **The two pair_w operators** (`physics_pc_sf_suu`, the only namelist entry
 that picks the method; the rest of the sweep is shared):
