@@ -192,6 +192,13 @@ module mod_petsc_pc_sf_solver
   !! GMRES coarse levels) and the outer iteration with it; with cos and sin in
   !! one block it reaches 1e-8 in ~20 and the outer count is the LU's (3).
   integer, parameter, public :: SF_GMG_HARM_PAIR_MIXED = 1
+  !> ... and the T block: its parallel conduction also couples a harmonic's
+  !! cos and sin slots (d_phi), so the radial lines hold both. 2026-10-05, nt7
+  !! 161x64 tstep 3 saturated, np 16: T V-cycles 4.43 -> 3.43 (global path),
+  !! 4.20 -> 3.37 on the highest-n mode-split family, 5.40 -> 4.15 with all
+  !! harmonics coupled; solve per step -1..-3 %, outer its unchanged. Not on
+  !! rho: one V-cycle already, the bigger blocks only cost (+5-10 %).
+  integer, parameter, public :: SF_GMG_HARM_PAIR_T = 1
   !> The mixed pair_w's hierarchy coarsens radially only (J kept) until the
   !! median cell aspect r dtheta/dr is 2, then in both directions (-1 = that
   !! count from the grid: 1 level at 41x32, aspect 3.75; 2 at 121x48 and
@@ -258,6 +265,7 @@ module mod_petsc_pc_sf_solver
     integer :: gmg_inst = 0                !< hierarchy id when backend == SF_GMG
     integer :: its_sum  = 0, its_max = 0, nsolve = 0
     integer :: nfail    = 0                !< solves that stopped unconverged (its cap, failed PC)
+    real*8  :: t_sum    = 0.d0             !< wall time in its solves (this rank)
     character(len=56) :: label = ""
   end type block_solver_t
 
@@ -496,10 +504,13 @@ contains
     PetscErrorCode, intent(inout) :: ierr
     PetscInt :: its
     KSPConvergedReason :: reason
+    real*8 :: t0
 
+    t0 = MPI_Wtime()
     if (slv%scaled) call VecPointwiseMult(rhs, rhs, slv%dscale, ierr)
     call KSPSolve(slv%ksp, rhs, sol, ierr)
     if (slv%scaled) call VecPointwiseMult(sol, sol, slv%dscale, ierr)
+    slv%t_sum = slv%t_sum + (MPI_Wtime() - t0)
 
     call KSPGetIterationNumber(slv%ksp, its, ierr)
     slv%its_sum = slv%its_sum + int(its)
@@ -513,7 +524,7 @@ contains
 
   subroutine sf_solver_reset_counters(slv)
     type(block_solver_t), intent(inout) :: slv
-    slv%its_sum = 0; slv%its_max = 0; slv%nsolve = 0; slv%nfail = 0
+    slv%its_sum = 0; slv%its_max = 0; slv%nsolve = 0; slv%nfail = 0; slv%t_sum = 0.d0
   end subroutine sf_solver_reset_counters
 
   !> One line: mean and max inner iterations since the last reset. An exact

@@ -189,9 +189,15 @@ ARMS['sf_gmg_wpj_fresh'] = dict(ARMS['sf_gmg_wpj'], iter_precon='0',
 ARMS['sf_gmg_wpj_hcall_fresh'] = dict(ARMS['sf_gmg_wpj_hcall'], iter_precon='0',
                                       physics_pc_sf_cross_weights='.f.')
 # ... and the SF solvers on one |n| family per rank, the families concurrent
-# (physics_pc_sf_mode_split; harm_couple = 0 only, np >= (n_tor+1)/2)
+# (physics_pc_sf_mode_split; np >= (n_tor+1)/2). With a cross-|n| band (_hc1,
+# _hcall: the same band on every operator, W included) the block solves become
+# FGMRES over all families, the family solvers as block-Jacobi preconditioner.
 ARMS['sf_gmg_wpj_ms'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_mode_split='.t.')
 ARMS['sf_gmg_wpj_fresh_ms'] = dict(ARMS['sf_gmg_wpj_fresh'], physics_pc_sf_mode_split='.t.')
+for _b in ('hc1', 'hcall'):
+    ARMS['sf_gmg_wpj_ms_' + _b] = dict(ARMS['sf_gmg_wpj_' + _b], physics_pc_sf_mode_split='.t.',
+                                       physics_pc_sf_cross_weights='.f.')
+    ARMS['sf_gmg_wpj_fresh_ms_' + _b] = dict(ARMS['sf_gmg_wpj_ms_' + _b], iter_precon='0')
 
 # JOREK's PC with each mode family on its own sub-communicator, so the family
 # blocks are factorised and solved concurrently instead of one after another
