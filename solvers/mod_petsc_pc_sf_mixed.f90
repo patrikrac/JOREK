@@ -4,7 +4,7 @@ module mod_petsc_pc_sf_mixed
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx
-  use mod_petsc_pc_blocks,      only: pack_blocks_aij, report_operator_density
+  use mod_petsc_pc_blocks,      only: pack_blocks_aij
   use mod_petsc_pc_sf_solver,   only: suu_form_t, SF_SUU_WJ, SF_SUU_WPJ, sf_split_parts, sf_opz
   implicit none
   private
@@ -79,7 +79,7 @@ module mod_petsc_pc_sf_mixed
 contains
 
   !--------------------------------------------------------------------
-  !> First build: D's groups, the blocks, the packed operator and its gate.
+  !> First build: D's groups, the blocks and the packed operator.
   !--------------------------------------------------------------------
   subroutine sfm_build(form, comm, my_id)
     type(suu_form_t), intent(in) :: form
@@ -110,8 +110,6 @@ contains
     end select
 
     call pack_op()
-    call gate(my_id)
-    call report_operator_density(sfm_op, trim(label()), my_id)
   end subroutine sfm_build
 
   !--------------------------------------------------------------------
@@ -424,83 +422,6 @@ contains
       comp = lab(comp)
     end block
   end subroutine block_of
-
-  !--------------------------------------------------------------------
-  !> First-build gate: the packed operator against its definition, block by
-  !! block through MatMult on the separate blocks, for a random x. Checks
-  !! the pack, the products and every sign. No flag: once per run.
-  !--------------------------------------------------------------------
-  subroutine gate(my_id)
-    integer, intent(in) :: my_id
-    Vec :: x, y, xs(4), ys(4), t1, t2
-    integer :: k, nf
-    real*8 :: e(2), d
-    PetscErrorCode :: ierr
-
-    nf = sfm_nf
-    call MatCreateVecs(sfm_op, x, y, ierr)
-    call VecSetRandom(x, PETSC_NULL_RANDOM, ierr)
-    call MatMult(sfm_op, x, y, ierr)
-    do k = 1, nf
-      call MatCreateVecs(g_ctx%B_33, xs(k), ys(k), ierr)
-    enddo
-    call MatCreateVecs(g_ctx%B_33, t1, t2, ierr)
-    call sf_split_parts(x, xs(1:nf), .false.)
-
-    ! rows 1, 2: (u, omega); row 1 from B_22 and W, not from the stored suu
-    call MatMult(g_ctx%B_22, xs(1), ys(1), ierr)
-    call MatMultAdd(g_ctx%W_force, xs(1), ys(1), ys(1), ierr)
-    call MatMultAdd(g_ctx%B_24, xs(2), ys(1), ys(1), ierr)
-    call MatMult(g_ctx%B_42, xs(1), ys(2), ierr)
-    call MatMultAdd(g_ctx%B_44, xs(2), ys(2), ys(2), ierr)
-    if (fm%form == SF_SUU_WJ) then
-      call MatMultAdd(g_ctx%B_23, xs(3), ys(1), ys(1), ierr)
-      ! j row: -B_31 D (B_12 x_u + B_13 x_j) + B_33 x_j
-      call MatMult(g_ctx%B_12, xs(1), t1, ierr)
-      call MatMultAdd(g_ctx%B_13, xs(3), t1, t1, ierr)
-      call MatMult(dpsi, t1, t2, ierr)
-      call MatMult(g_ctx%B_31, t2, ys(3), ierr)
-      call VecScale(ys(3), -1.0d0, ierr)
-      call MatMultAdd(g_ctx%B_33, xs(3), ys(3), ys(3), ierr)
-    else
-      call MatMultAdd(g_ctx%B_21, xs(3), ys(1), ys(1), ierr)
-      call MatMultAdd(g_ctx%B_23, xs(4), ys(1), ys(1), ierr)
-      call MatMult(g_ctx%B_12, xs(1), ys(3), ierr)
-      call MatMult(g_ctx%B_33, xs(3), t1, ierr)
-      call VecAXPY(ys(3), sf_opz(), t1, ierr)
-      call MatMultAdd(g_ctx%B_13, xs(4), ys(3), ys(3), ierr)
-      call MatMult(g_ctx%B_31, xs(3), ys(4), ierr)
-      call MatMultAdd(g_ctx%B_33, xs(4), ys(4), ys(4), ierr)
-    endif
-
-    call sf_split_parts(x, ys(1:nf), .true.)   ! x <- the reference, packed
-    call VecAXPY(x, -1.0d0, y, ierr)
-    call VecNorm(x, NORM_2, e(1), ierr)
-    call VecNorm(y, NORM_2, e(2), ierr)
-    d = e(1) / max(e(2), 1.d-300)
-    if (my_id == 0) write(*,'(A,ES10.3)') &
-      "[Physics PC]   pair_w mixed gate (packed vs block matvecs): ", d
-    if (d > 1.d-12) then
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: the packed mixed pair_w is wrong."
-      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
-    endif
-    call VecDestroy(x, ierr); call VecDestroy(y, ierr)
-    call VecDestroy(t1, ierr); call VecDestroy(t2, ierr)
-    do k = 1, nf
-      call VecDestroy(xs(k), ierr); call VecDestroy(ys(k), ierr)
-    enddo
-
-  end subroutine gate
-
-  !> What the packed operator carries, for the log.
-  character(len=64) function label()
-    select case (fm%form)
-    case (SF_SUU_WJ)
-      label = "pair_w mixed (u,omega,j), psi by lumped mass"
-    case default
-      label = "pair_w mixed (u,omega,psi,j), small-flow psi"
-    end select
-  end function label
 
 #endif
 end module mod_petsc_pc_sf_mixed

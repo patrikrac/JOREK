@@ -117,9 +117,8 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
 #define DFV (n_tor*n_vertex_max*n_degrees)
 
   real*8, dimension(DFV, DFV), intent(out) :: ELM
-  !> The term selection, when it is not physics_pc_force_operator's (the SF
-  !! path's "wj" / "wpj" arms assemble W without its bending term)
-  integer, intent(in), optional :: terms
+  !> The term selection (sf_force_terms): 1 all, 5 kink + curvature, 6 curvature
+  integer, intent(in) :: terms
 
   !> Four toroidal channels: _n carries d_phi on the trial function, _k on the
   !! test function, _kn on both (see header, PARALLEL GRADIENT).
@@ -136,8 +135,7 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   integer :: index_ij, index_kl
 
   real*8 :: wst, xjac, xjac_x, xjac_y, BigR
-  real*8 :: theta, zeta_t, pref, eps_cyl, GAMMA_l, p0, rw
-  integer :: rpow
+  real*8 :: theta, zeta_t, pref, eps_cyl, GAMMA_l, p0
 
   ! Test function
   real*8 :: v_x, v_y, v_s, v_t, v_ss, v_st, v_tt, v_xx, v_xy, v_yy
@@ -159,7 +157,6 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   real*8 :: ztor_x, ztor_y, ctor_x, ctor_y, bj_tst
   real*8 :: a_bend, a_kink, a_curv, a_uu
   real*8 :: a_uu_n, a_uu_k, a_uu_kn
-  integer :: fo
 
   real*8     :: in_fft(1:n_plane)
   complex*16 :: out_fft(1:n_plane)
@@ -180,18 +177,6 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   ! (theta*dt)^2 / opz -- the prefactor that turns a(du,v) into the matrix to be
   ! ADDED to B_22. opz = 1 + zeta, matching build_schur_mixed_prod.
   pref   = (theta * tstep)**2 / (1.d0 + zeta_t)
-
-  ! Workstream E, section 6: R-weight sweep on the BENDING family. Values
-  ! 20..24 mean "full operator, bending integrand multiplied by R**(value-22)",
-  ! so 22 reproduces force_operator = 1 exactly and is the sweep's own control.
-  ! A pointwise weight is a DIFFERENT operator and so can change the direction
-  ! of W; a scalar factor cannot, because cos(W,C) is scale-invariant.
-  fo = physics_pc_force_operator
-  if (present(terms)) fo = terms
-  rpow = 0
-  if (fo >= 20 .and. fo <= 24) then
-    rpow = fo - 22
-  endif
 
   x_g = 0.d0; x_s = 0.d0; x_t = 0.d0; x_ss = 0.d0; x_st = 0.d0; x_tt = 0.d0
   y_g = 0.d0; y_s = 0.d0; y_t = 0.d0; y_ss = 0.d0; y_st = 0.d0; y_tt = 0.d0
@@ -405,9 +390,7 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
           ! Bending: - int (1/R) grad(zeta).grad(chi), bilinear in Bpar, so it
           ! spreads over all four channels. Symmetric, negative semi-definite.
           !------------------------------------------------------------------
-          rw = BigR**rpow      ! = 1 unless the section-6 R sweep is active
-
-          a_bend = - rw * ( zeta_x*chi_x + zeta_y*chi_y ) / BigR
+          a_bend = - ( zeta_x*chi_x + zeta_y*chi_y ) / BigR
 
           !------------------------------------------------------------------
           ! Kink: - int (R*Bpar du) [v,j0], linear in Bpar -> p and n only.
@@ -423,56 +406,35 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
           a_curv = - 2.d0 * BigR**2 * v_y * ( p0_x*u_y - p0_y*u_x ) &
                    - 4.d0 * GAMMA_l * BigR * p0 * v_y * u_y
 
-          ! fo (physics_pc_force_operator, or the caller's terms) selects which
-          ! terms are assembled, so that W can be compared LIKE FOR LIKE against
-          ! a production S_uu whose channel set differs
-          ! (physics_pc_schur_channels = 1 carries the psi channel only, i.e.
-          ! bending + kink and NO pressure term), and so that the SF path's
-          ! mixed pair_w arms can take the bending (and kink) back out:
-          !   1 = bending + kink + curvature   (the full Eq. (19) operator)
-          !   2 = bending + kink               (matches schur_channels = 1)
-          !   3 = bending only                 (the dominant term alone)
-          !   5 = kink + curvature             (SF "wj": bending through j)
-          !   6 = curvature only               (SF "wpj": psi channel through psi, j)
-          if (fo == 4) then
-            ! UNIT TEST, not physics. Assembles amat_31's integrand
-            ! (v_x*u_x + v_y*u_y)/BigR*xjac through THIS routine's Jacobians,
-            ! derivative formulas, FFT scatter and 0.5*ELM halving. The dumped
-            ! W_force must then equal the dumped B_31 to round-off; any
-            ! difference is a defect in the machinery, not in the weak form.
-            a_uu  = ( v_x*u_x + v_y*u_y ) / BigR * xjac
-          else if (fo == 6) then
+          ! terms (sf_force_terms) selects which terms are assembled: the mixed
+          ! pair_w forms carry the bending (and kink) through explicit fields
+          ! and take them back out of W:
+          !   1 = bending + kink + curvature   (the full Eq. (19) operator: schur, w)
+          !   5 = kink + curvature             ("wj": bending through j)
+          !   6 = curvature only               ("wpj": psi channel through psi, j)
+          if (terms == 6) then
             a_uu  = pref * ( a_curv ) * xjac
-          else if (fo == 5) then
+          else if (terms == 5) then
             a_uu  = pref * ( a_kink + a_curv ) * xjac
-          else if (fo == 3) then
-            a_uu  = pref * ( a_bend ) * xjac
-          else if (fo == 2) then
-            a_uu  = pref * ( a_bend + a_kink ) * xjac
           else
             a_uu  = pref * ( a_bend + a_kink + a_curv ) * xjac
           endif
-          ! d_phi on trial: bending cross-term + the kink's toroidal half (the
-          ! latter dropped with the kink itself when fo = 3)
-          if (fo >= 3 .and. fo <= 4) then
-            a_uu_n = pref * ( - rw * ( zeta_x*ctor_x + zeta_y*ctor_y ) / BigR ) * xjac
-            if (fo == 4) a_uu_n = 0.d0   ! unit test: p only
-          else if (fo == 5) then
+          ! d_phi on trial: bending cross-term + the kink's toroidal half
+          if (terms == 5) then
             a_uu_n = pref * ( - eps_cyl * F0 * bj_tst ) * xjac
-          else if (fo == 6) then
+          else if (terms == 6) then
             a_uu_n = 0.d0
           else
-            a_uu_n = pref * ( - rw * ( zeta_x*ctor_x + zeta_y*ctor_y ) / BigR   &
+            a_uu_n = pref * ( - ( zeta_x*ctor_x + zeta_y*ctor_y ) / BigR   &
                               - eps_cyl * F0 * bj_tst ) * xjac
           endif
-          ! d_phi on test / on both: bending cross-terms only (none in the
-          ! unit test, which is poloidal like amat_31)
-          if (fo == 4 .or. fo == 5 .or. fo == 6) then
+          ! d_phi on test / on both: bending cross-terms only
+          if (terms == 5 .or. terms == 6) then
             a_uu_k  = 0.d0
             a_uu_kn = 0.d0
           else
-            a_uu_k  = pref * ( - rw * ( ztor_x*chi_x + ztor_y*chi_y ) / BigR ) * xjac
-            a_uu_kn = pref * ( - rw * ( ztor_x*ctor_x + ztor_y*ctor_y ) / BigR ) * xjac
+            a_uu_k  = pref * ( - ( ztor_x*chi_x + ztor_y*chi_y ) / BigR ) * xjac
+            a_uu_kn = pref * ( - ( ztor_x*ctor_x + ztor_y*ctor_y ) / BigR ) * xjac
           endif
 
           ELM_p (mp,index_ij,index_kl) = ELM_p (mp,index_ij,index_kl) + wst * a_uu

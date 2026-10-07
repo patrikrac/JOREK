@@ -1,10 +1,21 @@
 # Physics-PC MPI scaling study
 
-These scripts run strong- and weak-scaling series of the SFM2 physics
-preconditioner on a SLURM cluster, and compare it against JOREK's default PETSc
-preconditioner. The test case is the committed benchmark
-`namelist/model199/intear_island_demo`: a 2/1 tearing mode with a tstep ramp of
-0.1, 1 and 10, three steps each.
+These scripts run strong- and weak-scaling series of the physics
+preconditioner (`use_physics_pc`, the split-field (SF) preconditioner of
+`solvers/mod_petsc_pc_sf*`) on a SLURM cluster, and compare it against JOREK's
+default PETSc preconditioner. The SF arms run the reference physics case
+`namelist/model199/inxflow_shaped_pcbench`; the `jorek` arms run the committed
+benchmark `namelist/model199/intear_island_demo`, a 2/1 tearing mode.
+
+**The production configuration is `sf_gmg_wpj_ms`**: pair_w mixed (`wpj`)
+with the Eq. (17) corrector, one |n| family per rank group (mode split), and
+every block on its C¹ GMG. These are the namelist defaults: `use_physics_pc =
+.t.` alone runs it. Every other `sf_*` arm is a reference.
+
+The research arms of the earlier physics PC (`sfm2_*`, the `physics_pc_gmg_*`,
+`physics_pc_harm_split`, `physics_pc_mass_solver`, ... flags) were removed on
+2026-10-07; the sections below that quote them are measurement history. Their
+code is at the git tag `physics-pc-legacy`.
 
 | file | role |
 |---|---|
@@ -60,15 +71,10 @@ submitted again. `results.tsv` is rewritten after every case.
 
 | arm | preconditioner |
 |---|---|
-| `sfm2_gmg` | SFM2 without refactorisations: C¹ GMG on pair_w (matrix-free fine operator with the exact mass), eta-Schur + GMG on pair_psi, GMG on ρ/T. Only the constraint masses are factored, once per run. Every hierarchy uses the stage-D13 axis treatment: rings 0–3 of every level in one axis block solved by MUMPS (`physics_pc_gmg_axis_rings = 3`), and coarse levels without the boundary ring's Dirichlet DOFs (`physics_pc_gmg_bnd_drop = 1`). The ring count is fixed on purpose: the automatic choice (`-1`, all rings with r·Δθ/Δr < 1) grows like n_tht/2π rings, so its factor grows faster than N (438 MB at 49×64, tens of GB at 641×256). k = 3 was the fastest setting on both benchmarks. |
-| `sfm2_gmg_mass` | `sfm2_gmg` with the exact-mass solves done by a fixed-degree Chebyshev iteration preconditioned by additive Schwarz (one subdomain per rank, overlap 1, local ICC(0)) instead of MUMPS with a centralized RHS (`physics_pc_mass_solver = 2`). Iteration counts are identical; the point is that its cost per rank falls with the rank count while the MUMPS solve's rises (161×64: `PhysPC_MjSolve` 90 s at np 1, 312 s at np 32). On few ranks it is SLOWER than MUMPS. |
-| `sfm2_gmg_smop` | `sfm2_gmg` with the fine GMG smoother on the assembled operator, the exact matrix-free operator only for residuals (`physics_pc_gmg_smooth_op = 1`): about 4.8× fewer exact-mass solves, at +16% pair_w V-cycles and +1..2 outer iterations. |
-| `sfm2_gmg_q` | both of the above. |
-| `sfm2_gmg_d12` | `sfm2_gmg` without the axis treatment (the configuration of commit `3cafa9f46`). Opt-in only: the comparison is already measured (161×64, np 16: 473 s against 365 s), so it is not in the default arms. |
-| `sfm2_lu` | SFM2 with MUMPS LU inner solves (the reference for approximation quality); refactored at every PC rebuild |
+| `sf_gmg_wpj_ms` | **production**: see "The SF arms" below |
+| `sf_*` | the SF reference arms, see "The SF arms" below |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
 | `jorek_fresh` | `jorek` with the PC rebuilt at every step (`iter_precon = 0`): separates the loss of the mode coupling from a stale factorisation |
-| `sfm2_lu_hs0`, `sfm2_gmg_hs0` | `sfm2_lu` / `sfm2_gmg` keeping the cross-\|n\| entries (`physics_pc_harm_split = 0`). They are zeros at equilibrium but O(1) in the saturated island, where the `harm_split = 1` arms stall. |
 
 ## Series
 
@@ -105,24 +111,17 @@ equilibrium on a 51×16 grid and every larger mesh then fails in the check
 after the equilibrium computation. Override with `PCS_N_RADIAL`/`PCS_N_POL`.
 
 The GMG arm needs n_flux − 1 divisible by 4 and n_tht divisible by 8 (at least
-3 levels); `mknml.py` refuses other meshes. The `sfm2_lu` arm at np = 1 on
-161×64 and above needs a lot of memory (7.4 GB at 81×32, and LU fill grows
+3 levels); `mknml.py` refuses other meshes. The `sf_lu*` arms at np = 1 on
+161×64 and above need a lot of memory (7.4 GB at 81×32, and LU fill grows
 faster than the DOF count). Run it on whole nodes (`--mem=0`), or leave it out
 of the large cases.
 
-Two further knobs are off by default and have no arm, because they need a
-case the study does not cover (see `docs/physics_pc/workstream_D_matrix_free.md`
-§14):
+## The SF arms (`sf_gmg_wpj_ms`, `sf_gmg`, `sf_gmg_w`, `sf_gmg_wpj`, `sf_lu`, `sf_lu_w`, `sf_lu_wpj`, `sf_jorek`, `sf_direct`)
 
-- `physics_pc_gmg_axis_split = 1` solves the axis block as one LU per |n|
-  group, group k on rank mod(k, np), instead of one LU of all slots on rank 0.
-  The counts are identical. At n_tor = 3 it only cuts the peak by 20% and the
-  gather/scatter costs more than that, so it needs a larger n_tor.
-- `physics_pc_gmg_axis_droptol = 1.d-4` drops the entries below
-  tol·sqrt(|a_ii a_jj|) from the axis block before its LU: −47% factor entries
-  and −23% `GMG_AxSolve` at 41×16, with unchanged counts.
-
-## The production SF path (`sf_gmg`, `sf_gmg_w`, `sf_gmg_wpj`, `sf_lu`, `sf_lu_w`, `sf_lu_wpj`, `sf_jorek`, `sf_direct`)
+Every SF arm sets each `physics_pc_sf_*` flag it depends on (`mknml.py`), so
+an arm means the same whatever the namelist defaults. The arms without `_ms`
+run the global operators (every block on every rank), the `_ms` arms the mode
+split, which needs np >= (n_tor+1)/2.
 
 The split-field preconditioner of `mod_petsc_pc_sf*` (workstream H) runs on the
 reference physics case `namelist/model199/inxflow_shaped_pcbench`, not on the
@@ -135,7 +134,8 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 
 | arm | blocks |
 |---|---|
-| `sf_gmg` | S_uu = `schur` (the default): every block on its C¹ GMG, pair_psi split (ψ, j) and pair_w on zebra lines, ρ / T on radial lines |
+| `sf_gmg_wpj_ms` | **production**: `sf_gmg_wpj` on one \|n\| family per rank group (`physics_pc_sf_mode_split`) |
+| `sf_gmg` | S_uu = `schur`: every block on its C¹ GMG, pair_psi split (ψ, j) and pair_w on zebra lines, ρ / T on radial lines |
 | `sf_gmg_w` | the same with S_uu = `w`, B₂₂ + W assembled |
 | `sf_gmg_wpj` | the same with pair_w mixed (u, ω, ψ, j), ring smoother |
 | `sf_gmg_wpj_eq16` | `sf_gmg_wpj` with the Eq. (16) corrector (a second pair_psi solve) instead of the default Eq. (17) |
@@ -206,7 +206,7 @@ steps), pair_w V-cycles per solve in parentheses:
 - With full 2:1 coarsening pair_w's V-cycles grow with the mesh (2.0 → 3.7
   at tstep 1; to 1e-8: 8–10 → 20–29 FGMRES its): ring blocks leave the
   radial coupling to the coarse grid. Alternating rings with radial-line
-  blocks (smoother 9, multiplicative) is WORSE (121×48: no convergence at
+  blocks (a multiplicative smoother, since removed) is WORSE (121×48: no convergence at
   tstep 1): at large dt radial-line Jacobi amplifies the poloidal ψ–u
   coupling instead of smoothing it. The fix is radial semi-coarsening, below.
 - np > 1: JOREK partitions ring by ring, so a rank boundary cuts some rings
@@ -333,14 +333,12 @@ the parallel parts actually do; check it before reading any timing:
   prints it except the schur arm's pair_w (GMG1) and pair_psi (GMG2): pair_w's
   V-cycle needs GMRES there, and pair_psi also runs nested in the S_uu shell.
 - `GMG<k>: level matvecs on the OpenMP block kernel (bs 3, ... levels)`: the
-  SF operators, every GMG level, the prolongations and the SFM2 coupling
+  SF operators, every GMG level, the prolongations and the sweep's coupling
   blocks multiply with `solvers/jorek_blockmv_attach.c` (`SF_BLOCKMV = 1`),
   which threads over the rank's OpenMP threads and reads each harmonic
   block's column indices once. It is gated against PETSc's `MatMult` on first
   attach and shows up as `PC_BlockMV` in `prof.txt`. The comparison binary is
-  `SF_BLOCKMV = 0`: PETSc's kernel, one thread per rank, except that the
-  fine-level GMG operators become AIJMKL on a PETSc with MKL sparse
-  (`SF: GMG operators converted to AIJMKL (threaded SpMV)`). The laptop cannot
+  `SF_BLOCKMV = 0`: PETSc's kernel, one thread per rank. The laptop cannot
   judge the kernel: its memory bandwidth saturates at 2 threads
   (81×32 np 1×4: MatMult 23.5 → 20.2 s, KSP 41.9 → 38.3 s; np 2×2 even;
   one thread per rank ~10% slower). Compare the two binaries on the cluster
@@ -446,6 +444,10 @@ smoothing including the overlap scatter), `t_GMG<k>_AxSolve` (axis blocks),
 
 ## Motivation figures (`plot_motivation.py`)
 
+*Measurement history: these series were run with the `sfm2_*` arms, which
+exist only at the tag `physics-pc-legacy`. `plot_motivation.py` still reads
+their results; to rerun them, check out that tag.*
+
 Five figures for the case for a scalable physics PC. Each comes from one
 series; a series is one study directory:
 
@@ -538,23 +540,20 @@ arm to the `probes` series.
 
 - `outer_its`: FGMRES iterations per time step. They must stay flat with np;
   only round-off changes them.
-- `pw_cycles_mean`: mean pair_w GMG V-cycles per solve, per step. At np > 1
-  the radial-line smoother is cut into per-rank segments, so a rise with np is
-  expected. JOREK distributes the rows ring by ring, so each rank owns a band
-  of flux surfaces and every radial line gets one block-Jacobi cut per rank
-  boundary. On 41×16 the D13 axis treatment saves 35% / 20% / 10% of the
-  cycles at np = 1 / 2 / 4, because these cuts grow with np. Compare
-  `sfm2_gmg` against `sfm2_gmg_d12` at equal np.
-- `pp_its_mean` / `rt_its_mean`: inner iterations of pair_psi and ρ/T.
+- `sf_pj_mean`, `sf_w_mean`, `sf_rho_mean`, `sf_T_mean`: mean inner
+  iterations (V-cycles) per solve of each block, per step. JOREK distributes
+  the rows ring by ring, so every radial line is cut at each rank boundary;
+  the line overlap keeps these flat in np.
+- `pw_cycles_mean`, `pp_its_mean`, `rt_its_mean`: the same for the removed
+  `sfm2_*` arms (measurement history).
 - `wall_s`: PETSc total time. `setup_s_sum` / `solve_s_sum` are the PC build
   and the Krylov solves, summed over steps.
 - `t_<event>`: `-log_view` times (max over ranks, all stages). The ones to watch:
   - `PhysPC_SolveW`, `GMG_VCycle`: the pair_w multigrid.
   - `PhysPC_MjSolve`: the constraint-mass solve inside the matrix-free pair_w
-    operators. On the `sfm2_*` arms it is MUMPS with a centralized RHS, which
-    stopped scaling on the laptop and on the cluster. On `sf_gmg` it is the
-    Chebyshev solve in the level-0 operator of pair_w's multigrid (see the
-    SF path section); `sf_gmg_w` has none.
+    operators of the `schur` arms: the Chebyshev solve in the level-0 operator
+    of pair_w's multigrid (see the SF arms section); the assembled forms
+    (`w`, `wj`, `wpj`) have none.
   - `GMG_Coarse`, `GMG_AxSolve`: the coarsest level and the axis blocks. Both
     are exact LUs solved redundantly on the few ranks that own their rows
     (rank 0 for the axis), so they involve no collective over all ranks. A
@@ -596,6 +595,8 @@ negative reason.
     much of each case runs single-threaded.
 
 ## Local reference: 8-core MacBook Air (4 performance + 4 efficiency cores)
+
+*Measurement history (`sfm2_*` arms, tag `physics-pc-legacy`).*
 
 `sfm2_gmg` as of commit `3cafa9f46` (now the `sfm2_gmg_d12` arm) on 81×32
 (186k DOFs), 1 thread per rank:

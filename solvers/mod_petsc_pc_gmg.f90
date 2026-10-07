@@ -1,11 +1,6 @@
-!> Workstream C: geometric multigrid on the exact nested C1 coarse space of
-!! JOREK's logically structured polar grid, applied to the SFM2 packed pair_w.
-!!
-!! Port of docs/physics_pc/tools/gmg_probe.py, validated offline in stage C1
-!! (docs/physics_pc/workstream_C_gmg_probe.md S2, S3.2): on pair_w a V-cycle
-!! with GMRES(4)+Jacobi smoothing and an exact axis patch needs 15/16/44 FGMRES
-!! its at tstep 0.1/1/10 on 41x16 and 21/21/56 on the nested 81x32, against
-!! 33/37/77 -> 62/83/n.c. for the same smoother without a coarse grid.
+!> Geometric multigrid on the exact nested C1 coarse space of JOREK's
+!! logically structured polar grid: the GMG backend of the SF preconditioner's
+!! blocks (mod_petsc_pc_sf_solver), up to four independent hierarchies.
 !!
 !! THE COARSE SPACE. JOREK's cubic element is Bernstein in disguise
 !! (elements/mod_basisfunctions.f90): along an edge the control points are
@@ -22,9 +17,8 @@
 !! with a non-zero angular slope b on the axis would take values between
 !! coarse nodes other than the shared one, which the fine space cannot
 !! represent, so coarse axis b is dropped. The fine axis angular DOFs are then
-!! outside range(P) and near-null (X(:,3) = 0 on the axis), so the fine level
-!! gets an exact solve on all axis-node DOFs after each smoothing. Without it
-!! the error floor is ~50x higher (stage C1 gate 3).
+!! outside range(P) and near-null (X(:,3) = 0 on the axis), so the block
+!! smoothers solve the axis ring (rings 0..axis_k) as one block of its own.
 !!
 !! PARALLEL LAYOUT. The operator is packed rank by rank, [field 1 local |
 !! field 2 local], each field in JOREK index order (the Nest->AIJ pack). The
@@ -52,25 +46,19 @@ module mod_petsc_pc_gmg
   public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4
   public :: gmg_pc_apply_1, gmg_pc_apply_2
   public :: gmg_push, gmg_pop
-  public :: gmg_opts_t, gmg_opts_from_namelist
+  public :: gmg_opts_t
 
-  !> Everything that configures a hierarchy, passed EXPLICITLY. A caller that
-  !! passes it (the production SF path) is independent of every
-  !! physics_pc_gmg_* namelist entry; a caller that does not gets
-  !! gmg_opts_from_namelist(), i.e. exactly the research path's behaviour.
+  !> Everything that configures a hierarchy, passed EXPLICITLY by the caller
+  !! (mod_petsc_pc_sf_solver); no namelist entry reaches the GMG.
   type :: gmg_opts_t
-    integer :: smoother     = 0      !< level smoother code (see physics_pc_gmg_smoother)
+    integer :: smoother     = 0      !< level smoother: 4 rings, 5 radial lines, 7 zebra lines,
+                                     !< 8 zebra rings inside / zebra lines outside
     integer :: nsmooth      = 0      !< smoothing steps; <= 0 = the smoother's default
     integer :: pre0         = -1     !< level-0 pre-smoothing steps; < 0 = nsmooth (0 = none)
     integer :: post0        = -1     !< level-0 post-smoothing steps; < 0 = nsmooth (0 = none)
     integer :: nsmooth_c    = -1     !< pre and post steps on the coarse levels; <= 0 = nsmooth
     integer :: axis_rings   = 0      !< axis block extent: rings 0..k; -1 = by physical radius
-    integer :: axis_mult    = 0      !< axis/lines coupling (0 = additive)
-    integer :: axis_split   = 0      !< one axis solve per |n| group, on distinct ranks
-    integer :: smooth_op    = 0      !< 1 = fine smoother on the assembled surrogate
-    integer :: ring_diag    = 0      !< diagnostic samples per rebuild (0 = off)
     integer :: bnd_drop     = 0      !< drop Dirichlet DOFs from the coarse spaces
-    integer :: harm_split   = 0      !< operator is block-diagonal in |n|
     integer :: ring_overlap = 0      !< smoother 4 (and 9's rings): a ring cut by a rank
                                      !< boundary is extended by up to this many nodes along
                                      !< J into the ranks owning the rest (RAS, as the lines)
@@ -87,11 +75,8 @@ module mod_petsc_pc_gmg
                                      !< with jorek_blockmv_attach.c's OpenMP kernel
     integer :: rich_from    = -1     !< levels >= rich_from smooth with Richardson on the
                                      !< smoother's blocks (no reductions); < 0 = none
-    real*8  :: omega        = 0.7d0  !< Richardson damping (smoothers 1, 2)
-    real*8  :: rich_omega   = 0.d0   !< Richardson scale on levels >= rich_from;
-                                     !< <= 0 = 1 (smoothers 1, 2: omega)
-    real*8  :: axis_droptol = 0.d0   !< relative drop tolerance of the axis block
-    real*8  :: ring_aspect  = 1.d0   !< smoother 6 / axis_rings -1 switch radius
+    real*8  :: rich_omega   = 0.d0   !< Richardson scale on levels >= rich_from; <= 0 = 1
+    real*8  :: ring_aspect  = 1.d0   !< smoother 8 / axis_rings -1 switch radius
     integer :: semi_r       = 0      !< levels 1..semi_r coarsen in I (radially) only:
                                      !< they keep the finer level's nj and P is the
                                      !< identity along J; the levels below coarsen both.
@@ -130,9 +115,8 @@ module mod_petsc_pc_gmg
   integer, save     :: nlev = 0
   Mat, save         :: gP(1:MAX_LEV-1)
   Mat, save         :: gA(0:MAX_LEV-1)      !< gA(0) borrowed (the fine operator), gA(g>0) owned
-  KSP, save         :: gSm(0:MAX_LEV-1), gAxis
-  Vec, save         :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1), gzax
-  IS, save          :: gisAxis
+  KSP, save         :: gSm(0:MAX_LEV-1)
+  Vec, save         :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1)
   Mat, save         :: gF                   !< fine-level matvec operator: gA(0), or a
                                             !< matrix-free equivalent (Workstream D)
   logical, save     :: p_ready = .false., op_ready = .false., vec_ready = .false.
@@ -146,25 +130,21 @@ module mod_petsc_pc_gmg
   !! (local, 0-based, ascending; set before the first rds_setup), cnt/dsp =
   !! the members' row counts/offsets. Used for the stage-D13 axis blocks and
   !! the coarsest level, which both live on a few ranks at scale.
-  ! root >= 0 (stage Q, physics_pc_gmg_axis_split): the member of rank root
-  ! alone factors and solves; the others gather their rows to it and get the
-  ! solution back. root = -1: every member solves the same system redundantly.
   type :: rds_t
-    logical :: ready = .false., member = .false., solver = .false.
-    integer :: comm = MPI_COMM_NULL, np = 0, me = 0, root = -1
+    logical :: ready = .false., member = .false.
+    integer :: comm = MPI_COMM_NULL, np = 0, me = 0
     integer, allocatable :: loc(:), cnt(:), dsp(:)
     real*8, allocatable  :: send(:)
     IS  :: isq
     Mat, pointer :: sub(:) => null()
-    Mat :: flt                        !< sub(1) with small entries dropped (axis_droptol > 0)
-    logical :: filtered = .false.
     KSP :: ksp
     Vec :: b, x
   end type rds_t
 
-  ! Workstream D: node-block Jacobi smoother (Chacon 2025 S4.1). One dense block
-  ! per (node, toroidal harmonic) holding both fields and all four C1 DOFs, and
-  ! the axis ring as one block per harmonic. bid(row) -> block (1-based);
+  ! The block smoothers (Chacon 2025 S4.1, extended along rings and radial
+  ! lines): one block per line or ring and toroidal harmonic, holding every
+  ! field and all four C1 DOFs, and the axis ring as one block per harmonic.
+  ! bid(row) -> block (1-based);
   ! rows(off(b)+1 : off(b)+sz(b)) are the block's 0-based rows; the LU factors
   ! (column-major) start at lu(loff(b)+1), the pivots at piv(off(b)+1).
   type :: blk_t
@@ -173,7 +153,7 @@ module mod_petsc_pc_gmg
     logical, allocatable :: band(:)
     integer(8), allocatable :: loff(:)
     real*8, allocatable  :: lu(:)
-    ! Stage D13: with physics_pc_gmg_axis_rings /= 0 the axis block (rings
+    ! Stage D13: with gmg_opts_t%axis_rings /= 0 the axis block (rings
     ! 0..axis_lim(g), every slot) is not factored dense but by MUMPS on its
     ! submatrix: it holds a fixed fraction of the level's rows (~I_s/n_flux),
     ! so a dense LU would cost O(N^3). axblk(b) marks its blocks.
@@ -181,16 +161,8 @@ module mod_petsc_pc_gmg
     logical :: axsparse = .false.
     logical, allocatable :: axblk(:)
     IS  :: axis_is
-    ! one solve per |n| group with physics_pc_gmg_axis_split (the block is
-    ! block-diagonal in |n| once harm_split drops the cross-|n| entries),
-    ! group k solved on rank mod(k, np); otherwise one group, all slots
+    ! its direct solve (one group, all slots; size 1)
     type(rds_t), allocatable :: axg(:)
-    ! physics_pc_gmg_axis_mult > 0: Gauss-Seidel coupling between the axis
-    ! block and the lines through the interface blocks A(rest,ax), A(ax,rest)
-    logical :: gsready = .false., gsvec = .false.
-    IS  :: rest_is
-    Mat :: Bra, Bar
-    Vec :: xw, xw2, tr, ta
     ! Smoother 7 (zebra radial lines): colour of each block (0 = even J lines,
     ! the axis block and the I = 0 block; 1 = odd J lines), and the coupling of
     ! the odd lines' rows to colour-0 columns, A(odd, even+axis), as local CSR
@@ -233,34 +205,26 @@ module mod_petsc_pc_gmg
     integer(8) :: pat_id = -1, pat_nz = -1
   end type blk_t
   type(blk_t), save, target :: gBk(0:MAX_LEV-1)
-  !> Smoother 9 (alternating): the radial-line blocks; gBk holds the rings
-  type(blk_t), save, target :: gBk2(0:MAX_LEV-1)
-  logical, save :: blk_set2 = .false.        !< blk_apply works on gBk2
   type(rds_t), save :: gcrs                  !< the coarsest level's direct solve
   type(lvl_t), allocatable, save :: glv(:)   !< coarse DOF numberings, kept for the block maps
   integer, allocatable, save :: fine_node(:) !< level-0 row -> node-1 (i*n_tht + j), from node%index
-  integer, allocatable, save :: fine_kf(:)   !< level-0 row -> canonical DOF k + 4*field (ring diagnostics)
   integer, allocatable, save :: fine_harm(:) !< level-0 row -> toroidal slot m
   integer, save :: nth0 = 0                  !< n_tht (level-0 nj)
   integer, save :: nf_s = 0, cur_lev = 0
   integer, save :: stk_inst(8), stk_lev(8), nstk = 0
   integer, save :: sm_type = 0, sm_nstep = 4
-  logical, save :: sm_blocks = .false.
   real*8, allocatable, save :: blk_t_work(:,:)   !< (max block size, 0:threads-1)
   integer, parameter :: LINES_OMP_MIN = 4000     !< rows below which lines_solve stays serial
   ! Axis treatment (Bourne et al., JCP 488 (2023) 112249 S2-S3). Fine rings
-  ! I < ring_is have median r*dtheta/dr below physics_pc_gmg_ring_aspect: the
-  ! circle couplings dominate there, so smoother 6 uses ring blocks inside and
+  ! I < ring_is have median r*dtheta/dr below gmg_opts_t%ring_aspect: the
+  ! circle couplings dominate there, so smoother 8 uses ring blocks inside and
   ! radial lines outside (GMGPolar). Rings 0..axis_k form the axis block.
-  integer, save :: ring_is = 1, axis_k = 0, axis_mult = 0
+  integer, save :: ring_is = 1, axis_k = 0
   integer, save :: lovl = 0                 !< line overlap in nodes (gmg_opts_t%line_overlap)
   integer, save :: hpair = 0                !< gmg_opts_t%harm_pair
   integer, save :: rovl = 0                 !< gmg_opts_t%ring_overlap (ring blocks)
   integer, save :: semi_r = 0               !< gmg_opts_t%semi_r, of the hierarchy being built
   integer, save :: axsec = 0                !< axis J-sectors (gmg_opts_t%axis_sectors)
-  logical, save :: axis_split = .false.     !< stage Q: per-|n| axis solves on distinct ranks
-  real*8, save  :: axis_droptol = 0.d0      !< stage Q: relative drop tolerance of the axis block
-  integer, save :: diag_left = 0            !< ring-diag samples left in this rebuild
   integer, save :: gcomm = 0, gme = 0       !< communicator and rank of the hierarchy
   ! Galerkin chain reuse: the fine operand's sparsity pattern is fixed (the
   ! physics PC even keeps the same Mat for the run), so the PtAP symbolic phase
@@ -279,25 +243,22 @@ module mod_petsc_pc_gmg
   ! The routines below work on the module-level state; gmg_select(k) parks
   ! the active instance's state in inst(cur_inst) and loads instance k.
   ! PETSc handles are pointers and the arrays move with move_alloc, so a
-  ! switch is O(1). Instance 1 = pair_w (2 fields), 2 = the pair_psi Schur
-  ! Shat, 3 = B_55 (rho), 4 = B_66 (T), all one field. V-cycles of different
-  ! instances never nest.
+  ! switch is O(1). Instance 1 = pair_w, 2 = pair_psi, 3 = B_55 (rho),
+  ! 4 = B_66 (T). V-cycles of different instances nest only through
+  ! gmg_push / gmg_pop (the schur arm's pair_w shell applying pair_psi).
   integer, parameter :: MAX_INST = 4
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
-    integer :: ring_is = 1, axis_k = 0, axis_mult = 0, diag_left = 0, lovl = 0, axsec = 0, hpair = 0, rovl = 0
-    logical :: axis_split = .false.
-    real*8  :: axis_droptol = 0.d0
+    integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 0, rovl = 0
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
-    logical :: p_ready = .false., op_ready = .false., vec_ready = .false., sm_blocks = .false.
+    logical :: p_ready = .false., op_ready = .false., vec_ready = .false.
     Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gF
-    KSP :: gSm(0:MAX_LEV-1), gAxis
+    KSP :: gSm(0:MAX_LEV-1)
     type(rds_t) :: gcrs
-    Vec :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1), gzax
-    IS  :: gisAxis
-    type(blk_t) :: gBk(0:MAX_LEV-1), gBk2(0:MAX_LEV-1)
+    Vec :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1)
+    type(blk_t) :: gBk(0:MAX_LEV-1)
     type(lvl_t), allocatable :: glv(:)
-    integer, allocatable :: fine_node(:), fine_harm(:), fine_kf(:)
+    integer, allocatable :: fine_node(:), fine_harm(:)
   end type gmg_inst_t
   type(gmg_inst_t), save :: inst(MAX_INST)
   integer, save :: cur_inst = 1
@@ -309,8 +270,8 @@ module mod_petsc_pc_gmg
 
   ! -log_view events (Workstream D cost audit). Registered here, not in the
   ! physics-PC ctx, so this module keeps no dependency on it.
-  PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1, gev_axislu = -1
-  PetscLogEvent, save :: gev_axis = -1, gev_prolong = -1
+  PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1
+  PetscLogEvent, save :: gev_prolong = -1
   PetscLogEvent, save :: gev_blkmesh = -1, gev_blkpat = -1, gev_blknum = -1, gev_axnum = -1, gev_axtry = -1
   ! Workstream G, finding D3: these are per INSTANCE, like gev_vcycle. While
   ! they were shared, no -log_view number could attribute line or axis time to
@@ -330,21 +291,6 @@ module mod_petsc_pc_gmg
   integer, parameter :: PQ_J(0:3) = [0, 0, 1, 1]   !< ... and in j
 
 contains
-
-  !> The research path's configuration: every field from its namelist entry.
-  function gmg_opts_from_namelist() result(o)
-    use phys_module, only: physics_pc_gmg_smoother, physics_pc_gmg_nsmooth, physics_pc_gmg_omega, &
-                           physics_pc_gmg_axis_rings, physics_pc_gmg_ring_diag, physics_pc_gmg_axis_mult, &
-                           physics_pc_gmg_bnd_drop, physics_pc_gmg_smooth_op, physics_pc_gmg_axis_split, &
-                           physics_pc_harm_split, physics_pc_gmg_axis_droptol, physics_pc_gmg_ring_aspect
-    type(gmg_opts_t) :: o
-    o%smoother = physics_pc_gmg_smoother;    o%nsmooth = physics_pc_gmg_nsmooth
-    o%axis_rings = physics_pc_gmg_axis_rings; o%axis_mult = physics_pc_gmg_axis_mult
-    o%axis_split = physics_pc_gmg_axis_split; o%smooth_op = physics_pc_gmg_smooth_op
-    o%ring_diag = physics_pc_gmg_ring_diag;   o%bnd_drop = physics_pc_gmg_bnd_drop
-    o%harm_split = physics_pc_harm_split;     o%omega = physics_pc_gmg_omega
-    o%axis_droptol = physics_pc_gmg_axis_droptol; o%ring_aspect = physics_pc_gmg_ring_aspect
-  end function gmg_opts_from_namelist
 
   !> Save / restore the active hierarchy and level around a NESTED use of
   !! another hierarchy -- the pair_w shell applying pair_psi's V-cycle
@@ -370,41 +316,35 @@ contains
     ! park the active state
     associate (S => inst(cur_inst))
       S%nlev = nlev; S%nth0 = nth0; S%nf_s = nf_s; S%sm_type = sm_type; S%sm_nstep = sm_nstep
-      S%ring_is = ring_is; S%axis_k = axis_k; S%axis_mult = axis_mult; S%diag_left = diag_left
+      S%ring_is = ring_is; S%axis_k = axis_k
       S%lovl = lovl; S%axsec = axsec; S%hpair = hpair; S%rovl = rovl
-      S%axis_split = axis_split; S%axis_droptol = axis_droptol
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
-      S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready; S%sm_blocks = sm_blocks
-      S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm; S%gAxis = gAxis
-      S%gx = gx; S%gb = gb; S%gr = gr; S%gzax = gzax; S%gisAxis = gisAxis
+      S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready
+      S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm
+      S%gx = gx; S%gb = gb; S%gr = gr
       do g = 0, MAX_LEV - 1
         call move_blk(gBk(g), S%gBk(g))
-        call move_blk(gBk2(g), S%gBk2(g))
       enddo
       call move_rds(gcrs, S%gcrs)
       if (allocated(glv)) call move_alloc(glv, S%glv)
       if (allocated(fine_node)) call move_alloc(fine_node, S%fine_node)
-      if (allocated(fine_kf)) call move_alloc(fine_kf, S%fine_kf)
       if (allocated(fine_harm)) call move_alloc(fine_harm, S%fine_harm)
     end associate
     ! load instance k
     associate (S => inst(k))
       nlev = S%nlev; nth0 = S%nth0; nf_s = S%nf_s; sm_type = S%sm_type; sm_nstep = S%sm_nstep
-      ring_is = S%ring_is; axis_k = S%axis_k; axis_mult = S%axis_mult; diag_left = S%diag_left
+      ring_is = S%ring_is; axis_k = S%axis_k
       lovl = S%lovl; axsec = S%axsec; hpair = S%hpair; rovl = S%rovl
-      axis_split = S%axis_split; axis_droptol = S%axis_droptol
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
-      p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready; sm_blocks = S%sm_blocks
-      gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm; gAxis = S%gAxis
-      gx = S%gx; gb = S%gb; gr = S%gr; gzax = S%gzax; gisAxis = S%gisAxis
+      p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready
+      gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm
+      gx = S%gx; gb = S%gb; gr = S%gr
       do g = 0, MAX_LEV - 1
         call move_blk(S%gBk(g), gBk(g))
-        call move_blk(S%gBk2(g), gBk2(g))
       enddo
       call move_rds(S%gcrs, gcrs)
       if (allocated(S%glv)) call move_alloc(S%glv, glv)
       if (allocated(S%fine_node)) call move_alloc(S%fine_node, fine_node)
-      if (allocated(S%fine_kf)) call move_alloc(S%fine_kf, fine_kf)
       if (allocated(S%fine_harm)) call move_alloc(S%fine_harm, fine_harm)
     end associate
     cur_inst = k
@@ -417,10 +357,6 @@ contains
     b%axsparse = a%axsparse; b%axis_is = a%axis_is
     a%axsparse = .false.
     if (allocated(a%axg)) call move_alloc(a%axg, b%axg)
-    b%gsready = a%gsready; b%gsvec = a%gsvec
-    b%rest_is = a%rest_is; b%Bra = a%Bra; b%Bar = a%Bar
-    b%xw = a%xw; b%xw2 = a%xw2; b%tr = a%tr; b%ta = a%ta
-    a%gsready = .false.; a%gsvec = .false.
     if (allocated(a%axblk)) call move_alloc(a%axblk, b%axblk)
     if (allocated(a%bid))  call move_alloc(a%bid,  b%bid)
     if (allocated(a%off))  call move_alloc(a%off,  b%off)
@@ -454,13 +390,11 @@ contains
 
   subroutine move_rds(a, b)
     type(rds_t), intent(inout) :: a, b
-    b%ready = a%ready; b%member = a%member; b%solver = a%solver
-    b%comm = a%comm; b%np = a%np; b%me = a%me; b%root = a%root
+    b%ready = a%ready; b%member = a%member
+    b%comm = a%comm; b%np = a%np; b%me = a%me
     b%isq = a%isq; b%ksp = a%ksp; b%b = a%b; b%x = a%x
-    b%flt = a%flt; b%filtered = a%filtered; a%filtered = .false.
     b%sub => a%sub; a%sub => null()
-    a%ready = .false.; a%member = .false.; a%solver = .false.; a%comm = MPI_COMM_NULL; a%np = 0; a%me = 0
-    a%root = -1
+    a%ready = .false.; a%member = .false.; a%comm = MPI_COMM_NULL; a%np = 0; a%me = 0
     if (allocated(a%loc))  call move_alloc(a%loc,  b%loc)
     if (allocated(a%cnt))  call move_alloc(a%cnt,  b%cnt)
     if (allocated(a%dsp))  call move_alloc(a%dsp,  b%dsp)
@@ -469,13 +403,11 @@ contains
 
   !> (Re)build R for A(rows, rows), rows = R%loc on each rank. what = options
   !! prefix part (gmg<k>_<what>_); tag = label of the first build's
-  !! factor-size print. solver_rank (rank in gcomm): that rank alone solves,
-  !! whether or not it owns any of the rows; absent: all owners solve.
-  subroutine rds_setup(R, A, what, tag, solver_rank)
+  !! factor-size print. Every owner of some of the rows solves.
+  subroutine rds_setup(R, A, what, tag)
     type(rds_t), intent(inout) :: R
     Mat, intent(in)     :: A
     character(len=*), intent(in) :: what, tag
-    integer, intent(in), optional :: solver_rank
     PetscInt, parameter :: one = 1
     PetscInt :: rst, ren
     PetscErrorCode :: ierr
@@ -491,9 +423,7 @@ contains
     fresh = .not. R%ready .or. pat_fresh
     if (R%ready .and. pat_fresh) then
       call MatDestroySubMatrices(one, R%sub, ierr)
-      if (R%filtered) call MatDestroy(R%flt, ierr)
-      R%filtered = .false.
-      if (R%solver) then
+      if (R%member) then
         call KSPDestroy(R%ksp, ierr)
         call VecDestroy(R%x, ierr)
         call VecDestroy(R%b, ierr)
@@ -504,22 +434,12 @@ contains
       nl = size(R%loc)
       color = MPI_UNDEFINED
       if (nl > 0) color = 1
-      if (present(solver_rank)) then
-        if (gme == solver_rank) color = 1
-      endif
       call MPI_Comm_split(gcomm, color, gme, R%comm, mpierr)
       R%member = (color == 1)
       ntot = 0
       if (R%member) then
         call MPI_Comm_size(R%comm, R%np, mpierr)
         call MPI_Comm_rank(R%comm, R%me, mpierr)
-        R%root = -1
-        if (present(solver_rank)) then
-          k = -1
-          if (gme == solver_rank) k = R%me
-          call MPI_Allreduce(k, R%root, 1, MPI_INTEGER, MPI_MAX, R%comm, mpierr)
-        endif
-        R%solver = (R%root < 0 .or. R%me == R%root)
         allocate(R%cnt(0:R%np - 1), R%dsp(0:R%np), R%send(nl))
         call MPI_Allgather(nl, 1, MPI_INTEGER, R%cnt, 1, MPI_INTEGER, R%comm, mpierr)
         R%dsp(0) = 0
@@ -530,9 +450,6 @@ contains
         allocate(gl(ntot))
         call MPI_Allgatherv(int(rst) + R%loc, nl, MPI_INTEGER, gl, R%cnt, R%dsp(0:R%np - 1), &
                             MPI_INTEGER, R%comm, mpierr)
-        if (.not. R%solver) then            ! the root alone extracts and factors
-          deallocate(gl); allocate(gl(0)); ntot = 0
-        endif
       else
         allocate(gl(0))
       endif
@@ -556,12 +473,7 @@ contains
       call MatAssemblyBegin(R%sub(1), MAT_FINAL_ASSEMBLY, ierr)
       call MatAssemblyEnd(R%sub(1), MAT_FINAL_ASSEMBLY, ierr)
     endif
-    if (R%solver .and. axis_droptol > 0.d0 .and. what(1:2) == "ax") then
-      if (R%filtered) call MatDestroy(R%flt, ierr)
-      call rds_filter(R, tag, fresh)
-      R%filtered = .true.
-    endif
-    if (R%solver) then
+    if (R%member) then
       if (fresh) then
         ! the coarsest level from CRS_MUMPS_MIN rows on: MUMPS with SCOTCH
         ! ordering (ICNTL(7) = 3), threaded and with half the fill of PETSc's
@@ -584,7 +496,7 @@ contains
         call KSPSetOperators(R%ksp, rds_op(R), rds_op(R), ierr)
       endif
     endif
-    if (R%solver) then
+    if (R%member) then
       call KSPSetUp(R%ksp, ierr)
       ! PETSc's LU does not pivot: on a failed factorisation, MUMPS instead
       block
@@ -600,8 +512,8 @@ contains
         endif
       end block
     endif
-    if (.not. R%ready .and. R%solver) then      ! factor size
-      if (R%me == max(R%root, 0)) then
+    if (.not. R%ready .and. R%member) then      ! factor size
+      if (R%me == 0) then
         block
           Mat :: F
           MatInfo :: finfo
@@ -659,64 +571,12 @@ contains
     end subroutine rds_make_ksp
   end subroutine rds_setup
 
-  !> The matrix the KSP factors: the filtered copy where there is one.
+  !> The matrix the KSP factors.
   function rds_op(R) result(M_)
     type(rds_t), intent(in) :: R
     Mat :: M_
     M_ = R%sub(1)
-    if (R%filtered) M_ = R%flt
   end function rds_op
-
-  !> Stage Q (physics_pc_gmg_axis_droptol): R%flt = R%sub(1) without the
-  !! entries below tol*sqrt(|a_ii a_jj|). The scaling is per entry because
-  !! JOREK's boundary rows carry a diagonal about 7 decades above the bulk,
-  !! so one absolute threshold would empty the small-scale rows. The block
-  !! is a smoother component, so an approximate factor is allowed; what it
-  !! buys is a smaller factor and a cheaper triangular solve per call.
-  subroutine rds_filter(R, tag, verbose)
-    type(rds_t), intent(inout) :: R
-    character(len=*), intent(in) :: tag
-    logical, intent(in) :: verbose
-    Vec :: dv
-    MatInfo :: i0, i1
-    PetscScalar, pointer :: dp(:)
-    PetscErrorCode :: ierr
-    PetscInt :: n, q
-
-    call MatDuplicate(R%sub(1), MAT_COPY_VALUES, R%flt, ierr)
-    call MatCreateVecs(R%flt, dv, PETSC_NULL_VEC, ierr)
-    call MatGetDiagonal(R%flt, dv, ierr)
-    call VecGetLocalSize(dv, n, ierr)
-    call VecGetArray(dv, dp, ierr)
-    do q = 1, n
-      if (abs(dp(q)) > 0.d0) then
-        dp(q) = 1.d0 / sqrt(abs(dp(q)))
-      else
-        dp(q) = 1.d0
-      endif
-    enddo
-    call VecRestoreArray(dv, dp, ierr)
-    call MatGetInfo(R%flt, MAT_LOCAL, i0, ierr)
-    ! symmetric diagonal scaling, absolute filter, scaling undone: drops the
-    ! entries with |a_ij| < tol*sqrt(|a_ii a_jj|)
-    call MatDiagonalScale(R%flt, dv, dv, ierr)
-    call MatFilter(R%flt, axis_droptol, PETSC_TRUE, PETSC_TRUE, ierr)
-    call VecGetArray(dv, dp, ierr)
-    do q = 1, n
-      dp(q) = 1.d0 / dp(q)
-    enddo
-    call VecRestoreArray(dv, dp, ierr)
-    call MatDiagonalScale(R%flt, dv, dv, ierr)
-    ! compression can leave a row without a stored diagonal, which the LU
-    ! needs: put the (zero) diagonals back
-    call MatSetOption(R%flt, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
-    call VecSet(dv, 0.d0, ierr)
-    call MatDiagonalSet(R%flt, dv, ADD_VALUES, ierr)
-    call MatGetInfo(R%flt, MAT_LOCAL, i1, ierr)
-    call VecDestroy(dv, ierr)
-    if (verbose) write(*,'(A,I0,A,A,A,F5.1,A,ES8.1)') "[Mem] GMG", cur_inst, " ", trim(tag), &
-      ": axis drop keeps ", 100.d0 * i1%nz_used / max(i0%nz_used, 1.d0), "% of the entries, tol ", axis_droptol
-  end subroutine rds_filter
 
   !> yy(R%loc) = A(rows, rows)^-1 xx(R%loc) on the members; others return.
   subroutine rds_solve(R, xx, yy)
@@ -741,12 +601,6 @@ contains
     PetscErrorCode :: ie
     integer :: q, nl, o, mpierr
     if (.not. R%member) return
-    if (R%root >= 0) then
-      call rds_gather(R, xp)
-      call rds_local(R)
-      call rds_return(R, yp)
-      return
-    endif
     nl = size(R%loc)
     o = R%dsp(R%me)
     call VecGetArray(R%b, bp, ie)
@@ -770,80 +624,6 @@ contains
     call VecRestoreArrayRead(R%x, bp, ie)
   end subroutine rds_solve_arr
 
-  !> Several rooted solves at once (the per-|n| axis groups): every group's
-  !! rows go to its root first, then each root solves its groups, then the
-  !! solutions come back, so groups on different ranks are solved at the
-  !! same time. All ranks walk the groups in the same order (no deadlock).
-  subroutine rds_solve_groups(Rs, xp, yp)
-    type(rds_t), intent(inout) :: Rs(:)
-    PetscScalar, intent(in)    :: xp(:)
-    PetscScalar, intent(inout) :: yp(:)
-    integer :: k
-    if (size(Rs) == 1) then
-      call rds_solve_arr(Rs(1), xp, yp)
-      return
-    endif
-    do k = 1, size(Rs)
-      if (Rs(k)%member) call rds_gather(Rs(k), xp)
-    enddo
-    do k = 1, size(Rs)
-      if (Rs(k)%member) call rds_local(Rs(k))
-    enddo
-    do k = 1, size(Rs)
-      if (Rs(k)%member) call rds_return(Rs(k), yp)
-    enddo
-  end subroutine rds_solve_groups
-
-  !> rooted R: the members' rows of xp into the root's R%b
-  subroutine rds_gather(R, xp)
-    type(rds_t), intent(inout) :: R
-    PetscScalar, intent(in) :: xp(:)
-    PetscScalar, pointer :: bp(:)
-    PetscErrorCode :: ie
-    integer :: q, nl, mpierr
-    nl = size(R%loc)
-    do q = 1, nl
-      R%send(q) = xp(R%loc(q) + 1)
-    enddo
-    if (R%solver) then
-      call VecGetArray(R%b, bp, ie)
-      call MPI_Gatherv(R%send, nl, MPI_DOUBLE_PRECISION, bp, R%cnt, R%dsp(0:R%np - 1), &
-                       MPI_DOUBLE_PRECISION, R%root, R%comm, mpierr)
-      call VecRestoreArray(R%b, bp, ie)
-    else
-      call MPI_Gatherv(R%send, nl, MPI_DOUBLE_PRECISION, R%send, R%cnt, R%dsp(0:R%np - 1), &
-                       MPI_DOUBLE_PRECISION, R%root, R%comm, mpierr)
-    endif
-  end subroutine rds_gather
-
-  subroutine rds_local(R)
-    type(rds_t), intent(inout) :: R
-    PetscErrorCode :: ie
-    if (R%solver) call KSPSolve(R%ksp, R%b, R%x, ie)
-  end subroutine rds_local
-
-  !> rooted R: the root's R%x back to the members' rows of yp
-  subroutine rds_return(R, yp)
-    type(rds_t), intent(inout) :: R
-    PetscScalar, intent(inout) :: yp(:)
-    PetscScalar, pointer :: bp(:)
-    PetscErrorCode :: ie
-    integer :: q, nl, mpierr
-    nl = size(R%loc)
-    if (R%solver) then
-      call VecGetArrayRead(R%x, bp, ie)
-      call MPI_Scatterv(bp, R%cnt, R%dsp(0:R%np - 1), MPI_DOUBLE_PRECISION, R%send, nl, &
-                        MPI_DOUBLE_PRECISION, R%root, R%comm, mpierr)
-      call VecRestoreArrayRead(R%x, bp, ie)
-    else
-      call MPI_Scatterv(R%send, R%cnt, R%dsp(0:R%np - 1), MPI_DOUBLE_PRECISION, R%send, nl, &
-                        MPI_DOUBLE_PRECISION, R%root, R%comm, mpierr)
-    endif
-    do q = 1, nl
-      yp(R%loc(q) + 1) = R%send(q)
-    enddo
-  end subroutine rds_return
-
   !> One V-cycle of hierarchy k on b (x out), outside any PC: the pair_psi
   !! eta-Schur applies it to Shat.
   subroutine gmg_vcycle(k, b, x)
@@ -851,7 +631,6 @@ contains
     Vec :: b, x
     PetscErrorCode :: ierr
     call gmg_select(k)
-    if (diag_left > 0 .and. cur_inst <= 2) call ring_diag(b)
     call PetscLogEventBegin(gev_vcycle(cur_inst), ierr)
     call vcycle(0, b, x)
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
@@ -913,7 +692,7 @@ contains
     Mat, intent(in)      :: Aref
     integer, intent(in)  :: comm, my_id, n_fields
     logical, intent(out) :: ok
-    type(gmg_opts_t), intent(in), optional :: opts
+    type(gmg_opts_t), intent(in) :: opts
     type(gmg_opts_t) :: gopt
 
     type(lvl_t), allocatable :: lv(:)
@@ -936,11 +715,7 @@ contains
     gcomm = comm; gme = my_id
     call gmg_register_events()
     call PetscLogEventBegin(gev_prolong, ierr)
-    if (present(opts)) then
-      gopt = opts
-    else
-      gopt = gmg_opts_from_namelist()
-    endif
+    gopt = opts
     call opt_real("ring_aspect", gopt%ring_aspect)
     semi_r = max(gopt%semi_r, -1)
     call opt_int("semi_r", semi_r)
@@ -1148,15 +923,12 @@ contains
       deallocate(rs, cs, ws)
     enddo
 
-    !--- the fine-level axis patch: every DOF of every axis-ring node (owned rows)
-    call make_axis_is(n_idx)
-
     !--- Workstream D: packed LOCAL row -> (node, harmonic) maps for the block
     !--- smoothers, fine level (fine_node/fine_harm) and every coarse level
     nf_s = n_fields
     nth0 = n_tht
     nloc = n_fields * pc_ntor * ly(0)%nl(me)
-    allocate(fine_node(nloc), fine_harm(nloc), fine_kf(nloc))
+    allocate(fine_node(nloc), fine_harm(nloc))
     fine_node = -1
     do n = 1, node_list%n_nodes
       do k = 1, 4
@@ -1167,7 +939,6 @@ contains
             lr = (ff * ly(0)%nl(me) + ly(0)%lpos(idx)) * pc_ntor + mm + 1
             fine_node(lr) = n - 1
             fine_harm(lr) = mm
-            fine_kf(lr) = (k - 1) + 4 * ff
           enddo
         enddo
       enddo
@@ -1239,7 +1010,7 @@ contains
       deallocate(ar)
 
       ! Per-ring median and the switch ring I_s: the first ring whose median
-      ! reaches physics_pc_gmg_ring_aspect (GMGPolar's circle/radial criterion).
+      ! reaches gmg_opts_t%ring_aspect (GMGPolar's circle/radial criterion).
       ! Ring ii holds the cells between flux surfaces ii and ii+1.
       block
         real*8, allocatable :: rm(:), row(:)
@@ -1341,34 +1112,6 @@ contains
       call MatAssemblyEnd(P, MAT_FINAL_ASSEMBLY, ierr_)
     end subroutine make_expanded
 
-    subroutine make_axis_is(n_idx_)
-      integer, intent(in) :: n_idx_
-      PetscInt, allocatable :: ax(:)
-      logical, allocatable  :: seen(:)
-      PetscErrorCode :: ierr_
-      integer :: nn, kk, f, m, nax, id
-
-      allocate(seen(n_idx_), ax(n_fields * pc_ntor * 4 * n_tht * 2))
-      seen = .false.; nax = 0
-      do nn = 1, node_list%n_nodes
-        if ((nn - 1) / n_tht /= 0) cycle          ! first ring = the axis
-        do kk = 1, 4
-          id = node_list%node(nn)%index(kk)
-          if (seen(id)) cycle
-          seen(id) = .true.
-          if (ly(0)%own(id - 1) /= me) cycle      ! owned rows only: no duplicates at np > 1
-          do f = 0, n_fields - 1
-            do m = 0, pc_ntor - 1
-              nax = nax + 1
-              ax(nax) = prow(0, f, id - 1, m)
-            enddo
-          enddo
-        enddo
-      enddo
-      call ISCreateGeneral(comm, nax, ax(1:nax), PETSC_COPY_VALUES, gisAxis, ierr_)
-      deallocate(seen, ax)
-    end subroutine make_axis_is
-
   end subroutine gmg_build_prolongations
 
   !> Canonical DOF numbering of one coarse level. The axis keeps the shared
@@ -1466,7 +1209,7 @@ contains
   !! at every PC rebuild with new values in A; P is reused, and with an
   !! unchanged pattern so are the coarse operators and the LUs' symbolic phase.
   !--------------------------------------------------------------------
-  subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, smoother, nsmooth, opts, Ablk)
+  subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, opts, Ablk)
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
     Mat, intent(in), optional :: Afine  !< Workstream D: applies the fine operator
@@ -1476,13 +1219,10 @@ contains
                                         !< coupling, axis block) from Ablk instead of A;
                                         !< same layout as A, frozen pattern
     character(len=*), intent(in), optional :: tag   !< label for the prints
-    integer, intent(in), optional :: smoother, nsmooth   !< override the physics_pc_gmg_* knobs
-    type(gmg_opts_t), intent(in), optional :: opts    !< the whole configuration; absent =
-                                                      !< gmg_opts_from_namelist()
+    type(gmg_opts_t), intent(in) :: opts    !< the whole configuration
     type(gmg_opts_t) :: o
     PetscErrorCode :: ierr
     PC   :: pc
-    Mat  :: Aax
     MatInfo :: minfo
     PetscInt :: nr
     integer :: g, rich_from
@@ -1524,7 +1264,6 @@ contains
         enddo
       endif
       ! the level smoothers' KSPs are kept (created once, re-pointed below)
-      if (.not. sm_blocks) call KSPDestroy(gAxis, ierr)   ! sm_blocks: still last setup's
     endif
 
     call gmg_register_events()
@@ -1558,11 +1297,7 @@ contains
     endif
 
     call PetscLogEventBegin(gev_smsetup, ierr)
-    if (present(opts)) then
-      o = opts
-    else
-      o = gmg_opts_from_namelist()
-    endif
+    o = opts
     sm_type = o%smoother
     sm_nstep = o%nsmooth
     ! threaded matvecs: after the Galerkin chain, on every rebuild (the attach
@@ -1582,17 +1317,12 @@ contains
           ": level matvecs on the OpenMP block kernel (bs ", pc_ntor, ", ", nlev, " levels)"
       end block
     endif
-    if (present(smoother)) then
-      if (smoother >= 0) sm_type = smoother
-    endif
     call opt_int("smoother", sm_type)
-    if (present(nsmooth)) then
-      if (nsmooth > 0) sm_nstep = nsmooth
+    if (sm_type /= 4 .and. sm_type /= 5 .and. sm_type /= 7 .and. sm_type /= 8) then
+      if (my_id == 0) write(*,'(A,I0)') "[Physics PC]   FATAL: GMG smoother must be 4, 5, 7 or 8, got ", sm_type
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     endif
-    if (sm_nstep <= 0) then
-      sm_nstep = SM_STEPS
-      if (sm_type == 1 .or. sm_type == 2) sm_nstep = 3
-    endif
+    if (sm_nstep <= 0) sm_nstep = SM_STEPS
     st_pre0(cur_inst) = sm_nstep; st_post0(cur_inst) = sm_nstep; st_crs(cur_inst) = sm_nstep
     if (o%pre0 >= 0)     st_pre0(cur_inst)  = o%pre0
     if (o%post0 >= 0)    st_post0(cur_inst) = o%post0
@@ -1604,29 +1334,19 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: GMG level 0 needs pre0 + post0 > 0"
       call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     endif
-    sm_blocks = (sm_type >= 2)
-    axis_k = 0
-    if (sm_type >= 4) axis_k = max(o%axis_rings, -1)
-    if (sm_type >= 4) call opt_int("axis_rings", axis_k)
-    axis_mult = 0
-    if (axis_k /= 0) axis_mult = min(max(o%axis_mult, 0), 3)
-    axis_droptol = max(o%axis_droptol, 0.d0)
+    axis_k = max(o%axis_rings, -1)
+    call opt_int("axis_rings", axis_k)
     lovl = 0
-    if (sm_type == 5 .or. sm_type >= 7) lovl = max(o%line_overlap, 0)
-    if (sm_type == 5 .or. sm_type >= 7) call opt_int("line_overlap", lovl)
+    if (sm_type /= 4) lovl = max(o%line_overlap, 0)
+    if (sm_type /= 4) call opt_int("line_overlap", lovl)
     hpair = max(o%harm_pair, 0)
     call opt_int("harm_pair", hpair)
     rovl = 0
-    if (sm_type == 4 .or. sm_type == 9) rovl = max(o%ring_overlap, 0)
-    if (sm_type == 4 .or. sm_type == 9) call opt_int("ring_overlap", rovl)
+    if (sm_type == 4) rovl = max(o%ring_overlap, 0)
+    if (sm_type == 4) call opt_int("ring_overlap", rovl)
     axsec = 0
-    if (axis_k /= 0 .and. axis_mult == 0) axsec = o%axis_sectors
-    if (axis_k /= 0 .and. axis_mult == 0) call opt_int("axis_sectors", axsec)
-    ! per-|n| axis solves need the block to be block-diagonal in |n|
-    axis_split = (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split > 0)
-    if (axis_k /= 0 .and. o%axis_split > 0 .and. o%harm_split == 0 .and. my_id == 0) &
-      write(*,'(A)') "[Physics PC]   GMG: physics_pc_gmg_axis_split needs physics_pc_harm_split = 1; ignored"
-    diag_left = max(o%ring_diag, 0)
+    if (axis_k /= 0) axsec = o%axis_sectors
+    if (axis_k /= 0) call opt_int("axis_sectors", axsec)
     ! Levels g >= rich_from smooth with Richardson on the same blocks instead
     ! of GMRES: no norm, no inner product, so no global reduction below that
     ! level. GMRES costs two allreduces over the whole communicator per step,
@@ -1635,7 +1355,6 @@ contains
     rich_from = nlev
     if (o%rich_from >= 0) rich_from = o%rich_from
     rich_omega = 1.d0
-    if (sm_type == 1 .or. sm_type == 2) rich_omega = o%omega
     if (o%rich_omega > 0.d0) rich_omega = o%rich_omega
     call opt_int("rich_from", rich_from)
     call opt_real("rich_omega", rich_omega)
@@ -1643,16 +1362,13 @@ contains
       ! Created and configured once per hierarchy; a rebuild only re-points
       ! the operators and refactors the smoother blocks.
       if (.not. op_ready) call KSPCreate(comm, gSm(g), ierr)
-      if (g == 0 .and. o%smooth_op == 0) then
-        call KSPSetOperators(gSm(g), gF, gA(g), ierr)     ! Jacobi reads the Pmat
+      if (g == 0) then
+        call KSPSetOperators(gSm(g), gF, gA(g), ierr)     ! the blocks read the Pmat
       else
-        ! smooth_op 1: the fine smoother iterates on the assembled surrogate;
-        ! only the V-cycle residual and the outer Krylov apply gF (the shell)
-        ! -- one exact-mass solve per matvec there instead of per GMRES step
         call KSPSetOperators(gSm(g), gA(g), gA(g), ierr)
       endif
       if (.not. op_ready) then
-        if (sm_type == 1 .or. sm_type == 2 .or. g >= rich_from) then
+        if (g >= rich_from) then
           call KSPSetType(gSm(g), KSPRICHARDSON, ierr)
           call KSPRichardsonSetScale(gSm(g), rich_omega, ierr)
           call KSPSetNormType(gSm(g), KSP_NORM_NONE, ierr)
@@ -1669,56 +1385,14 @@ contains
         endif
         call KSPSetInitialGuessNonzero(gSm(g), PETSC_TRUE, ierr)
         call KSPGetPC(gSm(g), pc, ierr)
-        if (sm_type == 9) then
-          ! alternating: ring blocks, then radial lines on the updated residual,
-          !   y = R^-1 x;  y = y + L^-1 (x - A y)
-          call PCSetType(pc, PCCOMPOSITE, ierr)
-          call PCCompositeSetType(pc, PC_COMPOSITE_MULTIPLICATIVE, ierr)
-          call PCCompositeAddPCType(pc, PCSHELL, ierr)
-          call PCCompositeAddPCType(pc, PCSHELL, ierr)
-          block
-            PC :: sub
-            call PCCompositeGetPC(pc, 0, sub, ierr)
-            call PCShellSetApply(sub, blk_apply, ierr)
-            call PCShellSetName(sub, "C1 ring blocks", ierr)
-            call PCCompositeGetPC(pc, 1, sub, ierr)
-            call PCShellSetApply(sub, blk_apply_set2, ierr)
-            call PCShellSetName(sub, "C1 radial-line blocks", ierr)
-          end block
-        else if (sm_blocks) then
-          call PCSetType(pc, PCSHELL, ierr)
-          call PCShellSetApply(pc, blk_apply, ierr)
-          call PCShellSetName(pc, "C1 node-block Jacobi", ierr)
-        else
-          call PCSetType(pc, PCJACOBI, ierr)
-        endif
+        call PCSetType(pc, PCSHELL, ierr)
+        call PCShellSetApply(pc, blk_apply, ierr)
+        call PCShellSetName(pc, "C1 block smoother", ierr)
       endif
-      if (sm_type == 9) then
-        ! the two partitions, each built as its own smoother kind: rings (4,
-        ! no line overlap), then radial lines (5, with it) into gBk2
-        block
-          integer :: lovl_
-          lovl_ = lovl
-          sm_type = 4; lovl = 0
-          if (g == 0 .and. present(Ablk)) then
-            call build_blocks(g, Ablk)
-          else
-            call build_blocks(g, gA(g))
-          endif
-          sm_type = 5; lovl = lovl_
-          if (g == 0 .and. present(Ablk)) then
-            call build_blocks(g, Ablk, set2=.true.)
-          else
-            call build_blocks(g, gA(g), set2=.true.)
-          endif
-          sm_type = 9
-        end block
-      else if (sm_blocks) then
-        if (g == 0 .and. present(Ablk)) then
-          call build_blocks(g, Ablk)
-        else
-          call build_blocks(g, gA(g))
-        endif
+      if (g == 0 .and. present(Ablk)) then
+        call build_blocks(g, Ablk)
+      else
+        call build_blocks(g, gA(g))
       endif
       call KSPSetUp(gSm(g), ierr)
     enddo
@@ -1727,32 +1401,26 @@ contains
     block
       integer :: ib(3), ibg(3), mpierr
       ib = 0
-      if (sm_blocks) ib = [gBk(0)%nb, count(gBk(0)%band), sum(gBk(0:nlev-2)%nsing)]
+      ib = [gBk(0)%nb, count(gBk(0)%band), sum(gBk(0:nlev-2)%nsing)]
       call MPI_Allreduce(ib, ibg, 3, MPI_INTEGER, MPI_SUM, comm, mpierr)
-      ib(1) = 0
-      if (sm_blocks) ib(1) = maxval(gBk(0)%kl)
+      ib(1) = maxval(gBk(0)%kl)
       call MPI_Allreduce(MPI_IN_PLACE, ib(1), 1, MPI_INTEGER, MPI_MAX, comm, mpierr)
       if (my_id == 0) then
         if (present(tag)) write(*,'(A,A,A)', advance="no") "[Physics PC]   GMG (", tag, ")"
-        write(*,'(A,I0,A,I0,A,I0,A,I0,A,F5.2)', advance="no") "[Physics PC]   GMG smoother ", sm_type, &
+        write(*,'(A,I0,A,I0,A,I0,A,I0,A)', advance="no") "[Physics PC]   GMG smoother ", sm_type, &
           ": V(", st_pre0(cur_inst), ",", st_post0(cur_inst), ") on level 0, ", st_crs(cur_inst), &
-          " steps per side below, omega = ", o%omega
-        if (sm_blocks) then
-          write(*,'(A,I0,A,I0,A,I0,A,I0,A)') ", blocks ", ibg(1), " on level 0 (", &
-            ibg(2), " banded, max kl ", ib(1), "; ", ibg(3), " singular -> point)"
-        else
-          write(*,*)
-        endif
-        if (sm_type == 6 .or. sm_type == 8) write(*,'(A,I0,A)', advance="no") &
+          " steps per side below"
+        write(*,'(A,I0,A,I0,A,I0,A,I0,A)') ", blocks ", ibg(1), " on level 0 (", &
+          ibg(2), " banded, max kl ", ib(1), "; ", ibg(3), " singular -> point)"
+        if (sm_type == 8) write(*,'(A,I0,A)', advance="no") &
           "[Physics PC]   GMG hybrid smoother: ring blocks on fine rings I < ", ring_is, &
           ", radial lines outside"
-        if (sm_type >= 4 .and. axis_k > 0) write(*,'(A,I0,A)', advance="no") &
+        if (axis_k > 0) write(*,'(A,I0,A)', advance="no") &
           "; axis block = rings 0..", axis_k, " on every level"
-        if (sm_type >= 4 .and. axis_k < 0) write(*,'(A,I0,A)', advance="no") &
+        if (axis_k < 0) write(*,'(A,I0,A)', advance="no") &
           "[Physics PC]   GMG axis block = rings 0..I_s-1 of every level (fine: 0..", axis_lim(0), ")"
-        if (axis_mult > 0) write(*,'(A,I0)', advance="no") ", axis/lines Gauss-Seidel mode ", axis_mult
-        if (sm_type == 6 .or. sm_type == 8 .or. (sm_type >= 4 .and. axis_k /= 0)) write(*,*)
-        if (rich_from < nlev - 1 .and. sm_type /= 1 .and. sm_type /= 2) write(*,'(A,I0,A,I0,A,F5.2,A)') &
+        if (sm_type == 8 .or. axis_k /= 0) write(*,*)
+        if (rich_from < nlev - 1) write(*,'(A,I0,A,I0,A,F5.2,A)') &
           "[Physics PC]   GMG", cur_inst, ": Richardson smoothing on levels >= ", rich_from, &
           " (scale ", rich_omega, ", no reductions)"
       endif
@@ -1772,75 +1440,18 @@ contains
     endif
     call rds_setup(gcrs, gA(nlev - 1), "coarse", "coarse level")
     call PetscLogEventEnd(gev_coarselu, ierr)
-    ! Wiring gate (one coarse solve): the redundant solve must be exact.
-    ! Workstream G, finding A1: FIRST BUILD ONLY. It used to run on every PC
-    ! rebuild -- a random vector, two MatMults, a full coarse solve and four
-    ! VecNorms (four collectives) -- while printing only on the first build or
-    ! on failure. What it gates is the WIRING of rds_t against the coarse
-    ! operator, and the pattern is frozen after the first build, so a later
-    ! rebuild cannot break the wiring without also changing the pattern (which
-    ! pattern_sig catches on its own). Apply-neutral either way.
-    if (.not. op_ready) then
-    block
-        Vec :: cb, cx, cr
-        real*8 :: rn, bn, xn, en
-        call MatCreateVecs(gA(nlev - 1), cx, cb, ierr)
-        call VecDuplicate(cb, cr, ierr)
-        ! manufactured solution: b = A xt, so both the residual and the
-        ! error of the solve are known (an ill-conditioned coarse operator
-        ! shows as a small residual with a large error)
-        call VecSetRandom(cr, PETSC_NULL_RANDOM, ierr)               ! xt
-        call MatMult(gA(nlev - 1), cr, cb, ierr)
-        call VecZeroEntries(cx, ierr)
-        call rds_solve(gcrs, cb, cx)
-        call VecNorm(cr, NORM_2, en, ierr)
-        call VecAXPY(cr, -1.0d0, cx, ierr)                           ! xt - x
-        call VecNorm(cr, NORM_2, xn, ierr)
-        call MatMult(gA(nlev - 1), cx, cr, ierr)
-        call VecAXPY(cr, -1.0d0, cb, ierr)
-        call VecNorm(cr, NORM_2, rn, ierr)
-        call VecNorm(cb, NORM_2, bn, ierr)
-        if (my_id == 0 .and. (.not. op_ready .or. rn > 1.d-8 * bn)) write(*,'(A,A,ES10.3,A,ES10.3)') &
-          "[Physics PC]   GMG coarse solve self-check", merge(": WARNING, inexact! ", ":                   ", &
-          rn > 1.d-8 * bn), rn / max(bn, 1.d-300), " (residual), ", xn / max(en, 1.d-300)
-        call VecDestroy(cb, ierr); call VecDestroy(cx, ierr); call VecDestroy(cr, ierr)
-    end block
-    endif
-
-    ! The exact axis patch is only applied with the point-Jacobi smoothers; the
-    ! block smoothers carry the axis ring as one block of their own.
-    if (.not. sm_blocks) then
-      call PetscLogEventBegin(gev_axislu, ierr)
-      call MatCreateSubMatrix(gA(0), gisAxis, gisAxis, MAT_INITIAL_MATRIX, Aax, ierr)
-      call KSPCreate(comm, gAxis, ierr)
-      call KSPSetOperators(gAxis, Aax, Aax, ierr)
-      call KSPSetType(gAxis, KSPPREONLY, ierr)
-      call KSPGetPC(gAxis, pc, ierr)
-      call PCSetType(pc, PCLU, ierr)
-      call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
-      call set_prefix_mumps(gAxis, "axis")
-      call KSPSetUp(gAxis, ierr)
-      call PetscLogEventEnd(gev_axislu, ierr)
-    endif
-
     if (.not. vec_ready) then
       do g = 0, nlev - 1
         call MatCreateVecs(gA(g), gx(g), gb(g), ierr)
         call VecDuplicate(gx(g), gr(g), ierr)
       enddo
-      if (.not. sm_blocks) call MatCreateVecs(Aax, gzax, PETSC_NULL_VEC, ierr)
       vec_ready = .true.
     endif
-    if (.not. sm_blocks) call MatDestroy(Aax, ierr)        ! gAxis holds its own reference
-    ! Workstream G, findings A2/A3: the boundary-row scans and the C_op report
-    ! are FIRST BUILD ONLY. Both describe the hierarchy's STRUCTURE -- which is
-    ! frozen after the first build -- yet re-ran every rebuild, the C_op loop
-    ! costing 2*nlev collectives each time. Apply-neutral.
+    ! The C_op report describes the hierarchy's structure, frozen after the
+    ! first build: first build only.
     pat_fresh = .false.
     if (op_ready) return
     op_ready = .true.
-    if (diag_left > 0) call report_bnd_rows(gA(0))
-    if (o%bnd_drop > 0) call check_bnd_rows(gA(0))
 
     ! Operator complexity: the whole point against GAMG's C_op ~ 1.00 (T2).
     call MatGetInfo(gA(0), MAT_GLOBAL_SUM, minfo, ierr)
@@ -1941,7 +1552,6 @@ contains
     Vec :: b, x
     PetscErrorCode :: ierr
     call gmg_select(1)                  ! the PC-shell entry point is pair_w's
-    if (diag_left > 0) call ring_diag(b)
     call PetscLogEventBegin(gev_vcycle(cur_inst), ierr)
     call vcycle(0, b, x)
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
@@ -1961,7 +1571,6 @@ contains
     call PetscLogEventRegister("GMG_BlkNum",   cid, gev_blknum,   ierr)
     call PetscLogEventRegister("GMG_AxNum",    cid, gev_axnum,    ierr)
     call PetscLogEventRegister("GMG_AxTry",    cid, gev_axtry,    ierr)
-    call PetscLogEventRegister("GMG_AxisLU",   cid, gev_axislu,   ierr)
     call PetscLogEventRegister("GMG_VCycle",   cid, gev_vcycle(1),  ierr)
     call PetscLogEventRegister("GMG_Smooth0",  cid, gev_smooth0(1), ierr)
     call PetscLogEventRegister("GMG_SmoothC",  cid, gev_smooth(1),  ierr)
@@ -1978,7 +1587,6 @@ contains
     call PetscLogEventRegister("GMG4_Smooth0", cid, gev_smooth0(4), ierr)
     call PetscLogEventRegister("GMG4_SmoothC", cid, gev_smooth(4),  ierr)
     call PetscLogEventRegister("GMG4_Coarse",  cid, gev_coarse(4),  ierr)
-    call PetscLogEventRegister("GMG_Axis",     cid, gev_axis,     ierr)
     call PetscLogEventRegister("GMG_Lines",    cid, gev_lines(1),   ierr)
     call PetscLogEventRegister("GMG_AxSolve",  cid, gev_axsolve(1), ierr)
     call PetscLogEventRegister("GMG2_Lines",   cid, gev_lines(2),   ierr)
@@ -2012,8 +1620,7 @@ contains
       npre = st_crs(cur_inst);  npost = st_crs(cur_inst)
     endif
     if (npre > 0) call smooth(g, b, x, .true., npre)     ! pre-smooth (zero guess: no b - A*0)
-    if (g == 0 .and. .not. sm_blocks) call axis_patch(b, x)
-    if (npre == 0 .and. .not. (g == 0 .and. .not. sm_blocks)) then
+    if (npre == 0) then
       call VecCopy(b, gr(g), ierr)                        ! x is still 0: r = b
     else
       if (g == 0) then
@@ -2027,7 +1634,6 @@ contains
     call vcycle(g + 1, gb(g + 1), gx(g + 1))
     call MatMultAdd(gP(g + 1), gx(g + 1), x, x, ierr)     ! x += P e_c
     if (npost > 0) call smooth(g, b, x, .false., npost)  ! post-smooth
-    if (g == 0 .and. .not. sm_blocks) call axis_patch(b, x)
   end subroutine vcycle
 
   !> nstep smoother iterations on level g. The level's GMRES restart is the
@@ -2072,18 +1678,17 @@ contains
   !!    the zebra coupling CSR, and the value maps from A's CSR.
   !!  - numeric part, every rebuild: gather through the maps (blk_fill), then
   !!    factor. A singular block falls back to its diagonal (nsing).
-  subroutine build_blocks(g, A, set2)
-    use mod_petsc_pc_harm, only: pc_ntor, pc_ngrp, pc_grp
+  subroutine build_blocks(g, A)
+    use mod_petsc_pc_harm, only: pc_ntor
     integer, intent(in) :: g
     Mat, intent(in)     :: A
-    logical, intent(in), optional :: set2   !< build into gBk2 (smoother 9's lines)
     type(blk_t), pointer :: B
     PetscInt :: nr, r, ncols, rst, ren
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
     PetscInt, parameter :: one = 1
-    integer :: nc, I, J, m, bb, q, pcn, info, n, ldab, kk, tmp, nthr, ngrp, mpierr
+    integer :: nc, I, J, m, bb, q, pcn, info, n, ldab, kk, nthr, mpierr
     integer, allocatable :: cnt(:), key(:)
     integer(8) :: ix
     PetscInt, allocatable :: axr(:)
@@ -2091,9 +1696,6 @@ contains
     external :: dgetrf, dgbtrf
 
     B => gBk(g)
-    if (present(set2)) then
-      if (set2) B => gBk2(g)
-    endif
     call MatGetLocalSize(A, nr, PETSC_NULL_INTEGER, ierr)
     call MatGetOwnershipRange(A, rst, ren, ierr)
     if (.not. allocated(B%bid)) then
@@ -2108,7 +1710,7 @@ contains
           nc = glv(g)%nj
           I = glv(g)%rnode(r) / nc; J = mod(glv(g)%rnode(r), nc); m = glv(g)%rharm(r)
         endif
-        B%bid(r) = blk_id(g, I, J, m, nc)
+        B%bid(r) = blk_id(g, I, J, m)
         if (sm_type == 5 .or. sm_type == 7) key(r) = I
         if (sm_type == 4) then
           ! a ring is periodic in J: ordered 0, nc-1, 1, nc-2, ... (as smoother
@@ -2118,13 +1720,6 @@ contains
             key(r) = 2 * J
           else
             key(r) = 2 * (nc - 1 - J) + 1
-          endif
-        endif
-        if (sm_type == 6) then                     ! rings run along J, radial lines along I
-          if (I < ring_lim(g)) then
-            key(r) = J
-          else
-            key(r) = I
           endif
         endif
         if (sm_type == 8) then
@@ -2227,30 +1822,17 @@ contains
         enddo
         call ISCreateGeneral(gcomm, int(n, kind(nr)), axr, PETSC_COPY_VALUES, B%axis_is, ierr)
         call ISSort(B%axis_is, ierr)
-        ! the same rows, local and ascending, per axis group (key = group + 1)
-        ngrp = 1
-        if (axis_split) ngrp = pc_ngrp()
-        allocate(B%axg(ngrp), key(B%nrow))
+        ! the same rows, local and ascending, for its direct solve
+        allocate(B%axg(1), key(B%nrow))
         key = 0
         do q = 1, n
-          r = axr(q) - rst + 1
-          key(r) = 1
-          if (axis_split) then
-            if (g == 0) then
-              m = fine_harm(r)
-            else
-              m = glv(g)%rharm(r)
-            endif
-            key(r) = pc_grp(m) + 1                   ! |n| group of slot m (cos/sin together)
-          endif
+          key(axr(q) - rst + 1) = 1
         enddo
-        do kk = 1, ngrp
-          allocate(B%axg(kk)%loc(count(key == kk)))
-          n = 0
-          do r = 1, B%nrow
-            if (key(r) /= kk) cycle
-            n = n + 1; B%axg(kk)%loc(n) = int(r) - 1
-          enddo
+        allocate(B%axg(1)%loc(count(key == 1)))
+        n = 0
+        do r = 1, B%nrow
+          if (key(r) /= 1) cycle
+          n = n + 1; B%axg(1)%loc(n) = int(r) - 1
         enddo
         deallocate(axr, key)
       endif
@@ -2370,25 +1952,6 @@ contains
       endif
     endif
     if (B%axsparse .and. .not. B%axdon .and. .not. B%axnew) call ax_lu(g, A, B)
-
-    if (B%axsparse .and. axis_mult > 0) then
-      if (B%gsready) then
-        call MatDestroy(B%Bra, ierr)
-        call MatDestroy(B%Bar, ierr)
-      else
-        call ISComplement(B%axis_is, rst, ren, B%rest_is, ierr)
-      endif
-      call MatCreateSubMatrix(A, B%rest_is, B%axis_is, MAT_INITIAL_MATRIX, B%Bra, ierr)
-      call MatCreateSubMatrix(A, B%axis_is, B%rest_is, MAT_INITIAL_MATRIX, B%Bar, ierr)
-      if (.not. B%gsvec) then
-        call MatCreateVecs(A, B%xw, PETSC_NULL_VEC, ierr)
-        call VecDuplicate(B%xw, B%xw2, ierr)
-        call MatCreateVecs(B%Bra, PETSC_NULL_VEC, B%tr, ierr)
-        call MatCreateVecs(B%Bar, PETSC_NULL_VEC, B%ta, ierr)
-        B%gsvec = .true.
-      endif
-      B%gsready = .true.
-    endif
   end subroutine build_blocks
 
   !> Pattern part of build_blocks: band widths and storage layout of the
@@ -2955,23 +2518,16 @@ contains
           call axd_factor(gBk(g)%axd(kk))
         enddo
       endif
-      if (gBk2(g)%axpend) then
-        do kk = 1, size(gBk2(g)%axd)
-          call axd_factor(gBk2(g)%axd(kk))
-        enddo
-      endif
     enddo
     call PetscLogEventEnd(gev_axnum, ierr)
     ! a failed sector factorisation (zero pivot) on any rank: that level's
     ! block goes to the LU. Every rank walks the same levels (axpend agrees).
     do g = 0, nlev - 2
       if (gBk(g)%axpend) call check(gBk(g))
-      if (gBk2(g)%axpend) call check(gBk2(g))
     enddo
     ! first build: the gates, and the LU where a sector solve failed its gate
     do g = 0, nlev - 2
       if (gBk(g)%axnew) call finish(gBk(g))
-      if (gBk2(g)%axnew) call finish(gBk2(g))
     enddo
 
   contains
@@ -2999,28 +2555,17 @@ contains
     end subroutine finish
   end subroutine axd_factor_pending
 
-  !> The LU of the whole axis block(s) of level g (rds_t): where no sector
+  !> The LU of the whole axis block of level g (rds_t): where no sector
   !! solve is in use. First build and every rebuild.
   subroutine ax_lu(g, A, B)
     integer, intent(in) :: g
     Mat, intent(in) :: A
     type(blk_t), intent(inout) :: B
-    integer :: kk, gnp, mpierr
     character(len=24) :: axname
     character(len=64) :: axtag
-    if (size(B%axg) == 1) then
-      write(axname, '(A,I0)') "axblk", g
-      write(axtag, '(A,I0)') "axis block level ", g
-      call rds_setup(B%axg(1), A, trim(axname), trim(axtag))
-    else
-      call MPI_Comm_size(gcomm, gnp, mpierr)
-      do kk = 1, size(B%axg)
-        write(axname, '(A,I0,A,I0)') "axblk", g, "n", kk - 1
-        write(axtag, '(A,I0,A,I0,A,I0)') "axis block level ", g, " |n|-group ", kk - 1, &
-                                         " on rank ", mod(kk - 1, gnp)
-        call rds_setup(B%axg(kk), A, trim(axname), trim(axtag), mod(kk - 1, gnp))
-      enddo
-    endif
+    write(axname, '(A,I0)') "axblk", g
+    write(axtag, '(A,I0)') "axis block level ", g
+    call rds_setup(B%axg(1), A, trim(axname), trim(axtag))
   end subroutine ax_lu
 
   !> First sector rank of level g: the levels' sector sets follow each other
@@ -3276,31 +2821,29 @@ contains
 
   !> Block of the DOFs at grid point (I, J) of level g, toroidal slot m, for
   !! the active smoother. The axis ring (I = 0, one shared value DOF) is one
-  !! block per slot for every kind; with axis_k > 0 (kinds 4-6) rings 0..axis_k
-  !! are. 2/3 node, 4 flux-surface ring (all J at one I), 5 radial line (all
-  !! I > axis_k at one J), 6 rings for I < ring_lim(g) and radial lines
-  !! outside. Ids have gaps; build_blocks compresses them.
-  integer function blk_id(g, I, J, m_, nj)
+  !! block per slot; with axis_k /= 0 rings 0..axis_lim(g) are. 4 flux-surface
+  !! ring (all J at one I), 5 / 7 radial line (all I > axis_k at one J), 8
+  !! rings for I < ring_lim(g) and radial lines outside. Ids have gaps;
+  !! build_blocks compresses them.
+  integer function blk_id(g, I, J, m_)
     use mod_petsc_pc_harm, only: pc_ntor, pc_grp
-    integer, intent(in) :: g, I, J, m_, nj
+    integer, intent(in) :: g, I, J, m_
     integer :: is_g, m
     m = m_
     if (hpair > 0) m = pc_grp(m_)          ! slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs
-    if (I == 0 .or. (sm_type >= 4 .and. I <= axis_lim(g))) then
+    if (I == 0 .or. I <= axis_lim(g)) then
       blk_id = m + 1
     else if (sm_type == 4) then
       blk_id = pc_ntor + (I - 1) * pc_ntor + m + 1
     else if (sm_type == 5 .or. sm_type == 7) then
       blk_id = pc_ntor + J * pc_ntor + m + 1
-    else if (sm_type == 6 .or. sm_type == 8) then
+    else                                        ! 8
       is_g = ring_lim(g)
       if (I < is_g) then
         blk_id = pc_ntor + (I - 1) * pc_ntor + m + 1
       else
         blk_id = pc_ntor + max(is_g - 1, 0) * pc_ntor + J * pc_ntor + m + 1
       endif
-    else
-      blk_id = pc_ntor + ((I - 1) * nj + J) * pc_ntor + m + 1
     endif
   end function blk_id
 
@@ -3325,22 +2868,6 @@ contains
     endif
   end function axis_lim
 
-  !> PCSHELL apply on level cur_lev: y = blockdiag(A)^-1 x. With a sparse
-  !! axis block and axis_mult > 0 the axis block and the lines are coupled
-  !! Gauss-Seidel style instead of Jacobi (stage D13: the residual collects
-  !! on both sides of the axis-block boundary): 1 = axis block first, then
-  !! the lines on x - A(rest,ax) y_ax; 2 = lines first, then the axis block on
-  !! x - A(ax,rest) y_rest; 3 = axis, lines, axis (symmetric).
-  !> Smoother 9's second stage: blk_apply on the radial-line blocks.
-  subroutine blk_apply_set2(pc, x, y, ierr)
-    PC  :: pc
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    blk_set2 = .true.
-    call blk_apply(pc, x, y, ierr)
-    blk_set2 = .false.
-  end subroutine blk_apply_set2
-
   subroutine blk_apply(pc, x, y, ierr)
     PC  :: pc
     Vec :: x, y
@@ -3348,27 +2875,14 @@ contains
     type(blk_t), pointer :: B
 
     B => gBk(cur_lev)
-    if (blk_set2) B => gBk2(cur_lev)
     if (sm_type == 7 .or. sm_type == 8) then
       call zebra_solve(x, y)
-    else if (.not. B%axsparse .or. axis_mult == 0) then
+    else
       ! axis first: it depends on x only, and the ranks enter here in step
       ! (GMRES's reductions just synchronised them), which a J-sector solve
       ! needs; after the lines it would wait for the slowest rank's lines
       if (B%axsparse) call ax_solve(x, y)
       call lines_solve(x, y)
-    else if (axis_mult == 2) then
-      call lines_solve(x, y)
-      call update_rhs(x, y, B%xw, B%axis_is, B%rest_is, B%Bar, B%ta)
-      call ax_solve(B%xw, y)
-    else
-      call ax_solve(x, y)
-      call update_rhs(x, y, B%xw, B%rest_is, B%axis_is, B%Bra, B%tr)
-      call lines_solve(B%xw, y)
-      if (axis_mult == 3) then
-        call update_rhs(x, y, B%xw2, B%axis_is, B%rest_is, B%Bar, B%ta)
-        call ax_solve(B%xw2, y)
-      endif
     endif
     ierr = 0
 
@@ -3529,209 +3043,17 @@ contains
         call PetscLogEventEnd(gev_axsolve(cur_inst), ie)
         return
       endif
-      if (.not. any(B%axg(:)%member)) return
+      if (.not. B%axg(1)%member) return
       call PetscLogEventBegin(gev_axsolve(cur_inst), ie)
       call VecGetArrayRead(xx, xp, ie)
       call VecGetArray(yy, yp, ie)
-      call rds_solve_groups(B%axg, xp, yp)
+      call rds_solve_arr(B%axg(1), xp, yp)
       call VecRestoreArray(yy, yp, ie)
       call VecRestoreArrayRead(xx, xp, ie)
       call PetscLogEventEnd(gev_axsolve(cur_inst), ie)
     end subroutine ax_solve
 
-    !> w = x, then w(to rows) -= C y(from rows), C = A(to, from)
-    subroutine update_rhs(xx, yy, w, to_is, from_is, C, t)
-      Vec :: xx, yy, w, t
-      IS  :: to_is, from_is
-      Mat :: C
-      Vec :: ys, ws
-      PetscErrorCode :: ie
-      call VecCopy(xx, w, ie)
-      call VecGetSubVector(yy, from_is, ys, ie)
-      call MatMult(C, ys, t, ie)
-      call VecRestoreSubVector(yy, from_is, ys, ie)
-      call VecGetSubVector(w, to_is, ws, ie)
-      call VecAXPY(ws, -1.0d0, t, ie)
-      call VecRestoreSubVector(w, to_is, ws, ie)
-    end subroutine update_rhs
   end subroutine blk_apply
-
-  !> physics_pc_gmg_ring_diag: WHERE the residual of a real right-hand side
-  !! lives while stationary V-cycles reduce it. Runs NCYC cycles x <- x +
-  !! V(b - F x) from x = 0 on a copy and prints ||r||^2 by ring zone -- the
-  !! axis ring, rings 1..I_s-1 (r*dtheta/dr below the switch), I_s..2 I_s-1,
-  !! the rest -- next to each zone's share of the rows, plus the three rings
-  !! holding most of ||r||^2. The caller's solve is untouched.
-  subroutine ring_diag(b)
-    use phys_module, only: n_flux
-    Vec :: b
-    integer, parameter :: NCYC = 6
-    Vec :: x, r, e
-    PetscScalar, pointer :: rp(:)
-    PetscErrorCode :: ierr
-    PetscInt :: nl
-    integer :: c, l, q, t, mpierr, top(3)
-    real*8 :: zs(4), zr(4), rn, bn
-    real*8, allocatable :: pr(:)
-
-    diag_left = diag_left - 1
-    call VecDuplicate(b, x, ierr)
-    call VecDuplicate(b, r, ierr)
-    call VecDuplicate(b, e, ierr)
-    call VecZeroEntries(x, ierr)
-    call VecCopy(b, r, ierr)
-    call VecGetLocalSize(b, nl, ierr)
-    allocate(pr(0:n_flux - 1))
-    zr = 0.0d0
-    do l = 1, int(nl)
-      q = zone(fine_node(l) / nth0)
-      zr(q) = zr(q) + 1.0d0
-    enddo
-    call MPI_Allreduce(MPI_IN_PLACE, zr, 4, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
-    if (gme == 0) write(*,'(A,I0,A,I0,A,I0,A,4F6.1)') "[GMG ring-diag] inst ", cur_inst, &
-      ": zones axis | 1..", ring_is - 1, " | ", ring_is, "..2Is-1 | rest, rows %", 100.0d0 * zr / sum(zr)
-    bn = 0.0d0
-    do c = 0, NCYC
-      if (c > 0) then
-        call vcycle(0, r, e)
-        call VecAXPY(x, 1.0d0, e, ierr)
-        call MatMult(gF, x, r, ierr)
-        call VecAYPX(r, -1.0d0, b, ierr)
-      endif
-      pr = 0.0d0
-      call VecGetArrayRead(r, rp, ierr)
-      do l = 1, int(nl)
-        t = fine_node(l) / nth0
-        pr(t) = pr(t) + rp(l)**2
-      enddo
-      call VecRestoreArrayRead(r, rp, ierr)
-      call MPI_Allreduce(MPI_IN_PLACE, pr, n_flux, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
-      zs = 0.0d0
-      do t = 0, n_flux - 1
-        zs(zone(t)) = zs(zone(t)) + pr(t)
-      enddo
-      rn = sqrt(sum(pr))
-      if (c == 0) bn = max(rn, 1.d-300)
-      do q = 1, 3
-        top(q) = maxloc(pr, 1) - 1
-        pr(top(q)) = -pr(top(q)) - 1.d-300           ! mark taken (restored below)
-      enddo
-      pr = abs(pr)
-      if (gme == 0) write(*,'(A,I0,A,ES9.2,A,4F6.1,A,3(1X,I0,A,F4.1,A))') &
-        "[GMG ring-diag]   cyc ", c, " |r|/|b| ", rn / bn, "  share %", 100.0d0 * zs / max(sum(zs), 1.d-300), &
-        "  hot rings", (top(q), "(", 100.0d0 * pr(top(q)) / max(sum(pr), 1.d-300), "%)", q = 1, 3)
-    enddo
-    deallocate(pr)
-    call VecDestroy(x, ierr)
-    call VecDestroy(r, ierr)
-    call VecDestroy(e, ierr)
-
-  contains
-
-    integer function zone(ring)
-      integer, intent(in) :: ring
-      if (ring == 0) then
-        zone = 1
-      else if (ring < ring_is) then
-        zone = 2
-      else if (ring < 2 * ring_is) then
-        zone = 3
-      else
-        zone = 4
-      endif
-    end function zone
-  end subroutine ring_diag
-
-  !> physics_pc_gmg_ring_diag: which DOFs of the two outermost rings are pure
-  !! Dirichlet rows (only a diagonal entry) in the level-0 Pmat, by field and
-  !! canonical C1 DOF (u, a = radial, b = angular, c = cross derivative).
-  subroutine report_bnd_rows(A)
-    use phys_module, only: n_flux
-    Mat :: A
-    PetscInt :: nr, rst, ren, r, ncols
-    PetscInt, pointer :: cols(:)
-    PetscScalar, pointer :: vals(:)
-    PetscErrorCode :: ierr
-    integer :: cnt(0:7, 2, 2), q, ring, kf, mpierr, c
-    logical :: diag_only
-    character(len=1), parameter :: kn(0:3) = ['u', 'a', 'b', 'c']
-
-    call MatGetLocalSize(A, nr, PETSC_NULL_INTEGER, ierr)
-    call MatGetOwnershipRange(A, rst, ren, ierr)
-    cnt = 0
-    do r = 0, nr - 1
-      ring = fine_node(r + 1) / nth0
-      if (ring < n_flux - 2) cycle
-      q = ring - (n_flux - 2) + 1                 ! 1 = ring n_flux-2, 2 = boundary ring
-      kf = fine_kf(r + 1)
-      call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
-      diag_only = .true.
-      do c = 1, int(ncols)
-        if (cols(c) /= rst + r .and. vals(c) /= 0.0d0) diag_only = .false.
-      enddo
-      call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
-      cnt(kf, q, 1) = cnt(kf, q, 1) + 1
-      if (diag_only) cnt(kf, q, 2) = cnt(kf, q, 2) + 1
-    enddo
-    call MPI_Allreduce(MPI_IN_PLACE, cnt, size(cnt), MPI_INTEGER, MPI_SUM, gcomm, mpierr)
-    if (gme == 0) then
-      do q = 1, 2
-        write(*,'(A,I0,A)', advance="no") "[GMG ring-diag] Dirichlet rows on ring ", n_flux - 3 + q, " (field.dof diag-only/total):"
-        do kf = 0, 4 * nf_s - 1
-          write(*,'(1X,I0,A,A,A,I0,A,I0)', advance="no") kf / 4 + 1, ".", kn(mod(kf, 4)), " ", cnt(kf, q, 2), "/", cnt(kf, q, 1)
-        enddo
-        write(*,*)
-      enddo
-    endif
-  end subroutine report_bnd_rows
-
-  !> physics_pc_gmg_bnd_drop: every boundary-ring u and b row of the level-0
-  !! Pmat must be a pure Dirichlet row, or the dropped coarse DOFs remove a
-  !! part of the space the operator acts on. Warns (all ranks' count) if not.
-  subroutine check_bnd_rows(A)
-    use phys_module, only: n_flux
-    Mat :: A
-    PetscInt :: nr, rst, ren, r, ncols
-    PetscInt, pointer :: cols(:)
-    PetscScalar, pointer :: vals(:)
-    PetscErrorCode :: ierr
-    integer :: nbad, k, c, mpierr
-
-    call MatGetLocalSize(A, nr, PETSC_NULL_INTEGER, ierr)
-    call MatGetOwnershipRange(A, rst, ren, ierr)
-    nbad = 0
-    do r = 0, nr - 1
-      if (fine_node(r + 1) / nth0 /= n_flux - 1) cycle
-      k = mod(fine_kf(r + 1), 4)
-      if (k /= 0 .and. k /= 2) cycle
-      call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
-      do c = 1, int(ncols)
-        if (cols(c) /= rst + r .and. vals(c) /= 0.0d0) then
-          nbad = nbad + 1; exit
-        endif
-      enddo
-      call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
-    enddo
-    call MPI_Allreduce(MPI_IN_PLACE, nbad, 1, MPI_INTEGER, MPI_SUM, gcomm, mpierr)
-    if (gme == 0 .and. nbad > 0) write(*,'(A,I0,A)') "[Physics PC]   GMG WARNING: bnd_drop on, but ", nbad, &
-      " boundary u/b rows are not pure Dirichlet rows; the coarse space misses them"
-  end subroutine check_bnd_rows
-
-  subroutine axis_patch(b, x)
-    Vec :: b, x
-    Vec :: rs, xs
-    PetscErrorCode :: ierr
-    call PetscLogEventBegin(gev_axis, ierr)
-    call MatMult(gF, x, gr(0), ierr)
-    call VecAYPX(gr(0), -1.0d0, b, ierr)
-    call VecGetSubVector(gr(0), gisAxis, rs, ierr)
-    call KSPSolve(gAxis, rs, gzax, ierr)
-    call VecRestoreSubVector(gr(0), gisAxis, rs, ierr)
-    call VecGetSubVector(x, gisAxis, xs, ierr)
-    call VecAXPY(xs, 1.0d0, gzax, ierr)
-    call VecRestoreSubVector(x, gisAxis, xs, ierr)
-    call PetscLogEventEnd(gev_axis, ierr)
-  end subroutine axis_patch
 
 #endif
 end module mod_petsc_pc_gmg

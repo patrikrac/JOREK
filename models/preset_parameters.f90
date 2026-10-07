@@ -643,82 +643,19 @@ subroutine preset_parameters
   init_current_prof  = .false.
   current_prof_initialized = .false.
   
-  use_physics_pc     = .false.              ! Use physics-based block PCSHELL preconditioner
-  debug_physics_pc   = .false.              ! Print PC matrix analysis after first assembly
-  physics_pc_monolithic = .false.            ! Monolithic 4x4 solve (stage-one Schur test)
-  physics_pc_multi_step  = .false.           ! Three-step predictor-corrector apply (requires physics_pc_monolithic)
-  physics_pc_multi_step_symmetric = .false.   ! Backward corrector for B_16/B_25/B_26 in multi_step
-  physics_pc_wave_schur  = .false.           ! New wave-Schur block-LDU pred-corr (multi_step sub-mode)
-  physics_pc_sub_blocks      = .false.       ! 2x2 super-block PC: (psi,u) + (rho,T)
-  physics_pc_sub_blocks_mode = 1             ! 1=Jacobi (default), 2=GS-forward, 3=GS-symmetric
-  physics_pc_probe_exact = .false.           ! Probe exact 4x4 Schur complement via N mat-vec products (small problems only)
-  physics_pc_verify_spbp = .false.          ! Offline S_PBP spectrum diagnostic (expensive; own flag, not debug_physics_pc)
-  physics_pc_reduced_pde = .false.          ! Assemble the reduced 4-var PDE operator P_full (Milestone 1)
-  physics_pc_drop_psi_coupling = .false.    ! Drop U_psi_T, L_T_psi, L_rho_psi from P_full -> arrow structure (Milestone 3)
-  physics_pc_verify_reduced = .false.       ! Verify P_full against the probed exact condensed 4x4, then stop
-  physics_pc_verify_schur   = .false.       ! Stage 4.1: verify the exact Schur factorization of P_full
-  physics_pc_schur_approx   = .false.       ! Stage 4.2: small-flow and commutator M_* approximations of S_u
-  physics_pc_schur_assemble = .false.       ! Stage 4.4/Workstream A: sparse assembled Shat_ass with lumped mass inverses
-  physics_pc_schur_itersolve = .false.      ! Stage 4.5: is S_ass itself iteratively solvable? (ILU/AMG vs sparse MUMPS)
-  physics_pc_schur_global    = .false.      ! Stage 4.6: global FGMRES on P_full with the assembled-Schur block-LDU PC
-  physics_pc_schur_channels  = 1            ! Stage 6.2: channels in the production small-flow Schur (1=psi, 2=+rho, 3=+T)
-  physics_pc_schur_massinv   = 8            ! Stage 6.2: its mass inverse (2=diagonal, 3=row-sum lumped, 7=FSAI-0, 8=FSAI-1)
-  physics_pc_schur_amg       = .false.      ! Stage 6.2: solve S_PBP by GMRES+BoomerAMG instead of LU/MUMPS
-  physics_pc_schur_amg_its   = 4            ! Stage 6.2: fixed inner AMG-Krylov budget for S_PBP
-  physics_pc_schur_variant   = "SF"         ! Stage 6.3: momentum-Schur ansatz ("SF" = small-flow; else a cm_table label, e.g. M1a, M2e)
-  physics_pc_schur_inner     = 0            ! Stage 6.3: inner S_PBP solver (0 = legacy, honour physics_pc_schur_amg)
-  physics_pc_schur_mask      = .true.       ! Stage 6.3: ZBIG interior treatment for the commutator arm
-  physics_pc_probe_inner     = 0            ! Workstream B phase 5: iterative/AMG amenability probe (0=off, 1=LU+ILU, 2=+scalar AMG, 3=+fieldsplit)
-  physics_pc_schur_pairinv   = 2            ! Workstream B "SFM2": (psi,j) pair Schur inverse (2=diag, 3=lumped, 7=FSAI-0, 8=FSAI-1)
-  physics_pc_verify_mixed    = .false.      ! Workstream B: mixed-pair null test (rows 3/4 hard pass/fail)
-  physics_pc_pair_scale      = 0            ! Workstream B: symmetric block scaling of the packed pairs (0=off, 1=on)
-  physics_pc_pair_inner      = 0            ! Workstream B SFM2: pair inner solver (0=LU baseline, 1=iterative both, 2=iter psi + ILU w, 3=ILU both)
-  physics_pc_pair_maxits     = 30           ! Workstream B SFM2: iteration cap per pair inner solve
-  physics_pc_pair_rtol       = 1.d-2        ! Workstream B SFM2: rtol per pair inner solve
-  physics_pc_pair_amg_thr    = 0.05d0       ! Workstream B SFM2: GAMG strength threshold for the Shat = B_11 solve
-  physics_pc_dump_blocks     = 0            ! Workstream C: dump SFM2 operators + grid for the offline GMG probe (0=off)
-  physics_pc_force_operator  = 0            ! Workstream E: assemble the composed force operator W (0=off, 1=assemble+dump)
-  physics_pc_suu_form        = 0            ! Workstream E: pair_w (1,1) block (0=triple product, 1=composed B_22 + W)
-  physics_pc_sf              = .false.       ! Production SFM2 path (mod_petsc_pc_sf); ignores every research physics_pc_* flag
-  physics_pc_sf_suu          = "schur"       ! pair_w's S_uu: schur | w | wj | wpj (+ gate ablations, phys_module)
-  physics_pc_sf_pair_psi     = "gmg"         ! pair_psi backend: gmg | lu
-  physics_pc_sf_pair_w       = "gmg"         ! pair_w backend: gmg | lu
-  physics_pc_sf_rho          = "lu"          ! rho block backend: lu | gmg
-  physics_pc_sf_T            = "lu"          ! T block backend: lu | gmg
-  physics_pc_sf_rtol         = 1.d-1         ! shared inner rtol for the iterative backends
-  physics_pc_sf_corrector    = -1            ! corrector: -1 = auto (1 on wpj, else 0), 0 = Eq.16 pair_psi solve, 1 = Eq.17 from pair_w (B_16 T* folded), 2 = Eq.17, B_16 dropped
-  physics_pc_sf_harm_couple  = 0             ! cross-|n| band kept in the blocks: 0 | k | -1 = all
+  ! the physics-based (SF) preconditioner; the defaults are its production configuration
+  use_physics_pc              = .false.     ! Use the physics-based (SF) preconditioner (PETSc)
+  physics_pc_sf_suu           = "wpj"       ! pair_w's S_uu: wpj | wj | w | schur
+  physics_pc_sf_pair_psi      = "gmg"       ! pair_psi backend: gmg | lu
+  physics_pc_sf_pair_w        = "gmg"       ! pair_w backend: gmg | lu
+  physics_pc_sf_rho           = "gmg"       ! rho block backend: gmg | lu
+  physics_pc_sf_T             = "gmg"       ! T block backend: gmg | lu
+  physics_pc_sf_rtol          = 1.d-1       ! shared inner rtol for the iterative backends
+  physics_pc_sf_corrector     = -1          ! -1 = auto (Eq.17 on wpj, else Eq.16), 0 = Eq.16, 1 = Eq.17, 2 = Eq.17 without B_16 T*
+  physics_pc_sf_harm_couple   = 0           ! cross-|n| band kept in the blocks: 0 | k | -1 = all
   physics_pc_sf_cross_weights = .false.     ! per-build cross-|n| weight report (diagnostic, one pass over A)
-  physics_pc_sf_mode_split   = .false.       ! SF solvers on one |n| family per rank, families concurrent
-  physics_pc_psi_rtol        = -1.d0        ! Workstream F: pair_psi-only rtol; < 0 = fall back to physics_pc_pair_rtol
-  physics_pc_corrector_form  = 0            ! Workstream F: LDU step 3 (0=full pair_psi solve/Eq.16, 1=diagonal surrogate/Eq.17)
-  physics_pc_psi_schur       = 0            ! Workstream C: pair_psi by the eta-scaled j-first Schur (0=off, 1=LU Shat, 2=Jacobi+axis patch)
-  physics_pc_suu_ring        = 0            ! Workstream D: restrict S_uu to the ring-k node stencil (0=off)
-  physics_pc_suu_shell       = 0            ! Workstream D: matrix-free fine pair_w (0=off, 1=FSAI M, 2=exact B_33^-1)
-  physics_pc_rhot_gmg        = 0            ! k > 0 = rho/T blocks by FGMRES(k) + C1 GMG
-  physics_pc_rhot_gmg_smoother = -1
-  physics_pc_psi_gmg_smoother = -1          ! psi_schur = 3: Shat smoother (-1 = physics_pc_gmg_smoother)
-  physics_pc_psi_gmg_nsmooth  = 0
-  physics_pc_psi_outer       = 0            ! Workstream D: k > 0 = FGMRES(k) around the eta-Schur pair_psi solve
-  physics_pc_mass_split      = 0            ! Workstream D1: 1 = per-slot constraint-mass factors, shared across identical slots
-  physics_pc_lean_setup      = 0            ! Workstream D audit: 1 = diag-only Shat + first-build-only diagnostics
-  physics_pc_harm_split      = 0            ! Workstream D audit A8: 1 = drop cross-harmonic entries of the PC operands
-  physics_pc_gmg_smoother    = 0            ! Workstream D: 0 GMRES+Jacobi, 1 Richardson+Jacobi, 2 Richardson+node block, 3 GMRES+node block
-  physics_pc_gmg_nsmooth     = 0            ! Workstream D: smoothing steps (0 = 4 for GMRES, 3 for Richardson)
-  physics_pc_gmg_omega       = 0.7d0        ! Workstream D: Richardson damping (Chacon 2025)
-  physics_pc_gmg_ring_aspect = 1.0d0        ! Workstream D: smoother 6 rings where r*dtheta/dr < this, radial lines outside
-  physics_pc_gmg_axis_rings  = 0            ! Workstream D: rings 0..k in one axis block (block smoothers 4/5/6); -1 = rings below r*dtheta/dr = ring_aspect
-  physics_pc_gmg_axis_mult   = 0            ! Workstream D: axis block / lines coupling (0 Jacobi, 1 axis first, 2 lines first, 3 symmetric)
-  physics_pc_gmg_bnd_drop    = 0            ! Workstream D: 1 = coarse levels drop the Dirichlet u, b DOFs of the boundary ring
-  physics_pc_mass_solver     = 0            ! Stage Q: constraint masses by 0 MUMPS, 1 Chebyshev + node-block Jacobi, 2 Chebyshev + additive Schwarz/ICC, 3 CG (diagnostic)
-  physics_pc_gmg_smooth_op   = 0            ! Stage Q: 1 = fine GMG smoother on the assembled Pmat instead of the matrix-free shell
-  physics_pc_gmg_axis_split  = 0            ! Stage Q: 1 = one axis LU per |n| group, group k on rank mod(k, np)
-  physics_pc_gmg_axis_droptol = 0.d0        ! Stage Q: relative drop tolerance of the axis block before its LU
-  physics_pc_gmg_ring_diag   = 0            ! Workstream D: k > 0 = per-ring-zone residual profile on k V-cycles per rebuild
-  physics_pc_suu_comp        = 0            ! Workstream D: 1 = abs-row-sum diagonal compensation of the ring mask
-  physics_pc_w_gmg           = 0            ! Workstream C: pair_w by C1 geometric multigrid (0=off, 1=one V-cycle, 2=FGMRES+V-cycle)
-  commutator_analysis          = .false.    ! Commutator-operator (M_*) intertwining-defect analysis off by default
-  eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in correction matrices; use elm-diagonal BC in global matrix (required for physics PC Schur)
+  physics_pc_sf_mode_split    = .true.      ! SF solvers on one |n| family per rank group, families concurrent
+  eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in the physics PC's W; use elm-diagonal BC in global matrix
 
   use_mumps          = .false.              ! Use MUMPS solver
   use_pastix         = .false.              ! Use PASTIX solver

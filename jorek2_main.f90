@@ -95,10 +95,7 @@ program JOREK2
 #endif
 
 #ifdef USE_PETSC
-    use mod_petsc_pc_physics, only: petsc_assemble_pc_matrices, petsc_physics_pc_build_reduced, &
-                                    physics_pc_needs_commutator_blocks
-    use mod_petsc_pc_commutator_table, only: petsc_commutator_assemble
-    use mod_petsc_pc_sf, only: sf_enabled
+    use mod_petsc_pc_physics, only: petsc_assemble_pc_matrices
     use mod_petsc, only: petsc_initialize, petsc_finalize, petsc_print_version
 #endif
 
@@ -764,20 +761,14 @@ write(*,*) "n elements:", element_list%n_elements
     if (my_id.eq.0) write(*,FMT_TIMING) my_id, '# Elapsed time construct global matrix: ',tsecond
     
 #ifdef USE_PETSC
-    ! The SF path reads its element-assembled operators only when it rebuilds,
-    ! so a step that keeps the preconditioner skips their assembly. The test
-    ! is solve_sparse_system's own (keep_pc), made before the solve; if the
-    ! solve still rebuilds, it refills from the last assembly.
+    ! The physics PC reads its element-assembled operator W only when it
+    ! rebuilds, so a step that keeps the preconditioner skips its assembly. The
+    ! test is solve_sparse_system's own (keep_pc), made before the solve; if
+    ! the solve still rebuilds, it refills from the last assembly.
     if (use_physics_pc) then
-      if (.not. (sf_enabled() .and. solver%petsc_sys%ksp_ready .and. solver%keep_pc(istep))) &
+      if (.not. (solver%petsc_sys%ksp_ready .and. solver%keep_pc(istep))) &
         call petsc_assemble_pc_matrices(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat, mhd_sim)
     endif
-    ! The blocks are needed either by the commutator_analysis diagnostic or by
-    ! a commutator Schur variant in the production PC. They must be reassembled
-    ! every step: ADV1 carries the evolving flow and ES1R/EG1R the Spitzer
-    ! weight w(T0).
-    if (commutator_analysis .or. physics_pc_needs_commutator_blocks()) &
-      call petsc_commutator_assemble(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat)
 #endif
 
 #ifdef SAVEMATRIX

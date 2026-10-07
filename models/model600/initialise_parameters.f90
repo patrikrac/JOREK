@@ -106,68 +106,13 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 wall_resistivity, wall_resistivity_fact,            &
                 bc_natural_open,                                    &
                 use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
-                commutator_analysis,                                &
-                use_physics_pc, debug_physics_pc,                   &
-                physics_pc_monolithic, physics_pc_multi_step,       &
-                physics_pc_multi_step_symmetric,                    &
-                physics_pc_wave_schur, physics_pc_sub_blocks,       &
-                physics_pc_sub_blocks_mode, physics_pc_probe_exact, &
-                physics_pc_verify_spbp,                             &
-                physics_pc_reduced_pde,                             &
-                physics_pc_drop_psi_coupling,                       &
-                physics_pc_verify_reduced,                          &
-                physics_pc_verify_schur,                            &
-                physics_pc_schur_approx,                            &
-                physics_pc_schur_assemble,                          &
-                physics_pc_schur_itersolve,                         &
-                physics_pc_schur_global,                            &
-                physics_pc_schur_channels,                          &
-                physics_pc_schur_massinv,                           &
-                physics_pc_schur_amg,                               &
-                physics_pc_schur_amg_its,                           &
-                physics_pc_schur_variant,                           &
-                physics_pc_schur_inner,                             &
-                physics_pc_schur_mask,                              &
-                physics_pc_schur_pairinv,                           &
-                physics_pc_probe_inner,                             &
-                physics_pc_verify_mixed,                            &
-                physics_pc_pair_scale,                              &
-                physics_pc_pair_inner,                              &
-                physics_pc_pair_maxits,                             &
-                physics_pc_pair_rtol,                               &
-                physics_pc_pair_amg_thr,                            &
-                physics_pc_dump_blocks,                             &
-                physics_pc_force_operator,                          &
-                physics_pc_suu_form,                                &
-                physics_pc_sf,                                      &
+                use_physics_pc,                                     &
                 physics_pc_sf_suu,                                  &
-                physics_pc_sf_pair_psi,                             &
-                physics_pc_sf_pair_w,                               &
-                physics_pc_sf_rho,                                  &
-                physics_pc_sf_T,                                    &
-                physics_pc_sf_rtol,                                 &
-                physics_pc_sf_harm_couple,                          &
-                physics_pc_sf_mode_split,                           &
-                physics_pc_sf_corrector,                            &
+                physics_pc_sf_pair_psi, physics_pc_sf_pair_w,       &
+                physics_pc_sf_rho, physics_pc_sf_T,                 &
+                physics_pc_sf_rtol, physics_pc_sf_corrector,        &
+                physics_pc_sf_harm_couple, physics_pc_sf_mode_split, &
                 physics_pc_sf_cross_weights,                        &
-                physics_pc_psi_rtol,                                &
-                physics_pc_corrector_form,                          &
-                physics_pc_psi_schur,                               &
-                physics_pc_w_gmg,                                   &
-                physics_pc_suu_ring,                                &
-                physics_pc_suu_comp,                                &
-                physics_pc_suu_shell,                               &
-                physics_pc_lean_setup, physics_pc_gmg_smoother,     &
-                physics_pc_harm_split, physics_pc_mass_split,       &
-                physics_pc_psi_outer,                               &
-                physics_pc_psi_gmg_smoother, physics_pc_psi_gmg_nsmooth, &
-                physics_pc_rhot_gmg, physics_pc_rhot_gmg_smoother,  &
-                physics_pc_gmg_nsmooth, physics_pc_gmg_omega,       &
-                physics_pc_gmg_ring_aspect, physics_pc_gmg_axis_rings, &
-                physics_pc_gmg_ring_diag, physics_pc_gmg_axis_mult, &
-                physics_pc_gmg_bnd_drop,                            &
-                physics_pc_mass_solver, physics_pc_gmg_smooth_op,   &
-                physics_pc_gmg_axis_split, physics_pc_gmg_axis_droptol, &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &

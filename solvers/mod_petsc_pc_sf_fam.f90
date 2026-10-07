@@ -12,7 +12,7 @@ module mod_petsc_pc_sf_fam
   !> The SF path on one |n| family per rank (physics_pc_sf_mode_split).
   !!
   !! At physics_pc_sf_harm_couple = 0 every SF block is |n|-diagonal, so the
-  !! whole SFM2 sweep falls apart into independent problems, one per |n|
+  !! whole SF sweep falls apart into independent problems, one per |n|
   !! family: the n = 0 slot, then the cos and sin slots of each n. The global
   !! path still solves them together, every block on every rank, one block
   !! after another -- the regime in which the GMG's coarse levels, the
@@ -57,10 +57,6 @@ module mod_petsc_pc_sf_fam
   !! local part. It is extracted the same way, in the same pass structure, as
   !! a second fam_op_t (part = 1). The family part stays what the GMG
   !! factorizes; the sweep applies D + C (sff_cross_addmult).
-  !!
-  !! -sf_ms_verify 1 also builds the global operators and their family copies
-  !! the old way (MatCreateSubMatrix) once, and compares (sff_mat_refresh,
-  !! sff_compare; with a band, sff_compare_band on matvecs).
   !--------------------------------------------------------------------
 
   !> A family operator extracted directly. Block (a, b) of its nf x nf fields
@@ -88,16 +84,6 @@ module mod_petsc_pc_sf_fam
     Vec     :: xg, yg
   end type fam_op_t
 
-  !> One operator's family copy by MatCreateSubMatrix (-sf_ms_verify only).
-  type, public :: fam_mat_t
-    logical :: ready = .false.
-    Mat     :: perm                       !< family-major copy, global comm
-    Mat     :: loc                        !< its local rows, sequential
-    Mat     :: fam                        !< the family operator, family comm
-    PetscInt, allocatable :: keep(:)      !< positions of loc's entries kept in fam
-    PetscScalar, allocatable :: val(:)    !< fam's values, in its CSR order
-  end type fam_mat_t
-
   logical, save, public :: sff_on = .false.   !< decomposed and active
   integer, save, public :: sff_comm = MPI_COMM_NULL   !< this rank's family communicator
   integer, save, public :: sff_fam  = 0       !< this rank's family (1-based)
@@ -112,17 +98,15 @@ module mod_petsc_pc_sf_fam
   PetscInt, allocatable, save :: rsx(:)       !< first full-system row of each global rank
   integer, save :: n_idx = 0                  !< JOREK indices (A's block rows)
   integer, save :: i0 = 0, i1 = 0             !< my family indices [i0, i1)
-  logical, save :: is_ok(4) = .false.
-  IS, save :: is_f(4)                         !< family rows of a packed nf-field operator (verify)
   VecScatter, save :: sc6                     !< x <-> stage6
   Vec, save :: stage6                         !< global comm, local 6 n1: variables in turn
   logical, save :: vec_ok = .false.
 
   integer, parameter :: TAG_LEN = 0, TAG_COL = 4, TAG_VAL = 8   !< + field - 1, + 16 tagb
 
-  public :: sff_decompose, sff_op_build, sff_op_fill, sff_mat_refresh, sff_mat_free, sff_compare, &
+  public :: sff_decompose, sff_op_build, sff_op_fill, &
             sff_vec_setup, sff_scatter_in, sff_scatter_out, sff_banded, sff_cross_addmult, &
-            sff_cross_scale, sff_copy_local, sff_add_local, sff_compare_band
+            sff_cross_scale, sff_copy_local, sff_add_local
 
 contains
 
@@ -748,187 +732,12 @@ contains
     call VecRestoreArrayRead(src, sa, ierr)
   end subroutine sff_add_local
 
-  !> -sf_ms_verify with a band: (D + C) x against the global operator's
-  !! family-major copy perm (sff_mat_refresh) on a random x. Relative 2-norm
-  !! difference, over all ranks (rank 0 prints). exact: count it towards worst
-  !! (pair_w is exact only for band -1: the global path keeps all of W).
-  subroutine sff_compare_band(d, c, perm, my_id, worst, exact)
-    type(fam_op_t), intent(inout) :: d, c
-    Mat, intent(in)               :: perm
-    integer, intent(in)           :: my_id
-    real*8, intent(inout)         :: worst
-    logical, intent(in)           :: exact
-    Vec :: xg, yr, xf, yf
-    PetscRandom :: rnd
-    PetscReal :: nd, nr
-    PetscErrorCode :: ierr
-    call MatCreateVecs(perm, xg, yr, ierr)
-    call PetscRandomCreate(gcomm, rnd, ierr)
-    call VecSetRandom(xg, rnd, ierr)
-    call PetscRandomDestroy(rnd, ierr)
-    call MatMult(perm, xg, yr, ierr)
-    call MatCreateVecs(d%fam, xf, yf, ierr)
-    call sff_copy_local(xg, xf)
-    call MatMult(d%fam, xf, yf, ierr)
-    call sff_cross_addmult(c, xf, yf)
-    call VecNorm(yr, NORM_2, nr, ierr)
-    call sff_copy_local(yf, xg)                   ! xg <- (D + C) x
-    call VecAXPY(xg, -1.0d0, yr, ierr)
-    call VecNorm(xg, NORM_2, nd, ierr)
-    nd = nd / max(nr, tiny(1.d0))
-    if (exact) worst = max(worst, dble(nd))
-    if (my_id == 0) write(*,'(A,A,A,ES9.2,A)') "[Physics PC]   SF mode split verify: ", trim(d%label), &
-      " |(D + C) x - A x| / |A x| = ", nd, merge("            ", " (not gated)", exact)
-    call VecDestroy(xg, ierr); call VecDestroy(yr, ierr)
-    call VecDestroy(xf, ierr); call VecDestroy(yf, ierr)
-  end subroutine sff_compare_band
-
   subroutine fail(msg)
     character(len=*), intent(in) :: msg
     integer :: mpierr
     write(*,'(A,A,A,I0)') "[Physics PC]   FATAL: SF mode split: ", msg, " on rank ", gme
     call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
   end subroutine fail
-
-  !====================================================================
-  ! -sf_ms_verify: the family copy of a global operator, the old way
-  !====================================================================
-
-  !> My family rows of a packed nf-field operator src (global comm), in
-  !! family order: field, then index (my family indices), then the family's
-  !! slots. src's own layout: global rank r holds [field 0 | ... | field
-  !! nf-1], each (its A block rows) x n_tor slots.
-  subroutine family_rows(nf, src, is)
-    use mod_parameters, only: n_tor
-    integer, intent(in) :: nf
-    Mat, intent(in)     :: src
-    IS, intent(out)     :: is
-    PetscInt, allocatable :: ps(:), rows(:)
-    PetscInt :: rs, re, k
-    integer :: r, ff, i, s, mpierr
-    PetscErrorCode :: ierr
-
-    allocate(ps(0:gnp - 1))
-    call MatGetOwnershipRange(src, rs, re, ierr)
-    call MPI_Allgather(rs, 1, MPIU_INTEGER, ps, 1, MPIU_INTEGER, gcomm, mpierr)
-    if (re - rs /= int(nf, kind(rs)) * (idx0(gme + 1) - idx0(gme)) * n_tor) &
-      call fail("an operator's rows are not nf x indices x n_tor")
-    allocate(rows(int(nf, kind(k)) * sff_n1))
-    k = 0
-    do ff = 0, nf - 1
-      do i = i0, i1 - 1
-        r = sowner(i)
-        do s = 1, size(fmodes)
-          k = k + 1
-          rows(k) = ps(r) + (int(ff, kind(k)) * (idx0(r + 1) - idx0(r)) + (i - idx0(r))) * n_tor + fmodes(s)
-        enddo
-      enddo
-    enddo
-    call ISCreateGeneral(gcomm, k, rows, PETSC_COPY_VALUES, is, ierr)
-  end subroutine family_rows
-
-  !> Create (first call) or refresh t%fam, the family copy of src by
-  !! MatCreateSubMatrix. Collective on the global communicator. Entries
-  !! outside the family are dropped.
-  subroutine sff_mat_refresh(t, src, nf)
-    type(fam_mat_t), intent(inout) :: t
-    Mat, intent(in)                :: src
-    integer, intent(in)            :: nf
-
-    PetscInt, pointer :: ia(:), ja(:)
-    PetscScalar, pointer :: a(:)
-    PetscInt :: n, nloc, off, k, j, nk, fsize
-    PetscInt, allocatable :: fi(:), fj(:)
-    PetscBool :: done
-    PetscErrorCode :: ierr
-    integer :: mpierr
-    PetscInt, parameter :: zero = 0
-
-    if (.not. is_ok(nf)) then
-      call family_rows(nf, src, is_f(nf))
-      is_ok(nf) = .true.
-    endif
-    if (.not. t%ready) then
-      call MatCreateSubMatrix(src, is_f(nf), is_f(nf), MAT_INITIAL_MATRIX, t%perm, ierr)
-      call MatMPIAIJGetLocalMat(t%perm, MAT_INITIAL_MATRIX, t%loc, ierr)
-    else
-      call MatCreateSubMatrix(src, is_f(nf), is_f(nf), MAT_REUSE_MATRIX, t%perm, ierr)
-      call MatMPIAIJGetLocalMat(t%perm, MAT_REUSE_MATRIX, t%loc, ierr)
-    endif
-    call MatGetRowIJ(t%loc, zero, PETSC_FALSE, PETSC_FALSE, n, ia, ja, done, ierr)
-    call MatSeqAIJGetArrayRead(t%loc, a, ierr)
-    if (.not. t%ready) then
-      !--- the family's columns in perm's numbering: [off, off + family size)
-      call ISGetLocalSize(is_f(nf), nloc, ierr)
-      call MPI_Exscan(nloc, off, 1, MPIU_INTEGER, MPI_SUM, gcomm, mpierr)
-      if (gme == 0) off = 0
-      call MPI_Allreduce(MPI_IN_PLACE, off, 1, MPIU_INTEGER, MPI_MIN, sff_comm, mpierr)
-      call MPI_Allreduce(nloc, fsize, 1, MPIU_INTEGER, MPI_SUM, sff_comm, mpierr)
-      allocate(fi(n + 1), fj(ia(n + 1)), t%keep(ia(n + 1)))
-      nk = 0
-      fi(1) = 0
-      do k = 1, n
-        do j = ia(k) + 1, ia(k + 1)
-          if (ja(j) >= off .and. ja(j) < off + fsize) then
-            nk = nk + 1
-            fj(nk) = ja(j) - off
-            t%keep(nk) = j
-          endif
-        enddo
-        fi(k + 1) = nk
-      enddo
-      allocate(t%val(nk))
-      t%val = a(t%keep(1:nk))
-      call MatCreateMPIAIJWithArrays(sff_comm, n, n, PETSC_DETERMINE, PETSC_DETERMINE, &
-                                     fi, fj(1:nk), t%val, t%fam, ierr)
-      deallocate(fi, fj)
-      t%ready = .true.
-    else
-      t%val = a(t%keep(1:size(t%val)))
-      call MatUpdateMPIAIJWithArray(t%fam, t%val, ierr)
-    endif
-    call MatSeqAIJRestoreArrayRead(t%loc, a, ierr)
-    call MatRestoreRowIJ(t%loc, zero, PETSC_FALSE, PETSC_FALSE, n, ia, ja, done, ierr)
-  end subroutine sff_mat_refresh
-
-  subroutine sff_mat_free(t)
-    type(fam_mat_t), intent(inout) :: t
-    PetscErrorCode :: ierr
-    if (.not. t%ready) return
-    call MatDestroy(t%perm, ierr); call MatDestroy(t%loc, ierr); call MatDestroy(t%fam, ierr)
-    deallocate(t%keep, t%val)
-    t%ready = .false.
-  end subroutine sff_mat_free
-
-  !> Directly extracted vs copied family operator: stored entries and the
-  !! largest difference relative to the copy's largest entry, over all
-  !! families (rank 0 prints). Collective on the global communicator.
-  subroutine sff_compare(op, ref, my_id, worst)
-    type(fam_op_t), intent(in)  :: op
-    Mat, intent(in)             :: ref
-    integer, intent(in)         :: my_id
-    real*8, intent(inout)       :: worst
-    Mat :: d
-    PetscReal :: nd, nr
-    MatInfo :: info_o, info_r
-    real*8 :: loc(3), glob(3)
-    integer :: mpierr
-    PetscErrorCode :: ierr
-    call MatGetInfo(op%fam, MAT_GLOBAL_SUM, info_o, ierr)
-    call MatGetInfo(ref, MAT_GLOBAL_SUM, info_r, ierr)
-    call MatDuplicate(ref, MAT_COPY_VALUES, d, ierr)
-    call MatAXPY(d, -1.0d0, op%fam, DIFFERENT_NONZERO_PATTERN, ierr)
-    call MatNorm(d, NORM_INFINITY, nd, ierr)
-    call MatNorm(ref, NORM_INFINITY, nr, ierr)
-    call MatDestroy(d, ierr)
-    loc = [dble(nd) / max(dble(nr), tiny(1.d0)), &
-           abs(info_o%nz_used - info_r%nz_used), 0.d0]
-    if (fme /= 0) loc(2) = 0.d0                    ! one count per family
-    call MPI_Allreduce(loc, glob, 3, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
-    worst = max(worst, glob(1))
-    if (my_id == 0) write(*,'(A,A,A,ES9.2,A,I0)') "[Physics PC]   SF mode split verify: ", op%label, &
-      " |direct - copy| / |copy| = ", glob(1), ", stored-entry count difference ", nint(glob(2))
-  end subroutine sff_compare
 
   !====================================================================
   ! vectors

@@ -10,35 +10,27 @@ module mod_petsc_pc_blocks
   !--------------------------------------------------------------------
   !> Leaf primitives shared by the physics preconditioner paths.
   !!
-  !! These routines were factored out of mod_petsc_pc_physics_construction so
-  !! that the production path (mod_petsc_pc_sf) and the research path can use
-  !! ONE implementation rather than a copy each. Nothing here decides anything:
-  !! every routine is a pure operation on PETSc objects plus g_ctx%is_var, and
-  !! none of them reads a physics_pc_* flag except physics_pc_harm_split, which
-  !! selects the harmonic-block filter inside the extraction. The filter keeps
-  !! the |n| groups at most harm_band apart (harm_kept); the production path
-  !! sets harm_band from physics_pc_sf_harm_couple, everything else leaves 0.
-  !!
-  !! Moving them was value-neutral by construction: the bodies are unchanged.
+  !! Nothing here decides anything: every routine is a pure operation on
+  !! PETSc objects plus g_ctx%is_var. The block extraction keeps the |n|
+  !! groups at most harm_band apart (harm_kept); mod_petsc_pc_sf sets
+  !! harm_band from physics_pc_sf_harm_couple.
   !--------------------------------------------------------------------
 
   public :: pc_print_block_setup
   public :: create_variable_index_sets
-  public :: extract_sub_block
-  public :: extract_sub_block_h, extract_sub_blocks_h
+  public :: extract_sub_blocks_h
   public :: pack_pair_aij, pack_blocks_aij
   public :: make_pair_block_scale, make_field_block_scale
-  public :: report_operator_density
   public :: split_vars, merge_vars
   public :: harm_band, harm_kept
 
-  !> Cross-|n| band of the harm_split filter: 0 = same |n| group only (cos and
+  !> Cross-|n| band of the block extraction: 0 = same |n| group only (cos and
   !! sin of one n together), k > 0 = groups at most k apart, < 0 = all.
   integer, save :: harm_band = 0
 
 contains
 
-  !> Does the harm_split filter keep the entry between toroidal slots m and q?
+  !> Does the block extraction keep the entry between toroidal slots m and q?
   !! Slot m belongs to |n| group (m+1)/2 (slot 0 = n = 0, then cos/sin pairs).
   pure logical function harm_kept(m, q)
     integer, intent(in) :: m, q
@@ -119,145 +111,22 @@ contains
 
 
   !--------------------------------------------------------------------
-  !> Extract a sub-block A_ij from the full system matrix.
-  !! A_ij has rows corresponding to equation eq_row and columns
-  !! corresponding to variable var_col.
-  !--------------------------------------------------------------------
-  subroutine extract_sub_block(A_full, eq_row, var_col, B, first_time)
-    Mat, intent(in)    :: A_full
-    integer, intent(in) :: eq_row, var_col
-    Mat, intent(inout)  :: B
-    logical, intent(in) :: first_time
-
-    PetscErrorCode :: ierr
-
-    if (first_time) then
-      PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), MAT_INITIAL_MATRIX, B, ierr))
-    else
-      PetscCallA(MatCreateSubMatrix(A_full, g_ctx%is_var(eq_row), g_ctx%is_var(var_col), MAT_REUSE_MATRIX, B, ierr))
-    endif
-  end subroutine extract_sub_block
-
-  !--------------------------------------------------------------------
-  !> Audit A8: extract_sub_block, optionally keeping only the entries between
-  !! the SAME toroidal mode number |n| (group (m+1)/2 of slot m; cos and sin of
-  !! one n stay coupled) (physics_pc_harm_split = 1). JOREK assembles n_tor x n_tor blocks,
-  !! so every extracted block stores the cross-harmonic couplings, which are
-  !! zero for an axisymmetric linearisation and O(perturbation) otherwise. The
-  !! standard JOREK preconditioner is already harmonic-block-diagonal; this
-  !! makes the physics PC's operands so too, which removes ~2/3 of every
-  !! product's and matvec's work and splits each pair LU into n_tor
-  !! independent factorizations.
+  !> Extract the blocks Mb(k) = A(eqs(k), vrs(k)) of the full system matrix in
+  !! ONE pass over A_full's rows: each equation row is read once (MatGetRow on
+  !! JOREK's BAIJ matrix expands the whole n_var*n_tor-wide block row) and its
+  !! entries are dispatched to every requested block of that equation. Only
+  !! the entries between |n| groups at most harm_band apart are kept
+  !! (harm_kept; slot m is in group (m+1)/2, cos and sin of one n together).
   !!
-  !! The filtered block is read straight out of A_full's rows (MatGetRow), so
-  !! no unfiltered copy is ever held (memory audit: those copies of the 21
-  !! blocks were ~0.8 GB at 81x32), and A_full may be the AIJ copy or JOREK's
-  !! own BAIJ matrix (physics_pc_lean_setup >= 3 drops the AIJ copy).
+  !! The blocks are read straight out of A_full's rows (MatGetRow), so no
+  !! unfiltered copy is ever held, and A_full may be JOREK's own BAIJ matrix.
   !! Layout (create_variable_index_sets): full row node*bs + (v-1)*n_tor + m,
   !! sub-block row node*n_tor + m, bs = n_var*n_tor.
   !!
-  !! B keeps its identity across rebuilds (the product caches depend on it):
-  !! it is refilled into the pattern fixed on the first build.
-  !--------------------------------------------------------------------
-  subroutine extract_sub_block_h(A_full, eq_row, var_col, B, first_time)
-    use phys_module,    only: physics_pc_harm_split
-    use mod_parameters, only: n_tor, n_var
-    Mat, intent(in)     :: A_full
-    integer, intent(in) :: eq_row, var_col
-    Mat, intent(inout)  :: B
-    logical, intent(in) :: first_time
-    PetscErrorCode :: ierr
-    PetscInt :: i, ncols, rstart, rend, m, k, q, c, bs, nloc, nsub, nglob
-    PetscInt :: sr, sc, cstart, cend, node, col0
-    PetscInt, pointer :: cols(:)
-    PetscScalar, pointer :: vals(:)
-    PetscInt, allocatable :: dcnt(:), ocnt(:), cc(:)
-    PetscScalar, allocatable :: vv(:)
-    integer :: comm
-
-    if (physics_pc_harm_split == 0) then
-      call extract_sub_block(A_full, eq_row, var_col, B, first_time)
-      return
-    endif
-
-    bs = n_var * n_tor
-    call MatGetOwnershipRange(A_full, rstart, rend, ierr)
-    call MatGetSize(A_full, nglob, PETSC_NULL_INTEGER, ierr)
-    nloc   = ((rend - rstart) / bs) * n_tor
-    nsub   = (nglob / bs) * n_tor
-    cstart = (rstart / bs) * n_tor            ! owned sub-block columns [cstart, cend)
-    cend   = cstart + nloc
-    col0   = (var_col - 1) * n_tor            ! first slot of var_col inside a block
-
-    if (first_time) then
-      allocate(dcnt(nloc), ocnt(nloc))
-      dcnt = 0; ocnt = 0
-      do node = rstart / bs, rend / bs - 1
-        do m = 0, n_tor - 1
-          i = node * bs + (eq_row - 1) * n_tor + m
-          sr = node * n_tor + m - cstart + 1
-          call MatGetRow(A_full, i, ncols, cols, vals, ierr)
-          do k = 1, ncols
-            q = mod(cols(k), bs) - col0
-            if (q < 0 .or. q >= n_tor) cycle
-            if (.not. harm_kept(int(m), int(q))) cycle
-            sc = (cols(k) / bs) * n_tor + q
-            if (sc >= cstart .and. sc < cend) then
-              dcnt(sr) = dcnt(sr) + 1
-            else
-              ocnt(sr) = ocnt(sr) + 1
-            endif
-          enddo
-          call MatRestoreRow(A_full, i, ncols, cols, vals, ierr)
-        enddo
-      enddo
-      call PetscObjectGetComm(A_full, comm, ierr)
-      call MatCreate(comm, B, ierr)
-      call MatSetSizes(B, nloc, nloc, nsub, nsub, ierr)
-      call MatSetType(B, MATMPIAIJ, ierr)
-      call MatMPIAIJSetPreallocation(B, PETSC_DEFAULT_INTEGER, dcnt, &
-                                     PETSC_DEFAULT_INTEGER, ocnt, ierr)
-      deallocate(dcnt, ocnt)
-    else
-      call MatZeroEntries(B, ierr)
-    endif
-
-    allocate(cc(bs * 64), vv(bs * 64))
-    do node = rstart / bs, rend / bs - 1
-      do m = 0, n_tor - 1
-        i = node * bs + (eq_row - 1) * n_tor + m
-        sr = node * n_tor + m
-        call MatGetRow(A_full, i, ncols, cols, vals, ierr)
-        if (ncols > size(cc)) then
-          deallocate(cc, vv); allocate(cc(ncols), vv(ncols))
-        endif
-        c = 0
-        do k = 1, ncols
-          q = mod(cols(k), bs) - col0
-          if (q < 0 .or. q >= n_tor) cycle
-          if (.not. harm_kept(int(m), int(q))) cycle
-          c = c + 1; cc(c) = (cols(k) / bs) * n_tor + q; vv(c) = vals(k)
-        enddo
-        call MatRestoreRow(A_full, i, ncols, cols, vals, ierr)
-        if (c > 0) call MatSetValues(B, 1_4, [sr], c, cc(1:c), vv(1:c), INSERT_VALUES, ierr)
-      enddo
-    enddo
-    deallocate(cc, vv)
-    call MatAssemblyBegin(B, MAT_FINAL_ASSEMBLY, ierr)
-    call MatAssemblyEnd(B, MAT_FINAL_ASSEMBLY, ierr)
-    if (first_time) call MatSetOption(B, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
-  end subroutine extract_sub_block_h
-
-  !--------------------------------------------------------------------
-  !> extract_sub_block_h for a list of blocks Mb(k) = A(eqs(k), vrs(k)) in ONE
-  !! pass over A_full's rows: each equation row is read once (MatGetRow on
-  !! JOREK's BAIJ matrix expands the whole n_var*n_tor-wide block row) and its
-  !! entries are dispatched to every requested block of that equation. The
-  !! 21-block SFM2 extraction read each row 2-6 times. Same entries, same
-  !! per-row insertion order, same preallocation as extract_sub_block_h.
+  !! Each Mb(k) keeps its identity across rebuilds: it is refilled into the
+  !! pattern fixed on the first build.
   !--------------------------------------------------------------------
   subroutine extract_sub_blocks_h(A_full, eqs, vrs, Mb, first_time)
-    use phys_module,    only: physics_pc_harm_split
     use mod_parameters, only: n_tor, n_var
     Mat, intent(in)     :: A_full
     integer, intent(in) :: eqs(:), vrs(:)
@@ -274,12 +143,6 @@ contains
     integer :: comm, nb, e, v, kb, pass
 
     nb = size(eqs)
-    if (physics_pc_harm_split == 0) then
-      do kb = 1, nb
-        call extract_sub_block(A_full, eqs(kb), vrs(kb), Mb(kb), first_time)
-      enddo
-      return
-    endif
 
     bs = n_var * n_tor
     call MatGetOwnershipRange(A_full, rstart, rend, ierr)
@@ -363,34 +226,6 @@ contains
       if (first_time) call MatSetOption(Mb(kb), MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
     enddo
   end subroutine extract_sub_blocks_h
-
-  !--------------------------------------------------------------------
-  !> Report ABSOLUTE operator density: rows, nnz, and nnz per row.
-  !!
-  !! The per-arm build prints quote nnz RATIOS against different denominators
-  !! (Atilde_22 on one arm, B_22 on another, and the mixed arm's operator is
-  !! twice the size because it is packed), so those ratios cannot be compared
-  !! across arms. Densification under mesh refinement is the gate this whole
-  !! line of work is trying to clear, so it needs one absolute number measured
-  !! the same way everywhere. That is what this prints.
-  !--------------------------------------------------------------------
-  subroutine report_operator_density(A, tag, my_id)
-    Mat, intent(in)              :: A
-    character(len=*), intent(in) :: tag
-    integer, intent(in)          :: my_id
-
-    MatInfo        :: minfo
-    PetscErrorCode :: ierr
-    PetscInt       :: nrow
-    real*8         :: nz
-
-    call MatGetSize(A, nrow, PETSC_NULL_INTEGER, ierr)
-    call MatGetInfo(A, MAT_GLOBAL_SUM, minfo, ierr)
-    nz = minfo%nz_used
-    if (my_id == 0) write(*,'(A,A,A,I8,A,ES12.5,A,F9.2)') &
-      "[Physics PC]   DENSITY ", tag, ": rows = ", nrow, &
-      ", nnz = ", nz, ", nnz/row = ", nz / max(dble(nrow), 1.d0)
-  end subroutine report_operator_density
 
   !--------------------------------------------------------------------
   !> C = [[A11, A12], [A21, A22]] as one MPIAIJ in the packed layout of
@@ -555,12 +390,11 @@ contains
   !!
   !! The caller then solves (D A D) z = D b and recovers x = D z, so this is an
   !! exact similarity: it changes the conditioning the inner solver sees and
-  !! NOTHING else. physics_pc_pair_scale = 0 skips it entirely and so reproduces
-  !! the unscaled results bit-for-bit.
+  !! NOTHING else.
   !!
   !! WHY. Both packed pairs pit an operator block against a mass block, and in
-  !! both the two carry very different scale. Measured over the full ramp with
-  !! physics_pc_probe_inner = 3 (meas_B/pr_ramp_m8), the two behave DIFFERENTLY
+  !! both the two carry very different scale. Measured over the full ramp (the
+  !! former inner-solver probe, meas_B/pr_ramp_m8), the two behave DIFFERENTLY
   !! and it matters:
   !!
   !!   pair_w   |diag| spread 5.3e9 -> 2.2e10 -> 1.2e12 -> 3.1e13 at tstep

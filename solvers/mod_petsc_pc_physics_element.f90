@@ -3,15 +3,11 @@ module mod_petsc_pc_physics_element
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: type_physics_pc_ctx, g_ctx, &
-       physics_pc_log_events_register, pcev_elem_asm, physics_pc_mixed_arm
+  use mod_petsc_pc_physics_ctx, only: g_ctx, physics_pc_log_events_register, pcev_elem_asm
   implicit none
   private
 
-  public :: petsc_create_pc_matrices
   public :: petsc_assemble_pc_matrices
-  public :: petsc_update_physics_pc_ctx 
-  public :: petsc_test_pc_matrix
 
 contains
 
@@ -68,37 +64,14 @@ contains
   end subroutine petsc_create_pc_matrix
 
 
-  !> Create the four PC sub-matrices (sparsity allocation only).
-  subroutine petsc_create_pc_matrices(a_mat)
-    use data_structure,  only: type_SP_MATRIX
-
-    type(type_SP_MATRIX), intent(in) :: a_mat
-
-    g_ctx%comm = a_mat%comm
-    !call petsc_create_pc_matrix(g_ctx%A_j,    a_mat, 1)
-    !call petsc_create_pc_matrix(g_ctx%A_w,    a_mat, 1)
-    !call petsc_create_pc_matrix(g_ctx%A_jpsi, a_mat, 1)
-    !call petsc_create_pc_matrix(g_ctx%A_wu,   a_mat, 1)
-    call petsc_create_pc_matrix(g_ctx%K_psi_correction, a_mat, 1)
-    call petsc_create_pc_matrix(g_ctx%K_u_correction, a_mat, 1)
-    call petsc_create_pc_matrix(g_ctx%K_21_correction,  a_mat, 1)
-    call petsc_create_pc_matrix(g_ctx%K_61_correction,  a_mat, 1)
-
-    call petsc_create_pc_matrix(g_ctx%S_PBP, a_mat, 1)
-  end subroutine petsc_create_pc_matrices
-
-
-  !> Assemble the four elliptic PC sub-matrices from element-level data.
-  !!
-  !! When physics_pc_reduced_pde is set, also assembles P_full -- the reduced
-  !! 4-variable PDE operator of Milestone 1 (docs/physics_pc). P_full needs the
-  !! equilibrium state, which is why mhd_sim is threaded down to here.
+  !> Assemble the element-level operators of the physics PC: the composed
+  !! force operator W (models/model*/mod_pc_elt_matrix_force_fft.f90). It
+  !! needs mhd_sim (the linearisation state), which is why it is assembled
+  !! here and not in the PC build.
   subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
-    use construct_pc_matrix_mod
+    use construct_pc_matrix_mod, only: construct_force_operator_matrix
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
-    use phys_module,     only: debug_physics_pc, physics_pc_reduced_pde, &
-                               physics_pc_force_operator
     use mod_petsc_pc_sf_solver, only: sf_force_terms
 
     integer,              intent(in) :: my_id
@@ -107,142 +80,37 @@ contains
     type(type_SP_MATRIX), intent(in) :: a_mat
     type(type_MHD_SIM),   intent(in) :: mhd_sim
     PetscErrorCode :: ierr
-    logical        :: first_assembly
 
-
-    first_assembly = .not. g_ctx%matrices_ready
-
-    ! Registered here as well as in petsc_physics_pc_build_reduced: this routine
-    ! runs FIRST (jorek2_main.f90 assembles before mod_petsc.f90 builds the
-    ! reduced system), so relying on the other call site would push an
-    ! unregistered event id on the first step. The register call is idempotent.
+    ! This routine runs before the PC build on the first step, so the events
+    ! are registered here too (idempotent).
     call physics_pc_log_events_register()
     call PetscLogEventBegin(pcev_elem_asm, ierr)
 
-    ! The mixed-pair arms read none of what this block produces (see
-    ! physics_pc_mixed_arm). Skipping it removes a full element-loop assembly
-    ! over the mesh, plus five BAIJ create/destroy pairs, from every Newton
-    ! step. The *_ready flags are deliberately left .false. so that any future
-    ! reader of Atilde_* on this arm hits the existing "Schur correction block
-    ! required!" error rather than silently using an unassembled matrix.
-    if (.not. physics_pc_mixed_arm()) then
-      if (first_assembly) then
-        call petsc_create_pc_matrices(a_mat)
-      else
-        ! PetscCallA(MatDestroy(g_ctx%A_j,    ierr))
-        ! PetscCallA(MatDestroy(g_ctx%A_w,    ierr))
-        ! PetscCallA(MatDestroy(g_ctx%A_jpsi, ierr))
-        ! PetscCallA(MatDestroy(g_ctx%A_wu,   ierr))
-        PetscCallA(MatDestroy(g_ctx%K_psi_correction, ierr))
-        PetscCallA(MatDestroy(g_ctx%K_u_correction, ierr))
-        PetscCallA(MatDestroy(g_ctx%K_21_correction,  ierr))
-        PetscCallA(MatDestroy(g_ctx%K_61_correction,  ierr))
-        PetscCallA(MatDestroy(g_ctx%S_PBP,  ierr))
-        call petsc_create_pc_matrices(a_mat)
-      endif
-
-      !call construct_pc_elliptic_matrices(my_id, local_elms, n_local_elms, a_mat, &
-      !                                    g_ctx%A_j, g_ctx%A_w, g_ctx%A_jpsi, g_ctx%A_wu)
-
-      call construct_schur_correction_matrices(my_id, local_elms, n_local_elms, a_mat, &
-                                          g_ctx%K_psi_correction, g_ctx%K_u_correction, &
-                                          g_ctx%K_21_correction,  g_ctx%K_61_correction, g_ctx%S_PBP)
-      g_ctx%psi_correction_ready  = .true.
-      g_ctx%u_correction_ready    = .true.
-      g_ctx%correction_21_ready   = .true.
-      g_ctx%correction_61_ready   = .true.
-      g_ctx%matrices_ready = .true.
+    ! Created once and zeroed before every refill: the element routine only
+    ! ADDs, so this is the same operator as a fresh matrix, and W keeps its
+    ! identity and pattern for the run -- which the SF path's value maps rely on.
+    if (g_ctx%w_force_ready) then
+      PetscCallA(MatZeroEntries(g_ctx%W_force, ierr))
+    else
+      call petsc_create_pc_matrix(g_ctx%W_force, a_mat, 1)
+      ! The boundary rows are zeroed by MatZeroRows after every assembly;
+      ! without this it also DELETES their pattern, so the next assembly
+      ! would insert outside the (compressed) structure.
+      PetscCallA(MatSetOption(g_ctx%W_force, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
     endif
-    ! Ends here, not at the routine's end: P_full below is an optional
-    ! diagnostic path (physics_pc_reduced_pde) and folding it in would make the
-    ! event mean different things in different configurations.
+
+    ! the mixed pair_w forms carry the bending term (or the whole psi
+    ! channel) through explicit fields, and take it out of W here
+    call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
+                                         mhd_sim, g_ctx%W_force, terms=sf_force_terms())
+    g_ctx%w_force_ready = .true.
     call PetscLogEventEnd(pcev_elem_asm, ierr)
 
-    ! --- Milestone 1: the reduced PDE operator P_full ---
-    if (physics_pc_reduced_pde) then
-      if (.not. g_ctx%p_full_ready) then
-        call petsc_create_pc_matrix(g_ctx%P_full_pde, a_mat, 4)
-      else
-        PetscCallA(MatDestroy(g_ctx%P_full_pde, ierr))
-        call petsc_create_pc_matrix(g_ctx%P_full_pde, a_mat, 4)
-      endif
-
-      call construct_reduced_pde_matrix(my_id, local_elms, n_local_elms, a_mat, &
-                                        mhd_sim, g_ctx%P_full_pde)
-      g_ctx%p_full_ready = .true.
-
-      if (my_id .eq. 0) write(*,'(A)') "[Physics PC]   P_full (reduced PDE operator) assembled"
-    endif
-
-    ! --- Workstream E: the composed force operator W ---
-    ! Assembled here rather than in the SFM2 build because it needs mhd_sim (the
-    ! linearisation state), which only this routine is given. Purely diagnostic:
-    ! dump_sfm2_blocks writes it out, nothing in the apply reads it yet.
-    if (physics_pc_force_operator /= 0) then
-      ! Created once and zeroed before every refill: the element routine only
-      ! ADDs, so this is the same operator as a fresh matrix, and W keeps its
-      ! identity and pattern for the run -- which the production path's value
-      ! maps (mod_petsc_pc_sf_gather) rely on.
-      if (g_ctx%w_force_ready) then
-        PetscCallA(MatZeroEntries(g_ctx%W_force, ierr))
-      else
-        call petsc_create_pc_matrix(g_ctx%W_force, a_mat, 1)
-        ! The boundary rows are zeroed by MatZeroRows after every assembly;
-        ! without this it also DELETES their pattern, so the next assembly
-        ! would insert outside the (compressed) structure.
-        PetscCallA(MatSetOption(g_ctx%W_force, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
-      endif
-
-      ! the SF path's mixed pair_w arms carry the bending term (or the whole
-      ! psi channel) through explicit fields, and take it out of W here
-      call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
-                                           mhd_sim, g_ctx%W_force, terms=sf_force_terms())
-      g_ctx%w_force_ready = .true.
-
-      if (my_id .eq. 0) write(*,'(A)') &
-        "[Physics PC]   W (composed force operator) assembled"
-    endif
+    if (my_id .eq. 0) write(*,'(A)') &
+      "[Physics PC]   W (composed force operator) assembled"
   end subroutine petsc_assemble_pc_matrices
 
 
-
-  !> Refresh the module-level context after a matrix rebuild.
-  subroutine petsc_update_physics_pc_ctx()
-    ! Reserved for future use
-  end subroutine petsc_update_physics_pc_ctx
-
-
-
-    subroutine petsc_test_pc_matrix(A, mat_name, symmetric, my_id)
-    use mod_petsc_matrix_tests
-    use mod_parameters, only: n_tor, n_degrees
-    use nodes_elements
-
-    Mat,     intent(in) :: A
-    character(len=*), intent(in) :: mat_name
-    logical, intent(in) :: symmetric
-    integer, intent(in) :: my_id
-
-    integer :: inode, i_order, mpierr
-    integer :: max_axis_blk_local, max_axis_blk_global, n_axis_dofs
-
-    ! Find the largest block index assigned to any axis node on this rank.
-    max_axis_blk_local = 0
-    do inode = 1, node_list%n_nodes
-      if (.not. node_list%node(inode)%axis_node) cycle
-      do i_order = 1, n_degrees
-        if (node_list%node(inode)%index(i_order) > max_axis_blk_local) &
-          max_axis_blk_local = node_list%node(inode)%index(i_order)
-      end do
-    end do
-    call MPI_Allreduce(max_axis_blk_local, max_axis_blk_global, 1, &
-                       MPI_INTEGER, MPI_MAX, g_ctx%comm, mpierr)
-    ! Each block index corresponds to n_tor scalar rows in A_j
-    ! (construct_pc_matrix_mod.f90 uses bs1 = n_tor, assuming n_tor_local = n_tor).
-    n_axis_dofs = max_axis_blk_global * n_tor
-
-    call petsc_run_matrix_test(my_id, g_ctx%comm, A, mat_name, symmetric, n_axis_dofs)
-  end subroutine petsc_test_pc_matrix
 
 #endif
 end module mod_petsc_pc_physics_element

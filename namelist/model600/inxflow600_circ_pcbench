@@ -8,7 +8,7 @@
 !
 !  --- Compile-time settings --------------------------------------------
 !  model600 with every extension off: n_var = 6, the slots of model199
-!  (psi u zj w rho T).  physics_pc_sf refuses anything else.
+!  (psi u zj w rho T).  use_physics_pc refuses anything else.
 !    ./util/config.sh model=600 n_tor=1 n_period=1 n_plane=1 \
 !        with_vpar=.false. with_TiTe=.false. with_neutrals=.false. with_impurities=.false.
 !    ./util/config.sh model=600 n_tor=3 n_period=6 n_plane=4      (same extensions)
@@ -196,16 +196,11 @@
 ! the two arms are not solving the same problem.
  eliminate_boundary_dofs      = .f.
 
+! use_physics_pc = .t.: the split-field (SF) preconditioner in its production
+! configuration (the physics_pc_sf_* defaults, models/phys_module.f90). Its
+! mode split needs >= (n_tor+1)/2 MPI ranks; for fewer set
+! physics_pc_sf_mode_split = .f.
  use_physics_pc               = .f.
- debug_physics_pc             = .f.
- physics_pc_monolithic        = .f.
- physics_pc_multi_step        = .t.
- physics_pc_wave_schur        = .t.
- physics_pc_schur_channels    = 1
- physics_pc_schur_massinv     = 8
- physics_pc_reduced_pde       = .f.
- physics_pc_drop_psi_coupling = .f.
- physics_pc_verify_reduced    = .f.
 
 ! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
  use_strumpack     = .f.

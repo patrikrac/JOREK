@@ -19,8 +19,9 @@
 #    PCS_DRYRUN=1 pc_study.sh strong   # only print the cases that would run
 #
 #  Environment (defaults in brackets):
-#    PCS_ARMS    arms to run, in order          [jorek sfm2_lu sfm2_gmg sfm2_gmg_q;
-#                                                 nonlinear: jorek jorek_fresh sfm2_lu sfm2_lu_hs0 sfm2_gmg_hs0]
+#    PCS_ARMS    arms to run, in order          [jorek sf_gmg_wpj_ms sf_lu_wpj;
+#                                                 nonlinear: jorek jorek_fresh]
+#                (the _ms arms need np >= (n_tor+1)/2; smaller np fails the case)
 #    PCS_MESH    strong: the fixed mesh         [161x64]
 #    PCS_NPS     strong: rank counts            [1 2 4 8 16 32 64]
 #    PCS_WEAK    weak: mesh:np pairs            [81x32:1 161x64:4 321x128:16]
@@ -30,7 +31,7 @@
 #    PCS_NL_N    nonlinear: steps at tstep 1000 [200]
 #    PCS_REF     probes: the finished reference case directory
 #                                               [<PCS_ROOT>/../pc_scaling_nl/jorek_<mesh>_np1x<omp>]
-#    PCS_PROBE_ARMS   probes: arms              [sfm2_lu_hs0]
+#    PCS_PROBE_ARMS   probes: arms              [required]
 #    PCS_PROBE_STEPS  probes: first:stride:last [40:10:230]
 #    PCS_PROBE_LIST   probes: explicit restart steps, overrides PCS_PROBE_STEPS []
 #                     (sf_* arms: e.g. PCS_TSTEP_N=1.d0 PCS_NSTEP_N=5, since their
@@ -51,12 +52,10 @@ set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MODE=${1:-}
 if [ "$MODE" = nonlinear ]; then
-  ARMS=${PCS_ARMS:-"jorek jorek_fresh sfm2_lu sfm2_lu_hs0 sfm2_gmg_hs0"}
+  ARMS=${PCS_ARMS:-"jorek jorek_fresh"}
 else
   # jorek first: it is the cheapest, so a timed-out job still has the baseline.
-  # sfm2_gmg_d12 is NOT a default: it only exists to show what the D13 axis
-  # treatment bought, and that comparison is already measured.
-  ARMS=${PCS_ARMS:-"jorek sfm2_lu sfm2_gmg sfm2_gmg_q"}
+  ARMS=${PCS_ARMS:-"jorek sf_gmg_wpj_ms sf_lu_wpj"}
 fi
 MAXNP=${PCS_MAXNP:-${SLURM_NTASKS:-8}}
 export PCS_ROOT=${PCS_ROOT:-$PWD/pc_scaling}
@@ -104,7 +103,10 @@ case "$MODE" in
     np=${PCS_PROBE_NP:-1}
     STEPS=${PCS_PROBE_LIST:-$(seq "$p0" "$dp" "$p1")}
     echo "[pc_study] probes from $REF ($NF x $NT), steps" $STEPS", np=$np x $PCS_OMP"
-    for arm in ${PCS_PROBE_ARMS:-sfm2_lu_hs0}; do
+    if [ -z "${PCS_PROBE_ARMS:-}" ]; then
+      echo "[pc_study] probes: set PCS_PROBE_ARMS"; exit 1
+    fi
+    for arm in $PCS_PROBE_ARMS; do
       for s in $STEPS; do
         s=$((10#$s))
         f=$(printf '%s/jorek%06d.h5' "$REF" "$s")

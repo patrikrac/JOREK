@@ -68,8 +68,6 @@ contains
     integer, intent(in) :: eqs(:), vrs(:), pj_e(2), pj_v(2), w_e(2), w_v(2)
     integer, intent(in) :: comm, my_id
     integer :: k
-    real*8  :: dmax, dglob
-    integer :: mpierr
     PetscErrorCode :: ierr
 
     call require_baij(A, "A"); call require_baij(W, "W")
@@ -99,19 +97,6 @@ contains
     call source_state(A, a_id, a_nzst)
     call source_state(W, w_id, w_nzst)
 
-    ! the gate: a gather must reproduce what the conventional path stored
-    dmax = 0.d0
-    do k = 1, ntg
-      dmax = max(dmax, gather_one(tg(k), A, W, .true.))
-    enddo
-    call MPI_Allreduce(dmax, dglob, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
-    if (my_id == 0) write(*,'(A,I0,A,ES9.2)') "[Physics PC]   value maps: ", ntg, &
-      " operators, gather vs extraction max |diff| = ", dglob
-    if (dglob /= 0.d0) then
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: the value-map gather does not "// &
-        "reproduce the extracted operators."
-      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
-    endif
   end subroutine sfg_build
 
   !--------------------------------------------------------------------
@@ -121,7 +106,6 @@ contains
     Mat, intent(in)     :: A, W
     integer, intent(in) :: my_id
     integer(8) :: id, nz
-    real*8 :: d
     integer :: k
     PetscErrorCode :: ierr
 
@@ -130,7 +114,7 @@ contains
     call source_state(W, id, nz)
     if (id /= w_id .or. nz /= w_nzst) call frozen_fail("W")
     do k = 1, ntg
-      d = gather_one(tg(k), A, W, .false.)
+      call gather_one(tg(k), A, W)
       ! bump the object state: MUMPS and the GMG decide "new values" by it
       call MatAssemblyBegin(tg(k)%T, MAT_FINAL_ASSEMBLY, ierr)
       call MatAssemblyEnd(tg(k)%T, MAT_FINAL_ASSEMBLY, ierr)
@@ -498,10 +482,9 @@ contains
   !> Gather one target from A (and W). check = .true.: compare against the
   !! values the target holds instead of writing, and return max |diff|.
   !--------------------------------------------------------------------
-  real*8 function gather_one(t, A, W, check) result(dmax)
+  subroutine gather_one(t, A, W)
     type(tgt_t), intent(inout) :: t
     Mat, intent(in)     :: A, W
-    logical, intent(in) :: check
     Mat :: Ad, Ao, Wd, Wo, Td, To
     PetscInt, pointer :: ga(:), gw(:), gt(:)
     type(c_ptr) :: pad, pao, pwd, pwo, ptd, pto
@@ -510,7 +493,6 @@ contains
     integer :: k
     real*8 :: v
 
-    dmax = 0.d0
     call split_parts(A, .true., Ad, Ao, ga)
     call split_parts(t%T, .false., Td, To, gt)
     rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pad); call c_f_pointer(pad, va_d, [max(na_d, 1_8)])
@@ -523,26 +505,18 @@ contains
       rc = c_baij_get(transfer(Wo%v, 0_c_intptr_t), pwo); call c_f_pointer(pwo, vw_o, [max(nw_o, 1_8)])
     endif
 
-    !$omp parallel do private(v) reduction(max:dmax) schedule(static)
+    !$omp parallel do private(v) schedule(static)
     do k = 1, size(t%md)
       v = src(t%md(k), va_d, va_o)
       if (t%with_w) v = v + src(t%wd(k), vw_d, vw_o)
-      if (check) then
-        dmax = max(dmax, abs(v - vt_d(k)))
-      else
-        vt_d(k) = v
-      endif
+      vt_d(k) = v
     enddo
     !$omp end parallel do
-    !$omp parallel do private(v) reduction(max:dmax) schedule(static)
+    !$omp parallel do private(v) schedule(static)
     do k = 1, size(t%mo)
       v = src(t%mo(k), va_d, va_o)
       if (t%with_w) v = v + src(t%wo(k), vw_d, vw_o)
-      if (check) then
-        dmax = max(dmax, abs(v - vt_o(k)))
-      else
-        vt_o(k) = v
-      endif
+      vt_o(k) = v
     enddo
     !$omp end parallel do
 
@@ -554,7 +528,7 @@ contains
       rc = c_baij_restore(transfer(Wo%v, 0_c_intptr_t), pwo)
       rc = c_baij_restore(transfer(Wd%v, 0_c_intptr_t), pwd)
     endif
-  end function gather_one
+  end subroutine gather_one
 
   pure real*8 function src(m, d, o)
     integer(c_int32_t), intent(in) :: m

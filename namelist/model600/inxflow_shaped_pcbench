@@ -7,7 +7,7 @@
 !  the model199 file for how the case was built and what it measures.
 !
 !  Compile-time: model600 with every extension off (n_var = 6, model199's
-!  slots), which physics_pc_sf requires:
+!  slots), which use_physics_pc requires:
 !    ./util/config.sh model=600 n_tor=1 n_period=1 n_plane=1 \
 !        with_vpar=.false. with_TiTe=.false. with_neutrals=.false. with_impurities=.false.
 !    ./util/config.sh model=600 n_tor=3 n_period=6 n_plane=4      (same extensions)
@@ -157,12 +157,11 @@
 ! it on only for the stage-3 diagnostics.
  eliminate_boundary_dofs      = .f.
 
+! use_physics_pc = .t.: the split-field (SF) preconditioner in its production
+! configuration (the physics_pc_sf_* defaults, models/phys_module.f90). Its
+! mode split needs >= (n_tor+1)/2 MPI ranks; for fewer set
+! physics_pc_sf_mode_split = .f.
  use_physics_pc               = .f.
- debug_physics_pc             = .f.
- physics_pc_monolithic        = .f.
- physics_pc_reduced_pde       = .f.
- physics_pc_drop_psi_coupling = .f.
- physics_pc_verify_reduced    = .f.
 
 ! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
  use_strumpack     = .f.

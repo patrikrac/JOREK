@@ -38,8 +38,8 @@
 !  the exact MUMPS solves in the operator comparison stay cheap.  Refine
 !  n_radial/n_pol/n_flux/n_tht for scaling studies.
 !
-!  Run on 1 MPI rank: the physics PC apply path fails for np > 1
-!  (pre-existing, independent of this work).
+!  The physics PC (use_physics_pc) runs on any number of MPI ranks; its
+!  mode split needs at least (n_tor+1)/2.
 ! =====================================================================
 
 &in1
@@ -143,10 +143,6 @@
  gmres_tol = 1.d-8
 
 ! --- physics PC -------------------------------------------------------
-! physics_pc_reduced_pde     .t. -> reduced solve uses P_full
-!                            .f. -> extracted blocks + algebraic Schur
-! physics_pc_drop_psi_coupling .t. -> arrow structure (Milestone 3)
-! physics_pc_verify_reduced  .t. -> run the Milestone-1 block harness
 ! Eliminate the Dirichlet DOFs (row+column zeroed, representative diagonal)
 ! instead of the 1e12 ZBIG penalty. Strongly preferred for this study: the
 ! penalty rows otherwise dominate every operator norm, and -- measured --
@@ -154,12 +150,11 @@
 ! the cold-edge Spitzer eta_T blow-up in the boundary columns.
  eliminate_boundary_dofs      = .t.
 
+! use_physics_pc = .t.: the split-field (SF) preconditioner in its production
+! configuration (the physics_pc_sf_* defaults, models/phys_module.f90). Its
+! mode split needs >= (n_tor+1)/2 MPI ranks; for fewer set
+! physics_pc_sf_mode_split = .f.
  use_physics_pc               = .t.
- debug_physics_pc             = .f.
- physics_pc_monolithic        = .t.
- physics_pc_reduced_pde       = .t.
- physics_pc_drop_psi_coupling = .f.
- physics_pc_verify_reduced    = .f.
 
 ! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
  use_strumpack     = .f.

@@ -9,123 +9,85 @@ module mod_petsc_pc_sf
        pcev_extract, pcev_convert, pcev_build_suu, pcev_fact_pj, pcev_fact_w, &
        pcev_fact_rhot, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, pcev_apply
   use mod_petsc_pc_blocks, only: create_variable_index_sets, extract_sub_blocks_h, &
-       pack_pair_aij, make_pair_block_scale, make_field_block_scale, report_operator_density, &
+       pack_pair_aij, make_pair_block_scale, make_field_block_scale, &
        split_vars, merge_vars, harm_band
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather, sfg_cross_weights
   use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_dh, sfw_lines
   use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf
   use mod_petsc_raw_csr, only: blockmv_attach
-  use mod_petsc_pc_sf_fam, only: fam_op_t, fam_mat_t, sff_on, sff_comm, sff_decompose, sff_op_build, &
-       sff_op_fill, sff_mat_refresh, sff_mat_free, sff_compare, sff_vec_setup, sff_scatter_in, sff_scatter_out, &
-       sff_cross_addmult, sff_cross_scale, sff_copy_local, sff_add_local, sff_compare_band
+  use mod_petsc_pc_sf_fam, only: fam_op_t, sff_comm, sff_decompose, sff_op_build, &
+       sff_op_fill, sff_vec_setup, sff_scatter_in, sff_scatter_out, &
+       sff_cross_addmult, sff_cross_scale, sff_copy_local, sff_add_local
   implicit none
   private
 
   !--------------------------------------------------------------------
-  !> The production SFM2 preconditioner: a clean path, free of the research
-  !! arms and of their per-rebuild cost.
+  !> The physics-based preconditioner (use_physics_pc): the split-field (SF)
+  !! block-LDU sweep over the six variables (psi, u, j, omega, rho, T).
   !!
-  !! WHAT IT IS
-  !! ----------
-  !! One block-LDU sweep over the six variables, with j and omega kept
-  !! EXPLICIT inside two mixed 2x2 pairs rather than substituted out:
+  !! PRODUCTION CONFIGURATION (the namelist defaults)
+  !! ------------------------------------------------
+  !!   physics_pc_sf_suu        = "wpj"   pair_w mixed (u, omega, psi, j)
+  !!   physics_pc_sf_corrector  = -1      auto: Eq. (17) for wpj
+  !!   physics_pc_sf_mode_split = .t.     one |n| family per rank group
+  !!   physics_pc_sf_pair_psi / _pair_w / _rho / _T = "gmg"
+  !!   physics_pc_sf_harm_couple = 0      |n|-diagonal blocks
+  !! Everything else -- the S_uu forms schur / w / wj, the global (not mode
+  !! split) operators, the cross-|n| band, the LU backends, the Eq. (16)
+  !! corrector -- is a reference arm, kept for comparison.
+  !!
+  !! THE SWEEP
+  !! ---------
+  !! j and omega stay EXPLICIT inside two mixed pairs rather than being
+  !! substituted out:
   !!
   !!   pair_psi = [[B_11, B_13], [B_31, B_33]]      (psi, j)
   !!   pair_w   = [[S_uu, B_24], [B_42, B_44]]      (u, omega)
   !!
   !! pair_psi is solved SPLIT: the C1 GMG runs on the (psi, j) pair itself,
-  !! psi and j kept separate through the whole cycle and smoothed together
-  !! (Chacon JCP 526 (2025) S4.1). No Schur approximation and no B_33 solve
-  !! enter, and eta_num > 0 is allowed: hyper-resistivity only adds
-  !! eta_num K_1 to B_13, so both rows stay second order.
+  !! psi and j smoothed together (Chacon JCP 526 (2025) S4.1). No Schur
+  !! approximation and no B_33 solve enter.
   !!
-  !! pair_w's (1,1) block S_uu has two production forms, one namelist entry
-  !! apart (physics_pc_sf_suu); everything else in the sweep is shared.
+  !! pair_w's S_uu (physics_pc_sf_suu) builds on the composed force operator
+  !! W (Chacon JCP 526 (2025) Eqs. 17-19), assembled at element level
+  !! (construct_force_operator_matrix) with its prefactor and zeroed
+  !! Dirichlet rows:
   !!
-  !! "w": the COMPOSED operator (workstream E; Chacon JCP 526 (2025) 113789,
-  !! Eq. 17-19), assembled,
+  !!   "wpj" / "wj": pair_w MIXED, assembled (mod_petsc_pc_sf_mixed): W with
+  !!     its whole psi channel ("wpj") or its bending term ("wj") taken back
+  !!     out, and the channel put back through explicit fields, the way
+  !!     pair_psi keeps j explicit: (u, omega, psi, j) with the small-flow psi
+  !!     row, or (u, omega, j) with psi eliminated by the node-lumped psi mass.
+  !!     Restores the discrete projections and the resistive damping of the
+  !!     psi response that W lacks, with every block sparse and every row
+  !!     second order. Its multigrid smooths with flux-surface ring blocks, a
+  !!     harmonic's cos and sin slots in one block (SF_GMG_SMOOTHER_RINGS,
+  !!     SF_GMG_HARM_PAIR_MIXED), and coarsens radially only on its first
+  !!     levels (SF_GMG_SEMI_R_MIXED). With wpj, step 3 reads (psi, j) off
+  !!     pair_w's own solution (Eq. (17)) instead of a second pair_psi solve.
+  !!   "w": S_uu = B_22 + W, assembled. W is the continuum operator: it lacks
+  !!     the discrete projection M_j^-1, so its outer count grows with the mesh.
+  !!   "schur": the psi-channel Schur complement of the Jacobian, matrix-free
+  !!     (mod_petsc_pc_sf_pairw), S_uu u = B_22 u - B_21 psi - B_23 j with
+  !!     [psi; j] = pair_psi^-1 [B_12 u; 0]; its multigrid keeps B_22 + W.
   !!
-  !!   S_uu = B_22 + (theta dt)^2/opz * W(psi_0, p_0; n)          (S_W_aij)
+  !! THE MODE SPLIT
+  !! --------------
+  !! With physics_pc_sf_harm_couple = 0 every block is |n|-diagonal, so each
+  !! |n| family (n = 0, then each cos/sin pair) is solved on its own rank
+  !! group, all families concurrently (mod_petsc_pc_sf_fam). The operators
+  !! are extracted straight from A and W into the family layout; no global
+  !! operator exists. It needs at least one rank per family. A band k /= 0
+  !! keeps cross-|n| couplings: each block solve then becomes FGMRES over all
+  !! families on D + C, the family solvers as block-Jacobi preconditioner.
   !!
-  !! W is assembled at element level (construct_force_operator_matrix)
-  !! already carrying its prefactor, its toroidal channels and its zeroed
-  !! Dirichlet rows. No mass inverse anywhere, cheapest per outer iteration.
-  !! But W is the continuum operator: it lacks the discrete projection M_j^-1
-  !! of the Jacobian's Schur complement, an O(1) error at grid scale that
-  !! grows as (dt v_A / h)^2, so its outer count grows with the mesh (shaped
-  !! pcbench, np 4: 112 -> 203 its from 41x32 to 161x64). A SMALL-dt method:
-  !! no convergence at tstep 10 on the ballooning case.
-  !!
-  !! "schur" (default): the psi-channel Schur complement of the Jacobian,
-  !! matrix-free (mod_petsc_pc_sf_pairw),
-  !!
-  !!   S_uu u = B_22 u - B_21 psi - B_23 j,   [psi; j] = pair_psi^-1 [B_12 u; 0],
-  !!
-  !! pair_psi^-1 being one application of pair_psi's own solver. Its
-  !! multigrid keeps B_22 + W for the Galerkin chain and runs level 0 on the
-  !! same channel with a diagonal psi-row inverse and a Chebyshev constraint
-  !! mass. Outer count flat in the mesh (21/20/19/21/22 over 41x32 .. 161x64,
-  !! np 4, against 112 .. 201 for "w"); at 161x64 ~148 s against ~250 s.
-  !!
-  !! "wj" / "wpj": pair_w MIXED, assembled (mod_petsc_pc_sf_mixed). W with
-  !! its bending term ("wj") or its whole psi channel ("wpj") taken back out,
-  !! and the channel put back through explicit fields, the way pair_psi keeps
-  !! j explicit: (u, omega, j) with psi eliminated by the node-lumped psi mass,
-  !! or (u, omega, psi, j) with the small-flow psi row. Restores the discrete
-  !! projections and the resistive damping of the psi response that W lacks,
-  !! with every block sparse and every row second order. Its multigrid
-  !! smooths with flux-surface ring blocks, a harmonic's cos and sin slots in
-  !! one block (SF_GMG_SMOOTHER_RINGS, SF_GMG_HARM_PAIR_MIXED): at large dt
-  !! the psi - u coupling runs along the field lines, toroidally as well.
-  !! The rings leave the radial couplings, strongest on cells long in theta,
-  !! to the coarse grid, so its first levels coarsen radially only
-  !! (SF_GMG_SEMI_R_MIXED): pair_w then converges at the same rate from
-  !! 41x32 to 121x48 and from tstep 0.1 to 10 (rho 0.043-0.045 per cycle).
-  !!
-  !! Both pairs smooth with zebra lines and run asymmetric V-cycles, all
-  !! smoothing after the coarse correction (SF_PJ_*, SF_W_*): pair_psi
-  !! converges in one cycle per solve, pair_w in ~1 (w) / ~4 (schur).
-  !!
-  !! WHERE IT IS VALID
-  !! -----------------
-  !! Both arms are measured up to tstep 1 (the shaped pcbench ramp). The
-  !! schur arm's multigrid builds its coarse levels from the small-dt
-  !! composed operator, not yet measured at tstep 10. The zebra smoother
-  !! degrades on poloidally heavy meshes (n_flux well below n_tht); the
-  !! production meshes are radially heavy.
-  !!
-  !! WHAT IS DELIBERATELY ABSENT
-  !! ---------------------------
-  !! Every verify_/probe_/report_/dump_ routine, every rejected arm, and every
-  !! knob that was a measurement variable rather than a design choice, and every
-  !! superseded method: each block has ONE production solver (GMG) plus the
-  !! exact LU it is gated against, nothing else. The GMG smoothers, axis rings
-  !! and boundary drop are fixed at their audited values in
-  !! mod_petsc_pc_sf_solver. One namelist entry picks S_uu, four pick gmg | lu
-  !! per block and one sets the shared inner tolerance; nothing else is
-  !! configurable.
-  !!
-  !! Of the ~61 research physics_pc_* flags, this path READS exactly one --
-  !! physics_pc_force_operator, which must be 1 because W is assembled at
-  !! element level (the mixed arms then assemble only W's terms they do not
-  !! carry through explicit fields: sf_force_terms) -- and FORCES one,
-  !! physics_pc_harm_split = 1, which the
-  !! block extraction reads. Its filter keeps the |n| groups within
-  !! physics_pc_sf_harm_couple of each other (0, the default: the same |n|
-  !! only; harm_band in mod_petsc_pc_blocks), fixed for the run because the
-  !! band fixes every pattern. Every other one is ignored: the GMG receives its
-  !! whole configuration explicitly (gmg_opts_t, from the constants in
-  !! mod_petsc_pc_sf_solver), so a production deck cannot inherit a research
-  !! setting.
-  !!
-  !! It is also excluded, by name rather than by a flag it happens to leave at
-  !! a default, from three costs elsewhere in the solver: the commutator
-  !! element blocks (physics_pc_needs_commutator_blocks), the Schur-correction
-  !! element assembly (physics_pc_mixed_arm) and the full AIJ copy of the
-  !! Jacobian (no_aij in mod_petsc). It reads none of the three.
-  !!
-  !! The self-check runs on the FIRST BUILD ONLY and has no flag.
+  !! CONFIGURATION
+  !! -------------
+  !! The GMG smoothers, V-cycle shapes, axis rings and boundary drop are fixed
+  !! in mod_petsc_pc_sf_solver; the GMG receives its whole configuration
+  !! explicitly (gmg_opts_t). The namelist picks S_uu, gmg | lu per block, the
+  !! shared inner tolerance, the corrector, the band and the mode split.
   !--------------------------------------------------------------------
 
   logical, save :: sf_init_done = .false.
@@ -139,8 +101,8 @@ module mod_petsc_pc_sf
 
   !--- backends, resolved once from the namelist strings ------------------
   integer, save :: bk_pj = SF_GMG, bk_w = SF_GMG
-  integer, save :: bk_rho = SF_LU, bk_T = SF_LU
-  integer, save :: suu = SF_SUU_SCHUR          !< pair_w's S_uu (physics_pc_sf_suu)
+  integer, save :: bk_rho = SF_GMG, bk_T = SF_GMG
+  integer, save :: suu = SF_SUU_WPJ            !< pair_w's S_uu (physics_pc_sf_suu)
   type(suu_form_t), save :: sform              !< ... with its variant (the mixed forms)
   logical, save :: mixed = .false.             !< pair_w mixed: "wj" / "wpj"
   integer, save :: corr = 0                    !< step-3 corrector (physics_pc_sf_corrector)
@@ -192,16 +154,9 @@ module mod_petsc_pc_sf
   end type band_ksp_t
   type(band_ksp_t), save :: bks(4)     !< by GMG instance: 1 pair_w, 2 pair_psi, 3 rho, 4 T
 
-  public :: sf_enabled, sf_build, sf_apply, sf_report
+  public :: sf_build, sf_apply, sf_report
 
 contains
-
-  !> Is the production path selected? Read by the two dispatch points in
-  !! mod_petsc_pc_physics / mod_petsc_pc_physics_apply.
-  logical function sf_enabled()
-    use phys_module, only: physics_pc_sf
-    sf_enabled = physics_pc_sf
-  end function sf_enabled
 
   !--------------------------------------------------------------------
   !> Resolve the namelist into backends, and force the settings this path
@@ -213,7 +168,6 @@ contains
   subroutine sf_init(my_id)
     use phys_module, only: physics_pc_sf_suu, physics_pc_sf_pair_psi, physics_pc_sf_pair_w, &
                            physics_pc_sf_rho, physics_pc_sf_T, physics_pc_sf_rtol, &
-                           physics_pc_force_operator, physics_pc_harm_split, &
                            physics_pc_sf_harm_couple, physics_pc_sf_corrector, &
                            physics_pc_sf_mode_split
     use mod_parameters, only: n_tor
@@ -246,14 +200,6 @@ contains
                  "with_vpar, with_TiTe, with_neutrals and with_impurities off")
     if (mod(n_tor, 2) /= 1) call fatal("physics_pc_sf needs n_tor odd (n = 0 plus cos/sin pairs)")
 
-    !--- the one hard precondition: W must have been assembled.
-    if (physics_pc_force_operator /= 1) &
-      call fatal("physics_pc_sf needs physics_pc_force_operator = 1 (the FULL Eq. (19) W); "// &
-                 "without it S_uu = B_22 + W has no W to add.")
-
-    !--- settings this path implies. Forced, not offered.
-    call force_int(physics_pc_harm_split,      1, "physics_pc_harm_split")
-
     !--- the cross-|n| band of that filter: one value for the run
     if (physics_pc_sf_harm_couple < -1) &
       call fatal("physics_pc_sf_harm_couple must be -1 (all), 0 or a band k > 0")
@@ -279,7 +225,7 @@ contains
                  "physics_pc_sf_suu = w | wpj")
 
     if (my_id == 0) then
-      write(*,'(A)') "[Physics PC] ================ production SFM2 path ================"
+      write(*,'(A)') "[Physics PC] ================ split-field (SF) preconditioner ================"
       select case (suu)
       case (SF_SUU_SCHUR)
         write(*,'(A)') "[Physics PC]   S_uu     : schur (psi-channel Schur complement, matrix-free; GMG chain on B_22 + W)"
@@ -334,17 +280,6 @@ contains
         call fatal(trim(nm)//" must be lu | gmg, got '"//trim(s)//"'")
       end select
     end function backend_of
-
-    subroutine force_int(v, want, nm)
-      integer, intent(inout)       :: v
-      integer, intent(in)          :: want
-      character(len=*), intent(in) :: nm
-      if (v == want) return
-      if (my_id == 0) write(*,'(A,A,A,I0,A,I0,A)') &
-        "[Physics PC]   production path: forcing ", trim(nm), " = ", want, &
-        " (was ", v, "); this path implies it rather than offering it."
-      v = want
-    end subroutine force_int
 
     subroutine fatal(msg)
       character(len=*), intent(in) :: msg
@@ -592,8 +527,6 @@ contains
           enddo
         endif
         call PetscLogEventEnd(pcev_extract, ierr)
-        call verify_family_operators()
-        if (banded) call report_band_size()
       else
         call PetscLogEventBegin(pcev_extract, ierr)
         call sff_op_fill(o_pj,  A_full, g_ctx%W_force, sf_opz())
@@ -623,7 +556,7 @@ contains
       !--- the sweep's coupling blocks on the threaded block kernel, as on the
       !--- global path; the kernel reads the CSR arrays in place, so one
       !--- attach holds across the refills
-      if (first_ .and. SF_BLOCKMV == 1) then
+      if (first_) then
         block
           use mod_petsc_pc_harm, only: pc_ntor
           integer :: nno
@@ -694,22 +627,6 @@ contains
       c%se = d%se; c%sv = d%sv; c%scl = d%scl; c%has_w = d%has_w
     end subroutine cross_of
 
-    !> Stored entries of the cross-family parts against the family parts.
-    subroutine report_band_size()
-      real*8 :: nd, nc, wd, wc
-      integer :: k
-      nd = 0.d0; nc = 0.d0
-      call band_count(o_w, x_w, comm, nd, nc);  wd = nd;  wc = nc
-      call band_count(o_pj, x_pj, comm, nd, nc)
-      call band_count(o_rho, x_rho, comm, nd, nc)
-      call band_count(o_T, x_T, comm, nd, nc)
-      do k = 1, NCB
-        call band_count(o_cb(k), x_cb(k), comm, nd, nc)
-      enddo
-      if (my_id == 0) write(*,'(A,ES10.3,A,F6.2,A,F6.2,A)') "[Physics PC]   SF band: cross-family entries ", &
-        nc, " (", nc / max(nd, 1.d0), " x the family parts; pair_w ", wc / max(wd, 1.d0), " x)"
-    end subroutine report_band_size
-
     subroutine full_op(op, label, tagb, vars)
       type(fam_op_t), intent(inout) :: op
       character(len=*), intent(in) :: label
@@ -722,41 +639,6 @@ contains
         enddo
       enddo
     end subroutine full_op
-
-    !> -sf_ms_verify 1: build the global operators and their family copies
-    !! the old way once, and require the direct extraction to match them.
-    subroutine verify_family_operators()
-      PetscInt :: iv
-      PetscBool :: set
-      real*8 :: worst, worst_b
-      iv = 0
-      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_ms_verify", iv, set, ierr)
-      if (iv == 0) return
-      call first_build_operators()
-      worst = 0.d0;  worst_b = 0.d0
-      call verify_check(my_id, worst, worst_b, o_pj, x_pj, g_ctx%K_pj_aij, 2, .true.)
-      ! the global path keeps all of W in pair_w: exact against it only for band -1
-      if (mixed) then
-        call verify_check(my_id, worst, worst_b, o_w, x_w, sfm_op, sfm_nf, harm_band < 0)
-      else
-        call verify_check(my_id, worst, worst_b, o_w, x_w, g_ctx%S_W_aij, 2, harm_band < 0)
-      endif
-      call verify_check(my_id, worst, worst_b, o_rho, x_rho, g_ctx%B_55, 1, .true.)
-      call verify_check(my_id, worst, worst_b, o_T, x_T, g_ctx%B_66, 1, .true.)
-      call verify_check(my_id, worst, worst_b, o_cb(1), x_cb(1), g_ctx%B_12, 1, .true.);  call verify_check(my_id, worst, worst_b, o_cb(2), x_cb(2), g_ctx%B_16, 1, .true.)
-      call verify_check(my_id, worst, worst_b, o_cb(3), x_cb(3), g_ctx%B_21, 1, .true.);  call verify_check(my_id, worst, worst_b, o_cb(4), x_cb(4), g_ctx%B_23, 1, .true.)
-      call verify_check(my_id, worst, worst_b, o_cb(5), x_cb(5), g_ctx%B_25, 1, .true.);  call verify_check(my_id, worst, worst_b, o_cb(6), x_cb(6), g_ctx%B_26, 1, .true.)
-      call verify_check(my_id, worst, worst_b, o_cb(7), x_cb(7), g_ctx%B_51, 1, .true.);  call verify_check(my_id, worst, worst_b, o_cb(8), x_cb(8), g_ctx%B_52, 1, .true.)
-      call verify_check(my_id, worst, worst_b, o_cb(9), x_cb(9), g_ctx%B_61, 1, .true.);  call verify_check(my_id, worst, worst_b, o_cb(10), x_cb(10), g_ctx%B_62, 1, .true.)
-      call verify_check(my_id, worst, worst_b, o_cb(11), x_cb(11), g_ctx%B_63, 1, .true.)
-      call verify_check(my_id, worst, worst_b, o_cb(12), x_cb(12), gB_65, 1, .true.)
-      if (worst > 0.d0 .or. worst_b > 1.d-12) then
-        if (my_id == 0) write(*,'(A,2ES9.2)') "[Physics PC]   FATAL: SF mode split verify: the direct "// &
-          "extraction differs from the copied operators, worst (family parts, band matvecs) ", worst, worst_b
-        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
-      endif
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   SF mode split verify: all 15 operators identical"
-    end subroutine verify_family_operators
 
     !> First build: the operators with their frozen patterns, the value maps
     !! into them, and the release of the blocks that only fed the packing.
@@ -818,8 +700,6 @@ contains
       endif
       call PetscLogEventEnd(pcev_build_suu, ierr)
 
-      call sf_selfcheck(my_id)
-
       !--- the value maps, gated against what was just extracted (schur:
       !--- pw0 and sfw_lines, the pair_w smoother operator, are refilled like
       !--- S_W_aij; sfw_numeric adds the channel on top of sfw_lines)
@@ -852,80 +732,31 @@ contains
         g_ctx%B_42 = PETSC_NULL_MAT; g_ctx%B_44 = PETSC_NULL_MAT
       endif
 
-      !--- the SFM2 apply's coupling blocks: fixed patterns, refilled in place
-      !--- by the value map, so one attach holds for the run
-      if (SF_BLOCKMV == 1) then
-        block
-          use mod_parameters, only: n_tor
-          integer :: nno, ncb, k
-          Mat :: cb(14)
-          ! a refused attach (not AIJ) keeps PETSc's own matvec: correct, but
-          ! single-threaded, so it is reported
-          cb(1:12) = [g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_23, g_ctx%B_25, g_ctx%B_26, &
-                      g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62, g_ctx%B_63, gB_65]
-          ncb = 12
-          if (suu == SF_SUU_SCHUR) then
-            cb(13:14) = [g_ctx%B_31, pw0]
-            ncb = 14
-          endif
-          nno = 0
-          do k = 1, ncb
-            if (.not. blockmv_attach(cb(k), int(n_tor))) nno = nno + 1
-          enddo
-          if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   SF: WARNING ", nno, &
-            " coupling block(s) not AIJ, left on PETSc's single-threaded matvec"
-        end block
-      endif
-#if defined(PETSC_HAVE_MKL_SPARSE)
-      !--- threaded SpMV: PETSc's AIJ matvec is single-threaded per rank, and
-      !--- the level-0 matvecs are most of a V-cycle, so the operators the
-      !--- multigrid multiplies with become MKL's inspector-executor type (in
-      !--- place: same CSR arrays, so the value maps stay valid; the gather's
-      !--- assembly refreshes MKL's handle). LU backends keep plain AIJ.
-      !--- (SF_BLOCKMV = 1 does this with its own kernel, in the GMG setup)
-      if (SF_BLOCKMV == 0) then
-        if (bk_pj  == SF_GMG) call MatConvert(g_ctx%K_pj_aij, MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%K_pj_aij, ierr)
-        if (bk_w   == SF_GMG) call MatConvert(g_ctx%S_W_aij,  MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%S_W_aij,  ierr)
-        if (bk_rho == SF_GMG) call MatConvert(g_ctx%B_55,     MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%B_55,     ierr)
-        if (bk_T   == SF_GMG) call MatConvert(g_ctx%B_66,     MATAIJMKL, MAT_INPLACE_MATRIX, g_ctx%B_66,     ierr)
-        if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: GMG operators converted to AIJMKL (threaded SpMV)"
-      endif
-#endif
+      !--- the sweep's coupling blocks: fixed patterns, refilled in place by
+      !--- the value map, so one attach holds for the run
+      block
+        use mod_parameters, only: n_tor
+        integer :: nno, ncb, k
+        Mat :: cb(14)
+        ! a refused attach (not AIJ) keeps PETSc's own matvec: correct, but
+        ! single-threaded, so it is reported
+        cb(1:12) = [g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_23, g_ctx%B_25, g_ctx%B_26, &
+                    g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62, g_ctx%B_63, gB_65]
+        ncb = 12
+        if (suu == SF_SUU_SCHUR) then
+          cb(13:14) = [g_ctx%B_31, pw0]
+          ncb = 14
+        endif
+        nno = 0
+        do k = 1, ncb
+          if (.not. blockmv_attach(cb(k), int(n_tor))) nno = nno + 1
+        enddo
+        if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   SF: WARNING ", nno, &
+          " coupling block(s) not AIJ, left on PETSc's single-threaded matvec"
+      end block
     end subroutine first_build_operators
 
   end subroutine sf_build
-
-  !> nd, nc += the global stored entries of a family part d (family comms)
-  !! and of its cross-family part c.
-  subroutine band_count(d, c, comm, nd, nc)
-    type(fam_op_t), intent(in) :: d, c
-    integer, intent(in)        :: comm
-    real*8, intent(inout)      :: nd, nc
-    MatInfo :: info
-    real*8 :: v(2), g(2)
-    integer :: mpierr
-    PetscErrorCode :: ierr
-    call MatGetInfo(d%fam, MAT_LOCAL, info, ierr);  v(1) = info%nz_used
-    call MatGetInfo(c%fam, MAT_LOCAL, info, ierr);  v(2) = info%nz_used
-    call MPI_Allreduce(v, g, 2, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
-    nd = nd + g(1);  nc = nc + g(2)
-  end subroutine band_count
-
-  !> -sf_ms_verify: a family part against the family copy of the global
-  !! operator src; with a band also D + C against src on a matvec.
-  subroutine verify_check(my_id, worst, worst_b, d, c, src, nf, exact)
-    integer, intent(in)           :: my_id
-    real*8, intent(inout)         :: worst, worst_b
-    type(fam_op_t), intent(inout) :: d, c
-    Mat, intent(in)               :: src
-    integer, intent(in)           :: nf
-    logical, intent(in)           :: exact
-    type(fam_mat_t) :: cp
-    call sff_mat_refresh(cp, src, nf)
-    call sff_compare(d, cp%fam, my_id, worst)
-    if (banded) call sff_compare_band(d, c, cp%perm, my_id, worst_b, exact)
-    call sff_mat_free(cp)
-  end subroutine verify_check
 
   !====================================================================
   ! the cross-|n| band under the mode split
@@ -1095,8 +926,6 @@ contains
     end associate
   end subroutine bsolve
 
-  !> y = B x for a coupling block of the sweep (k: its index in o_cb), with
-  !! a band plus its cross-family part.
   !> use_b65 = B_65 has a nonzero entry anywhere (comm: the operators'
   !! communicator; on the mode split the families' union, i.e. comm_g).
   subroutine set_use_b65(a, comm)
@@ -1114,6 +943,8 @@ contains
       sqrt(nrm), " (max over ranks): applied in the rho -> T sweep"
   end subroutine set_use_b65
 
+  !> y = B x for a coupling block of the sweep (k: its index in o_cb), with
+  !! a band plus its cross-family part.
   subroutine cmult(a, k, x, y)
     Mat :: a
     integer, intent(in) :: k
@@ -1122,100 +953,6 @@ contains
     call MatMult(a, x, y, ierr)
     if (banded) call sff_cross_addmult(x_cb(k), x, y)
   end subroutine cmult
-
-  !--------------------------------------------------------------------
-  !> First-build structural check. No flag: once per run it costs a fraction
-  !! of a second, and it is the only thing that catches a mis-scaled or
-  !! mis-assembled operator -- both of which are invisible to every norm the
-  !! build already prints. The GMG's own coarse-solve and boundary-row gates
-  !! run on its first build for the same reason.
-  !--------------------------------------------------------------------
-  subroutine sf_selfcheck(my_id)
-    integer, intent(in) :: my_id
-    call report_operator_density(g_ctx%B_22,     "B_22 (bare momentum)", my_id)
-    call report_operator_density(g_ctx%W_force,  "W    (force operator)", my_id)
-    call report_operator_density(g_ctx%S_W_aij,  "pair_w (packed u,omega)", my_id)
-    call report_operator_density(g_ctx%K_pj_aij, "pair_psi (packed psi,j)", my_id)
-    call w_symmetry_check(my_id)
-    call dump_blocks()
-  contains
-    !> -sf_dump 1: the extracted blocks and W as PETSc binaries sfdump_<op>.petsc
-    !! in the run directory, for offline checks of W against the discrete
-    !! Schur correction (first build, global path only).
-    subroutine dump_blocks()
-      PetscInt :: iv
-      PetscBool :: set
-      PetscErrorCode :: ierr
-      iv = 0
-      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_dump", iv, set, ierr)
-      if (iv == 0 .or. famode) return
-      call one(g_ctx%B_11, "B_11"); call one(g_ctx%B_12, "B_12"); call one(g_ctx%B_13, "B_13")
-      call one(g_ctx%B_16, "B_16"); call one(g_ctx%B_21, "B_21"); call one(g_ctx%B_22, "B_22")
-      call one(g_ctx%B_23, "B_23"); call one(g_ctx%B_24, "B_24"); call one(g_ctx%B_25, "B_25")
-      call one(g_ctx%B_26, "B_26"); call one(g_ctx%B_31, "B_31"); call one(g_ctx%B_33, "B_33")
-      call one(g_ctx%B_42, "B_42"); call one(g_ctx%B_44, "B_44"); call one(g_ctx%B_51, "B_51")
-      call one(g_ctx%B_52, "B_52"); call one(g_ctx%B_55, "B_55"); call one(g_ctx%B_61, "B_61")
-      call one(g_ctx%B_62, "B_62"); call one(g_ctx%B_63, "B_63"); call one(gB_65, "B_65")
-      call one(g_ctx%B_66, "B_66"); call one(g_ctx%W_force, "W")
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: blocks dumped to sfdump_*.petsc"
-    end subroutine dump_blocks
-    subroutine one(A, nm)
-      Mat :: A
-      character(len=*), intent(in) :: nm
-      PetscViewer :: vw
-      PetscErrorCode :: ierr
-      if (A == PETSC_NULL_MAT) return
-      call PetscViewerBinaryOpen(PETSC_COMM_WORLD, "sfdump_"//nm//".petsc", FILE_MODE_WRITE, vw, ierr)
-      call MatView(A, vw, ierr)
-      call PetscViewerDestroy(vw, ierr)
-    end subroutine one
-  end subroutine sf_selfcheck
-
-  !> W's symmetry defect, every run (one transpose at the first build). The
-  !! bending and the gamma p0 part are symmetric by construction; the kink and
-  !! the grad p0 part only together, at force balance -- so on a real
-  !! equilibrium the defect measures how far it is from (reduced) force
-  !! balance, and an assembly error shows up as a defect at the bending-only
-  !! term set (-sf_w_terms 3), which must be at round-off.
-  !! -sf_w_check 1 adds the unit test of the W assembly (model199 / model600):
-  !!   -sf_w_terms 4: W must equal A's (zj, psi) block, B_31, to round-off
-  !! (needs physics_pc_sf_harm_couple = -1, so B_31 keeps every harmonic).
-  subroutine w_symmetry_check(my_id)
-    integer, intent(in) :: my_id
-    Mat :: Wt, D
-    real*8 :: nw, nd, nb
-    PetscInt :: iv
-    PetscBool :: set
-    PetscErrorCode :: ierr
-    call MatNorm(g_ctx%W_force, NORM_FROBENIUS, nw, ierr)
-    call MatTranspose(g_ctx%W_force, MAT_INITIAL_MATRIX, Wt, ierr)
-    call MatAYPX(Wt, -1.0d0, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
-    call MatNorm(Wt, NORM_FROBENIUS, nd, ierr)
-    call MatDestroy(Wt, ierr)
-    if (my_id == 0) write(*,'(A,I0,A,ES10.3,A,ES10.3)') "[Physics PC]   SF: W (terms ", sf_force_terms(), &
-      ") |W|_F ", nw, ", symmetry defect |W - W^T|_F / |W|_F ", nd / max(nw, 1.d-300)
-    iv = 0
-    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_w_check", iv, set, ierr)
-    if (iv == 0) return
-    if (sf_force_terms() == 4) call against(g_ctx%B_31, "B_31")
-  contains
-    !> W's unit-test term sets reproduce one Jacobian block: compare
-    subroutine against(Bk, nm)
-      Mat :: Bk
-      character(len=*), intent(in) :: nm
-      if (Bk == PETSC_NULL_MAT) then
-        if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: -sf_w_check needs "//nm//" (global path)"
-        return
-      endif
-      call MatDuplicate(g_ctx%W_force, MAT_COPY_VALUES, D, ierr)
-      call MatAXPY(D, -1.0d0, Bk, DIFFERENT_NONZERO_PATTERN, ierr)
-      call MatNorm(D, NORM_FROBENIUS, nd, ierr)
-      call MatNorm(Bk, NORM_FROBENIUS, nb, ierr)
-      call MatDestroy(D, ierr)
-      if (my_id == 0) write(*,'(A,I0,A,A,A,A,A,ES10.3,A,ES10.3)') "[Physics PC]   SF: W unit test ", &
-        sf_force_terms(), ": |W - ", nm, "|_F / |", nm, "|_F ", nd / max(nb, 1.d-300), ", norm ", nb
-    end subroutine against
-  end subroutine w_symmetry_check
 
   !--------------------------------------------------------------------
   !> y = P^-1 x: the block-LDU sweep.
