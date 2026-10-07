@@ -75,6 +75,14 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 wall_resistivity, wall_resistivity_fact,            &
                 bc_natural_open,                                    &
                 use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
+                use_physics_pc,                                     &
+                physics_pc_sf_suu,                                  &
+                physics_pc_sf_pair_psi, physics_pc_sf_pair_w,       &
+                physics_pc_sf_rho, physics_pc_sf_T,                 &
+                physics_pc_sf_rtol, physics_pc_sf_corrector,        &
+                physics_pc_sf_harm_couple, physics_pc_sf_mode_split, &
+                physics_pc_sf_cross_weights,                        &
+                eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &
                 use_BLR_compression, epsilon_BLR, just_in_time_BLR, &

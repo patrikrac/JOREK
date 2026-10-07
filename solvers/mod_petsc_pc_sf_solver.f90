@@ -319,6 +319,17 @@ contains
     if (.not. ok) return
     if (f%form == SF_SUU_WJ)  sf_force_terms = 5      ! kink + curvature
     if (f%form == SF_SUU_WPJ) sf_force_terms = 6      ! curvature
+    ! TESTING ONLY: -sf_w_terms k assembles pc_elt_matrix_force_fft's term
+    ! set k instead (4, 7, 8 are its unit tests; sf_selfcheck reports them).
+    ! The PC built on such a W is not a preconditioner for anything.
+    block
+      PetscInt :: iv
+      PetscBool :: set
+      PetscErrorCode :: ierr
+      iv = sf_force_terms
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_w_terms", iv, set, ierr)
+      if (set) sf_force_terms = int(iv)
+    end block
   end function sf_force_terms
 
   !> physics_pc_sf_vpar_stage -> SF_VPAR_V0 | SF_VPAR_B0; -1 for an unknown string.
@@ -425,7 +436,7 @@ contains
     integer, intent(in), optional :: line_overlap, axis_sectors, rich_from  !< SF_GMG: per-block
                                               !< overrides of SF_GMG_LINE_OVERLAP, SF_GMG_AXIS_SECTORS,
                                               !< SF_GMG_RICH_FROM
-    integer, intent(in), optional :: harm_pair  !< SF_GMG: 1 = cos/sin slots share the smoother blocks
+    integer, intent(in), optional :: harm_pair  !< SF_GMG: 1 = cos/sin slots share the smoother blocks, 2 = all slots do
     integer, intent(in), optional :: ring_overlap !< SF_GMG: ring blocks cut by a rank boundary, extended
     integer, intent(in), optional :: semi_r     !< SF_GMG: radial-only coarse levels (gmg_opts_t)
     integer, intent(in), optional :: axis_rings !< SF_GMG: per-block override of SF_GMG_AXIS_RINGS

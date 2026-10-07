@@ -116,13 +116,13 @@ contains
   
                             call boundary_conditions_add_one_entry(                 &
                                    index_node, k, in, index_node, k, in,            &
-                                   zbig, index_min, index_max, a_mat)
+                                   zbig, index_min, index_max, a_mat, my_id)
 
                             index_node = node_list%node(inode)%index(2)
 
                             call boundary_conditions_add_one_entry(                 &
                                    index_node, k, in, index_node, k, in,            &
-                                   zbig, index_min, index_max, a_mat)
+                                   zbig, index_min, index_max, a_mat, my_id)
                           endif
                         endif
                       endif
@@ -136,13 +136,13 @@ contains
 
                             call boundary_conditions_add_one_entry(                 &
                                    index_node, k, in, index_node, k, in,            &
-                                   zbig, index_min, index_max, a_mat)
+                                   zbig, index_min, index_max, a_mat, my_id)
 
                             index_node = node_list%node(inode)%index(3)
 
                             call boundary_conditions_add_one_entry(                 &
                                    index_node, k, in, index_node, k, in,            &
-                                   zbig, index_min, index_max, a_mat)
+                                   zbig, index_min, index_max, a_mat, my_id)
                          endif
 
                       endif

@@ -535,7 +535,7 @@ contains
   subroutine split_vars(x, v)
     use mod_parameters, only: n_var, n_tor
     Vec :: x
-    Vec :: v(:)
+    Vec :: v(:)                         !< variables 1..size(v)
     PetscScalar, pointer :: xa(:), va(:)
     PetscErrorCode :: ierr
     PetscInt :: nl
