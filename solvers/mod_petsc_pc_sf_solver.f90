@@ -328,6 +328,17 @@ contains
     if (.not. ok) return
     if (f%form == SF_SUU_WJ)  sf_force_terms = 5      ! kink + curvature
     if (f%form == SF_SUU_WPJ) sf_force_terms = 6      ! curvature
+    ! TESTING ONLY: -sf_w_terms k assembles pc_elt_matrix_force_fft's term
+    ! set k instead (4, 7, 8 are its unit tests; sf_selfcheck reports them).
+    ! The PC built on such a W is not a preconditioner for anything.
+    block
+      PetscInt :: iv
+      PetscBool :: set
+      PetscErrorCode :: ierr
+      iv = sf_force_terms
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_w_terms", iv, set, ierr)
+      if (set) sf_force_terms = int(iv)
+    end block
   end function sf_force_terms
 
   !> physics_pc_sf_vpar_stage -> SF_VPAR_V0 | SF_VPAR_B0; -1 for an unknown string.

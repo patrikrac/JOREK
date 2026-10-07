@@ -198,8 +198,8 @@ module mod_petsc_pc_sf
   Mat, save :: a_12, a_16, a_21, a_23, a_25, a_26, a_51, a_52, a_61, a_62, a_63, a_65
   !> The sweep's coupling blocks: B_12 B_16 B_21 B_23 B_25 B_26 B_51 B_52 B_61
   !! B_62 B_63, and B_65, the T row's rho column -- zero in model199 (a
-  !! temperature equation), the O(1) mass (1+zeta) T0 drho in model600 (a
-  !! pressure equation). It is applied only where it is not zero (use_b65), so
+  !! temperature equation), the O(1) mass (1+zeta) T0 drho in model600 and
+  !! model183 (a pressure equation). It is applied only where it is not zero (use_b65), so
   !! model199 runs are unchanged.
   !! With v_par six more: 13 B_71, 14 B_72 (+ W_vu), 15 B_75, 16 B_76, and
   !! for "b0" 17 B_57, 18 B_67; ncb_on of them are in use.
@@ -255,13 +255,14 @@ contains
 
     !--- the variables the sweep knows: (psi, u, zj, w, rho, T), in the slots
     !--- of model199 -- which model600 has with its extensions off -- and
-    !--- model600's v_par as var 7. The slot layout (n = 0, then cos/sin
-    !--- pairs) needs n_tor odd -- an even n_tor would leave the last slot in
-    !--- no family (fslots).
-    if (jorek_model /= 199 .and. jorek_model /= 600) &
-      call fatal("physics_pc_sf supports model199 and model600 only")
-    if (n_var /= 6 .and. .not. (jorek_model == 600 .and. n_var == 7 .and. var_Vpar == 7 .and. var_T == 6)) &
-      call fatal("physics_pc_sf supports (psi, u, zj, w, rho, T), plus v_par on model600: build model600 "// &
+    !--- v_par as var 7 (model600, and the stellarator model183). The slot
+    !--- layout (n = 0, then cos/sin pairs) needs n_tor odd -- an even n_tor
+    !--- would leave the last slot in no family (fslots).
+    if (jorek_model /= 199 .and. jorek_model /= 600 .and. jorek_model /= 183) &
+      call fatal("physics_pc_sf supports model199, model600 and model183 only")
+    if (n_var /= 6 .and. .not. ((jorek_model == 600 .or. jorek_model == 183) .and. n_var == 7 .and. &
+                                var_Vpar == 7 .and. var_T == 6)) &
+      call fatal("physics_pc_sf supports (psi, u, zj, w, rho, T), plus v_par on model600 / model183: build "// &
                  "with with_TiTe, with_neutrals and with_impurities off")
     if (mod(n_tor, 2) /= 1) call fatal("physics_pc_sf needs n_tor odd (n = 0 plus cos/sin pairs)")
 
@@ -312,6 +313,10 @@ contains
       vstage = sf_vpar_stage()
       if (vstage < 0) call fatal("physics_pc_sf_vpar_stage must be v0 | b0 | b1, got '"// &
                                  trim(physics_pc_sf_vpar_stage)//"'")
+      ! b0 / b1 need the sound-wave Schur terms W_vv, W_vu, W_uv, assembled
+      ! only by model600's pc_elt_matrix_force_fft
+      if (vstage /= SF_VPAR_V0 .and. jorek_model /= 600) &
+        call fatal("physics_pc_sf_vpar_stage = b0 | b1 needs model600 (W_vv): run v0")
       ncb_on = 16
       if (vstage /= SF_VPAR_V0) then
         ncb_on = 18
@@ -785,6 +790,9 @@ contains
         call full_op(o_w, "pair_w (wpj)", 2, [var_u, var_w, var_psi, var_zj])
         o_w%se(2, 3:4) = 0; o_w%se(3, 2) = 0; o_w%se(4, 1:2) = 0
         o_w%se(3, 3) = var_zj; o_w%sv(3, 3) = var_zj; o_w%scl(3, 3) = 1     ! opz M_psi = opz B_33
+        if (jorek_model == 183) then                     ! B_11 (mod_petsc_pc_sf_mixed, psi_mass_b11)
+          o_w%se(3, 3) = var_psi; o_w%sv(3, 3) = var_psi; o_w%scl(3, 3) = 0
+        endif
       else
         call full_op(o_w, "pair_w", 2, [var_u, var_w])
       endif
@@ -895,6 +903,8 @@ contains
         call sfw_structure(pw0, bk_w == SF_GMG, comm, my_id)
       endif
       call PetscLogEventEnd(pcev_build_suu, ierr)
+
+      call sf_selfcheck(my_id)
 
       !--- the value maps, gated against what was just extracted (schur:
       !--- pw0 and sfw_lines, the pair_w smoother operator, are refilled like
@@ -1032,6 +1042,129 @@ contains
     if (me == 0 .and. use_b65) write(*,'(A,ES10.3,A)') "[Physics PC]   SF: B_65 (T row, rho column) |.|_F = ", &
       sqrt(nrm), " (max over ranks): applied in the rho -> T sweep"
   end subroutine set_use_b65
+
+  !> First-build diagnostics of W: its symmetry defect, every run; -sf_w_check
+  !! and -sf_dump (w_symmetry_check, dump_blocks).
+  subroutine sf_selfcheck(my_id)
+    integer, intent(in) :: my_id
+    call w_symmetry_check(my_id)
+    call dump_blocks()
+  contains
+    !> -sf_dump 1: the extracted blocks and W as PETSc binaries sfdump_<op>.petsc
+    !! in the run directory, for offline checks of W against the discrete
+    !! Schur correction (first build, global path only).
+    subroutine dump_blocks()
+      PetscInt :: iv
+      PetscBool :: set
+      PetscErrorCode :: ierr
+      iv = 0
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_dump", iv, set, ierr)
+      if (iv == 0 .or. famode) return
+      call one(g_ctx%B_11, "B_11"); call one(g_ctx%B_12, "B_12"); call one(g_ctx%B_13, "B_13")
+      call one(g_ctx%B_16, "B_16"); call one(g_ctx%B_21, "B_21"); call one(g_ctx%B_22, "B_22")
+      call one(g_ctx%B_23, "B_23"); call one(g_ctx%B_24, "B_24"); call one(g_ctx%B_25, "B_25")
+      call one(g_ctx%B_26, "B_26"); call one(g_ctx%B_31, "B_31"); call one(g_ctx%B_33, "B_33")
+      call one(g_ctx%B_42, "B_42"); call one(g_ctx%B_44, "B_44"); call one(g_ctx%B_51, "B_51")
+      call one(g_ctx%B_52, "B_52"); call one(g_ctx%B_55, "B_55"); call one(g_ctx%B_61, "B_61")
+      call one(g_ctx%B_62, "B_62"); call one(g_ctx%B_63, "B_63"); call one(gB_65, "B_65")
+      call one(g_ctx%B_66, "B_66"); call one(g_ctx%W_force, "W")
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: blocks dumped to sfdump_*.petsc"
+    end subroutine dump_blocks
+    subroutine one(A, nm)
+      Mat :: A
+      character(len=*), intent(in) :: nm
+      PetscViewer :: vw
+      PetscErrorCode :: ierr
+      if (A == PETSC_NULL_MAT) return
+      call PetscViewerBinaryOpen(PETSC_COMM_WORLD, "sfdump_"//nm//".petsc", FILE_MODE_WRITE, vw, ierr)
+      call MatView(A, vw, ierr)
+      call PetscViewerDestroy(vw, ierr)
+    end subroutine one
+  end subroutine sf_selfcheck
+
+  !> W's symmetry defect, every run (one transpose at the first build). The
+  !! bending and the gamma p0 part are symmetric by construction; the kink and
+  !! the grad p0 part only together, at force balance -- so on a real
+  !! equilibrium the defect measures how far it is from (reduced) force
+  !! balance, and an assembly error shows up as a defect at the bending-only
+  !! term set (-sf_w_terms 3), which must be at round-off.
+  !! -sf_w_check 1 adds the unit tests of the W assembly (model183):
+  !!   -sf_w_terms 4: W must equal A's (w, u) block, B_42, to round-off
+  !!   -sf_w_terms 7 / 8: |W|_F of int (v_pp u + v_p u_p) against int v_p u_p
+  !! (needs physics_pc_sf_harm_couple = .t., so B_42 keeps every harmonic).
+  subroutine w_symmetry_check(my_id)
+    integer, intent(in) :: my_id
+    Mat :: Wt, D
+    real*8 :: nw, nd, nb
+    PetscInt :: iv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    call MatNorm(g_ctx%W_force, NORM_FROBENIUS, nw, ierr)
+    call MatTranspose(g_ctx%W_force, MAT_INITIAL_MATRIX, Wt, ierr)
+    call MatAYPX(Wt, -1.0d0, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
+    call MatNorm(Wt, NORM_FROBENIUS, nd, ierr)
+    call MatDestroy(Wt, ierr)
+    if (my_id == 0) write(*,'(A,I0,A,ES10.3,A,ES10.3)') "[Physics PC]   SF: W (terms ", sf_force_terms(), &
+      ") |W|_F ", nw, ", symmetry defect |W - W^T|_F / |W|_F ", nd / max(nw, 1.d-300)
+    iv = 0
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_w_check", iv, set, ierr)
+    if (iv == 0) return
+    select case (sf_force_terms())
+    case (4);  call against(g_ctx%B_42, "B_42")
+    case (9);  call against(g_ctx%B_12, "B_12")
+    case (10); call against(g_ctx%B_23, "B_23")
+    case (11); call against(g_ctx%B_31, "B_31")
+    end select
+    ! 7 / 8: d_phi at fixed (R, Z) integrates to zero only where the
+    ! cross-section does not move with phi -- on a stellarator the boundary
+    ! does, so restrict to DOFs of non-boundary nodes (v = u = 0 there)
+    if (sf_force_terms() == 7 .or. sf_force_terms() == 8) then
+      block
+        use nodes_elements, only: node_list
+        use mod_parameters, only: n_tor, n_degrees
+        Vec :: msk
+        PetscInt :: r0, r1, row
+        integer :: n, dg, m
+        call MatCreateVecs(g_ctx%W_force, msk, PETSC_NULL_VEC, ierr)
+        call VecSet(msk, 1.0d0, ierr)
+        call VecGetOwnershipRange(msk, r0, r1, ierr)
+        do n = 1, node_list%n_nodes
+          if (node_list%node(n)%boundary == 0) cycle
+          do dg = 1, n_degrees
+            do m = 1, n_tor
+              row = int(node_list%node(n)%index(dg) - 1, kind(row)) * n_tor + (m - 1)
+              if (row >= r0 .and. row < r1) call VecSetValue(msk, row, 0.0d0, INSERT_VALUES, ierr)
+            enddo
+          enddo
+        enddo
+        call VecAssemblyBegin(msk, ierr); call VecAssemblyEnd(msk, ierr)
+        call MatDuplicate(g_ctx%W_force, MAT_COPY_VALUES, D, ierr)
+        call MatDiagonalScale(D, msk, msk, ierr)
+        call MatNorm(D, NORM_FROBENIUS, nd, ierr)
+        call MatDestroy(D, ierr)
+        call VecDestroy(msk, ierr)
+        if (my_id == 0) write(*,'(A,I0,A,ES10.3)') "[Physics PC]   SF: W unit test ", sf_force_terms(), &
+          ": |W|_F on interior DOFs ", nd
+      end block
+    endif
+  contains
+    !> W's unit-test term sets reproduce one Jacobian block: compare
+    subroutine against(Bk, nm)
+      Mat :: Bk
+      character(len=*), intent(in) :: nm
+      if (Bk == PETSC_NULL_MAT) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: -sf_w_check needs "//nm//" (global path)"
+        return
+      endif
+      call MatDuplicate(g_ctx%W_force, MAT_COPY_VALUES, D, ierr)
+      call MatAXPY(D, -1.0d0, Bk, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatNorm(D, NORM_FROBENIUS, nd, ierr)
+      call MatNorm(Bk, NORM_FROBENIUS, nb, ierr)
+      call MatDestroy(D, ierr)
+      if (my_id == 0) write(*,'(A,I0,A,A,A,A,A,ES10.3,A,ES10.3)') "[Physics PC]   SF: W unit test ", &
+        sf_force_terms(), ": |W - ", nm, "|_F / |", nm, "|_F ", nd / max(nb, 1.d-300), ", norm ", nb
+    end subroutine against
+  end subroutine w_symmetry_check
 
   !--------------------------------------------------------------------
   !> y = P^-1 x: the block-LDU sweep.

@@ -176,13 +176,18 @@ USE_DOMM ?= 1
 ifeq ($(USE_DOMM), 1)
   DEFINES := $(DEFINES) -DUSE_DOMM              # Use Dommaschk potentials, without FE correction of n.B on boundary 
 endif
+# -heap-arrays is Intel-only; gfortran would read it as -h (fatal)
 ifeq (model180, $(MODEL))
   DEFINES := $(DEFINES) -DSEMIANALYTICAL -DSTELLARATOR_MODEL
-  FFLAGS  := $(FFLAGS) -heap-arrays
+  ifeq ($(COMPILER_FAMILY), intel)
+    FFLAGS  := $(FFLAGS) -heap-arrays
+  endif
 endif
 ifeq (model183, $(MODEL))
   DEFINES := $(DEFINES) -DSEMIANALYTICAL -DSTELLARATOR_MODEL
-  FFLAGS  := $(FFLAGS) -heap-arrays
+  ifeq ($(COMPILER_FAMILY), intel)
+    FFLAGS  := $(FFLAGS) -heap-arrays
+  endif
 endif
 ifeq (.true., $(shell ./util/config.sh -p with_vpar))
   DEFINES  := $(DEFINES) -DWITH_Vpar
