@@ -16,6 +16,7 @@ module mod_petsc_pc_sf
   use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_dh, sfw_lines
   use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf
   use mod_petsc_raw_csr, only: blockmv_attach
+  use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
   use mod_petsc_pc_sf_fam, only: fam_op_t, sff_comm, sff_decompose, sff_op_build, &
        sff_op_fill, sff_vec_setup, sff_scatter_in, sff_scatter_out, &
        sff_cross_addmult, sff_cross_scale, sff_copy_local, sff_add_local
@@ -29,7 +30,8 @@ module mod_petsc_pc_sf
   !! PRODUCTION CONFIGURATION (the namelist defaults)
   !! ------------------------------------------------
   !!   physics_pc_sf_suu        = "wpj"   pair_w mixed (u, omega, psi, j)
-  !!   physics_pc_sf_corrector  = -1      auto: Eq. (17) for wpj
+  !!   physics_pc_sf_corrector  = -1      auto: strict Eq. (17) for wpj (3;
+  !!                                      1 on model600)
   !!   physics_pc_sf_mode_split = .t.     one |n| family per rank group
   !!   physics_pc_sf_pair_psi / _pair_w / _rho / _T = "gmg"
   !!   physics_pc_sf_harm_couple = 0      |n|-diagonal blocks
@@ -136,6 +138,12 @@ module mod_petsc_pc_sf
   logical, save :: use_b65 = .false.
   Mat, save :: gB_65 = PETSC_NULL_MAT          !< global path's B_65 (g_ctx has no slot)
   type(fam_op_t), save :: o_pj, o_w, o_rho, o_T, o_cb(NCB)
+  !> corr 3: the rho / T time-derivative mass. In model199 both rows carry
+  !! (1 + zeta) v phi R, which is the omega mass B_44 times opz; B_44 is
+  !! geometry-only, so its Chebyshev inverse is set up once and opz divided out
+  type(fam_op_t), save :: o_m
+  Mat, save :: a_m
+  type(mass_cheb_t), save :: mcm
 
   !--- ... with a cross-|n| band (physics_pc_sf_harm_couple /= 0): each
   !--- operator's cross-family part C (global comm, mod_petsc_pc_sf_fam). The
@@ -208,13 +216,17 @@ contains
     !--- the corrector: Eq. (17) reads (psi, j) off pair_w, so it needs the
     !--- one form that carries both explicitly
     corr = physics_pc_sf_corrector
-    if (corr < -1 .or. corr > 2) call fatal("physics_pc_sf_corrector must be -1 (auto), 0, 1 or 2")
+    if (corr < -1 .or. corr > 3) call fatal("physics_pc_sf_corrector must be -1 (auto), 0, 1, 2 or 3")
     if (corr == -1) then
       corr = 0
-      if (suu == SF_SUU_WPJ) corr = 1
+      if (suu == SF_SUU_WPJ) corr = merge(3, 1, jorek_model == 199)
     endif
     if (corr /= 0 .and. suu /= SF_SUU_WPJ) &
-      call fatal("physics_pc_sf_corrector = 1 | 2 needs physics_pc_sf_suu = wpj (pair_w must carry psi and j)")
+      call fatal("physics_pc_sf_corrector = 1 | 2 | 3 needs physics_pc_sf_suu = wpj (pair_w must carry psi and j)")
+    ! corr 3 takes the rho / T mass as opz B_44: model199's rows; model600's T
+    ! row is a pressure equation (mass rho0 v phi R, plus a rho column)
+    if (corr == 3 .and. jorek_model /= 199) &
+      call fatal("physics_pc_sf_corrector = 3 supports model199 only (rho / T mass = opz B_44)")
 
     !--- one |n| family per rank: only where every block is |n|-diagonal, and
     !--- only for the assembled pair_w forms (the schur shell is not split)
@@ -263,6 +275,9 @@ contains
         write(*,'(A)') "[Physics PC]   corrector: Eq. (17), (psi, j) from pair_w, B_16 T* on its psi row"
       case (2)
         write(*,'(A)') "[Physics PC]   corrector: Eq. (17), (psi, j) from pair_w, B_16 T* dropped"
+      case (3)
+        write(*,'(A)') "[Physics PC]   corrector: Eq. (17) strict, (psi, j) from pair_w, B_16 T* dropped, "// &
+                       "rho / T by their mass (opz B_44)^-1, no block solve"
       end select
     endif
 
@@ -351,6 +366,7 @@ contains
         endif
       endif
       a_pj = g_ctx%K_pj_aij;  a_rho = g_ctx%B_55;  a_T = g_ctx%B_66
+      if (corr == 3) a_m = g_ctx%B_44
       a_w  = g_ctx%S_W_aij
       if (mixed) a_w = sfm_op
       nf_w = 2
@@ -444,6 +460,16 @@ contains
                          comm_s, my_id, physics_pc_sf_rtol, gmg_inst=4, nfields=1, &
                          smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot, &
                          harm_pair=SF_GMG_HARM_PAIR_T)
+    if (corr == 3 .and. first) then
+      block
+        use mod_petsc_pc_harm, only: pc_ntor
+        use mod_parameters,   only: n_tor
+        integer :: nh
+        nh = n_tor
+        if (famode) nh = int(pc_ntor)
+        call mass_cheb_setup(mcm, a_m, comm_s, "rho / T mass B_44", nh)
+      end block
+    endif
     call PetscLogEventEnd(pcev_fact_rhot, ierr)
     if (banded .and. first) then
       call band_setup(1, o_w,   SF_GMG_MAXITS)
@@ -514,6 +540,7 @@ contains
         call sff_op_build(o_w,   A_full, g_ctx%W_force, sf_opz(), my_id)
         call sff_op_build(o_rho, A_full, g_ctx%W_force, sf_opz(), my_id)
         call sff_op_build(o_T,   A_full, g_ctx%W_force, sf_opz(), my_id)
+        if (corr == 3) call sff_op_build(o_m, A_full, g_ctx%W_force, sf_opz(), my_id)
         do k = 1, NCB
           call sff_op_build(o_cb(k), A_full, g_ctx%W_force, sf_opz(), my_id)
         enddo
@@ -548,6 +575,7 @@ contains
         call PetscLogEventEnd(pcev_extract, ierr)
       endif
       a_pj = o_pj%fam;  a_w = o_w%fam;  a_rho = o_rho%fam;  a_T = o_T%fam
+      if (corr == 3) a_m = o_m%fam
       nf_w = o_w%nf
       a_12 = o_cb(1)%fam; a_16 = o_cb(2)%fam; a_21 = o_cb(3)%fam;  a_23 = o_cb(4)%fam
       a_25 = o_cb(5)%fam; a_26 = o_cb(6)%fam; a_51 = o_cb(7)%fam;  a_52 = o_cb(8)%fam
@@ -605,6 +633,8 @@ contains
       o_w%has_w = .true.
       call full_op(o_rho, "B_55", 3, [var_rho])
       call full_op(o_T,   "B_66", 4, [var_T])
+      ! tags 1 .. 2 (4 + NCB) are the family and cross parts'
+      if (corr == 3) call full_op(o_m, "B_44", 2 * (4 + NCB) + 1, [var_w])
       do k = 1, NCB
         o_cb(k)%label = cn(k); o_cb(k)%nf = 1; o_cb(k)%tagb = 4 + k
         o_cb(k)%se(1, 1) = ce(k); o_cb(k)%sv(1, 1) = cv(k)
@@ -963,6 +993,8 @@ contains
   !!   3. corrector  pair_psi (dpsi, dj) = (B_12 u + B_16 T*, 0);  psi -= dpsi
   !!      (Eq. (16)), or on "wpj" (default) psi += psi_w, j += j_w from
   !!      pair_w's own solution (Eq. (17), physics_pc_sf_corrector)
+  !!      then rho / T: a B_55 / B_66 solve on (B_52 u, B_62 u) (Eq. (16)),
+  !!      or with corrector 3 their mass inverse (opz B_44)^-1 (Eq. (17))
   !--------------------------------------------------------------------
   subroutine sf_apply(x, y, ierr)
     use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
@@ -1093,23 +1125,34 @@ contains
     endif
 
     !--- Step 3: rho / T correctors. Only u enters -- U's omega COLUMN is zero.
-    call cmult(a_52, 8, y_u, w3)
-    call PetscLogEventBegin(pcev_solve_rhot, ierr)
-    call bsolve(slv_rho, w3, w5)
-    call PetscLogEventEnd(pcev_solve_rhot, ierr)
-    call VecWAXPY(y_rho, -1.0d0, w5, t_rho, ierr)
+    if (corr == 3) then
+      ! Eq. (17) strict: M^-1 ~ the time derivative's, (opz B_44)^-1; no B_65
+      ! (zero in model199), no block solve
+      call cmult(a_52, 8, y_u, w3)
+      call mass_cheb_solve(mcm, w3, w5)
+      call VecWAXPY(y_rho, -1.0d0 / sf_opz(), w5, t_rho, ierr)
+      call cmult(a_62, 10, y_u, w3)
+      call mass_cheb_solve(mcm, w3, w5)
+      call VecWAXPY(y_T, -1.0d0 / sf_opz(), w5, t_T, ierr)
+    else
+      call cmult(a_52, 8, y_u, w3)
+      call PetscLogEventBegin(pcev_solve_rhot, ierr)
+      call bsolve(slv_rho, w3, w5)
+      call PetscLogEventEnd(pcev_solve_rhot, ierr)
+      call VecWAXPY(y_rho, -1.0d0, w5, t_rho, ierr)
 
-    ! [[B_55, 0], [B_65, B_66]] (drho, dT) = (B_52 u, B_62 u): with B_65 the
-    ! T correction sees the rho correction just computed (w5)
-    call cmult(a_62, 10, y_u, w3)
-    if (use_b65) then
-      call cmult(a_65, 12, w5, w4)
-      call VecAXPY(w3, -1.0d0, w4, ierr)
+      ! [[B_55, 0], [B_65, B_66]] (drho, dT) = (B_52 u, B_62 u): with B_65 the
+      ! T correction sees the rho correction just computed (w5)
+      call cmult(a_62, 10, y_u, w3)
+      if (use_b65) then
+        call cmult(a_65, 12, w5, w4)
+        call VecAXPY(w3, -1.0d0, w4, ierr)
+      endif
+      call PetscLogEventBegin(pcev_solve_rhot, ierr)
+      call bsolve(slv_T, w3, w5)
+      call PetscLogEventEnd(pcev_solve_rhot, ierr)
+      call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
     endif
-    call PetscLogEventBegin(pcev_solve_rhot, ierr)
-    call bsolve(slv_T, w3, w5)
-    call PetscLogEventEnd(pcev_solve_rhot, ierr)
-    call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
 
     if (famode) then
       t1 = MPI_Wtime()

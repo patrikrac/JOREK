@@ -651,7 +651,7 @@ subroutine preset_parameters
   physics_pc_sf_rho           = "gmg"       ! rho block backend: gmg | lu
   physics_pc_sf_T             = "gmg"       ! T block backend: gmg | lu
   physics_pc_sf_rtol          = 1.d-1       ! shared inner rtol for the iterative backends
-  physics_pc_sf_corrector     = -1          ! -1 = auto (Eq.17 on wpj, else Eq.16), 0 = Eq.16, 1 = Eq.17, 2 = Eq.17 without B_16 T*
+  physics_pc_sf_corrector     = -1          ! -1 = auto (strict Eq.17 = 3 on wpj, 1 on model600; else Eq.16), 0 = Eq.16, 1 = Eq.17, 2 = Eq.17 without B_16 T*, 3 = strict Eq.17 (mass-only rho/T)
   physics_pc_sf_harm_couple   = 0           ! cross-|n| band kept in the blocks: 0 | k | -1 = all
   physics_pc_sf_cross_weights = .false.     ! per-build cross-|n| weight report (diagnostic, one pass over A)
   physics_pc_sf_mode_split    = .true.      ! SF solvers on one |n| family per rank group, families concurrent
