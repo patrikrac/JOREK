@@ -535,7 +535,7 @@ contains
   subroutine split_vars(x, v)
     use mod_parameters, only: n_var, n_tor
     Vec :: x
-    Vec :: v(6)
+    Vec :: v(:)                         !< variables 1..size(v)
     PetscScalar, pointer :: xa(:), va(:)
     PetscErrorCode :: ierr
     PetscInt :: nl
@@ -544,7 +544,7 @@ contains
     bs = n_var * n_tor
     nn = int(nl) / bs
     call VecGetArrayRead(x, xa, ierr)
-    do k = 1, 6
+    do k = 1, size(v)
       call VecGetArray(v(k), va, ierr)
       do i = 0, nn - 1
         va(i * n_tor + 1 : (i + 1) * n_tor) = xa(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor)
@@ -554,11 +554,11 @@ contains
     call VecRestoreArrayRead(x, xa, ierr)
   end subroutine split_vars
 
-  !> Inverse of split_vars: variables 1..6 of y from v(k); any further
-  !! variables of y (n_var > 6) are left untouched, as before.
+  !> Inverse of split_vars: variables 1..size(v) of y from v(k); any further
+  !! variables of y are left untouched.
   subroutine merge_vars(v, y)
     use mod_parameters, only: n_var, n_tor
-    Vec :: v(6)
+    Vec :: v(:)
     Vec :: y
     PetscScalar, pointer :: ya(:), va(:)
     PetscErrorCode :: ierr
@@ -568,7 +568,7 @@ contains
     bs = n_var * n_tor
     nn = int(nl) / bs
     call VecGetArray(y, ya, ierr)
-    do k = 1, 6
+    do k = 1, size(v)
       call VecGetArrayRead(v(k), va, ierr)
       do i = 0, nn - 1
         ya(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor) = va(i * n_tor + 1 : (i + 1) * n_tor)

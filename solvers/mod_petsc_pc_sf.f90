@@ -1,7 +1,7 @@
 module mod_petsc_pc_sf
 #ifdef USE_PETSC
   use mpi_mod
-  use mod_parameters, only: n_var
+  use mod_parameters, only: n_var, var_Vpar
   use mod_model_settings, only: jorek_model
 #include "petsc/finclude/petsc.h"
   use petsc
@@ -109,8 +109,19 @@ module mod_petsc_pc_sf
   logical, save :: mixed = .false.             !< pair_w mixed: "wj" / "wpj"
   integer, save :: corr = 0                    !< step-3 corrector (physics_pc_sf_corrector)
 
+  !--- v_par (model183 with_vpar, var 7): its own block B_77, solved after
+  !--- rho and T in both sweeps, so the lower couplings B_71, B_75, B_76 (and
+  !--- B_72 in the corrector) enter and the upper B_57, B_67 do not; the u
+  !--- row sees it through B_27. LU only for now, global path only.
+  integer, parameter :: NSV = max(6, n_var)          !< variables the sweep splits
+  logical, parameter :: with_v = (var_Vpar > 0)
+  type(block_solver_t), save :: slv_v
+  Mat, save :: a_v = PETSC_NULL_MAT, a_27 = PETSC_NULL_MAT, a_71 = PETSC_NULL_MAT, &
+               a_72 = PETSC_NULL_MAT, a_75 = PETSC_NULL_MAT, a_76 = PETSC_NULL_MAT
+  Vec, save :: t_v
+
   !--- work state owned by this path --------------------------------------
-  Vec, save :: sv_x(6), sv_y(6)
+  Vec, save :: sv_x(NSV), sv_y(NSV)
   Vec, save :: rhs_PJ, sol_PJ, rhs_W, sol_W
   Vec, save :: w3, w4, w5, t_rho, t_T
   Vec, save :: zv                      !< mixed: a zero field (the psi / j right-hand sides)
@@ -131,8 +142,8 @@ module mod_petsc_pc_sf
   Mat, save :: a_12, a_16, a_21, a_23, a_25, a_26, a_51, a_52, a_61, a_62, a_63, a_65
   !> The sweep's coupling blocks: B_12 B_16 B_21 B_23 B_25 B_26 B_51 B_52 B_61
   !! B_62 B_63, and B_65, the T row's rho column -- zero in model199 (a
-  !! temperature equation), the O(1) mass (1+zeta) T0 drho in model600 (a
-  !! pressure equation). It is applied only where it is not zero (use_b65), so
+  !! temperature equation), the O(1) mass (1+zeta) T0 drho in model600 and
+  !! model183 (a pressure equation). It is applied only where it is not zero (use_b65), so
   !! model199 runs are unchanged.
   integer, parameter :: NCB = 12
   logical, save :: use_b65 = .false.
@@ -198,14 +209,17 @@ contains
     bk_T   = backend_of(physics_pc_sf_T,      "physics_pc_sf_T")
 
     !--- the variables the sweep knows: (psi, u, zj, w, rho, T), in the slots
-    !--- of model199 -- which model600 has with its extensions off. The slot
-    !--- layout (n = 0, then cos/sin pairs) needs n_tor odd -- an even n_tor
-    !--- would leave the last slot in no family (fslots).
-    if (jorek_model /= 199 .and. jorek_model /= 600) &
-      call fatal("physics_pc_sf supports model199 and model600 only")
-    if (n_var /= 6) &
-      call fatal("physics_pc_sf supports (psi, u, zj, w, rho, T) only: build model600 with "// &
-                 "with_vpar, with_TiTe, with_neutrals and with_impurities off")
+    !--- of model199 -- which model600 has with its extensions off -- plus
+    !--- model183's v_par (var 7, global path only). The slot layout (n = 0,
+    !--- then cos/sin pairs) needs n_tor odd -- an even n_tor would leave the
+    !--- last slot in no family (fslots).
+    if (jorek_model /= 199 .and. jorek_model /= 600 .and. jorek_model /= 183) &
+      call fatal("physics_pc_sf supports model199, model600 and model183 only")
+    if (n_var /= 6 .and. .not. (jorek_model == 183 .and. n_var == 7 .and. var_Vpar == 7)) &
+      call fatal("physics_pc_sf supports (psi, u, zj, w, rho, T) and model183's v_par only: build "// &
+                 "model600 with with_vpar, with_TiTe, with_neutrals and with_impurities off")
+    if (n_var == 7 .and. physics_pc_sf_mode_split) &
+      call fatal("physics_pc_sf_mode_split has no v_par block yet: run without it")
     if (mod(n_tor, 2) /= 1) call fatal("physics_pc_sf needs n_tor odd (n = 0 plus cos/sin pairs)")
 
     !--- the cross-|n| band of that filter: one value for the run
@@ -470,6 +484,9 @@ contains
         call mass_cheb_setup(mcm, a_m, comm_s, "rho / T mass B_44", nh)
       end block
     endif
+    if (with_v) call sf_solver_setup(slv_v, a_v, SF_LU, "v_par-block KSP (B_77)", &
+                                     comm_s, my_id, physics_pc_sf_rtol, gmg_inst=4, nfields=1, &
+                                     smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
     call PetscLogEventEnd(pcev_fact_rhot, ierr)
     if (banded .and. first) then
       call band_setup(1, o_w,   SF_GMG_MAXITS)
@@ -486,12 +503,13 @@ contains
       call MatCreateVecs(a_rho, sv_x(1), PETSC_NULL_VEC, ierr)
       block
         integer :: k
-        do k = 2, 6
+        do k = 2, NSV
           call VecDuplicate(sv_x(1), sv_x(k), ierr)
         enddo
-        do k = 1, 6
+        do k = 1, NSV
           call VecDuplicate(sv_x(1), sv_y(k), ierr)
         enddo
+        if (with_v) call VecDuplicate(sv_x(1), t_v, ierr)
       end block
       call VecDuplicate(sv_x(1), w3, ierr)
       call VecDuplicate(sv_x(1), w4, ierr)
@@ -627,6 +645,9 @@ contains
         call full_op(o_w, "pair_w (wpj)", 2, [var_u, var_w, var_psi, var_zj])
         o_w%se(2, 3:4) = 0; o_w%se(3, 2) = 0; o_w%se(4, 1:2) = 0
         o_w%se(3, 3) = var_zj; o_w%sv(3, 3) = var_zj; o_w%scl(3, 3) = 1     ! opz M_psi = opz B_33
+        if (jorek_model == 183) then                     ! B_11 (mod_petsc_pc_sf_mixed, psi_mass_b11)
+          o_w%se(3, 3) = var_psi; o_w%sv(3, 3) = var_psi; o_w%scl(3, 3) = 0
+        endif
       else
         call full_op(o_w, "pair_w", 2, [var_u, var_w])
       endif
@@ -673,7 +694,8 @@ contains
     !> First build: the operators with their frozen patterns, the value maps
     !! into them, and the release of the blocks that only fed the packing.
     subroutine first_build_operators()
-      integer, parameter :: NBLK = 22
+      integer, parameter :: NVP = merge(6, 0, with_v)      !< v_par's blocks
+      integer, parameter :: NBLK = 22 + NVP
       integer :: eqs(NBLK), vrs(NBLK), nkeep
       Mat :: M(NBLK), S_uu, none(0)
 
@@ -683,27 +705,35 @@ contains
         call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
       endif
 
-      !--- the 22 blocks in ONE pass over A_full's rows. The first 14 are the
-      !--- ones the apply and the rho/T solvers read (the 14th is B_65), the
-      !--- next 3 (B_13, B_31, B_33) the ones the schur shell reads; the rest
-      !--- only feed the packed pairs and are released once the maps exist.
-      nkeep = 14
-      if (suu == SF_SUU_SCHUR) nkeep = 17
+      !--- the 22 blocks (28 with v_par) in ONE pass over A_full's rows. The
+      !--- first 14 are the ones the apply and the rho/T solvers read (the 14th
+      !--- is B_65), then v_par's 6, the next 3 (B_13, B_31, B_33) the ones the
+      !--- schur shell reads; the rest only feed the packed pairs and are
+      !--- released once the maps exist.
+      nkeep = 14 + NVP
+      if (suu == SF_SUU_SCHUR) nkeep = 17 + NVP
       if (mixed) nkeep = NBLK                 ! the mixed pair_w repacks from all of them
       call PetscLogEventBegin(pcev_extract, ierr)
       eqs(1:14) = [var_psi, var_psi, var_u, var_u, var_u, var_u, var_rho, var_rho, var_rho, &
                    var_T, var_T, var_T, var_T, var_T]
       vrs(1:14) = [var_u, var_T, var_psi, var_zj, var_rho, var_T, var_psi, var_u, var_rho, &
                    var_psi, var_u, var_zj, var_T, var_rho]
-      eqs(15:NBLK) = [var_psi, var_zj, var_zj, var_psi, var_u, var_u, var_w, var_w]
-      vrs(15:NBLK) = [var_zj, var_psi, var_zj, var_psi, var_u, var_w, var_u, var_w]
+      if (with_v) then                                     ! B_27 B_71 B_72 B_75 B_76 B_77
+        eqs(15:20) = [var_u, var_Vpar, var_Vpar, var_Vpar, var_Vpar, var_Vpar]
+        vrs(15:20) = [var_Vpar, var_psi, var_u, var_rho, var_T, var_Vpar]
+      endif
+      eqs(15+NVP:NBLK) = [var_psi, var_zj, var_zj, var_psi, var_u, var_u, var_w, var_w]
+      vrs(15+NVP:NBLK) = [var_zj, var_psi, var_zj, var_psi, var_u, var_w, var_u, var_w]
       call extract_sub_blocks_h(A_full, eqs, vrs, M, .true.)
       g_ctx%B_12 = M(1);  g_ctx%B_16 = M(2);  g_ctx%B_21 = M(3);  g_ctx%B_23 = M(4)
       g_ctx%B_25 = M(5);  g_ctx%B_26 = M(6);  g_ctx%B_51 = M(7);  g_ctx%B_52 = M(8)
       g_ctx%B_55 = M(9);  g_ctx%B_61 = M(10); g_ctx%B_62 = M(11); g_ctx%B_63 = M(12)
       g_ctx%B_66 = M(13); gB_65 = M(14)
-      g_ctx%B_13 = M(15); g_ctx%B_31 = M(16); g_ctx%B_33 = M(17); g_ctx%B_11 = M(18)
-      g_ctx%B_22 = M(19); g_ctx%B_24 = M(20); g_ctx%B_42 = M(21); g_ctx%B_44 = M(22)
+      if (with_v) then
+        a_27 = M(15); a_71 = M(16); a_72 = M(17); a_75 = M(18); a_76 = M(19); a_v = M(20)
+      endif
+      g_ctx%B_13 = M(15+NVP); g_ctx%B_31 = M(16+NVP); g_ctx%B_33 = M(17+NVP); g_ctx%B_11 = M(18+NVP)
+      g_ctx%B_22 = M(19+NVP); g_ctx%B_24 = M(20+NVP); g_ctx%B_42 = M(21+NVP); g_ctx%B_44 = M(22+NVP)
       call set_use_b65(gB_65, comm)
       call PetscLogEventEnd(pcev_extract, ierr)
 
@@ -730,6 +760,8 @@ contains
       endif
       call PetscLogEventEnd(pcev_build_suu, ierr)
 
+      call sf_selfcheck(my_id)
+
       !--- the value maps, gated against what was just extracted (schur:
       !--- pw0 and sfw_lines, the pair_w smoother operator, are refilled like
       !--- S_W_aij; sfw_numeric adds the channel on top of sfw_lines)
@@ -754,7 +786,7 @@ contains
       end block
       ! g_ctx held copies of the released handles: null them, so nothing can
       ! reach a freed Mat through them
-      if (nkeep < 17) then
+      if (nkeep < 17 + NVP) then
         g_ctx%B_13 = PETSC_NULL_MAT; g_ctx%B_31 = PETSC_NULL_MAT; g_ctx%B_33 = PETSC_NULL_MAT
       endif
       if (nkeep < NBLK) then
@@ -984,6 +1016,129 @@ contains
     if (banded) call sff_cross_addmult(x_cb(k), x, y)
   end subroutine cmult
 
+  !> First-build diagnostics of W: its symmetry defect, every run; -sf_w_check
+  !! and -sf_dump (w_symmetry_check, dump_blocks).
+  subroutine sf_selfcheck(my_id)
+    integer, intent(in) :: my_id
+    call w_symmetry_check(my_id)
+    call dump_blocks()
+  contains
+    !> -sf_dump 1: the extracted blocks and W as PETSc binaries sfdump_<op>.petsc
+    !! in the run directory, for offline checks of W against the discrete
+    !! Schur correction (first build, global path only).
+    subroutine dump_blocks()
+      PetscInt :: iv
+      PetscBool :: set
+      PetscErrorCode :: ierr
+      iv = 0
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_dump", iv, set, ierr)
+      if (iv == 0 .or. famode) return
+      call one(g_ctx%B_11, "B_11"); call one(g_ctx%B_12, "B_12"); call one(g_ctx%B_13, "B_13")
+      call one(g_ctx%B_16, "B_16"); call one(g_ctx%B_21, "B_21"); call one(g_ctx%B_22, "B_22")
+      call one(g_ctx%B_23, "B_23"); call one(g_ctx%B_24, "B_24"); call one(g_ctx%B_25, "B_25")
+      call one(g_ctx%B_26, "B_26"); call one(g_ctx%B_31, "B_31"); call one(g_ctx%B_33, "B_33")
+      call one(g_ctx%B_42, "B_42"); call one(g_ctx%B_44, "B_44"); call one(g_ctx%B_51, "B_51")
+      call one(g_ctx%B_52, "B_52"); call one(g_ctx%B_55, "B_55"); call one(g_ctx%B_61, "B_61")
+      call one(g_ctx%B_62, "B_62"); call one(g_ctx%B_63, "B_63"); call one(gB_65, "B_65")
+      call one(g_ctx%B_66, "B_66"); call one(g_ctx%W_force, "W")
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: blocks dumped to sfdump_*.petsc"
+    end subroutine dump_blocks
+    subroutine one(A, nm)
+      Mat :: A
+      character(len=*), intent(in) :: nm
+      PetscViewer :: vw
+      PetscErrorCode :: ierr
+      if (A == PETSC_NULL_MAT) return
+      call PetscViewerBinaryOpen(PETSC_COMM_WORLD, "sfdump_"//nm//".petsc", FILE_MODE_WRITE, vw, ierr)
+      call MatView(A, vw, ierr)
+      call PetscViewerDestroy(vw, ierr)
+    end subroutine one
+  end subroutine sf_selfcheck
+
+  !> W's symmetry defect, every run (one transpose at the first build). The
+  !! bending and the gamma p0 part are symmetric by construction; the kink and
+  !! the grad p0 part only together, at force balance -- so on a real
+  !! equilibrium the defect measures how far it is from (reduced) force
+  !! balance, and an assembly error shows up as a defect at the bending-only
+  !! term set (-sf_w_terms 3), which must be at round-off.
+  !! -sf_w_check 1 adds the unit tests of the W assembly (model183):
+  !!   -sf_w_terms 4: W must equal A's (w, u) block, B_42, to round-off
+  !!   -sf_w_terms 7 / 8: |W|_F of int (v_pp u + v_p u_p) against int v_p u_p
+  !! (needs physics_pc_sf_harm_couple = -1, so B_42 keeps every harmonic).
+  subroutine w_symmetry_check(my_id)
+    integer, intent(in) :: my_id
+    Mat :: Wt, D
+    real*8 :: nw, nd, nb
+    PetscInt :: iv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    call MatNorm(g_ctx%W_force, NORM_FROBENIUS, nw, ierr)
+    call MatTranspose(g_ctx%W_force, MAT_INITIAL_MATRIX, Wt, ierr)
+    call MatAYPX(Wt, -1.0d0, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
+    call MatNorm(Wt, NORM_FROBENIUS, nd, ierr)
+    call MatDestroy(Wt, ierr)
+    if (my_id == 0) write(*,'(A,I0,A,ES10.3,A,ES10.3)') "[Physics PC]   SF: W (terms ", sf_force_terms(), &
+      ") |W|_F ", nw, ", symmetry defect |W - W^T|_F / |W|_F ", nd / max(nw, 1.d-300)
+    iv = 0
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_w_check", iv, set, ierr)
+    if (iv == 0) return
+    select case (sf_force_terms())
+    case (4);  call against(g_ctx%B_42, "B_42")
+    case (9);  call against(g_ctx%B_12, "B_12")
+    case (10); call against(g_ctx%B_23, "B_23")
+    case (11); call against(g_ctx%B_31, "B_31")
+    end select
+    ! 7 / 8: d_phi at fixed (R, Z) integrates to zero only where the
+    ! cross-section does not move with phi -- on a stellarator the boundary
+    ! does, so restrict to DOFs of non-boundary nodes (v = u = 0 there)
+    if (sf_force_terms() == 7 .or. sf_force_terms() == 8) then
+      block
+        use nodes_elements, only: node_list
+        use mod_parameters, only: n_tor, n_degrees
+        Vec :: msk
+        PetscInt :: r0, r1, row
+        integer :: n, dg, m
+        call MatCreateVecs(g_ctx%W_force, msk, PETSC_NULL_VEC, ierr)
+        call VecSet(msk, 1.0d0, ierr)
+        call VecGetOwnershipRange(msk, r0, r1, ierr)
+        do n = 1, node_list%n_nodes
+          if (node_list%node(n)%boundary == 0) cycle
+          do dg = 1, n_degrees
+            do m = 1, n_tor
+              row = int(node_list%node(n)%index(dg) - 1, kind(row)) * n_tor + (m - 1)
+              if (row >= r0 .and. row < r1) call VecSetValue(msk, row, 0.0d0, INSERT_VALUES, ierr)
+            enddo
+          enddo
+        enddo
+        call VecAssemblyBegin(msk, ierr); call VecAssemblyEnd(msk, ierr)
+        call MatDuplicate(g_ctx%W_force, MAT_COPY_VALUES, D, ierr)
+        call MatDiagonalScale(D, msk, msk, ierr)
+        call MatNorm(D, NORM_FROBENIUS, nd, ierr)
+        call MatDestroy(D, ierr)
+        call VecDestroy(msk, ierr)
+        if (my_id == 0) write(*,'(A,I0,A,ES10.3)') "[Physics PC]   SF: W unit test ", sf_force_terms(), &
+          ": |W|_F on interior DOFs ", nd
+      end block
+    endif
+  contains
+    !> W's unit-test term sets reproduce one Jacobian block: compare
+    subroutine against(Bk, nm)
+      Mat :: Bk
+      character(len=*), intent(in) :: nm
+      if (Bk == PETSC_NULL_MAT) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: -sf_w_check needs "//nm//" (global path)"
+        return
+      endif
+      call MatDuplicate(g_ctx%W_force, MAT_COPY_VALUES, D, ierr)
+      call MatAXPY(D, -1.0d0, Bk, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatNorm(D, NORM_FROBENIUS, nd, ierr)
+      call MatNorm(Bk, NORM_FROBENIUS, nb, ierr)
+      call MatDestroy(D, ierr)
+      if (my_id == 0) write(*,'(A,I0,A,A,A,A,A,ES10.3,A,ES10.3)') "[Physics PC]   SF: W unit test ", &
+        sf_force_terms(), ": |W - ", nm, "|_F / |", nm, "|_F ", nd / max(nb, 1.d-300), ", norm ", nb
+    end subroutine against
+  end subroutine w_symmetry_check
+
   !--------------------------------------------------------------------
   !> y = P^-1 x: the block-LDU sweep.
   !!
@@ -1055,6 +1210,17 @@ contains
     call bsolve(slv_T, w4, t_T)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
 
+    !--- Step 1: predictor v_par  v* = B_77^-1 (x_v - B_71 psi* - B_75 rho* - B_76 T*)
+    if (with_v) then
+      call MatMult(a_71, y_psi, w3, ierr)
+      call VecWAXPY(w4, -1.0d0, w3, sv_x(var_Vpar), ierr)
+      call MatMult(a_75, t_rho, w3, ierr)
+      call VecAXPY(w4, -1.0d0, w3, ierr)
+      call MatMult(a_76, t_T, w3, ierr)
+      call VecAXPY(w4, -1.0d0, w3, ierr)
+      call bsolve(slv_v, w4, t_v)
+    endif
+
     !--- Step 2: the ONE packed wave solve -------------------------------
     !   RHS_u  = x_u - B_21 psi* - B_23 j* - B_25 rho* - B_26 T*
     ! B_21 is the RAW lower coupling and B_23 j* carries the Lorentz path
@@ -1071,6 +1237,10 @@ contains
     call VecAXPY(w5, -1.0d0, w3, ierr)
     call cmult(a_26, 6, t_T, w3)
     call VecAXPY(w5, -1.0d0, w3, ierr)
+    if (with_v) then                                    ! - B_27 v*
+      call MatMult(a_27, t_v, w3, ierr)
+      call VecAXPY(w5, -1.0d0, w3, ierr)
+    endif
     ! mixed: the psi / j rows' right-hand side is zero (the predictor has
     ! consumed x_psi, x_j). With the Eq. (16) corrector their solution is
     ! discarded -- step 3 recomputes psi and j by a pair_psi solve. With
@@ -1148,10 +1318,24 @@ contains
         call cmult(a_65, 12, w5, w4)
         call VecAXPY(w3, -1.0d0, w4, ierr)
       endif
+      if (with_v) call VecCopy(w5, w4, ierr)             ! keep drho for v_par
       call PetscLogEventBegin(pcev_solve_rhot, ierr)
       call bsolve(slv_T, w3, w5)
       call PetscLogEventEnd(pcev_solve_rhot, ierr)
       call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
+
+      ! v_par corrector: B_77 dv = B_72 u - B_75 drho - B_76 dT (corr 3 is
+      ! model199 only, so v_par always takes this branch)
+      if (with_v) then
+        call MatMult(a_75, w4, w3, ierr)                 ! w4 = drho
+        call VecScale(w3, -1.0d0, ierr)
+        call MatMult(a_76, w5, w4, ierr)                 ! w5 = dT
+        call VecAXPY(w3, -1.0d0, w4, ierr)
+        call MatMult(a_72, y_u, w4, ierr)
+        call VecAXPY(w3, 1.0d0, w4, ierr)
+        call bsolve(slv_v, w3, w4)
+        call VecWAXPY(sv_y(var_Vpar), -1.0d0, w4, t_v, ierr)
+      endif
     endif
 
     if (famode) then
@@ -1177,11 +1361,13 @@ contains
       call sf_solver_report(slv_w,   my_id)
       call sf_solver_report(slv_rho, my_id)
       call sf_solver_report(slv_T,   my_id)
+      if (with_v) call sf_solver_report(slv_v, my_id)
     endif
     call sf_solver_reset_counters(slv_pj)
     call sf_solver_reset_counters(slv_w)
     call sf_solver_reset_counters(slv_rho)
     call sf_solver_reset_counters(slv_T)
+    if (with_v) call sf_solver_reset_counters(slv_v)
     t_apply = 0.d0;  t_scat = 0.d0
   end subroutine sf_report
 

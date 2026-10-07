@@ -64,7 +64,8 @@ module mod_petsc_pc_gmg
                                      !< J into the ranks owning the rest (RAS, as the lines)
     integer :: harm_pair    = 0      !< 1 = a harmonic's cos and sin slots share every
                                      !< smoother block (first-order d_phi couplings, which
-                                     !< map cos <-> sin, then lie inside the blocks)
+                                     !< map cos <-> sin, then lie inside the blocks);
+                                     !< 2 = all slots share them (3D equilibria)
     integer :: line_overlap = 0      !< smoothers 5/7: radial lines extended by this many
                                      !< nodes into the ranks owning their continuation
                                      !< (restricted additive Schwarz); 0 = local segments
@@ -697,6 +698,8 @@ contains
 
     type(lvl_t), allocatable :: lv(:)
     integer, allocatable :: o(:,:)
+    logical, allocatable :: oset(:,:)
+    integer :: n_inact
     ! (lv is handed to the module-level glv at the end, for the block maps)
     integer :: n_idx, e, iv, n, k, i, j, ni, nj, g, cand(4), nent, nrow_s, ncol_s
     integer :: eps_s(4), eps_t(4), cols(MAX_ENT), vi(4), vj(4), idx
@@ -741,9 +744,14 @@ contains
       endif
     enddo
 
-    !--- gate 2: per-node orientation o = +-1, consistent across elements
-    allocate(o(node_list%n_nodes, 0:3))
-    o = 0
+    !--- gate 2: per-node orientation o = +-1, consistent across elements.
+    !--- fix_axis_nodes zeroes the angular (t, st) size factors of the axis
+    !--- nodes (grid_flux_surface.f90:644, mod_import_gvec.f90:471) and pins
+    !--- those DOFs (fix_nodes_on_axis): no basis function uses them, so they
+    !--- get o = 0 -- an INACTIVE DOF that P never writes. The coarse axis
+    !--- angular slope is dropped anyway (header, THE AXIS).
+    allocate(o(node_list%n_nodes, 0:3), oset(node_list%n_nodes, 0:3))
+    o = 0; oset = .false.; n_inact = 0
     do e = 1, element_list%n_elements
       do iv = 1, 4
         n = element_list%element(e)%vertex(iv)
@@ -753,11 +761,14 @@ contains
                      eps_s(iv) * eps_t(iv) * element_list%element(e)%size(iv, 4)])
         do k = 0, 3
           if (abs(cand(k + 1)) /= 1) then
-            call fail("element size factor is not +-1 (fix_axis_nodes?)")
-            return
+            if (.not. (cand(k + 1) == 0 .and. k >= 2 .and. node_list%node(n)%axis_node)) then
+              call fail("element size factor is not +-1")
+              return
+            endif
           endif
-          if (o(n, k) == 0) then
-            o(n, k) = cand(k + 1)
+          if (.not. oset(n, k)) then
+            o(n, k) = cand(k + 1); oset(n, k) = .true.
+            if (cand(k + 1) == 0) n_inact = n_inact + 1
           else if (o(n, k) /= cand(k + 1)) then
             call fail("inconsistent DOF orientation between elements")
             return
@@ -765,6 +776,8 @@ contains
         enddo
       enddo
     enddo
+    if (my_id == 0 .and. n_inact > 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, &
+      ": ", n_inact, " axis DOFs inactive (fix_axis_nodes), P leaves them out"
 
     !--- coarse levels. Radial semi-coarsening (semi_r): on cells long in theta
     !--- the elliptic couplings are strongest radially, which the ring blocks do
@@ -780,11 +793,8 @@ contains
         na = 0
         do ii = 1, n_flux - 2
           do jj = 0, n_tht - 1
-            xa = node_list%node(ii * n_tht + jj + 1)%x(1, 1, 1:2)
-            xb = node_list%node((ii + 1) * n_tht + jj + 1)%x(1, 1, 1:2)
-            xc = node_list%node(ii * n_tht + mod(jj + 1, n_tht) + 1)%x(1, 1, 1:2)
             na = na + 1
-            ar(na) = norm2(xc - xa) / max(norm2(xb - xa), 1.d-300)
+            ar(na) = cell_aspect(ii, jj)
           enddo
         enddo
         call sort_real(ar(1:na))
@@ -890,6 +900,7 @@ contains
         idx = node_list%node(n)%index(k + 1) - 1
         if (done(idx + 1)) cycle             ! the shared axis value: one row
         done(idx + 1) = .true.
+        if (o(n, k) == 0) cycle              ! inactive (fixed) axis DOF: empty row
         call interp_row(i, j, k, lv(1), lv(1)%nj == n_tht, cols, w, nent)
         rs(ns + 1:ns + nent) = idx
         cs(ns + 1:ns + nent) = cols(1:nent)
@@ -995,12 +1006,8 @@ contains
       na = 0
       do ii = 1, n_flux - 2
         do jj = 0, n_tht - 1
-          xa = node_list%node(ii * n_tht + jj + 1)%x(1, 1, 1:2)
-          xb = node_list%node((ii + 1) * n_tht + jj + 1)%x(1, 1, 1:2)
-          xc = node_list%node(ii * n_tht + mod(jj + 1, n_tht) + 1)%x(1, 1, 1:2)
-          dr = norm2(xb - xa); dt = norm2(xc - xa)
           na = na + 1
-          ar(na) = dt / max(dr, 1.d-300)        ! > 1: cell long in theta
+          ar(na) = cell_aspect(ii, jj)          ! > 1: cell long in theta
         enddo
       enddo
       call sort_real(ar(1:na))                   ! na = (n_flux-2) n_tht cells
@@ -1018,10 +1025,7 @@ contains
         allocate(rm(n_flux - 2), row(n_tht))
         do ii = 1, n_flux - 2
           do jj = 0, n_tht - 1
-            xa = node_list%node(ii * n_tht + jj + 1)%x(1, 1, 1:2)
-            xb = node_list%node((ii + 1) * n_tht + jj + 1)%x(1, 1, 1:2)
-            xc = node_list%node(ii * n_tht + mod(jj + 1, n_tht) + 1)%x(1, 1, 1:2)
-            row(jj + 1) = norm2(xc - xa) / max(norm2(xb - xa), 1.d-300)
+            row(jj + 1) = cell_aspect(ii, jj)
           enddo
           call sort_real(row)
           rm(ii) = row((n_tht + 1) / 2)
@@ -1058,6 +1062,44 @@ contains
     call PetscLogEventEnd(gev_prolong, ierr)
 
   contains
+
+    !> Aspect r dtheta/dr of cell (ring ii, angle jj) from its vertex
+    !! positions. On a stellarator grid R, Z depend on phi, and node%x(1,...)
+    !! is only the phi-averaged harmonic, rounder than any real cross-section:
+    !! take the median over the n_plane toroidal planes instead.
+    real*8 function cell_aspect(ii, jj)
+#ifdef STELLARATOR_MODEL
+      use basis_at_gaussian, only: HZ_coord
+      use mod_parameters,    only: n_plane, n_coord_tor
+#endif
+      integer, intent(in) :: ii, jj
+      integer :: na_, nb_, nc_
+      real*8  :: xa_(2), xb_(2), xc_(2)
+#ifdef STELLARATOR_MODEL
+      integer :: mp_, d_
+      real*8  :: r_(n_plane)
+#endif
+      na_ = ii * n_tht + jj + 1
+      nb_ = (ii + 1) * n_tht + jj + 1
+      nc_ = ii * n_tht + mod(jj + 1, n_tht) + 1
+#ifdef STELLARATOR_MODEL
+      do mp_ = 1, n_plane
+        do d_ = 1, 2
+          xa_(d_) = sum(HZ_coord(1:n_coord_tor, mp_) * node_list%node(na_)%x(1:n_coord_tor, 1, d_))
+          xb_(d_) = sum(HZ_coord(1:n_coord_tor, mp_) * node_list%node(nb_)%x(1:n_coord_tor, 1, d_))
+          xc_(d_) = sum(HZ_coord(1:n_coord_tor, mp_) * node_list%node(nc_)%x(1:n_coord_tor, 1, d_))
+        enddo
+        r_(mp_) = norm2(xc_ - xa_) / max(norm2(xb_ - xa_), 1.d-300)
+      enddo
+      call sort_real(r_)
+      cell_aspect = r_((n_plane + 1) / 2)
+#else
+      xa_ = node_list%node(na_)%x(1, 1, 1:2)
+      xb_ = node_list%node(nb_)%x(1, 1, 1:2)
+      xc_ = node_list%node(nc_)%x(1, 1, 1:2)
+      cell_aspect = norm2(xc_ - xa_) / max(norm2(xb_ - xa_), 1.d-300)
+#endif
+    end function cell_aspect
 
     subroutine fail(msg)
       character(len=*), intent(in) :: msg
@@ -2830,7 +2872,11 @@ contains
     integer, intent(in) :: g, I, J, m_
     integer :: is_g, m
     m = m_
-    if (hpair > 0) m = pc_grp(m_)          ! slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs
+    if (hpair == 1) m = pc_grp(m_)         ! slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs
+    ! harm_pair 2: every slot in one block. A 3D (stellarator) equilibrium
+    ! couples n to n +- k*n_coord_period at O(1) (geometry and grad chi in
+    ! B.grad), high-frequency along the ring, which per-|n| blocks miss.
+    if (hpair >= 2) m = 0
     if (I == 0 .or. I <= axis_lim(g)) then
       blk_id = m + 1
     else if (sm_type == 4) then

@@ -453,6 +453,22 @@ contains
         PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_restart", rs, set, ierr))
         if (set) PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, rs, ierr))
       end block
+      ! -jorek_outer_rtol r, -jorek_outer_maxit k: the outer FGMRES relative tolerance
+      ! and iteration cap (defaults 1e-8, 400; the input's gmres_tol/gmres_max_iter
+      ! are not used on this path)
+      block
+        PetscReal :: rt
+        PetscInt :: mi
+        PetscBool :: set_rt, set_mi
+        rt = 1.d-8
+        mi = 400
+        PetscCallA(PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_rtol", rt, set_rt, ierr))
+        PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_maxit", mi, set_mi, ierr))
+        if (set_rt .or. set_mi) then
+          PetscCallA(KSPSetTolerances(petsc_sys%ksp, rt, 1.d-36, PETSC_CURRENT_REAL, mi, ierr))
+          if (my_id .eq. 0) write(*,'(A,ES10.3,A,I0)') " [PETSc] outer FGMRES rtol ", rt, ", maxit ", mi
+        endif
+      end block
 
       if (use_physics_pc) then
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + Physics PCSHELL"

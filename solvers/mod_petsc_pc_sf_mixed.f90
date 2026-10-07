@@ -4,6 +4,7 @@ module mod_petsc_pc_sf_mixed
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx
+  use mod_model_settings,       only: jorek_model
   use mod_petsc_pc_blocks,      only: pack_blocks_aij
   use mod_petsc_pc_sf_solver,   only: suu_form_t, SF_SUU_WJ, SF_SUU_WPJ, sf_split_parts, sf_opz
   implicit none
@@ -51,7 +52,12 @@ module mod_petsc_pc_sf_mixed
   !!
   !! M_psi is B_33: the psi row's mass (amat_11) and the constraint mass
   !! (amat_33) are the same integrand, and every variable carries the same
-  !! boundary rows.
+  !! boundary rows. NOT in model183: there B_33 = theta Bv2 M (the current
+  !! is defined with |grad chi|^2, mod_equations.f90 zj row) while the psi
+  !! row's mass is (1 + zeta) M, so opz B_33 is off by theta Bv2 (~0.25 on
+  !! W7-A, varying in space) and the wpj pair_w GMG stalls at a 0.25
+  !! reduction per V-cycle. There the psi row takes B_11 itself, i.e. opz M
+  !! plus the small-flow terms (psi_mass_b11).
   !!
   !! STRUCTURE ONCE, NUMBERS PER REBUILD. sfm_build (first build) fixes D's
   !! node groups and every pattern; sfm_refill (every later rebuild, after the
@@ -69,6 +75,8 @@ module mod_petsc_pc_sf_mixed
   Mat, save :: p12, p13                    !< wj: B_31 D B_12, B_31 D B_13
   Mat, save :: jju, jjj                    !< wj: -B_31 D B_12, B_33 - B_31 D B_13
   Mat, save :: mpsi                        !< wpj: opz M_psi
+  !> wpj's psi row from B_11 (opz M + small flow) instead of opz B_33
+  logical, parameter :: psi_mass_b11 = (jorek_model == 183)
   logical, save :: packed = .false.
 
   !--- D's groups: the local rows (0-based, rank-local) of each diagonal block
@@ -105,8 +113,12 @@ contains
       call MatAXPY(jjj, 1.0d0, g_ctx%B_33, DIFFERENT_NONZERO_PATTERN, ierr)
     case (SF_SUU_WPJ)
       sfm_nf = 4
-      call MatDuplicate(g_ctx%B_33, MAT_COPY_VALUES, mpsi, ierr)
-      call MatScale(mpsi, sf_opz(), ierr)
+      if (psi_mass_b11) then
+        call MatDuplicate(g_ctx%B_11, MAT_COPY_VALUES, mpsi, ierr)
+      else
+        call MatDuplicate(g_ctx%B_33, MAT_COPY_VALUES, mpsi, ierr)
+        call MatScale(mpsi, sf_opz(), ierr)
+      endif
     end select
 
     call pack_op()
@@ -135,8 +147,12 @@ contains
       call MatAXPY(jjj, -1.0d0, p13, SUBSET_NONZERO_PATTERN, ierr)
       call MatAXPY(jjj, 1.0d0, g_ctx%B_33, SUBSET_NONZERO_PATTERN, ierr)
     case (SF_SUU_WPJ)
-      call MatCopy(g_ctx%B_33, mpsi, SAME_NONZERO_PATTERN, ierr)
-      call MatScale(mpsi, sf_opz(), ierr)
+      if (psi_mass_b11) then
+        call MatCopy(g_ctx%B_11, mpsi, SAME_NONZERO_PATTERN, ierr)
+      else
+        call MatCopy(g_ctx%B_33, mpsi, SAME_NONZERO_PATTERN, ierr)
+        call MatScale(mpsi, sf_opz(), ierr)
+      endif
     end select
 
     call pack_op()
