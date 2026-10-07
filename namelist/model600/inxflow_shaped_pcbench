@@ -1,0 +1,178 @@
+! =====================================================================
+!  inxflow_shaped_pcbench  (model600)
+!  The D-shaped (v2: ellip 1.7, tria 0.1, up/down symmetric) limiter case
+!  of the physics-PC study, namelist/model199/inxflow_shaped_pcbench, run
+!  on model600 to test the SF preconditioner on the production model
+!  family.  Geometry, mesh, drive (eta = 2.d-5) and sources unchanged; see
+!  the model199 file for how the case was built and what it measures.
+!
+!  Compile-time: model600 with every extension off (n_var = 6, model199's
+!  slots), which physics_pc_sf requires:
+!    ./util/config.sh model=600 n_tor=1 n_period=1 n_plane=1 \
+!        with_vpar=.false. with_TiTe=.false. with_neutrals=.false. with_impurities=.false.
+!    ./util/config.sh model=600 n_tor=3 n_period=6 n_plane=4      (same extensions)
+!  On macOS check models/model600/mod_model_settings.f90 afterwards:
+!  config.sh can leave ".false.true." there.
+!
+!  Physics "matched" to model199 (block "model600-only physics" below):
+!  tauIC = 0, bootstrap/NEO off, no Taylor-Galerkin terms, eta ~ T^-1.5
+!  (eta_coul_log_dep = .f.) and model199's viscosity form
+!  (visco_old_setup = .t.).
+!
+!  Workflow as in the model199 file: stage 1 ramped with the ntor1 binary,
+!  stage 2 at tstep 3 with the n = 0/6 binary, stage 3 the PC arms from
+!  one restart with eliminate_boundary_dofs = .t. in every arm.
+! =====================================================================
+
+&in1
+
+ restart = .f.
+ regrid  = .f.
+
+ tstep_n   = 1.d-3,1.d-2,1.d-1,1.d0,3.d0
+ nstep_n   = 10,10,10,10,10
+
+ nout = 5
+
+ freeboundary = .f.
+
+ fbnd(1)   = 2.
+ fbnd(2:4) = 0.
+ mf        = 0
+
+! --- circular limiter geometry ---------------------------------------
+ ellip  = 1.7
+ tria_u = 0.1
+ tria_l = 0.1
+ quad_u = 0.
+ quad_l = 0.
+
+ xpoint = .f.
+ xampl  = 0.
+ xsig   = 0.6
+ xwidth = 1.5
+ xtheta = 4.7
+ xshift = 0.0
+
+ R_begin = 2.9
+ R_end   = 3.1
+ Z_begin = -0.1
+ Z_end   = 0.1
+
+ R_geo = 3.0
+ Z_geo = 0.
+ amin  = 1.
+
+ F0    = 3.0
+
+ n_R      = 0
+ n_Z      = 0
+ n_radial = 81
+ n_pol    = 128
+
+ n_flux    = 41
+ n_tht     = 64
+ n_open    = 0
+ n_leg     = 0
+ n_private = 0
+
+ eta   = 2.d-5
+ visco = 4.d-6
+
+! --- model600-only physics: matched to model199 (see header) ----------
+ tauIC     = 0.d0
+ bootstrap = .f.
+ NEO       = .f.
+ tgnum_psi = 0.d0
+ tgnum_u   = 0.d0
+ tgnum_zj  = 0.d0
+ tgnum_w   = 0.d0
+ tgnum_rho = 0.d0
+ tgnum_T   = 0.d0
+ eta_coul_log_dep = .f.
+ visco_old_setup  = .t.
+
+! numerical resistivity is required for this case
+ eta_num = 3.d-10
+
+ D_par     = 0.d0
+ D_perp(1) = 1.d-5
+ D_perp(2) = 0.85d0
+ D_perp(3) = 0.d0
+ D_perp(4) = 0.01d0
+ D_perp(5) = 0.92d0
+
+ ZK_par     = 10.d0
+ ZK_perp(1) = 1.d-5
+ ZK_perp(2) = 0.85d0
+ ZK_perp(3) = 0.d0
+ ZK_perp(4) = 0.01d0
+ ZK_perp(5) = 0.92d0
+
+ FF_0 = 1.6
+ FF_1 = 0.
+ FF_coef(1)  = -1.0
+ FF_coef(2)  = 0.d0
+ FF_coef(3)  = 0.d0
+ FF_coef(4)  = 0.03d0
+ FF_coef(5)  = 1.0d0
+ FF_coef(6)  = -0.06d0
+ FF_coef(7)  = 0.90d0
+ FF_coef(8)  = 0.07d0
+
+ heatsource     = 1.d-7
+ particlesource = 5.d-6
+
+ T_0 = 1.5d-2
+ T_1 = 3.d-4
+ T_coef(1) = -0.66d0
+ T_coef(2) = +0.0d0
+ T_coef(3) = 0.d0
+ T_coef(4) = 0.08d0
+ T_coef(5) = 0.94d0
+
+ rho_0 = 1.
+ rho_1 = 0.01
+ rho_coef(1)  =  0.0
+ rho_coef(2)  =  0.0
+ rho_coef(3)  =  0.0
+ rho_coef(4)  =  0.08
+ rho_coef(5)  =  0.94d0
+
+ iter_precon    = 22
+ gmres_m        = 20
+ gmres_4        = 1.d0
+ gmres_max_iter = 200
+ gmres_tol      = 1.d-8
+
+! --- physics PC -------------------------------------------------------
+! Eliminate the Dirichlet DOFs (row+column zeroed, representative diagonal)
+! instead of the 1e12 ZBIG penalty.  Wanted for the PC study: the penalty
+! rows otherwise dominate every operator norm.
+!
+! CAUTION: this flag is ours, it is in no stock JOREK case, and it is applied
+! to the MAIN system matrix (matrix/construct_matrix_mod.f90:474-748), not
+! only to the PC matrices -- so it changes the boundary condition of the
+! physics solve.  Keep it OFF for the stage-1/stage-2 physics runs and turn
+! it on only for the stage-3 diagnostics.
+ eliminate_boundary_dofs      = .f.
+
+ use_physics_pc               = .f.
+ debug_physics_pc             = .f.
+ physics_pc_monolithic        = .f.
+ physics_pc_reduced_pde       = .f.
+ physics_pc_drop_psi_coupling = .f.
+ physics_pc_verify_reduced    = .f.
+
+! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
+ use_strumpack     = .f.
+ use_strumpack_eq  = .f.
+ use_strumpack_prj = .f.
+ use_mumps         = .f.
+ use_mumps_eq      = .f.
+ use_mumps_prj     = .f.
+ use_pastix        = .f.
+ use_pastix_eq     = .f.
+ use_pastix_prj    = .f.
+ use_petsc_eq      = .t.
+/

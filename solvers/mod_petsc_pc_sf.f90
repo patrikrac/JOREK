@@ -1,6 +1,8 @@
 module mod_petsc_pc_sf
 #ifdef USE_PETSC
   use mpi_mod
+  use mod_parameters, only: n_var
+  use mod_model_settings, only: jorek_model
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx, physics_pc_mem, &
@@ -162,8 +164,16 @@ module mod_petsc_pc_sf
   real*8, save  :: t_apply = 0.d0, t_scat = 0.d0   !< mode split: apply / scatter wall time since the report
   integer, save :: nf_w = 0                    !< pair_w's packed fields
   Mat, save :: a_pj, a_w, a_rho, a_T
-  Mat, save :: a_12, a_16, a_21, a_23, a_25, a_26, a_51, a_52, a_61, a_62, a_63
-  type(fam_op_t), save :: o_pj, o_w, o_rho, o_T, o_cb(11)
+  Mat, save :: a_12, a_16, a_21, a_23, a_25, a_26, a_51, a_52, a_61, a_62, a_63, a_65
+  !> The sweep's coupling blocks: B_12 B_16 B_21 B_23 B_25 B_26 B_51 B_52 B_61
+  !! B_62 B_63, and B_65, the T row's rho column -- zero in model199 (a
+  !! temperature equation), the O(1) mass (1+zeta) T0 drho in model600 (a
+  !! pressure equation). It is applied only where it is not zero (use_b65), so
+  !! model199 runs are unchanged.
+  integer, parameter :: NCB = 12
+  logical, save :: use_b65 = .false.
+  Mat, save :: gB_65 = PETSC_NULL_MAT          !< global path's B_65 (g_ctx has no slot)
+  type(fam_op_t), save :: o_pj, o_w, o_rho, o_T, o_cb(NCB)
 
   !--- ... with a cross-|n| band (physics_pc_sf_harm_couple /= 0): each
   !--- operator's cross-family part C (global comm, mod_petsc_pc_sf_fam). The
@@ -172,7 +182,7 @@ module mod_petsc_pc_sf
   !--- own solvers (their V-cycles, all families at once): block Jacobi over
   !--- the |n| families inside a Krylov method that sees the coupling.
   logical, save :: banded = .false.
-  type(fam_op_t), save :: x_pj, x_w, x_rho, x_T, x_cb(11)
+  type(fam_op_t), save :: x_pj, x_w, x_rho, x_T, x_cb(NCB)
   type :: band_ksp_t
     logical :: ready = .false.
     KSP :: ksp
@@ -206,6 +216,7 @@ contains
                            physics_pc_force_operator, physics_pc_harm_split, &
                            physics_pc_sf_harm_couple, physics_pc_sf_corrector, &
                            physics_pc_sf_mode_split
+    use mod_parameters, only: n_tor
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
 
@@ -223,6 +234,17 @@ contains
     bk_w   = backend_of(physics_pc_sf_pair_w, "physics_pc_sf_pair_w")
     bk_rho = backend_of(physics_pc_sf_rho,    "physics_pc_sf_rho")
     bk_T   = backend_of(physics_pc_sf_T,      "physics_pc_sf_T")
+
+    !--- the variables the sweep knows: (psi, u, zj, w, rho, T), in the slots
+    !--- of model199 -- which model600 has with its extensions off. The slot
+    !--- layout (n = 0, then cos/sin pairs) needs n_tor odd -- an even n_tor
+    !--- would leave the last slot in no family (fslots).
+    if (jorek_model /= 199 .and. jorek_model /= 600) &
+      call fatal("physics_pc_sf supports model199 and model600 only")
+    if (n_var /= 6) &
+      call fatal("physics_pc_sf supports (psi, u, zj, w, rho, T) only: build model600 with "// &
+                 "with_vpar, with_TiTe, with_neutrals and with_impurities off")
+    if (mod(n_tor, 2) /= 1) call fatal("physics_pc_sf needs n_tor odd (n = 0 plus cos/sin pairs)")
 
     !--- the one hard precondition: W must have been assembled.
     if (physics_pc_force_operator /= 1) &
@@ -400,7 +422,7 @@ contains
       if (mixed) nf_w = sfm_nf
       a_12 = g_ctx%B_12; a_16 = g_ctx%B_16; a_21 = g_ctx%B_21; a_23 = g_ctx%B_23
       a_25 = g_ctx%B_25; a_26 = g_ctx%B_26; a_51 = g_ctx%B_51; a_52 = g_ctx%B_52
-      a_61 = g_ctx%B_61; a_62 = g_ctx%B_62; a_63 = g_ctx%B_63
+      a_61 = g_ctx%B_61; a_62 = g_ctx%B_62; a_63 = g_ctx%B_63; a_65 = gB_65
       comm_s = comm
     endif
     call physics_pc_mem("SF build: operators filled", my_id)
@@ -557,7 +579,7 @@ contains
         call sff_op_build(o_w,   A_full, g_ctx%W_force, sf_opz(), my_id)
         call sff_op_build(o_rho, A_full, g_ctx%W_force, sf_opz(), my_id)
         call sff_op_build(o_T,   A_full, g_ctx%W_force, sf_opz(), my_id)
-        do k = 1, 11
+        do k = 1, NCB
           call sff_op_build(o_cb(k), A_full, g_ctx%W_force, sf_opz(), my_id)
         enddo
         if (banded) then
@@ -565,7 +587,7 @@ contains
           call sff_op_build(x_w,   A_full, g_ctx%W_force, sf_opz(), my_id)
           call sff_op_build(x_rho, A_full, g_ctx%W_force, sf_opz(), my_id)
           call sff_op_build(x_T,   A_full, g_ctx%W_force, sf_opz(), my_id)
-          do k = 1, 11
+          do k = 1, NCB
             call sff_op_build(x_cb(k), A_full, g_ctx%W_force, sf_opz(), my_id)
           enddo
         endif
@@ -578,7 +600,7 @@ contains
         call sff_op_fill(o_w,   A_full, g_ctx%W_force, sf_opz())
         call sff_op_fill(o_rho, A_full, g_ctx%W_force, sf_opz())
         call sff_op_fill(o_T,   A_full, g_ctx%W_force, sf_opz())
-        do k = 1, 11
+        do k = 1, NCB
           call sff_op_fill(o_cb(k), A_full, g_ctx%W_force, sf_opz())
         enddo
         if (banded) then
@@ -586,7 +608,7 @@ contains
           call sff_op_fill(x_w,   A_full, g_ctx%W_force, sf_opz())
           call sff_op_fill(x_rho, A_full, g_ctx%W_force, sf_opz())
           call sff_op_fill(x_T,   A_full, g_ctx%W_force, sf_opz())
-          do k = 1, 11
+          do k = 1, NCB
             call sff_op_fill(x_cb(k), A_full, g_ctx%W_force, sf_opz())
           enddo
         endif
@@ -596,7 +618,8 @@ contains
       nf_w = o_w%nf
       a_12 = o_cb(1)%fam; a_16 = o_cb(2)%fam; a_21 = o_cb(3)%fam;  a_23 = o_cb(4)%fam
       a_25 = o_cb(5)%fam; a_26 = o_cb(6)%fam; a_51 = o_cb(7)%fam;  a_52 = o_cb(8)%fam
-      a_61 = o_cb(9)%fam; a_62 = o_cb(10)%fam; a_63 = o_cb(11)%fam
+      a_61 = o_cb(9)%fam; a_62 = o_cb(10)%fam; a_63 = o_cb(11)%fam; a_65 = o_cb(12)%fam
+      if (first_) call set_use_b65(a_65, comm)
       !--- the sweep's coupling blocks on the threaded block kernel, as on the
       !--- global path; the kernel reads the CSR arrays in place, so one
       !--- attach holds across the refills
@@ -605,7 +628,7 @@ contains
           use mod_petsc_pc_harm, only: pc_ntor
           integer :: nno
           nno = 0
-          do k = 1, 11
+          do k = 1, NCB
             if (.not. blockmv_attach(o_cb(k)%fam, int(pc_ntor))) nno = nno + 1
           enddo
           ! the cross parts: rows of one family, columns of several, so no
@@ -615,7 +638,7 @@ contains
             if (.not. blockmv_attach(x_w%fam, 1))   nno = nno + 1
             if (.not. blockmv_attach(x_rho%fam, 1)) nno = nno + 1
             if (.not. blockmv_attach(x_T%fam, 1))   nno = nno + 1
-            do k = 1, 11
+            do k = 1, NCB
               if (.not. blockmv_attach(x_cb(k)%fam, 1)) nno = nno + 1
             enddo
           endif
@@ -629,14 +652,14 @@ contains
     !! [[B_11, B_13], [B_31, B_33]]; pair_w [[B_22 + W, B_24], [B_42, B_44]]
     !! or, wpj, [[B_22 + W, B_24, B_21, B_23], [B_42, B_44, 0, 0],
     !! [B_12, 0, opz B_33, B_13], [0, 0, B_31, B_33]] (mod_petsc_pc_sf_mixed);
-    !! rho, T and the sweep's 11 coupling blocks.
+    !! rho, T and the sweep's NCB coupling blocks.
     subroutine define_family_operators()
-      integer, parameter :: ce(11) = [var_psi, var_psi, var_u, var_u, var_u, var_u, &
-                                      var_rho, var_rho, var_T, var_T, var_T]
-      integer, parameter :: cv(11) = [var_u, var_T, var_psi, var_zj, var_rho, var_T, &
-                                      var_psi, var_u, var_psi, var_u, var_zj]
-      character(len=4), parameter :: cn(11) = ["B_12", "B_16", "B_21", "B_23", "B_25", "B_26", &
-                                                "B_51", "B_52", "B_61", "B_62", "B_63"]
+      integer, parameter :: ce(NCB) = [var_psi, var_psi, var_u, var_u, var_u, var_u, &
+                                       var_rho, var_rho, var_T, var_T, var_T, var_T]
+      integer, parameter :: cv(NCB) = [var_u, var_T, var_psi, var_zj, var_rho, var_T, &
+                                       var_psi, var_u, var_psi, var_u, var_zj, var_rho]
+      character(len=4), parameter :: cn(NCB) = ["B_12", "B_16", "B_21", "B_23", "B_25", "B_26", &
+                                                 "B_51", "B_52", "B_61", "B_62", "B_63", "B_65"]
       integer :: k
       call full_op(o_pj, "pair_psi", 1, [var_psi, var_zj])
       if (suu == SF_SUU_WPJ) then
@@ -649,7 +672,7 @@ contains
       o_w%has_w = .true.
       call full_op(o_rho, "B_55", 3, [var_rho])
       call full_op(o_T,   "B_66", 4, [var_T])
-      do k = 1, 11
+      do k = 1, NCB
         o_cb(k)%label = cn(k); o_cb(k)%nf = 1; o_cb(k)%tagb = 4 + k
         o_cb(k)%se(1, 1) = ce(k); o_cb(k)%sv(1, 1) = cv(k)
       enddo
@@ -657,7 +680,7 @@ contains
       if (banded) then
         call cross_of(o_pj, x_pj);  call cross_of(o_w, x_w)
         call cross_of(o_rho, x_rho);  call cross_of(o_T, x_T)
-        do k = 1, 11
+        do k = 1, NCB
           call cross_of(o_cb(k), x_cb(k))
         enddo
       endif
@@ -666,7 +689,8 @@ contains
     subroutine cross_of(d, c)
       type(fam_op_t), intent(in)    :: d
       type(fam_op_t), intent(inout) :: c
-      c%label = d%label; c%nf = d%nf; c%tagb = d%tagb + 15; c%part = 1
+      ! tags 1..4 + NCB are the family parts', so the cross parts start above
+      c%label = d%label; c%nf = d%nf; c%tagb = d%tagb + 4 + NCB; c%part = 1
       c%se = d%se; c%sv = d%sv; c%scl = d%scl; c%has_w = d%has_w
     end subroutine cross_of
 
@@ -679,7 +703,7 @@ contains
       call band_count(o_pj, x_pj, comm, nd, nc)
       call band_count(o_rho, x_rho, comm, nd, nc)
       call band_count(o_T, x_T, comm, nd, nc)
-      do k = 1, 11
+      do k = 1, NCB
         call band_count(o_cb(k), x_cb(k), comm, nd, nc)
       enddo
       if (my_id == 0) write(*,'(A,ES10.3,A,F6.2,A,F6.2,A)') "[Physics PC]   SF band: cross-family entries ", &
@@ -725,6 +749,7 @@ contains
       call verify_check(my_id, worst, worst_b, o_cb(7), x_cb(7), g_ctx%B_51, 1, .true.);  call verify_check(my_id, worst, worst_b, o_cb(8), x_cb(8), g_ctx%B_52, 1, .true.)
       call verify_check(my_id, worst, worst_b, o_cb(9), x_cb(9), g_ctx%B_61, 1, .true.);  call verify_check(my_id, worst, worst_b, o_cb(10), x_cb(10), g_ctx%B_62, 1, .true.)
       call verify_check(my_id, worst, worst_b, o_cb(11), x_cb(11), g_ctx%B_63, 1, .true.)
+      call verify_check(my_id, worst, worst_b, o_cb(12), x_cb(12), gB_65, 1, .true.)
       if (worst > 0.d0 .or. worst_b > 1.d-12) then
         if (my_id == 0) write(*,'(A,2ES9.2)') "[Physics PC]   FATAL: SF mode split verify: the direct "// &
           "extraction differs from the copied operators, worst (family parts, band matvecs) ", worst, worst_b
@@ -736,7 +761,7 @@ contains
     !> First build: the operators with their frozen patterns, the value maps
     !! into them, and the release of the blocks that only fed the packing.
     subroutine first_build_operators()
-      integer, parameter :: NBLK = 21
+      integer, parameter :: NBLK = 22
       integer :: eqs(NBLK), vrs(NBLK), nkeep
       Mat :: M(NBLK), S_uu, none(0)
 
@@ -746,27 +771,28 @@ contains
         call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
       endif
 
-      !--- the 21 blocks in ONE pass over A_full's rows. The first 13 are the
-      !--- ones the apply and the rho/T solvers read, the next 3 (B_13, B_31,
-      !--- B_33) the ones the schur shell reads; the rest only feed the packed
-      !--- pairs and are released once the maps exist.
-      nkeep = 13
-      if (suu == SF_SUU_SCHUR) nkeep = 16
+      !--- the 22 blocks in ONE pass over A_full's rows. The first 14 are the
+      !--- ones the apply and the rho/T solvers read (the 14th is B_65), the
+      !--- next 3 (B_13, B_31, B_33) the ones the schur shell reads; the rest
+      !--- only feed the packed pairs and are released once the maps exist.
+      nkeep = 14
+      if (suu == SF_SUU_SCHUR) nkeep = 17
       if (mixed) nkeep = NBLK                 ! the mixed pair_w repacks from all of them
       call PetscLogEventBegin(pcev_extract, ierr)
-      eqs = [var_psi, var_psi, var_u, var_u, var_u, var_u, var_rho, var_rho, var_rho, &
-             var_T, var_T, var_T, var_T, var_psi, var_zj, var_zj, &
-             var_psi, var_u, var_u, var_w, var_w]
-      vrs = [var_u, var_T, var_psi, var_zj, var_rho, var_T, var_psi, var_u, var_rho, &
-             var_psi, var_u, var_zj, var_T, var_zj, var_psi, var_zj, &
-             var_psi, var_u, var_w, var_u, var_w]
+      eqs(1:14) = [var_psi, var_psi, var_u, var_u, var_u, var_u, var_rho, var_rho, var_rho, &
+                   var_T, var_T, var_T, var_T, var_T]
+      vrs(1:14) = [var_u, var_T, var_psi, var_zj, var_rho, var_T, var_psi, var_u, var_rho, &
+                   var_psi, var_u, var_zj, var_T, var_rho]
+      eqs(15:NBLK) = [var_psi, var_zj, var_zj, var_psi, var_u, var_u, var_w, var_w]
+      vrs(15:NBLK) = [var_zj, var_psi, var_zj, var_psi, var_u, var_w, var_u, var_w]
       call extract_sub_blocks_h(A_full, eqs, vrs, M, .true.)
       g_ctx%B_12 = M(1);  g_ctx%B_16 = M(2);  g_ctx%B_21 = M(3);  g_ctx%B_23 = M(4)
       g_ctx%B_25 = M(5);  g_ctx%B_26 = M(6);  g_ctx%B_51 = M(7);  g_ctx%B_52 = M(8)
       g_ctx%B_55 = M(9);  g_ctx%B_61 = M(10); g_ctx%B_62 = M(11); g_ctx%B_63 = M(12)
-      g_ctx%B_66 = M(13)
-      g_ctx%B_13 = M(14); g_ctx%B_31 = M(15); g_ctx%B_33 = M(16); g_ctx%B_11 = M(17)
-      g_ctx%B_22 = M(18); g_ctx%B_24 = M(19); g_ctx%B_42 = M(20); g_ctx%B_44 = M(21)
+      g_ctx%B_66 = M(13); gB_65 = M(14)
+      g_ctx%B_13 = M(15); g_ctx%B_31 = M(16); g_ctx%B_33 = M(17); g_ctx%B_11 = M(18)
+      g_ctx%B_22 = M(19); g_ctx%B_24 = M(20); g_ctx%B_42 = M(21); g_ctx%B_44 = M(22)
+      call set_use_b65(gB_65, comm)
       call PetscLogEventEnd(pcev_extract, ierr)
 
       !--- pair_psi = [[B_11, B_13], [B_31, B_33]]. Row 2 IS Jacobian row 3
@@ -818,7 +844,7 @@ contains
       end block
       ! g_ctx held copies of the released handles: null them, so nothing can
       ! reach a freed Mat through them
-      if (nkeep < 16) then
+      if (nkeep < 17) then
         g_ctx%B_13 = PETSC_NULL_MAT; g_ctx%B_31 = PETSC_NULL_MAT; g_ctx%B_33 = PETSC_NULL_MAT
       endif
       if (nkeep < NBLK) then
@@ -832,15 +858,15 @@ contains
         block
           use mod_parameters, only: n_tor
           integer :: nno, ncb, k
-          Mat :: cb(13)
+          Mat :: cb(14)
           ! a refused attach (not AIJ) keeps PETSc's own matvec: correct, but
           ! single-threaded, so it is reported
-          cb(1:11) = [g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_23, g_ctx%B_25, g_ctx%B_26, &
-                      g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62, g_ctx%B_63]
-          ncb = 11
+          cb(1:12) = [g_ctx%B_12, g_ctx%B_16, g_ctx%B_21, g_ctx%B_23, g_ctx%B_25, g_ctx%B_26, &
+                      g_ctx%B_51, g_ctx%B_52, g_ctx%B_61, g_ctx%B_62, g_ctx%B_63, gB_65]
+          ncb = 12
           if (suu == SF_SUU_SCHUR) then
-            cb(12:13) = [g_ctx%B_31, pw0]
-            ncb = 13
+            cb(13:14) = [g_ctx%B_31, pw0]
+            ncb = 14
           endif
           nno = 0
           do k = 1, ncb
@@ -1071,6 +1097,23 @@ contains
 
   !> y = B x for a coupling block of the sweep (k: its index in o_cb), with
   !! a band plus its cross-family part.
+  !> use_b65 = B_65 has a nonzero entry anywhere (comm: the operators'
+  !! communicator; on the mode split the families' union, i.e. comm_g).
+  subroutine set_use_b65(a, comm)
+    Mat :: a
+    integer, intent(in) :: comm
+    real*8 :: nrm
+    integer :: mpierr, me
+    PetscErrorCode :: ierr
+    call MatNorm(a, NORM_FROBENIUS, nrm, ierr)
+    nrm = nrm**2
+    call MPI_Allreduce(MPI_IN_PLACE, nrm, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
+    use_b65 = (nrm > 0.d0)
+    call MPI_Comm_rank(comm, me, mpierr)
+    if (me == 0 .and. use_b65) write(*,'(A,ES10.3,A)') "[Physics PC]   SF: B_65 (T row, rho column) |.|_F = ", &
+      sqrt(nrm), " (max over ranks): applied in the rho -> T sweep"
+  end subroutine set_use_b65
+
   subroutine cmult(a, k, x, y)
     Mat :: a
     integer, intent(in) :: k
@@ -1093,7 +1136,86 @@ contains
     call report_operator_density(g_ctx%W_force,  "W    (force operator)", my_id)
     call report_operator_density(g_ctx%S_W_aij,  "pair_w (packed u,omega)", my_id)
     call report_operator_density(g_ctx%K_pj_aij, "pair_psi (packed psi,j)", my_id)
+    call w_symmetry_check(my_id)
+    call dump_blocks()
+  contains
+    !> -sf_dump 1: the extracted blocks and W as PETSc binaries sfdump_<op>.petsc
+    !! in the run directory, for offline checks of W against the discrete
+    !! Schur correction (first build, global path only).
+    subroutine dump_blocks()
+      PetscInt :: iv
+      PetscBool :: set
+      PetscErrorCode :: ierr
+      iv = 0
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_dump", iv, set, ierr)
+      if (iv == 0 .or. famode) return
+      call one(g_ctx%B_11, "B_11"); call one(g_ctx%B_12, "B_12"); call one(g_ctx%B_13, "B_13")
+      call one(g_ctx%B_16, "B_16"); call one(g_ctx%B_21, "B_21"); call one(g_ctx%B_22, "B_22")
+      call one(g_ctx%B_23, "B_23"); call one(g_ctx%B_24, "B_24"); call one(g_ctx%B_25, "B_25")
+      call one(g_ctx%B_26, "B_26"); call one(g_ctx%B_31, "B_31"); call one(g_ctx%B_33, "B_33")
+      call one(g_ctx%B_42, "B_42"); call one(g_ctx%B_44, "B_44"); call one(g_ctx%B_51, "B_51")
+      call one(g_ctx%B_52, "B_52"); call one(g_ctx%B_55, "B_55"); call one(g_ctx%B_61, "B_61")
+      call one(g_ctx%B_62, "B_62"); call one(g_ctx%B_63, "B_63"); call one(gB_65, "B_65")
+      call one(g_ctx%B_66, "B_66"); call one(g_ctx%W_force, "W")
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: blocks dumped to sfdump_*.petsc"
+    end subroutine dump_blocks
+    subroutine one(A, nm)
+      Mat :: A
+      character(len=*), intent(in) :: nm
+      PetscViewer :: vw
+      PetscErrorCode :: ierr
+      if (A == PETSC_NULL_MAT) return
+      call PetscViewerBinaryOpen(PETSC_COMM_WORLD, "sfdump_"//nm//".petsc", FILE_MODE_WRITE, vw, ierr)
+      call MatView(A, vw, ierr)
+      call PetscViewerDestroy(vw, ierr)
+    end subroutine one
   end subroutine sf_selfcheck
+
+  !> W's symmetry defect, every run (one transpose at the first build). The
+  !! bending and the gamma p0 part are symmetric by construction; the kink and
+  !! the grad p0 part only together, at force balance -- so on a real
+  !! equilibrium the defect measures how far it is from (reduced) force
+  !! balance, and an assembly error shows up as a defect at the bending-only
+  !! term set (-sf_w_terms 3), which must be at round-off.
+  !! -sf_w_check 1 adds the unit test of the W assembly (model199 / model600):
+  !!   -sf_w_terms 4: W must equal A's (zj, psi) block, B_31, to round-off
+  !! (needs physics_pc_sf_harm_couple = -1, so B_31 keeps every harmonic).
+  subroutine w_symmetry_check(my_id)
+    integer, intent(in) :: my_id
+    Mat :: Wt, D
+    real*8 :: nw, nd, nb
+    PetscInt :: iv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    call MatNorm(g_ctx%W_force, NORM_FROBENIUS, nw, ierr)
+    call MatTranspose(g_ctx%W_force, MAT_INITIAL_MATRIX, Wt, ierr)
+    call MatAYPX(Wt, -1.0d0, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
+    call MatNorm(Wt, NORM_FROBENIUS, nd, ierr)
+    call MatDestroy(Wt, ierr)
+    if (my_id == 0) write(*,'(A,I0,A,ES10.3,A,ES10.3)') "[Physics PC]   SF: W (terms ", sf_force_terms(), &
+      ") |W|_F ", nw, ", symmetry defect |W - W^T|_F / |W|_F ", nd / max(nw, 1.d-300)
+    iv = 0
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_w_check", iv, set, ierr)
+    if (iv == 0) return
+    if (sf_force_terms() == 4) call against(g_ctx%B_31, "B_31")
+  contains
+    !> W's unit-test term sets reproduce one Jacobian block: compare
+    subroutine against(Bk, nm)
+      Mat :: Bk
+      character(len=*), intent(in) :: nm
+      if (Bk == PETSC_NULL_MAT) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   SF: -sf_w_check needs "//nm//" (global path)"
+        return
+      endif
+      call MatDuplicate(g_ctx%W_force, MAT_COPY_VALUES, D, ierr)
+      call MatAXPY(D, -1.0d0, Bk, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatNorm(D, NORM_FROBENIUS, nd, ierr)
+      call MatNorm(Bk, NORM_FROBENIUS, nb, ierr)
+      call MatDestroy(D, ierr)
+      if (my_id == 0) write(*,'(A,I0,A,A,A,A,A,ES10.3,A,ES10.3)') "[Physics PC]   SF: W unit test ", &
+        sf_force_terms(), ": |W - ", nm, "|_F / |", nm, "|_F ", nd / max(nb, 1.d-300), ", norm ", nb
+    end subroutine against
+  end subroutine w_symmetry_check
 
   !--------------------------------------------------------------------
   !> y = P^-1 x: the block-LDU sweep.
@@ -1156,6 +1278,10 @@ contains
     call VecWAXPY(w4, -1.0d0, w3, x_T, ierr)
     call cmult(a_63, 11, y_j, w3)
     call VecAXPY(w4, -1.0d0, w3, ierr)
+    if (use_b65) then                                   ! - B_65 rho*
+      call cmult(a_65, 12, t_rho, w3)
+      call VecAXPY(w4, -1.0d0, w3, ierr)
+    endif
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call bsolve(slv_T, w4, t_T)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
@@ -1236,7 +1362,13 @@ contains
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
     call VecWAXPY(y_rho, -1.0d0, w5, t_rho, ierr)
 
+    ! [[B_55, 0], [B_65, B_66]] (drho, dT) = (B_52 u, B_62 u): with B_65 the
+    ! T correction sees the rho correction just computed (w5)
     call cmult(a_62, 10, y_u, w3)
+    if (use_b65) then
+      call cmult(a_65, 12, w5, w4)
+      call VecAXPY(w3, -1.0d0, w4, ierr)
+    endif
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
     call bsolve(slv_T, w3, w5)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)

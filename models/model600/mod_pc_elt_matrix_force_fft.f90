@@ -1,3 +1,27 @@
+!> model600's copy of the force operator W (models/model199/
+!! mod_pc_elt_matrix_force_fft.f90), for the SF path on model600 run with
+!! its extensions off (n_var = 6, the slots of model199).
+!!
+!! WHY A COPY IS ENOUGH. With tauIC = 0, TG, NEO and v_par off, model600's
+!! blocks entering W are model199's:
+!!   - psi row: the same B_11 mass v psi/R and B_12 = Bpar;
+!!   - u row: the same R^3 rho mass (model199's r0_hat = R^2 rho), B_21, B_23;
+!!   - zj row: the same weak form of Delta* psi, v zj/R + grad v.grad psi/R;
+!!   - pressure: model600 writes the u row's coupling as -R^2 [v, dp], model199
+!!     as +2R v dZ dp -- one integration by parts apart, the same operator;
+!!     and model600's T equation is in pressure form (mass v R (rho0 dT +
+!!     T0 drho) = v R dp, u column -v R^2 [p0, du] - 2 gamma R p0 dZ du v),
+!!     which gives the dp model199 builds from its separate rho and T rows.
+!! So the continuum W is the same; only GAMMA differs (model600 reads it from
+!! phys_module). The model600-only terms -- tauIC (B_15, B_16, B_56 and the
+!! diamagnetic parts of B_11, B_22), eta(T), TG, the conservative-form
+!! terms -- are not in W; they stay in the blocks the SF path extracts from A.
+!!
+!! The term sets (physics_pc_force_operator / terms) are model199's; term
+!! set 4 reproduces model600's amat(var_zj,var_psi) to round-off.
+!!
+!! model199's documentation follows.
+!!
 !> Workstream E: the reduced-MHD momentum-Schur FORCE OPERATOR, assembled
 !! directly instead of formed as a matrix triple product.
 !!
@@ -52,8 +76,8 @@
 !!
 !!     Bpar f := [f, psi0] + (eps_cyl * F0 / R) d_phi f      ( = B_0 . grad f )
 !!
-!! (amat_12 + amat_12_n at mod_elt_matrix_fft.f90:493,495 and amat_23 +
-!! amat_23_n at :510,512 -- identical structure). The composition is therefore
+!! (amat(var_psi,var_u) + amat_n(var_psi,var_u) and amat(var_u,var_zj) +
+!! amat_n(var_u,var_zj) in mod_elt_matrix_fft.f90 -- identical structure).
 !! built on Bpar throughout, which is what makes it Chacon's "dv x B_0" rather
 !! than a poloidal special case. Bpar is still ANTISYMMETRIC under int . dV (the
 !! bracket by cyclic invariance, d_phi because eps_cyl*F0/R is phi-independent),
@@ -170,9 +194,9 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   ELM_k  = 0.d0
   ELM_kn = 0.d0
 
-  ! Mirrors mod_elt_matrix_fft.f90:111 and :212 -- the same local overrides the
-  ! model's own element routine uses, so W composes the identical blocks.
-  GAMMA_l = 5.d0 / 3.d0
+  ! model600's element routine takes GAMMA from phys_module (no local
+  ! override, unlike model199) and has no eps_cyl, i.e. eps_cyl = 1.
+  GAMMA_l = gamma
   eps_cyl = 1.d0
 
   theta  = time_evol_theta
