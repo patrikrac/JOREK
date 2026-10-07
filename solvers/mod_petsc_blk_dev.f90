@@ -14,7 +14,7 @@ module mod_petsc_blk_dev
   implicit none
   private
 
-  public :: blk_dev_available, blk_dev_pattern, blk_dev_values, blk_dev_apply, blk_dev_free
+  public :: blk_dev_available, blk_dev_pattern, blk_dev_spike, blk_dev_values, blk_dev_apply, blk_dev_free
 
 #ifdef USE_GPU_PC
   interface
@@ -29,13 +29,19 @@ module mod_petsc_blk_dev
       type(c_ptr), value        :: bcol
       real(c_double)            :: stats(3)
     end function jorek_blk_kokkos
-    integer(c_int) function c_blk_values(h, nlu, lu, npiv, piv, nz, zv) bind(C, name="jorek_blk_kokkos_values")
+    integer(c_int) function c_blk_spike(h, nlu, lu, stats) bind(C, name="jorek_blk_kokkos_spike")
+      use, intrinsic :: iso_c_binding
+      type(c_ptr), value          :: h
+      integer(c_long_long), value :: nlu
+      real(c_double)              :: lu(*), stats(3)
+    end function c_blk_spike
+    integer(c_int) function c_blk_values(h, nlu, lu, npiv, piv, nz, zv, bad, stats) bind(C, name="jorek_blk_kokkos_values")
       use, intrinsic :: iso_c_binding
       type(c_ptr), value          :: h
       integer(c_long_long), value :: nlu
       integer(c_int), value       :: npiv, nz
-      real(c_double)              :: lu(*), zv(*)
-      integer(c_int)              :: piv(*)
+      real(c_double)              :: lu(*), zv(*), stats(3)
+      integer(c_int)              :: piv(*), bad(*)
     end function c_blk_values
     integer(c_int) function c_blk_apply(h, x, y, xg) bind(C, name="jorek_blk_kokkos_apply")
       use, intrinsic :: iso_c_binding
@@ -93,12 +99,26 @@ contains
 #endif
   end subroutine blk_dev_pattern
 
-  !> The factors (lu, LAPACK pivots) and the zebra coupling's values, at every rebuild.
-  subroutine blk_dev_values(h, lu, piv, zv)
+  !> The partitioned (SPIKE) form of the band blocks, at every rebuild, from
+  !! the blocks' UNFACTORED band storage (before the host LU overwrites it).
+  subroutine blk_dev_spike(h, lu)
+    type(c_ptr), intent(in) :: h
+    real*8, intent(in) :: lu(:)
+#ifdef USE_GPU_PC
+    real(c_double) :: st(3)
+    if (c_blk_spike(h, int(size(lu, kind=8), c_long_long), lu, st) /= 0) stop "blk_dev_spike: PETSc/Kokkos error"
+#endif
+  end subroutine blk_dev_spike
+
+  !> The factors (lu, LAPACK pivots) and the zebra coupling's values, at every
+  !! rebuild; bad(b) /= 0: block b's host LU failed (point Jacobi), so it is
+  !! not partitioned. stats = partitioned blocks, interiors, their device MB.
+  subroutine blk_dev_values(h, lu, piv, zv, bad, stats)
     type(c_ptr), intent(in) :: h
     real*8, intent(in)  :: lu(:)
-    integer, intent(in) :: piv(:)
+    integer, intent(in) :: piv(:), bad(:)
     real*8, intent(in), allocatable, target :: zv(:)
+    real*8, intent(out) :: stats(3)
 #ifdef USE_GPU_PC
     real(c_double), target  :: none(1)
     real(c_double), pointer :: pzv(:)
@@ -108,8 +128,10 @@ contains
     if (allocated(zv)) then
       pzv => zv; nz = size(zv)
     endif
-    if (c_blk_values(h, int(size(lu, kind=8), c_long_long), lu, int(size(piv), c_int), piv, int(nz, c_int), pzv) /= 0) &
-      stop "blk_dev_values: PETSc/Kokkos error"
+    if (c_blk_values(h, int(size(lu, kind=8), c_long_long), lu, int(size(piv), c_int), piv, int(nz, c_int), pzv, &
+                     bad, stats) /= 0) stop "blk_dev_values: PETSc/Kokkos error"
+#else
+    stats = 0.d0
 #endif
   end subroutine blk_dev_values
 

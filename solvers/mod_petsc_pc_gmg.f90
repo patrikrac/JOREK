@@ -45,7 +45,7 @@ module mod_petsc_pc_gmg
   use iso_c_binding, only: c_ptr, c_double, c_null_ptr, c_associated
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach, &
                                aij_vals_write, aij_vals_written
-  use mod_petsc_blk_dev, only: blk_dev_available, blk_dev_pattern, blk_dev_values, blk_dev_apply, blk_dev_free
+  use mod_petsc_blk_dev, only: blk_dev_available, blk_dev_pattern, blk_dev_spike, blk_dev_values, blk_dev_apply, blk_dev_free
   use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_refill, axd_factor, axd_solve
   implicit none
   private
@@ -243,9 +243,12 @@ module mod_petsc_pc_gmg
     integer(8) :: pat_id = -1, pat_nz = -1
     ! Device path: the factors' copy on the device (mod_petsc_blk_dev), which
     ! then does the solves of every block but the axis blocks; null = host.
-    ! dstat = largest block, widest band, multiply-adds of one pass.
+    ! dstat = largest block, widest band, multiply-adds of one pass, and the
+    ! partitioned (SPIKE) band blocks, their interiors and device MB. dev_off:
+    ! the level failed blk_dev_gate and keeps the host solves for good.
     type(c_ptr) :: dh = c_null_ptr
-    real*8 :: dstat(3) = 0.d0
+    real*8 :: dstat(6) = 0.d0
+    logical :: dev_off = .false.
   end type blk_t
   type(blk_t), save, target :: gBk(0:MAX_LEV-1)
   !> Smoother 9 (alternating): the radial-line blocks; gBk holds the rings
@@ -470,6 +473,7 @@ contains
     if (allocated(a%axd))  call move_alloc(a%axd,  b%axd)
     b%pat_id = a%pat_id; b%pat_nz = a%pat_nz; a%pat_id = -1; a%pat_nz = -1
     b%dh = a%dh; a%dh = c_null_ptr; b%dstat = a%dstat
+    b%dev_off = a%dev_off; a%dev_off = .false.
   end subroutine move_blk
 
   subroutine move_rds(a, b)
@@ -1987,10 +1991,11 @@ contains
     PC  :: nopc
     Vec :: x, y1, y2
     PetscErrorCode :: ierr
-    real*8 :: dn, yn, st(3), sm
+    real*8 :: dn, yn, st(3), sm, sp(3)
     logical :: has
-    integer :: g, lev0, mpierr
+    integer :: g, lev0, mpierr, crank
 
+    call MPI_Comm_rank(gcomm, crank, mpierr)
     lev0 = cur_lev
     do g = 0, nlev - 2
       has = c_associated(gBk(g)%dh)
@@ -2012,15 +2017,23 @@ contains
       call VecDestroy(x, ierr); call VecDestroy(y1, ierr); call VecDestroy(y2, ierr)
       dn = dn / max(yn, 1.d-300)
       st = 0.d0
-      if (c_associated(gBk(g)%dh)) st = gBk(g)%dstat
+      if (c_associated(gBk(g)%dh)) st = gBk(g)%dstat(1:3)
       sm = st(3)
+      sp = 0.d0
+      if (c_associated(gBk(g)%dh)) sp = gBk(g)%dstat(4:6)
       call MPI_Allreduce(MPI_IN_PLACE, st(1:2), 2, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
       call MPI_Allreduce(MPI_IN_PLACE, sm, 1, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
-      if (.not. (dn <= DEV_GATE_TOL)) call blk_dev_free(gBk(g)%dh)
-      if (my_id == 0) write(*,'(A,I0,A,I0,A,ES9.2,A,A,I0,A,I0,A,ES9.2,A)') "[Physics PC]   GMG", cur_inst, &
-        " level ", g, ": device block solves vs host ", dn, &
+      call MPI_Allreduce(MPI_IN_PLACE, sp, 3, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
+      if (.not. (dn <= DEV_GATE_TOL)) then
+        call blk_dev_free(gBk(g)%dh)
+        gBk(g)%dev_off = .true.          ! no new handle at later rebuilds
+      endif
+      ! one line per hierarchy communicator (one per family under the mode split)
+      if (crank == 0) write(*,'(A,I0,A,I0,A,I0,A,ES9.2,A,A,I0,A,I0,A,ES9.2,A,I0,A,I0,A,F0.1,A)') "[Physics PC]   GMG", &
+        cur_inst, " (rank ", my_id, ") level ", g, ": device block solves vs host ", dn, &
         merge(" -> in use       ", " -> WARNING: host", dn <= DEV_GATE_TOL), &
-        " (largest block ", nint(st(1)), ", widest band ", nint(st(2)), ", ", sm, " mult-adds per pass)"
+        " (largest block ", nint(st(1)), ", widest band ", nint(st(2)), ", ", sm, " mult-adds per pass; partitioned ", &
+        nint(sp(1)), " blocks in ", nint(sp(2)), " interiors, ", sp(3), " MB)"
     enddo
     cur_lev = lev0
   end subroutine blk_dev_gate
@@ -2284,7 +2297,7 @@ contains
     PetscInt :: nr, r, ncols, rst, ren
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
-    logical :: devpat
+    logical :: devpat, devblk
     PetscErrorCode :: ierr
     PetscInt, parameter :: one = 1
     integer :: nc, I, J, m, bb, q, pcn, info, n, ldab, kk, tmp, nthr, ngrp, mpierr
@@ -2498,6 +2511,15 @@ contains
     ! The blocks are independent: factor them on the rank's OpenMP threads
     ! (hybrid runs leave them idle in the PETSc parts). The singular-block
     ! fallback reads A (MatGetRow is not thread-safe), so it runs afterwards.
+    ! device path: the blocks' structure and, from the band blocks before
+    ! their LU, the partitioned solves (smoother 9's two block sets stay on the host)
+    devblk = dev .and. dev_blocks .and. sm_type /= 9 .and. .not. B%dev_off .and. count(.not. B%axblk) > 0
+    if (devblk) then
+      if (devpat .or. .not. c_associated(B%dh)) call blk_dev_pattern(B%dh, B%nrow, B%ngh, B%off, B%sz, B%kl, B%ku, &
+        B%band, B%loff, B%axblk, B%rows, B%bcol, B%zp, B%zc, B%dstat(1:3))
+      call blk_dev_spike(B%dh, B%lu)
+    endif
+
     allocate(binfo(B%nb))
     binfo = 0
     !$omp parallel do schedule(dynamic, 1) private(bb, n, ldab)
@@ -2547,12 +2569,8 @@ contains
       endif
     enddo
 
-    ! device path: the factors' copy (smoother 9's two block sets stay on the host)
-    if (dev .and. dev_blocks .and. sm_type /= 9 .and. count(.not. B%axblk) > 0) then
-      if (devpat .or. .not. c_associated(B%dh)) call blk_dev_pattern(B%dh, B%nrow, B%ngh, B%off, B%sz, B%kl, B%ku, &
-        B%band, B%loff, B%axblk, B%rows, B%bcol, B%zp, B%zc, B%dstat)
-      call blk_dev_values(B%dh, B%lu, B%piv, B%zv)
-    endif
+    ! device path: the factors' copy
+    if (devblk) call blk_dev_values(B%dh, B%lu, B%piv, B%zv, merge(1, 0, binfo /= 0), B%dstat(4:6))
 
     call PetscLogEventEnd(gev_blknum, ierr)
     if (B%axsparse .and. B%axdon .and. pat_fresh) then
