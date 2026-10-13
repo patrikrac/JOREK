@@ -257,7 +257,13 @@ module mod_petsc_pc_sf_solver
   !! overlap 1 + Richardson there, 321x128 np 64 went from 16/12/10 outer its
   !! at tstep 1 to 71/38/52 (pair_w 25.6 V-cycles per solve); 161x64 held.
   integer, parameter, public :: SF_GMG_RICH_FROM = 1, SF_GMG_RICH_NONE = -1
-  real*8,  parameter, public :: SF_GMG_RICH_OMEGA_ZEBRA = 1.0d0, SF_GMG_RICH_OMEGA_LINES = 0.8d0
+  !> Richardson scale: zebra sweeps are multiplicative and need none; the
+  !! additive block-Jacobi smoothers (radial lines, rings) are damped, since
+  !! undamped ring Jacobi is no smoother where the mass is small against the
+  !! radial coupling (LFA: two-grid factor 1.00; Rac, GMG for the SF
+  !! preconditioner, R6). Ring damping 0.8 on s540 (n_tor 7, all slots per
+  !! block): 311 s against 313 s, pair_w 5.17 V-cycles per solve against 5.26.
+  real*8,  parameter, public :: SF_GMG_RICH_OMEGA_ZEBRA = 1.0d0, SF_GMG_RICH_OMEGA_ADDITIVE = 0.8d0
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (30 for the packed pairs, 10 for the scalar transport blocks), so the
@@ -424,7 +430,7 @@ contains
     integer, intent(in), optional :: semi_r     !< SF_GMG: radial-only coarse levels (gmg_opts_t)
     integer, intent(in), optional :: axis_rings !< SF_GMG: per-block override of SF_GMG_AXIS_RINGS
     real*8,  intent(in), optional :: rich_omega !< SF_GMG: coarse-level Richardson damping (default:
-                                              !< SF_GMG_RICH_OMEGA_LINES on lines, else _ZEBRA)
+                                              !< SF_GMG_RICH_OMEGA_ADDITIVE on lines and rings, else _ZEBRA)
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -481,7 +487,8 @@ contains
       o%ring_aspect  = 1.d0
       o%rich_from    = SF_GMG_RICH_FROM
       o%rich_omega   = SF_GMG_RICH_OMEGA_ZEBRA
-      if (smoother == SF_GMG_SMOOTHER_LINES) o%rich_omega = SF_GMG_RICH_OMEGA_LINES
+      if (smoother == SF_GMG_SMOOTHER_LINES .or. smoother == SF_GMG_SMOOTHER_RINGS) &
+        o%rich_omega = SF_GMG_RICH_OMEGA_ADDITIVE
       if (present(line_overlap)) o%line_overlap = line_overlap
       if (present(axis_sectors)) o%axis_sectors = axis_sectors
       if (present(rich_from))    o%rich_from    = rich_from

@@ -32,8 +32,8 @@ module mod_petsc_pc_sf
   !! PRODUCTION CONFIGURATION (the namelist defaults)
   !! ------------------------------------------------
   !!   physics_pc_sf_suu        = "wpj"   pair_w mixed (u, omega, psi, j)
-  !!   physics_pc_sf_corrector  = -1      auto: strict Eq. (17) for wpj (3;
-  !!                                      1 on model600)
+  !!   physics_pc_sf_corrector  = -1      auto: the consistent corrector 4
+  !!                                      for wpj
   !!   physics_pc_sf_mode_split = .t.     one |n| family per rank group
   !!   physics_pc_sf_pair_psi / _pair_w / _rho / _T = "gmg"
   !!   physics_pc_sf_harm_couple = 0      |n|-diagonal blocks
@@ -317,13 +317,13 @@ contains
     !--- the corrector: Eq. (17) reads (psi, j) off pair_w, so it needs the
     !--- one form that carries both explicitly
     corr = physics_pc_sf_corrector
-    if (corr < -1 .or. corr > 3) call fatal("physics_pc_sf_corrector must be -1 (auto), 0, 1, 2 or 3")
+    if (corr < -1 .or. corr > 4) call fatal("physics_pc_sf_corrector must be -1 (auto), 0, 1, 2, 3 or 4")
     if (corr == -1) then
       corr = 0
-      if (suu == SF_SUU_WPJ) corr = merge(3, 1, jorek_model == 199)
+      if (suu == SF_SUU_WPJ) corr = 4
     endif
     if (corr /= 0 .and. suu /= SF_SUU_WPJ) &
-      call fatal("physics_pc_sf_corrector = 1 | 2 | 3 needs physics_pc_sf_suu = wpj (pair_w must carry psi and j)")
+      call fatal("physics_pc_sf_corrector = 1 | 2 | 3 | 4 needs physics_pc_sf_suu = wpj (pair_w must carry psi and j)")
     ! corr 3 takes the rho / T mass as opz B_44: model199's rows; model600's T
     ! row is a pressure equation (mass rho0 v phi R, plus a rho column)
     if (corr == 3 .and. jorek_model /= 199) &
@@ -460,6 +460,9 @@ contains
       case (3)
         write(*,'(A)') "[Physics PC]   corrector: Eq. (17) strict, (psi, j) from pair_w, B_16 T* dropped, "// &
                        "rho / T by their mass (opz B_44)^-1, no block solve"
+      case (4)
+        write(*,'(A)') "[Physics PC]   corrector: consistent (Alg. 1), (psi, j) from pair_w, B_16 T* on its psi row, "// &
+                       "rho / T corrections with B_51 psi_w, B_61 psi_w + B_63 j_w"
       end select
       select case (seq)
       case (1)
@@ -685,7 +688,7 @@ contains
                              comm_s, my_id, physics_pc_sf_rtol, gmg_inst=5, nfields=1, &
                              smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, axis_rings=ax_rhot, &
                              harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
-                             semi_r=SF_GMG_SEMI_R_MIXED, rich_omega=SF_GMG_RICH_OMEGA_LINES)
+                             semi_r=SF_GMG_SEMI_R_MIXED, rich_omega=SF_GMG_RICH_OMEGA_ADDITIVE)
       endif
     endif
     if (corr == 3 .and. first) then
@@ -1863,7 +1866,7 @@ contains
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
     endif
     if (mixed) then
-      if (corr == 1) then
+      if (corr == 1 .or. corr == 4) then
         call cmult(a_16, 2, t_T, w4)
         call VecScale(w4, -1.0d0, ierr)
         parts = [w5, x_w, w4, zv, wv2]
@@ -1911,6 +1914,18 @@ contains
       call PetscLogEventEnd(pcev_solve_rhot, ierr)
     endif
 
+    !--- corrector 4, the consistent one (Rac, GMG for the SF preconditioner,
+    !--- Alg. 1): the rho / T corrections below also carry pair_w's change of
+    !--- (psi, j), B_51 psi_w and B_61 psi_w + B_63 j_w, which corrector 1
+    !--- drops. Kept in y_rho / y_T (free until the correctors) while w3, w4
+    !--- still hold psi_w, j_w. The same block solves as corrector 1.
+    if (corr == 4) then
+      call cmult(a_51, 7, w3, y_rho)
+      call cmult(a_61, 9, w3, y_T)
+      call cmult(a_63, 11, w4, w5)
+      call VecAXPY(y_T, 1.0d0, w5, ierr)
+    endif
+
     !--- Step 3: corrector psi-pair --------------------------------------
     if (corr /= 0) then
       ! Eq. (17): psi = psi* + psi_w, j = j* + j_w, no solve
@@ -1946,6 +1961,7 @@ contains
     else
       ! "b0" / "b1": the upper couplings of v_par too, (B_52 u + B_57 V, B_62 u + B_67 V)
       call cmult(a_52, 8, y_u, w3)
+      if (corr == 4) call VecAXPY(w3, 1.0d0, y_rho, ierr)  ! + B_51 psi_w
       if (vcor) then
         call cmult(a_vc(VC57), 12 + VC57, y_v, w4)
         call VecAXPY(w3, 1.0d0, w4, ierr)
@@ -1958,6 +1974,7 @@ contains
       ! [[B_55, 0], [B_65, B_66]] (drho, dT) = (B_52 u, B_62 u): with B_65 the
       ! T correction sees the rho correction just computed (w5)
       call cmult(a_62, 10, y_u, w3)
+      if (corr == 4) call VecAXPY(w3, 1.0d0, y_T, ierr)    ! + B_61 psi_w + B_63 j_w
       if (vcor) then
         call cmult(a_vc(VC67), 12 + VC67, y_v, w4)
         call VecAXPY(w3, 1.0d0, w4, ierr)
