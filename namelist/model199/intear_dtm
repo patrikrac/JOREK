@@ -1,0 +1,160 @@
+! =====================================================================
+!  intear_dtm
+!  Reversed-shear double tearing mode (m=2, n=1) on a circular domain,
+!  R/a = 3: a test case for the SF preconditioner (docs/physics_pc).
+!
+!  Derived from `intear_island_demo` (same eta, visco, transport, flat
+!  rho, T profile shape, time-step ramp, solver flags).  Changes:
+!    - R_geo 10 -> 3, F0 10 -> 3 (R/a = 3, B0 = 1)
+!    - FF' from a GVEC equilibrium (ffprime_file) instead of FF_coef
+!    - radial grid accumulation at both q = 2 surfaces
+!
+!  Target q(psi_N) (natural cubic spline through the anchors):
+!    psi_N  0     0.1   0.175  0.25  0.5   0.75  1.0
+!    q      2.45  2.0   1.9    2.0   2.7   3.4   4.5
+!  so q = 2 at psi_N = 0.10 and 0.25 (s = sqrt(psi_N) = 0.32 / 0.50),
+!  q_min = 1.90 at psi_N ~ 0.17.  JOREK reproduces it to |dq| < 0.01
+!  (psi_bnd - psi_axis = 0.1816, R_axis = 3.057).
+!
+!  FF' profile: intear_dtm_ffprime.dat (copy it into the run directory).
+!  Made by util/intear_dtm/gvec_ffprime.py (GVEC 1.5.0, fixed boundary,
+!  iota and p prescribed, PhiEdge tuned to F = 3 at the boundary, F^2(psi)
+!  fitted and differentiated).  Model199 is reduced MHD (B_phi = F0/R),
+!  so GVEC is given q_target*F(psi)/F0; otherwise the JOREK q would come
+!  out up to 1 % low near the axis (the GVEC F rises 3.000 -> 3.034).
+!
+!  Variants: intear_dtm_highp (beta_N 2.5 %), intear_dtm_chipar (ZK_par x100).
+!
+!  REQUIRES a build with n_tor = 3, n_period = 1 in models/mod_settings.f90.
+!  The m=2 seed is hard-coded at amplitude 1e-10 in
+!  models/model199/initial_conditions.f90; it seeds both q = 2 surfaces.
+!
+!  Runs on any number of MPI ranks (the physics PC's mode split needs at
+!  least (n_tor+1)/2).
+! =====================================================================
+
+&in1
+
+ restart = .f.
+ regrid  = .f.
+ refinement=.false.
+ tstep   = 1.
+ nstep   = 0
+ tstep_n = 1.d0,1.d1,1.d2,1.d3
+ nstep_n = 10,10,10,200
+
+ nout = 10
+
+! rst_hdf5 = 1    ! = 0 ; restart from binary files
+!                 ! = 1 ; restart from HDF5 files
+
+ fbnd(1)   = 2.
+ fbnd(2:4) = 0.
+ mf        = 0
+
+ ellip  = 1.
+ tria_u = 0.
+ tria_l = 0.
+ quad_u = -0.
+ quad_l = -0.
+
+ freeboundary = .f.
+
+ xampl  = +0.
+ xsig   = 0.6
+ xwidth = 1.5
+ xtheta = 4.7
+ xshift = 0.0
+ xpoint = .f.
+
+ R_begin = 2.9
+ R_end   = 3.1
+ Z_begin = -0.1
+ Z_end   = 0.1
+
+ R_geo = 3.0
+ Z_geo = 0.
+
+ F0    = 3.0
+
+ amin     = 1.
+
+ n_R      = 0
+ n_Z      = 0
+ n_radial = 51
+ n_pol    = 16
+
+ n_flux   = 41
+ n_tht    = 16
+ n_open   = 0
+ n_leg    = 0
+ n_private = 0
+
+! radial accumulation (in s = sqrt(psi_N)) at the two q = 2 surfaces:
+! 15 flux surfaces between them instead of 8, ds = 0.012 there
+ xr1  = 0.316
+ sig1 = 0.08
+ xr2  = 0.50
+ sig2 = 0.08
+
+ eta   = 1.d-6
+ visco = 1.d-7
+
+ eta_num = 0.d-10
+ visco_num = 0.d0
+
+ D_par  = 0.d0
+ D_perp = 1.d-7
+
+ ZK_par  = 1.d0
+ ZK_perp = 1.d-7
+
+ ffprime_file = 'intear_dtm_ffprime.dat'
+
+ heatsource     = 0.d0
+ particlesource = 0.d0
+
+ T_0 = 1.d-6
+ T_1 = 1.d-8
+ T_coef(1) = -0.8d0
+ T_coef(2) = +0.0d0
+ T_coef(3) = 0.d0
+ T_coef(4) = 1.d0
+ T_coef(5) = 5.d0
+
+ rho_0 = 1.
+ rho_1 = 1.
+ rho_coef(1)  =  0.0
+ rho_coef(2)  =  0.0
+ rho_coef(3)  =  0.0
+ rho_coef(4)  =  1.d0
+ rho_coef(5)  =  5.d0
+
+ iter_precon = 22
+ gmres_m = 20
+ gmres_4 = 1.d0
+ gmres_max_iter = 200
+ gmres_tol = 1.d-8
+
+! --- boundary DOF treatment and solver flags -------------------------
+ eliminate_boundary_dofs = .t.
+
+! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
+ use_strumpack     = .f.
+ use_strumpack_eq  = .f.
+ use_strumpack_prj = .f.
+ use_mumps         = .f.
+ use_mumps_eq      = .f.
+ use_mumps_prj     = .f.
+ use_pastix        = .f.
+ use_pastix_eq     = .f.
+ use_pastix_prj    = .f.
+ use_petsc_eq      = .t.
+
+! --- physics PC -------------------------------------------------------
+! use_physics_pc = .t.: the split-field (SF) preconditioner in its production
+! configuration (the physics_pc_sf_* defaults, models/phys_module.f90). Its
+! mode split needs >= (n_tor+1)/2 MPI ranks; for fewer set
+! physics_pc_sf_mode_split = .f.
+ use_physics_pc               = .t.
+/
