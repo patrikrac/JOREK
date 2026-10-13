@@ -93,7 +93,7 @@ contains
 
 subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
                                    R_axis, Z_axis, psi_axis, psi_bnd, &
-                                   R_xpoint, Z_xpoint, ELM, terms)
+                                   R_xpoint, Z_xpoint, ELM, terms, ELM_v, gamma_w, vu_full)
 
   use constants
   use mod_parameters
@@ -119,6 +119,11 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   real*8, dimension(DFV, DFV), intent(out) :: ELM
   !> The term selection (sf_force_terms): 1 all, 5 kink + curvature, 6 curvature
   integer, intent(in) :: terms
+  !> v_par's sound-wave Schur terms (model600 with_vpar only): model199 has no
+  !! v_par, so they are zero here; the arguments keep the interface common.
+  real*8, dimension(DFV, DFV, 3), intent(out), optional :: ELM_v
+  real*8, intent(in), optional :: gamma_w
+  logical, intent(in), optional :: vu_full
 
   !> Four toroidal channels: _n carries d_phi on the trial function, _k on the
   !! test function, _kn on both (see header, PARALLEL GRADIENT).
@@ -162,6 +167,7 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   complex*16 :: out_fft(1:n_plane)
 
   ELM    = 0.d0
+  if (present(ELM_v)) ELM_v = 0.d0
   ELM_p  = 0.d0
   ELM_n  = 0.d0
   ELM_k  = 0.d0

@@ -441,6 +441,19 @@ contains
       ! ||b|| (PETSc default; KSPConvergedDefaultSetUIRNorm is NOT set), so the stopping
       ! criterion is identical to the zero-start behaviour - only the starting point changes.
       PetscCallA(KSPSetInitialGuessNonzero(petsc_sys%ksp, PETSC_TRUE, ierr))
+      ! -jorek_outer_zero_guess: start from zero instead. The previous increment is a poor
+      ! guess while stiff transients flip sign from step to step (Crank-Nicolson on a fresh
+      ! state): its residual can exceed ||b|| by orders of magnitude and trip the
+      ! divergence test (KSP_DIVERGED_DTOL) at iteration 0.
+      block
+        PetscBool :: zg, set
+        zg = PETSC_FALSE
+        PetscCallA(PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_zero_guess", zg, set, ierr))
+        if (zg) then
+          PetscCallA(KSPSetInitialGuessNonzero(petsc_sys%ksp, PETSC_FALSE, ierr))
+          if (my_id .eq. 0) write(*,'(A)') " [PETSc] outer FGMRES from a zero initial guess"
+        endif
+      end block
 
       ! Set the maximum iterations and restart
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))

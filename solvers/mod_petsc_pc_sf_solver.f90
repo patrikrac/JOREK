@@ -144,6 +144,16 @@ module mod_petsc_pc_sf_solver
   integer, parameter, public :: SF_SUU_WJ    = 3
   integer, parameter, public :: SF_SUU_WPJ   = 4
 
+  !--- v_par (model600 with_vpar, physics_pc_sf_vpar_stage) ------------------
+  !> "v0": B_77 solved last, against the final psi, u, rho, T, no feedback.
+  !> "b0": the sequential velocity stage, B_77 + W_vv after pair_w, with
+  !! (B_72 + W_vu) u on its right-hand side and v_par in the rho / T correctors.
+  !> "b1": v_par bundled with u in pair_w (5 fields), W_vv / W_vu / W_uv in
+  !! its blocks; the mode split only.
+  integer, parameter, public :: SF_VPAR_V0 = 0
+  integer, parameter, public :: SF_VPAR_B0 = 1
+  integer, parameter, public :: SF_VPAR_B1 = 2
+
   !> physics_pc_sf_suu, parsed
   type, public :: suu_form_t
     integer :: form = SF_SUU_WPJ
@@ -272,6 +282,7 @@ module mod_petsc_pc_sf_solver
   public :: sf_solver_reset_counters, sf_solver_report
   public :: sf_backend_name, sf_split_halves, sf_split_parts
   public :: sf_suu_parse, sf_force_terms, sf_opz
+  public :: sf_vpar_stage, sf_vpar_wmask, sf_vpar_gamma_w, sf_vpar_w_assembled, sf_vpar_wvu_full
 
 contains
 
@@ -304,6 +315,65 @@ contains
     if (f%form == SF_SUU_WPJ) sf_force_terms = 6      ! curvature
   end function sf_force_terms
 
+  !> physics_pc_sf_vpar_stage -> SF_VPAR_V0 | SF_VPAR_B0; -1 for an unknown string.
+  integer function sf_vpar_stage()
+    use phys_module, only: physics_pc_sf_vpar_stage
+    select case (trim(adjustl(physics_pc_sf_vpar_stage)))
+    case ("v0");  sf_vpar_stage = SF_VPAR_V0
+    case ("b0");  sf_vpar_stage = SF_VPAR_B0
+    case ("b1");  sf_vpar_stage = SF_VPAR_B1
+    case default; sf_vpar_stage = -1
+    end select
+  end function sf_vpar_stage
+
+  !> "b0" / "b1": which of v_par's W terms the sweep uses (-sf_vpar_w): bit 0
+  !! = W_vv on B_77, bit 1 = W_vu on B_72, bit 2 = W_uv on B_27 ("b1" only).
+  !! Default: all of them. 0 is the stage without the sound Schur terms, which
+  !! isolates their effect from the placement of the solve.
+  integer function sf_vpar_wmask()
+    PetscInt :: iv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    iv = 3
+    if (sf_vpar_stage() == SF_VPAR_B1) iv = 7
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_vpar_w", iv, set, ierr)
+    sf_vpar_wmask = int(iv)
+  end function sf_vpar_wmask
+
+  !> The adiabatic index of v_par's W terms (-sf_vpar_gamma_w, default GAMMA).
+  !! W eliminates T with its mass only; with strong parallel conduction the
+  !! true response is closer to isothermal, i.e. gamma -> 1 along B.
+  real*8 function sf_vpar_gamma_w()
+    use phys_module, only: gamma
+    PetscReal :: rv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    rv = gamma
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_vpar_gamma_w", rv, set, ierr)
+    sf_vpar_gamma_w = rv
+  end function sf_vpar_gamma_w
+
+  !> -sf_vpar_wvu_full 1: W_vu with the whole p channel (R [p0,u] kept), and
+  !! psi_w in v_par's row instead -- the psi channel explicit, as in pair_w,
+  !! rather than cancelled analytically (mod_pc_elt_matrix_force_fft, V_PAR).
+  logical function sf_vpar_wvu_full()
+    PetscInt :: iv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    iv = 0
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_vpar_wvu_full", iv, set, ierr)
+    sf_vpar_wvu_full = (iv /= 0)
+  end function sf_vpar_wvu_full
+
+  !> Are v_par's W terms (W_vv, W_vu, W_uv) assembled? With v_par, the SF
+  !! path on and the "b0" or "b1" stage.
+  logical function sf_vpar_w_assembled()
+    use mod_parameters, only: var_Vpar
+    use phys_module,    only: use_physics_pc
+    sf_vpar_w_assembled = (var_Vpar > 0) .and. use_physics_pc .and. &
+                          (sf_vpar_stage() == SF_VPAR_B0 .or. sf_vpar_stage() == SF_VPAR_B1)
+  end function sf_vpar_w_assembled
+
   !> Human-readable backend name, for the one setup line each block prints.
   function sf_backend_name(backend) result(s)
     integer, intent(in) :: backend
@@ -323,16 +393,16 @@ contains
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
                              nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
                              line_overlap, axis_sectors, rich_from, harm_pair, ring_overlap, &
-                             semi_r, axis_rings)
+                             semi_r, axis_rings, rich_omega)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
-                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_opts_t
+                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
     integer, intent(in)          :: backend, comm, my_id
     character(len=*), intent(in) :: label
     real*8, intent(in)           :: rtol
-    integer, intent(in)          :: gmg_inst  !< SF_GMG: hierarchy instance (1..4)
+    integer, intent(in)          :: gmg_inst  !< SF_GMG: hierarchy instance (1..5)
     integer, intent(in)          :: nfields   !< SF_GMG: fields packed per node in
                                               !< A -- 2 for the mixed pairs, 1 for a
                                               !< scalar block
@@ -353,6 +423,8 @@ contains
     integer, intent(in), optional :: ring_overlap !< SF_GMG: ring blocks cut by a rank boundary, extended
     integer, intent(in), optional :: semi_r     !< SF_GMG: radial-only coarse levels (gmg_opts_t)
     integer, intent(in), optional :: axis_rings !< SF_GMG: per-block override of SF_GMG_AXIS_RINGS
+    real*8,  intent(in), optional :: rich_omega !< SF_GMG: coarse-level Richardson damping (default:
+                                              !< SF_GMG_RICH_OMEGA_LINES on lines, else _ZEBRA)
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -417,6 +489,7 @@ contains
       if (present(ring_overlap)) o%ring_overlap = ring_overlap
       if (present(semi_r))       o%semi_r       = semi_r
       if (present(axis_rings))   o%axis_rings   = axis_rings
+      if (present(rich_omega))   o%rich_omega   = rich_omega
 
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)
@@ -462,6 +535,7 @@ contains
         case (2); call PCShellSetApply(pc, gmg_pc_apply_2, ierr)
         case (3); call PCShellSetApply(pc, gmg_pc_apply_3, ierr)
         case (4); call PCShellSetApply(pc, gmg_pc_apply_4, ierr)
+        case (5); call PCShellSetApply(pc, gmg_pc_apply_5, ierr)
         end select
         call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       endif

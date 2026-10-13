@@ -655,6 +655,8 @@ subroutine preset_parameters
   physics_pc_sf_harm_couple   = 0           ! cross-|n| band kept in the blocks: 0 | k | -1 = all
   physics_pc_sf_cross_weights = .false.     ! per-build cross-|n| weight report (diagnostic, one pass over A)
   physics_pc_sf_mode_split    = .true.      ! SF solvers on one |n| family per rank group, families concurrent
+  physics_pc_sf_vpar          = "gmg"       ! v_par block backend (model600 with_vpar): gmg | lu
+  physics_pc_sf_vpar_stage    = "v0"        ! v_par in the sweep: v0 (last, no feedback) | b0 (velocity stage + sound Schur W) | b1 (in pair_w)
   eliminate_boundary_dofs = .false.         ! Zero boundary DOF rows in the physics PC's W; use elm-diagonal BC in global matrix
 
   use_mumps          = .false.              ! Use MUMPS solver

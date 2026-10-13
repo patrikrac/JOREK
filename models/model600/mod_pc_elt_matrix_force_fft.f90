@@ -19,6 +19,29 @@
 !!
 !! The term sets (terms) are model199's.
 !!
+!! V_PAR (with_vpar, the SF path's "b0" stage; optional ELM_v). The same
+!! element pass also assembles v_par's sound-wave Schur terms: the p-channel
+!! of S = B - L M^-1 U with v_par's couplings, the (rho, T) block eliminated
+!! by its mass only. With D_B f = (F0/R) d_phi f + [f, psi0] (R B.grad f, the
+!! operator of amat(var_vpar, var_rho/T) and amat(var_T, var_vpar)),
+!! P_B = D_B p0, c = (theta dt)^2/opz and the T row's mass R opz dp:
+!!   B_7p dp   = theta dt v D_B(dp)                    (v_par row: rho, T columns)
+!!   B_p7 V    = theta dt v (V P_B + gamma p0 D_B V)   (T row: v_par column)
+!!   B_pu u    = theta dt v (-R^2 [p0,u] - 2 gamma R p0 dZ u)
+!! so, after one integration by parts (v = 0 on the Dirichlet boundary),
+!!   W_vv(v,V) = + c (D_B v) (V P_B + gamma p0 D_B V) / R          (-B_7p M^-1 B_p7)
+!!   W_vu(v,u) = - 2 c gamma p0 (D_B v) dZ u                       (-B_7p M^-1 B_pu, R[p0,u] dropped)
+!!   W_uv(v,V) = + 2 c dZ v (V P_B + gamma p0 D_B V)               (-B_up M^-1 B_p7)
+!! W_vu drops the R[p0,u] half of dp_u: for an axisymmetric p0 = p0(psi0) it
+!! cancels exactly against the psi channel's -B_71 M_psi^-1 B_12 u, which is
+!! why the sweep takes B_71 psi* (not psi_w) on v_par's right-hand side. With
+!! P_B = 0 (p0 a flux function) W_vu(a,b) = -W_uv(b,a): the (u, v_par) block
+!! is symmetric after flipping the u row's sign, and its gamma p0 part is
+!! positive semi-definite. gamma_w replaces GAMMA in these three terms only.
+!! vu_full keeps the dropped half instead (the whole p channel,
+!!   W_vu(v,u) = - c (D_B v) (R [p0,u] + 2 gamma p0 dZ u) ),
+!! for a sweep that puts psi_w into v_par's row itself (-sf_vpar_wvu_full).
+!!
 !! model199's documentation follows.
 !!
 !> Workstream E: the reduced-MHD momentum-Schur FORCE OPERATOR, assembled
@@ -116,7 +139,7 @@ contains
 
 subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
                                    R_axis, Z_axis, psi_axis, psi_bnd, &
-                                   R_xpoint, Z_xpoint, ELM, terms)
+                                   R_xpoint, Z_xpoint, ELM, terms, ELM_v, gamma_w, vu_full)
 
   use constants
   use mod_parameters
@@ -142,10 +165,22 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   real*8, dimension(DFV, DFV), intent(out) :: ELM
   !> The term selection (sf_force_terms): 1 all, 5 kink + curvature, 6 curvature
   integer, intent(in) :: terms
+  !> v_par's sound-wave Schur terms (see the header, V_PAR): 1 = W_vv (v_par
+  !! row, v_par column), 2 = W_vu (v_par row, u column), 3 = W_uv (u row,
+  !! v_par column). Assembled only when present.
+  real*8, dimension(DFV, DFV, 3), intent(out), optional :: ELM_v
+  !> ... their adiabatic index (default GAMMA)
+  real*8, intent(in), optional :: gamma_w
+  !> ... W_vu with the R [p0,u] half kept (default: dropped)
+  logical, intent(in), optional :: vu_full
 
   !> Four toroidal channels: _n carries d_phi on the trial function, _k on the
   !! test function, _kn on both (see header, PARALLEL GRADIENT).
   real*8, dimension(n_plane, NFV, NFV) :: ELM_p, ELM_n, ELM_k, ELM_kn
+  !> ... and v_par's three blocks (allocated only with ELM_v)
+  real*8, allocatable, dimension(:,:,:,:) :: EV_p, EV_n, EV_k, EV_kn
+  logical :: do_v
+  integer :: b
 
   real*8, dimension(n_gauss,n_gauss) :: x_g, x_s, x_t, x_ss, x_st, x_tt
   real*8, dimension(n_gauss,n_gauss) :: y_g, y_s, y_t, y_ss, y_st, y_tt
@@ -153,6 +188,8 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   !> Background fields. Second (s,t) derivatives ARE needed here, for ps0.
   real*8, dimension(n_plane, n_var, n_gauss, n_gauss) :: eq_g, eq_s, eq_t
   real*8, dimension(n_plane, n_var, n_gauss, n_gauss) :: eq_ss, eq_st, eq_tt
+  !> d_phi of rho0 and T0 (v_par's P_B = D_B p0 only)
+  real*8, dimension(n_plane, 2, n_gauss, n_gauss) :: eqp_rt
 
   integer :: i, j, k, l, ms, mt, mp, in
   integer :: index_ij, index_kl
@@ -161,9 +198,13 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   real*8 :: theta, zeta_t, pref, eps_cyl, GAMMA_l, p0
 
   ! Test function
-  real*8 :: v_x, v_y, v_s, v_t, v_ss, v_st, v_tt, v_xx, v_xy, v_yy
+  real*8 :: v, v_x, v_y, v_s, v_t, v_ss, v_st, v_tt, v_xx, v_xy, v_yy
   ! Trial function
-  real*8 :: u_x, u_y, u_s, u_t, u_ss, u_st, u_tt, u_xx, u_xy, u_yy
+  real*8 :: u, u_x, u_y, u_s, u_t, u_ss, u_st, u_tt, u_xx, u_xy, u_yy
+  ! v_par's terms: gamma_w, P_B = D_B p0, and the trial's V P_B + g p0 D_B V
+  ! (poloidal part qv, the coefficient of d_phi V: qv_n)
+  real*8 :: g_v, p0_p, P_B, qv, qv_n, cv, qu
+  logical :: vfull
 
   ! Background at the Gauss point
   real*8 :: ps0_x, ps0_y, ps0_s, ps0_t, ps0_ss, ps0_st, ps0_tt
@@ -189,11 +230,22 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   ELM_n  = 0.d0
   ELM_k  = 0.d0
   ELM_kn = 0.d0
+  do_v   = present(ELM_v)
+  if (do_v) then
+    ELM_v = 0.d0
+    allocate(EV_p(n_plane, NFV, NFV, 3), EV_n(n_plane, NFV, NFV, 3), &
+             EV_k(n_plane, NFV, NFV, 3), EV_kn(n_plane, NFV, NFV, 3))
+    EV_p = 0.d0; EV_n = 0.d0; EV_k = 0.d0; EV_kn = 0.d0
+  endif
 
   ! model600's element routine takes GAMMA from phys_module (no local
   ! override, unlike model199) and has no eps_cyl, i.e. eps_cyl = 1.
   GAMMA_l = gamma
   eps_cyl = 1.d0
+  g_v     = gamma
+  if (present(gamma_w)) g_v = gamma_w
+  vfull   = .false.
+  if (present(vu_full)) vfull = vu_full
 
   theta  = time_evol_theta
   zeta_t = time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
@@ -205,6 +257,7 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   y_g = 0.d0; y_s = 0.d0; y_t = 0.d0; y_ss = 0.d0; y_st = 0.d0; y_tt = 0.d0
   eq_g = 0.d0; eq_s = 0.d0; eq_t = 0.d0
   eq_ss = 0.d0; eq_st = 0.d0; eq_tt = 0.d0
+  eqp_rt = 0.d0
 
   do i = 1, n_vertex_max
     do j = 1, n_degrees
@@ -242,6 +295,14 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
                      + nodes(i)%values(in,j,k) * element%size(i,j) * H_tt(i,j,ms,mt) * HZ(in,mp)
               enddo
             enddo
+            if (do_v) then
+              do in = 1, n_tor
+                eqp_rt(mp,1,ms,mt) = eqp_rt(mp,1,ms,mt) &
+                     + nodes(i)%values(in,j,5) * element%size(i,j) * H(i,j,ms,mt) * HZ_p(in,mp)
+                eqp_rt(mp,2,ms,mt) = eqp_rt(mp,2,ms,mt) &
+                     + nodes(i)%values(in,j,6) * element%size(i,j) * H(i,j,ms,mt) * HZ_p(in,mp)
+              enddo
+            endif
           enddo
 
         enddo
@@ -318,6 +379,13 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
       p0_y = r0_y*T0 + r0*T0_y
       ! p0 itself, for the compressional (gamma p0 div dv) half of Eq. (19)
       p0   = r0 * T0
+      ! v_par: P_B = D_B p0 = (F0/R) d_phi p0 + [p0, psi0] (zero for an
+      ! axisymmetric p0 = p0(psi0)); d_phi p0 formed like p0_x above
+      if (do_v) then
+        p0_p = eqp_rt(mp,1,ms,mt) * T0 + r0 * eqp_rt(mp,2,ms,mt)
+        P_B  = F0 / BigR * p0_p + ( p0_x*ps0_y - p0_y*ps0_x )
+        cv   = pref * xjac
+      endif
 
       !--------------------------------------------------------------------
       ! Test function loop
@@ -327,6 +395,7 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
 
         index_ij = n_degrees*(i-1) + j
 
+        v    = h   (i,j,ms,mt) * element%size(i,j)
         v_s  = h_s (i,j,ms,mt) * element%size(i,j)
         v_t  = h_t (i,j,ms,mt) * element%size(i,j)
         v_ss = h_ss(i,j,ms,mt) * element%size(i,j)
@@ -375,6 +444,7 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
 
           index_kl = n_degrees*(k-1) + l
 
+          u    = h   (k,l,ms,mt) * element%size(k,l)
           u_s  = h_s (k,l,ms,mt) * element%size(k,l)
           u_t  = h_t (k,l,ms,mt) * element%size(k,l)
           u_ss = h_ss(k,l,ms,mt) * element%size(k,l)
@@ -465,6 +535,30 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
           ELM_k (mp,index_ij,index_kl) = ELM_k (mp,index_ij,index_kl) + wst * a_uu_k
           ELM_kn(mp,index_ij,index_kl) = ELM_kn(mp,index_ij,index_kl) + wst * a_uu_kn
 
+          !------------------------------------------------------------------
+          ! v_par's sound-wave Schur terms (header, V_PAR). The trial u is the
+          ! v_par basis function V in W_vv / W_uv. D_B v = (F0/R) v_p + b_tst,
+          ! D_B V = (F0/R) V_p + b_tri; _n / _k / _kn: the coefficient of the
+          ! trial's / test's / both d_phi.
+          !------------------------------------------------------------------
+          if (do_v) then
+            qv   = u * P_B + g_v * p0 * b_tri               ! V P_B + g p0 [V, psi0]
+            qv_n = g_v * p0 * F0 / BigR * u                 ! g p0 (F0/R) d_phi V
+            ! W_vv = c (D_B v)(V P_B + g p0 D_B V) / R
+            EV_p (mp,index_ij,index_kl,1) = EV_p (mp,index_ij,index_kl,1) + wst * cv * b_tst * qv / BigR
+            EV_n (mp,index_ij,index_kl,1) = EV_n (mp,index_ij,index_kl,1) + wst * cv * b_tst * qv_n / BigR
+            EV_k (mp,index_ij,index_kl,1) = EV_k (mp,index_ij,index_kl,1) + wst * cv * F0 / BigR**2 * v * qv
+            EV_kn(mp,index_ij,index_kl,1) = EV_kn(mp,index_ij,index_kl,1) + wst * cv * F0 / BigR**2 * v * qv_n
+            ! W_vu = - c (D_B v) (2 g p0 dZ u [+ R [p0,u] with vu_full])
+            qu = 2.d0 * g_v * p0 * u_y
+            if (vfull) qu = qu + BigR * ( p0_x*u_y - p0_y*u_x )
+            EV_p (mp,index_ij,index_kl,2) = EV_p (mp,index_ij,index_kl,2) - wst * cv * b_tst * qu
+            EV_k (mp,index_ij,index_kl,2) = EV_k (mp,index_ij,index_kl,2) - wst * cv * F0 / BigR * v * qu
+            ! W_uv = 2 c dZ v (V P_B + g p0 D_B V)
+            EV_p (mp,index_ij,index_kl,3) = EV_p (mp,index_ij,index_kl,3) + wst * cv * 2.d0 * v_y * qv
+            EV_n (mp,index_ij,index_kl,3) = EV_n (mp,index_ij,index_kl,3) + wst * cv * 2.d0 * v_y * qv_n
+          endif
+
          enddo  ! l
         enddo   ! k
 
@@ -528,6 +622,43 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
   ! The scatter routines accumulate each (row, col) pair twice; same convention
   ! as mod_elt_matrix_fft and mod_pc_elt_matrix_reduced_fft.
   ELM = 0.5d0 * ELM
+
+  if (do_v) then
+    do b = 1, 3
+      do i = 1, NFV
+        do j = 1, NFV
+          call one_channel(EV_p (:,i,j,b), 0)
+          call one_channel(EV_n (:,i,j,b), 1)
+          call one_channel(EV_k (:,i,j,b), 2)
+          call one_channel(EV_kn(:,i,j,b), 3)
+        enddo
+      enddo
+    enddo
+    ELM_v = 0.5d0 * ELM_v
+    deallocate(EV_p, EV_n, EV_k, EV_kn)
+  endif
+
+contains
+
+  !> One toroidal channel of one v_par block entry (i, j, b) into ELM_v(:,:,b):
+  !! ch 0 = p, 1 = n, 2 = k, 3 = kn.
+  subroutine one_channel(c, ch)
+    real*8, intent(in)  :: c(n_plane)
+    integer, intent(in) :: ch
+    if (maxval(abs(c)) == 0.d0) return
+    in_fft = c
+#ifdef USE_FFTW
+    call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+    call pc_my_fft(in_fft, out_fft, n_plane)
+#endif
+    select case (ch)
+    case (0); call scatter_fft_to_elm   (out_fft, i, j, ELM_v(:,:,b), DFV)
+    case (1); call scatter_fft_to_elm_n (out_fft, i, j, ELM_v(:,:,b), DFV)
+    case (2); call scatter_fft_to_elm_k (out_fft, i, j, ELM_v(:,:,b), DFV)
+    case (3); call scatter_fft_to_elm_kn(out_fft, i, j, ELM_v(:,:,b), DFV)
+    end select
+  end subroutine one_channel
 
 end subroutine pc_elt_matrix_force_fft
 

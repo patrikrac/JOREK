@@ -39,6 +39,13 @@ module mod_petsc_pc_physics_ctx
     !! size n_tor. See models/model199/mod_pc_elt_matrix_force_fft.f90.
     Mat :: W_force
     logical :: w_force_ready = .false.
+
+    !> v_par's sound-wave Schur terms (model600 with_vpar, the "b0" stage):
+    !! the same element pass as W, one variable each, block size n_tor.
+    !! W_vv is added to B_77, W_vu (v_par row, u column) to B_72; W_uv (u row,
+    !! v_par column) only feeds the (u, v_par) symmetry diagnostic.
+    Mat :: W_vv, W_vu, W_uv
+    logical :: w_v_ready = .false.
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx

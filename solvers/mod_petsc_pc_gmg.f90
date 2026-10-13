@@ -43,7 +43,7 @@ module mod_petsc_pc_gmg
   private
 
   public :: gmg_build_prolongations, gmg_setup_operator, gmg_vcycle_apply, gmg_is_ready
-  public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4
+  public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5
   public :: gmg_pc_apply_1, gmg_pc_apply_2
   public :: gmg_push, gmg_pop
   public :: gmg_opts_t
@@ -64,7 +64,8 @@ module mod_petsc_pc_gmg
                                      !< J into the ranks owning the rest (RAS, as the lines)
     integer :: harm_pair    = 0      !< 1 = a harmonic's cos and sin slots share every
                                      !< smoother block (first-order d_phi couplings, which
-                                     !< map cos <-> sin, then lie inside the blocks)
+                                     !< map cos <-> sin, then lie inside the blocks);
+                                     !< 2 = every slot in one block (cross-|n| coupling)
     integer :: line_overlap = 0      !< smoothers 5/7: radial lines extended by this many
                                      !< nodes into the ranks owning their continuation
                                      !< (restricted additive Schwarz); 0 = local segments
@@ -244,9 +245,9 @@ module mod_petsc_pc_gmg
   ! the active instance's state in inst(cur_inst) and loads instance k.
   ! PETSc handles are pointers and the arrays move with move_alloc, so a
   ! switch is O(1). Instance 1 = pair_w, 2 = pair_psi, 3 = B_55 (rho),
-  ! 4 = B_66 (T). V-cycles of different instances nest only through
+  ! 4 = B_66 (T), 5 = v_par (model600 with_vpar). V-cycles of different instances nest only through
   ! gmg_push / gmg_pop (the schur arm's pair_w shell applying pair_psi).
-  integer, parameter :: MAX_INST = 4
+  integer, parameter :: MAX_INST = 5
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
     integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 0, rovl = 0
@@ -276,9 +277,10 @@ module mod_petsc_pc_gmg
   ! Workstream G, finding D3: these are per INSTANCE, like gev_vcycle. While
   ! they were shared, no -log_view number could attribute line or axis time to
   ! pair_w rather than to Shat / rho / T, which is what left C1's rank soft.
-  PetscLogEvent, save :: gev_lines(4) = -1, gev_axsolve(4) = -1   !< the block smoother's two halves
+  PetscLogEvent, save :: gev_lines(MAX_INST) = -1, gev_axsolve(MAX_INST) = -1   !< the block smoother's two halves
   ! per hierarchy instance (1 = pair_w keeps the original names, 2 = GMG2_*)
-  PetscLogEvent, save :: gev_vcycle(4) = -1, gev_smooth0(4) = -1, gev_smooth(4) = -1, gev_coarse(4) = -1
+  PetscLogEvent, save :: gev_vcycle(MAX_INST) = -1, gev_smooth0(MAX_INST) = -1, gev_smooth(MAX_INST) = -1
+  PetscLogEvent, save :: gev_coarse(MAX_INST) = -1
   logical, save       :: gev_ready = .false.
 
   ! 1D cubic-Hermite subdivision, level-local canonical units (u, f_x/3):
@@ -636,8 +638,8 @@ contains
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
   end subroutine gmg_vcycle
 
-  !> PC-shell entry points of the pair_w (1), Shat (2), rho (3) and T (4)
-  !! hierarchies. gmg_vcycle_apply is instance 1's historical name and is kept
+  !> PC-shell entry points of the pair_w (1), Shat (2), rho (3), T (4) and
+  !! v_par (5) hierarchies. gmg_vcycle_apply is instance 1's historical name and is kept
   !! so the research path's PCShellSetApply is unchanged; gmg_pc_apply_1 is the
   !! same callback under the uniform name the production path selects by index.
   subroutine gmg_pc_apply_1(pc, b, x, ierr)
@@ -670,6 +672,14 @@ contains
     call gmg_vcycle(4, b, x)
     ierr = 0
   end subroutine gmg_pc_apply_4
+
+  subroutine gmg_pc_apply_5(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call gmg_vcycle(5, b, x)
+    ierr = 0
+  end subroutine gmg_pc_apply_5
 
   logical function gmg_is_ready()
     gmg_is_ready = p_ready
@@ -1403,7 +1413,8 @@ contains
       ib = 0
       ib = [gBk(0)%nb, count(gBk(0)%band), sum(gBk(0:nlev-2)%nsing)]
       call MPI_Allreduce(ib, ibg, 3, MPI_INTEGER, MPI_SUM, comm, mpierr)
-      ib(1) = maxval(gBk(0)%kl)
+      ib(1) = 0
+      if (gBk(0)%nb > 0) ib(1) = maxval(gBk(0)%kl)
       call MPI_Allreduce(MPI_IN_PLACE, ib(1), 1, MPI_INTEGER, MPI_MAX, comm, mpierr)
       if (my_id == 0) then
         if (present(tag)) write(*,'(A,A,A)', advance="no") "[Physics PC]   GMG (", tag, ")"
@@ -1587,6 +1598,10 @@ contains
     call PetscLogEventRegister("GMG4_Smooth0", cid, gev_smooth0(4), ierr)
     call PetscLogEventRegister("GMG4_SmoothC", cid, gev_smooth(4),  ierr)
     call PetscLogEventRegister("GMG4_Coarse",  cid, gev_coarse(4),  ierr)
+    call PetscLogEventRegister("GMG5_VCycle",  cid, gev_vcycle(5),  ierr)
+    call PetscLogEventRegister("GMG5_Smooth0", cid, gev_smooth0(5), ierr)
+    call PetscLogEventRegister("GMG5_SmoothC", cid, gev_smooth(5),  ierr)
+    call PetscLogEventRegister("GMG5_Coarse",  cid, gev_coarse(5),  ierr)
     call PetscLogEventRegister("GMG_Lines",    cid, gev_lines(1),   ierr)
     call PetscLogEventRegister("GMG_AxSolve",  cid, gev_axsolve(1), ierr)
     call PetscLogEventRegister("GMG2_Lines",   cid, gev_lines(2),   ierr)
@@ -1595,6 +1610,8 @@ contains
     call PetscLogEventRegister("GMG3_AxSolve", cid, gev_axsolve(3), ierr)
     call PetscLogEventRegister("GMG4_Lines",   cid, gev_lines(4),   ierr)
     call PetscLogEventRegister("GMG4_AxSolve", cid, gev_axsolve(4), ierr)
+    call PetscLogEventRegister("GMG5_Lines",   cid, gev_lines(5),   ierr)
+    call PetscLogEventRegister("GMG5_AxSolve", cid, gev_axsolve(5), ierr)
     gev_ready = .true.
   end subroutine gmg_register_events
 
@@ -2056,7 +2073,7 @@ contains
       integer :: cb, pr, pc
       if (C < 0) return                           ! outside the rank's rows and ghosts
       cb = B%bid(C + 1)
-      if (sm_type >= 7 .and. B%bcol(bb) == 1 .and. B%bcol(cb) == 0) then
+      if ((sm_type == 7 .or. sm_type == 8) .and. B%bcol(bb) == 1 .and. B%bcol(cb) == 0) then
         if (pass == 1) then
           B%zp(R + 2) = B%zp(R + 2) + 1
         else
@@ -2830,7 +2847,11 @@ contains
     integer, intent(in) :: g, I, J, m_
     integer :: is_g, m
     m = m_
-    if (hpair > 0) m = pc_grp(m_)          ! slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs
+    if (hpair == 1) m = pc_grp(m_)         ! slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs
+    ! harm_pair 2: every slot in one block. Cross-|n| couplings (a nonlinear
+    ! or 3D equilibrium couples n to n' at O(1), at fine radial scales that
+    ! no coarse level resolves) then lie inside the smoother's blocks.
+    if (hpair >= 2) m = 0
     if (I == 0 .or. I <= axis_lim(g)) then
       blk_id = m + 1
     else if (sm_type == 4) then

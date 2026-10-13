@@ -72,7 +72,7 @@ contains
     use construct_pc_matrix_mod, only: construct_force_operator_matrix
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
-    use mod_petsc_pc_sf_solver, only: sf_force_terms
+    use mod_petsc_pc_sf_solver, only: sf_force_terms, sf_vpar_w_assembled, sf_vpar_gamma_w, sf_vpar_wvu_full
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
@@ -101,13 +101,40 @@ contains
 
     ! the mixed pair_w forms carry the bending term (or the whole psi
     ! channel) through explicit fields, and take it out of W here
-    call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
-                                         mhd_sim, g_ctx%W_force, terms=sf_force_terms())
+    if (sf_vpar_w_assembled()) then
+      ! v_par's sound-wave Schur terms in the same element pass (one matrix
+      ! each, the same lifecycle as W)
+      if (g_ctx%w_v_ready) then
+        PetscCallA(MatZeroEntries(g_ctx%W_vv, ierr))
+        PetscCallA(MatZeroEntries(g_ctx%W_vu, ierr))
+        PetscCallA(MatZeroEntries(g_ctx%W_uv, ierr))
+      else
+        call petsc_create_pc_matrix(g_ctx%W_vv, a_mat, 1)
+        call petsc_create_pc_matrix(g_ctx%W_vu, a_mat, 1)
+        call petsc_create_pc_matrix(g_ctx%W_uv, a_mat, 1)
+        PetscCallA(MatSetOption(g_ctx%W_vv, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
+        PetscCallA(MatSetOption(g_ctx%W_vu, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
+        PetscCallA(MatSetOption(g_ctx%W_uv, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
+      endif
+      call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
+                                           mhd_sim, g_ctx%W_force, terms=sf_force_terms(), &
+                                           W_vv=g_ctx%W_vv, W_vu=g_ctx%W_vu, W_uv=g_ctx%W_uv, &
+                                           gamma_w=sf_vpar_gamma_w(), vu_full=sf_vpar_wvu_full())
+      g_ctx%w_v_ready = .true.
+    else
+      call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
+                                           mhd_sim, g_ctx%W_force, terms=sf_force_terms())
+    endif
     g_ctx%w_force_ready = .true.
     call PetscLogEventEnd(pcev_elem_asm, ierr)
 
-    if (my_id .eq. 0) write(*,'(A)') &
-      "[Physics PC]   W (composed force operator) assembled"
+    if (my_id .eq. 0) then
+      if (g_ctx%w_v_ready) then
+        write(*,'(A)') "[Physics PC]   W (composed force operator) and v_par's W_vv, W_vu, W_uv assembled"
+      else
+        write(*,'(A)') "[Physics PC]   W (composed force operator) assembled"
+      endif
+    endif
   end subroutine petsc_assemble_pc_matrices
 
 

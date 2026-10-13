@@ -79,6 +79,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 physics_pc_sf_rtol, physics_pc_sf_corrector,        &
                 physics_pc_sf_harm_couple, physics_pc_sf_mode_split, &
                 physics_pc_sf_cross_weights,                        &
+                physics_pc_sf_vpar, physics_pc_sf_vpar_stage,       &
                 eliminate_boundary_dofs,                            &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &

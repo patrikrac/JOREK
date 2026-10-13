@@ -112,6 +112,18 @@ for _b in ('hc1', 'hcall'):
                                        physics_pc_sf_cross_weights='.f.')
     ARMS['sf_gmg_wpj_fresh_ms_' + _b] = dict(ARMS['sf_gmg_wpj_ms_' + _b], iter_precon='0')
 
+# v_par (model600 built with_vpar; base PCS_BASE=namelist/model600/
+# inxflow_shaped_vpar_pcbench): its block's backend follows the arm (lu / gmg),
+# its place in the sweep the suffix -- v0 = solved last, no feedback; b0 = the
+# sequential velocity stage with the sound-wave Schur terms; b1 = v_par in
+# pair_w (mode split only) (-sf_vpar_w, -sf_vpar_gamma_w as PETSc options).
+for _s in ('v0', 'b0', 'b1'):
+    ARMS['sf_lu_wpj_' + _s] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_vpar='"lu"',
+                                   physics_pc_sf_vpar_stage='"%s"' % _s)
+    ARMS['sf_gmg_wpj_ms_' + _s] = dict(ARMS['sf_gmg_wpj_ms'], physics_pc_sf_vpar='"gmg"',
+                                       physics_pc_sf_vpar_stage='"%s"' % _s)
+    ARMS['sf_lu_wpj_ms_' + _s] = dict(ARMS['sf_lu_wpj_' + _s], physics_pc_sf_mode_split='.t.')
+
 # JOREK's PC with each mode family on its own sub-communicator, so the family
 # blocks are factorised and solved concurrently instead of one after another
 # (-jorek_pc_mode_split, branch numerics_develop only; needs np >= n_mode_families).
