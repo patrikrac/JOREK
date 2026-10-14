@@ -6,7 +6,7 @@ import sys, re
 EV = ["KSPSolve","PCApply","PhysPC_Apply","PhysPC_SolveW","PhysPC_SolveRhoT","GMG_VCycle","GMG_Lines","GMG_AxSolve",
       "GMG_Coarse","GMG3_VCycle","GMG4_VCycle","GMG3_Lines","GMG4_Lines","GMG3_AxSolve","GMG4_AxSolve",
       "MatMult","MatMultAdd","MatMultTranspose","MatSolve","VecScatterEnd","VecMDot","VecNorm",
-      "PhysPC_Extract","PhysPC_FactW","PhysPC_FactRhoT","BLK_Band","BLK_Dense","SPK_GathScat","SPK_Interior","SPK_Sep","SPK_Update","GMG_PtAP","GMG_SmSetup","GMG_DevOps","GMG_BlkNum","GMG_AxNum"]
+      "PhysPC_Extract","PhysPC_FactW","PhysPC_FactRhoT","BLK_Band","BLK_Dense","SPK_GathScat","SPK_Interior","SPK_Sep","SPK_Update","GMG_PtAP","GMG_SmSetup","GMG_DevOps","GMG_BlkNum","GMG_AxNum","GMG_CoarseLU","RING_Solve","CRS_DevSolve","CRS_DevFactor","VecCopy","GMG_Smooth0","GMG_SmoothC","GMG3_Coarse","GMG4_Coarse","PhysPC_SolvePJ","RING_Factor","BLK_DevInv","GMG_DevFactor","PhysPC_BuildSuu","MatAXPY","MatPtAPNumeric"]
 def parse(fn):
     d = {}
     for ln in open(fn, errors="replace"):

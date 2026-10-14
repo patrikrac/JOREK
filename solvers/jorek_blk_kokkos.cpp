@@ -1,7 +1,8 @@
 /* Device kernel of the C1 GMG block smoothers (mod_petsc_pc_gmg, blk_apply).
  *
  * The smoother blocks of one level (radial lines, flux-surface rings; blk_t)
- * are factored on the host by LAPACK (dgbtrf / dgetrf), as on the CPU path.
+ * are factored on the host by LAPACK (dgbtrf / dgetrf), as on the CPU path;
+ * on rebuilds the dense blocks are inverted here instead (dense_inverses).
  * This file keeps a copy of the factors in Kokkos views and applies them to
  * PETSc Kokkos vectors: gather -> pivoted band / dense solve -> scatter, one
  * team per block, the band updates on the team's vector lanes. With the
@@ -32,16 +33,17 @@
  */
 #if defined(USE_PETSC) && defined(USE_GPU_PC)
 #include <petscvec_kokkos.hpp>
+#include <petscmat.h>
 #include <Kokkos_Core.hpp>
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
+#include "jorek_dense_batched.hpp"
 
 extern "C" {
 void dgbtrf_(const int *, const int *, const int *, const int *, double *, const int *, int *, int *);
 void dgbtrs_(const char *, const int *, const int *, const int *, const int *, const double *, const int *, const int *, double *, const int *, int *, size_t);
-void dgetrf_(const int *, const int *, double *, const int *, int *, int *);
-void dgetri_(const int *, double *, const int *, const int *, double *, const int *, int *);
 }
 
 namespace {
@@ -75,6 +77,30 @@ struct BlkDev {
   LongView loff;
   RealView lu, zv, w, yg;
   RealView dinv;             /* dense blocks: explicit inverses, row-major, at their loff */
+  RealView tw;               /* device inversion: the blocks' transposes */
+  /* the device fill (jorek_blk_kokkos_fill): entry q of the level matrix's
+   * diagonal (+k) / off-diagonal (-k) values, or of the ghost rows' (gsrc),
+   * into lu (dst > 0, 1-based) or the zebra coupling zv (dst < 0) */
+  IntView  fm_src, fg_src;
+  LongView fm_dst, fg_dst;
+  RealView vg;
+  /* device inversion (dense_inverses): the dense blocks per size, kept per
+   * layout, with their batches' pointers into tw / dinv (igrp_tw / _dinv) */
+  struct InvGroup {
+    int                 n = 0;
+    std::vector<int>    blk;
+    IntView             bl;
+    jorek_dense::PtrView pa, pc;
+  };
+  std::vector<InvGroup> igrp;
+  bool                  igrp_set = false;
+  int                   maxgrp   = 0;
+  const double         *igrp_tw = nullptr, *igrp_dinv = nullptr;
+  IntView               dfail, dinfo;
+#if defined(KOKKOS_ENABLE_CUDA)
+  jorek_dense::BatchWork bwork;
+  jorek_dense::LargeWork lwork;
+#endif
   /* host copies of the layout, for the partitioning */
   std::vector<int>       h_off, h_sz, h_kl, h_ku, h_band, h_ax, h_col;
   std::vector<long long> h_loff;
@@ -93,7 +119,7 @@ struct BlkDev {
 };
 
 /* -log_view events of the kernels (with -log_view_gpu_time: their GPU time) */
-PetscLogEvent ev_band = -1, ev_dense, ev_gs, ev_int, ev_sep, ev_upd;
+PetscLogEvent ev_band = -1, ev_dense, ev_gs, ev_int, ev_sep, ev_upd, ev_dinv;
 
 PetscErrorCode events_register()
 {
@@ -108,6 +134,7 @@ PetscErrorCode events_register()
   PetscCall(PetscLogEventRegister("SPK_Interior", cid, &ev_int));
   PetscCall(PetscLogEventRegister("SPK_Sep", cid, &ev_sep));
   PetscCall(PetscLogEventRegister("SPK_Update", cid, &ev_upd));
+  PetscCall(PetscLogEventRegister("BLK_DevInv", cid, &ev_dinv));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -168,34 +195,6 @@ KOKKOS_INLINE_FUNCTION void band_solve(const Team &team, int n, int kl, int ku, 
     Kokkos::single(Kokkos::PerThread(team), [=](PetscScalar &v) { v = (x[j] /= col[0]); }, t);
     if (t == 0.0) continue;
     Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, lo, j), [=](const int i) { x[i] -= t * col[i - j]; });
-    team.team_barrier();
-  }
-}
-
-/* x <- (P L U)^-1 x, dgetrf's dense storage: dgetrs('N') for one right-hand side */
-KOKKOS_INLINE_FUNCTION void dense_solve(const Team &team, int n, const PetscScalar *a, const int *ipiv, PetscScalar *x)
-{
-  /* dgetrf's L is stored with all interchanges applied, so they all come first */
-  int done; /* a value, so that the lanes wait for the single */
-  Kokkos::single(
-    Kokkos::PerThread(team),
-    [=](int &v) {
-      for (int j = 0; j < n; j++) pivot(x, j, ipiv[j] - 1);
-      v = 1;
-    },
-    done);
-  for (int j = 0; j < n; j++) {
-    const PetscScalar *col = a + (size_t)j * n;
-    const PetscScalar  t   = x[j];
-    if (t != 0.0) Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, j + 1, n), [=](const int i) { x[i] -= col[i] * t; });
-    team.team_barrier();
-  }
-  for (int j = n - 1; j >= 0; j--) {
-    const PetscScalar *col = a + (size_t)j * n;
-    PetscScalar        t;
-    Kokkos::single(Kokkos::PerThread(team), [=](PetscScalar &v) { v = (x[j] /= col[j]); }, t);
-    if (t == 0.0) continue;
-    Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, 0, j), [=](const int i) { x[i] -= t * col[i]; });
     team.team_barrier();
   }
 }
@@ -296,18 +295,7 @@ bool spike_factor(int n, int kl, int ku, const double *ab, int mt, SpkHost &S)
       }
     }
   }
-  {
-    std::vector<int> ip(ns);
-    int              info = 0, lw = -1;
-    double           q;
-    dgetrf_(&ns, &ns, Sm.data(), &ns, ip.data(), &info);
-    if (info) return false;
-    dgetri_(&ns, Sm.data(), &ns, ip.data(), &q, &lw, &info);
-    lw = std::max(1, (int)q);
-    std::vector<double> wk(lw);
-    dgetri_(&ns, Sm.data(), &ns, ip.data(), wk.data(), &lw, &info);
-    if (info) return false;
-  }
+  if (jorek_dense::inverse_host(ns, Sm.data())) return false;
   S.sinv.resize((size_t)ns * ns);
   for (int i = 0; i < ns; i++)
     for (int j = 0; j < ns; j++) S.sinv[(size_t)i * ns + j] = Sm[(size_t)j * ns + i];
@@ -406,6 +394,112 @@ PetscErrorCode spike_upload(BlkDev *B)
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+/* the dense blocks by size (igrp), once per layout */
+PetscErrorCode dense_groups(BlkDev *B)
+{
+  PetscFunctionBeginUser;
+  if (!B->igrp_set) {
+    std::map<int, std::vector<int>> grp;
+    size_t                          need = 0;
+    for (int b = 0; b < B->nb; b++)
+      if (!B->h_ax[b] && !B->h_band[b]) grp[B->h_sz[b]].push_back(b);
+    B->igrp.clear();
+    B->maxgrp = 0;
+    for (auto &g : grp) {
+      BlkDev::InvGroup q;
+      q.n   = g.first;
+      q.blk = g.second;
+      PetscCallCXX(upload(q.bl, "blk_grp", q.blk.data(), q.blk.size()));
+      need      = std::max(need, q.blk.size() * (size_t)q.n * q.n);
+      B->maxgrp = std::max(B->maxgrp, (int)q.blk.size());
+      B->igrp.push_back(std::move(q));
+    }
+    PetscCallCXX(jorek_dense::grow(B->tw, "blk_tw", need));
+    B->igrp_set  = true;
+    B->igrp_tw   = nullptr;
+    B->igrp_dinv = nullptr;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* The dense blocks' inverses on the device, from their UNFACTORED values in
+ * B->lu (column-major A at loff): per block size one batch on the blocks'
+ * transposes, whose column-major inverse is A^-1 row-major (dinv's form) --
+ * batched cuBLAS up to n 64, cuSOLVER per block above (cut rings, coarse
+ * levels); threaded LAPACK on host backends. The groups and their pointer
+ * arrays are kept per layout. bad[b] = 1 for a singular block; *nbad their
+ * count. */
+PetscErrorCode dense_inverses(BlkDev *B, int *bad, int *nbad)
+{
+  PetscFunctionBeginUser;
+  *nbad = 0;
+  PetscCall(dense_groups(B));
+  if (B->igrp.empty()) PetscFunctionReturn(PETSC_SUCCESS);
+  if (B->dinv.extent(0) != B->lu.extent(0)) PetscCallCXX(B->dinv = RealView(Kokkos::view_alloc(std::string("blk_dinv"), Kokkos::WithoutInitializing), B->lu.extent(0)));
+  PetscCallCXX(jorek_dense::grow(B->dfail, "blk_fail", (size_t)B->nb));
+  PetscCallCXX(Kokkos::deep_copy(B->dfail, 0));
+  auto       lu = B->lu, tw = B->tw, dinv = B->dinv;
+  auto       loff = B->loff;
+  auto       fl   = B->dfail;
+#if defined(KOKKOS_ENABLE_CUDA)
+  const bool repoint = B->igrp_tw != tw.data() || B->igrp_dinv != dinv.data();
+  PetscCallCXX(jorek_dense::grow(B->dinfo, "blk_info", (size_t)B->maxgrp));
+  auto info = B->dinfo;
+#endif
+  for (auto &q : B->igrp) {
+    const int n = q.n, nb = (int)q.blk.size();
+    auto      bl = q.bl;
+    PetscCallCXX(Kokkos::parallel_for(
+      "jorek_blk_ftrans", Kokkos::RangePolicy<ExecSpace>(0, (long long)nb * n * n), KOKKOS_LAMBDA(const long long r) {
+        const long long nn = (long long)n * n;
+        const int       i = (int)(r / nn), e = (int)(r % nn), ro = e % n, c = e / n;
+        tw(i * nn + e) = lu(loff(bl(i)) + c + (long long)ro * n); /* T = A^T */
+      }));
+#if defined(KOKKOS_ENABLE_CUDA)
+    if (n <= 64) {
+      if (repoint || q.pa.extent(0) != (size_t)nb) { /* the batch's pointers: once per layout and buffers */
+        q.pa = jorek_dense::PtrView(Kokkos::view_alloc(std::string("blk_pa"), Kokkos::WithoutInitializing), nb);
+        q.pc = jorek_dense::PtrView(Kokkos::view_alloc(std::string("blk_pc"), Kokkos::WithoutInitializing), nb);
+        auto pa = q.pa, pc = q.pc;
+        PetscCallCXX(Kokkos::parallel_for(
+          "jorek_blk_fptr", Kokkos::RangePolicy<ExecSpace>(0, nb), KOKKOS_LAMBDA(const int i) {
+            pa(i) = (uintptr_t)(tw.data() + (long long)i * n * n);
+            pc(i) = (uintptr_t)(dinv.data() + loff(bl(i)));
+          }));
+      }
+      PetscCall(jorek_dense::inverse_batched(n, nb, q.pa, q.pc, n, info, B->bwork));
+    } else {
+      for (int i = 0; i < nb; i++) PetscCall(jorek_dense::inverse_large(n, tw.data() + (long long)i * n * n, dinv.data() + B->h_loff[q.blk[i]], info.data() + i, B->lwork));
+    }
+    PetscCallCXX(Kokkos::parallel_for(
+      "jorek_blk_ffail", Kokkos::RangePolicy<ExecSpace>(0, nb), KOKKOS_LAMBDA(const int i) {
+        if (info(i) != 0) fl(bl(i)) = 1;
+      }));
+#else
+    if constexpr (Kokkos::SpaceAccessibility<Kokkos::HostSpace, MemSpace>::accessible) {
+      PetscCallCXX(ExecSpace().fence());
+      double     *T0 = tw.data(), *D0 = dinv.data();
+      int        *f0 = fl.data();
+      const auto &gb = q.blk;
+  #pragma omp parallel for schedule(dynamic, 1)
+      for (int i = 0; i < nb; i++) {
+        double *T = T0 + (long long)i * n * n;
+        if (jorek_dense::inverse_host(n, T)) f0[gb[i]] = 1;
+        else std::copy(T, T + (size_t)n * n, D0 + B->h_loff[gb[i]]);
+      }
+    } else SETERRQ(PETSC_COMM_SELF, PETSC_ERR_SUP, "device dense inverses: no batched backend for this Kokkos device");
+#endif
+  }
+  B->igrp_tw   = tw.data();
+  B->igrp_dinv = dinv.data();
+  auto hf      = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), fl);
+  for (int b = 0; b < B->nb; b++) {
+    bad[b] = hf(b);
+    *nbad += hf(b);
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 } // namespace
 
 extern "C" {
@@ -437,6 +531,7 @@ PetscErrorCode jorek_blk_kokkos(void **h, int nb, int nrow, int ngh, const int *
   B->h_band.assign(band, band + nb);
   B->h_ax.assign(axblk, axblk + nb);
   B->h_loff.assign(loff, loff + nb);
+  B->igrp_set = false; /* dense_inverses regroups */
   B->h_col.assign(nb, 0);
   if (bcol)
     for (int b = 0; b < nb; b++) B->h_col[b] = (bcol[b] == 1) ? 1 : 0;
@@ -508,13 +603,22 @@ PetscErrorCode jorek_blk_kokkos_spike(void *h, long long nlu, const double *lu, 
 /* The factors, at every rebuild: lu (nlu entries), the LAPACK pivots (1-based,
  * per block row) and the zebra coupling's values. bad[b] != 0: the host LU of
  * block b failed (it became point Jacobi), so it is not partitioned either. */
-PetscErrorCode jorek_blk_kokkos_values(void *h, long long nlu, const double *lu, int npiv, const int *piv, int nz, const double *zv, const int *bad, double *stats)
+PetscErrorCode jorek_blk_kokkos_values(void *h, long long nlu, const double *lu, int npiv, const int *piv, int nz, const double *zv, const int *bad, int dense_raw, int *dbad, int *ndbad, double *stats)
 {
   BlkDev *B = static_cast<BlkDev *>(h);
 
   PetscFunctionBeginUser;
   PetscCallCXX(upload(B->lu, "blk_lu", lu, (size_t)nlu));
-  {
+  *ndbad = 0;
+  if (dense_raw) {
+    /* dense blocks unfactored: their inverses on the device */
+    PetscCall(PetscLogEventBegin(ev_dinv, 0, 0, 0, 0));
+    PetscCall(PetscLogGpuTimeBegin());
+    PetscCall(dense_inverses(B, dbad, ndbad));
+    PetscCall(PetscLogGpuTimeEnd());
+    PetscCall(PetscLogEventEnd(ev_dinv, 0, 0, 0, 0));
+    if (*ndbad) PetscFunctionReturn(PETSC_SUCCESS); /* the caller factors on the host and calls again */
+  } else {
     /* dense blocks: their inverse from the host LU (dgetri), applied as a
      * product; a failed block (point Jacobi) keeps its diagonal LU */
     bool any = false;
@@ -524,13 +628,8 @@ PetscErrorCode jorek_blk_kokkos_values(void *h, long long nlu, const double *lu,
     for (int b = 0; b < B->nb; b++) {
       if (B->h_ax[b] || B->h_band[b]) continue;
       const int           n = B->h_sz[b];
-      std::vector<double> a(lu + B->h_loff[b], lu + B->h_loff[b] + (size_t)n * n), wk(1);
-      std::vector<int>    ip(piv + B->h_off[b], piv + B->h_off[b] + n);
-      int                 info = 0, lw = -1;
-      dgetri_(&n, a.data(), &n, ip.data(), wk.data(), &lw, &info);
-      lw = std::max(1, (int)wk[0]);
-      wk.resize(lw);
-      dgetri_(&n, a.data(), &n, ip.data(), wk.data(), &lw, &info);
+      std::vector<double> a(lu + B->h_loff[b], lu + B->h_loff[b] + (size_t)n * n);
+      jorek_dense::getri_host(n, a.data(), piv + B->h_off[b]);
       for (int i = 0; i < n; i++)
         for (int j = 0; j < n; j++) inv[B->h_loff[b] + (size_t)i * n + j] = a[(size_t)j * n + i];
     }
@@ -547,10 +646,101 @@ PetscErrorCode jorek_blk_kokkos_values(void *h, long long nlu, const double *lu,
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+/* The device fill's map (mod_petsc_pc_gmg: the host's share of the level's
+ * value map, hvs / hvd and hgs / hgd), once per pattern */
+PetscErrorCode jorek_blk_kokkos_fillmap(void *h, long long n1, const int *src, const long long *dst, long long n2, const int *gsrc, const long long *gdst)
+{
+  BlkDev *B = static_cast<BlkDev *>(h);
+
+  PetscFunctionBeginUser;
+  PetscCallCXX(upload(B->fm_src, "blk_fm_src", src, (size_t)n1));
+  PetscCallCXX(upload(B->fm_dst, "blk_fm_dst", dst, (size_t)n1));
+  PetscCallCXX(upload(B->fg_src, "blk_fg_src", gsrc, (size_t)n2));
+  PetscCallCXX(upload(B->fg_dst, "blk_fg_dst", gdst, (size_t)n2));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* Every rebuild, instead of the host fill and jorek_blk_kokkos_values: the
+ * dense blocks' (zeroed) and the zebra coupling's values straight from the
+ * level matrix's device parts Ad / Ao (Ao may be NULL) and the ghost rows'
+ * values vg (host, nvg) through the fill map, then the dense blocks inverted
+ * there (nlu, nz: the host arrays' lengths). dbad / ndbad as
+ * jorek_blk_kokkos_values: the caller then fills and factors on the host. */
+PetscErrorCode jorek_blk_kokkos_fill(void *h, long long nlu, int nz, Mat Ad, Mat Ao, long long nvg, const double *vg, int *dbad, int *ndbad)
+{
+  BlkDev         *B = static_cast<BlkDev *>(h);
+  const PetscInt *ii, *jj;
+  PetscScalar    *ad = nullptr, *ao = nullptr;
+  PetscMemType    mt;
+
+  PetscFunctionBeginUser;
+  if (B->lu.extent(0) != (size_t)nlu) PetscCallCXX(B->lu = RealView(Kokkos::view_alloc(std::string("blk_lu"), Kokkos::WithoutInitializing), (size_t)nlu));
+  if (B->zv.extent(0) != (size_t)nz) PetscCallCXX(B->zv = RealView("blk_zv", (size_t)nz));
+  PetscCall(dense_groups(B));
+  PetscCall(MatSeqAIJGetCSRAndMemType(Ad, &ii, &jj, &ad, &mt));
+  if (Ao) PetscCall(MatSeqAIJGetCSRAndMemType(Ao, &ii, &jj, &ao, &mt));
+  auto lu = B->lu, zv = B->zv;
+  auto loff = B->loff;
+  for (auto &q : B->igrp) { /* the dense blocks: every entry the map does not set is 0 */
+    const int n = q.n;
+    auto      bl = q.bl;
+    PetscCallCXX(Kokkos::parallel_for(
+      "jorek_blk_fzero", Kokkos::RangePolicy<ExecSpace>(0, (long long)q.blk.size() * n * n), KOKKOS_LAMBDA(const long long r) {
+        const long long nn = (long long)n * n;
+        lu(loff(bl(r / nn)) + r % nn) = 0.0;
+      }));
+  }
+  auto fsrc = B->fm_src;
+  auto fdst = B->fm_dst;
+  PetscCallCXX(Kokkos::parallel_for(
+    "jorek_blk_fill", Kokkos::RangePolicy<ExecSpace, Kokkos::IndexType<long long>>(0, (long long)fsrc.extent(0)), KOKKOS_LAMBDA(const long long q) {
+      const int       sv = fsrc(q);
+      const long long d  = fdst(q);
+      const double    v  = (sv > 0) ? ad[sv - 1] : ao[-sv - 1];
+      if (d > 0) lu(d - 1) = v;
+      else zv(-d - 1) = v;
+    }));
+  if (B->fg_src.extent(0)) {
+    PetscCallCXX(upload(B->vg, "blk_vg", vg, (size_t)nvg));
+    auto gsrc = B->fg_src;
+    auto dg   = B->vg;
+    auto gdst = B->fg_dst;
+    PetscCallCXX(Kokkos::parallel_for(
+      "jorek_blk_gfill", Kokkos::RangePolicy<ExecSpace, Kokkos::IndexType<long long>>(0, (long long)gsrc.extent(0)), KOKKOS_LAMBDA(const long long q) {
+        const long long d = gdst(q);
+        const double    v = dg(gsrc(q) - 1);
+        if (d > 0) lu(d - 1) = v;
+        else zv(-d - 1) = v;
+      }));
+  }
+  PetscCall(PetscLogEventBegin(ev_dinv, 0, 0, 0, 0));
+  PetscCall(PetscLogGpuTimeBegin());
+  PetscCall(dense_inverses(B, dbad, ndbad));
+  PetscCall(PetscLogGpuTimeEnd());
+  PetscCall(PetscLogEventEnd(ev_dinv, 0, 0, 0, 0));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* The zebra coupling (1-based row pointers zp, columns zc, values zv) and the
+ * colour-0 solutions on the ghost rows (yg, ngh), for the device ring solver's
+ * colour-1 rings / lines (jorek_ring_kokkos_apply): device pointers. */
+PetscErrorCode jorek_blk_kokkos_zebra(void *h, const int **zp, const int **zc, const PetscScalar **zv, PetscScalar **yg)
+{
+  BlkDev *B = static_cast<BlkDev *>(h);
+
+  PetscFunctionBeginUser;
+  *zp = B->zp.data();
+  *zc = B->zc.data();
+  *zv = B->zv.data();
+  *yg = B->yg.data();
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 /* y(block rows) = block solves of x; xg: x on the ghost rows (ngh > 0).
  * Pass 1's blocks (zebra colour 1) solve x - zv * y(pass 0), and read pass 0's
- * solutions on the ghost rows, which stay here. y's other rows are kept. */
-PetscErrorCode jorek_blk_kokkos_apply(void *h, Vec x, Vec y, Vec xg)
+ * solutions on the ghost rows, which stay here. y's other rows are kept.
+ * colour >= 0: that pass only (the ring solver's blocks go in between). */
+PetscErrorCode jorek_blk_kokkos_apply(void *h, Vec x, Vec y, Vec xg, int colour)
 {
   BlkDev   *B = static_cast<BlkDev *>(h);
   CRealView xv, gv;
@@ -560,7 +750,7 @@ PetscErrorCode jorek_blk_kokkos_apply(void *h, Vec x, Vec y, Vec xg)
   PetscCall(VecGetKokkosView(x, &xv));
   if (B->ngh > 0) PetscCall(VecGetKokkosView(xg, &gv));
   PetscCall(VecGetKokkosView(y, &yv));
-  for (int c = 0; c < 2; c++) {
+  for (int c = (colour < 0 ? 0 : colour); c <= (colour < 0 ? 1 : colour); c++) {
     const int nr  = B->nrow;
     auto      off = B->off, sz = B->sz, kl = B->kl, ku = B->ku, band = B->band, rows = B->rows, piv = B->piv, zp = B->zp, zc = B->zc;
     auto      loff = B->loff;

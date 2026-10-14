@@ -87,7 +87,9 @@
       ipv(q + 1 : q + b) = piv(rg%rp(n) + 1 : rg%rp(n) + b)
       q = q + b
     enddo
-    if (rg%ns <= 3) then
+    if (rg%sepm == 1) then
+      call BCR_SOLVE(rg, a, w)
+    else if (rg%ns <= 3) then
       call GETRS('N', rg%nf, 1, a(rg%of + 1), rg%nf, ipv, w, rg%nf, info)
     else
       call THOMAS_SOLVE(rg%sub, a(rg%of + 1), ipv, w)
@@ -115,3 +117,50 @@
       call GEMV('N', bj, rg%bs(jn), mone, a(rg%ou(J) + 1), bj, x(rg%rp(jn) + 1), 1, one, x(rg%rp(J) + 1), 1)
     enddo
   end subroutine HYB_SOL_BWD
+
+  !> the separators' system by block cyclic reduction (sepm 1, bcr_factor):
+  !! w = the separators' right-hand sides packed by rg%co, solution out.
+  !! Down the levels the kept nodes gather w_k -= A w_k-h + B w_k+h, the top
+  !! pair is solved whole, and back up each eliminated node takes
+  !! w_k = Dinv_k (w_k - L_k w_k-h - U_k w_k+h).
+  subroutine BCR_SOLVE(rg, a, w)
+    type(btd_ring), intent(in) :: rg
+    real(RK), intent(in)    :: a(*)
+    real(RK), intent(inout) :: w(*)
+    real(RK), parameter :: one = 1, mone = -1, zero = 0
+    integer :: ns, lv, h, k, km, kp, bk, b0, b1
+    real(RK) :: t(rg%nf), u(rg%nf)
+    ns = rg%ns
+    h = 1
+    do lv = 0, rg%nlev - 1
+      do k = 0, ns - 1, 2 * h
+        km = modulo(k - h, ns); kp = modulo(k + h, ns); bk = nb(k)
+        call GEMV('N', bk, nb(km), mone, a(rg%ba(k, lv) + 1), bk, w(rg%co(km) + 1), 1, one, w(rg%co(k) + 1), 1)
+        call GEMV('N', bk, nb(kp), mone, a(rg%bb(k, lv) + 1), bk, w(rg%co(kp) + 1), 1, one, w(rg%co(k) + 1), 1)
+      enddo
+      h = 2 * h
+    enddo
+    b0 = nb(0); b1 = nb(h)
+    t(1:b0) = w(rg%co(0) + 1 : rg%co(0) + b0)
+    t(b0 + 1 : b0 + b1) = w(rg%co(h) + 1 : rg%co(h) + b1)
+    call GEMV('N', b0 + b1, b0 + b1, one, a(rg%bt + 1), b0 + b1, t, 1, zero, u, 1)
+    w(rg%co(0) + 1 : rg%co(0) + b0) = u(1:b0)
+    w(rg%co(h) + 1 : rg%co(h) + b1) = u(b0 + 1 : b0 + b1)
+    do lv = rg%nlev - 1, 0, -1
+      h = 2**lv
+      do k = h, ns - 1, 2 * h
+        km = modulo(k - h, ns); kp = modulo(k + h, ns); bk = nb(k)
+        t(1:bk) = w(rg%co(k) + 1 : rg%co(k) + bk)
+        call GEMV('N', bk, nb(km), mone, a(rg%bl(k) + 1), bk, w(rg%co(km) + 1), 1, one, t, 1)
+        call GEMV('N', bk, nb(kp), mone, a(rg%bu(k) + 1), bk, w(rg%co(kp) + 1), 1, one, t, 1)
+        call GEMV('N', bk, bk, one, a(rg%bd(k) + 1), bk, t, 1, zero, w(rg%co(k) + 1), 1)
+      enddo
+    enddo
+
+  contains
+
+    integer function nb(k_)
+      integer, intent(in) :: k_
+      nb = rg%bs(rg%sep(k_))
+    end function nb
+  end subroutine BCR_SOLVE

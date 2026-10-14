@@ -59,24 +59,39 @@ module mod_gmg_ring_btd
     integer, allocatable :: sep(:)
     integer(8), allocatable :: osab(:), osba(:), osbb(:)
     type(btd_ring), allocatable :: sub
+    ! sepm 1: the separators' system by periodic block cyclic reduction
+    ! (bcr_factor; ns >= 4 a power of 2) instead of dense / Thomas. Separator
+    ! k (rows co(k)+1..co(k+1) of the packed separator vector) is eliminated
+    ! at level lev = trailing zeros of k (k = 0 and ns/2 reach the top): its
+    ! inverse pivot block at bd(k), its couplings L / U to k -+ 2^lev at bl(k)
+    ! / bu(k); kept nodes at level l store A = L Dinv(k-h), B = U Dinv(k+h) at
+    ! ba(k, l) / bb(k, l) (h = 2^l); bt: the top pair's dense inverse. All
+    ! offsets are into the ring's storage, like od.
+    integer :: sepm = 0, nlev = 0
+    integer, allocatable :: co(:)
+    integer(8), allocatable :: bd(:), bl(:), bu(:), ba(:,:), bb(:,:)
+    integer(8) :: bt = 0
     integer(8) :: tot = 0                           !< storage (doubles)
   end type btd_ring
 
   public :: btd_plan, btd_index, btd_factor, btd_solve, btd_matvec, btd_to_sp, btd_solve_sp
   public :: hyb_end, hyb_fac_seg, hyb_fac_sep, hyb_sol_fwd, hyb_sol_sep, hyb_sol_bwd
   public :: hyb_sol_fwd_sp, hyb_sol_sep_sp, hyb_sol_bwd_sp
+  public :: bcr_ok, btd_dev_pack
 
-  external :: dgetrf, dgetrs, dgemm, dgemv, sgetrs, sgemv
+  external :: dgetrf, dgetrs, dgetri, dgemm, dgemv, sgetrs, sgemv
 
 contains
 
   !> Storage layout of a ring of nn >= 4 nodes with bs(0:nn-1) rows each;
-  !! ns: the hybrid's segments (1..nn/2)
-  recursive subroutine btd_plan(rg, meth, nn, bs, ns)
+  !! ns: the hybrid's segments (1..nn/2); bcr: its separators by block cyclic
+  !! reduction where bcr_ok(ns)
+  recursive subroutine btd_plan(rg, meth, nn, bs, ns, bcr)
     type(btd_ring), intent(inout) :: rg
     integer, intent(in) :: meth, nn, bs(0:nn - 1)
     integer, intent(in), optional :: ns
-    integer :: J, c, k, i
+    logical, intent(in), optional :: bcr
+    integer :: J, c, k, i, l, h, kk
     integer(8) :: t
 
     rg%meth = meth; rg%nn = nn
@@ -84,6 +99,8 @@ contains
     if (allocated(rg%oc)) deallocate(rg%oc, rg%orr)
     if (allocated(rg%sep)) deallocate(rg%sep, rg%osab, rg%osba, rg%osbb)
     if (allocated(rg%sub)) deallocate(rg%sub)
+    if (allocated(rg%co)) deallocate(rg%co, rg%bd, rg%bl, rg%bu, rg%ba, rg%bb)
+    rg%sepm = 0; rg%nlev = 0
     allocate(rg%bs(0:nn - 1), rg%rp(0:nn), rg%od(0:nn - 1), rg%ou(0:nn - 1), rg%ol(0:nn - 1))
     rg%bs = bs
     rg%rp(0) = 0
@@ -125,7 +142,35 @@ contains
       enddo
       rg%nf = sum(bs(rg%sep))
       rg%of = t
-      if (rg%ns <= 3) then
+      if (present(bcr)) then
+        if (bcr .and. bcr_ok(rg%ns)) rg%sepm = 1
+      endif
+      if (rg%sepm == 1) then
+        associate (n_ => rg%ns)
+          allocate(rg%co(0:n_), rg%bd(0:n_ - 1), rg%bl(0:n_ - 1), rg%bu(0:n_ - 1))
+          rg%nlev = nint(log(dble(n_)) / log(2.d0)) - 1
+          allocate(rg%ba(0:n_ - 1, 0:rg%nlev - 1), rg%bb(0:n_ - 1, 0:rg%nlev - 1))
+          rg%bd = 0; rg%bl = 0; rg%bu = 0; rg%ba = 0; rg%bb = 0
+          rg%co(0) = 0
+          do k = 0, n_ - 1
+            rg%co(k + 1) = rg%co(k) + sb(k)
+          enddo
+          h = 1
+          do l = 0, rg%nlev - 1
+            do k = h, n_ - 1, 2 * h                      ! eliminated at level l
+              rg%bd(k) = t; t = t + int(sb(k), 8)**2
+              rg%bl(k) = t; t = t + int(sb(k), 8) * sb(modulo(k - h, n_))
+              rg%bu(k) = t; t = t + int(sb(k), 8) * sb(modulo(k + h, n_))
+            enddo
+            do kk = 0, n_ - 1, 2 * h                     ! kept
+              rg%ba(kk, l) = t; t = t + int(sb(kk), 8) * sb(modulo(kk - h, n_))
+              rg%bb(kk, l) = t; t = t + int(sb(kk), 8) * sb(modulo(kk + h, n_))
+            enddo
+            h = 2 * h
+          enddo
+          rg%bt = t; t = t + int(sb(0) + sb(h), 8)**2
+        end associate
+      else if (rg%ns <= 3) then
         t = t + int(rg%nf, 8)**2
       else
         allocate(rg%sub)
@@ -146,7 +191,19 @@ contains
       integer, intent(in) :: j_
       prv = modulo(j_ - 1, nn)
     end function prv
+
+    !> rows of separator k_
+    integer function sb(k_)
+      integer, intent(in) :: k_
+      sb = bs(rg%sep(k_))
+    end function sb
   end subroutine btd_plan
+
+  !> the separators' count suits block cyclic reduction: a power of 2, >= 4
+  logical function bcr_ok(ns)
+    integer, intent(in) :: ns
+    bcr_ok = (ns >= 4 .and. iand(ns, ns - 1) == 0)
+  end function bcr_ok
 
   !> last interior node of hybrid segment k
   integer function hyb_end(rg, k)
@@ -327,7 +384,12 @@ contains
     do k = 0, ns - 1
       co(k + 1) = co(k) + rg%bs(rg%sep(k))
     enddo
-    if (ns <= 3) then
+    if (rg%sepm == 1) then
+      call bcr_factor(rg, a, info)
+      do q = 1, rg%nf                       ! explicit inverses: no pivots
+        ipv(q) = q - co(count(co(1:ns) < q))
+      enddo
+    else if (ns <= 3) then
       a(rg%of + 1 : rg%of + int(rg%nf, 8)**2) = 0.d0
       do k = 0, ns - 1
         kp = modulo(k - 1, ns); kn = modulo(k + 1, ns)
@@ -384,6 +446,145 @@ contains
     end subroutine cpy
   end subroutine hyb_fac_sep
 
+  !> The separators' periodic block-tridiagonal chain by block cyclic
+  !! reduction (sepm 1), its blocks from the segments' Schur parts as in
+  !! hyb_fac_sep. Level l (h = 2^l, nodes k = 0, h, 2h, ...) inverts the
+  !! odd nodes' pivot blocks and folds them into the even ones:
+  !!   A = L_k Dinv_k-h, B = U_k Dinv_k+h,  D_k -= A U_k-h + B L_k+h,
+  !!   L_k <- -A L_k-h,  U_k <- -B U_k+h   (couplings to k -+ 2h),
+  !! until the pair 0, ns/2 is left, inverted whole (its two couplings, one
+  !! across each way round the ring, summed). Explicit inverses throughout:
+  !! the solve is then products only, level-parallel (the device kernel).
+  subroutine bcr_factor(rg, a, info)
+    type(btd_ring), intent(in) :: rg
+    real*8, intent(inout) :: a(*)
+    integer, intent(out)  :: info
+    type :: mat_t
+      real*8, allocatable :: m(:,:)
+    end type mat_t
+    type(mat_t), allocatable :: D(:), L(:), U(:)
+    real*8, allocatable :: AA(:,:), BB(:,:), T(:,:)
+    integer :: ns, k, km, kp, h, lv, b0, b1
+    ns = rg%ns
+    allocate(D(0:ns - 1), L(0:ns - 1), U(0:ns - 1))
+    do k = 0, ns - 1
+      km = modulo(k - 1, ns); kp = modulo(k + 1, ns)
+      D(k)%m = blk(rg%od(rg%sep(k)), sb(k), sb(k)) + blk(rg%osbb(km), sb(k), sb(k))
+      U(k)%m = blk(rg%osab(k), sb(k), sb(kp))
+      L(k)%m = blk(rg%osba(km), sb(k), sb(km))
+    enddo
+    info = 0
+    h = 1
+    do lv = 0, rg%nlev - 1
+      do k = h, ns - 1, 2 * h
+        call inv(D(k)%m, info)
+        if (info /= 0) return
+        call put(rg%bd(k), D(k)%m); call put(rg%bl(k), L(k)%m); call put(rg%bu(k), U(k)%m)
+      enddo
+      do k = 0, ns - 1, 2 * h
+        km = modulo(k - h, ns); kp = modulo(k + h, ns)
+        AA = mm(L(k)%m, D(km)%m); BB = mm(U(k)%m, D(kp)%m)
+        call put(rg%ba(k, lv), AA); call put(rg%bb(k, lv), BB)
+        D(k)%m = D(k)%m - mm(AA, U(km)%m) - mm(BB, L(kp)%m)
+        L(k)%m = -mm(AA, L(km)%m)
+        U(k)%m = -mm(BB, U(kp)%m)
+      enddo
+      h = 2 * h
+    enddo
+    b0 = sb(0); b1 = sb(h)
+    allocate(T(b0 + b1, b0 + b1))
+    T(1:b0, 1:b0) = D(0)%m;           T(1:b0, b0 + 1:) = L(0)%m + U(0)%m
+    T(b0 + 1:, 1:b0) = L(h)%m + U(h)%m; T(b0 + 1:, b0 + 1:) = D(h)%m
+    call inv(T, info)
+    if (info /= 0) return
+    call put(rg%bt, T)
+
+  contains
+
+    integer function sb(k_)
+      integer, intent(in) :: k_
+      sb = rg%bs(rg%sep(k_))
+    end function sb
+
+    function blk(o, m, n) result(r)
+      integer(8), intent(in) :: o
+      integer, intent(in) :: m, n
+      real*8 :: r(m, n)
+      r = reshape(a(o + 1 : o + int(m, 8) * n), [m, n])
+    end function blk
+
+    subroutine put(o, r)
+      integer(8), intent(in) :: o
+      real*8, intent(in) :: r(:,:)
+      a(o + 1 : o + size(r, kind=8)) = reshape(r, [size(r, kind=8)])
+    end subroutine put
+
+    function mm(x, y) result(r)
+      real*8, intent(in) :: x(:,:), y(:,:)
+      real*8 :: r(size(x, 1), size(y, 2))
+      call dgemm('N', 'N', size(x, 1), size(y, 2), size(x, 2), 1.d0, x, size(x, 1), y, size(y, 1), 0.d0, r, size(x, 1))
+    end function mm
+  end subroutine bcr_factor
+
+  !> x = x^-1 in place (dgetrf + dgetri); info /= 0: singular
+  subroutine inv(x, info)
+    real*8, intent(inout) :: x(:,:)
+    integer, intent(out)  :: info
+    integer :: n, ipv(size(x, 1)), lw
+    real*8, allocatable :: wk(:)
+    real*8 :: q(1)
+    n = size(x, 1)
+    call dgetrf(n, n, x, n, ipv, info)
+    if (info /= 0) return
+    call dgetri(n, x, n, ipv, q, -1, info)
+    lw = max(1, int(q(1)))
+    allocate(wk(lw))
+    call dgetri(n, x, n, ipv, wk, lw, info)
+  end subroutine inv
+
+  !> The device kernel's copy of a factored ring (jorek_ring_kokkos): the
+  !! factors with the interior nodes' pivot blocks as explicit inverses and,
+  !! for ns <= 3, the dense separators' system inverted. ok = .false.: the
+  !! layout has no device form (a sub-Thomas separator system).
+  subroutine btd_dev_pack(rg, a, piv, out, ok)
+    type(btd_ring), intent(in) :: rg
+    real*8, intent(in)  :: a(*)
+    integer, intent(in) :: piv(*)
+    real*8, intent(out) :: out(*)
+    logical, intent(out) :: ok
+    integer :: k, J, bj, info, lw, q, ipv(max(rg%nf, 1))
+    real*8, allocatable :: wk(:)
+    real*8 :: qw(1)
+    ok = (rg%meth == RS_HYB .and. (rg%sepm == 1 .or. rg%ns <= 3))
+    if (.not. ok) return
+    out(1:rg%tot) = a(1:rg%tot)
+    do k = 0, rg%ns - 1
+      do J = rg%sep(k) + 1, hyb_end(rg, k)
+        bj = rg%bs(J)
+        call dgetri(bj, out(rg%od(J) + 1), bj, piv(rg%rp(J) + 1), qw, -1, info)
+        lw = max(1, int(qw(1)))
+        if (.not. allocated(wk)) allocate(wk(lw))
+        if (size(wk) < lw) then
+          deallocate(wk); allocate(wk(lw))
+        endif
+        call dgetri(bj, out(rg%od(J) + 1), bj, piv(rg%rp(J) + 1), wk, size(wk), info)
+      enddo
+    enddo
+    if (rg%sepm == 0) then
+      q = 0
+      do k = 0, rg%ns - 1
+        J = rg%sep(k)
+        ipv(q + 1 : q + rg%bs(J)) = piv(rg%rp(J) + 1 : rg%rp(J + 1))
+        q = q + rg%bs(J)
+      enddo
+      call dgetri(rg%nf, out(rg%of + 1), rg%nf, ipv, qw, -1, info)
+      lw = max(1, int(qw(1)))
+      if (allocated(wk)) deallocate(wk)
+      allocate(wk(lw))
+      call dgetri(rg%nf, out(rg%of + 1), rg%nf, ipv, wk, lw, info)
+    endif
+  end subroutine btd_dev_pack
+
   !> a4 = a, rounded to single: the factors of one ring for the *_sp solves
   subroutine btd_to_sp(rg, a, a4)
     type(btd_ring), intent(in) :: rg
@@ -401,6 +602,7 @@ contains
 #define HYB_SOL_FWD hyb_sol_fwd
 #define HYB_SOL_SEP hyb_sol_sep
 #define HYB_SOL_BWD hyb_sol_bwd
+#define BCR_SOLVE bcr_solve
 #include "mod_gmg_ring_btd_solve.inc"
 #undef RK
 #undef GEMV
@@ -410,6 +612,7 @@ contains
 #undef HYB_SOL_FWD
 #undef HYB_SOL_SEP
 #undef HYB_SOL_BWD
+#undef BCR_SOLVE
 #define RK 4
 #define GEMV sgemv
 #define GETRS sgetrs
@@ -418,6 +621,7 @@ contains
 #define HYB_SOL_FWD hyb_sol_fwd_sp
 #define HYB_SOL_SEP hyb_sol_sep_sp
 #define HYB_SOL_BWD hyb_sol_bwd_sp
+#define BCR_SOLVE bcr_solve_sp
 #include "mod_gmg_ring_btd_solve.inc"
 
 end module mod_gmg_ring_btd

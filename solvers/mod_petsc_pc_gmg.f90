@@ -39,7 +39,9 @@ module mod_petsc_pc_gmg
   use iso_c_binding, only: c_ptr, c_double, c_null_ptr, c_associated
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach, &
                                aij_vals_write, aij_vals_written
-  use mod_petsc_blk_dev, only: blk_dev_available, blk_dev_pattern, blk_dev_spike, blk_dev_values, blk_dev_apply, blk_dev_free
+  use mod_petsc_blk_dev, only: blk_dev_available, blk_dev_pattern, blk_dev_spike, blk_dev_values, blk_dev_apply, blk_dev_free, &
+                               ring_dev_pattern, ring_dev_values, ring_dev_factor, ring_dev_fillmap, ring_dev_apply, &
+                               blk_dev_fillmap, blk_dev_fill, crs_dev_has, crs_dev_map, crs_dev_setup, crs_dev_apply, crs_dev_free, vec_touch
   use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_refill, axd_factor, axd_solve
   use mod_gmg_ring_btd
   implicit none
@@ -48,7 +50,7 @@ module mod_petsc_pc_gmg
   public :: gmg_build_prolongations, gmg_setup_operator, gmg_vcycle_apply, gmg_is_ready
   public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5
   public :: gmg_pc_apply_1, gmg_pc_apply_2
-  public :: gmg_push, gmg_pop
+  public :: gmg_push, gmg_pop, gmg_dev_ops, gmg_mat_dev, gmg_dev_on, gmg_dev_mtype, gmg_is_dev_mat
   public :: gmg_opts_t
 
   !> Everything that configures a hierarchy, passed EXPLICITLY by the caller
@@ -143,6 +145,29 @@ module mod_petsc_pc_gmg
   logical, save     :: dev = .false.
   logical, save     :: dev_blocks = .true.    !< -sf_gpu_blocks: block smoothers on the device too
   logical, save     :: blk_host = .false.     !< blk_apply on the host factors (the gate's reference)
+  ! Device ring solver (jorek_ring_kokkos, smoother 4): the ring blocks by the
+  ! Thomas / reduction hybrid with -sf_gpu_ring_m interior nodes per segment
+  ! (-1: auto, enough segments to fill the device) and its separators by
+  ! block cyclic reduction; -sf_gpu_ring_single: its factors in single.
+  integer, save     :: dev_ring_m = -1
+  logical, save     :: dev_any = .false.          !< some hierarchy runs on the device path
+  character(len=64), save :: dev_mtype = "aijkokkos"   !< -sf_gpu_mat_type
+  integer, save     :: dev_coarse = 0           !< -sf_gpu_coarse: 0 host, 1 dense inverse, 2 cuDSS, 3 auto
+  !> -sf_gpu_coarse 3 (default with cuDSS): the dense inverse up to this many
+  !! rows, cuDSS above. A small solve is latency-bound and the inverse's one
+  !! product beats cuDSS's triangular sweeps (161x64 nt7: axis blocks of a few
+  !! hundred rows 65 us per cuDSS solve, coarse 1288 rows dense 21 us); the
+  !! n^2 storage bounds it (-sf_gpu_coarse_dense_max).
+  integer, save     :: dev_dense_max = 6000
+  logical, save     :: dev_ring_sp = .true.
+  !> -sf_gpu_ptap: the Galerkin chain on the device (MatPtAP of the device
+  !! copies, the coarse operators device matrices themselves; the host setup
+  !! reads them after a sync), instead of on the host and copied over
+  logical, save     :: dev_ptap = .true.
+  !> -sf_gpu_factor: the ring / line blocks factored on the device (batched
+  !! cuBLAS, or threaded LAPACK on host backends) from their unfactored
+  !! values; the host factors them only for the first build's gate
+  logical, save     :: dev_fac = .true.
   Mat, save         :: gAd(0:MAX_LEV-1), gPd(1:MAX_LEV-1), gFd
 
   !> A direct solve of A(rows, rows) done REDUNDANTLY on the ranks that own
@@ -163,6 +188,14 @@ module mod_petsc_pc_gmg
     Mat, pointer :: sub(:) => null()
     KSP :: ksp
     Vec :: b, x
+    logical :: fresh = .true.      !< the last rds_setup extracted anew
+    ! device solve (-sf_gpu_coarse, the coarsest level and the axis blocks on
+    ! the device path): dmode 1 dense inverse / 2 cuDSS; handle dh on every
+    ! rank (its gather / return map, jorek_crs_kokkos_map), the factors on
+    ! the members
+    integer :: dmode = 0
+    type(c_ptr) :: dh = c_null_ptr
+    real*8 :: dmb = 0.d0
   end type rds_t
 
   ! The block smoothers (Chacon 2025 S4.1, extended along rings and radial
@@ -226,6 +259,13 @@ module mod_petsc_pc_gmg
     integer, allocatable    :: vs(:), gs(:)
     integer(8), allocatable :: vd(:), gd(:)
     integer(8) :: nvd = 0, nvo = 0, nvg = 0          !< source value-array lengths
+    ! Device fill (-sf_gpu_factor): the maps' entries into ring-solver blocks
+    ! live on the device (ring_dev_fillmap, built for pattern dmap_pat); the
+    ! host fills only the rest, hvs / hvd and hgs / hgd -- or, once those are
+    ! on the device too (blk_dev_fillmap, pattern bmap_pat), nothing
+    integer, allocatable    :: hvs(:), hgs(:)
+    integer(8), allocatable :: hvd(:), hgd(:)
+    integer(8) :: dmap_pat = -1, bmap_pat = -1
     integer(8) :: pat_id = -1, pat_nz = -1
     ! Device path: the factors' copy on the device (mod_petsc_blk_dev), which
     ! then does the solves of every block but the axis blocks; null = host.
@@ -234,6 +274,10 @@ module mod_petsc_pc_gmg
     ! the level failed blk_dev_gate and keeps the host solves for good.
     type(c_ptr) :: dh = c_null_ptr
     real*8 :: dstat(6) = 0.d0
+    ! device ring solver (jorek_ring_kokkos) for the ring-solver blocks;
+    ! rstat = rings, segments per ring, largest node block, device MB
+    type(c_ptr) :: rh = c_null_ptr
+    real*8 :: rstat(4) = 0.d0
     logical :: dev_off = .false.
     ! ring_solver > 0: ring blocks solved as periodic block-tridiagonal
     ! chains of node blocks (mod_gmg_ring_btd). btd(b) marks them; their rows
@@ -244,7 +288,7 @@ module mod_petsc_pc_gmg
     ! (block lb, segment lk) work items of all the rank's rings, and the work
     ! vector wk (block order) the threaded solve runs on.
     logical, allocatable :: btd(:), jac(:)
-    integer, allocatable :: qn(:), ghJ(:)
+    integer, allocatable :: qn(:), ghJ(:), ghI(:)   !< ghI: I of each ghost row
     type(btd_ring), allocatable :: rg(:)
     integer, allocatable :: lb(:), lk(:)
     real*8, allocatable :: wk(:)
@@ -275,6 +319,7 @@ module mod_petsc_pc_gmg
   integer, save :: rsolv = 0, rbmin = 0, rchk = 0   !< gmg_opts_t%ring_solver / ring_btd_min / ring_check
   integer, save :: rseg = 0                         !< gmg_opts_t%ring_segs
   logical, save :: rsp = .false.                    !< gmg_opts_t%ring_single
+  integer, save :: rbcr = 0                         !< -sf_gmg<k>_ring_bcr: separators by block cyclic reduction
   integer, save :: semi_r = 0               !< gmg_opts_t%semi_r, of the hierarchy being built
   integer, save :: axsec = 0                !< axis J-sectors (gmg_opts_t%axis_sectors)
   integer, save :: gcomm = 0, gme = 0       !< communicator and rank of the hierarchy
@@ -302,7 +347,7 @@ module mod_petsc_pc_gmg
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
     integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 0, rovl = 0
-    integer :: rsolv = 0, rbmin = 0, rchk = 0, rseg = 0
+    integer :: rsolv = 0, rbmin = 0, rchk = 0, rseg = 0, rbcr = 0
     logical :: rsp = .false.
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false.
@@ -327,7 +372,7 @@ module mod_petsc_pc_gmg
   ! -log_view events (Workstream D cost audit). Registered here, not in the
   ! physics-PC ctx, so this module keeps no dependency on it.
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1
-  PetscLogEvent, save :: gev_prolong = -1, gev_dev = -1
+  PetscLogEvent, save :: gev_prolong = -1, gev_dev = -1, gev_rfac = -1
   PetscLogEvent, save :: gev_blkmesh = -1, gev_blkpat = -1, gev_blknum = -1, gev_axnum = -1, gev_axtry = -1
   ! Workstream G, finding D3: these are per INSTANCE, like gev_vcycle. While
   ! they were shared, no -log_view number could attribute line or axis time to
@@ -375,7 +420,7 @@ contains
       S%nlev = nlev; S%nth0 = nth0; S%nf_s = nf_s; S%sm_type = sm_type; S%sm_nstep = sm_nstep
       S%ring_is = ring_is; S%axis_k = axis_k
       S%lovl = lovl; S%axsec = axsec; S%hpair = hpair; S%rovl = rovl
-      S%rsolv = rsolv; S%rbmin = rbmin; S%rchk = rchk; S%rsp = rsp; S%rseg = rseg
+      S%rsolv = rsolv; S%rbmin = rbmin; S%rchk = rchk; S%rsp = rsp; S%rseg = rseg; S%rbcr = rbcr
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready
       S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm
@@ -394,7 +439,7 @@ contains
       nlev = S%nlev; nth0 = S%nth0; nf_s = S%nf_s; sm_type = S%sm_type; sm_nstep = S%sm_nstep
       ring_is = S%ring_is; axis_k = S%axis_k
       lovl = S%lovl; axsec = S%axsec; hpair = S%hpair; rovl = S%rovl
-      rsolv = S%rsolv; rbmin = S%rbmin; rchk = S%rchk; rsp = S%rsp; rseg = S%rseg
+      rsolv = S%rsolv; rbmin = S%rbmin; rchk = S%rchk; rsp = S%rsp; rseg = S%rseg; rbcr = S%rbcr
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready
       gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm
@@ -444,15 +489,23 @@ contains
     if (allocated(a%vd))   call move_alloc(a%vd,   b%vd)
     if (allocated(a%gd))   call move_alloc(a%gd,   b%gd)
     b%nvd = a%nvd; b%nvo = a%nvo; b%nvg = a%nvg
+    if (allocated(a%hvs))  call move_alloc(a%hvs,  b%hvs)
+    if (allocated(a%hgs))  call move_alloc(a%hgs,  b%hgs)
+    if (allocated(a%hvd))  call move_alloc(a%hvd,  b%hvd)
+    if (allocated(a%hgd))  call move_alloc(a%hgd,  b%hgd)
+    b%dmap_pat = a%dmap_pat; a%dmap_pat = -1
+    b%bmap_pat = a%bmap_pat; a%bmap_pat = -1
     b%axdon = a%axdon; a%axdon = .false.
     if (allocated(a%axd))  call move_alloc(a%axd,  b%axd)
     b%pat_id = a%pat_id; b%pat_nz = a%pat_nz; a%pat_id = -1; a%pat_nz = -1
     b%dh = a%dh; a%dh = c_null_ptr; b%dstat = a%dstat
+    b%rh = a%rh; a%rh = c_null_ptr; b%rstat = a%rstat
     b%dev_off = a%dev_off; a%dev_off = .false.
     if (allocated(a%btd))  call move_alloc(a%btd,  b%btd)
     if (allocated(a%jac))  call move_alloc(a%jac,  b%jac)
     if (allocated(a%qn))   call move_alloc(a%qn,   b%qn)
     if (allocated(a%ghJ))  call move_alloc(a%ghJ,  b%ghJ)
+    if (allocated(a%ghI))  call move_alloc(a%ghI,  b%ghI)
     if (allocated(a%rg))   call move_alloc(a%rg,   b%rg)
     if (allocated(a%lb))   call move_alloc(a%lb,   b%lb)
     if (allocated(a%lk))   call move_alloc(a%lk,   b%lk)
@@ -467,6 +520,8 @@ contains
     b%ready = a%ready; b%member = a%member
     b%comm = a%comm; b%np = a%np; b%me = a%me
     b%isq = a%isq; b%ksp = a%ksp; b%b = a%b; b%x = a%x
+    b%fresh = a%fresh; b%dmode = a%dmode; b%dh = a%dh; b%dmb = a%dmb
+    a%dmode = 0; a%dh = c_null_ptr
     b%sub => a%sub; a%sub => null()
     a%ready = .false.; a%member = .false.; a%comm = MPI_COMM_NULL; a%np = 0; a%me = 0
     if (allocated(a%loc))  call move_alloc(a%loc,  b%loc)
@@ -495,6 +550,7 @@ contains
     ! a new operator pattern: the submatrix and the factorisation's symbolic
     ! phase are pattern-bound, the members and the row set are not
     fresh = .not. R%ready .or. pat_fresh
+    R%fresh = fresh
     if (R%ready .and. pat_fresh) then
       call MatDestroySubMatrices(one, R%sub, ierr)
       if (R%member) then
@@ -570,7 +626,9 @@ contains
         call KSPSetOperators(R%ksp, rds_op(R), rds_op(R), ierr)
       endif
     endif
-    if (R%member) then
+    ! the device solve in use (rds_dev_setup, after the first build's gate):
+    ! no host LU, the factorisation is the device's
+    if (R%member .and. .not. (R%dmode > 0 .and. dev_fac)) then
       call KSPSetUp(R%ksp, ierr)
       ! PETSc's LU does not pivot: on a failed factorisation, MUMPS instead
       block
@@ -666,6 +724,84 @@ contains
     call VecRestoreArrayRead(xx, xp, ie)
   end subroutine rds_solve
 
+  !> The device form of R (after rds_setup): the gather / return scatters on
+  !! the level vectors' type (v), once, and the member's factorisation on the
+  !! device, every rebuild. The first build checks it against the host solve
+  !! on a random vector; a miss (or a failed device factorisation) keeps the
+  !! host solve for good (dmode -1).
+  subroutine rds_dev_setup(R, v, what)
+    type(rds_t), intent(inout) :: R
+    Vec, intent(in) :: v
+    character(len=*), intent(in) :: what
+    real*8, parameter :: CRS_GATE_TOL = 1.d-8
+    PetscErrorCode :: ierr
+    PetscInt :: ntot, rst, ren, nl, o
+    Vec :: y1, y2
+    real*8 :: dn, yn, mb
+    integer :: mpierr, vcomm, vme
+    logical :: first
+    ! the reductions on the level vector's own communicator
+    call PetscObjectGetComm(v, vcomm, ierr)
+    call MPI_Comm_rank(vcomm, vme, mpierr)
+    first = (R%dmode == 0)
+    if (first) then
+      call ISGetSize(R%isq, ntot, ierr)
+      call VecGetOwnershipRange(v, rst, ren, ierr)
+      nl = 0; o = 0
+      if (R%member) then
+        nl = size(R%loc); o = R%dsp(R%me)
+      endif
+      if (R%member) call crs_dev_map(R%dh, int(ntot), R%loc, int(o), R%comm, R%cnt, R%dsp)
+      ! only the members solve: each decides from the block's size alone
+      R%dmode = dev_coarse
+      if (dev_coarse == 3) R%dmode = merge(1, 2, ntot <= dev_dense_max)
+    endif
+    mb = 0.d0
+    if (R%member) call crs_dev_setup(R%dh, R%dmode, R%fresh .or. first, rds_op(R), mb)
+    R%dmb = mb
+    if (.not. first) return
+    ! gate: device vs host on a random right-hand side
+    call VecDuplicate(v, y1, ierr); call VecDuplicate(v, y2, ierr)
+    call VecSetRandom(y1, PETSC_NULL_RANDOM, ierr)
+    call VecCopy(y1, y2, ierr)
+    block
+      Vec :: x1, x2
+      call VecDuplicate(v, x1, ierr); call VecDuplicate(v, x2, ierr)
+      call VecZeroEntries(x1, ierr); call VecZeroEntries(x2, ierr)
+      call rds_solve(R, y1, x1)
+      call rds_solve_dev(R, y2, x2)
+      call vec_touch(x1)                         ! the members' writes: no cached norm left
+      call VecNorm(x1, NORM_2, yn, ierr)
+      call VecAXPY(x1, -1.d0, x2, ierr)
+      call VecNorm(x1, NORM_2, dn, ierr)
+      call VecDestroy(x1, ierr); call VecDestroy(x2, ierr)
+    end block
+    call VecDestroy(y1, ierr); call VecDestroy(y2, ierr)
+    dn = dn / max(yn, 1.d-300)
+    call MPI_Allreduce(MPI_IN_PLACE, mb, 1, MPI_DOUBLE_PRECISION, MPI_MAX, vcomm, mpierr)
+    if (vme == 0) write(*,'(A,I0,A,A,A,A,A,ES9.2,A,A,F0.1,A)') "[Physics PC]   GMG", cur_inst, ": ", what, " on the device (", &
+      trim(merge("cuDSS        ", "dense inverse", R%dmode == 2)), ") vs host ", dn, &
+      merge(" -> in use       ", " -> WARNING: host", dn <= CRS_GATE_TOL), ", ", mb, " MB"
+    if (.not. (dn <= CRS_GATE_TOL)) then
+      call crs_dev_free(R%dh)
+      R%dmode = -1
+    endif
+  end subroutine rds_dev_setup
+
+  !> yy(R%loc) = A(rows, rows)^-1 xx(R%loc) on the device, members only (the
+  !! members exchange their parts among themselves)
+  subroutine rds_solve_dev(R, xx, yy)
+    type(rds_t), intent(inout) :: R
+    Vec :: xx, yy
+    PetscErrorCode :: ie
+    if (R%member) then
+      call crs_dev_apply(R%dh, xx, yy)
+    else
+      call vec_touch(yy)                         ! as on the members: no cached norm left
+    endif
+    ie = 0
+  end subroutine rds_solve_dev
+
   !> rds_solve on the arrays of xx and yy (blk_apply holds them already).
   subroutine rds_solve_arr(R, xp, yp)
     type(rds_t), intent(inout) :: R
@@ -710,13 +846,16 @@ contains
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
   end subroutine gmg_vcycle
 
-  !> The V-cycle on the caller's vectors. On the device path they are host
-  !! vectors (the block's Krylov solver owns them): level 0's own pair, unused
-  !! by the cycle otherwise, carries them to the device and back.
+  !> The V-cycle on the caller's vectors. On the device path they are device
+  !! vectors when the block's Krylov solver runs there too (gmg_dev_ops),
+  !! else host vectors: level 0's own pair, unused by the cycle otherwise,
+  !! then carries them to the device and back.
   subroutine vcycle_top(b, x)
     Vec :: b, x
     PetscErrorCode :: ierr
-    if (dev) then
+    VecType :: vt
+    if (dev) call VecGetType(b, vt, ierr)
+    if (dev .and. index(vt, "kokkos") == 0) then
       call VecCopy(b, gb(0), ierr)
       call vcycle(0, gb(0), gx(0))
       call VecCopy(gx(0), x, ierr)
@@ -1367,14 +1506,51 @@ contains
     gA(0) = A
     gF = A
     if (present(Afine)) gF = Afine
+    if (.not. op_ready) call dev_options()
     call PetscLogEventBegin(gev_ptap, ierr)
-    do g = 1, nlev - 1
-      if (reuse) then
-        call MatPtAP(gA(g - 1), gP(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
+    if (dev .and. dev_ptap) then
+      ! the Galerkin chain on the device: from the fine operator's device
+      ! copy (made, or refilled, here) and the prolongations' (made once)
+      call PetscLogEventBegin(gev_dev, ierr)
+      if (gmg_is_dev_mat(gA(0))) then
+        ! the operator is a device matrix already (the SF path's device
+        ! gather): used as it is; the host setup below reads its synced copy
+        if (op_ready .and. gAd(0) /= gA(0)) call MatDestroy(gAd(0), ierr)
+        gAd(0) = gA(0)
+        call mat_host_sync(gA(0))
+      else if (op_ready .and. reuse .and. gAd(0) /= gA(0)) then
+        call dev_refill(gA(0), gAd(0))
       else
-        call MatPtAP(gA(g - 1), gP(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
+        if (op_ready .and. gAd(0) /= gA(0)) call MatDestroy(gAd(0), ierr)
+        call dev_copy(gA(0), gAd(0))
       endif
-    enddo
+      if (.not. op_ready) then
+        do g = 1, nlev - 1
+          call dev_copy(gP(g), gPd(g))
+        enddo
+      endif
+      call PetscLogEventEnd(gev_dev, ierr)
+      do g = 1, nlev - 1
+        if (reuse) then
+          call MatPtAP(gAd(g - 1), gPd(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
+        else
+          call MatPtAP(gAd(g - 1), gPd(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
+        endif
+        gAd(g) = gA(g)
+      enddo
+      ! the host setup (blocks, axis, coarse LU) reads them next
+      do g = 1, nlev - 1
+        call mat_host_sync(gA(g))
+      enddo
+    else
+      do g = 1, nlev - 1
+        if (reuse) then
+          call MatPtAP(gA(g - 1), gP(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
+        else
+          call MatPtAP(gA(g - 1), gP(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
+        endif
+      enddo
+    endif
     call PetscLogEventEnd(gev_ptap, ierr)
     ! the multiply kernel each level's matvecs actually run: MatPtAP decides
     ! the coarse types, whatever the fine operator was converted to
@@ -1445,9 +1621,12 @@ contains
     if (sm_type == 4) call opt_int("ring_overlap", rovl)
     rsolv = o%ring_solver
     call opt_int("ring_solver", rsolv)
-    if (rsolv < 0) rsolv = merge(RS_HYB, RS_LAPACK, hpair >= 2)
+    ! the device ring solver needs the hybrid's layout
+    if (rsolv < 0) rsolv = merge(RS_HYB, RS_LAPACK, hpair >= 2 .or. dev_ring())
     rseg = max(o%ring_segs, 0)
     call opt_int("ring_segs", rseg)
+    rbcr = merge(1, 0, dev_ring())
+    call opt_int("ring_bcr", rbcr)
     rbmin = max(o%ring_btd_min, 0)
     call opt_int("ring_btd_min", rbmin)
     rchk = max(o%ring_check, 0)
@@ -1465,6 +1644,8 @@ contains
     endif
     axsec = 0
     if (axis_k /= 0) axsec = o%axis_sectors
+    ! device path: the axis block's LU (rds_t), which has a device form
+    if (axis_k /= 0 .and. dev .and. dev_coarse > 0) axsec = 0
     if (axis_k /= 0) call opt_int("axis_sectors", axsec)
     ! Levels g >= rich_from smooth with Richardson on the same blocks instead
     ! of GMRES: no norm, no inner product, so no global reduction below that
@@ -1597,6 +1778,22 @@ contains
       enddo
       vec_ready = .true.
     endif
+    ! the coarsest level's solve and the axis blocks' LUs on the device too
+    ! (first build: gated)
+    if (dev .and. dev_coarse > 0) then
+      call PetscLogEventBegin(gev_coarselu, ierr)
+      if (gcrs%dmode >= 0) call rds_dev_setup(gcrs, gx(nlev - 1), "coarse solve")
+      do g = 0, nlev - 2
+        if (.not. gBk(g)%axsparse .or. gBk(g)%axdon) cycle
+        if (gBk(g)%axg(1)%dmode < 0) cycle
+        block
+          character(len=32) :: lab
+          write(lab, '(A,I0)') "axis block level ", g
+          call rds_dev_setup(gBk(g)%axg(1), gx(g), trim(lab))
+        end block
+      enddo
+      call PetscLogEventEnd(gev_coarselu, ierr)
+    endif
     ! The C_op report describes the hierarchy's structure, frozen after the
     ! first build: first build only.
     pat_fresh = .false.
@@ -1617,6 +1814,117 @@ contains
     if (my_id == 0) write(*,'(A,F6.3)') "   C_op = ", nzt / max(nz0, 1.d0)
   end subroutine gmg_setup_operator
 
+  !> The device path is on (-sf_gpu, read at the first hierarchy's build)
+  logical function gmg_dev_on()
+    gmg_dev_on = dev_any
+  end function gmg_dev_on
+
+  !> the device matrix type (-sf_gpu_mat_type)
+  function gmg_dev_mtype() result(t)
+    character(len=64) :: t
+    t = dev_mtype
+  end function gmg_dev_mtype
+
+  !> M is of the device matrix type already (e.g. the SF operators gathered
+  !! on the device: mpiaijkokkos for -sf_gpu_mat_type aijkokkos)
+  logical function gmg_is_dev_mat(M)
+    Mat, intent(in) :: M
+    character(len=80) :: tm
+    PetscErrorCode :: ierr
+    call MatGetType(M, tm, ierr)
+    gmg_is_dev_mat = (index(tm, trim(dev_mtype)) > 0)
+  end function gmg_is_dev_mat
+
+  !> D = a device copy of the AIJ matrix S (fresh: created anew, else S's
+  !! values refilled into D, same pattern), for the SF apply's couplings; S
+  !! itself when it is a device matrix already
+  subroutine gmg_mat_dev(S, D, fresh)
+    Mat, intent(in) :: S
+    Mat, intent(inout) :: D
+    logical, intent(in) :: fresh
+    PetscErrorCode :: ierr
+    if (gmg_is_dev_mat(S)) then
+      D = S
+    else if (fresh) then
+      call MatDuplicate(S, MAT_COPY_VALUES, D, ierr)
+      call MatConvert(D, trim(dev_mtype), MAT_INPLACE_MATRIX, D, ierr)
+    else
+      call dev_refill(S, D)
+    endif
+  end subroutine gmg_mat_dev
+
+  !> Hierarchy k's operators for its block's Krylov solver on the device
+  !! path: on = its V-cycle is on the device and the fine operator is a
+  !! device matrix (not a matrix-free shell); Fd = that operator, Ad = gAd(0).
+  !! Leaves hierarchy k selected.
+  subroutine gmg_dev_ops(k, on, Fd, Ad)
+    integer, intent(in) :: k
+    logical, intent(out) :: on
+    Mat, intent(out) :: Fd, Ad
+    MatType :: mt
+    PetscErrorCode :: ierr
+    call gmg_select(k)
+    on = dev
+    if (.not. on) return
+    call MatGetType(gFd, mt, ierr)
+    on = (index(mt, "kokkos") > 0)
+    Fd = gFd; Ad = gAd(0)
+  end subroutine gmg_dev_ops
+
+  !> The ring blocks go to the device ring solver (jorek_ring_kokkos) on the
+  !! device path: rings (smoother 4), radial lines (5), and both colours of
+  !! the zebra smoothers (7 lines, 8 rings inside ring_lim / lines outside)
+  logical function zebra_sm()
+    zebra_sm = (sm_type == 7 .or. sm_type == 8)
+  end function zebra_sm
+
+  logical function dev_ring()
+    dev_ring = dev .and. dev_blocks .and. (sm_type == 4 .or. sm_type == 5 .or. sm_type == 7 .or. sm_type == 8)
+  end function dev_ring
+
+  !> The device path's options of the active hierarchy (first build, before
+  !! its Galerkin chain)
+  subroutine dev_options()
+    PetscErrorCode :: ierr
+    PetscInt :: pv
+    PetscBool :: set
+    integer :: idev
+    if (.not. op_ready) then
+      pv = 0
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu", pv, set, ierr)
+      idev = int(pv)
+      call opt_int("gpu", idev)
+      dev = (idev > 0)
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_mat_type", dev_mtype, set, ierr)
+      dev_any = dev_any .or. dev
+      pv = 1
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_blocks", pv, set, ierr)
+      dev_blocks = (pv > 0 .and. blk_dev_available())
+      pv = -1
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_ring_m", pv, set, ierr)
+      dev_ring_m = int(pv)
+      pv = 1
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_ring_single", pv, set, ierr)
+      dev_ring_sp = (pv > 0)
+      pv = merge(3, 1, crs_dev_has(2))
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_coarse", pv, set, ierr)
+      dev_coarse = int(pv)
+      if (dev_coarse == 3 .and. .not. crs_dev_has(2)) dev_coarse = 1
+      if (dev_coarse > 0 .and. dev_coarse < 3) then
+        if (.not. crs_dev_has(dev_coarse)) dev_coarse = 0
+      endif
+      pv = dev_dense_max
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_coarse_dense_max", pv, set, ierr)
+      dev_dense_max = int(pv)
+      pv = 1
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_ptap", pv, set, ierr)
+      dev_ptap = (pv > 0)
+      pv = 1
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_factor", pv, set, ierr)
+      dev_fac = (pv > 0)
+    endif
+  end subroutine dev_options
+
   !> The operators the V-cycle multiplies with: gAd / gPd / gFd. Host path:
   !! the level operators themselves. Device path (-sf_gpu 1, or -sf_gmg<k>_gpu
   !! for one hierarchy): copies of type -sf_gpu_mat_type (default aijkokkos,
@@ -1626,25 +1934,11 @@ contains
   subroutine dev_operators(my_id, reuse)
     integer, intent(in) :: my_id
     logical, intent(in) :: reuse
-    character(len=64), save :: mtype = "aijkokkos"
     character(len=80) :: tf
     PetscErrorCode :: ierr
-    PetscInt :: pv
-    PetscBool :: set
-    integer :: g, idev
+    integer :: g
     logical :: fresh, own_f
 
-    if (.not. op_ready) then
-      pv = 0
-      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu", pv, set, ierr)
-      idev = int(pv)
-      call opt_int("gpu", idev)
-      dev = (idev > 0)
-      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_mat_type", mtype, set, ierr)
-      pv = 1
-      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_blocks", pv, set, ierr)
-      dev_blocks = (pv > 0 .and. blk_dev_available())
-    endif
     if (.not. dev) then
       gAd = gA; gPd = gP; gFd = gF
       return
@@ -1653,17 +1947,28 @@ contains
     fresh = .not. (op_ready .and. reuse)
     call MatGetType(gF, tf, ierr)
     own_f = (gF /= gA(0) .and. index(tf, "aij") > 0)
-    do g = 0, nlev - 1
-      if (fresh) then
-        if (op_ready) call MatDestroy(gAd(g), ierr)
-        call dev_copy(gA(g), gAd(g))
-      else
-        call dev_refill(gA(g), gAd(g))
+    ! -sf_gpu_ptap: the fine copy and the prolongations were made before the
+    ! (device) Galerkin chain, whose coarse operators are device matrices
+    if (.not. dev_ptap) then
+      do g = 0, nlev - 1
+        if (gmg_is_dev_mat(gA(g))) then                ! a device matrix already: itself
+          if (op_ready .and. gAd(g) /= gA(g)) call MatDestroy(gAd(g), ierr)
+          gAd(g) = gA(g)
+        else if (fresh) then
+          if (op_ready .and. gAd(g) /= gA(g)) call MatDestroy(gAd(g), ierr)
+          call dev_copy(gA(g), gAd(g))
+        else
+          call dev_refill(gA(g), gAd(g))
+        endif
+      enddo
+      if (.not. op_ready) then
+        do g = 1, nlev - 1
+          call dev_copy(gP(g), gPd(g))
+        enddo
       endif
-    enddo
-    if (.not. op_ready) then
+    else
       do g = 1, nlev - 1
-        call dev_copy(gP(g), gPd(g))
+        gAd(g) = gA(g)
       enddo
     endif
     if (own_f) then
@@ -1687,18 +1992,39 @@ contains
 
   contains
 
-    !> D = a device-type copy of S. Not MatConvert(S, ..., MAT_INITIAL_MATRIX):
-    !! PETSc 3.25.3's MPIAIJ -> MPIAIJKokkos conversion then retypes the
-    !! SOURCE's diagonal/off-diagonal parts and ghost vector instead of the
-    !! copy's (mpiaijkok.kokkos.cxx, MatConvert_MPIAIJ_MPIAIJKokkos), which
-    !! breaks the host operator the setup keeps using. In place it is right.
-    subroutine dev_copy(S, D)
-      Mat, intent(in)  :: S
-      Mat, intent(out) :: D
-      call MatDuplicate(S, MAT_COPY_VALUES, D, ierr)
-      call MatConvert(D, trim(mtype), MAT_INPLACE_MATRIX, D, ierr)
-    end subroutine dev_copy
   end subroutine dev_operators
+
+  !> D = a device-type copy of S. Not MatConvert(S, ..., MAT_INITIAL_MATRIX):
+  !! PETSc 3.25.3's MPIAIJ -> MPIAIJKokkos conversion then retypes the
+  !! SOURCE's diagonal/off-diagonal parts and ghost vector instead of the
+  !! copy's (mpiaijkok.kokkos.cxx, MatConvert_MPIAIJ_MPIAIJKokkos), which
+  !! breaks the host operator the setup keeps using. In place it is right.
+  subroutine dev_copy(S, D)
+    Mat, intent(in)  :: S
+    Mat, intent(out) :: D
+    PetscErrorCode :: ierr
+    call MatDuplicate(S, MAT_COPY_VALUES, D, ierr)
+    call MatConvert(D, trim(dev_mtype), MAT_INPLACE_MATRIX, D, ierr)
+  end subroutine dev_copy
+
+  !> M's values on the host up to date with the device's (a device AIJ's host
+  !! readers -- MatGetRow, MatCreateSubMatrices -- read its host array as it
+  !! is; a GetArrayRead syncs it)
+  subroutine mat_host_sync(M)
+    Mat, intent(in) :: M
+    Mat :: Md, Mo
+    PetscInt, pointer :: garr(:)
+    logical :: has_o
+    type(c_ptr) :: p
+    real(c_double), pointer :: v(:)
+    call aij_parts(M, Md, Mo, garr, has_o)
+    call aij_vals_read(Md, 1_8, p, v)
+    call aij_vals_done(Md, p)
+    if (has_o) then
+      call aij_vals_read(Mo, 1_8, p, v)
+      call aij_vals_done(Mo, p)
+    endif
+  end subroutine mat_host_sync
 
   !> First build: the device block solves of every level against the host
   !! factors they were copied from, on a random vector. Same algorithm, so the
@@ -1707,6 +2033,10 @@ contains
   subroutine blk_dev_gate(my_id)
     integer, intent(in) :: my_id
     real*8, parameter :: DEV_GATE_TOL = 1.d-10
+    ! the ring solver's device form differs from the host's (explicit
+    ! inverses, cyclic reduction, single precision): a coarser gate, for bugs
+    real*8, parameter :: RING_GATE_TOL = 1.d-6, RING_GATE_TOL_SP = 1.d-3
+    real*8 :: tol, rs(4)
     PC  :: nopc
     Vec :: x, y1, y2
     PetscErrorCode :: ierr
@@ -1717,7 +2047,7 @@ contains
     call MPI_Comm_rank(gcomm, crank, mpierr)
     lev0 = cur_lev
     do g = 0, nlev - 2
-      has = c_associated(gBk(g)%dh)
+      has = c_associated(gBk(g)%dh) .or. c_associated(gBk(g)%rh)
       call MPI_Allreduce(MPI_IN_PLACE, has, 1, MPI_LOGICAL, MPI_LOR, gcomm, mpierr)
       if (.not. has) cycle
       call MatCreateVecs(gAd(g), x, y1, ierr)
@@ -1743,16 +2073,27 @@ contains
       call MPI_Allreduce(MPI_IN_PLACE, st(1:2), 2, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
       call MPI_Allreduce(MPI_IN_PLACE, sm, 1, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
       call MPI_Allreduce(MPI_IN_PLACE, sp, 3, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
-      if (.not. (dn <= DEV_GATE_TOL)) then
+      rs = 0.d0
+      if (c_associated(gBk(g)%rh)) rs = gBk(g)%rstat
+      call MPI_Allreduce(MPI_IN_PLACE, rs(1), 1, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
+      call MPI_Allreduce(MPI_IN_PLACE, rs(2:3), 2, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
+      call MPI_Allreduce(MPI_IN_PLACE, rs(4), 1, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
+      tol = DEV_GATE_TOL
+      if (rs(1) > 0.d0) tol = merge(RING_GATE_TOL_SP, RING_GATE_TOL, dev_ring_sp)
+      if (.not. (dn <= tol)) then
         call blk_dev_free(gBk(g)%dh)
+        call blk_dev_free(gBk(g)%rh, ring=.true.)
         gBk(g)%dev_off = .true.          ! no new handle at later rebuilds
       endif
       ! one line per hierarchy communicator (one per family under the mode split)
       if (crank == 0) write(*,'(A,I0,A,I0,A,I0,A,ES9.2,A,A,I0,A,I0,A,ES9.2,A,I0,A,I0,A,F0.1,A)') "[Physics PC]   GMG", &
         cur_inst, " (rank ", my_id, ") level ", g, ": device block solves vs host ", dn, &
-        merge(" -> in use       ", " -> WARNING: host", dn <= DEV_GATE_TOL), &
+        merge(" -> in use       ", " -> WARNING: host", dn <= tol), &
         " (largest block ", nint(st(1)), ", widest band ", nint(st(2)), ", ", sm, " mult-adds per pass; partitioned ", &
         nint(sp(1)), " blocks in ", nint(sp(2)), " interiors, ", sp(3), " MB)"
+      if (crank == 0 .and. rs(1) > 0.d0) write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,F0.1,A,A)') "[Physics PC]   GMG", &
+        cur_inst, " level ", g, ": device ring solver, ", nint(rs(1)), " rings x ", nint(rs(2)), &
+        " segments, node blocks <= ", nint(rs(3)), ", ", rs(4), " MB", merge(", single", "        ", dev_ring_sp)
     enddo
     cur_lev = lev0
   end subroutine blk_dev_gate
@@ -1901,6 +2242,7 @@ contains
     call PetscLogEventRegister("GMG_PtAP",     cid, gev_ptap,     ierr)
     call PetscLogEventRegister("GMG_Prolong",  cid, gev_prolong,  ierr)
     call PetscLogEventRegister("GMG_DevOps",   cid, gev_dev,      ierr)
+    call PetscLogEventRegister("GMG_DevFactor", cid, gev_rfac,    ierr)
     call PetscLogEventRegister("GMG_SmSetup",  cid, gev_smsetup,  ierr)
     call PetscLogEventRegister("GMG_CoarseLU", cid, gev_coarselu, ierr)
     call PetscLogEventRegister("GMG_BlkMesh",  cid, gev_blkmesh,  ierr)
@@ -1952,7 +2294,11 @@ contains
 
     if (g == nlev - 1) then
       call PetscLogEventBegin(gev_coarse(cur_inst), ierr)
-      call rds_solve(gcrs, b, x)
+      if (gcrs%dmode > 0) then
+        call rds_solve_dev(gcrs, b, x)
+      else
+        call rds_solve(gcrs, b, x)
+      endif
       call PetscLogEventEnd(gev_coarse(cur_inst), ierr)
       return
     endif
@@ -2029,7 +2375,8 @@ contains
     PetscInt :: nr, r, ncols, rst, ren
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
-    logical :: devpat, devblk
+    logical :: devpat, devblk, devring, devfac, ringdev_ok, hostbtd, devdense, dfill, dbfill
+    integer :: nb_bad
     PetscErrorCode :: ierr
     PetscInt, parameter :: one = 1
     integer :: nc, I, J, m, bb, q, pcn, info, n, ldab, kk, nthr, mpierr
@@ -2217,22 +2564,53 @@ contains
       endif
     end block
     call PetscLogEventBegin(gev_blknum, ierr)
-    call blk_fill(B, A)
+    ! a rebuild on the device path with the device fill's map in place: the
+    ! ring-solver blocks' values go from the level's device matrix straight
+    ! into the device factorisation (ring_dev_factor_raw), the host fills the rest
+    dfill = dev .and. dev_blocks .and. dev_fac .and. op_ready .and. .not. devpat .and. .not. B%dev_off
+    dfill = dfill .and. dev_ring() .and. c_associated(B%rh) .and. B%dmap_pat == B%pat_id .and. allocated(B%hvs)
+    dfill = dfill .and. A == gA(g)
+    ! ... and with the blocks' own share on the device too (no band blocks,
+    ! whose LU is the host's), no host fill at all: blk_dev_fill below
+    dbfill = dfill .and. c_associated(B%dh) .and. .not. any(B%band) .and. B%bmap_pat == B%pat_id
+    if (.not. dbfill) call blk_fill(B, A, dfill)
 
     ! The blocks are independent: factor them on the rank's OpenMP threads
     ! (hybrid runs leave them idle in the PETSc parts). The singular-block
     ! fallback reads A (MatGetRow is not thread-safe), so it runs afterwards.
     ! device path: the blocks' structure and, from the band blocks before
-    ! their LU, the partitioned solves. A level with ring-solver blocks stays
-    ! on the host: their storage is not the band / dense one blk_dev reads.
-    devblk = dev .and. dev_blocks .and. .not. B%dev_off .and. count(.not. B%axblk) > 0 .and. .not. any(B%btd)
+    ! their LU, the partitioned solves. The ring-solver blocks (rings of
+    ! smoother 4, radial lines of smoother 5, both colours of the zebra
+    ! smoothers 7 / 8) go to the device ring solver, the others to blk_dev.
+    ! Zebra: blk_dev's handle also holds the colour-1 coupling and the
+    ! colour-0 ghost solutions, which the ring solver reads -- kept even
+    ! when every non-axis block is a ring-solver block.
+    devblk = dev .and. dev_blocks .and. .not. B%dev_off .and. (dev_ring() .or. .not. any(B%btd))
+    devring = devblk .and. any(B%btd)
+    devblk = devblk .and. (count(.not. (B%axblk .or. B%btd)) > 0 .or. (devring .and. zebra_sm()))
     if (.not. devblk .and. c_associated(B%dh)) call blk_dev_free(B%dh)
+    if (.not. devring .and. c_associated(B%rh)) call blk_dev_free(B%rh, ring=.true.)
     if (devblk) then
       if (devpat .or. .not. c_associated(B%dh)) call blk_dev_pattern(B%dh, B%nrow, B%ngh, B%off, B%sz, B%kl, B%ku, &
-        B%band, B%loff, B%axblk, B%rows, B%bcol, B%zp, B%zc, B%dstat(1:3))
+        B%band, B%loff, B%axblk .or. B%btd, B%rows, B%bcol, B%zp, B%zc, B%dstat(1:3))
       call blk_dev_spike(B%dh, B%lu)
     endif
 
+    ! the ring / line blocks factored on the device from their unfactored
+    ! values; on the host only for the first build (the gate's reference) or
+    ! where the device factorisation fails
+    devfac = devring .and. dev_fac
+    devdense = devblk .and. dev_fac .and. op_ready
+    ringdev_ok = .false.
+    if (devfac) then
+      call ring_dev_factor_raw(B, devpat .or. .not. c_associated(B%rh), dfill, gAd(g), ringdev_ok)
+      if (.not. ringdev_ok .and. op_ready) then
+        call MPI_Comm_rank(gcomm, q, mpierr)
+        write(*,'(A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, " (rank ", q, ") level ", g, &
+          ": device ring factorisation failed, host factors"
+      endif
+    endif
+    hostbtd = .not. ringdev_ok .or. .not. op_ready
     allocate(binfo(B%nb))
     binfo = 0
     if (rchk > 0) a0chk = B%lu
@@ -2242,55 +2620,61 @@ contains
       n = B%sz(bb)
       if (B%btd(bb)) then
         B%jac(bb) = .false.
+        if (.not. hostbtd) cycle
         if (.not. allocated(B%wk)) call btd_factor(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), binfo(bb))
       else if (B%band(bb)) then
         ldab = 2 * B%kl(bb) + B%ku(bb) + 1
         call dgbtrf(n, n, B%kl(bb), B%ku(bb), B%lu(B%loff(bb) + 1), ldab, B%piv(B%off(bb) + 1), binfo(bb))
-      else
+      else if (.not. devdense) then
         call dgetrf(n, n, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), binfo(bb))
       endif
     enddo
     !$omp end parallel do
-    if (allocated(B%wk)) call hyb_par_factor(B, binfo)
-    B%nsing = 0
-    do bb = 1, B%nb
-      n = B%sz(bb)
-      if (B%axblk(bb)) cycle
-      info = binfo(bb)
-      if (info /= 0) then
-        ! singular block: keep only its diagonal, from the Pmat (point Jacobi)
-        B%nsing = B%nsing + 1
-        ! a ring solver's block: a singular node block (the block
-        ! elimination pivots inside the nodes only)
-        if (B%btd(bb)) B%jac(bb) = .true.
-        B%lu(B%loff(bb) + 1 : B%loff(bb) + blk_size(B, bb)) = 0.0d0
-        do q = 1, n
-          r = B%rows(B%off(bb) + q)
-          ix = lu_index(B, bb, q, q)
-          if (r < B%nrow) then
-            call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
-            do pcn = 1, int(ncols)
-              if (cols(pcn) == rst + r) B%lu(ix) = vals(pcn)
-            enddo
-            call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
-          else                                          ! ghost row: from sg(1), global columns
-            call MatGetRow(B%sg(1), r - B%nrow, ncols, cols, vals, ierr)
-            do pcn = 1, int(ncols)
-              if (cols(pcn) == B%gidx(r - B%nrow + 1)) B%lu(ix) = vals(pcn)
-            enddo
-            call MatRestoreRow(B%sg(1), r - B%nrow, ncols, cols, vals, ierr)
-          endif
-          if (abs(B%lu(ix)) < tiny(1.0d0)) B%lu(ix) = 1.0d0
-          B%piv(B%off(bb) + q) = q
-        enddo
-      endif
-    enddo
-    if (rsp) call btd_single(B)
-    if (rchk > 0) call btd_check(g, B, a0chk)
-    if (rchk > 1) call btd_decay(g, B)
+    if (allocated(B%wk) .and. hostbtd) call hyb_par_factor(B, binfo)
+    call blk_singular_fallback()
+    if (rsp .and. hostbtd) call btd_single(B)
+    if (rchk > 0 .and. hostbtd) call btd_check(g, B, a0chk)
+    if (rchk > 1 .and. hostbtd) call btd_decay(g, B)
 
-    ! device path: the factors' copy
-    if (devblk) call blk_dev_values(B%dh, B%lu, B%piv, B%zv, merge(1, 0, binfo /= 0), B%dstat(4:6))
+    ! device path: the factors' copy (the rings': factored there already;
+    ! the dense blocks' inverses: there too, after the first build)
+    if (devblk .and. devdense) then
+      if (dbfill) then
+        block
+          Mat :: Ad, Ao
+          PetscInt, pointer :: garr(:)
+          logical :: has_o
+          type(c_ptr) :: pg
+          real(c_double), pointer :: vg(:)
+          real*8 :: vg0(0)
+          call aij_parts(gAd(g), Ad, Ao, garr, has_o)
+          if (B%ovl .and. B%nvg > 0) then
+            call aij_vals_read(B%sg(1), B%nvg, pg, vg)
+            call blk_dev_fill(B%dh, size(B%lu, kind=8), size(B%zv), Ad, Ao, has_o, vg(1:B%nvg), binfo, nb_bad)
+            call aij_vals_done(B%sg(1), pg)
+          else
+            call blk_dev_fill(B%dh, size(B%lu, kind=8), size(B%zv), Ad, Ao, has_o, vg0, binfo, nb_bad)
+          endif
+          if (nb_bad > 0) call blk_fill(B, A, .false.)  ! the host fallback below needs the host values
+        end block
+      else
+        call blk_dev_values(B%dh, B%lu, B%piv, B%zv, merge(1, 0, binfo /= 0), B%dstat(4:6), raw=.true., nbad=nb_bad)
+      endif
+      if (nb_bad > 0) then                       ! a singular dense block: the host LU (and its fallback)
+        !$omp parallel do schedule(dynamic, 1) private(bb, n)
+        do bb = 1, B%nb
+          if (B%axblk(bb) .or. B%btd(bb) .or. B%band(bb)) cycle
+          n = B%sz(bb)
+          call dgetrf(n, n, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), binfo(bb))
+        enddo
+        !$omp end parallel do
+        call blk_singular_fallback()
+        call blk_dev_values(B%dh, B%lu, B%piv, B%zv, merge(1, 0, binfo /= 0), B%dstat(4:6))
+      endif
+    else if (devblk) then
+      call blk_dev_values(B%dh, B%lu, B%piv, B%zv, merge(1, 0, binfo /= 0), B%dstat(4:6))
+    endif
+    if (devring .and. .not. ringdev_ok) call ring_dev_upload(B, devpat .or. .not. c_associated(B%rh))
 
     call PetscLogEventEnd(gev_blknum, ierr)
     if (B%axsparse .and. B%axdon .and. pat_fresh) then
@@ -2320,6 +2704,46 @@ contains
       endif
     endif
     if (B%axsparse .and. .not. B%axdon .and. .not. B%axnew) call ax_lu(g, A, B)
+
+  contains
+
+    !> singular blocks (binfo /= 0): only their diagonal, from the Pmat
+    !! (point Jacobi)
+    subroutine blk_singular_fallback()
+      B%nsing = 0
+      do bb = 1, B%nb
+        n = B%sz(bb)
+        if (B%axblk(bb)) cycle
+        info = binfo(bb)
+        if (info /= 0) then
+          ! singular block: keep only its diagonal, from the Pmat (point Jacobi)
+          B%nsing = B%nsing + 1
+          ! a ring solver's block: a singular node block (the block
+          ! elimination pivots inside the nodes only)
+          if (B%btd(bb)) B%jac(bb) = .true.
+          B%lu(B%loff(bb) + 1 : B%loff(bb) + blk_size(B, bb)) = 0.0d0
+          do q = 1, n
+            r = B%rows(B%off(bb) + q)
+            ix = lu_index(B, bb, q, q)
+            if (r < B%nrow) then
+              call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
+              do pcn = 1, int(ncols)
+                if (cols(pcn) == rst + r) B%lu(ix) = vals(pcn)
+              enddo
+              call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
+            else                                          ! ghost row: from sg(1), global columns
+              call MatGetRow(B%sg(1), r - B%nrow, ncols, cols, vals, ierr)
+              do pcn = 1, int(ncols)
+                if (cols(pcn) == B%gidx(r - B%nrow + 1)) B%lu(ix) = vals(pcn)
+              enddo
+              call MatRestoreRow(B%sg(1), r - B%nrow, ncols, cols, vals, ierr)
+            endif
+            if (abs(B%lu(ix)) < tiny(1.0d0)) B%lu(ix) = 1.0d0
+            B%piv(B%off(bb) + q) = q
+          enddo
+        endif
+      enddo
+    end subroutine blk_singular_fallback
   end subroutine build_blocks
 
   !> ring_solver > 0, mesh part: the ring blocks solved as periodic
@@ -2335,30 +2759,42 @@ contains
   subroutine btd_mark(g, B)
     integer, intent(in) :: g
     type(blk_t), intent(inout) :: B
-    integer :: nc, nall, r, bb, q, I, ns, nthr, n, k
-    integer, allocatable :: key(:), cnt(:,:)
+    integer :: nc, nall, r, bb, q, I, J, ns, nthr, n, k, nn, i0
+    integer, allocatable :: kJ(:), kI(:), cnt(:), nb_(:), i0_(:)
+    type :: cnt_t
+      integer, allocatable :: c(:)
+    end type cnt_t
+    type(cnt_t), allocatable :: cb(:)
+    logical :: lines, zlines
     nall = B%nrow + B%ngh
     if (allocated(B%btd)) deallocate(B%btd, B%jac, B%rg, B%qn)
     allocate(B%btd(B%nb), B%jac(B%nb), B%rg(B%nb), B%qn(nall))
     B%btd = .false.; B%jac = .false.; B%qn = 0
-    if (rsolv == RS_LAPACK .or. (sm_type /= 4 .and. sm_type /= 8)) return
+    ! rings (smoothers 4, 8): periodic chains in J; radial lines (smoother 5,
+    ! and on the device path the zebra lines of 7 and of 8 outside ring_lim):
+    ! chains in I, the ring solver's layout with zero wrap couplings
+    zlines = dev_ring() .and. (sm_type == 7 .or. sm_type == 8)
+    if (rsolv == RS_LAPACK) return
+    if (sm_type /= 4 .and. sm_type /= 5 .and. sm_type /= 8 .and. .not. zlines) return
     if (g == 0) then
       nc = nth0
     else
       nc = glv(g)%nj
     endif
-    if (nc < 4) return
-    allocate(key(nall), cnt(0:nc - 1, B%nb))
+    if (nc < 4 .and. sm_type == 4) return
+    allocate(kJ(nall), kI(nall), cb(B%nb), nb_(B%nb), i0_(B%nb))
+    nb_ = 0; i0_ = 0
     do r = 1, nall
       if (r <= B%nrow) then
         if (g == 0) then
-          key(r) = mod(fine_node(r), nth0)
+          J = mod(fine_node(r), nth0); I = fine_node(r) / nth0
         else
-          key(r) = mod(glv(g)%rnode(r), nc)
+          J = mod(glv(g)%rnode(r), nc); I = glv(g)%rnode(r) / nc
         endif
       else
-        key(r) = B%ghJ(r - B%nrow)
+        J = B%ghJ(r - B%nrow); I = B%ghI(r - B%nrow)
       endif
+      kI(r) = I; kJ(r) = J
     enddo
     do bb = 1, B%nb
       if (B%axblk(bb) .or. B%sz(bb) < max(rbmin, 1)) cycle
@@ -2367,42 +2803,74 @@ contains
       do q = 1, B%sz(bb)
         r = B%rows(B%off(bb) + q) + 1
         if (r > B%nrow) cycle
-        if (g == 0) then
-          I = fine_node(r) / nth0
-        else
-          I = glv(g)%rnode(r) / nc
-        endif
+        I = kI(r)
         exit
       enddo
       if (I <= 0) cycle
-      if (sm_type == 8) then
-        if (I >= ring_lim(g)) cycle
+      select case (sm_type)
+      case (5)
+        lines = .true.
+      case (7)
+        lines = .true.
+      case (8)
+        lines = (I >= ring_lim(g))
+        if (lines .and. .not. zlines) cycle
+      case default
+        lines = .false.
+      end select
+      if (.not. lines .and. nc < 4) cycle
+      if (lines) then                                ! the line's I range
+        i0 = huge(1); n = -1
+        do q = 1, B%sz(bb)
+          r = B%rows(B%off(bb) + q) + 1
+          i0 = min(i0, kI(r)); n = max(n, kI(r))
+        enddo
+        nn = n - i0 + 1
+        if (nn < 4) cycle
+      else
+        i0 = 0; nn = nc
       endif
-      cnt(:, bb) = 0
+      allocate(cnt(0:nn - 1))
+      cnt = 0
       do q = 1, B%sz(bb)
         r = B%rows(B%off(bb) + q) + 1
-        cnt(key(r), bb) = cnt(key(r), bb) + 1
+        k = merge(kI(r), kJ(r), lines) - i0
+        cnt(k) = cnt(k) + 1
       enddo
-      if (any(cnt(:, bb) == 0)) cycle               ! still cut by a rank boundary
-      call sort_rows_by_key(B%rows(B%off(bb) + 1:B%off(bb) + B%sz(bb)), key)
+      if (any(cnt == 0)) then                        ! a ring still cut by a rank boundary, a gapped line
+        deallocate(cnt)
+        cycle
+      endif
+      call move_alloc(cnt, cb(bb)%c)
+      nb_(bb) = nn; i0_(bb) = i0
+      if (lines) then
+        call sort_rows_by_key(B%rows(B%off(bb) + 1:B%off(bb) + B%sz(bb)), kI)
+      else
+        call sort_rows_by_key(B%rows(B%off(bb) + 1:B%off(bb) + B%sz(bb)), kJ)
+      endif
       do q = 1, B%sz(bb)
         r = B%rows(B%off(bb) + q)
         B%pos(r + 1) = q
-        B%qn(B%off(bb) + q) = key(r + 1)
+        B%qn(B%off(bb) + q) = merge(kI(r + 1), kJ(r + 1), lines) - i0
       enddo
       B%btd(bb) = .true.
     enddo
-    ns = rseg
-    if (ns == 0) then
-      nthr = 1
-      !$ nthr = omp_get_max_threads()
-      n = max(count(B%btd), 1)
-      ns = 1
-      if (n < nthr) ns = (nthr + n - 1) / n
-    endif
     do bb = 1, B%nb
-      if (B%btd(bb)) call btd_plan(B%rg(bb), rsolv, nc, cnt(:, bb), ns)
+      if (.not. B%btd(bb)) cycle
+      nn = nb_(bb)
+      ns = rseg
+      if (ns == 0 .and. dev_ring() .and. rsolv == RS_HYB .and. .not. B%dev_off) then
+        ns = dev_ring_ns(nn, count(B%btd))
+      else if (ns == 0) then
+        nthr = 1
+        !$ nthr = omp_get_max_threads()
+        n = max(count(B%btd), 1)
+        ns = 1
+        if (n < nthr) ns = (nthr + n - 1) / n
+      endif
+      call btd_plan(B%rg(bb), rsolv, nn, cb(bb)%c, ns, bcr=(rbcr > 0))
     enddo
+    ns = maxval([1, (B%rg(bb)%ns, bb = 1, B%nb)])
     ! smoother 4 with segmented rings: the hybrid threaded over (block,
     ! segment) work items, one item for every other non-axis block
     if (allocated(B%wk)) deallocate(B%wk, B%lb, B%lk)
@@ -2423,6 +2891,30 @@ contains
       enddo
     endif
   end subroutine btd_mark
+
+  !> Segments per ring for the device ring solver, rings of nc nodes, nr of
+  !! them on the rank: nc / (m + 1) for -sf_gpu_ring_m m, else (auto) nc / 8
+  !! doubled until the level's rings give >= 4096 segments; a power of 2 (the
+  !! separators' cyclic reduction) of at most nc / 2 and 32 (one team per
+  !! ring, a vector of lanes per segment).
+  integer function dev_ring_ns(nc, nr)
+    integer, intent(in) :: nc, nr
+    integer :: ns, cap
+    cap = min(nc / 2, 32)
+    if (dev_ring_m >= 0) then
+      ns = max(nc / (dev_ring_m + 1), 1)
+    else
+      ns = max(nc / 8, 1)
+    endif
+    ns = 2**int(log(dble(ns)) / log(2.d0) + 1.d-9)
+    ns = max(1, min(ns, cap))
+    if (dev_ring_m < 0) then
+      do while (2 * ns <= cap .and. nr * ns < 4096)
+        ns = 2 * ns
+      enddo
+    endif
+    dev_ring_ns = ns
+  end function dev_ring_ns
 
   !> hybrid on smoother 4: the segments of all the rank's rings on the
   !! threads, then every ring's separators. One parallel region.
@@ -2451,6 +2943,245 @@ contains
     !$omp end do
     !$omp end parallel
   end subroutine hyb_par_factor
+
+  !> Device ring solver: the level's ring-solver blocks' offsets in the packed
+  !! storage handed to jorek_ring_kokkos (fo(bb), 0-based; nfac in all)
+  subroutine ring_dev_offsets(B, fo, nfac)
+    type(blk_t), intent(in) :: B
+    integer(8), allocatable, intent(out) :: fo(:)
+    integer(8), intent(out) :: nfac
+    integer :: bb
+    allocate(fo(B%nb))
+    nfac = 0
+    do bb = 1, B%nb
+      fo(bb) = nfac
+      if (B%btd(bb)) nfac = nfac + B%rg(bb)%tot
+    enddo
+  end subroutine ring_dev_offsets
+
+  !> Device ring solver, per pattern: the rings' layout to jorek_ring_kokkos
+  !! (flattened rg's: per ring a header, per node bs / rp and the block
+  !! offsets, per separator its cyclic-reduction offsets)
+  subroutine ring_dev_layout(B)
+    type(blk_t), intent(inout) :: B
+    integer, parameter :: NH = 10, NH8 = 3
+    integer, allocatable :: hdr(:), ni(:), si(:)
+    integer(8), allocatable :: hdr8(:), n8(:), s8(:), l8(:), fo(:)
+    integer :: nr, bb, r, nn, ns, nl, J, k, l, pn, ps, pl
+    integer(8) :: nfac
+    call ring_dev_offsets(B, fo, nfac)
+    nr = count(B%btd)
+    pn = 0; ps = 0; pl = 0
+    do bb = 1, B%nb
+      if (.not. B%btd(bb)) cycle
+      pn = pn + B%rg(bb)%nn; ps = ps + max(B%rg(bb)%ns, 1); pl = pl + max(B%rg(bb)%ns, 1) * max(B%rg(bb)%nlev, 1)
+    enddo
+    allocate(hdr(NH * nr), hdr8(NH8 * nr), ni(2 * pn), n8(5 * pn), si(2 * ps), s8(3 * ps), l8(2 * pl))
+    hdr = 0; hdr8 = 0; ni = 0; n8 = 0; si = 0; s8 = 0; l8 = 0
+    r = 0; pn = 0; ps = 0; pl = 0
+    do bb = 1, B%nb
+      if (.not. B%btd(bb)) cycle
+      associate (rg => B%rg(bb))
+        nn = rg%nn; ns = rg%ns; nl = rg%nlev
+        hdr(NH * r + 1 : NH * r + NH) = [B%off(bb), B%sz(bb), nn, ns, merge(nl, 0, rg%sepm == 1), rg%nf, &
+                                         merge(B%bcol(bb), 0, zebra_sm()), pn, ps, pl]
+        hdr8(NH8 * r + 1 : NH8 * r + NH8) = [fo(bb), rg%of, rg%bt]
+        do J = 0, nn - 1
+          ni(2 * (pn + J) + 1) = rg%bs(J); ni(2 * (pn + J) + 2) = rg%rp(J)
+          n8(5 * (pn + J) + 1 : 5 * (pn + J) + 5) = [rg%od(J), rg%ou(J), rg%ol(J), rg%oc(J), rg%orr(J)]
+        enddo
+        do k = 0, ns - 1
+          si(2 * (ps + k) + 1) = rg%sep(k)
+          if (rg%sepm == 1) then
+            si(2 * (ps + k) + 2) = rg%co(k)
+            s8(3 * (ps + k) + 1 : 3 * (ps + k) + 3) = [rg%bd(k), rg%bl(k), rg%bu(k)]
+            do l = 0, nl - 1
+              l8(2 * (pl + l * ns + k) + 1 : 2 * (pl + l * ns + k) + 2) = [rg%ba(k, l), rg%bb(k, l)]
+            enddo
+          endif
+        enddo
+        pn = pn + nn; ps = ps + max(ns, 1); pl = pl + max(ns, 1) * max(nl, 1)
+      end associate
+      r = r + 1
+    enddo
+    call ring_dev_pattern(B%rh, nr, B%nrow, B%ngh, hdr, hdr8, ni, n8, si, s8, l8, B%rows, B%rstat)
+  end subroutine ring_dev_layout
+
+  !> Device ring solver, every rebuild: the rings factored on the device
+  !! (jorek_ring_kokkos_factor) from their UNFACTORED values -- B%lu, or with
+  !! dfill straight from the level's device matrix Adev (and the ghost rows
+  !! of sg(1)) through the fill map. dok: the factorisation succeeded (else
+  !! the caller factors on the host and calls ring_dev_upload).
+  subroutine ring_dev_factor_raw(B, newpat, dfill, Adev, dok)
+    type(blk_t), intent(inout) :: B
+    logical, intent(in) :: newpat
+    logical, intent(in) :: dfill
+    Mat, intent(in) :: Adev
+    logical, intent(out) :: dok
+    integer, allocatable :: fl(:), ord(:)
+    integer(8), allocatable :: fo(:), g8(:)
+    real*8, allocatable :: fac(:)
+    integer :: nr, bb, k, ps
+    integer(8) :: nfac
+    logical :: ok
+    PetscErrorCode :: ierr
+    if (newpat) call ring_dev_layout(B)
+    call ring_dev_offsets(B, fo, nfac)
+    nr = count(B%btd)
+    ! per separator its segment's Schur blocks' offsets
+    allocate(fl(nr), g8(3 * sum([(max(B%rg(bb)%ns, 1), bb = 1, B%nb)], mask=B%btd)))
+    ps = 0
+    do bb = 1, B%nb
+      if (.not. B%btd(bb)) cycle
+      do k = 0, max(B%rg(bb)%ns, 1) - 1
+        if (B%rg(bb)%ns > 0) g8(3 * ps + 1 : 3 * ps + 3) = [B%rg(bb)%osab(k), B%rg(bb)%osba(k), B%rg(bb)%osbb(k)]
+        ps = ps + 1
+      enddo
+    enddo
+    ! the device fill's map, once per pattern (the first build fills on the host)
+    if (B%dmap_pat /= B%pat_id) call fill_map()
+    call PetscLogEventBegin(gev_rfac, ierr)
+    if (dfill) then
+      block
+        Mat :: Ad, Ao
+        PetscInt, pointer :: garr(:)
+        logical :: has_o
+        type(c_ptr) :: pg
+        real(c_double), pointer :: vg(:)
+        real*8 :: none(1), nofac(1)
+        none = 0.d0; nofac = 0.d0
+        call aij_parts(Adev, Ad, Ao, garr, has_o)
+        if (B%ovl .and. B%nvg > 0) then
+          call aij_vals_read(B%sg(1), B%nvg, pg, vg)
+          call ring_dev_factor(B%rh, nofac, g8, newpat, dev_ring_sp, fl, ok, B%rstat, nfac, Ad, Ao, has_o, vg)
+          call aij_vals_done(B%sg(1), pg)
+        else
+          call ring_dev_factor(B%rh, nofac, g8, newpat, dev_ring_sp, fl, ok, B%rstat, nfac, Ad, Ao, has_o, none(1:0))
+        endif
+      end block
+    else
+      allocate(fac(max(nfac, 1_8)))
+      do bb = 1, B%nb
+        if (.not. B%btd(bb)) cycle
+        fac(fo(bb) + 1 : fo(bb) + B%rg(bb)%tot) = B%lu(B%loff(bb) + 1 : B%loff(bb) + B%rg(bb)%tot)
+      enddo
+      call ring_dev_factor(B%rh, fac, g8, newpat, dev_ring_sp, fl, ok, B%rstat, max(nfac, 1_8))
+    endif
+    call PetscLogEventEnd(gev_rfac, ierr)
+    dok = ok .and. all(fl == 0)
+    if (.not. ok) write(*,'(A,I0,A)') "[Physics PC]   GMG", cur_inst, ": a ring layout without a device factorisation"
+    if (ok .and. .not. dok) write(*,'(A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, ": device ring factorisation, ", &
+      count(fl /= 0), " of ", nr, " rings singular"
+
+  contains
+
+    !> Split the value maps: entries into ring-solver blocks to the device
+    !! (destination in the rings' packed storage, 0-based), the rest to the
+    !! host's hvs / hvd, hgs / hgd
+    subroutine fill_map()
+      integer, allocatable :: s1(:), s2(:)
+      integer(8), allocatable :: d1(:), d2(:)
+      integer :: i, j, t
+      allocate(ord(B%nb))
+      do i = 1, B%nb
+        ord(i) = i
+      enddo
+      do i = 2, B%nb                               ! insertion sort by loff (mostly in order already)
+        t = ord(i); j = i - 1
+        do while (j >= 1)
+          if (B%loff(ord(j)) <= B%loff(t)) exit
+          ord(j + 1) = ord(j); j = j - 1
+        enddo
+        ord(j + 1) = t
+      enddo
+      call split(B%vs, B%vd, s1, d1, B%hvs, B%hvd)
+      call split(B%gs, B%gd, s2, d2, B%hgs, B%hgd)
+      call ring_dev_fillmap(B%rh, s1, d1, s2, d2)
+      B%dmap_pat = B%pat_id
+      if (c_associated(B%dh)) then                  ! the blocks' share, for blk_dev_fill
+        call blk_dev_fillmap(B%dh, B%hvs, B%hvd, B%hgs, B%hgd)
+        B%bmap_pat = B%pat_id
+      endif
+      deallocate(ord)
+    end subroutine fill_map
+
+    !> the block holding lu(d)
+    integer function blk_of(d)
+      integer(8), intent(in) :: d
+      integer :: lo_, hi_, mid
+      lo_ = 1; hi_ = B%nb
+      do while (lo_ < hi_)                         ! the last block with loff < d
+        mid = (lo_ + hi_ + 1) / 2
+        if (B%loff(ord(mid)) < d) then
+          lo_ = mid
+        else
+          hi_ = mid - 1
+        endif
+      enddo
+      blk_of = ord(lo_)
+    end function blk_of
+
+    subroutine split(vs, vd, ds, dd, hs, hd)
+      integer, intent(in) :: vs(:)
+      integer(8), intent(in) :: vd(:)
+      integer, allocatable, intent(out) :: ds(:), hs(:)
+      integer(8), allocatable, intent(out) :: dd(:), hd(:)
+      integer :: k_, nd_, nh_
+      integer, allocatable :: bk(:)               ! the entry's ring-solver block, 0: host
+      allocate(bk(size(vs)))
+      !$omp parallel do schedule(static)
+      do k_ = 1, size(vs)
+        bk(k_) = 0
+        if (vd(k_) > 0) then
+          bk(k_) = blk_of(vd(k_))
+          if (.not. B%btd(bk(k_))) bk(k_) = 0
+        endif
+      enddo
+      !$omp end parallel do
+      nd_ = count(bk > 0); nh_ = size(vs) - nd_
+      allocate(ds(nd_), dd(nd_), hs(nh_), hd(nh_))
+      nd_ = 0; nh_ = 0
+      do k_ = 1, size(vs)
+        if (bk(k_) > 0) then
+          nd_ = nd_ + 1
+          ds(nd_) = vs(k_); dd(nd_) = fo(bk(k_)) + (vd(k_) - B%loff(bk(k_)) - 1)
+        else
+          nh_ = nh_ + 1
+          hs(nh_) = vs(k_); hd(nh_) = vd(k_)
+        endif
+      enddo
+    end subroutine split
+  end subroutine ring_dev_factor_raw
+
+  !> Device ring solver, every rebuild: the host's factors (B%lu, factored by
+  !! btd_factor / hyb_par_factor) in the device form, btd_dev_pack's; singular
+  !! rings as point Jacobi on their node blocks' diagonals, flagged per ring
+  subroutine ring_dev_upload(B, newpat)
+    type(blk_t), intent(inout) :: B
+    logical, intent(in) :: newpat
+    integer(8), allocatable :: fo(:)
+    real*8, allocatable :: fac(:)
+    integer :: bb
+    integer(8) :: nfac
+    logical :: ok, okall
+    if (newpat) call ring_dev_layout(B)
+    call ring_dev_offsets(B, fo, nfac)
+    allocate(fac(max(nfac, 1_8)))
+    okall = .true.
+    !$omp parallel do schedule(dynamic, 1) private(ok) reduction(.and.:okall)
+    do bb = 1, B%nb
+      if (.not. B%btd(bb)) cycle
+      if (B%jac(bb)) then
+        fac(fo(bb) + 1 : fo(bb) + B%rg(bb)%tot) = B%lu(B%loff(bb) + 1 : B%loff(bb) + B%rg(bb)%tot)
+      else
+        call btd_dev_pack(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), fac(fo(bb) + 1), ok)
+        okall = okall .and. ok
+      endif
+    enddo
+    !$omp end parallel do
+    if (.not. okall) stop "ring_dev_upload: a ring layout without a device form (ring_segs > 3 without ring_bcr?)"
+    call ring_dev_values(B%rh, fac, pack(merge(1, 0, B%jac), B%btd), dev_ring_sp, B%rstat)
+  end subroutine ring_dev_upload
 
   !> ring_single: the ring blocks' factors rounded to single, into lu4 (its
   !! layout is set again on every build; the pattern rarely changes)
@@ -2743,9 +3474,10 @@ contains
 
   !> Numeric part of build_blocks: the blocks' values (and the zebra
   !! couplings) gathered from A and sg(1) through the value maps.
-  subroutine blk_fill(B, A)
+  subroutine blk_fill(B, A, dfill)
     type(blk_t), intent(inout) :: B
     Mat, intent(in) :: A
+    logical, intent(in) :: dfill      !< the ring-solver blocks are filled on the device
     Mat :: Ad, Ao
     PetscInt, pointer :: garr(:)
     logical :: has_o
@@ -2771,38 +3503,51 @@ contains
     ! the pages' first touch then spreads over the threads' memory
     !$omp parallel do schedule(static)
     do k = 1, B%nb
+      if (dfill .and. B%btd(k)) cycle
       B%lu(B%loff(k) + 1 : B%loff(k) + blk_size(B, k)) = 0.0d0
     enddo
     !$omp end parallel do
-    !$omp parallel do private(v, d) schedule(static)
-    do k = 1, size(B%vs)
-      if (B%vs(k) > 0) then
-        v = vd_(B%vs(k))
-      else
-        v = vo_(-B%vs(k))
-      endif
-      d = B%vd(k)
-      if (d > 0) then
-        B%lu(d) = v
-      else
-        B%zv(-d) = v
-      endif
-    enddo
-    !$omp end parallel do
-    !$omp parallel do private(v, d) schedule(static)
-    do k = 1, size(B%gs)
-      v = vg_(B%gs(k))
-      d = B%gd(k)
-      if (d > 0) then
-        B%lu(d) = v
-      else
-        B%zv(-d) = v
-      endif
-    enddo
-    !$omp end parallel do
+    if (dfill) then
+      call scatter(B%hvs, B%hvd, B%hgs, B%hgd)
+    else
+      call scatter(B%vs, B%vd, B%gs, B%gd)
+    endif
     call aij_vals_done(Ad, pd)
     if (has_o) call aij_vals_done(Ao, po)
     if (B%ovl) call aij_vals_done(B%sg(1), ps)
+
+  contains
+
+    subroutine scatter(vs, vd, gs, gd)
+      integer, intent(in)    :: vs(:), gs(:)
+      integer(8), intent(in) :: vd(:), gd(:)
+      !$omp parallel do private(v, d) schedule(static)
+      do k = 1, size(vs)
+        if (vs(k) > 0) then
+          v = vd_(vs(k))
+        else
+          v = vo_(-vs(k))
+        endif
+        d = vd(k)
+        if (d > 0) then
+          B%lu(d) = v
+        else
+          B%zv(-d) = v
+        endif
+      enddo
+      !$omp end parallel do
+      !$omp parallel do private(v, d) schedule(static)
+      do k = 1, size(gs)
+        v = vg_(gs(k))
+        d = gd(k)
+        if (d > 0) then
+          B%lu(d) = v
+        else
+          B%zv(-d) = v
+        endif
+      enddo
+      !$omp end parallel do
+    end subroutine scatter
   end subroutine blk_fill
 
   !> Mesh part of the line overlap (first build only; see blk_t). The ghost
@@ -3071,8 +3816,9 @@ contains
     allocate(B%gidx(ngh), B%yg(ngh))
     B%gidx = gl
     if (allocated(B%ghJ)) deallocate(B%ghJ)
-    allocate(B%ghJ(ngh))
-    B%ghJ = gJ
+    if (allocated(B%ghI)) deallocate(B%ghI)
+    allocate(B%ghJ(ngh), B%ghI(ngh))
+    B%ghJ = gJ; B%ghI = gI
     call ISCreateGeneral(PETSC_COMM_SELF, int(ngh, kind(nn)), gl, PETSC_COPY_VALUES, B%isg, ierr)
     call VecCreate(PETSC_COMM_SELF, B%xg, ierr)
     call VecSetSizes(B%xg, int(ngh, kind(nn)), int(ngh, kind(nn)), ierr)
@@ -3538,17 +4284,29 @@ contains
     Vec :: x, y
     PetscErrorCode :: ierr
     type(blk_t), pointer :: B
+    integer :: c
 
     B => gBk(cur_lev)
-    if (c_associated(B%dh) .and. .not. blk_host) then
-      ! device factors: the axis block first (on the host), as below
+    if ((c_associated(B%dh) .or. c_associated(B%rh)) .and. .not. blk_host) then
+      ! device factors: the axis block first (on the host), as below; the
+      ! ring-solver blocks by the device ring solver, the others by blk_dev
       if (B%axsparse) call ax_solve(x, y)
       call PetscLogEventBegin(gev_lines(cur_inst), ierr)
       if (B%ovl) then
         call VecScatterBegin(B%sct, x, B%xg, INSERT_VALUES, SCATTER_FORWARD, ierr)
         call VecScatterEnd(B%sct, x, B%xg, INSERT_VALUES, SCATTER_FORWARD, ierr)
       endif
-      call blk_dev_apply(B%dh, x, y, B%xg)
+      if (zebra_sm()) then
+        ! zebra: per colour the other blocks, then the rings / lines; colour
+        ! 1 reads colour 0's solution (y, and blk_dev's ghost copy)
+        do c = 0, 1
+          if (c_associated(B%dh)) call blk_dev_apply(B%dh, x, y, B%xg, c)
+          if (c_associated(B%rh)) call ring_dev_apply(B%rh, x, y, B%xg, c, B%dh)
+        enddo
+      else
+        if (c_associated(B%dh)) call blk_dev_apply(B%dh, x, y, B%xg)
+        if (c_associated(B%rh)) call ring_dev_apply(B%rh, x, y, B%xg)
+      endif
       call PetscLogEventEnd(gev_lines(cur_inst), ierr)
     else if (sm_type == 7 .or. sm_type == 8) then
       call zebra_solve(x, y)
@@ -3858,6 +4616,12 @@ contains
         do kk = 1, size(B%axd)
           call axd_solve(B%axd(kk), xx, yy)
         enddo
+        call PetscLogEventEnd(gev_axsolve(cur_inst), ie)
+        return
+      endif
+      if (B%axg(1)%dmode > 0) then              ! device: every rank enters the scatters
+        call PetscLogEventBegin(gev_axsolve(cur_inst), ie)
+        call rds_solve_dev(B%axg(1), xx, yy)
         call PetscLogEventEnd(gev_axsolve(cur_inst), ie)
         return
       endif
