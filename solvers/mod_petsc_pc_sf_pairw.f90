@@ -77,9 +77,8 @@ module mod_petsc_pc_sf_pairw
   !--- how the channel inverts the psi row (apply_suu) ----------------------
   integer, parameter :: CH_NESTED = 1       !< pair_psi's solver (sfw_shell)
   integer, parameter :: CH_DH     = 2       !< Dh, and B_33^-1 by Chebyshev (sfw_dh)
-  integer, parameter :: CH_QI     = 3       !< Dh, and Qi for B_33^-1 (sfw_lines' gate)
 
-  logical, save :: blk = .false., gated = .false.
+  logical, save :: blk = .false.
   type(mass_cheb_t), save :: mcheb
   Mat, save :: p0                           !< the caller's scaled [B_22,B_24;B_42,B_44]
   Mat, save :: b31t                         !< B_31^T, for diag(B_13 Qi B_31)
@@ -109,8 +108,8 @@ contains
   !--------------------------------------------------------------------
   !> First build: the shells and, with blocks (pair_w on the GMG backend),
   !! the V-cycle's Dh operator, the Chebyshev mass and the structure of
-  !! sfw_lines -- filled with P0's values, as the value-map gate expects of
-  !! every target. Pw is P0, unscaled here; the caller scales it in place,
+  !! sfw_lines -- filled with P0's values, as the value maps expect of every
+  !! target. Pw is P0, unscaled here; the caller scales it in place,
   !! every rebuild.
   !--------------------------------------------------------------------
   subroutine sfw_structure(Pw, blocks, comm, my_id)
@@ -165,8 +164,6 @@ contains
     call MatTranspose(g_ctx%B_31, MAT_REUSE_MATRIX, b31t, ierr)
     call make_dh(comm, my_id)
     call lines_numeric()
-    if (.not. gated) call lines_gate(comm, my_id)
-    gated = .true.
   end subroutine sfw_numeric
 
   subroutine sfw_mult(A, x, y, ierr)
@@ -220,16 +217,12 @@ contains
       call VecPointwiseMult(zs, zs, dpj, ierr)
       call sf_split_halves(zs, pp, j2, .false.)
       call VecScale(j2, -1.0d0, ierr)
-    case (CH_DH, CH_QI)
+    case (CH_DH)
       call VecPointwiseMult(pp, pp, dh, ierr)                  ! psi = Dh B_12 x_u
       call MatMult(g_ctx%B_31, pp, j1, ierr)
-      if (mode == CH_QI) then
-        call VecPointwiseMult(j2, j1, qi, ierr)
-      else
-        call PetscLogEventBegin(pcev_mjsolve, ierr)
-        call mass_cheb_solve(mcheb, j1, j2)                    ! -j = B_33^-1 B_31 psi
-        call PetscLogEventEnd(pcev_mjsolve, ierr)
-      endif
+      call PetscLogEventBegin(pcev_mjsolve, ierr)
+      call mass_cheb_solve(mcheb, j1, j2)                      ! -j = B_33^-1 B_31 psi
+      call PetscLogEventEnd(pcev_mjsolve, ierr)
     end select
     call MatMult(g_ctx%B_21, pp, tu, ierr)
     call VecGetArray(y, ya, ierr)
@@ -386,7 +379,7 @@ contains
     call VecScatterCreate(dh, is2, d2, PETSC_NULL_IS, sc_d, ierr)
 
     !--- sfw_lines: the union of P0's and C's patterns, preallocated exactly,
-    !--- holding P0's values (C's positions 0) as the value-map gate expects
+    !--- holding P0's values (C's positions 0) as the value maps expect
     n = local_rows(p0); ng = global_rows(p0)
     allocate(uoff(n + 1), dnz(n), onz(n))
     uoff(1) = 0
@@ -666,67 +659,6 @@ contains
     call MatDestroySubMatrices(1, f31, ierr)
     call MatDestroySubMatrices(1, f12, ierr)
   end subroutine lines_numeric
-
-  !--------------------------------------------------------------------
-  !> First-build gate of the mask, keys, halo, maps and pair columns: for x
-  !! on one even line (J = 0, slot 0, outside the axis block), sfw_lines x
-  !! must equal the diagonal-mass channel operator on that line's rows and on
-  !! the odd lines next to it -- exactly the rows whose entries the mask keeps.
-  !--------------------------------------------------------------------
-  subroutine lines_gate(comm, my_id)
-    use phys_module,    only: n_tht
-    use mod_parameters, only: n_tor
-    integer, intent(in) :: comm, my_id
-    Vec :: x, y1, y2
-    PetscScalar, pointer :: xa(:), a1(:), a2(:)
-    PetscErrorCode :: ierr
-    integer :: r
-    real*8 :: e(2)
-
-    call MatCreateVecs(sfw_lines, x, y1, ierr)
-    call VecDuplicate(y1, y2, ierr)
-    call VecSetRandom(x, PETSC_NULL_RANDOM, ierr)
-    call VecGetArray(x, xa, ierr)
-    do r = 1, size(xa)
-      if (r > nu) then
-        xa(r) = 0.0d0
-      else if (.not. on_line0(r)) then
-        xa(r) = 0.0d0
-      endif
-    enddo
-    call VecRestoreArray(x, xa, ierr)
-    call MatMult(sfw_lines, x, y1, ierr)
-    call apply_suu(x, y2, CH_QI)
-    call VecGetArrayRead(y1, a1, ierr)
-    call VecGetArrayRead(y2, a2, ierr)
-    e = 0.d0
-    do r = 1, int(nu)
-      if (.not. (on_line0(r) .or. (kI(r) > SF_GMG_AXIS_RINGS .and. &
-                                   (kJ(r) == 1 .or. kJ(r) == n_tht - 1)))) cycle
-      e(1) = e(1) + (a1(r) - a2(r))**2
-      e(2) = e(2) + a2(r)**2
-    enddo
-    call VecRestoreArrayRead(y1, a1, ierr)
-    call VecRestoreArrayRead(y2, a2, ierr)
-    call MPI_Allreduce(MPI_IN_PLACE, e, 2, MPI_DOUBLE_PRECISION, MPI_SUM, comm, ierr)
-    e(1) = sqrt(e(1) / max(e(2), 1.d-300))
-    if (my_id == 0) write(*,'(A,ES10.3)') &
-      "[Physics PC]   pair_w smoother operator gate (masked vs full channel, one line): ", e(1)
-    if (e(1) > 1.d-10) then
-      if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: the masked smoother operator is wrong."
-      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
-    endif
-    call VecDestroy(x, ierr); call VecDestroy(y1, ierr); call VecDestroy(y2, ierr)
-
-  contains
-
-    logical function on_line0(r_)
-      integer, intent(in) :: r_
-      on_line0 = kI(r_) > SF_GMG_AXIS_RINGS .and. kJ(r_) == 0 .and. &
-                 mod(u0 + r_ - 1, int(n_tor, kind(u0))) == 0
-    end function on_line0
-
-  end subroutine lines_gate
 
   !====================================================================
   ! raw CSR access

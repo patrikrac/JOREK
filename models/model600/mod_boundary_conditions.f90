@@ -262,7 +262,7 @@ do i=1, n_local_elms !=== do elements
 
               call boundary_conditions_add_one_entry(                &
                      index_node, var_psi, in, index_node, var_psi, in,         &
-                     zbig, index_min, index_max, a_mat)
+                     zbig, index_min, index_max, a_mat, my_id)
 
               call boundary_conditions_add_RHS(                      &
                      index_node, var_psi, in, index_min, index_max,       &
@@ -272,7 +272,7 @@ do i=1, n_local_elms !=== do elements
 
               call boundary_conditions_add_one_entry(                 &
                      index_node2, var_psi, in, index_node2, var_psi, in,        &
-                     zbig, index_min, index_max, a_mat)
+                     zbig, index_min, index_max, a_mat, my_id)
 
               call boundary_conditions_add_RHS(                       &
                      index_node2, var_psi, in, index_min, index_max,       &
@@ -344,7 +344,7 @@ do i=1, n_local_elms !=== do elements
                 index_node = node_list%node(inode)%index(index_tmp)
                 call boundary_conditions_add_one_entry(                 &
                        index_node, k, in, index_node, k, in,            &
-                       zbig, index_min, index_max, a_mat)
+                       zbig, index_min, index_max, a_mat, my_id)
               enddo
             enddo
             
@@ -581,29 +581,29 @@ do i=1, n_local_elms !=== do elements
           call boundary_conditions_add_one_entry(             &
                index_node, kv, in, index_node, kv, in,        &
                - zbig * Mach1BC_v,                            &
-               index_min, index_max, a_mat)
+               index_min, index_max, a_mat, my_id)
 
           if ( with_TiTe ) then
             call boundary_conditions_add_one_entry(             &
                  index_node, kv, in, index_node, kTi, in,       &
                  - zbig * Mach1BC_T,                            &
-                 index_min, index_max, a_mat)
+                 index_min, index_max, a_mat, my_id)
   
             call boundary_conditions_add_one_entry(             &
                  index_node, kv, in, index_node, kTe, in,       &
                  - zbig * Mach1BC_T,                            &
-                 index_min, index_max, a_mat)
+                 index_min, index_max, a_mat, my_id)
           else
             call boundary_conditions_add_one_entry(             &
                  index_node, kv, in, index_node, kT, in,        &
                  - zbig * Mach1BC_T,                            &
-                 index_min, index_max, a_mat)
+                 index_min, index_max, a_mat, my_id)
           endif
 
           call boundary_conditions_add_one_entry(             &
                index_node,  kv, in, index_node2, ku, in,      &
                - zbig * Mach1BC_u,                            &
-               index_min, index_max, a_mat)
+               index_min, index_max, a_mat, my_id)
 
           if (in .eq. 1) then
             call boundary_conditions_add_RHS(                        &
@@ -621,45 +621,45 @@ do i=1, n_local_elms !=== do elements
           call boundary_conditions_add_one_entry(               &
                  index_node2, kv, in, index_node2, kv, in,      &
                  - zbig * dMach1BC_v,                           &
-                 index_min, index_max, a_mat)
+                 index_min, index_max, a_mat, my_id)
 
           if ( with_TiTe ) then
             call boundary_conditions_add_one_entry(               &
                    index_node2, kv, in, index_node2, kTi, in,     &
                    - zbig * dMach1BC_Tb,                          &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
  
             call boundary_conditions_add_one_entry(               &
                    index_node2, kv, in, index_node2, kTe, in,     &
                    - zbig * dMach1BC_Tb,                          &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
  
             call boundary_conditions_add_one_entry(               &
                    index_node2, kv, in, index_node,  kTi, in,     &
                    - zbig * dMach1BC_Ti,                          & 
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
  
             call boundary_conditions_add_one_entry(               &
                    index_node2, kv, in, index_node,  kTe, in,     &
                    - zbig * dMach1BC_Te,                          & 
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
           else
             call boundary_conditions_add_one_entry(               &
                    index_node2, kv, in, index_node2, kT, in,      &
                    - zbig * dMach1BC_Tb,                          &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
  
             call boundary_conditions_add_one_entry(               &
                    index_node2, kv, in, index_node,  kT, in,      &
                    - zbig * dMach1BC_T,                           & 
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
           endif
 
           if ( include_2nd_derivatives .and. (n_order .ge. 5) ) then
             call boundary_conditions_add_one_entry(               &
                    index_node2, kv, in, index_node3, ku, in,      &
                    - zbig * dMach1BC_ubb,                         &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
           endif
 
           if (in .eq. 1) then
@@ -680,31 +680,31 @@ do i=1, n_local_elms !=== do elements
             call boundary_conditions_add_one_entry(               &
                    index_node3, kv, in, index_node3, kv,  in,     &
                    - zbig * d2Mach1BC_v,                          &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
             call boundary_conditions_add_one_entry(               &
                    index_node3, kv, in, index_node , kTi, in,     &
                    - zbig * d2Mach1BC_T,                          &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
             call boundary_conditions_add_one_entry(               &
                    index_node3, kv, in, index_node , kTe, in,     &
                    - zbig * d2Mach1BC_T,                          &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
             call boundary_conditions_add_one_entry(               &
                    index_node3, kv, in, index_node2, kTi, in,     &
                    - zbig * d2Mach1BC_Tb,                         &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
             call boundary_conditions_add_one_entry(               &
                    index_node3, kv, in, index_node2, kTe, in,     &
                    - zbig * d2Mach1BC_Tb,                         &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
             call boundary_conditions_add_one_entry(               &
                    index_node3, kv, in, index_node3, kTi, in,     &
                    - zbig * d2Mach1BC_Tbb,                        &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
             call boundary_conditions_add_one_entry(               &
                    index_node3, kv, in, index_node3, kTe, in,     &
                    - zbig * d2Mach1BC_Tbb,                        &
-                   index_min, index_max, a_mat)
+                   index_min, index_max, a_mat, my_id)
             if (in .eq. 1) then
               call boundary_conditions_add_RHS(                           &
                      index_node3, kv, in, index_min, index_max, RHS_loc,  &
@@ -730,7 +730,7 @@ do i=1, n_local_elms !=== do elements
               index_node = node_list%node(inode)%index(index_tmp)
               call boundary_conditions_add_one_entry(                 &
                      index_node, k, in, index_node, k, in,            &
-                     zbig, index_min, index_max, a_mat)
+                     zbig, index_min, index_max, a_mat, my_id)
             enddo
           enddo
 

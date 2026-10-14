@@ -1,0 +1,174 @@
+! =====================================================================
+!  intear_dtm_highp  (model600, no v_par)
+!  `intear_dtm` at finite beta: same target q-profile, pressure raised
+!  10^4 x (T_0 1e-6 -> 1e-2, T_1 1e-8 -> 1e-4; rho flat, so p = T).
+!  beta_p = 1.36, beta_t = 1.1 %, beta_N = 2.5 %, R_axis 3.057 -> 3.153.
+!  FF' recomputed with GVEC at this pressure (intear_dtm_highp_ffprime.dat;
+!  copy it into the run directory) so that q is unchanged (|dq| < 0.021):
+!  the pressure current carries most of j_phi, FF' is 0.33 on axis and
+!  slightly negative for psi_N > 0.78.  eta and ZK_par are normalised to
+!  T_0, so their axis values are those of intear_dtm.  Expect pressure-
+!  driven contributions on top of the double tearing drive: scout it
+!  before using it for preconditioner arms.
+!
+!  ---- base case description (intear_dtm) ----
+!  intear_dtm  (model600, no v_par)
+!  Reversed-shear double tearing mode on a circular domain, R/a = 3:
+!  namelist/model199/intear_dtm ported to model600 for the physics run
+!  (linear growth and nonlinear phase), and as a preconditioner test case.
+!
+!  Equilibrium as in the model199 deck: R_geo = 3, F0 = 3 (B0 = 1), FF'
+!  from GVEC (intear_dtm_ffprime.dat, util/intear_dtm/gvec_ffprime.py;
+!  copy it into the run directory; intear_dtm_highp_ffprime.dat for this
+!  variant), target q(psi_N) through
+!    psi_N  0     0.1   0.175  0.25  0.5   0.75  1.0
+!    q      2.45  2.0   1.9    2.0   2.7   3.4   4.5
+!  q = 2 at psi_N = 0.10 / 0.25 (s = 0.32 / 0.50), q_min = 1.90.
+!  eta = 1e-6, visco = 1e-7, flat rho, cold T (T_0 = 1e-6): intear values.
+!
+!  Physics matched to model199 (as in inxflow_shaped_pcbench): tauIC = 0,
+!  bootstrap/NEO off, no Taylor-Galerkin terms, eta ~ (T/T_0)^-1.5 without
+!  the Coulomb-log dependence, model199's viscosity form.  keep_current_prof
+!  (default .t.) holds the equilibrium current against resistive decay.
+!  The perturbation is model600's seed: 1e-12 in w for every n > 0.
+!
+!  Mesh: 61 x 32 flux-aligned, accumulated at both q = 2 surfaces; 32
+!  poloidal elements for m up to ~ n*q_edge with n <= 3.
+!
+!  Compile-time: model600 without v_par and the other extensions
+!  (n_var = 6), n_period = 1:
+!    ./util/config.sh model=600 n_tor=7 n_period=1 n_plane=16 \
+!        with_vpar=.false. with_TiTe=.false. with_neutrals=.false. with_impurities=.false.
+!  (n_tor = 3, n_plane = 8 for an n = 0/1 linear scan.)
+!
+!  Physics runs use the standard JOREK PC and the Dirichlet penalty
+!  (eliminate_boundary_dofs = .f.): that flag changes the boundary
+!  condition of the main solve.  The SF PC arms restart from these runs.
+! =====================================================================
+
+&in1
+
+ restart = .f.
+ regrid  = .f.
+ refinement=.false.
+
+ tstep_n = 1.d0,1.d1,3.d1
+ nstep_n = 10,10,600
+
+ nout = 20
+
+ fbnd(1)   = 2.
+ fbnd(2:4) = 0.
+ mf        = 0
+
+ ellip  = 1.
+ tria_u = 0.
+ tria_l = 0.
+ quad_u = -0.
+ quad_l = -0.
+
+ freeboundary = .f.
+
+ xampl  = +0.
+ xsig   = 0.6
+ xwidth = 1.5
+ xtheta = 4.7
+ xshift = 0.0
+ xpoint = .f.
+
+ R_begin = 2.9
+ R_end   = 3.1
+ Z_begin = -0.1
+ Z_end   = 0.1
+
+ R_geo = 3.0
+ Z_geo = 0.
+
+ F0    = 3.0
+
+ amin     = 1.
+
+ n_R      = 0
+ n_Z      = 0
+ n_radial = 51
+ n_pol    = 32
+
+ n_flux   = 61
+ n_tht    = 32
+ n_open   = 0
+ n_leg    = 0
+ n_private = 0
+
+! radial accumulation (in s = sqrt(psi_N)) at the two q = 2 surfaces
+ xr1  = 0.316
+ sig1 = 0.08
+ xr2  = 0.50
+ sig2 = 0.08
+
+ eta   = 1.d-6
+ visco = 1.d-7
+
+ eta_num   = 0.d0
+ visco_num = 0.d0
+
+! --- model600-only physics: matched to model199 (see header) ----------
+ tauIC     = 0.d0
+ bootstrap = .f.
+ NEO       = .f.
+ tgnum_psi = 0.d0
+ tgnum_u   = 0.d0
+ tgnum_zj  = 0.d0
+ tgnum_w   = 0.d0
+ tgnum_rho = 0.d0
+ tgnum_T   = 0.d0
+ eta_coul_log_dep = .f.
+ visco_old_setup  = .t.
+
+ D_par     = 0.d0
+ D_perp(1) = 1.d-7
+
+ ZK_par     = 1.d0
+ ZK_perp(1) = 1.d-7
+
+ ffprime_file = 'intear_dtm_highp_ffprime.dat'
+
+ heatsource     = 0.d0
+ particlesource = 0.d0
+
+ T_0 = 1.d-2
+ T_1 = 1.d-4
+ T_coef(1) = -0.8d0
+ T_coef(2) = +0.0d0
+ T_coef(3) = 0.d0
+ T_coef(4) = 1.d0
+ T_coef(5) = 5.d0
+
+ rho_0 = 1.
+ rho_1 = 1.
+ rho_coef(1)  =  0.0
+ rho_coef(2)  =  0.0
+ rho_coef(3)  =  0.0
+ rho_coef(4)  =  1.d0
+ rho_coef(5)  =  5.d0
+
+ iter_precon    = 22
+ gmres_m        = 20
+ gmres_4        = 1.d0
+ gmres_max_iter = 200
+ gmres_tol      = 1.d-8
+
+ eliminate_boundary_dofs = .f.
+ use_physics_pc          = .f.
+
+! this build has no MUMPS/STRUMPACK bindings; MUMPS is reached via PETSc
+ use_strumpack     = .f.
+ use_strumpack_eq  = .f.
+ use_strumpack_prj = .f.
+ use_mumps         = .f.
+ use_mumps_eq      = .f.
+ use_mumps_prj     = .f.
+ use_pastix        = .f.
+ use_pastix_eq     = .f.
+ use_pastix_prj    = .f.
+ use_petsc_eq      = .t.
+/

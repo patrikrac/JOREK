@@ -4,12 +4,12 @@ module mod_petsc_pc_sf_solver
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: physics_pc_mumps_mem
-  use mod_petsc_pc_blocks,      only: pc_print_block_setup, harm_band
+  use mod_petsc_pc_blocks,      only: pc_print_block_setup
   implicit none
   private
 
   !--------------------------------------------------------------------
-  !> Block -> solver abstraction for the production SFM2 path.
+  !> Block -> solver abstraction for the SF preconditioner (mod_petsc_pc_sf).
   !!
   !! Every diagonal block of the LDU sweep is solved through ONE type, so
   !! "which solver does this block use" is a value rather than a code path.
@@ -125,10 +125,10 @@ module mod_petsc_pc_sf_solver
   !! sequential LU it replaces. 161x64 np 64 x 8 (2026-09-28): setup 17.8 ->
   !! 7.2 s, solve 17.8 -> 14.1 s with the sequential LU, outer its 45 -> 44.
   integer, parameter, public :: SF_GMG_AXIS_SECTORS_SCHUR_W = 0
-  !> Matvec kernel of the SF operators, the GMG levels and the SFM2 coupling
-  !! blocks: 0 = PETSc's (one thread per rank; AIJMKL where PETSc has MKL
-  !! sparse), 1 = jorek_blockmv_attach.c (OpenMP, reads each n_tor harmonic block's
-  !! column indices once; exact, gated against MatMult on first attach).
+  !> Matvec kernel of the SF operators, the GMG levels and the sweep's coupling
+  !! blocks: 1 = jorek_blockmv_attach.c (OpenMP, reads each n_tor harmonic block's
+  !! column indices once; exact, gated against MatMult on first attach),
+  !! 0 = PETSc's (one thread per rank).
   integer, parameter, public :: SF_BLOCKMV = 1
   !--- the pair_w operators (physics_pc_sf_suu) -----------------------------
   !> "w": S_uu = B_22 + W, assembled; pair_w's GMG and Krylov both on it.
@@ -144,9 +144,19 @@ module mod_petsc_pc_sf_solver
   integer, parameter, public :: SF_SUU_WJ    = 3
   integer, parameter, public :: SF_SUU_WPJ   = 4
 
+  !--- v_par (model600 with_vpar, physics_pc_sf_vpar_stage) ------------------
+  !> "v0": B_77 solved last, against the final psi, u, rho, T, no feedback.
+  !> "b0": the sequential velocity stage, B_77 + W_vv after pair_w, with
+  !! (B_72 + W_vu) u on its right-hand side and v_par in the rho / T correctors.
+  !> "b1": v_par bundled with u in pair_w (5 fields), W_vv / W_vu / W_uv in
+  !! its blocks; the mode split only.
+  integer, parameter, public :: SF_VPAR_V0 = 0
+  integer, parameter, public :: SF_VPAR_B0 = 1
+  integer, parameter, public :: SF_VPAR_B1 = 2
+
   !> physics_pc_sf_suu, parsed
   type, public :: suu_form_t
-    integer :: form = SF_SUU_SCHUR
+    integer :: form = SF_SUU_WPJ
   end type suu_form_t
 
   !--- V-cycle shapes (gmg_opts_t pre0 / post0 / nsmooth_c) -----------------
@@ -247,12 +257,17 @@ module mod_petsc_pc_sf_solver
   !! overlap 1 + Richardson there, 321x128 np 64 went from 16/12/10 outer its
   !! at tstep 1 to 71/38/52 (pair_w 25.6 V-cycles per solve); 161x64 held.
   integer, parameter, public :: SF_GMG_RICH_FROM = 1, SF_GMG_RICH_NONE = -1
-  real*8,  parameter, public :: SF_GMG_RICH_OMEGA_ZEBRA = 1.0d0, SF_GMG_RICH_OMEGA_LINES = 0.8d0
+  !> Richardson scale: zebra sweeps are multiplicative and need none; the
+  !! additive block-Jacobi smoothers (radial lines, rings) are damped, since
+  !! undamped ring Jacobi is no smoother where the mass is small against the
+  !! radial coupling (LFA: two-grid factor 1.00; Rac, GMG for the SF
+  !! preconditioner, R6). Ring damping 0.8 on s540 (n_tor 7, all slots per
+  !! block): 311 s against 313 s, pair_w 5.17 V-cycles per solve against 5.26.
+  real*8,  parameter, public :: SF_GMG_RICH_OMEGA_ZEBRA = 1.0d0, SF_GMG_RICH_OMEGA_ADDITIVE = 0.8d0
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
-  !! (physics_pc_pair_maxits = 30 for the packed pairs, physics_pc_rhot_gmg =
-  !! 10 for the scalar transport blocks), so the production path reproduces
-  !! those runs rather than approximating them.
+  !! (30 for the packed pairs, 10 for the scalar transport blocks), so the
+  !! SF path reproduces those runs rather than approximating them.
   integer, parameter, public :: SF_GMG_MAXITS      = 30  !< default: the packed pairs
   integer, parameter, public :: SF_GMG_MAXITS_RHOT = 10  !< the scalar rho / T blocks
 
@@ -269,10 +284,11 @@ module mod_petsc_pc_sf_solver
     character(len=56) :: label = ""
   end type block_solver_t
 
-  public :: sf_solver_setup, sf_solver_apply, sf_solver_destroy
+  public :: sf_solver_setup, sf_solver_apply
   public :: sf_solver_reset_counters, sf_solver_report
   public :: sf_backend_name, sf_split_halves, sf_split_parts
   public :: sf_suu_parse, sf_force_terms, sf_opz
+  public :: sf_vpar_stage, sf_vpar_wmask, sf_vpar_gamma_w, sf_vpar_w_assembled, sf_vpar_wvu_full
 
 contains
 
@@ -291,21 +307,78 @@ contains
     end select
   end subroutine sf_suu_parse
 
-  !> The W terms the SF path's pair_w needs (pc_elt_matrix_force_fft's
-  !! selection): the mixed forms carry the bending term (wj) or the whole psi
-  !! channel (wpj) through explicit fields, so W keeps only the rest. Every
-  !! other configuration assembles what physics_pc_force_operator says.
+  !> The W terms pair_w needs (pc_elt_matrix_force_fft's selection): all of
+  !! W for schur / w (1); the mixed forms carry the bending term (wj) or the
+  !! whole psi channel (wpj) through explicit fields, so W keeps only the rest.
   integer function sf_force_terms()
-    use phys_module, only: physics_pc_sf, physics_pc_sf_suu, physics_pc_force_operator
+    use phys_module, only: physics_pc_sf_suu
     type(suu_form_t) :: f
     logical :: ok
-    sf_force_terms = physics_pc_force_operator
-    if (.not. physics_pc_sf) return
+    sf_force_terms = 1
     call sf_suu_parse(physics_pc_sf_suu, f, ok)
     if (.not. ok) return
     if (f%form == SF_SUU_WJ)  sf_force_terms = 5      ! kink + curvature
     if (f%form == SF_SUU_WPJ) sf_force_terms = 6      ! curvature
   end function sf_force_terms
+
+  !> physics_pc_sf_vpar_stage -> SF_VPAR_V0 | SF_VPAR_B0; -1 for an unknown string.
+  integer function sf_vpar_stage()
+    use phys_module, only: physics_pc_sf_vpar_stage
+    select case (trim(adjustl(physics_pc_sf_vpar_stage)))
+    case ("v0");  sf_vpar_stage = SF_VPAR_V0
+    case ("b0");  sf_vpar_stage = SF_VPAR_B0
+    case ("b1");  sf_vpar_stage = SF_VPAR_B1
+    case default; sf_vpar_stage = -1
+    end select
+  end function sf_vpar_stage
+
+  !> "b0" / "b1": which of v_par's W terms the sweep uses (-sf_vpar_w): bit 0
+  !! = W_vv on B_77, bit 1 = W_vu on B_72, bit 2 = W_uv on B_27 ("b1" only).
+  !! Default: all of them. 0 is the stage without the sound Schur terms, which
+  !! isolates their effect from the placement of the solve.
+  integer function sf_vpar_wmask()
+    PetscInt :: iv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    iv = 3
+    if (sf_vpar_stage() == SF_VPAR_B1) iv = 7
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_vpar_w", iv, set, ierr)
+    sf_vpar_wmask = int(iv)
+  end function sf_vpar_wmask
+
+  !> The adiabatic index of v_par's W terms (-sf_vpar_gamma_w, default GAMMA).
+  !! W eliminates T with its mass only; with strong parallel conduction the
+  !! true response is closer to isothermal, i.e. gamma -> 1 along B.
+  real*8 function sf_vpar_gamma_w()
+    use phys_module, only: gamma
+    PetscReal :: rv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    rv = gamma
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_vpar_gamma_w", rv, set, ierr)
+    sf_vpar_gamma_w = rv
+  end function sf_vpar_gamma_w
+
+  !> -sf_vpar_wvu_full 1: W_vu with the whole p channel (R [p0,u] kept), and
+  !! psi_w in v_par's row instead -- the psi channel explicit, as in pair_w,
+  !! rather than cancelled analytically (mod_pc_elt_matrix_force_fft, V_PAR).
+  logical function sf_vpar_wvu_full()
+    PetscInt :: iv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    iv = 0
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_vpar_wvu_full", iv, set, ierr)
+    sf_vpar_wvu_full = (iv /= 0)
+  end function sf_vpar_wvu_full
+
+  !> Are v_par's W terms (W_vv, W_vu, W_uv) assembled? With v_par, the SF
+  !! path on and the "b0" or "b1" stage.
+  logical function sf_vpar_w_assembled()
+    use mod_parameters, only: var_Vpar
+    use phys_module,    only: use_physics_pc
+    sf_vpar_w_assembled = (var_Vpar > 0) .and. use_physics_pc .and. &
+                          (sf_vpar_stage() == SF_VPAR_B0 .or. sf_vpar_stage() == SF_VPAR_B1)
+  end function sf_vpar_w_assembled
 
   !> Human-readable backend name, for the one setup line each block prints.
   function sf_backend_name(backend) result(s)
@@ -326,16 +399,16 @@ contains
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
                              nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
                              line_overlap, axis_sectors, rich_from, harm_pair, ring_overlap, &
-                             semi_r, axis_rings)
+                             semi_r, axis_rings, rich_omega)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
-                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_opts_t
+                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
     integer, intent(in)          :: backend, comm, my_id
     character(len=*), intent(in) :: label
     real*8, intent(in)           :: rtol
-    integer, intent(in)          :: gmg_inst  !< SF_GMG: hierarchy instance (1..4)
+    integer, intent(in)          :: gmg_inst  !< SF_GMG: hierarchy instance (1..5)
     integer, intent(in)          :: nfields   !< SF_GMG: fields packed per node in
                                               !< A -- 2 for the mixed pairs, 1 for a
                                               !< scalar block
@@ -356,6 +429,8 @@ contains
     integer, intent(in), optional :: ring_overlap !< SF_GMG: ring blocks cut by a rank boundary, extended
     integer, intent(in), optional :: semi_r     !< SF_GMG: radial-only coarse levels (gmg_opts_t)
     integer, intent(in), optional :: axis_rings !< SF_GMG: per-block override of SF_GMG_AXIS_RINGS
+    real*8,  intent(in), optional :: rich_omega !< SF_GMG: coarse-level Richardson damping (default:
+                                              !< SF_GMG_RICH_OMEGA_ADDITIVE on lines and rings, else _ZEBRA)
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -409,14 +484,11 @@ contains
       o%axis_sectors = SF_GMG_AXIS_SECTORS
       o%blockmv      = SF_BLOCKMV
       o%bnd_drop     = 1               ! Dirichlet DOFs out of the coarse spaces
-      ! the extracted blocks are |n|-diagonal unless physics_pc_sf_harm_couple
-      ! keeps a cross-|n| band (the GMG reads it only to allow axis_split)
-      o%harm_split   = merge(1, 0, harm_band == 0)
-      o%axis_mult    = 0;  o%axis_split = 0;  o%smooth_op = 0;  o%ring_diag = 0
-      o%omega        = 0.7d0;  o%axis_droptol = 0.d0;  o%ring_aspect = 1.d0
+      o%ring_aspect  = 1.d0
       o%rich_from    = SF_GMG_RICH_FROM
       o%rich_omega   = SF_GMG_RICH_OMEGA_ZEBRA
-      if (smoother == SF_GMG_SMOOTHER_LINES) o%rich_omega = SF_GMG_RICH_OMEGA_LINES
+      if (smoother == SF_GMG_SMOOTHER_LINES .or. smoother == SF_GMG_SMOOTHER_RINGS) &
+        o%rich_omega = SF_GMG_RICH_OMEGA_ADDITIVE
       if (present(line_overlap)) o%line_overlap = line_overlap
       if (present(axis_sectors)) o%axis_sectors = axis_sectors
       if (present(rich_from))    o%rich_from    = rich_from
@@ -424,6 +496,7 @@ contains
       if (present(ring_overlap)) o%ring_overlap = ring_overlap
       if (present(semi_r))       o%semi_r       = semi_r
       if (present(axis_rings))   o%axis_rings   = axis_rings
+      if (present(rich_omega))   o%rich_omega   = rich_omega
 
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)
@@ -469,6 +542,7 @@ contains
         case (2); call PCShellSetApply(pc, gmg_pc_apply_2, ierr)
         case (3); call PCShellSetApply(pc, gmg_pc_apply_3, ierr)
         case (4); call PCShellSetApply(pc, gmg_pc_apply_4, ierr)
+        case (5); call PCShellSetApply(pc, gmg_pc_apply_5, ierr)
         end select
         call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       endif
@@ -543,15 +617,6 @@ contains
       write(*,*)
     endif
   end subroutine sf_solver_report
-
-  subroutine sf_solver_destroy(slv)
-    type(block_solver_t), intent(inout) :: slv
-    PetscErrorCode :: ierr
-    if (.not. slv%created) return
-    call KSPDestroy(slv%ksp, ierr)
-    if (slv%scaled) call VecDestroy(slv%dscale, ierr)
-    slv%created = .false.; slv%scaled = .false.
-  end subroutine sf_solver_destroy
 
   !--------------------------------------------------------------------
   !> Move between a packed pair vector and its two field halves. The pack is

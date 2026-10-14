@@ -12,7 +12,7 @@ module mod_petsc_pc_sf_fam
   !> The SF path on one |n| family per rank (physics_pc_sf_mode_split).
   !!
   !! At physics_pc_sf_harm_couple = 0 every SF block is |n|-diagonal, so the
-  !! whole SFM2 sweep falls apart into independent problems, one per |n|
+  !! whole SF sweep falls apart into independent problems, one per |n|
   !! family: the n = 0 slot, then the cos and sin slots of each n. The global
   !! path still solves them together, every block on every rank, one block
   !! after another -- the regime in which the GMG's coarse levels, the
@@ -57,21 +57,21 @@ module mod_petsc_pc_sf_fam
   !! local part. It is extracted the same way, in the same pass structure, as
   !! a second fam_op_t (part = 1). The family part stays what the GMG
   !! factorizes; the sweep applies D + C (sff_cross_addmult).
-  !!
-  !! -sf_ms_verify 1 also builds the global operators and their family copies
-  !! the old way (MatCreateSubMatrix) once, and compares (sff_mat_refresh,
-  !! sff_compare; with a band, sff_compare_band on matvecs).
   !--------------------------------------------------------------------
 
   !> A family operator extracted directly. Block (a, b) of its nf x nf fields
-  !! is A(se(a,b), sv(a,b)) (variables; 0 = none), times opz where scl = 1;
-  !! has_w adds W to block (1, 1).
+  !! is A(se(a,b), sv(a,b)) (variables; 0 = none), times opz where scl = 1,
+  !! plus W source wid(a,b) of the Wf(:) the build / fill get (0 = none;
+  !! pair_w's B_22 + W: wid(1,1) = W's index). All W sources must share one
+  !! block pattern (they come from one element pass); the build checks it.
+  integer, parameter, public :: SFF_NFMAX = 5          !< fields per operator (pair_w with v_par)
   type, public :: fam_op_t
     character(len=24) :: label = ""
     integer :: nf = 0, tagb = 0
     integer :: part = 0                              !< 0: family part (family comm); 1: cross-family (global comm)
-    integer :: se(4, 4) = 0, sv(4, 4) = 0, scl(4, 4) = 0
-    logical :: has_w = .false.
+    integer :: se(SFF_NFMAX, SFF_NFMAX) = 0, sv(SFF_NFMAX, SFF_NFMAX) = 0, scl(SFF_NFMAX, SFF_NFMAX) = 0
+    integer :: wid(SFF_NFMAX, SFF_NFMAX) = 0
+    logical :: has_w = .false.                       !< any wid > 0 (set by the build)
     logical :: ready = .false.
     Mat     :: fam                                   !< the operator, family comm
     real(c_double), allocatable :: val(:)            !< its values, CSR order
@@ -82,21 +82,12 @@ module mod_petsc_pc_sf_fam
     integer :: nsend = 0
     integer, allocatable :: sdst(:), stag(:), soff(:), scnt(:)
     integer(c_int32_t), allocatable :: sa(:), sw(:)  !< +k / -k: A's (W's) diagonal / off-diagonal part
+    integer(c_int8_t), allocatable :: ss(:)          !< the W source of sw (wid), 0 = none
     integer(c_int8_t), allocatable :: sc(:)          !< 1: times opz
     !--- part 1: global-comm work vectors of the matvec (sff_cross_addmult)
     logical :: vec_ok = .false.
     Vec     :: xg, yg
   end type fam_op_t
-
-  !> One operator's family copy by MatCreateSubMatrix (-sf_ms_verify only).
-  type, public :: fam_mat_t
-    logical :: ready = .false.
-    Mat     :: perm                       !< family-major copy, global comm
-    Mat     :: loc                        !< its local rows, sequential
-    Mat     :: fam                        !< the family operator, family comm
-    PetscInt, allocatable :: keep(:)      !< positions of loc's entries kept in fam
-    PetscScalar, allocatable :: val(:)    !< fam's values, in its CSR order
-  end type fam_mat_t
 
   logical, save, public :: sff_on = .false.   !< decomposed and active
   integer, save, public :: sff_comm = MPI_COMM_NULL   !< this rank's family communicator
@@ -112,17 +103,17 @@ module mod_petsc_pc_sf_fam
   PetscInt, allocatable, save :: rsx(:)       !< first full-system row of each global rank
   integer, save :: n_idx = 0                  !< JOREK indices (A's block rows)
   integer, save :: i0 = 0, i1 = 0             !< my family indices [i0, i1)
-  logical, save :: is_ok(4) = .false.
-  IS, save :: is_f(4)                         !< family rows of a packed nf-field operator (verify)
-  VecScatter, save :: sc6                     !< x <-> stage6
-  Vec, save :: stage6                         !< global comm, local 6 n1: variables in turn
+  VecScatter, save :: scv                     !< x <-> stagev
+  Vec, save :: stagev                         !< global comm, local nsv n1: variables in turn
+  integer, save :: nsv = 0                    !< the variables the sweep splits (sff_vec_setup)
   logical, save :: vec_ok = .false.
 
-  integer, parameter :: TAG_LEN = 0, TAG_COL = 4, TAG_VAL = 8   !< + field - 1, + 16 tagb
+  integer, parameter :: TAG_LEN = 0, TAG_COL = 8, TAG_VAL = 16  !< + field - 1 (< 8), + TAG_STRIDE tagb
+  integer, parameter :: TAG_STRIDE = 32
 
-  public :: sff_decompose, sff_op_build, sff_op_fill, sff_mat_refresh, sff_mat_free, sff_compare, &
+  public :: sff_decompose, sff_op_build, sff_op_fill, &
             sff_vec_setup, sff_scatter_in, sff_scatter_out, sff_banded, sff_cross_addmult, &
-            sff_cross_scale, sff_copy_local, sff_add_local, sff_compare_band
+            sff_cross_scale, sff_copy_local, sff_add_local, sff_lift, sff_band_rows, sff_index_count
 
 contains
 
@@ -293,7 +284,7 @@ contains
   subroutine sff_op_build(op, Aj, Wf, opz, my_id)
     use mod_parameters, only: n_tor, n_var
     type(fam_op_t), intent(inout) :: op
-    Mat, intent(in)     :: Aj, Wf
+    Mat, intent(in)     :: Aj, Wf(:)
     real*8, intent(in)  :: opz
     integer, intent(in) :: my_id
 
@@ -307,7 +298,7 @@ contains
     integer :: ig, g, ns_g, nbs, ccomm
     integer(8) :: na_d, na_o, nw_d, nw_o, ndrop, nd_glob
     integer, allocatable :: sl(:), slg(:), cf(:)
-    integer :: cbase
+    integer :: cbase, iw0, iw
     integer, allocatable :: uj(:), ka(:), kw(:)          ! one index's block columns: A / W block (+-k, 0)
     integer, allocatable :: srow(:), scol(:), smrow(:), smcol(:)
     integer :: nrow_tot
@@ -318,6 +309,10 @@ contains
     PetscErrorCode :: ierr
 
     nf = op%nf
+    if (nf > SFF_NFMAX) call fail("more fields than SFF_NFMAX")
+    if (any(op%wid(1:nf, 1:nf) < 0) .or. any(op%wid(1:nf, 1:nf) > size(Wf))) &
+      call fail("a W source index outside Wf")
+    op%has_w = any(op%wid(1:nf, 1:nf) > 0)
     bsa = n_var * n_tor
     call MatGetBlockSize(Aj, bsx, ierr)
     if (bsx /= bsa) call fail("A's block size is not n_var * n_tor")
@@ -327,15 +322,23 @@ contains
     na_d = int(aia(nad + 1), 8) * bsa * bsa
     na_o = int(oia(nao + 1), 8) * bsa * bsa
     nw_d = 0; nw_o = 0
+    ! W's block pattern from the first source this operator reads; every
+    ! other source it reads must have the same (one element pass)
+    iw0 = 0
     if (op%has_w) then
-      call MatGetBlockSize(Wf, bsx, ierr)
+      iw0 = minval(op%wid(1:nf, 1:nf), mask=op%wid(1:nf, 1:nf) > 0)
+      call MatGetBlockSize(Wf(iw0), bsx, ierr)
       if (bsx /= n_tor) call fail("W's block size is not n_tor")
-      call split_parts(Wf, .true., Wd, Wo, gw)
+      call split_parts(Wf(iw0), .true., Wd, Wo, gw)
       call get_ij(Wd, .true., nwd, wia, wja)
       call get_ij(Wo, .true., nwo, woia, woja)
       if (nwd /= nad) call fail("W's block rows are not A's")
       nw_d = int(wia(nwd + 1), 8) * n_tor * n_tor
       nw_o = int(woia(nwo + 1), 8) * n_tor * n_tor
+      do iw = 1, size(Wf)
+        if (iw == iw0 .or. .not. any(op%wid(1:nf, 1:nf) == iw)) cycle
+        call same_pattern(Wf(iw))
+      enddo
     endif
     if (max(na_d, na_o, nw_d, nw_o) >= int(huge(0_c_int32_t), 8)) &
       call fail("a BAIJ value array exceeds the 32-bit position index")
@@ -370,7 +373,7 @@ contains
             nmsg = nmsg + 1
             if (pass == 2) then
               op%sdst(nmsg) = fr0(f) + q
-              op%stag(nmsg) = 16 * op%tagb + TAG_VAL + a - 1
+              op%stag(nmsg) = TAG_STRIDE * op%tagb + TAG_VAL + a - 1
               op%soff(nmsg) = ent
               smrow(nmsg) = nrow_tot
               smcol(nmsg) = ent
@@ -403,7 +406,7 @@ contains
                     e = op%se(a, b); v = op%sv(a, b)
                     do jq = u, k
                       if (.not. ((e > 0 .and. ka(jq) /= 0) .or. &
-                                 (op%has_w .and. a == 1 .and. b == 1 .and. kw(jq) /= 0))) cycle
+                                 (op%wid(a, b) > 0 .and. kw(jq) /= 0))) cycle
                       do sq = 1, ns_g
                         qslot = slg(sq)
                         row = row + 1
@@ -415,9 +418,11 @@ contains
                           if (e > 0 .and. ka(jq) /= 0) &
                             op%sa(ent) = apos(ka(jq), (e - 1) * n_tor + m, (v - 1) * n_tor + qslot, bsa)
                           if (op%has_w) then
-                            op%sw(ent) = 0
-                            if (a == 1 .and. b == 1 .and. kw(jq) /= 0) &
+                            op%sw(ent) = 0; op%ss(ent) = 0
+                            if (op%wid(a, b) > 0 .and. kw(jq) /= 0) then
                               op%sw(ent) = apos(kw(jq), m, qslot, n_tor)
+                              op%ss(ent) = int(op%wid(a, b), c_int8_t)
+                            endif
                           endif
                           if (allocated(op%sc)) op%sc(ent) = int(op%scl(a, b), c_int8_t)
                         endif
@@ -428,8 +433,8 @@ contains
                 enddo
                 enddo
                 if (pass == 2) srow(nrow_tot) = row
-                ! W's entries of this row outside the band (pair_w only)
-                if (pass == 1 .and. op%has_w .and. a == 1 .and. op%part == 0) then
+                ! W's entries of this row outside the band
+                if (pass == 1 .and. any(op%wid(a, 1:nf) > 0) .and. op%part == 0) then
                   do jq = 1, nu
                     if (kw(jq) /= 0) ndrop = ndrop + (n_tor - nbs)
                   enddo
@@ -444,7 +449,7 @@ contains
         op%nsend = nmsg
         allocate(op%sdst(nmsg), op%stag(nmsg), op%soff(nmsg), op%scnt(nmsg), smrow(nmsg + 1), smcol(nmsg + 1))
         allocate(op%sa(ent), srow(nrow_tot), scol(ent))
-        if (op%has_w) allocate(op%sw(ent))
+        if (op%has_w) allocate(op%sw(ent), op%ss(ent))
         if (any(op%scl(1:nf, 1:nf) /= 0)) allocate(op%sc(ent))
       else
         smrow(nmsg + 1) = nrow_tot; smcol(nmsg + 1) = ent
@@ -486,7 +491,7 @@ contains
         if (ib_ <= ia_) cycle
         k = k + 1
         op%rsrc(k) = r
-        op%rtag(k) = 16 * op%tagb + TAG_VAL + a - 1
+        op%rtag(k) = TAG_STRIDE * op%tagb + TAG_VAL + a - 1
         rrow0(k) = (a - 1) * nq_me * ns_me + (ia_ - i0) * ns_me
         rnrow(k) = (ib_ - ia_) * ns_me
       enddo
@@ -550,6 +555,29 @@ contains
 
   contains
 
+    !> Fail unless W source Wm has the block pattern of Wf(iw0) read above.
+    subroutine same_pattern(Wm)
+      Mat, intent(in) :: Wm
+      Mat :: Xd, Xo
+      PetscInt, pointer :: gx(:), xia(:), xja(:), xoia(:), xoja(:)
+      PetscInt :: nxd, nxo
+      logical :: same
+      call split_parts(Wm, .true., Xd, Xo, gx)
+      call get_ij(Xd, .true., nxd, xia, xja)
+      call get_ij(Xo, .true., nxo, xoia, xoja)
+      same = (nxd == nwd .and. nxo == nwo)
+      if (same) same = all(xia == wia) .and. all(xoia == woia)
+      if (same) same = all(xja(1:xia(nxd + 1)) == wja(1:wia(nwd + 1)))
+      if (same) same = all(xoja(1:xoia(nxo + 1)) == woja(1:woia(nwo + 1)))
+      if (same .and. size(gx) == size(gw)) then
+        same = all(gx == gw)
+      else
+        same = .false.
+      endif
+      call put_ij(Xd, .true., nxd, xia, xja); call put_ij(Xo, .true., nxo, xoia, xoja)
+      if (.not. same) call fail("the W sources of one operator have different block patterns")
+    end subroutine same_pattern
+
     !> Block columns of local block row l of A and of W, merged, ascending:
     !! uj(1:nu), with the A / W block (+k diagonal part, -k off-diagonal, 0).
     subroutine block_cols(l_)
@@ -609,15 +637,23 @@ contains
   subroutine sff_op_fill(op, Aj, Wf, opz)
     use mod_parameters, only: n_tor, n_var
     type(fam_op_t), intent(inout) :: op
-    Mat, intent(in)    :: Aj, Wf
+    Mat, intent(in)    :: Aj, Wf(:)
     real*8, intent(in) :: opz
-    Mat :: Ad, Ao, Wd, Wo
+    !> one W source's value arrays
+    type :: wvals_t
+      Mat :: d, o
+      type(c_ptr) :: pd, po
+      real(c_double), pointer :: vd(:) => null(), vo(:) => null()
+      logical :: on = .false.
+    end type wvals_t
+    Mat :: Ad, Ao
     PetscInt, pointer :: ga(:), gw(:)
-    type(c_ptr) :: pad, pao, pwd, pwo
-    real(c_double), pointer :: va_d(:), va_o(:), vw_d(:), vw_o(:)
+    type(c_ptr) :: pad, pao
+    real(c_double), pointer :: va_d(:), va_o(:)
+    type(wvals_t), allocatable :: wv(:)
     real(c_double), allocatable :: sbuf(:)
     integer(c_int) :: rc
-    integer :: k, nreq, mpierr, n
+    integer :: k, nreq, mpierr, n, iw
     integer, allocatable :: reqs(:)
     real*8 :: x
     PetscErrorCode :: ierr
@@ -626,10 +662,17 @@ contains
     call split_parts(Aj, .true., Ad, Ao, ga)
     rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pad); call c_f_pointer(pad, va_d, [huge(1)])
     rc = c_baij_get(transfer(Ao%v, 0_c_intptr_t), pao); call c_f_pointer(pao, va_o, [huge(1)])
+    allocate(wv(size(Wf)))
     if (op%has_w) then
-      call split_parts(Wf, .true., Wd, Wo, gw)
-      rc = c_baij_get(transfer(Wd%v, 0_c_intptr_t), pwd); call c_f_pointer(pwd, vw_d, [huge(1)])
-      rc = c_baij_get(transfer(Wo%v, 0_c_intptr_t), pwo); call c_f_pointer(pwo, vw_o, [huge(1)])
+      do iw = 1, size(Wf)
+        if (.not. any(op%wid(1:op%nf, 1:op%nf) == iw)) cycle
+        wv(iw)%on = .true.
+        call split_parts(Wf(iw), .true., wv(iw)%d, wv(iw)%o, gw)
+        rc = c_baij_get(transfer(wv(iw)%d%v, 0_c_intptr_t), wv(iw)%pd)
+        call c_f_pointer(wv(iw)%pd, wv(iw)%vd, [huge(1)])
+        rc = c_baij_get(transfer(wv(iw)%o%v, 0_c_intptr_t), wv(iw)%po)
+        call c_f_pointer(wv(iw)%po, wv(iw)%vo, [huge(1)])
+      enddo
     endif
 
     allocate(sbuf(max(n, 1)))
@@ -646,9 +689,9 @@ contains
       endif
       if (op%has_w) then
         if (op%sw(k) > 0) then
-          x = x + vw_d(op%sw(k))
+          x = x + wv(op%ss(k))%vd(op%sw(k))
         else if (op%sw(k) < 0) then
-          x = x + vw_o(-op%sw(k))
+          x = x + wv(op%ss(k))%vo(-op%sw(k))
         endif
       endif
       sbuf(k) = x
@@ -657,10 +700,12 @@ contains
 
     rc = c_baij_restore(transfer(Ao%v, 0_c_intptr_t), pao)
     rc = c_baij_restore(transfer(Ad%v, 0_c_intptr_t), pad)
-    if (op%has_w) then
-      rc = c_baij_restore(transfer(Wo%v, 0_c_intptr_t), pwo)
-      rc = c_baij_restore(transfer(Wd%v, 0_c_intptr_t), pwd)
-    endif
+    do iw = 1, size(Wf)
+      if (.not. wv(iw)%on) cycle
+      rc = c_baij_restore(transfer(wv(iw)%o%v, 0_c_intptr_t), wv(iw)%po)
+      rc = c_baij_restore(transfer(wv(iw)%d%v, 0_c_intptr_t), wv(iw)%pd)
+    enddo
+    deallocate(wv)
 
     allocate(reqs(op%nrecv + op%nsend))
     nreq = 0
@@ -723,6 +768,119 @@ contains
     call MatDiagonalScale(c%fam, c%xg, c%xg, ierr)
   end subroutine sff_cross_scale
 
+  !> Mg = Mf lifted from the family communicator onto the global one: the
+  !! same local rows and columns, every index shifted by the family's offset.
+  !! The families hold contiguous rank blocks in order and a family matrix
+  !! couples its own family only, so a family index i is global index
+  !! i + (my global start - my family start), the starts being the rank's
+  !! ownership in each numbering (rows and columns separately) -- the
+  !! family-major numbering C's columns already use. reuse: Mg exists with
+  !! this pattern; only the values are written. Any AIJ type (one-rank
+  !! families may hold sequential matrices).
+  subroutine sff_lift(Mf, Mg, reuse)
+    Mat, intent(in)     :: Mf
+    Mat, intent(inout)  :: Mg
+    logical, intent(in) :: reuse
+    PetscInt :: m, n, rf0, rf1, cf0, cf1, rg0, cg0, ncol, i, j
+    PetscInt, allocatable :: dnz(:), onz(:), cols(:)
+    PetscInt, pointer :: fc(:)
+    PetscScalar, pointer :: fv(:)
+    integer(8) :: loc(2), st(2)
+    integer :: mpierr
+    PetscErrorCode :: ierr
+    call MatGetLocalSize(Mf, m, n, ierr)
+    call MatGetOwnershipRange(Mf, rf0, rf1, ierr)
+    call MatGetOwnershipRangeColumn(Mf, cf0, cf1, ierr)
+    loc = [int(m, 8), int(n, 8)]; st = 0
+    call MPI_Exscan(loc, st, 2, MPI_INTEGER8, MPI_SUM, gcomm, mpierr)
+    if (gme == 0) st = 0
+    rg0 = int(st(1), kind(rg0)); cg0 = int(st(2), kind(cg0))
+    if (.not. reuse) then
+      allocate(dnz(max(m, 1)), onz(max(m, 1)))
+      dnz = 0; onz = 0
+      do i = 0, m - 1
+        call MatGetRow(Mf, rf0 + i, ncol, fc, PETSC_NULL_SCALAR_POINTER, ierr)
+        do j = 1, ncol
+          if (fc(j) - cf0 >= 0 .and. fc(j) - cf0 < n) then
+            dnz(i + 1) = dnz(i + 1) + 1
+          else
+            onz(i + 1) = onz(i + 1) + 1
+          endif
+        enddo
+        call MatRestoreRow(Mf, rf0 + i, ncol, fc, PETSC_NULL_SCALAR_POINTER, ierr)
+      enddo
+      call MatCreateAIJ(gcomm, m, n, PETSC_DETERMINE, PETSC_DETERMINE, 0, dnz, 0, onz, Mg, ierr)
+      call MatSetOption(Mg, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE, ierr)
+      deallocate(dnz, onz)
+    endif
+    allocate(cols(1))
+    do i = 0, m - 1
+      call MatGetRow(Mf, rf0 + i, ncol, fc, fv, ierr)
+      if (size(cols) < ncol) then
+        deallocate(cols); allocate(cols(ncol))
+      endif
+      cols(1:ncol) = fc(1:ncol) - cf0 + cg0
+      call MatSetValues(Mg, 1, [rg0 + i], ncol, cols, fv, INSERT_VALUES, ierr)
+      call MatRestoreRow(Mf, rf0 + i, ncol, fc, fv, ierr)
+    enddo
+    deallocate(cols)
+    call MatAssemblyBegin(Mg, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(Mg, MAT_FINAL_ASSEMBLY, ierr)
+  end subroutine sff_lift
+
+  !> The JOREK indices (A's block rows) the families split.
+  integer function sff_index_count()
+    sff_index_count = n_idx
+  end function sff_index_count
+
+  !> The global band rows (sff_lift's / C's family-major numbering) of the
+  !! JOREK indices idx(:) (0-based, any order): every family, its nf fields
+  !! and every slot. Family f's rank q holds rows (field a, index i, slot m)
+  !! at start(q) + (a nl_q + i - i0_q) ns_f + m, start(q) the global ranks'
+  !! row counts before it (families on contiguous ranks, in order).
+  subroutine sff_band_rows(nf, idx, rows)
+    integer, intent(in) :: nf
+    integer, intent(in) :: idx(:)
+    PetscInt, allocatable, intent(out) :: rows(:)
+    integer(8), allocatable :: base(:)
+    integer :: f, q, r, ns, a, m, j, i, ia, nl, ntot
+    allocate(base(0:gnp))
+    base(0) = 0
+    do f = 1, sff_nfam
+      ns = size(fslots(f))
+      do q = 0, fr0(f + 1) - fr0(f) - 1
+        r = fr0(f) + q
+        base(r + 1) = base(r) + int(nf, 8) * (frange(f, q + 1) - frange(f, q)) * ns
+      enddo
+    enddo
+    ntot = 0
+    do f = 1, sff_nfam
+      ntot = ntot + nf * size(fslots(f)) * size(idx)
+    enddo
+    allocate(rows(ntot))
+    j = 0
+    do f = 1, sff_nfam
+      ns = size(fslots(f))
+      do ia = 1, size(idx)
+        i = idx(ia)
+        if (i < 0 .or. i >= n_idx) call fail("sff_band_rows: index out of range")
+        q = fowner(f, i)
+        r = fr0(f) + q
+        ia_blk: block
+          integer :: i0q
+          i0q = frange(f, q)
+          nl  = frange(f, q + 1) - i0q
+          do a = 0, nf - 1
+            do m = 0, ns - 1
+              j = j + 1
+              rows(j) = int(base(r) + (int(a, 8) * nl + (i - i0q)) * ns + m, kind(rows))
+            enddo
+          enddo
+        end block ia_blk
+      enddo
+    enddo
+  end subroutine sff_band_rows
+
   !> dst = src on the local entries (vectors on different communicators,
   !! same local length).
   subroutine sff_copy_local(src, dst)
@@ -748,41 +906,6 @@ contains
     call VecRestoreArrayRead(src, sa, ierr)
   end subroutine sff_add_local
 
-  !> -sf_ms_verify with a band: (D + C) x against the global operator's
-  !! family-major copy perm (sff_mat_refresh) on a random x. Relative 2-norm
-  !! difference, over all ranks (rank 0 prints). exact: count it towards worst
-  !! (pair_w is exact only for band -1: the global path keeps all of W).
-  subroutine sff_compare_band(d, c, perm, my_id, worst, exact)
-    type(fam_op_t), intent(inout) :: d, c
-    Mat, intent(in)               :: perm
-    integer, intent(in)           :: my_id
-    real*8, intent(inout)         :: worst
-    logical, intent(in)           :: exact
-    Vec :: xg, yr, xf, yf
-    PetscRandom :: rnd
-    PetscReal :: nd, nr
-    PetscErrorCode :: ierr
-    call MatCreateVecs(perm, xg, yr, ierr)
-    call PetscRandomCreate(gcomm, rnd, ierr)
-    call VecSetRandom(xg, rnd, ierr)
-    call PetscRandomDestroy(rnd, ierr)
-    call MatMult(perm, xg, yr, ierr)
-    call MatCreateVecs(d%fam, xf, yf, ierr)
-    call sff_copy_local(xg, xf)
-    call MatMult(d%fam, xf, yf, ierr)
-    call sff_cross_addmult(c, xf, yf)
-    call VecNorm(yr, NORM_2, nr, ierr)
-    call sff_copy_local(yf, xg)                   ! xg <- (D + C) x
-    call VecAXPY(xg, -1.0d0, yr, ierr)
-    call VecNorm(xg, NORM_2, nd, ierr)
-    nd = nd / max(nr, tiny(1.d0))
-    if (exact) worst = max(worst, dble(nd))
-    if (my_id == 0) write(*,'(A,A,A,ES9.2,A)') "[Physics PC]   SF mode split verify: ", trim(d%label), &
-      " |(D + C) x - A x| / |A x| = ", nd, merge("            ", " (not gated)", exact)
-    call VecDestroy(xg, ierr); call VecDestroy(yr, ierr)
-    call VecDestroy(xf, ierr); call VecDestroy(yf, ierr)
-  end subroutine sff_compare_band
-
   subroutine fail(msg)
     character(len=*), intent(in) :: msg
     integer :: mpierr
@@ -791,166 +914,30 @@ contains
   end subroutine fail
 
   !====================================================================
-  ! -sf_ms_verify: the family copy of a global operator, the old way
-  !====================================================================
-
-  !> My family rows of a packed nf-field operator src (global comm), in
-  !! family order: field, then index (my family indices), then the family's
-  !! slots. src's own layout: global rank r holds [field 0 | ... | field
-  !! nf-1], each (its A block rows) x n_tor slots.
-  subroutine family_rows(nf, src, is)
-    use mod_parameters, only: n_tor
-    integer, intent(in) :: nf
-    Mat, intent(in)     :: src
-    IS, intent(out)     :: is
-    PetscInt, allocatable :: ps(:), rows(:)
-    PetscInt :: rs, re, k
-    integer :: r, ff, i, s, mpierr
-    PetscErrorCode :: ierr
-
-    allocate(ps(0:gnp - 1))
-    call MatGetOwnershipRange(src, rs, re, ierr)
-    call MPI_Allgather(rs, 1, MPIU_INTEGER, ps, 1, MPIU_INTEGER, gcomm, mpierr)
-    if (re - rs /= int(nf, kind(rs)) * (idx0(gme + 1) - idx0(gme)) * n_tor) &
-      call fail("an operator's rows are not nf x indices x n_tor")
-    allocate(rows(int(nf, kind(k)) * sff_n1))
-    k = 0
-    do ff = 0, nf - 1
-      do i = i0, i1 - 1
-        r = sowner(i)
-        do s = 1, size(fmodes)
-          k = k + 1
-          rows(k) = ps(r) + (int(ff, kind(k)) * (idx0(r + 1) - idx0(r)) + (i - idx0(r))) * n_tor + fmodes(s)
-        enddo
-      enddo
-    enddo
-    call ISCreateGeneral(gcomm, k, rows, PETSC_COPY_VALUES, is, ierr)
-  end subroutine family_rows
-
-  !> Create (first call) or refresh t%fam, the family copy of src by
-  !! MatCreateSubMatrix. Collective on the global communicator. Entries
-  !! outside the family are dropped.
-  subroutine sff_mat_refresh(t, src, nf)
-    type(fam_mat_t), intent(inout) :: t
-    Mat, intent(in)                :: src
-    integer, intent(in)            :: nf
-
-    PetscInt, pointer :: ia(:), ja(:)
-    PetscScalar, pointer :: a(:)
-    PetscInt :: n, nloc, off, k, j, nk, fsize
-    PetscInt, allocatable :: fi(:), fj(:)
-    PetscBool :: done
-    PetscErrorCode :: ierr
-    integer :: mpierr
-    PetscInt, parameter :: zero = 0
-
-    if (.not. is_ok(nf)) then
-      call family_rows(nf, src, is_f(nf))
-      is_ok(nf) = .true.
-    endif
-    if (.not. t%ready) then
-      call MatCreateSubMatrix(src, is_f(nf), is_f(nf), MAT_INITIAL_MATRIX, t%perm, ierr)
-      call MatMPIAIJGetLocalMat(t%perm, MAT_INITIAL_MATRIX, t%loc, ierr)
-    else
-      call MatCreateSubMatrix(src, is_f(nf), is_f(nf), MAT_REUSE_MATRIX, t%perm, ierr)
-      call MatMPIAIJGetLocalMat(t%perm, MAT_REUSE_MATRIX, t%loc, ierr)
-    endif
-    call MatGetRowIJ(t%loc, zero, PETSC_FALSE, PETSC_FALSE, n, ia, ja, done, ierr)
-    call MatSeqAIJGetArrayRead(t%loc, a, ierr)
-    if (.not. t%ready) then
-      !--- the family's columns in perm's numbering: [off, off + family size)
-      call ISGetLocalSize(is_f(nf), nloc, ierr)
-      call MPI_Exscan(nloc, off, 1, MPIU_INTEGER, MPI_SUM, gcomm, mpierr)
-      if (gme == 0) off = 0
-      call MPI_Allreduce(MPI_IN_PLACE, off, 1, MPIU_INTEGER, MPI_MIN, sff_comm, mpierr)
-      call MPI_Allreduce(nloc, fsize, 1, MPIU_INTEGER, MPI_SUM, sff_comm, mpierr)
-      allocate(fi(n + 1), fj(ia(n + 1)), t%keep(ia(n + 1)))
-      nk = 0
-      fi(1) = 0
-      do k = 1, n
-        do j = ia(k) + 1, ia(k + 1)
-          if (ja(j) >= off .and. ja(j) < off + fsize) then
-            nk = nk + 1
-            fj(nk) = ja(j) - off
-            t%keep(nk) = j
-          endif
-        enddo
-        fi(k + 1) = nk
-      enddo
-      allocate(t%val(nk))
-      t%val = a(t%keep(1:nk))
-      call MatCreateMPIAIJWithArrays(sff_comm, n, n, PETSC_DETERMINE, PETSC_DETERMINE, &
-                                     fi, fj(1:nk), t%val, t%fam, ierr)
-      deallocate(fi, fj)
-      t%ready = .true.
-    else
-      t%val = a(t%keep(1:size(t%val)))
-      call MatUpdateMPIAIJWithArray(t%fam, t%val, ierr)
-    endif
-    call MatSeqAIJRestoreArrayRead(t%loc, a, ierr)
-    call MatRestoreRowIJ(t%loc, zero, PETSC_FALSE, PETSC_FALSE, n, ia, ja, done, ierr)
-  end subroutine sff_mat_refresh
-
-  subroutine sff_mat_free(t)
-    type(fam_mat_t), intent(inout) :: t
-    PetscErrorCode :: ierr
-    if (.not. t%ready) return
-    call MatDestroy(t%perm, ierr); call MatDestroy(t%loc, ierr); call MatDestroy(t%fam, ierr)
-    deallocate(t%keep, t%val)
-    t%ready = .false.
-  end subroutine sff_mat_free
-
-  !> Directly extracted vs copied family operator: stored entries and the
-  !! largest difference relative to the copy's largest entry, over all
-  !! families (rank 0 prints). Collective on the global communicator.
-  subroutine sff_compare(op, ref, my_id, worst)
-    type(fam_op_t), intent(in)  :: op
-    Mat, intent(in)             :: ref
-    integer, intent(in)         :: my_id
-    real*8, intent(inout)       :: worst
-    Mat :: d
-    PetscReal :: nd, nr
-    MatInfo :: info_o, info_r
-    real*8 :: loc(3), glob(3)
-    integer :: mpierr
-    PetscErrorCode :: ierr
-    call MatGetInfo(op%fam, MAT_GLOBAL_SUM, info_o, ierr)
-    call MatGetInfo(ref, MAT_GLOBAL_SUM, info_r, ierr)
-    call MatDuplicate(ref, MAT_COPY_VALUES, d, ierr)
-    call MatAXPY(d, -1.0d0, op%fam, DIFFERENT_NONZERO_PATTERN, ierr)
-    call MatNorm(d, NORM_INFINITY, nd, ierr)
-    call MatNorm(ref, NORM_INFINITY, nr, ierr)
-    call MatDestroy(d, ierr)
-    loc = [dble(nd) / max(dble(nr), tiny(1.d0)), &
-           abs(info_o%nz_used - info_r%nz_used), 0.d0]
-    if (fme /= 0) loc(2) = 0.d0                    ! one count per family
-    call MPI_Allreduce(loc, glob, 3, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
-    worst = max(worst, glob(1))
-    if (my_id == 0) write(*,'(A,A,A,ES9.2,A,I0)') "[Physics PC]   SF mode split verify: ", op%label, &
-      " |direct - copy| / |copy| = ", glob(1), ", stored-entry count difference ", nint(glob(2))
-  end subroutine sff_compare
-
-  !====================================================================
   ! vectors
   !====================================================================
 
   !--------------------------------------------------------------------
-  !> The scatter between the full-system vector and the family layout of all
-  !! six variables. x_tmpl: a vector of the full system's layout. Once.
+  !> The scatter between the full-system vector and the family layout of
+  !! variables 1..nvars (the sweep's: 6, or 7 with v_par). x_tmpl: a vector of
+  !! the full system's layout. Once.
   !--------------------------------------------------------------------
-  subroutine sff_vec_setup(x_tmpl)
+  subroutine sff_vec_setup(x_tmpl, nvars)
     use mod_parameters, only: n_tor, n_var
     Vec, intent(in) :: x_tmpl
+    integer, intent(in) :: nvars
     PetscInt, allocatable :: idx(:)
     PetscInt :: k
-    IS :: is6
+    IS :: isv
     integer :: v, r, i, s
     PetscErrorCode :: ierr
 
     if (vec_ok) return
-    allocate(idx(6 * sff_n1))
+    if (nvars < 1 .or. nvars > n_var) call fail("sff_vec_setup: nvars outside 1 .. n_var")
+    nsv = nvars
+    allocate(idx(nsv * sff_n1))
     k = 0
-    do v = 1, 6
+    do v = 1, nsv
       do i = i0, i1 - 1
         r = sowner(i)
         do s = 1, size(fmodes)
@@ -960,48 +947,52 @@ contains
         enddo
       enddo
     enddo
-    call ISCreateGeneral(gcomm, k, idx, PETSC_COPY_VALUES, is6, ierr)
-    call VecCreateMPI(gcomm, k, PETSC_DETERMINE, stage6, ierr)
-    call VecScatterCreate(x_tmpl, is6, stage6, PETSC_NULL_IS, sc6, ierr)
-    call ISDestroy(is6, ierr)
+    call ISCreateGeneral(gcomm, k, idx, PETSC_COPY_VALUES, isv, ierr)
+    call VecCreateMPI(gcomm, k, PETSC_DETERMINE, stagev, ierr)
+    call VecScatterCreate(x_tmpl, isv, stagev, PETSC_NULL_IS, scv, ierr)
+    call ISDestroy(isv, ierr)
     vec_ok = .true.
   end subroutine sff_vec_setup
 
-  !> v(k) = variable k of x, in the family layout (v on the family comm).
+  !> v(k) = variable k of x, in the family layout (v on the family comm),
+  !! k = 1 .. nsv.
   subroutine sff_scatter_in(x, v)
     Vec :: x
-    Vec :: v(6)
+    Vec :: v(:)
     PetscScalar, pointer :: sa(:), va(:)
     PetscErrorCode :: ierr
     integer :: k
-    call VecScatterBegin(sc6, x, stage6, INSERT_VALUES, SCATTER_FORWARD, ierr)
-    call VecScatterEnd(sc6, x, stage6, INSERT_VALUES, SCATTER_FORWARD, ierr)
-    call VecGetArrayRead(stage6, sa, ierr)
-    do k = 1, 6
+    if (size(v) /= nsv) call fail("sff_scatter_in: not the variables of sff_vec_setup")
+    call VecScatterBegin(scv, x, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
+    call VecScatterEnd(scv, x, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
+    call VecGetArrayRead(stagev, sa, ierr)
+    do k = 1, nsv
       call VecGetArray(v(k), va, ierr)
       va = sa((k - 1) * sff_n1 + 1 : k * sff_n1)
       call VecRestoreArray(v(k), va, ierr)
     enddo
-    call VecRestoreArrayRead(stage6, sa, ierr)
+    call VecRestoreArrayRead(stagev, sa, ierr)
   end subroutine sff_scatter_in
 
-  !> y = the six family-layout variables v(k), back in the full system.
-  !! Every row of y belongs to exactly one family, so y is fully overwritten.
+  !> y = the family-layout variables v(k), k = 1 .. nsv, back in the full
+  !! system. Every row of y belongs to exactly one family, so variables
+  !! 1 .. nsv of y are fully overwritten (any further ones are not touched).
   subroutine sff_scatter_out(v, y)
-    Vec :: v(6)
+    Vec :: v(:)
     Vec :: y
     PetscScalar, pointer :: sa(:), va(:)
     PetscErrorCode :: ierr
     integer :: k
-    call VecGetArray(stage6, sa, ierr)
-    do k = 1, 6
+    if (size(v) /= nsv) call fail("sff_scatter_out: not the variables of sff_vec_setup")
+    call VecGetArray(stagev, sa, ierr)
+    do k = 1, nsv
       call VecGetArrayRead(v(k), va, ierr)
       sa((k - 1) * sff_n1 + 1 : k * sff_n1) = va
       call VecRestoreArrayRead(v(k), va, ierr)
     enddo
-    call VecRestoreArray(stage6, sa, ierr)
-    call VecScatterBegin(sc6, stage6, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
-    call VecScatterEnd(sc6, stage6, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
+    call VecRestoreArray(stagev, sa, ierr)
+    call VecScatterBegin(scv, stagev, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
+    call VecScatterEnd(scv, stagev, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
   end subroutine sff_scatter_out
 
 #endif

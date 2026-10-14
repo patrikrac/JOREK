@@ -2443,8 +2443,8 @@ do i=1,n_vertex_max
                   !#  Current Definition Equation                                                                    #
                   !###################################################################################################
 
-                  amat(var_zj,var_zj) = v * zj * BigR * xjac
-                  amat(var_zj,var_psi) = (v_x * psi_x + v_y * psi_y ) * BigR * xjac + 2.d0 * v * psi_x * BigR * xjac
+                  amat(var_zj,var_zj) = v * zj / BigR * xjac
+                  amat(var_zj,var_psi) = (v_x * psi_x + v_y * psi_y ) / BigR * xjac
 
                   !###################################################################################################
                   !#  Vorticity Definition Equation                                                                  #

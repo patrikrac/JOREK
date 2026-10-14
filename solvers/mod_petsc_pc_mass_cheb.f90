@@ -61,12 +61,13 @@ contains
 
   !> Configure, estimate the bounds, choose the degree and gate it. Once per
   !! run (B's values never change). Collective on comm.
-  subroutine mass_cheb_setup(MC, B, comm, label)
+  subroutine mass_cheb_setup(MC, B, comm, label, nharm)
     use mod_parameters, only: n_tor
     type(mass_cheb_t), intent(inout) :: MC
     Mat, intent(in)              :: B
     integer, intent(in)          :: comm
     character(len=*), intent(in) :: label
+    integer, intent(in), optional :: nharm   !< B's harmonics per node block (default n_tor)
     KSP :: est
     PC  :: pc
     PetscErrorCode :: ierr
@@ -76,7 +77,11 @@ contains
     logical :: okb
 
     call MPI_Comm_rank(comm, rank, ierr)
-    okb = blockmv_attach(B, int(n_tor))       ! the iteration's matvec on the threads
+    if (present(nharm)) then
+      okb = blockmv_attach(B, nharm)          ! the iteration's matvec on the threads
+    else
+      okb = blockmv_attach(B, int(n_tor))
+    endif
 
     call KSPCreate(comm, MC%ksp, ierr)
     call KSPSetOperators(MC%ksp, B, B, ierr)
