@@ -74,7 +74,7 @@ module mod_petsc_pc_sf_mixed
   !--- D's groups: the local rows (0-based, rank-local) of each diagonal block
   integer, allocatable, save :: gptr(:), grow(:)
 
-  public :: sfm_build, sfm_refill
+  public :: sfm_build, sfm_refill, sfm_map_spec, sfm_release_parts
 
 contains
 
@@ -141,6 +141,37 @@ contains
 
     call pack_op()
   end subroutine sfm_refill
+
+  !--------------------------------------------------------------------
+  !> "wpj" is a plain gather of A and W (mod_petsc_pc_sf_gather): block (f, g)
+  !! of the packed (u, omega, psi, j) operator is A(se, sv) (se = 0: empty),
+  !! times opz where zs, plus W in (1, 1) -- pack_op's blocks. ok = .false.
+  !! for "wj", whose D products are not a gather.
+  !--------------------------------------------------------------------
+  subroutine sfm_map_spec(se, sv, zs, ok)
+    use mod_parameters, only: var_psi, var_u, var_zj, var_w
+    integer, intent(out) :: se(4, 4), sv(4, 4)
+    logical, intent(out) :: zs(4, 4)
+    logical, intent(out) :: ok
+    integer :: f(4)
+    ok = (fm%form == SF_SUU_WPJ)
+    se = 0; sv = 0; zs = .false.
+    if (.not. ok) return
+    f = [var_u, var_w, var_psi, var_zj]
+    se(1, :) = var_u;  sv(1, :) = f                      ! S_uu, B_24, B_21, B_23
+    se(2, 1:2) = var_w; sv(2, 1:2) = f(1:2)              ! B_42, B_44
+    se(3, 1) = var_psi; sv(3, 1) = var_u                 ! B_12
+    se(3, 3) = var_zj;  sv(3, 3) = var_zj; zs(3, 3) = .true.   ! opz M_psi = opz B_33
+    se(3, 4) = var_psi; sv(3, 4) = var_zj                ! B_13
+    se(4, 3:4) = var_zj; sv(4, 3:4) = [var_psi, var_zj]  ! B_31, B_33
+  end subroutine sfm_map_spec
+
+  !> The gather refills sfm_op: the parts only the re-assembly needed go
+  subroutine sfm_release_parts()
+    PetscErrorCode :: ierr
+    call MatDestroy(suu, ierr)
+    if (fm%form == SF_SUU_WPJ) call MatDestroy(mpsi, ierr)
+  end subroutine sfm_release_parts
 
   !> The packed operator from the current blocks (first call: its pattern).
   subroutine pack_op()

@@ -12,12 +12,13 @@ module mod_petsc_pc_sf
        pack_pair_aij, make_pair_block_scale, make_field_block_scale, &
        split_vars, merge_vars, harm_band
   use mod_petsc_pc_sf_solver
-  use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather, sfg_cross_weights
+  use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather, sfg_drop, sfg_cross_weights, sfg_dev_setup
   use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_dh, sfw_lines
-  use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf
+  use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf, sfm_map_spec, sfm_release_parts
   use mod_petsc_raw_csr, only: blockmv_attach
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
-  use mod_petsc_pc_sf_fam, only: fam_op_t, sff_comm, sff_decompose, sff_op_build, &
+  use mod_petsc_blk_dev, only: vec_make_dev
+  use mod_petsc_pc_sf_fam, only: fam_op_t, sff_comm, sff_decompose, sff_op_build, sff_op_dev, &
        sff_op_fill, sff_vec_setup, sff_scatter_in, sff_scatter_out, &
        sff_cross_addmult, sff_cross_scale, sff_copy_local, sff_add_local, sff_lift, &
        sff_band_rows, sff_index_count
@@ -135,6 +136,7 @@ module mod_petsc_pc_sf
   integer, save :: suu = SF_SUU_WPJ            !< pair_w's S_uu (physics_pc_sf_suu)
   type(suu_form_t), save :: sform              !< ... with its variant (the mixed forms)
   logical, save :: mixed = .false.             !< pair_w mixed: "wj" / "wpj"
+  logical, save :: sfm_gathered = .false.      !< the mixed pair_w refilled by the value map (no sfm_refill)
   integer, save :: corr = 0                    !< step-3 corrector (physics_pc_sf_corrector)
   !> EXPERIMENT (-sf_seq, see sf_core_sweep): 0 the LDU sweep below; 1 core
   !! first, block Gauss--Seidel on {(u, omega, psi, j) | (rho, T)}; 2 block
@@ -175,6 +177,15 @@ module mod_petsc_pc_sf
   Vec, save :: w3, w4, w5, t_rho, t_T
   Vec, save :: zv                      !< mixed: a zero field (the psi / j right-hand sides)
   logical, save :: vecs_ready = .false.
+  ! The SF apply on the device (-sf_gpu 1 with every block solver on the GMG
+  ! device path; -sf_gpu_apply 0 keeps it on the host): its work vectors are
+  ! device vectors and cmult multiplies with device copies ad(k) of the
+  ! couplings, refilled lazily once per build (ad_gen(k) /= sf_gen).
+  logical, save :: sfdev = .false.
+  integer, save :: sf_gen = 0
+  integer, parameter :: NAD = 64
+  Mat, save     :: ad(NAD)
+  integer, save :: ad_gen(NAD) = -1
   logical, save :: kpj_packed = .false., sw_packed = .false., pw0_packed = .false.
   Mat, save     :: pw0                 !< schur: pair_w without W, [[B_22, B_24], [B_42, B_44]]
 
@@ -526,6 +537,7 @@ contains
 
     call sf_init(my_id)
     first = sf_first
+    sf_gen = sf_gen + 1
     comm_g = comm
     pj_post0 = SF_PJ_POST0_SCHUR
     if (suu /= SF_SUU_SCHUR) pj_post0 = SF_PJ_POST0_W
@@ -560,10 +572,10 @@ contains
         call first_build_operators()
       else
         call PetscLogEventBegin(pcev_extract, ierr)
-        call sfg_gather(A_full, g_ctx%W_force, my_id)
+        call sfg_gather(A_full, g_ctx%W_force, my_id, sf_opz())
         if (with_v) call vpar_global_sums(.false.)
         call PetscLogEventEnd(pcev_extract, ierr)
-        if (mixed) then
+        if (mixed .and. .not. sfm_gathered) then
           call PetscLogEventBegin(pcev_build_suu, ierr)
           call sfm_refill(comm, my_id)
           call PetscLogEventEnd(pcev_build_suu, ierr)
@@ -713,9 +725,26 @@ contains
 
     !--- work vectors: the operators keep their layout for the run.
     if (.not. vecs_ready) then
+      block
+        use mod_petsc_pc_gmg, only: gmg_dev_on
+        PetscInt :: pv
+        PetscBool :: set
+        pv = 1
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_apply", pv, set, ierr)
+        sfdev = gmg_dev_on() .and. pv > 0 .and. .not. banded .and. seq == 0 .and. corr /= 3 .and. &
+                slv_pj%dev .and. slv_w%dev .and. slv_rho%dev .and. slv_T%dev
+        if (with_v .and. sfdev) sfdev = slv_v%dev
+        if (my_id == 0 .and. gmg_dev_on()) write(*,'(A,A)') "[Physics PC]   SF apply: ", &
+          merge("on the device (work vectors, couplings, packs)", "on the host                                   ", sfdev)
+      end block
       call MatCreateVecs(a_pj, rhs_PJ, sol_PJ, ierr)
       call MatCreateVecs(a_w, rhs_W, sol_W, ierr)
       call MatCreateVecs(a_rho, sv_x(1), PETSC_NULL_VEC, ierr)
+      if (sfdev) then
+        call vec_make_dev(rhs_PJ); call vec_make_dev(sol_PJ)
+        call vec_make_dev(rhs_W);  call vec_make_dev(sol_W)
+        call vec_make_dev(sv_x(1))
+      endif
       block
         integer :: k
         do k = 2, NSV
@@ -736,11 +765,14 @@ contains
       call VecSet(zv, 0.0d0, ierr)
       call MatCreateVecs(a_rho, t_rho, PETSC_NULL_VEC, ierr)
       call MatCreateVecs(a_T,   t_T,   PETSC_NULL_VEC, ierr)
+      if (sfdev) then
+        call vec_make_dev(t_rho); call vec_make_dev(t_T)
+      endif
       if (famode) then
         block
           Vec :: xt
           call MatCreateVecs(A_full, xt, PETSC_NULL_VEC, ierr)
-          call sff_vec_setup(xt, NSV)
+          call sff_vec_setup(xt, NSV, dev=sfdev)
           call VecDestroy(xt, ierr)
         end block
       endif
@@ -818,6 +850,22 @@ contains
           enddo
         endif
         call PetscLogEventEnd(pcev_extract, ierr)
+      endif
+      !--- device path: the operators become device matrices, filled there
+      !--- from the next build on (-sf_gpu_gather 0: host fills + copies)
+      if (first_ .and. .not. banded .and. sf_dev_gather()) then
+        block
+          use mod_petsc_pc_gmg, only: gmg_dev_mtype
+          character(len=64) :: mt
+          mt = gmg_dev_mtype()
+          call sff_op_dev(o_pj, mt);  call sff_op_dev(o_w, mt)
+          call sff_op_dev(o_rho, mt); call sff_op_dev(o_T, mt)
+          if (with_v .and. vstage /= SF_VPAR_B1) call sff_op_dev(o_v, mt)
+          if (corr == 3) call sff_op_dev(o_m, mt)
+          do k = 1, ncb_on
+            call sff_op_dev(o_cb(k), mt)
+          enddo
+        end block
       endif
       a_pj = o_pj%fam;  a_w = o_w%fam;  a_rho = o_rho%fam;  a_T = o_T%fam
       if (corr == 3) a_m = o_m%fam
@@ -1028,7 +1076,33 @@ contains
       !--- the value maps, gated against what was just extracted (schur:
       !--- pw0 and sfw_lines, the pair_w smoother operator, are refilled like
       !--- S_W_aij; sfw_numeric adds the channel on top of sfw_lines)
-      if (suu /= SF_SUU_SCHUR) then
+      if (mixed) then
+        ! the mixed pair_w straight from A and W where it is a gather ("wpj");
+        ! then the blocks only its re-assembly read are dropped
+        block
+          integer :: mse(4, 4), msv(4, 4)
+          logical :: mzs(4, 4), mok
+          call sfm_map_spec(mse, msv, mzs, mok)
+          if (mok) then
+            call sfg_build(A_full, g_ctx%W_force, M(1:nkeep), eqs(1:nkeep), vrs(1:nkeep), &
+                           g_ctx%K_pj_aij, [var_psi, var_zj], [var_psi, var_zj], &
+                           g_ctx%S_W_aij, none, [var_u, var_w], [var_u, var_w], comm, my_id, &
+                           Mix=sfm_op, mix_se=mse(1:sfm_nf, 1:sfm_nf), mix_sv=msv(1:sfm_nf, 1:sfm_nf), &
+                           mix_zs=mzs(1:sfm_nf, 1:sfm_nf), opz=sf_opz(), mix_ok=sfm_gathered)
+          else
+            call sfg_build(A_full, g_ctx%W_force, M(1:nkeep), eqs(1:nkeep), vrs(1:nkeep), &
+                           g_ctx%K_pj_aij, [var_psi, var_zj], [var_psi, var_zj], &
+                           g_ctx%S_W_aij, none, [var_u, var_w], [var_u, var_w], comm, my_id)
+          endif
+          if (sfm_gathered .and. corr /= 3) then        ! corrector 3 reads B_44 (a_m)
+            call sfg_drop(M(15+NVP:NBLK))
+            call sfm_release_parts()
+            call MatDestroy(g_ctx%S_W_aij, ierr)           ! the mixed path solves sfm_op
+            g_ctx%S_W_aij = PETSC_NULL_MAT
+            nkeep = 14 + NVP
+          endif
+        end block
+      else if (suu /= SF_SUU_SCHUR) then
         call sfg_build(A_full, g_ctx%W_force, M(1:nkeep), eqs(1:nkeep), vrs(1:nkeep), &
                        g_ctx%K_pj_aij, [var_psi, var_zj], [var_psi, var_zj], &
                        g_ctx%S_W_aij, none, [var_u, var_w], [var_u, var_w], comm, my_id)
@@ -1092,6 +1166,16 @@ contains
         if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   SF: WARNING ", nno, &
           " coupling block(s) not AIJ, left on PETSc's single-threaded matvec"
       end block
+
+      !--- device path: the operators become device matrices, gathered there
+      !--- on every rebuild (-sf_gpu_gather 0: host gather + device copies)
+      if (suu /= SF_SUU_SCHUR .and. sf_dev_gather()) then
+        block
+          use mod_petsc_pc_gmg, only: gmg_dev_mtype
+          logical :: dok
+          call sfg_dev_setup(A_full, g_ctx%W_force, gmg_dev_mtype(), sf_opz(), comm, my_id, dok)
+        end block
+      endif
     end subroutine first_build_operators
 
     !> The global path's "b0" operators of v_par: vop_g = B_77 + W_vv,
@@ -1731,13 +1815,36 @@ contains
       sqrt(nrm), " (max over ranks): applied in the rho -> T sweep"
   end subroutine set_use_b65
 
+  !> The SF operators gathered on the device (-sf_gpu 1 and -sf_gpu_gather 1,
+  !! the default with it, in a Kokkos build)
+  logical function sf_dev_gather()
+    use mod_petsc_raw_csr, only: sfg_dev_available
+    PetscInt :: pg, pv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    pg = 0; pv = 1
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu", pg, set, ierr)
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_gather", pv, set, ierr)
+    sf_dev_gather = pg > 0 .and. pv > 0 .and. sfg_dev_available()
+  end function sf_dev_gather
+
   !> y = B x for a coupling block of the sweep (k: its index in o_cb), with
   !! a band plus its cross-family part.
   subroutine cmult(a, k, x, y)
+    use mod_petsc_pc_gmg, only: gmg_mat_dev
     Mat :: a
     integer, intent(in) :: k
     Vec :: x, y
     PetscErrorCode :: ierr
+    if (sfdev) then
+      if (k < 1 .or. k > NAD) stop "cmult: coupling id outside the device copies"
+      if (ad_gen(k) /= sf_gen) then
+        call gmg_mat_dev(a, ad(k), ad_gen(k) < 0)
+        ad_gen(k) = sf_gen
+      endif
+      call MatMult(ad(k), x, y, ierr)
+      return
+    endif
     call MatMult(a, x, y, ierr)
     if (banded) call sff_cross_addmult(x_cb(k), x, y)
   end subroutine cmult

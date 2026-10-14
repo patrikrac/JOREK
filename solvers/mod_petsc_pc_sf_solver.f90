@@ -282,6 +282,11 @@ module mod_petsc_pc_sf_solver
     integer :: nfail    = 0                !< solves that stopped unconverged (its cap, failed PC)
     real*8  :: t_sum    = 0.d0             !< wall time in its solves (this rank)
     character(len=56) :: label = ""
+    ! SF_GMG on the device path: the FGMRES runs on the hierarchy's device
+    ! operators and vectors (drhs, dsol; dds = dscale's copy), one copy in and
+    ! one out per solve
+    logical :: dev      = .false.
+    Vec     :: drhs, dsol, dds
   end type block_solver_t
 
   public :: sf_solver_setup, sf_solver_apply
@@ -400,11 +405,12 @@ contains
                              nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
                              line_overlap, axis_sectors, rich_from, harm_pair, ring_overlap, &
                              semi_r, axis_rings, rich_omega)
-    use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
+    use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, gmg_dev_ops, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
+    Mat :: devF, devA                      !< SF_GMG device path: the FGMRES's operators
     integer, intent(in)          :: backend, comm, my_id
     character(len=*), intent(in) :: label
     real*8, intent(in)           :: rtol
@@ -514,6 +520,20 @@ contains
       else
         call gmg_setup_operator(A, comm, my_id, Afine=Aop, tag=trim(label), opts=o, Ablk=Ablk)
       endif
+      block
+        Mat :: Fd, Ad
+        logical :: don
+        call gmg_dev_ops(slv%gmg_inst, don, Fd, Ad)
+        if (don .and. .not. slv%dev) then
+          call MatCreateVecs(Ad, slv%dsol, slv%drhs, ierr)
+          call VecDuplicate(slv%drhs, slv%dds, ierr)
+        endif
+        slv%dev = don
+        if (don .and. slv%scaled) call VecCopy(slv%dscale, slv%dds, ierr)
+        if (don) then
+          devF = Fd; devA = Ad
+        endif
+      end block
       call gmg_select(1)
 
       !--- the Krylov wrapper: created once, re-pointed at every rebuild
@@ -546,7 +566,9 @@ contains
         end select
         call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       endif
-      if (present(Aop)) then
+      if (slv%dev) then
+        call KSPSetOperators(slv%ksp, devF, devA, ierr)
+      else if (present(Aop)) then
         call KSPSetOperators(slv%ksp, Aop, A, ierr)
       else
         call KSPSetOperators(slv%ksp, A, A, ierr)
@@ -573,6 +595,7 @@ contains
   !! does and is safe because the caller owns rhs and refills it every apply.
   !--------------------------------------------------------------------
   subroutine sf_solver_apply(slv, rhs, sol, ierr)
+    use mod_petsc_blk_dev, only: vec_is_dev
     type(block_solver_t), intent(inout) :: slv
     Vec, intent(in) :: rhs, sol
     PetscErrorCode, intent(inout) :: ierr
@@ -581,9 +604,21 @@ contains
     real*8 :: t0
 
     t0 = MPI_Wtime()
-    if (slv%scaled) call VecPointwiseMult(rhs, rhs, slv%dscale, ierr)
-    call KSPSolve(slv%ksp, rhs, sol, ierr)
-    if (slv%scaled) call VecPointwiseMult(sol, sol, slv%dscale, ierr)
+    if (slv%dev .and. vec_is_dev(rhs)) then             ! the SF apply on the device: in place
+      if (slv%scaled) call VecPointwiseMult(rhs, rhs, slv%dds, ierr)
+      call KSPSolve(slv%ksp, rhs, sol, ierr)
+      if (slv%scaled) call VecPointwiseMult(sol, sol, slv%dds, ierr)
+    else if (slv%dev) then
+      call VecCopy(rhs, slv%drhs, ierr)
+      if (slv%scaled) call VecPointwiseMult(slv%drhs, slv%drhs, slv%dds, ierr)
+      call KSPSolve(slv%ksp, slv%drhs, slv%dsol, ierr)
+      if (slv%scaled) call VecPointwiseMult(slv%dsol, slv%dsol, slv%dds, ierr)
+      call VecCopy(slv%dsol, sol, ierr)
+    else
+      if (slv%scaled) call VecPointwiseMult(rhs, rhs, slv%dscale, ierr)
+      call KSPSolve(slv%ksp, rhs, sol, ierr)
+      if (slv%scaled) call VecPointwiseMult(sol, sol, slv%dscale, ierr)
+    endif
     slv%t_sum = slv%t_sum + (MPI_Wtime() - t0)
 
     call KSPGetIterationNumber(slv%ksp, its, ierr)
@@ -626,75 +661,40 @@ contains
   subroutine sf_split_halves(p, h1, h2, to_p)
     Vec :: p, h1, h2
     logical, intent(in) :: to_p
-    PetscScalar, pointer :: pa(:), a1(:), a2(:)
-    PetscErrorCode :: ierr
-    PetscInt :: n1, n2
-
-    call VecGetLocalSize(h1, n1, ierr)
-    call VecGetLocalSize(h2, n2, ierr)
-    if (to_p) then
-      call VecGetArray(p, pa, ierr)
-      call VecGetArrayRead(h1, a1, ierr)
-      call VecGetArrayRead(h2, a2, ierr)
-      pa(1:n1)           = a1(1:n1)
-      pa(n1 + 1:n1 + n2) = a2(1:n2)
-      call VecRestoreArrayRead(h1, a1, ierr)
-      call VecRestoreArrayRead(h2, a2, ierr)
-      call VecRestoreArray(p, pa, ierr)
-    else
-      call VecGetArrayRead(p, pa, ierr)
-      call VecGetArray(h1, a1, ierr)
-      call VecGetArray(h2, a2, ierr)
-      a1(1:n1) = pa(1:n1)
-      a2(1:n2) = pa(n1 + 1:n1 + n2)
-      call VecRestoreArray(h1, a1, ierr)
-      call VecRestoreArray(h2, a2, ierr)
-      call VecRestoreArrayRead(p, pa, ierr)
-    endif
+    Vec :: h(2)
+    h = [h1, h2]
+    call sf_split_parts(p, h, to_p)
   end subroutine sf_split_halves
 
-  !> sf_split_halves for any number of fields: p = [h(1) local | h(2) local | ...].
-  !! On the way out a part may be skipped (keep(k) = .false.).
+  !> sf_split_halves for any number of parts: p = [h(1) local | h(2) local |
+  !! ...]; keep(k) false: part k is not unpacked. On the device when the
+  !! vectors are device vectors (vec_copy_strided).
   subroutine sf_split_parts(p, h, to_p, keep)
+    use mod_petsc_blk_dev, only: vec_copy_strided
     Vec :: p
     Vec :: h(:)
     logical, intent(in) :: to_p
     logical, intent(in), optional :: keep(:)
-    PetscScalar, pointer :: pa(:), a(:)
     PetscErrorCode :: ierr
-    PetscInt :: n, o
-    integer :: k
+    PetscInt :: n
+    integer :: k, o
 
-    if (to_p) then
-      call VecGetArray(p, pa, ierr)
-    else
-      call VecGetArrayRead(p, pa, ierr)
-    endif
     o = 0
     do k = 1, size(h)
       call VecGetLocalSize(h(k), n, ierr)
       if (to_p) then
-        call VecGetArrayRead(h(k), a, ierr)
-        pa(o + 1:o + n) = a(1:n)
-        call VecRestoreArrayRead(h(k), a, ierr)
+        call vec_copy_strided(p, o, 0, h(k), 0, 0, int(n), 1)
       else
         if (present(keep)) then
           if (.not. keep(k)) then
-            o = o + n
+            o = o + int(n)
             cycle
           endif
         endif
-        call VecGetArray(h(k), a, ierr)
-        a(1:n) = pa(o + 1:o + n)
-        call VecRestoreArray(h(k), a, ierr)
+        call vec_copy_strided(h(k), 0, 0, p, o, 0, int(n), 1)
       endif
-      o = o + n
+      o = o + int(n)
     enddo
-    if (to_p) then
-      call VecRestoreArray(p, pa, ierr)
-    else
-      call VecRestoreArrayRead(p, pa, ierr)
-    endif
   end subroutine sf_split_parts
 
 #endif

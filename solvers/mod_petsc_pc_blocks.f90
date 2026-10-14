@@ -534,48 +534,36 @@ contains
   !! map of create_variable_index_sets. Rank-local, no communication.
   subroutine split_vars(x, v)
     use mod_parameters, only: n_var, n_tor
+    use mod_petsc_blk_dev, only: vec_copy_strided
     Vec :: x
     Vec :: v(:)
-    PetscScalar, pointer :: xa(:), va(:)
     PetscErrorCode :: ierr
     PetscInt :: nl
-    integer :: k, i, bs, nn
+    integer :: k, bs, nn
     call VecGetLocalSize(x, nl, ierr)
     bs = n_var * n_tor
     nn = int(nl) / bs
-    call VecGetArrayRead(x, xa, ierr)
     do k = 1, size(v)
-      call VecGetArray(v(k), va, ierr)
-      do i = 0, nn - 1
-        va(i * n_tor + 1 : (i + 1) * n_tor) = xa(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor)
-      enddo
-      call VecRestoreArray(v(k), va, ierr)
+      call vec_copy_strided(v(k), 0, n_tor, x, (k - 1) * n_tor, bs, n_tor, nn)
     enddo
-    call VecRestoreArrayRead(x, xa, ierr)
   end subroutine split_vars
 
   !> Inverse of split_vars: variables 1..size(v) of y from v(k); any further
   !! variables of y are left untouched.
   subroutine merge_vars(v, y)
     use mod_parameters, only: n_var, n_tor
+    use mod_petsc_blk_dev, only: vec_copy_strided
     Vec :: v(:)
     Vec :: y
-    PetscScalar, pointer :: ya(:), va(:)
     PetscErrorCode :: ierr
     PetscInt :: nl
-    integer :: k, i, bs, nn
+    integer :: k, bs, nn
     call VecGetLocalSize(y, nl, ierr)
     bs = n_var * n_tor
     nn = int(nl) / bs
-    call VecGetArray(y, ya, ierr)
     do k = 1, size(v)
-      call VecGetArrayRead(v(k), va, ierr)
-      do i = 0, nn - 1
-        ya(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor) = va(i * n_tor + 1 : (i + 1) * n_tor)
-      enddo
-      call VecRestoreArrayRead(v(k), va, ierr)
+      call vec_copy_strided(y, (k - 1) * n_tor, bs, v(k), 0, n_tor, n_tor, nn)
     enddo
-    call VecRestoreArray(y, ya, ierr)
   end subroutine merge_vars
 
 #endif

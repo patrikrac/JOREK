@@ -5,8 +5,9 @@ module mod_petsc_pc_sf_gather
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_blocks, only: harm_kept
-  use mod_petsc_raw_csr, only: split_parts, get_ij, put_ij, &
-                               c_baij_get, c_baij_restore, c_aij_get, c_aij_restore
+  use mod_petsc_raw_csr, only: split_parts, get_ij, put_ij, aij_parts, aij_vals_read, aij_vals_done, &
+                               c_baij_get, c_baij_restore, c_aij_get, c_aij_restore, &
+                               sfg_dev_source, sfg_dev_target, sfg_dev_target_clear, sfg_dev_gather
   implicit none
   private
 
@@ -28,22 +29,41 @@ module mod_petsc_pc_sf_gather
   !!             map is otherwise invisible to every norm the build prints).
   !! sfg_gather  every later rebuild.
   !!
+  !! A target is a single block A(e, v) or an nf-field packed operator (rank
+  !! p's rows: [field 1 | ... | field nf] of its sub-block range), whose block
+  !! (f, g) is A(se(f, g), sv(f, g)) (se = 0: an empty block), optionally times
+  !! the current opz (zs), plus W in block (1, 1) for pair_w's S_uu = B_22 + W.
+  !! The mixed pair_w ("wpj", mod_petsc_pc_sf_mixed) is such an operator, so a
+  !! rebuild gathers it directly instead of re-adding and repacking its blocks.
+  !!
   !! The maps assume the frozen pattern. If A's or W's nonzero state or object
   !! changes, sfg_gather stops loudly rather than silently dropping entries.
   !!
   !! The raw CSR access (value arrays, diagonal/off-diagonal split) is in
   !! mod_petsc_raw_csr.
+  !!
+  !! DEVICE PATH (sfg_dev_setup, -sf_gpu with -sf_gpu_gather 1): the targets
+  !! become device matrices and every rebuild gathers on the device
+  !! (jorek_sfg_kokkos.cpp) from A's and W's values there -- A's go up once
+  !! per step anyway, for the outer FGMRES -- so no host pass over the values
+  !! and no upload of the operators. Gated once against the host gather.
   !--------------------------------------------------------------------
+
+  integer, parameter :: MAXF = 4      !< fields of a packed target
 
   !> One target operator and its map. md/mo index the target's diagonal and
   !! off-diagonal CSR values; each entry is +k (k-th value of A's diagonal
   !! BAIJ part), -k (of A's off-diagonal part) or 0 (no A contribution).
-  !! wd/wo: the same into W, for pair_w's S_uu entries only.
+  !! wd/wo: the same into W, for the S_uu entries only; zd/zo /= 0: the entry
+  !! is scaled by opz (blocks with zs).
   type :: tgt_t
     Mat     :: T
-    integer :: e(2) = 0, v(2) = 0      !< equations (row fields) / variables (column fields)
-    logical :: pair = .false., with_w = .false.
+    integer :: nf = 1                                  !< fields (1: a single block)
+    integer :: se(MAXF, MAXF) = 0, sv(MAXF, MAXF) = 0  !< block (f, g) = A(se, sv); se = 0: empty
+    logical :: zs(MAXF, MAXF) = .false.                !< block (f, g) scaled by opz
+    logical :: with_w = .false., with_z = .false.
     integer(c_int32_t), allocatable :: md(:), mo(:), wd(:), wo(:)
+    integer(c_int8_t), allocatable  :: zd(:), zo(:)
   end type tgt_t
 
   integer, parameter :: MAXT = 40      !< the mixed pair_w arms keep all 22 blocks (29 with v_par) + 2 pairs
@@ -51,8 +71,9 @@ module mod_petsc_pc_sf_gather
   integer, save     :: ntg = 0
   integer(8), save  :: a_nzst = -1, w_nzst = -1, a_id = -1, w_id = -1
   integer(8), save  :: na_d = 0, na_o = 0, nw_d = 0, nw_o = 0   !< value-array lengths
+  logical, save     :: dev_on = .false.     !< the targets are gathered on the device
 
-  public :: sfg_build, sfg_gather, sfg_cross_weights
+  public :: sfg_build, sfg_gather, sfg_drop, sfg_cross_weights, sfg_dev_setup
 
 contains
 
@@ -62,12 +83,23 @@ contains
   !! and Pw(:) further operators in pair_w's layout without W. All of them
   !! already hold the conventionally extracted values.
   !--------------------------------------------------------------------
-  subroutine sfg_build(A, W, blocks, eqs, vrs, Kpj, pj_e, pj_v, Sw, Pw, w_e, w_v, comm, my_id)
+  !! Mix (optional): a packed operator with W in block (1, 1) -- the mixed
+  !! pair_w -- in place of Sw, its blocks by mix_se / mix_sv / mix_zs; its map
+  !! is gated against the values it holds (mix_ok, opz the current one).
+  !--------------------------------------------------------------------
+  subroutine sfg_build(A, W, blocks, eqs, vrs, Kpj, pj_e, pj_v, Sw, Pw, w_e, w_v, comm, my_id, &
+                       Mix, mix_se, mix_sv, mix_zs, opz, mix_ok)
     Mat, intent(in)     :: A, W
     Mat, intent(in)     :: blocks(:), Kpj, Sw, Pw(:)
     integer, intent(in) :: eqs(:), vrs(:), pj_e(2), pj_v(2), w_e(2), w_v(2)
     integer, intent(in) :: comm, my_id
-    integer :: k
+    Mat, intent(in), optional :: Mix
+    integer, intent(in), optional :: mix_se(:, :), mix_sv(:, :)
+    logical, intent(in), optional :: mix_zs(:, :)
+    real*8, intent(in), optional :: opz
+    logical, intent(out), optional :: mix_ok
+    integer :: k, nf
+    real*8 :: dmax
     PetscErrorCode :: ierr
 
     call require_baij(A, "A"); call require_baij(W, "W")
@@ -76,19 +108,23 @@ contains
         MAXT, " operators (MAXT)."
       call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     endif
+    if (present(Mix) .and. size(Pw) > 0) stop "sfg_build: Mix replaces Sw, without further Pw operators"
     ntg = 0
     do k = 1, size(blocks)
-      ntg = ntg + 1
-      tg(ntg)%T = blocks(k); tg(ntg)%e = [eqs(k), 0]; tg(ntg)%v = [vrs(k), 0]
+      call add_target(blocks(k), 1, reshape([eqs(k)], [1, 1]), reshape([vrs(k)], [1, 1]))
     enddo
-    ntg = ntg + 1
-    tg(ntg)%T = Kpj; tg(ntg)%e = pj_e; tg(ntg)%v = pj_v; tg(ntg)%pair = .true.
-    ntg = ntg + 1
-    tg(ntg)%T = Sw;  tg(ntg)%e = w_e;  tg(ntg)%v = w_v;  tg(ntg)%pair = .true.
+    call add_target(Kpj, 2, spread(pj_e, 2, 2), spread(pj_v, 1, 2))
+    if (present(Mix)) then
+      nf = size(mix_se, 1)
+      call add_target(Mix, nf, mix_se, mix_sv)
+      tg(ntg)%zs(1:nf, 1:nf) = mix_zs
+      tg(ntg)%with_z = any(mix_zs)
+    else
+      call add_target(Sw, 2, spread(w_e, 2, 2), spread(w_v, 1, 2))
+    endif
     tg(ntg)%with_w = .true.
     do k = 1, size(Pw)
-      ntg = ntg + 1
-      tg(ntg)%T = Pw(k); tg(ntg)%e = w_e; tg(ntg)%v = w_v; tg(ntg)%pair = .true.
+      call add_target(Pw(k), 2, spread(w_e, 2, 2), spread(w_v, 1, 2))
     enddo
 
     do k = 1, ntg
@@ -96,15 +132,163 @@ contains
     enddo
     call source_state(A, a_id, a_nzst)
     call source_state(W, w_id, w_nzst)
+    if (present(Mix)) then
+      ! the map against the conventionally built values (MatAXPY + pack): the
+      ! same sums in the same order, so they must agree to the bit
+      call gather_one(tg(ntg), A, W, opz, dmax)
+      call MPI_Allreduce(MPI_IN_PLACE, dmax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, ierr)
+      mix_ok = (dmax == 0.d0)
+      if (my_id == 0) write(*,'(A,ES9.2,A)') "[Physics PC]   pair_w mixed: value map vs assembled, max |diff| ", &
+        dmax, merge(" -> gathered on rebuilds  ", " -> FALLBACK: re-assembled", mix_ok)
+      if (.not. mix_ok) then
+        ntg = ntg - 1                                   ! drop it: Sw instead
+        call add_target(Sw, 2, spread(w_e, 2, 2), spread(w_v, 1, 2))
+        tg(ntg)%with_w = .true.
+        call build_map(tg(ntg), A, W, comm)
+      endif
+    endif
+
+  contains
+
+    subroutine add_target(T, nf_, se, sv)
+      Mat, intent(in)     :: T
+      integer, intent(in) :: nf_, se(:, :), sv(:, :)
+      ntg = ntg + 1
+      tg(ntg)%T = T; tg(ntg)%nf = nf_
+      tg(ntg)%se = 0; tg(ntg)%sv = 0; tg(ntg)%zs = .false.
+      tg(ntg)%se(1:nf_, 1:nf_) = se; tg(ntg)%sv(1:nf_, 1:nf_) = sv
+      tg(ntg)%with_w = .false.; tg(ntg)%with_z = .false.
+    end subroutine add_target
 
   end subroutine sfg_build
 
   !--------------------------------------------------------------------
+  !> No more refills of the operators T(:) (released by the caller)
+  !--------------------------------------------------------------------
+  subroutine sfg_drop(T)
+    Mat, intent(in) :: T(:)
+    integer :: k, j, n
+    n = 0
+    do k = 1, ntg
+      if (any([(tg(k)%T%v == T(j)%v, j = 1, size(T))])) cycle
+      n = n + 1
+      if (n /= k) tg(n) = tg(k)
+    enddo
+    do k = n + 1, ntg
+      if (allocated(tg(k)%md)) deallocate(tg(k)%md, tg(k)%mo)
+      if (allocated(tg(k)%wd)) deallocate(tg(k)%wd, tg(k)%wo)
+      if (allocated(tg(k)%zd)) deallocate(tg(k)%zd, tg(k)%zo)
+    enddo
+    ntg = n
+    if (dev_on) then                         ! the device ids follow the list
+      call sfg_dev_target_clear()
+      do k = 1, ntg
+        call dev_register(k)
+      enddo
+    endif
+  end subroutine sfg_drop
+
+  !--------------------------------------------------------------------
+  !> Device path: every target becomes a device matrix of type mtype (in
+  !! place: the handles stay valid) and is gathered on the device from now
+  !! on. Gate: the device gather must reproduce the values the host gather
+  !! put there; otherwise the host gather stays (on the device matrices,
+  !! through PETSc's accessors). ok: the device gather is in use.
+  !--------------------------------------------------------------------
+  subroutine sfg_dev_setup(A, W, mtype, opz, comm, my_id, ok)
+    Mat, intent(in)     :: A, W
+    character(len=*), intent(in) :: mtype
+    real*8, intent(in)  :: opz
+    integer, intent(in) :: comm, my_id
+    logical, intent(out) :: ok
+    integer :: k, q
+    real*8 :: dmax, vmax
+    real*8, allocatable :: h1(:), h2(:)
+    Mat :: Tp(2)
+    PetscInt, pointer :: garr(:)
+    logical :: has_o
+    type(c_ptr) :: p
+    real(c_double), pointer :: v(:)
+    PetscErrorCode :: ierr
+
+    call sfg_dev_source(0, A)
+    if (any(tg(1:ntg)%with_w)) call sfg_dev_source(1, W)
+    dmax = 0.d0; vmax = 0.d0
+    do k = 1, ntg
+      call MatConvert(tg(k)%T, trim(mtype), MAT_INPLACE_MATRIX, tg(k)%T, ierr)
+      call dev_register(k)
+      call aij_parts(tg(k)%T, Tp(1), Tp(2), garr, has_o)
+      ! the values the host put there, then the device gather's (read back)
+      call aij_vals_read(Tp(1), part_n(k, 1), p, v); h1 = v(1:part_n(k, 1)); call aij_vals_done(Tp(1), p)
+      if (has_o) then
+        call aij_vals_read(Tp(2), part_n(k, 2), p, v); h2 = v(1:part_n(k, 2)); call aij_vals_done(Tp(2), p)
+      endif
+      call sfg_dev_gather(k, opz)
+      do q = 1, merge(2, 1, has_o)
+        call aij_vals_read(Tp(q), part_n(k, q), p, v)
+        if (part_n(k, q) > 0) then
+          if (q == 1) then
+            dmax = max(dmax, maxval(abs(v(1:part_n(k, q)) - h1))); vmax = max(vmax, maxval(abs(h1)))
+          else
+            dmax = max(dmax, maxval(abs(v(1:part_n(k, q)) - h2))); vmax = max(vmax, maxval(abs(h2)))
+          endif
+        endif
+        call aij_vals_done(Tp(q), p)
+      enddo
+    enddo
+    call MPI_Allreduce(MPI_IN_PLACE, dmax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, ierr)
+    call MPI_Allreduce(MPI_IN_PLACE, vmax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, ierr)
+    ok = (dmax <= 1.d-14 * max(vmax, tiny(1.d0)))
+    dev_on = ok
+    if (my_id == 0) write(*,'(A,I0,A,ES9.2,A,ES9.2,A)') "[Physics PC]   SF operators on the device (", ntg, &
+      " targets): device vs host gather, max |diff| ", dmax, " (max |value| ", vmax, ")" // &
+      merge(" -> device gather in use     ", " -> FALLBACK: host gather    ", ok)
+    if (.not. ok) then
+      ! the device gather overwrote the targets above: the host's values back
+      call sfg_dev_target_clear()
+      do k = 1, ntg
+        call gather_one(tg(k), A, W, opz)
+        call MatAssemblyBegin(tg(k)%T, MAT_FINAL_ASSEMBLY, ierr)
+        call MatAssemblyEnd(tg(k)%T, MAT_FINAL_ASSEMBLY, ierr)
+      enddo
+    endif
+
+  contains
+
+    integer(8) function part_n(k_, q_)
+      integer, intent(in) :: k_, q_
+      if (q_ == 1) then
+        part_n = size(tg(k_)%md, kind=8)
+      else
+        part_n = size(tg(k_)%mo, kind=8)
+      endif
+    end function part_n
+
+  end subroutine sfg_dev_setup
+
+  !> target k's maps to the device gather
+  subroutine dev_register(k)
+    integer, intent(in) :: k
+    associate (t => tg(k))
+      if (t%with_w .and. t%with_z) then
+        call sfg_dev_target(k, t%T, t%md, t%mo, wd=t%wd, wo=t%wo, zd=t%zd, zo=t%zo)
+      else if (t%with_w) then
+        call sfg_dev_target(k, t%T, t%md, t%mo, wd=t%wd, wo=t%wo)
+      else if (t%with_z) then
+        call sfg_dev_target(k, t%T, t%md, t%mo, zd=t%zd, zo=t%zo)
+      else
+        call sfg_dev_target(k, t%T, t%md, t%mo)
+      endif
+    end associate
+  end subroutine dev_register
+
+  !--------------------------------------------------------------------
   !> Refill every target from A and W (every rebuild after the first).
   !--------------------------------------------------------------------
-  subroutine sfg_gather(A, W, my_id)
+  subroutine sfg_gather(A, W, my_id, opz)
     Mat, intent(in)     :: A, W
     integer, intent(in) :: my_id
+    real*8, intent(in)  :: opz            !< the current opz (blocks with zs)
     integer(8) :: id, nz
     integer :: k
     PetscErrorCode :: ierr
@@ -113,8 +297,18 @@ contains
     if (id /= a_id .or. nz /= a_nzst) call frozen_fail("A")
     call source_state(W, id, nz)
     if (id /= w_id .or. nz /= w_nzst) call frozen_fail("W")
+    if (dev_on) then
+      ! A's values are on the device for the outer solve already (an upload
+      ! only if not), W's go up here; each gather bumps its target's state
+      call sfg_dev_source(0, A)
+      if (any(tg(1:ntg)%with_w)) call sfg_dev_source(1, W)
+      do k = 1, ntg
+        call sfg_dev_gather(k, opz)
+      enddo
+      return
+    endif
     do k = 1, ntg
-      call gather_one(tg(k), A, W)
+      call gather_one(tg(k), A, W, opz)
       ! bump the object state: MUMPS and the GMG decide "new values" by it
       call MatAssemblyBegin(tg(k)%T, MAT_FINAL_ASSEMBLY, ierr)
       call MatAssemblyEnd(tg(k)%T, MAT_FINAL_ASSEMBLY, ierr)
@@ -287,8 +481,8 @@ contains
 
   !--------------------------------------------------------------------
   !> The map of one target. Coordinates: a sub-block index s = node*n_tor + m
-  !! (the layout of every extracted block); a packed pair holds, on rank p,
-  !! [field-1 rows | field-2 rows] of that rank's sub-block range.
+  !! (the layout of every extracted block); a packed target holds, on rank p,
+  !! [field-1 rows | ... | field-nf rows] of that rank's sub-block range.
   !--------------------------------------------------------------------
   subroutine build_map(t, A, W, comm)
     use mod_parameters, only: n_tor, n_var
@@ -333,11 +527,7 @@ contains
     allocate(sub0(0:np), nsub(0:np - 1))
     block
       integer :: mysub0, mynsub
-      if (t%pair) then
-        mynsub = int(re - rs) / 2; mysub0 = int(rs) / 2
-      else
-        mynsub = int(re - rs); mysub0 = int(rs)
-      endif
+      mynsub = int(re - rs) / t%nf; mysub0 = int(rs) / t%nf
       call MPI_Allgather(mysub0, 1, MPI_INTEGER, sub0, 1, MPI_INTEGER, comm, mpierr)
       call MPI_Allgather(mynsub, 1, MPI_INTEGER, nsub, 1, MPI_INTEGER, comm, mpierr)
       sub0(np) = sub0(np - 1) + nsub(np - 1)
@@ -349,6 +539,11 @@ contains
     if (allocated(t%md)) deallocate(t%md, t%mo)
     allocate(t%md(tia(ntd + 1)), t%mo(toia(nto + 1)))
     t%md = 0; t%mo = 0
+    if (allocated(t%zd)) deallocate(t%zd, t%zo)
+    if (t%with_z) then
+      allocate(t%zd(tia(ntd + 1)), t%zo(toia(nto + 1)))
+      t%zd = 0; t%zo = 0
+    endif
     if (t%with_w) then
       if (allocated(t%wd)) deallocate(t%wd, t%wo)
       allocate(t%wd(tia(ntd + 1)), t%wo(toia(nto + 1)))
@@ -362,11 +557,13 @@ contains
           do k = int(tia(lr + 1)) + 1, int(tia(lr + 2))
             call decode(int(cs, 8) + tja(k), .false., sc, f_c)
             call locate(t%md(k), t%wd, k, sr, sc, f_r, f_c)
+            if (t%with_z) t%zd(k) = merge(1_c_int8_t, 0_c_int8_t, t%zs(f_r, f_c))
           enddo
         else
           do k = int(toia(lr + 1)) + 1, int(toia(lr + 2))
             call decode(int(gt(toja(k) + 1), 8), .false., sc, f_c)
             call locate(t%mo(k), t%wo, k, sr, sc, f_r, f_c)
+            if (t%with_z) t%zo(k) = merge(1_c_int8_t, 0_c_int8_t, t%zs(f_r, f_c))
           enddo
         endif
       enddo
@@ -381,7 +578,7 @@ contains
 
   contains
 
-    !> Target global index -> (sub-block index, field 1|2).
+    !> Target global index -> (sub-block index, field 1 .. nf).
     subroutine decode(g, is_row, s, f)
       integer(8), intent(in)  :: g
       logical, intent(in)     :: is_row
@@ -389,7 +586,7 @@ contains
       integer, intent(out)    :: f
       integer :: p, lo, hi, mid
       integer(8) :: off
-      if (.not. t%pair) then
+      if (t%nf == 1) then
         s = g; f = 1
         return
       endif
@@ -399,7 +596,7 @@ contains
         lo = 0; hi = np - 1                     ! rank whose packed range holds g
         do while (lo < hi)
           mid = (lo + hi + 1) / 2
-          if (2_8 * sub0(mid) <= g) then
+          if (int(t%nf, 8) * sub0(mid) <= g) then
             lo = mid
           else
             hi = mid - 1
@@ -407,12 +604,8 @@ contains
         enddo
         p = lo
       endif
-      off = g - 2_8 * sub0(p)
-      if (off < nsub(p)) then
-        f = 1; s = sub0(p) + off
-      else
-        f = 2; s = sub0(p) + off - nsub(p)
-      endif
+      off = g - int(t%nf, 8) * sub0(p)
+      f = int(off / nsub(p)) + 1; s = sub0(p) + mod(off, int(nsub(p), 8))
     end subroutine decode
 
     !> Map entry k: the source of target (sub row sr, field f_r; sub col sc,
@@ -424,7 +617,7 @@ contains
       integer(8), intent(in) :: sr_, sc_
       integer :: e, v, m, q
       integer(8) :: arow, acol
-      e = t%e(fr); v = t%v(fc)
+      e = t%se(fr, fc); v = t%sv(fr, fc)
       m = int(mod(sr_, int(n_tor, 8))); q = int(mod(sc_, int(n_tor, 8)))
       arow = (sr_ / n_tor) * bsa + (e - 1) * n_tor + m
       acol = (sc_ / n_tor) * bsa + (v - 1) * n_tor + q
@@ -433,18 +626,14 @@ contains
       ! sin of one n). W is NOT filtered, so pair_w's S_uu holds cross-|n|
       ! entries from W at any band.
       mk = 0
-      if (harm_kept(m, q)) mk = find_baij(arow, acol, bsa, rs_node(), aia, aja, oia, oja, ga)
+      if (e > 0 .and. harm_kept(m, q)) mk = find_baij(arow, acol, bsa, rs_node(), aia, aja, oia, oja, ga)
       if (t%with_w .and. fr == 1 .and. fc == 1) &
         wmap(k) = find_baij(sr_, sc_, int(n_tor), rs_node(), wia, wja, woia, woja, gw)
     end subroutine locate
 
     !> This rank's first JOREK node (= first block row of A and of W).
     integer function rs_node()
-      if (t%pair) then
-        rs_node = int(rs) / 2 / n_tor
-      else
-        rs_node = int(rs) / n_tor
-      endif
+      rs_node = int(rs) / t%nf / n_tor
     end function rs_node
 
   end subroutine build_map
@@ -479,20 +668,26 @@ contains
   end function find_baij
 
   !--------------------------------------------------------------------
-  !> Gather one target from A (and W). check = .true.: compare against the
-  !! values the target holds instead of writing, and return max |diff|.
+  !> Gather one target from A (and W); blocks with zs times opz. dmax
+  !! present: compare against the values the target holds instead of writing,
+  !! and return max |diff| there.
   !--------------------------------------------------------------------
-  subroutine gather_one(t, A, W)
+  subroutine gather_one(t, A, W, opz, dmax)
     type(tgt_t), intent(inout) :: t
     Mat, intent(in)     :: A, W
+    real*8, intent(in)  :: opz
+    real*8, intent(out), optional :: dmax
     Mat :: Ad, Ao, Wd, Wo, Td, To
     PetscInt, pointer :: ga(:), gw(:), gt(:)
     type(c_ptr) :: pad, pao, pwd, pwo, ptd, pto
     real(c_double), pointer :: va_d(:), va_o(:), vw_d(:), vw_o(:), vt_d(:), vt_o(:)
     integer(c_int) :: rc
     integer :: k
-    real*8 :: v
+    real*8 :: v, dm
+    logical :: chk
 
+    chk = present(dmax)
+    dm = 0.d0
     call split_parts(A, .true., Ad, Ao, ga)
     call split_parts(t%T, .false., Td, To, gt)
     rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pad); call c_f_pointer(pad, va_d, [max(na_d, 1_8)])
@@ -505,20 +700,35 @@ contains
       rc = c_baij_get(transfer(Wo%v, 0_c_intptr_t), pwo); call c_f_pointer(pwo, vw_o, [max(nw_o, 1_8)])
     endif
 
-    !$omp parallel do private(v) schedule(static)
+    !$omp parallel do private(v) schedule(static) reduction(max:dm)
     do k = 1, size(t%md)
       v = src(t%md(k), va_d, va_o)
+      if (t%with_z) then
+        if (t%zd(k) /= 0) v = opz * v
+      endif
       if (t%with_w) v = v + src(t%wd(k), vw_d, vw_o)
-      vt_d(k) = v
+      if (chk) then
+        dm = max(dm, abs(vt_d(k) - v))
+      else
+        vt_d(k) = v
+      endif
     enddo
     !$omp end parallel do
-    !$omp parallel do private(v) schedule(static)
+    !$omp parallel do private(v) schedule(static) reduction(max:dm)
     do k = 1, size(t%mo)
       v = src(t%mo(k), va_d, va_o)
+      if (t%with_z) then
+        if (t%zo(k) /= 0) v = opz * v
+      endif
       if (t%with_w) v = v + src(t%wo(k), vw_d, vw_o)
-      vt_o(k) = v
+      if (chk) then
+        dm = max(dm, abs(vt_o(k) - v))
+      else
+        vt_o(k) = v
+      endif
     enddo
     !$omp end parallel do
+    if (chk) dmax = dm
 
     rc = c_aij_restore(transfer(To%v, 0_c_intptr_t), pto)
     rc = c_aij_restore(transfer(Td%v, 0_c_intptr_t), ptd)

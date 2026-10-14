@@ -2,6 +2,8 @@ module mod_petsc
 #ifdef USE_PETSC
   use mpi_mod
   use mod_petsc_pc
+  use mod_petsc_raw_csr, only: baij_map_t, baij_aij_map, baij_aij_fill, &
+                               sfg_dev_available, sfg_dev_source, sfg_dev_expand_setup, sfg_dev_expand
 #include "petsc/finclude/petsc.h"
   use petsc
 #ifdef USE_SLEPC
@@ -23,6 +25,14 @@ module mod_petsc
     logical :: ksp_ready     = .false.  ! KSP, A_aij, PC setup + factored
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
+    ! Outer FGMRES on the device (-sf_gpu 1 with the physics PC; -sf_gpu_outer
+    ! 0 keeps it on the host): A_dev, an AIJ device copy of A (through the
+    ! host AIJ A_dtmp), refilled before every solve; x_aij / b_aij are then
+    ! device vectors, and the physics PC receives device vectors
+    logical :: outer_dev = .false.
+    Mat  :: A_dtmp, A_dev
+    type(baij_map_t) :: dmap     !< A -> A_dev values (else A_dtmp's MatConvert, slow: row by row)
+    logical :: dexp = .false.    !< A_dev expanded on the device from A's uploaded BAIJ values (-sf_gpu_gather)
   end type type_PETSC_SYSTEM
 
 
@@ -69,7 +79,9 @@ contains
 
 
   subroutine petsc_finalize()
+    use mod_petsc_raw_csr, only: sfg_dev_release
     PetscErrorCode :: ierr
+    call sfg_dev_release()          ! its device memory before Kokkos goes
 #ifdef USE_SLEPC
     call SlepcFinalize(ierr)
 #else
@@ -430,10 +442,47 @@ contains
         PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
       endif
       call physics_pc_mem("solver: after AIJ copy", my_id)
-      PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      block
+        use mod_petsc_blk_dev, only: blk_dev_available
+        PetscInt :: pv
+        PetscBool :: set
+        pv = 0
+        PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu", pv, set, ierr))
+        if (pv > 0) then
+          pv = 1
+          PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_outer", pv, set, ierr))
+        endif
+        petsc_sys%outer_dev = (pv > 0 .and. use_physics_pc .and. blk_dev_available())
+      end block
+      if (petsc_sys%outer_dev) then
+        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_dtmp, ierr))
+        PetscCallA(MatDuplicate(petsc_sys%A_dtmp, MAT_COPY_VALUES, petsc_sys%A_dev, ierr))
+        PetscCallA(MatConvert(petsc_sys%A_dev, "aijkokkos", MAT_INPLACE_MATRIX, petsc_sys%A_dev, ierr))
+        PetscCallA(MatCreateVecs(petsc_sys%A_dev, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+        call baij_aij_map(petsc_sys%A, petsc_sys%A_dev, petsc_sys%dmap)
+        if (petsc_sys%dmap%ok) PetscCallA(MatDestroy(petsc_sys%A_dtmp, ierr))
+        block
+          PetscInt :: pg
+          PetscBool :: set
+          pg = 1
+          PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_gather", pg, set, ierr))
+          petsc_sys%dexp = petsc_sys%dmap%ok .and. pg > 0 .and. sfg_dev_available()
+          if (petsc_sys%dexp) then
+            call sfg_dev_expand_setup(petsc_sys%A_dev, petsc_sys%A)
+            deallocate(petsc_sys%dmap%md, petsc_sys%dmap%mo)          ! the host map is not needed
+          endif
+        end block
+        if (my_id == 0) write(*,*) "[PETSc] setup: outer FGMRES on the device (AIJ Kokkos copy of A), BAIJ value map ", petsc_sys%dmap%ok
+      else
+        PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      endif
 
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      if (petsc_sys%outer_dev) then
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_dev, petsc_sys%A_dev, ierr))
+      else
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      endif
       PetscCallA(KSPSetType(petsc_sys%ksp, KSPFGMRES, ierr))
 
       ! Warm-start: consume the JOREK initial guess (previous-step increment) loaded into
@@ -502,7 +551,7 @@ contains
         PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       endif
       if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      call outer_operators()
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       call physics_pc_mem("solver: rebuild done", my_id)
@@ -517,7 +566,7 @@ contains
       if (.not. no_aij) then
         PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
       endif
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      call outer_operators()
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
     end if
 
@@ -551,6 +600,30 @@ contains
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
     if (my_id .eq.0) write(*,'(A,ES12.4)') "[PETSc] solution norm: ", petsc_norm
+
+  contains
+
+    !> the KSP's operators for this solve: A_aij, or on the device path A's
+    !! new values in A_dev (A refilled in place by JOREK, fixed pattern)
+    subroutine outer_operators()
+      use mod_petsc_pc_gmg, only: gmg_mat_dev
+      if (petsc_sys%dexp) then
+        ! A's values up once (pinned), A_dev expanded from them on the device;
+        ! the physics PC's device gather reads the same upload
+        call sfg_dev_source(0, petsc_sys%A)
+        call sfg_dev_expand()
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_dev, petsc_sys%A_dev, ierr))
+      else if (petsc_sys%outer_dev .and. petsc_sys%dmap%ok) then
+        call baij_aij_fill(petsc_sys%A, petsc_sys%A_dev, petsc_sys%dmap)
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_dev, petsc_sys%A_dev, ierr))
+      else if (petsc_sys%outer_dev) then
+        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_dtmp, ierr))
+        call gmg_mat_dev(petsc_sys%A_dtmp, petsc_sys%A_dev, .false.)
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_dev, petsc_sys%A_dev, ierr))
+      else
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      endif
+    end subroutine outer_operators
   end subroutine petsc_solve_iterative_and_retrieve
 
 

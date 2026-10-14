@@ -4,7 +4,8 @@ module mod_petsc_pc_sf_fam
   use iso_c_binding
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_raw_csr, only: split_parts, get_ij, put_ij, c_baij_get, c_baij_restore
+  use mod_petsc_raw_csr, only: split_parts, get_ij, put_ij, c_baij_get, c_baij_restore, aij_parts, &
+                               sfg_dev_source, sfg_dev_fam_set, sfg_dev_fam_values, sfg_dev_fam_install
   implicit none
   private
 
@@ -87,6 +88,10 @@ module mod_petsc_pc_sf_fam
     !--- part 1: global-comm work vectors of the matvec (sff_cross_addmult)
     logical :: vec_ok = .false.
     Vec     :: xg, yg
+    !--- device path (sff_op_dev): the operator a device matrix, its values
+    !--- gathered (source side) and installed (owner side) on the device;
+    !--- requested, then in use once its next fill matched the host's
+    integer :: dev = 0                               !< 0 off, 1 requested, 2 in use
   end type fam_op_t
 
   logical, save, public :: sff_on = .false.   !< decomposed and active
@@ -111,7 +116,7 @@ module mod_petsc_pc_sf_fam
   integer, parameter :: TAG_LEN = 0, TAG_COL = 8, TAG_VAL = 16  !< + field - 1 (< 8), + TAG_STRIDE tagb
   integer, parameter :: TAG_STRIDE = 32
 
-  public :: sff_decompose, sff_op_build, sff_op_fill, &
+  public :: sff_decompose, sff_op_build, sff_op_fill, sff_op_dev, &
             sff_vec_setup, sff_scatter_in, sff_scatter_out, sff_banded, sff_cross_addmult, &
             sff_cross_scale, sff_copy_local, sff_add_local, sff_lift, sff_band_rows, sff_index_count
 
@@ -635,77 +640,48 @@ contains
   !! global communicator.
   !--------------------------------------------------------------------
   subroutine sff_op_fill(op, Aj, Wf, opz)
-    use mod_parameters, only: n_tor, n_var
     type(fam_op_t), intent(inout) :: op
     Mat, intent(in)    :: Aj, Wf(:)
     real*8, intent(in) :: opz
-    !> one W source's value arrays
-    type :: wvals_t
-      Mat :: d, o
-      type(c_ptr) :: pd, po
-      real(c_double), pointer :: vd(:) => null(), vo(:) => null()
-      logical :: on = .false.
-    end type wvals_t
-    Mat :: Ad, Ao
-    PetscInt, pointer :: ga(:), gw(:)
-    type(c_ptr) :: pad, pao
-    real(c_double), pointer :: va_d(:), va_o(:)
-    type(wvals_t), allocatable :: wv(:)
-    real(c_double), allocatable :: sbuf(:)
-    integer(c_int) :: rc
+    real(c_double), allocatable :: sbuf(:), dbuf(:)
     integer :: k, nreq, mpierr, n, iw
     integer, allocatable :: reqs(:)
-    real*8 :: x
+    real*8 :: dmax, vmax
     PetscErrorCode :: ierr
 
     n = size(op%sa)
-    call split_parts(Aj, .true., Ad, Ao, ga)
-    rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pad); call c_f_pointer(pad, va_d, [huge(1)])
-    rc = c_baij_get(transfer(Ao%v, 0_c_intptr_t), pao); call c_f_pointer(pao, va_o, [huge(1)])
-    allocate(wv(size(Wf)))
-    if (op%has_w) then
-      do iw = 1, size(Wf)
-        if (.not. any(op%wid(1:op%nf, 1:op%nf) == iw)) cycle
-        wv(iw)%on = .true.
-        call split_parts(Wf(iw), .true., wv(iw)%d, wv(iw)%o, gw)
-        rc = c_baij_get(transfer(wv(iw)%d%v, 0_c_intptr_t), wv(iw)%pd)
-        call c_f_pointer(wv(iw)%pd, wv(iw)%vd, [huge(1)])
-        rc = c_baij_get(transfer(wv(iw)%o%v, 0_c_intptr_t), wv(iw)%po)
-        call c_f_pointer(wv(iw)%po, wv(iw)%vo, [huge(1)])
-      enddo
-    endif
-
     allocate(sbuf(max(n, 1)))
-    !$omp parallel do private(x) schedule(static)
-    do k = 1, n
-      x = 0.d0
-      if (op%sa(k) > 0) then
-        x = va_d(op%sa(k))
-      else if (op%sa(k) < 0) then
-        x = va_o(-op%sa(k))
-      endif
-      if (allocated(op%sc)) then
-        if (op%sc(k) == 1) x = x * opz
-      endif
+    if (op%dev > 0) then
+      ! the sources on the device (A's upload is the outer solve's), the
+      ! send buffer gathered there
+      call sfg_dev_source(0, Aj)
       if (op%has_w) then
-        if (op%sw(k) > 0) then
-          x = x + wv(op%ss(k))%vd(op%sw(k))
-        else if (op%sw(k) < 0) then
-          x = x + wv(op%ss(k))%vo(-op%sw(k))
-        endif
+        do iw = 1, size(Wf)
+          if (any(op%wid(1:op%nf, 1:op%nf) == iw)) call sfg_dev_source(iw, Wf(iw))
+        enddo
       endif
-      sbuf(k) = x
-    enddo
-    !$omp end parallel do
-
-    rc = c_baij_restore(transfer(Ao%v, 0_c_intptr_t), pao)
-    rc = c_baij_restore(transfer(Ad%v, 0_c_intptr_t), pad)
-    do iw = 1, size(Wf)
-      if (.not. wv(iw)%on) cycle
-      rc = c_baij_restore(transfer(wv(iw)%o%v, 0_c_intptr_t), wv(iw)%po)
-      rc = c_baij_restore(transfer(wv(iw)%d%v, 0_c_intptr_t), wv(iw)%pd)
-    enddo
-    deallocate(wv)
+      if (op%dev == 2) then
+        call sfg_dev_fam_values(op%tagb, opz, sbuf(1:n))
+      else
+        ! the gate, once: the device's values next to the host's
+        allocate(dbuf(max(n, 1)))
+        call sfg_dev_fam_values(op%tagb, opz, dbuf(1:n))
+        call host_values(sbuf)
+        dmax = 0.d0; vmax = 0.d0
+        if (n > 0) then
+          dmax = maxval(abs(dbuf(1:n) - sbuf(1:n))); vmax = maxval(abs(sbuf(1:n)))
+        endif
+        call MPI_Allreduce(MPI_IN_PLACE, dmax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
+        call MPI_Allreduce(MPI_IN_PLACE, vmax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
+        op%dev = merge(2, 0, dmax <= 1.d-14 * max(vmax, tiny(1.d0)))
+        if (gme == 0) write(*,'(A,A,A,ES9.2,A)') "[Physics PC]   SF ", trim(op%label), &
+          ": device vs host gather, max |diff| ", dmax, merge(" -> device gather in use  ", " -> FALLBACK: host gather ", op%dev == 2)
+        if (op%dev == 2) sbuf = dbuf
+        deallocate(dbuf)
+      endif
+    else
+      call host_values(sbuf)
+    endif
 
     allocate(reqs(op%nrecv + op%nsend))
     nreq = 0
@@ -721,10 +697,152 @@ contains
     enddo
     call MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE, mpierr)
     deallocate(sbuf, reqs)
-    ! new values in place: same pattern, same arrays (the block kernel and
-    ! the GMG keep their handles); the object state tells MUMPS and the GMG
-    call MatUpdateMPIAIJWithArray(op%fam, op%val, ierr)
+    if (op%dev == 2) then
+      call sfg_dev_fam_install(op%tagb, op%val)
+    else
+      ! new values in place: same pattern, same arrays (the block kernel and
+      ! the GMG keep their handles); the object state tells MUMPS and the GMG
+      call MatUpdateMPIAIJWithArray(op%fam, op%val, ierr)
+    endif
+
+  contains
+
+    !> the send buffer on the host, from A's and W's value arrays
+    subroutine host_values(buf)
+      real(c_double), intent(out) :: buf(:)
+      !> one W source's value arrays
+      type :: wvals_t
+        Mat :: d, o
+        type(c_ptr) :: pd, po
+        real(c_double), pointer :: vd(:) => null(), vo(:) => null()
+        logical :: on = .false.
+      end type wvals_t
+      Mat :: Ad, Ao
+      PetscInt, pointer :: ga(:), gw(:)
+      type(c_ptr) :: pad, pao
+      real(c_double), pointer :: va_d(:), va_o(:)
+      type(wvals_t), allocatable :: wv(:)
+      integer(c_int) :: rc
+      integer :: q, jw
+      real*8 :: x
+
+      call split_parts(Aj, .true., Ad, Ao, ga)
+      rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pad); call c_f_pointer(pad, va_d, [huge(1)])
+      rc = c_baij_get(transfer(Ao%v, 0_c_intptr_t), pao); call c_f_pointer(pao, va_o, [huge(1)])
+      allocate(wv(size(Wf)))
+      if (op%has_w) then
+        do jw = 1, size(Wf)
+          if (.not. any(op%wid(1:op%nf, 1:op%nf) == jw)) cycle
+          wv(jw)%on = .true.
+          call split_parts(Wf(jw), .true., wv(jw)%d, wv(jw)%o, gw)
+          rc = c_baij_get(transfer(wv(jw)%d%v, 0_c_intptr_t), wv(jw)%pd)
+          call c_f_pointer(wv(jw)%pd, wv(jw)%vd, [huge(1)])
+          rc = c_baij_get(transfer(wv(jw)%o%v, 0_c_intptr_t), wv(jw)%po)
+          call c_f_pointer(wv(jw)%po, wv(jw)%vo, [huge(1)])
+        enddo
+      endif
+
+      !$omp parallel do private(x) schedule(static)
+      do q = 1, n
+        x = 0.d0
+        if (op%sa(q) > 0) then
+          x = va_d(op%sa(q))
+        else if (op%sa(q) < 0) then
+          x = va_o(-op%sa(q))
+        endif
+        if (allocated(op%sc)) then
+          if (op%sc(q) == 1) x = x * opz
+        endif
+        if (op%has_w) then
+          if (op%sw(q) > 0) then
+            x = x + wv(op%ss(q))%vd(op%sw(q))
+          else if (op%sw(q) < 0) then
+            x = x + wv(op%ss(q))%vo(-op%sw(q))
+          endif
+        endif
+        buf(q) = x
+      enddo
+      !$omp end parallel do
+
+      rc = c_baij_restore(transfer(Ao%v, 0_c_intptr_t), pao)
+      rc = c_baij_restore(transfer(Ad%v, 0_c_intptr_t), pad)
+      do jw = 1, size(Wf)
+        if (.not. wv(jw)%on) cycle
+        rc = c_baij_restore(transfer(wv(jw)%o%v, 0_c_intptr_t), wv(jw)%po)
+        rc = c_baij_restore(transfer(wv(jw)%d%v, 0_c_intptr_t), wv(jw)%pd)
+      enddo
+      deallocate(wv)
+    end subroutine host_values
+
   end subroutine sff_op_fill
+
+  !--------------------------------------------------------------------
+  !> Device path: the family operator becomes a device matrix of type mtype
+  !! (in place: the handles stay valid), and its fills run on the device from
+  !! the next one on (gated there against the host's once). The family part
+  !! only; a cross part (part 1) stays on the host.
+  !--------------------------------------------------------------------
+  subroutine sff_op_dev(op, mtype)
+    type(fam_op_t), intent(inout) :: op
+    character(len=*), intent(in) :: mtype
+    Mat :: Td, To
+    PetscInt, pointer :: garr(:), dia(:), dja(:), oia(:), oja(:)
+    PetscInt :: nd, no, cs, ce
+    integer(c_long_long), allocatable :: perm(:)
+    integer :: i, j, ld
+    integer(8) :: q, pd, po
+    logical :: has_o, can
+    integer :: mpierr
+    PetscErrorCode :: ierr
+
+    ! one decision for all ranks: the fills' gate is collective
+    can = (op%part == 0 .and. op%ready)
+    call MPI_Allreduce(MPI_IN_PLACE, can, 1, MPI_LOGICAL, MPI_LAND, gcomm, mpierr)
+    if (.not. can) return
+    ! where each value of MatUpdateMPIAIJWithArray's order goes: per row the
+    ! off-diagonal entries left of the diagonal block, the diagonal block,
+    ! the remaining off-diagonal entries (columns ascending)
+    call aij_parts(op%fam, Td, To, garr, has_o)
+    call MatGetOwnershipRangeColumn(op%fam, cs, ce, ierr)
+    call get_ij(Td, .false., nd, dia, dja)
+    if (has_o) call get_ij(To, .false., no, oia, oja)
+    allocate(perm(size(op%val)))
+    q = 0
+    do i = 1, int(nd)
+      ld = 0
+      if (has_o) then
+        do j = int(oia(i)) + 1, int(oia(i + 1))
+          if (garr(oja(j) + 1) < cs) ld = ld + 1
+        enddo
+        po = oia(i)
+        do j = 1, ld
+          q = q + 1; perm(q) = -(po + 1); po = po + 1
+        enddo
+      endif
+      do pd = dia(i), dia(i + 1) - 1
+        q = q + 1; perm(q) = pd
+      enddo
+      if (has_o) then
+        do j = int(oia(i)) + ld + 1, int(oia(i + 1))
+          q = q + 1; perm(q) = -(po + 1); po = po + 1
+        enddo
+      endif
+    enddo
+    call put_ij(Td, .false., nd, dia, dja)
+    if (has_o) call put_ij(To, .false., no, oia, oja)
+    if (q /= size(op%val, kind=8)) call fail("sff_op_dev: the value order does not match the operator")
+    call MatConvert(op%fam, trim(mtype), MAT_INPLACE_MATRIX, op%fam, ierr)
+    if (op%has_w .and. allocated(op%sc)) then
+      call sfg_dev_fam_set(op%tagb, op%sa, sw=op%sw, ss=op%ss, sc=op%sc, T=op%fam, perm=perm)
+    else if (op%has_w) then
+      call sfg_dev_fam_set(op%tagb, op%sa, sw=op%sw, ss=op%ss, T=op%fam, perm=perm)
+    else if (allocated(op%sc)) then
+      call sfg_dev_fam_set(op%tagb, op%sa, sc=op%sc, T=op%fam, perm=perm)
+    else
+      call sfg_dev_fam_set(op%tagb, op%sa, T=op%fam, perm=perm)
+    endif
+    op%dev = 1
+  end subroutine sff_op_dev
 
   !> Are families f and g within the cross-|n| band (physics_pc_sf_harm_couple)?
   !! Family f holds |n| group f - 1.
@@ -922,10 +1040,12 @@ contains
   !! variables 1..nvars (the sweep's: 6, or 7 with v_par). x_tmpl: a vector of
   !! the full system's layout. Once.
   !--------------------------------------------------------------------
-  subroutine sff_vec_setup(x_tmpl, nvars)
+  subroutine sff_vec_setup(x_tmpl, nvars, dev)
     use mod_parameters, only: n_tor, n_var
+    use mod_petsc_blk_dev, only: vec_make_dev
     Vec, intent(in) :: x_tmpl
     integer, intent(in) :: nvars
+    logical, intent(in), optional :: dev     !< the staging vector on the device (the SF apply's device path)
     PetscInt, allocatable :: idx(:)
     PetscInt :: k
     IS :: isv
@@ -949,6 +1069,9 @@ contains
     enddo
     call ISCreateGeneral(gcomm, k, idx, PETSC_COPY_VALUES, isv, ierr)
     call VecCreateMPI(gcomm, k, PETSC_DETERMINE, stagev, ierr)
+    if (present(dev)) then
+      if (dev) call vec_make_dev(stagev)
+    endif
     call VecScatterCreate(x_tmpl, isv, stagev, PETSC_NULL_IS, scv, ierr)
     call ISDestroy(isv, ierr)
     vec_ok = .true.
@@ -957,40 +1080,32 @@ contains
   !> v(k) = variable k of x, in the family layout (v on the family comm),
   !! k = 1 .. nsv.
   subroutine sff_scatter_in(x, v)
+    use mod_petsc_blk_dev, only: vec_copy_strided
     Vec :: x
     Vec :: v(:)
-    PetscScalar, pointer :: sa(:), va(:)
     PetscErrorCode :: ierr
     integer :: k
     if (size(v) /= nsv) call fail("sff_scatter_in: not the variables of sff_vec_setup")
     call VecScatterBegin(scv, x, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
     call VecScatterEnd(scv, x, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
-    call VecGetArrayRead(stagev, sa, ierr)
     do k = 1, nsv
-      call VecGetArray(v(k), va, ierr)
-      va = sa((k - 1) * sff_n1 + 1 : k * sff_n1)
-      call VecRestoreArray(v(k), va, ierr)
+      call vec_copy_strided(v(k), 0, 0, stagev, (k - 1) * sff_n1, 0, sff_n1, 1)
     enddo
-    call VecRestoreArrayRead(stagev, sa, ierr)
   end subroutine sff_scatter_in
 
   !> y = the family-layout variables v(k), k = 1 .. nsv, back in the full
   !! system. Every row of y belongs to exactly one family, so variables
   !! 1 .. nsv of y are fully overwritten (any further ones are not touched).
   subroutine sff_scatter_out(v, y)
+    use mod_petsc_blk_dev, only: vec_copy_strided
     Vec :: v(:)
     Vec :: y
-    PetscScalar, pointer :: sa(:), va(:)
     PetscErrorCode :: ierr
     integer :: k
     if (size(v) /= nsv) call fail("sff_scatter_out: not the variables of sff_vec_setup")
-    call VecGetArray(stagev, sa, ierr)
     do k = 1, nsv
-      call VecGetArrayRead(v(k), va, ierr)
-      sa((k - 1) * sff_n1 + 1 : k * sff_n1) = va
-      call VecRestoreArrayRead(v(k), va, ierr)
+      call vec_copy_strided(stagev, (k - 1) * sff_n1, 0, v(k), 0, 0, sff_n1, 1)
     enddo
-    call VecRestoreArray(stagev, sa, ierr)
     call VecScatterBegin(scv, stagev, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
     call VecScatterEnd(scv, stagev, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
   end subroutine sff_scatter_out
