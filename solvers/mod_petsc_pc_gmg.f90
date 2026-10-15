@@ -38,12 +38,13 @@ module mod_petsc_pc_gmg
   use petsc
   use iso_c_binding, only: c_ptr, c_double, c_null_ptr, c_associated
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach, &
-                               aij_vals_write, aij_vals_written
+                               aij_vals_write, aij_vals_written, sfg_dev_copy_values
   use mod_petsc_blk_dev, only: blk_dev_available, blk_dev_pattern, blk_dev_spike, blk_dev_values, blk_dev_apply, blk_dev_free, &
                                ring_dev_pattern, ring_dev_values, ring_dev_factor, ring_dev_fillmap, ring_dev_apply, &
                                blk_dev_fillmap, blk_dev_fill, crs_dev_has, crs_dev_map, crs_dev_setup, crs_dev_apply, crs_dev_free, vec_touch
   use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_refill, axd_factor, axd_solve
   use mod_gmg_ring_btd
+  use mod_petsc_pc_physics_ctx, only: physics_pc_mem
   implicit none
   private
 
@@ -164,6 +165,16 @@ module mod_petsc_pc_gmg
   !! copies, the coarse operators device matrices themselves; the host setup
   !! reads them after a sync), instead of on the host and copied over
   logical, save     :: dev_ptap = .true.
+  !> -sf_gpu_ptap 2: lean products -- no MatProduct data kept between
+  !! rebuilds (PETSc's keeps A P, the transposes and the partial products,
+  !! several times the coarse operators' own memory); every rebuild computes
+  !! each level's product afresh into a temporary, copies its values into the
+  !! level operator on the device (same pattern, checked) and frees it.
+  !! Opt-in, for when the device memory is short (the harmonic-coupled global
+  !! path on one node): it redoes the symbolic product at every rebuild
+  !! (161x64 nt7 np4: +1.3 s per rebuild at physics_pc_sf_harm_couple = 0)
+  logical, save     :: ptap_lean = .false.
+  logical, save     :: lean_marked(16) = .false.   !< per instance: its first lean rebuild's memory reported
   !> -sf_gpu_factor: the ring / line blocks factored on the device (batched
   !! cuBLAS, or threaded LAPACK on host backends) from their unfactored
   !! values; the host factors them only for the first build's gate
@@ -1531,13 +1542,33 @@ contains
       endif
       call PetscLogEventEnd(gev_dev, ierr)
       do g = 1, nlev - 1
-        if (reuse) then
+        if (reuse .and. ptap_lean) then
+          ! -sf_gpu_ptap 2: a fresh product, its values into gA(g), freed
+          block
+            Mat :: Ct
+            integer :: ok
+            call MatPtAP(gAd(g - 1), gPd(g), MAT_INITIAL_MATRIX, 2.0d0, Ct, ierr)
+            if (.not. lean_marked(min(cur_inst, size(lean_marked)))) call mem_mark_lev("product (temporary)", g)
+            call sfg_dev_copy_values(Ct, gA(g), ok)
+            call MatDestroy(Ct, ierr)
+            if (ok == 0) then
+              if (my_id == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   FATAL: GMG", cur_inst, " level ", g, &
+                ": the fresh product's pattern differs from the level operator's (-sf_gpu_ptap 2); "// &
+                "run with -sf_gpu_ptap 1"
+              call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+            endif
+          end block
+        else if (reuse) then
           call MatPtAP(gAd(g - 1), gPd(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
         else
           call MatPtAP(gAd(g - 1), gPd(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
+          if (.not. op_ready) call mem_mark_lev("product", g)
+          ! lean: the operator only; its product data goes
+          if (ptap_lean) call MatProductClear(gA(g), ierr)
         endif
         gAd(g) = gA(g)
       enddo
+      if (reuse .and. ptap_lean) lean_marked(min(cur_inst, size(lean_marked))) = .true.
       ! the host setup (blocks, axis, coarse LU) reads them next
       do g = 1, nlev - 1
         call mat_host_sync(gA(g))
@@ -1574,6 +1605,7 @@ contains
     sm_type = o%smoother
     sm_nstep = o%nsmooth
     call dev_operators(my_id, reuse)
+    if (dev .and. .not. op_ready) call mem_mark("device operators")
     ! threaded matvecs: after the Galerkin chain, on every rebuild (the attach
     ! is idempotent and only re-plans on a new pattern). gA(0) is the caller's
     ! operator; P serves the V-cycle's prolongation (MatMultAdd). Not on the
@@ -1695,6 +1727,13 @@ contains
         call build_blocks(g, gA(g))
       endif
       call KSPSetUp(gSm(g), ierr)
+      if (dev .and. .not. op_ready) then
+        block
+          character(len=16) :: lv
+          write(lv, '(A,I0)') "level ", g
+          call mem_mark(trim(lv)//" blocks")
+        end block
+      endif
     enddo
     call axd_factor_pending()
     if (dev .and. .not. op_ready) call blk_dev_gate(my_id)
@@ -1794,6 +1833,7 @@ contains
       enddo
       call PetscLogEventEnd(gev_coarselu, ierr)
     endif
+    if (dev .and. .not. op_ready) call mem_mark("coarse and axis solves")
     ! The C_op report describes the hierarchy's structure, frozen after the
     ! first build: first build only.
     pat_fresh = .false.
@@ -1812,6 +1852,25 @@ contains
       if (my_id == 0) write(*,'(A,I0,A,F7.1,A)', advance="no") " ", nr, " (", nzg / max(dble(nr), 1.d0), ")"
     enddo
     if (my_id == 0) write(*,'(A,F6.3)') "   C_op = ", nzt / max(nz0, 1.d0)
+
+  contains
+
+    !> Memory audit on the device path's first build: where the device
+    !! memory goes, stage by stage
+    subroutine mem_mark(what)
+      character(len=*), intent(in) :: what
+      character(len=8) :: k
+      write(k, '(I0)') cur_inst
+      call physics_pc_mem("GMG"//trim(k)//": "//what, my_id)
+    end subroutine mem_mark
+
+    subroutine mem_mark_lev(what, g)
+      character(len=*), intent(in) :: what
+      integer, intent(in) :: g
+      character(len=16) :: lv
+      write(lv, '(A,I0)') "level ", g
+      call mem_mark(trim(lv)//" "//what)
+    end subroutine mem_mark_lev
   end subroutine gmg_setup_operator
 
   !> The device path is on (-sf_gpu, read at the first hierarchy's build)
@@ -1919,6 +1978,7 @@ contains
       pv = 1
       call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_ptap", pv, set, ierr)
       dev_ptap = (pv > 0)
+      ptap_lean = (pv == 2)
       pv = 1
       call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_factor", pv, set, ierr)
       dev_fac = (pv > 0)

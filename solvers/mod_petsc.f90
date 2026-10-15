@@ -3,7 +3,8 @@ module mod_petsc
   use mpi_mod
   use mod_petsc_pc
   use mod_petsc_raw_csr, only: baij_map_t, baij_aij_map, baij_aij_fill, &
-                               sfg_dev_available, sfg_dev_source, sfg_dev_expand_setup, sfg_dev_expand
+                               sfg_dev_available, sfg_dev_source, sfg_dev_expand_setup, sfg_dev_expand, &
+                               sfg_dev_bmv_setup
 #include "petsc/finclude/petsc.h"
   use petsc
 #ifdef USE_SLEPC
@@ -33,6 +34,7 @@ module mod_petsc
     Mat  :: A_dtmp, A_dev
     type(baij_map_t) :: dmap     !< A -> A_dev values (else A_dtmp's MatConvert, slow: row by row)
     logical :: dexp = .false.    !< A_dev expanded on the device from A's uploaded BAIJ values (-sf_gpu_gather)
+    logical :: bmv = .false.     !< A_dev a shell: A's block product on the device from those values (-sf_gpu_outer_bmv)
   end type type_PETSC_SYSTEM
 
 
@@ -454,7 +456,31 @@ contains
         endif
         petsc_sys%outer_dev = (pv > 0 .and. use_physics_pc .and. blk_dev_available())
       end block
-      if (petsc_sys%outer_dev) then
+      ! -sf_gpu_outer_bmv (default 1): the outer operator a shell, A's block
+      ! product on the device from A's uploaded BAIJ values (which the physics
+      ! PC's device gathers read anyway): no AIJ copy, on the host or the
+      ! device. Gated against the host BAIJ product; else the AIJ copy below.
+      if (petsc_sys%outer_dev .and. sfg_dev_available()) then
+        block
+          PetscInt :: pb
+          PetscBool :: set
+          real*8 :: rel
+          pb = 1
+          PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_gpu_outer_bmv", pb, set, ierr))
+          if (pb > 0) then
+            call sfg_dev_source(0, petsc_sys%A)
+            call sfg_dev_bmv_setup(petsc_sys%A, petsc_sys%A_dev, rel)
+            petsc_sys%bmv = (rel <= 1.d-12)
+            if (my_id == 0) write(*,'(A,ES9.2,A)') " [PETSc] setup: outer FGMRES on the device, A's block product "// &
+              "from its BAIJ values vs host, max |diff| / max |A x| ", rel, &
+              merge(" -> in use            ", " -> FALLBACK: AIJ copy", petsc_sys%bmv)
+            if (.not. petsc_sys%bmv) PetscCallA(MatDestroy(petsc_sys%A_dev, ierr))
+          endif
+        end block
+      endif
+      if (petsc_sys%bmv) then
+        PetscCallA(MatCreateVecs(petsc_sys%A_dev, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      else if (petsc_sys%outer_dev) then
         PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_dtmp, ierr))
         PetscCallA(MatDuplicate(petsc_sys%A_dtmp, MAT_COPY_VALUES, petsc_sys%A_dev, ierr))
         PetscCallA(MatConvert(petsc_sys%A_dev, "aijkokkos", MAT_INPLACE_MATRIX, petsc_sys%A_dev, ierr))
@@ -607,7 +633,12 @@ contains
     !! new values in A_dev (A refilled in place by JOREK, fixed pattern)
     subroutine outer_operators()
       use mod_petsc_pc_gmg, only: gmg_mat_dev
-      if (petsc_sys%dexp) then
+      if (petsc_sys%bmv) then
+        ! A's values up once (pinned): the shell's product and the physics
+        ! PC's device gather read them; the upload marks the shell changed
+        call sfg_dev_source(0, petsc_sys%A)
+        PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_dev, petsc_sys%A_dev, ierr))
+      else if (petsc_sys%dexp) then
         ! A's values up once (pinned), A_dev expanded from them on the device;
         ! the physics PC's device gather reads the same upload
         call sfg_dev_source(0, petsc_sys%A)

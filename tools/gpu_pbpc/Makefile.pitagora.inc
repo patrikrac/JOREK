@@ -44,7 +44,10 @@ USE_FFTW          = 1
 USE_BOOST         = 1
 
 # --- Preprocessor ----------------------------------------------------------
-DEFINES           = -DUSE_MPI -DUSE_BOOST
+# FUNNELED: MPI_THREAD_FUNNELED (only the master thread calls MPI). The
+# booster nodes' UCX (HPC-X) has no MPI_THREAD_MULTIPLE, so without it Open MPI
+# drops UCX for its own transports -- which hang between nodes (TCP btl).
+DEFINES           = -DUSE_MPI -DUSE_BOOST -DFUNNELED
 
 # --- PETSc -----------------------------------------------------------------
 # PETSC_DIR comes from env_pitagora.sh. defaults.mk includes PETSc's own

@@ -29,11 +29,15 @@
 #include <petscmat.h>
 #include <petsc/private/petscimpl.h>
 #include <Kokkos_Core.hpp>
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <string>
 #include <vector>
 #if defined(KOKKOS_ENABLE_CUDA)
   #include <cuda_runtime.h>
+#elif defined(KOKKOS_ENABLE_HIP)
+  #include <hip/hip_runtime.h>
 #endif
 
 namespace {
@@ -83,7 +87,22 @@ struct Fam {
 };
 std::map<int, Fam> fam;
 std::map<PetscInt, Vec> ones; /* MatDiagonalScale's ones, by local row count */
-PetscLogEvent           ev_up = -1, ev_ga = -1;
+PetscLogEvent           ev_up = -1, ev_ga = -1, ev_bmv = -1;
+
+/* the outer operator as a shell (jorek_sfg_bmv_setup): A's block product
+ * straight from source 0, the BAIJ values the gathers read -- no AIJ copy.
+ * The parts' block row pointers / block columns (diagonal: local block
+ * columns; off-diagonal: compressed, into the ghost vector xg, which the
+ * scatter fills from x's owners through A's garray). */
+struct Bmv {
+  Mat        S = nullptr;
+  int        bs = 0, nbr = 0, nbo = 0;
+  long long  nzb_d = 0, nzb_o = 0; /* stored blocks per part */
+  IntView    ia_d, ja_d, ia_o, ja_o;
+  Vec        xg = nullptr;
+  VecScatter sc = nullptr;
+};
+Bmv bmv;
 
 /* the globals' device memory goes before Kokkos does: jorek_sfg_release,
  * called ahead of PetscFinalize (whose registered finalizers run only after
@@ -100,17 +119,23 @@ PetscErrorCode release()
   ex = Expand();
   for (auto &v : ones) PetscCall(VecDestroy(&v.second));
   ones.clear();
+  /* the shell itself is the caller's (mod_petsc); its views and scatter go */
+  PetscCall(VecDestroy(&bmv.xg));
+  PetscCall(VecScatterDestroy(&bmv.sc));
+  bmv = Bmv();
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
 PetscErrorCode events()
 {
   PetscFunctionBeginUser;
+  PetscCall(PetscKokkosInitializeCheck()); /* the first device object may be ours (no AIJ copy before) */
   if (ev_up < 0) {
     PetscClassId cid;
     PetscCall(PetscClassIdRegister("JOREK SF gather", &cid));
     PetscCall(PetscLogEventRegister("SFG_DevUpload", cid, &ev_up));
     PetscCall(PetscLogEventRegister("SFG_DevGather", cid, &ev_ga));
+    PetscCall(PetscLogEventRegister("SFG_BlockMult", cid, &ev_bmv));
   }
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -170,6 +195,92 @@ PetscErrorCode dev_values(Mat M, double **a, long long *nz)
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+/* y (+)= the part's block rows times x: one team per block row, a block
+ * row's rows on the team's threads (a block is column-major, so the threads
+ * read consecutive values; x's entry is the same for all of them) */
+PetscErrorCode bmv_part(const IntView &ia, const IntView &ja, const RealView &v, const PetscScalar *x, PetscScalar *y, bool add)
+{
+  PetscFunctionBeginUser;
+  const int       bs = bmv.bs;
+  const long long bs2 = (long long)bs * bs;
+  const double   *va = v.data();
+  const auto      body = KOKKOS_LAMBDA(const Kokkos::TeamPolicy<ExecSpace>::member_type &t)
+  {
+    const int ib = t.league_rank();
+    const int k0 = ia(ib), k1 = ia(ib + 1);
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(t, bs), [&](const int i) {
+      double s = 0.0;
+      for (int k = k0; k < k1; k++) {
+        const double      *b  = va + (long long)k * bs2 + i;
+        const PetscScalar *xc = x + (long long)ja(k) * bs;
+        for (int j = 0; j < bs; j++) s += b[(long long)j * bs] * xc[j];
+      }
+      const long long r = (long long)ib * bs + i;
+      y[r] = add ? y[r] + s : s;
+    });
+  };
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
+  Kokkos::TeamPolicy<ExecSpace> pol(PetscGetKokkosExecutionSpace(), bmv.nbr, std::min(((bs + 31) / 32) * 32, 256));
+#else
+  Kokkos::TeamPolicy<ExecSpace> pol(PetscGetKokkosExecutionSpace(), bmv.nbr, Kokkos::AUTO());
+#endif
+  PetscCallCXX(Kokkos::parallel_for("jorek_sfg_bmv", pol, body));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* the shell's MatMult: y = A x from source 0, the ghost blocks' exchange
+ * overlapping the diagonal part */
+PetscErrorCode bmv_mult(Mat S, Vec x, Vec y)
+{
+  using CView = Kokkos::View<const PetscScalar *, MemSpace>;
+  using View  = Kokkos::View<PetscScalar *, MemSpace>;
+  CView xv, gv;
+  View  yv;
+
+  PetscFunctionBeginUser;
+  (void)S;
+  PetscCall(PetscLogEventBegin(ev_bmv, x, y, 0, 0));
+  if (bmv.nbo) PetscCall(VecScatterBegin(bmv.sc, x, bmv.xg, INSERT_VALUES, SCATTER_FORWARD));
+  PetscCall(VecGetKokkosView(x, &xv));
+  PetscCall(VecGetKokkosViewWrite(y, &yv));
+  PetscCall(bmv_part(bmv.ia_d, bmv.ja_d, src[0].d, xv.data(), yv.data(), false));
+  PetscCall(VecRestoreKokkosViewWrite(y, &yv));
+  PetscCall(VecRestoreKokkosView(x, &xv));
+  if (bmv.nbo) {
+    PetscCall(VecScatterEnd(bmv.sc, x, bmv.xg, INSERT_VALUES, SCATTER_FORWARD));
+    PetscCall(VecGetKokkosView(bmv.xg, &gv));
+    PetscCall(VecGetKokkosView(y, &yv));
+    PetscCall(bmv_part(bmv.ia_o, bmv.ja_o, src[0].o, gv.data(), yv.data(), true));
+    PetscCall(VecRestoreKokkosView(y, &yv));
+    PetscCall(VecRestoreKokkosView(bmv.xg, &gv));
+  }
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
+  PetscCall(PetscLogGpuFlops(2.0 * (double)(bmv.nzb_d + bmv.nzb_o) * bmv.bs * bmv.bs));
+#else
+  PetscCall(PetscLogFlops(2.0 * (double)(bmv.nzb_d + bmv.nzb_o) * bmv.bs * bmv.bs));
+#endif
+  PetscCall(PetscLogEventEnd(ev_bmv, x, y, 0, 0));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* a part's block structure on the device: block row pointers and columns */
+PetscErrorCode bmv_ij(Mat P, IntView &ia, IntView &ja, long long &nzb)
+{
+  const PetscInt *pi, *pj;
+  PetscInt        n;
+  PetscBool       done;
+
+  PetscFunctionBeginUser;
+  PetscCall(MatGetRowIJ(P, 0, PETSC_FALSE, PETSC_TRUE, &n, &pi, &pj, &done));
+  PetscCheck(done && n == bmv.nbr, PETSC_COMM_SELF, PETSC_ERR_PLIB, "SF block product: no block structure (%" PetscInt_FMT " block rows)", n);
+  std::vector<int> hi(pi, pi + n + 1), hj(pj, pj + pi[n]);
+  nzb = pi[n];
+  PetscCall(MatRestoreRowIJ(P, 0, PETSC_FALSE, PETSC_TRUE, &n, &pi, &pj, &done));
+  PetscCallCXX(upload(ia, "sfg_bmv_ia", hi.data(), hi.size()));
+  PetscCallCXX(upload(ja, "sfg_bmv_ja", hj.data(), hj.size()));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 } // namespace
 
 extern "C" {
@@ -197,6 +308,7 @@ PetscErrorCode jorek_sfg_source(int which, Mat Bd, Mat Bo, long long nd, const d
   PetscCall(PetscLogEventEnd(ev_up, 0, 0, 0, 0));
   S.st_d = sd;
   S.st_o = so;
+  if (which == 0 && bmv.S) PetscCall(PetscObjectStateIncrease((PetscObject)bmv.S)); /* the outer operator's values moved */
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -403,6 +515,175 @@ PetscErrorCode jorek_sfg_fam_install(int k, const double *val)
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+/* The outer operator *S: a shell whose MatMult is A's block product on the
+ * device from source 0 (A: the MPIBAIJ / SeqBAIJ Jacobian; its values must be
+ * uploaded, jorek_sfg_source(0, ..), before each use). Gate: S x against
+ * PETSc's host BAIJ product on a random x, *rel = max |diff| / max |A x|. */
+PetscErrorCode jorek_sfg_bmv_setup(Mat A, Mat *S, double *rel)
+{
+  MPI_Comm        comm;
+  Mat             Ad = A, Ao = nullptr;
+  const PetscInt *garray = nullptr;
+  PetscBool       mpi;
+  PetscInt        m, n, M, N, bs;
+
+  PetscFunctionBeginUser;
+  PetscCall(events());
+  PetscCall(PetscObjectGetComm((PetscObject)A, &comm));
+  PetscCall(PetscObjectTypeCompare((PetscObject)A, MATMPIBAIJ, &mpi));
+  if (mpi) PetscCall(MatMPIBAIJGetSeqBAIJ(A, &Ad, &Ao, &garray));
+  PetscCall(MatGetBlockSize(A, &bs));
+  PetscCall(MatGetLocalSize(A, &m, &n));
+  PetscCall(MatGetSize(A, &M, &N));
+  PetscCheck(src[0].d.extent(0) > 0, PETSC_COMM_SELF, PETSC_ERR_ORDER, "SF block product: A's values not uploaded (jorek_sfg_source 0)");
+  bmv.bs  = (int)bs;
+  bmv.nbr = (int)(m / bs);
+  PetscCall(bmv_ij(Ad, bmv.ia_d, bmv.ja_d, bmv.nzb_d));
+  PetscCheck(src[0].d.extent(0) == (size_t)(bmv.nzb_d * bs * bs), PETSC_COMM_SELF, PETSC_ERR_ARG_SIZ, "SF block product: source 0 holds %zu values, the diagonal part %lld blocks", src[0].d.extent(0), bmv.nzb_d);
+  bmv.nbo = 0;
+  if (Ao) {
+    PetscInt nco;
+    PetscCall(MatGetSize(Ao, NULL, &nco));
+    bmv.nbo = (int)(nco / bs);
+  }
+  if (bmv.nbo) {
+    PetscCall(bmv_ij(Ao, bmv.ia_o, bmv.ja_o, bmv.nzb_o));
+    PetscCheck(src[0].o.extent(0) == (size_t)(bmv.nzb_o * bs * bs), PETSC_COMM_SELF, PETSC_ERR_ARG_SIZ, "SF block product: source 0 holds %zu off-diagonal values, the part %lld blocks", src[0].o.extent(0), bmv.nzb_o);
+  }
+  PetscCall(MatCreateShell(comm, m, n, M, N, NULL, S));
+  PetscCall(MatShellSetOperation(*S, MATOP_MULT, (PetscErrorCodeFn *)bmv_mult));
+  PetscCall(MatShellSetVecType(*S, VECKOKKOS));
+  PetscCall(MatSetBlockSize(*S, bs));
+  bmv.S = *S;
+  {
+    Vec x;
+    PetscCall(MatCreateVecs(*S, &x, NULL));
+    if (bmv.nbo) {
+      IS from;
+      PetscCall(VecCreateSeqKokkos(PETSC_COMM_SELF, (PetscInt)bmv.nbo * bs, &bmv.xg));
+      PetscCall(ISCreateBlock(PETSC_COMM_SELF, bs, bmv.nbo, garray, PETSC_COPY_VALUES, &from));
+      PetscCall(VecScatterCreate(x, from, bmv.xg, NULL, &bmv.sc));
+      PetscCall(ISDestroy(&from));
+    }
+    PetscCall(VecDestroy(&x));
+  }
+  /* the gate */
+  {
+    Vec                xh, yh, xd, yd;
+    const PetscScalar *ph, *pd;
+    PetscScalar       *pw;
+    PetscRandom        rnd;
+    PetscInt           nl;
+    double             loc[2] = {0.0, 0.0}, glo[2];
+    PetscCall(MatCreateVecs(A, &xh, &yh));
+    PetscCall(MatCreateVecs(*S, &xd, &yd));
+    PetscCall(PetscRandomCreate(comm, &rnd));
+    PetscCall(PetscRandomSetFromOptions(rnd));
+    PetscCall(VecSetRandom(xh, rnd));
+    PetscCall(PetscRandomDestroy(&rnd));
+    PetscCall(VecGetLocalSize(xh, &nl));
+    PetscCall(VecGetArrayRead(xh, &ph));
+    PetscCall(VecGetArrayWrite(xd, &pw));
+    for (PetscInt i = 0; i < nl; i++) pw[i] = ph[i];
+    PetscCall(VecRestoreArrayWrite(xd, &pw));
+    PetscCall(VecRestoreArrayRead(xh, &ph));
+    PetscCall(MatMult(A, xh, yh));
+    PetscCall(MatMult(*S, xd, yd));
+    PetscCall(VecGetArrayRead(yh, &ph));
+    PetscCall(VecGetArrayRead(yd, &pd));
+    for (PetscInt i = 0; i < nl; i++) {
+      loc[0] = std::max(loc[0], std::abs(pd[i] - ph[i]));
+      loc[1] = std::max(loc[1], std::abs(ph[i]));
+    }
+    PetscCall(VecRestoreArrayRead(yd, &pd));
+    PetscCall(VecRestoreArrayRead(yh, &ph));
+    PetscCallMPI(MPI_Allreduce(loc, glo, 2, MPI_DOUBLE, MPI_MAX, comm));
+    *rel = glo[0] / std::max(glo[1], 1e-300);
+    PetscCall(VecDestroy(&xh));
+    PetscCall(VecDestroy(&yh));
+    PetscCall(VecDestroy(&xd));
+    PetscCall(VecDestroy(&yd));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* C's values = T's, on the device: T a fresh product of the same operands as
+ * C (the Galerkin chain's -sf_gpu_ptap 2, mod_petsc_pc_gmg), so the same
+ * pattern -- checked here, row pointers and columns of each part and the
+ * off-diagonal part's garray; *ok = 0 (nothing copied) where they differ.
+ * Both (MPI or sequential) aijkokkos. */
+PetscErrorCode jorek_dev_copy_values(Mat T, Mat C, int *ok)
+{
+  Mat             tp[2] = {T, nullptr}, cp[2] = {C, nullptr};
+  const PetscInt *tg = nullptr, *cg = nullptr;
+  PetscBool       mpi;
+
+  PetscFunctionBeginUser;
+  *ok = 1;
+  PetscCall(PetscObjectTypeCompare((PetscObject)C, MATMPIAIJKOKKOS, &mpi));
+  if (mpi) {
+    PetscInt nt, nc;
+    PetscCall(MatMPIAIJGetSeqAIJ(T, &tp[0], &tp[1], &tg));
+    PetscCall(MatMPIAIJGetSeqAIJ(C, &cp[0], &cp[1], &cg));
+    PetscCall(MatGetSize(tp[1], NULL, &nt));
+    PetscCall(MatGetSize(cp[1], NULL, &nc));
+    if (nt != nc) *ok = 0;
+    for (PetscInt i = 0; *ok && i < nc; i++)
+      if (tg[i] != cg[i]) *ok = 0;
+  }
+  double *ta[2] = {nullptr, nullptr}, *ca[2] = {nullptr, nullptr};
+  long long n[2] = {0, 0};
+  for (int q = 0; q < (mpi ? 2 : 1) && *ok; q++) {
+    const PetscInt *ti, *tj, *ci, *cj;
+    PetscMemType    mt;
+    PetscInt        mtr, mcr;
+    long long       ntz, ncz;
+    PetscCall(MatGetLocalSize(tp[q], &mtr, NULL));
+    PetscCall(MatGetLocalSize(cp[q], &mcr, NULL));
+    PetscCall(dev_values(tp[q], &ta[q], &ntz));
+    PetscCall(dev_values(cp[q], &ca[q], &ncz));
+    if (mtr != mcr || ntz != ncz) {
+      *ok = 0;
+      break;
+    }
+    PetscCall(MatSeqAIJGetCSRAndMemType(tp[q], &ti, &tj, &ta[q], &mt));
+    PetscCall(MatSeqAIJGetCSRAndMemType(cp[q], &ci, &cj, &ca[q], &mt));
+    long long bad = 0;
+    const long long nr = mtr;
+    PetscCallCXX(Kokkos::parallel_reduce(
+      "jorek_copy_check", Range(PetscGetKokkosExecutionSpace(), 0, ntz + nr + 1),
+      KOKKOS_LAMBDA(const long long e, long long &b) {
+        if (e < ntz) b += (tj[e] != cj[e]);
+        else b += (ti[e - ntz] != ci[e - ntz]);
+      },
+      bad));
+    if (bad) *ok = 0;
+    n[q] = ntz;
+  }
+  int g = *ok;
+  PetscCallMPI(MPI_Allreduce(MPI_IN_PLACE, &g, 1, MPI_INT, MPI_MIN, PetscObjectComm((PetscObject)C)));
+  *ok = g;
+  if (!*ok) PetscFunctionReturn(PETSC_SUCCESS);
+  for (int q = 0; q < (mpi ? 2 : 1); q++) {
+    if (!n[q]) continue;
+    Kokkos::View<double *, MemSpace, Kokkos::MemoryUnmanaged> dt(ta[q], (size_t)n[q]), dc(ca[q], (size_t)n[q]);
+    PetscCallCXX(Kokkos::deep_copy(PetscGetKokkosExecutionSpace(), dc, dt));
+    PetscCall(mark_device(cp[q]));
+  }
+  PetscCall(PetscObjectStateIncrease((PetscObject)C));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* the shell is not used (a failed gate): forget it before its owner destroys it */
+PetscErrorCode jorek_sfg_bmv_drop(void)
+{
+  PetscFunctionBeginUser;
+  PetscCall(VecDestroy(&bmv.xg));
+  PetscCall(VecScatterDestroy(&bmv.sc));
+  bmv = Bmv();
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 /* the device memory of this file, ahead of PetscFinalize (mod_petsc) */
 PetscErrorCode jorek_sfg_release(void)
 {
@@ -417,10 +698,34 @@ int jorek_sfg_kokkos(void)
   return 1;
 }
 
+/* The device's memory in use and its total, in bytes (the memory audit,
+ * physics_pc_mem); -1 where the backend gives no figure */
+void jorek_dev_mem(double *used, double *total)
+{
+  *used = *total = -1.0;
+#if defined(KOKKOS_ENABLE_CUDA)
+  size_t fr, tot;
+  if (cudaMemGetInfo(&fr, &tot) == cudaSuccess) {
+    *used  = (double)(tot - fr);
+    *total = (double)tot;
+  }
+#elif defined(KOKKOS_ENABLE_HIP)
+  size_t fr, tot;
+  if (hipMemGetInfo(&fr, &tot) == hipSuccess) {
+    *used  = (double)(tot - fr);
+    *total = (double)tot;
+  }
+#endif
+}
+
 } // extern "C"
 #else
 extern "C" int jorek_sfg_kokkos(void)
 {
   return 0;
+}
+extern "C" void jorek_dev_mem(double *used, double *total)
+{
+  *used = *total = -1.0;
 }
 #endif

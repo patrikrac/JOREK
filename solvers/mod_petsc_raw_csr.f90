@@ -95,6 +95,20 @@ module mod_petsc_raw_csr
     integer(c_int) function c_sfg_expand() bind(C, name="jorek_sfg_expand")
       import :: c_int
     end function c_sfg_expand
+    integer(c_int) function c_sfg_bmv_setup(A, S, rel) bind(C, name="jorek_sfg_bmv_setup")
+      import :: c_int, c_intptr_t, c_double
+      integer(c_intptr_t), value :: A
+      integer(c_intptr_t) :: S
+      real(c_double) :: rel
+    end function c_sfg_bmv_setup
+    integer(c_int) function c_sfg_bmv_drop() bind(C, name="jorek_sfg_bmv_drop")
+      import :: c_int
+    end function c_sfg_bmv_drop
+    integer(c_int) function c_dev_copy_values(T, C, ok) bind(C, name="jorek_dev_copy_values")
+      import :: c_int, c_intptr_t
+      integer(c_intptr_t), value :: T, C
+      integer(c_int) :: ok
+    end function c_dev_copy_values
     integer(c_int) function c_sfg_target(k, T, Td, To, nd, md, wd, zd, no, mo, wo, zo, hw, hz) &
         bind(C, name="jorek_sfg_target")
       import :: c_int, c_intptr_t, c_long_long, c_int32_t, c_int8_t
@@ -144,7 +158,8 @@ module mod_petsc_raw_csr
   public :: split_parts, get_ij, put_ij, aij_parts, aij_vals_read, aij_vals_done
   public :: aij_vals_write, aij_vals_written
   public :: blockmv_attach
-  public :: sfg_dev_available, sfg_dev_source, sfg_dev_expand_setup, sfg_dev_expand
+  public :: sfg_dev_available, sfg_dev_source, sfg_dev_expand_setup, sfg_dev_expand, sfg_dev_bmv_setup
+  public :: sfg_dev_copy_values
   public :: sfg_dev_target, sfg_dev_target_clear, sfg_dev_gather
   public :: sfg_dev_fam_set, sfg_dev_fam_values, sfg_dev_fam_install, sfg_dev_release
 
@@ -448,6 +463,47 @@ contains
     if (rc /= 0) stop "sfg_dev_expand_setup: PETSc/Kokkos error"
 #endif
   end subroutine sfg_dev_expand_setup
+
+  !> S = the outer operator as a shell: A's block product on the device, from
+  !! A's uploaded BAIJ values (sfg_dev_source(0, A) first, and before every
+  !! solve); rel = the gate, S x against the host BAIJ product (max |diff| /
+  !! max |A x|, random x). Above 1e-12 the shell is not used: the caller
+  !! destroys S.
+  subroutine sfg_dev_bmv_setup(A, S, rel)
+    Mat, intent(in)  :: A
+    Mat, intent(out) :: S
+    real*8, intent(out) :: rel
+#ifdef USE_GPU_PC
+    integer(c_intptr_t) :: ps
+    real(c_double) :: r
+    ps = 0
+    if (c_sfg_bmv_setup(transfer(A%v, 0_c_intptr_t), ps, r) /= 0) stop "sfg_dev_bmv_setup: PETSc/Kokkos error"
+    S%v = transfer(ps, S%v)
+    rel = r
+    ! gate: a failed one leaves the AIJ copy to the caller
+    if (.not. (rel <= 1.d-12)) then
+      if (c_sfg_bmv_drop() /= 0) stop "sfg_dev_bmv_setup: PETSc/Kokkos error"
+    endif
+#else
+    rel = huge(1.d0)
+#endif
+  end subroutine sfg_dev_bmv_setup
+
+  !> C's values = T's on the device, T a fresh product of C's operands (same
+  !! pattern, checked: ok = 0 and nothing copied where it differs); both
+  !! aijkokkos (mod_petsc_pc_gmg, -sf_gpu_ptap 2)
+  subroutine sfg_dev_copy_values(T, C, ok)
+    Mat, intent(in) :: T, C
+    integer, intent(out) :: ok
+#ifdef USE_GPU_PC
+    integer(c_int) :: o
+    if (c_dev_copy_values(transfer(T%v, 0_c_intptr_t), transfer(C%v, 0_c_intptr_t), o) /= 0) &
+      stop "sfg_dev_copy_values: PETSc/Kokkos error"
+    ok = int(o)
+#else
+    ok = 0
+#endif
+  end subroutine sfg_dev_copy_values
 
   subroutine sfg_dev_expand()
 #ifdef USE_GPU_PC

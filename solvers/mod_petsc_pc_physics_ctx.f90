@@ -130,13 +130,36 @@ contains
   !! evicts pages under pressure), so the heap figures are the attribution;
   !! MUMPS-internal memory is not on the PETSc heap (see physics_pc_mumps_mem).
   subroutine physics_pc_mem(tag, my_id)
+#ifdef USE_GPU_PC
+    use iso_c_binding, only: c_double
+#endif
     character(len=*), intent(in) :: tag
     integer, intent(in)          :: my_id
     PetscLogDouble :: hcur, hmax
     PetscErrorCode :: ierr
+#ifdef USE_GPU_PC
+    interface
+      subroutine c_dev_mem(used, total) bind(C, name="jorek_dev_mem")
+        import :: c_double
+        real(c_double), intent(out) :: used, total
+      end subroutine c_dev_mem
+    end interface
+    real(c_double) :: dused, dtot
+#endif
     call PetscMallocGetCurrentUsage(hcur, ierr)
     call PetscMallocGetMaximumUsage(hmax, ierr)
-    if (my_id == 0) write(*,'(A,A,T52,A,F7.3,A,F7.3,A,F7.3,A)') "[Mem] ", tag, &
+    if (my_id /= 0) return
+#ifdef USE_GPU_PC
+    ! the device's (rank 0's): what this audit is mostly about on the device path
+    call c_dev_mem(dused, dtot)
+    if (dtot > 0.d0) then
+      write(*,'(A,A,T52,A,F7.3,A,F7.3,A,F7.3,A,F7.3,A,F7.3,A)') "[Mem] ", tag, &
+        "heap ", hcur / 1.d9, " GB, heap peak ", hmax / 1.d9, " GB, RSS peak ", &
+        physics_pc_peak_rss() / 1.d9, " GB, device ", dused / 1.d9, " / ", dtot / 1.d9, " GB"
+      return
+    endif
+#endif
+    write(*,'(A,A,T52,A,F7.3,A,F7.3,A,F7.3,A)') "[Mem] ", tag, &
       "heap ", hcur / 1.d9, " GB, heap peak ", hmax / 1.d9, " GB, RSS peak ", &
       physics_pc_peak_rss() / 1.d9, " GB"
   end subroutine physics_pc_mem
