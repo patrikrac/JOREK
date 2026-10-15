@@ -112,6 +112,15 @@ for _b in ('hc1', 'hcall'):
                                        physics_pc_sf_cross_weights='.f.')
     ARMS['sf_gmg_wpj_fresh_ms_' + _b] = dict(ARMS['sf_gmg_wpj_ms_' + _b], iter_precon='0')
 
+# Flux-Schur arm (physics_pc_sf_suu = "flux"): D_v (velocity block) first, then
+# S1 on (psi, j), then velocity and rho/T re-solves; no corrector. The pair_psi
+# slot solves S1, the pair_w slot D_v. _lu: those two by MUMPS LU (the exact
+# reference for the T0-T3 checks, util/physics_pc_scaling/flux_checks/README.md).
+ARMS['sf_gmg_flux_ms'] = dict(ARMS['sf_gmg_wpj_ms'], physics_pc_sf_suu='"flux"',
+                              physics_pc_sf_corrector='0')
+ARMS['sf_lu_flux_ms'] = dict(ARMS['sf_gmg_flux_ms'], physics_pc_sf_pair_psi='"lu"',
+                             physics_pc_sf_pair_w='"lu"')
+
 # v_par (model600 built with_vpar; base PCS_BASE=namelist/model600/
 # inxflow_shaped_vpar_pcbench): its block's backend follows the arm (lu / gmg),
 # its place in the sweep the suffix -- v0 = solved last, no feedback; b0 = the
@@ -132,6 +141,8 @@ ARMS['jorek_fresh_ms'] = dict(ARMS['jorek_fresh'])
 # PETSc options an arm needs besides its namelist (`mknml.py petscopts <arm>`).
 ARM_PETSC_OPTS = {'sf_direct': '-jorek_pc_full_lu',
                   'jorek_fresh_ms': '-jorek_pc_mode_split'}
+# Flux-Schur T0-T3 checks: add e.g. (needs an existing directory)
+#   ARM_PETSC_OPTS['sf_lu_flux_ms'] = '-sf_flux_dump /path/to/dumpdir -sf_flux_spai_check'
 
 
 def is_sf(arm):

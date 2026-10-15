@@ -46,6 +46,14 @@ module mod_petsc_pc_physics_ctx
     !! v_par column) only feeds the (u, v_par) symmetry diagnostic.
     Mat :: W_vv, W_vu, W_uv
     logical :: w_v_ready = .false.
+
+    !> The R^3 rho0-weighted mass of the flux arm (sf_needs_mass_w): one
+    !! variable, block size n_tor, diagonal in the toroidal slot, rho0 the
+    !! n = 0 density; Dirichlet rows and columns with a unit diagonal, so SPD.
+    !! Same lifecycle as W. See modelPC/mod_pc_elt_mass_w.f90 and
+    !! construct_pc_matrix_mod::construct_mass_w_matrix.
+    Mat :: M_w
+    logical :: M_w_ready = .false.
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx

@@ -73,6 +73,7 @@ submitted again. `results.tsv` is rewritten after every case.
 |---|---|
 | `sf_gmg_wpj_ms` | **production**: see "The SF arms" below |
 | `sf_*` | the SF reference arms, see "The SF arms" below |
+| `sf_gmg_flux_ms` / `sf_lu_flux_ms` | flux-Schur SF arm (`physics_pc_sf_suu = "flux"`) on the mode split, GMG / pair_psi+pair_w by LU; see "Flux-Schur arm (flux)" |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
 | `jorek_fresh` | `jorek` with the PC rebuilt at every step (`iter_precon = 0`): separates the loss of the mode coupling from a stale factorisation |
 
@@ -141,8 +142,29 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 | `sf_gmg_wpj_eq16` | `sf_gmg_wpj` with the Eq. (16) corrector (a second pair_psi solve) instead of the default Eq. (17) |
 | `sf_lu` / `sf_lu_w` / `sf_lu_wpj` | every block by MUMPS LU: the exact references, for approximation quality (`sf_lu_wj`: the lumped-mass form; `sf_lugw_wpj`: LU except pair_w) |
 | `sf_gmg_wpj_hc1` / `_hcall`, `sf_lu_wpj_hc1` / `_hcall` | `sf_gmg_wpj` / `sf_lu_wpj` keeping the cross-\|n\| couplings of the \|n\| groups at most 1 apart / all (`physics_pc_sf_harm_couple` = 1 / -1, fixed for the run), with the per-build cross-\|n\| weight report on (`physics_pc_sf_cross_weights`) |
+| `sf_gmg_flux_ms` | flux-Schur (`physics_pc_sf_suu = "flux"`, `physics_pc_sf_corrector = 0`) on top of `sf_gmg_wpj_ms`: D_v first, then S1 on (ψ, j), then velocity and ρ / T re-solves |
+| `sf_lu_flux_ms` | `sf_gmg_flux_ms` with the pair_psi (S1) and pair_w (D_v) slots by MUMPS LU: the exact-block reference for the flux checks |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
 | `sf_direct` | full-system direct solve: one MUMPS LU of the whole coupled Jacobian (`-jorek_pc_full_lu`, in-core), refactorised every step (`iter_precon = 0`); FGMRES only checks it |
+
+**Flux-Schur arm (`flux`).** `physics_pc_sf_suu = "flux"` (arms
+`sf_gmg_flux_ms`, `sf_lu_flux_ms`) solves the velocity block D_v first, then S1
+on (ψ, j), then re-solves velocity and ρ / T. The pair_psi solver slot solves
+S1 (log label `S1 KSP`), the pair_w slot D_v (`D_v KSP`); `collect.py` reads
+both labels into the `sf_pj_mean` / `sf_w_mean` columns. The T0-T3 checks and
+how to run them: `util/physics_pc_scaling/flux_checks/README.md`. PETSc options
+(see the FLUX_SCHUR header of `solvers/mod_petsc_pc_sf.f90`; add them via
+`ARM_PETSC_OPTS` in `mknml.py`):
+
+| option | meaning |
+|---|---|
+| `-sf_flux_spai_r` | C_w's sparsity pattern = M_w^r (default 2) |
+| `-sf_flux_b16` | `0` drops the B_16 T* term from the flux right-hand side (default on) |
+| `-sf_flux_bend_sign` | sign of the bending term (T0; default 1) |
+| `-sf_flux_bend_form` | `0` B_12^T C_w B_12 (design note, default), `1` B_12 C_w B_12^T (C_w on the velocity space) |
+| `-sf_gmg6_ncol`, `-sf_gmg6_ring_super` | S1's GMG (hierarchy 6): ring colours (`0` auto = radial reach + 1), super-node ring solve (`-1` auto from the reach along a ring, off by default) |
+| `-sf_flux_spai_check` | `1`: check C_w's definiteness at every build |
+| `-sf_flux_dump <dir>` | write the family blocks once, as PETSc binary, for the T0-T3 checks |
 
 **The wpj corrector** (`physics_pc_sf_corrector`, 2026-10-02). Step 3 of the
 sweep needs M⁻¹ U δv. Chacon's Eq. (16) applies the full M⁻¹ (a second pair_psi

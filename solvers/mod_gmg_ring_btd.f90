@@ -4,7 +4,12 @@
 !! (and, with harm_pair 2, all toroidal slots). C1 elements couple a node to
 !! J +- 1 only, so the block is a PERIODIC block-tridiagonal chain of dense
 !! node blocks: D_J = A(J, J), U_J = A(J, J+1), L_J = A(J, J-1), indices mod
-!! nn. Two factorisations of it, both with partial pivoting inside the node
+!! nn. An operator reaching J +- s (s > 1) is handled by the caller: it
+!! groups the ring's nodes into super-nodes of >= s consecutive J
+!! (mod_petsc_pc_gmg btd_mark, ring_super), which are the "nodes" here --
+!! nothing in this module assumes a node is one grid point, only that each
+!! couples to its two neighbours in the periodic chain.
+!! Two factorisations of it, both with partial pivoting inside the node
 !! blocks only (none across nodes):
 !!  - RS_THOMAS: block LU of nodes 0..nn-2 bordered by the last node (the
 !!    periodic coupling becomes a fill column C and row R);

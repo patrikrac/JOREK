@@ -1,10 +1,12 @@
 module construct_pc_matrix_mod
 !----------------------------------------------------------------
 ! Element assembly of the physics PC's operators: the composed force
-! operator W of the SF path (construct_force_operator_matrix).
+! operator W of the SF path (construct_force_operator_matrix) and the
+! R^3 rho0-weighted mass M_w of the flux arm (construct_mass_w_matrix).
 !
 ! Reuses the mesh traversal of construct_matrix_mod but calls the
-! model's pc_elt_matrix_force_fft and inserts into a 1-variable
+! PC element routines (the model's pc_elt_matrix_force_fft, the
+! model-independent pc_elt_mass_w) and inserts into a 1-variable
 ! PETSc BAIJ matrix.
 !
 ! Assumptions:
@@ -18,29 +20,28 @@ use petsc
 implicit none
 private
 public :: construct_force_operator_matrix
+public :: construct_mass_w_matrix
 
 contains
 
 
 
 
+#ifdef USE_PETSC
 !--------------------------------------------------------------------
-!> Zero out the rows of a 1-variable PC matrix that correspond to
-!! constrained boundary DOFs.
-!!
-!! Used for matrices that are ADDED to a B-block which already has BCs
-!! enforced (W, added to B_22). Setting those rows to exactly zero keeps
-!! B's boundary equations untouched; a ZBIG diagonal here would double
-!! B's ZBIG diagonal.
+!> Collect the global rows of a 1-variable PC matrix (block size n_tor)
+!! that correspond to constrained boundary DOFs owned by this rank.
 !!
 !! Constrained DOFs per boundary type (matching the model's boundary_conditions):
 !!   type 1 (open field lines):  i_order ∈ {1, 2}  (value, ds)
 !!   type 2 (wall-aligned):      i_order ∈ {1, 3}  (value, dt)
 !!   type 3 (corner):            i_order ∈ {1, 2, 3}
 !! Toroidal modes flagged by `is_freebound(in, var_index)` are skipped.
+!! Row index of (node index, mode in): n_tor*(index_node-1) + (in-1).
+!! The list may contain duplicates (nodes shared by several local elements).
 !--------------------------------------------------------------------
-subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
-                                   my_ind_min, my_ind_max)
+subroutine collect_bc_rows_pc_matrix(var_index, local_elms, n_local_elms, &
+                                     my_ind_min, my_ind_max, rows_bc, n_rows_bc)
 
   use mod_parameters,   only: n_tor, n_vertex_max, n_order
   use nodes_elements,   only: node_list, element_list
@@ -49,24 +50,19 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
 
   implicit none
 
-#ifdef USE_PETSC
-  Mat, intent(inout) :: pc_mat
-#endif
-  integer, intent(in) :: var_index
-  integer, intent(in) :: local_elms(:)
-  integer, intent(in) :: n_local_elms
-  integer, intent(in) :: my_ind_min, my_ind_max
+  integer,               intent(in)  :: var_index       !< variable whose free-boundary modes are skipped
+  integer,               intent(in)  :: local_elms(:)   !< local element list
+  integer,               intent(in)  :: n_local_elms    !< number of local elements
+  integer,               intent(in)  :: my_ind_min      !< first node index owned by this rank
+  integer,               intent(in)  :: my_ind_max      !< last node index owned by this rank
+  PetscInt, allocatable, intent(out) :: rows_bc(:)      !< the constrained global rows (size >= 1)
+  PetscInt,              intent(out) :: n_rows_bc       !< number of valid entries in rows_bc
 
   integer :: i, in, iv, inode, ielm
   integer :: index_node, index_tmp, kk, ll, iv_dir
   integer :: node_indices((n_order+1)/2, (n_order+1)/2)
   logical :: skip_mode(n_tor)
-
-#ifdef USE_PETSC
-  PetscInt, allocatable :: rows_to_zero(:)
-  PetscInt              :: n_rows_to_zero
-  PetscInt              :: cap
-  PetscErrorCode        :: ierr
+  PetscInt :: cap
 
   call calculate_node_indices(node_indices)
 
@@ -79,8 +75,8 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
   ! each with up to 3 constrained DOFs across n_tor modes.
   cap = n_local_elms * n_vertex_max * 3 * n_tor
   if (cap < 1) cap = 1
-  allocate(rows_to_zero(cap))
-  n_rows_to_zero = 0
+  allocate(rows_bc(cap))
+  n_rows_bc = 0
 
   do i = 1, n_local_elms
     ielm = local_elms(i)
@@ -103,8 +99,8 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
               index_tmp  = node_indices(kk, ll)
               index_node = node_list%node(inode)%index(index_tmp)
               if ((index_node .lt. my_ind_min) .or. (index_node .gt. my_ind_max)) cycle
-              n_rows_to_zero = n_rows_to_zero + 1
-              rows_to_zero(n_rows_to_zero) = n_tor * (index_node - 1) + (in - 1)
+              n_rows_bc = n_rows_bc + 1
+              rows_bc(n_rows_bc) = n_tor * (index_node - 1) + (in - 1)
             enddo
           enddo
         endif
@@ -120,8 +116,8 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
               index_tmp  = node_indices(kk, ll)
               index_node = node_list%node(inode)%index(index_tmp)
               if ((index_node .lt. my_ind_min) .or. (index_node .gt. my_ind_max)) cycle
-              n_rows_to_zero = n_rows_to_zero + 1
-              rows_to_zero(n_rows_to_zero) = n_tor * (index_node - 1) + (in - 1)
+              n_rows_bc = n_rows_bc + 1
+              rows_bc(n_rows_bc) = n_tor * (index_node - 1) + (in - 1)
             enddo
           enddo
         endif
@@ -129,6 +125,41 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
       enddo  ! in
     enddo    ! iv
   enddo      ! i
+
+end subroutine collect_bc_rows_pc_matrix
+#endif
+
+
+
+!--------------------------------------------------------------------
+!> Zero out the rows of a 1-variable PC matrix that correspond to
+!! constrained boundary DOFs (the DOF set of collect_bc_rows_pc_matrix).
+!!
+!! Used for matrices that are ADDED to a B-block which already has BCs
+!! enforced (W, added to B_22). Setting those rows to exactly zero keeps
+!! B's boundary equations untouched; a ZBIG diagonal here would double
+!! B's ZBIG diagonal.
+!--------------------------------------------------------------------
+subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
+                                   my_ind_min, my_ind_max)
+
+  implicit none
+
+#ifdef USE_PETSC
+  Mat, intent(inout) :: pc_mat
+#endif
+  integer, intent(in) :: var_index
+  integer, intent(in) :: local_elms(:)
+  integer, intent(in) :: n_local_elms
+  integer, intent(in) :: my_ind_min, my_ind_max
+
+#ifdef USE_PETSC
+  PetscInt, allocatable :: rows_to_zero(:)
+  PetscInt              :: n_rows_to_zero
+  PetscErrorCode        :: ierr
+
+  call collect_bc_rows_pc_matrix(var_index, local_elms, n_local_elms, &
+                                 my_ind_min, my_ind_max, rows_to_zero, n_rows_to_zero)
 
   ! Collective: every rank must call MatZeroRows even with n=0.
   ! Diag value = 0  →  the rows become identically zero (no diagonal injection).
@@ -415,5 +446,268 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
 #endif
 
 end subroutine construct_force_operator_matrix
+
+
+
+!--------------------------------------------------------------------
+!> Assemble the R^3 rho0-weighted mass M_w of the flux arm.
+!!
+!! One variable, block size n_tor, diagonal in the toroidal slot (see
+!! modelPC/mod_pc_elt_mass_w for the kernel and the n = 0 weight). It needs
+!! no mhd_sim: the nodal values in node_list are the linearisation state.
+!!
+!! Unlike W this matrix is used on its own (as an SPD mass), not added to a
+!! B-block, so:
+!!   - the axis basis transform of construct_matrix is applied to axis
+!!     elements when treat_axis is on (same routine, same condition);
+!!   - the constrained DOFs are imposed as Dirichlet rows AND columns with a
+!!     unit diagonal (MatZeroRowsColumns), unconditionally, i.e. independent of
+!!     eliminate_boundary_dofs. The set is the boundary set of
+!!     collect_bc_rows_pc_matrix (W's set) plus the axis DOFs construct_matrix
+!!     penalises: index 4 with treat_axis (its row/column is identically zero
+!!     after the transform), indices 3 and 4 with fix_axis_nodes. A unit
+!!     diagonal instead of ZBIG: the rows are decoupled, so this only fixes
+!!     the constrained DOFs to zero without spoiling the conditioning.
+!!
+!! var_index selects the variable whose free-boundary modes (is_freebound)
+!! are left unconstrained, as in zero_bc_rows_pc_matrix; default var_u.
+!--------------------------------------------------------------------
+subroutine construct_mass_w_matrix(my_id, local_elms, n_local_elms, a_mat, M_w, var_index)
+
+  use mod_pc_elt_mass_w,  only: pc_elt_mass_w
+  use mod_parameters,     only: n_tor, n_degrees, n_vertex_max, var_u
+  use data_structure,     only: type_SP_MATRIX, type_element, type_node
+  use nodes_elements
+  use phys_module,        only: treat_axis, fix_axis_nodes
+  use mod_axis_treatment, only: transform_basis_for_axis_element
+  use omp_lib
+
+  implicit none
+
+  integer,              intent(in) :: my_id            !< MPI rank
+  integer, pointer,     intent(in) :: local_elms(:)    !< local element list
+  integer,              intent(in) :: n_local_elms     !< number of local elements
+  type(type_SP_MATRIX), intent(in) :: a_mat            !< the system matrix (index ranges)
+#ifdef USE_PETSC
+  Mat,                  intent(inout) :: M_w           !< the mass, created by petsc_create_pc_matrix(.., 1)
+#endif
+  integer, optional,    intent(in) :: var_index        !< variable of the free-boundary mode skip (default var_u)
+
+#define DFV_MW (n_tor*n_vertex_max*n_degrees)
+
+  type(type_element), allocatable :: element_thr(:)
+  type(type_node),    allocatable :: nodes_thr(:,:)
+  integer,            allocatable :: node_out_thr(:,:)
+  real*8,             allocatable :: ELM_thr(:,:,:)
+  real*8,             allocatable :: RHS_thr(:,:)
+  real*8,             allocatable :: buf_thr(:,:)
+
+  integer :: my_ind_min, my_ind_max, var_bc
+  integer :: nthreads, omp_tid
+  integer :: ife, ielm, iv, inode
+  integer :: i, i_order, k, k_order
+  integer :: index_node1, index_node2
+  integer :: j, l, idx_ij, idx_kl
+  integer :: bs1, n_ax_dofs, ia
+  integer :: i_v1(1), i_harm(n_tor), ax_dofs(2)
+#ifdef USE_PETSC
+  PetscErrorCode        :: ierr
+  PetscInt              :: idxm(1), idxn(1)
+  PetscInt, allocatable :: rows_bc(:), rows_dir(:)
+  PetscInt              :: n_rows_bc, n_rows_dir, cap, row, row0, row_end, n_loc_rows
+  logical,  allocatable :: row_seen(:)
+#endif
+
+  my_ind_min = a_mat%index_min(my_id+1)
+  my_ind_max = a_mat%index_max(my_id+1)
+  bs1        = n_tor
+
+  var_bc = var_u
+  if (present(var_index)) var_bc = var_index
+
+  ! the axis transform's variable / harmonic subsets: the one variable, all slots
+  i_v1(1) = 1
+  do i = 1, n_tor
+    i_harm(i) = i
+  enddo
+
+  !$omp parallel
+  !$omp master
+#ifdef _OPENMP
+  nthreads = omp_get_num_threads()
+#else
+  nthreads = 1
+#endif
+  !$omp end master
+  !$omp end parallel
+
+  allocate(element_thr (nthreads))
+  allocate(nodes_thr   (n_vertex_max, nthreads))
+  allocate(node_out_thr(n_vertex_max, nthreads))
+  allocate(ELM_thr     (DFV_MW, DFV_MW, nthreads))
+  allocate(RHS_thr     (DFV_MW, nthreads))
+  allocate(buf_thr     (bs1*bs1, nthreads))
+
+  !$omp parallel &
+  !$omp   default(shared) &
+  !$omp   shared(n_local_elms, local_elms, element_list, node_list, &
+  !$omp          my_ind_min, my_ind_max, bs1, treat_axis, i_v1, i_harm, &
+  !$omp          element_thr, nodes_thr, node_out_thr, ELM_thr, RHS_thr, buf_thr &
+#ifdef USE_PETSC
+  !$omp          , M_w &
+#endif
+  !$omp         ) &
+  !$omp   private(ife, ielm, iv, inode, omp_tid, &
+  !$omp           i, i_order, k, k_order, &
+  !$omp           index_node1, index_node2, &
+  !$omp           j, l, idx_ij, idx_kl &
+#ifdef USE_PETSC
+  !$omp           ,ierr, idxm, idxn &
+#endif
+  !$omp          )
+
+#ifdef _OPENMP
+  omp_tid = 1 + omp_get_thread_num()
+#else
+  omp_tid = 1
+#endif
+
+  !$omp do schedule(runtime)
+  do ife = 1, n_local_elms
+    ielm = local_elms(ife)
+
+    element_thr(omp_tid) = element_list%element(ielm)
+    do iv = 1, n_vertex_max
+      inode = element_thr(omp_tid)%vertex(iv)
+      nodes_thr(iv, omp_tid)    = node_list%node(inode)
+      node_out_thr(iv, omp_tid) = inode
+    enddo
+
+    call pc_elt_mass_w(element_thr(omp_tid), nodes_thr(:,omp_tid), ELM_thr(:,:,omp_tid))
+
+    ! the axis basis transform, exactly as construct_matrix (one variable,
+    ! all n_tor slots); RHS_thr is a dummy the routine requires
+    if (treat_axis .and. (nodes_thr(1,omp_tid)%axis_node .or. nodes_thr(2,omp_tid)%axis_node .or. &
+                          nodes_thr(3,omp_tid)%axis_node .or. nodes_thr(4,omp_tid)%axis_node)) then
+      RHS_thr(:,omp_tid) = 0.d0
+      call transform_basis_for_axis_element(nodes_thr(:,omp_tid), ielm, ELM_thr(:,:,omp_tid), &
+                                            RHS_thr(:,omp_tid), i_v1, 1, i_harm, n_tor)
+    endif
+
+#ifdef USE_PETSC
+    do i = 1, n_vertex_max
+      do i_order = 1, n_degrees
+
+        index_node1 = node_list%node(node_out_thr(i,omp_tid))%index(i_order)
+        if ((index_node1 .lt. my_ind_min) .or. (index_node1 .gt. my_ind_max)) cycle
+        idxm(1) = index_node1 - 1
+
+        do k = 1, n_vertex_max
+          do k_order = 1, n_degrees
+
+            index_node2 = node_list%node(node_out_thr(k,omp_tid))%index(k_order)
+            idxn(1) = index_node2 - 1
+
+            buf_thr(:,omp_tid) = 0.d0
+            do j = 1, bs1
+              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
+              do l = 1, bs1
+                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
+                buf_thr((j-1)*bs1+l, omp_tid) = ELM_thr(idx_ij, idx_kl, omp_tid)
+              enddo
+            enddo
+            !$omp critical
+            PetscCallA(MatSetValuesBlocked(M_w, 1, idxm, 1, idxn, buf_thr(:,omp_tid), ADD_VALUES, ierr))
+            !$omp end critical
+
+          enddo  ! k_order
+        enddo    ! k
+
+      enddo  ! i_order
+    enddo    ! i
+#endif
+
+  enddo  ! ife
+  !$omp end do
+  !$omp end parallel
+
+  deallocate(element_thr, nodes_thr, node_out_thr, ELM_thr, RHS_thr, buf_thr)
+
+#ifdef USE_PETSC
+  PetscCallA(MatAssemblyBegin(M_w, MAT_FINAL_ASSEMBLY, ierr))
+  PetscCallA(MatAssemblyEnd  (M_w, MAT_FINAL_ASSEMBLY, ierr))
+
+  !--- Dirichlet DOFs: the boundary set (W's), unconditionally
+  call collect_bc_rows_pc_matrix(var_bc, local_elms, n_local_elms, &
+                                 a_mat%my_ind_min, a_mat%my_ind_max, rows_bc, n_rows_bc)
+
+  !--- plus the axis DOFs construct_matrix penalises
+  n_ax_dofs = 0
+  if (fix_axis_nodes) then
+    n_ax_dofs  = 2
+    ax_dofs(1) = 3
+    ax_dofs(2) = 4
+  elseif (treat_axis) then
+    n_ax_dofs  = 1
+    ax_dofs(1) = 4
+  endif
+
+  cap = n_rows_bc + n_local_elms * n_vertex_max * n_ax_dofs * n_tor
+  if (cap < 1) cap = 1
+  allocate(rows_dir(cap))
+
+  ! De-duplicated through a mark on the owned rows (nodes are shared by
+  ! several local elements). The rows are owned by construction; a row
+  ! outside the ownership range would still be passed on, just not marked.
+  PetscCallA(MatGetOwnershipRange(M_w, row0, row_end, ierr))
+  n_loc_rows = row_end - row0
+  if (n_loc_rows < 1) n_loc_rows = 1
+  allocate(row_seen(0:n_loc_rows-1))
+  row_seen   = .false.
+  n_rows_dir = 0
+
+  do ia = 1, n_rows_bc
+    row = rows_bc(ia)
+    if ((row >= row0) .and. (row < row_end)) then
+      if (row_seen(row - row0)) cycle
+      row_seen(row - row0) = .true.
+    endif
+    n_rows_dir           = n_rows_dir + 1
+    rows_dir(n_rows_dir) = row
+  enddo
+
+  if (n_ax_dofs > 0) then
+    do ife = 1, n_local_elms
+      ielm = local_elms(ife)
+      do iv = 1, n_vertex_max
+        inode = element_list%element(ielm)%vertex(iv)
+        if (.not. node_list%node(inode)%axis_node) cycle
+        do ia = 1, n_ax_dofs
+          index_node1 = node_list%node(inode)%index(ax_dofs(ia))
+          if ((index_node1 .lt. a_mat%my_ind_min) .or. (index_node1 .gt. a_mat%my_ind_max)) cycle
+          do i = 1, n_tor
+            row = n_tor * (index_node1 - 1) + (i - 1)
+            if ((row >= row0) .and. (row < row_end)) then
+              if (row_seen(row - row0)) cycle
+              row_seen(row - row0) = .true.
+            endif
+            n_rows_dir           = n_rows_dir + 1
+            rows_dir(n_rows_dir) = row
+          enddo
+        enddo
+      enddo
+    enddo
+  endif
+
+  ! Collective: every rank calls it, also with n_rows_dir = 0. Rows and
+  ! columns zeroed, unit diagonal: SPD on the constrained space.
+  PetscCallA(MatZeroRowsColumns(M_w, n_rows_dir, rows_dir, 1.0d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
+
+  deallocate(rows_bc, rows_dir, row_seen)
+#endif
+
+#undef DFV_MW
+
+end subroutine construct_mass_w_matrix
 
 end module construct_pc_matrix_mod

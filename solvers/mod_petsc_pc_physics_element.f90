@@ -67,12 +67,14 @@ contains
   !> Assemble the element-level operators of the physics PC: the composed
   !! force operator W (models/model*/mod_pc_elt_matrix_force_fft.f90). It
   !! needs mhd_sim (the linearisation state), which is why it is assembled
-  !! here and not in the PC build.
+  !! here and not in the PC build. With the flux arm (sf_needs_mass_w) also
+  !! the R^3 rho0 mass M_w (modelPC/mod_pc_elt_mass_w.f90).
   subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
-    use construct_pc_matrix_mod, only: construct_force_operator_matrix
+    use construct_pc_matrix_mod, only: construct_force_operator_matrix, construct_mass_w_matrix
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
-    use mod_petsc_pc_sf_solver, only: sf_force_terms, sf_vpar_w_assembled, sf_vpar_gamma_w, sf_vpar_wvu_full
+    use mod_petsc_pc_sf_solver, only: sf_force_terms, sf_vpar_w_assembled, sf_vpar_gamma_w, sf_vpar_wvu_full, &
+                                      sf_needs_mass_w
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
@@ -126,6 +128,20 @@ contains
                                            mhd_sim, g_ctx%W_force, terms=sf_force_terms())
     endif
     g_ctx%w_force_ready = .true.
+
+    ! the flux arm's R^3 rho0 mass: the same lifecycle as W (created once,
+    ! zeroed before every refill); its Dirichlet rows/columns are imposed by
+    ! MatZeroRowsColumns after every assembly, hence the kept pattern
+    if (sf_needs_mass_w()) then
+      if (g_ctx%M_w_ready) then
+        PetscCallA(MatZeroEntries(g_ctx%M_w, ierr))
+      else
+        call petsc_create_pc_matrix(g_ctx%M_w, a_mat, 1)
+        PetscCallA(MatSetOption(g_ctx%M_w, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
+      endif
+      call construct_mass_w_matrix(my_id, local_elms, n_local_elms, a_mat, g_ctx%M_w)
+      g_ctx%M_w_ready = .true.
+    endif
     call PetscLogEventEnd(pcev_elem_asm, ierr)
 
     if (my_id .eq. 0) then
@@ -134,6 +150,7 @@ contains
       else
         write(*,'(A)') "[Physics PC]   W (composed force operator) assembled"
       endif
+      if (sf_needs_mass_w()) write(*,'(A)') "[Physics PC]   M_w (R^3 rho0 mass, n = 0 weight) assembled"
     endif
   end subroutine petsc_assemble_pc_matrices
 

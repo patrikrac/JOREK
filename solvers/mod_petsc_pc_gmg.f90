@@ -1,6 +1,6 @@
 !> Geometric multigrid on the exact nested C1 coarse space of JOREK's
 !! logically structured polar grid: the GMG backend of the SF preconditioner's
-!! blocks (mod_petsc_pc_sf_solver), up to four independent hierarchies.
+!! blocks (mod_petsc_pc_sf_solver), up to MAX_INST (6) independent hierarchies.
 !!
 !! THE COARSE SPACE. JOREK's cubic element is Bernstein in disguise
 !! (elements/mod_basisfunctions.f90): along an edge the control points are
@@ -45,7 +45,7 @@ module mod_petsc_pc_gmg
 
   public :: gmg_build_prolongations, gmg_setup_operator, gmg_vcycle_apply, gmg_is_ready
   public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5
-  public :: gmg_pc_apply_1, gmg_pc_apply_2
+  public :: gmg_pc_apply_1, gmg_pc_apply_2, gmg_pc_apply_6
   public :: gmg_push, gmg_pop
   public :: gmg_opts_t
 
@@ -70,7 +70,8 @@ module mod_petsc_pc_gmg
     integer :: ring_solver  = -1     !< ring blocks (smoothers 4, 8): 0 LAPACK band / dense LU,
                                      !< 1 periodic block Thomas, 2 Thomas / reduction hybrid
                                      !< threaded across the rank's rings and their segments
-                                     !< (mod_gmg_ring_btd); -1 = 2 with harm_pair 2, else 0
+                                     !< (mod_gmg_ring_btd); -1 = 2 with harm_pair 2, else 1
+                                     !< with ring_super /= 0, else 0
     integer :: ring_segs    = 0      !< hybrid: segments per ring; 0 = ceil(threads / rings)
                                      !< when a rank has fewer rings than threads, else 1
     integer :: ring_btd_min = 0      !< ring blocks with fewer rows keep the LAPACK LU
@@ -96,6 +97,14 @@ module mod_petsc_pc_gmg
                                      !< identity along J; the levels below coarsen both.
                                      !< < 0: as many as bring the median cell aspect
                                      !< r dtheta/dr to SEMI_ASPECT
+    integer :: ncol         = 2      !< smoother 8: colours of the ring sweep, ring I has
+                                     !< colour mod(I, ncol); 2 = the zebra (unchanged path);
+                                     !< <= 0 = auto, (radial reach R of each level) + 1, the
+                                     !< exact block Gauss-Seidel (see MULTI-COLOUR RING SWEEP)
+    integer :: ring_super   = 0      !< ring solver (smoothers 4, 8): ring nodes grouped into
+                                     !< super-nodes of >= s consecutive J so that a ring
+                                     !< coupling to J +- s is block-tridiagonal again;
+                                     !< 0 / 1 = off, s >= 2, -1 = s from each level's reach
   end type gmg_opts_t
 
   integer, parameter :: MAX_LEV   = 8
@@ -183,6 +192,29 @@ module mod_petsc_pc_gmg
     ! over the rank's rows (zp 1-based pointers, zc 0-based local columns).
     integer, allocatable :: bcol(:), zp(:), zc(:)
     real*8, allocatable  :: zv(:)
+    ! MULTI-COLOUR RING SWEEP (smoother 8, gmg_opts_t%ncol /= 2; mcol). The
+    ! zebra's two colours make each colour block Jacobi as soon as the
+    ! operator couples ring I to I +- 2 or further (the flux arm's S1 reaches
+    ! 2 + r rings through its bending term). With ncol colours, ring I has
+    ! colour mod(I, ncol), the radial lines outside keep mod(J, 2), and the
+    ! colours are swept 0, 1, .., ncol-1 forward from a zero guess: a block
+    ! of colour c is solved from x - A(block, colours < c) y, i.e. with the
+    ! residual of every block already updated, the axis block (solved first)
+    ! included. Couplings to later colours meet y = 0 and are not stored, so
+    ! the coupling CSR (zp/zc/zv) holds exactly the entries to EARLIER
+    ! colours; for ncol = 2 that is colour 1 -> colour 0, the zebra's. A ring
+    ! of colour c reaches no other ring of colour c when ncol >= R + 1 (R =
+    ! the level's radial reach, rreach), and the sweep is then exact block
+    ! Gauss-Seidel on the rank's rows; nxc counts the within-colour couplings
+    ! between different blocks that it drops (none then). ncol <= 0 picks
+    ! R + 1 per level. With mcol the boundary ring is a ring block too when
+    ! no interior ring reaches ring_aspect (gmg_build_prolongations).
+    ! Rings cut by a rank boundary stay one block per rank (block Jacobi
+    ! across the cut, as in the zebra). jreach: the largest J distance
+    ! (periodic) of a coupling within a ring outside the axis block; nsup:
+    ! the ring solver's super-node size (ring_super, btd_mark), 1 = off.
+    logical :: mcol = .false.
+    integer :: ncol = 2, rreach = -1, jreach = -1, nsup = 1, nxc = 0
     ! Overlapping line segments (restricted additive Schwarz, Cai & Sarkis,
     ! SISC 21 (1999) 792). The partition is ring-major, so every rank boundary
     ! cuts every radial line; with lovl > 0 each local line segment is
@@ -257,6 +289,8 @@ module mod_petsc_pc_gmg
   integer, save :: rsolv = 0, rbmin = 0, rchk = 0   !< gmg_opts_t%ring_solver / ring_btd_min / ring_check
   integer, save :: rseg = 0                         !< gmg_opts_t%ring_segs
   logical, save :: rsp = .false.                    !< gmg_opts_t%ring_single
+  integer, save :: ncol_o = 2                       !< gmg_opts_t%ncol (smoother 8; 2 = the zebra)
+  integer, save :: rsup = 0                         !< gmg_opts_t%ring_super
   integer, save :: semi_r = 0               !< gmg_opts_t%semi_r, of the hierarchy being built
   integer, save :: axsec = 0                !< axis J-sectors (gmg_opts_t%axis_sectors)
   integer, save :: gcomm = 0, gme = 0       !< communicator and rank of the hierarchy
@@ -278,13 +312,15 @@ module mod_petsc_pc_gmg
   ! the active instance's state in inst(cur_inst) and loads instance k.
   ! PETSc handles are pointers and the arrays move with move_alloc, so a
   ! switch is O(1). Instance 1 = pair_w, 2 = pair_psi, 3 = B_55 (rho),
-  ! 4 = B_66 (T), 5 = v_par (model600 with_vpar). V-cycles of different instances nest only through
+  ! 4 = B_66 (T), 5 = v_par (model600 with_vpar), 6 = the flux arm's S1 (psi, j).
+  ! V-cycles of different instances nest only through
   ! gmg_push / gmg_pop (the schur arm's pair_w shell applying pair_psi).
-  integer, parameter :: MAX_INST = 5
+  integer, parameter :: MAX_INST = 6
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
     integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 0, rovl = 0
     integer :: rsolv = 0, rbmin = 0, rchk = 0, rseg = 0
+    integer :: ncol_o = 2, rsup = 0
     logical :: rsp = .false.
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false.
@@ -356,6 +392,7 @@ contains
       S%ring_is = ring_is; S%axis_k = axis_k
       S%lovl = lovl; S%axsec = axsec; S%hpair = hpair; S%rovl = rovl
       S%rsolv = rsolv; S%rbmin = rbmin; S%rchk = rchk; S%rsp = rsp; S%rseg = rseg
+      S%ncol_o = ncol_o; S%rsup = rsup
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready
       S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm
@@ -374,6 +411,7 @@ contains
       ring_is = S%ring_is; axis_k = S%axis_k
       lovl = S%lovl; axsec = S%axsec; hpair = S%hpair; rovl = S%rovl
       rsolv = S%rsolv; rbmin = S%rbmin; rchk = S%rchk; rsp = S%rsp; rseg = S%rseg
+      ncol_o = S%ncol_o; rsup = S%rsup
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready
       gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm
@@ -412,6 +450,9 @@ contains
     if (allocated(a%zp))   call move_alloc(a%zp,   b%zp)
     if (allocated(a%zc))   call move_alloc(a%zc,   b%zc)
     if (allocated(a%zv))   call move_alloc(a%zv,   b%zv)
+    b%mcol = a%mcol; b%ncol = a%ncol; b%rreach = a%rreach; b%jreach = a%jreach
+    b%nsup = a%nsup; b%nxc = a%nxc
+    a%mcol = .false.; a%ncol = 2; a%rreach = -1; a%jreach = -1; a%nsup = 1; a%nxc = 0
     b%ovl = a%ovl; b%ngh = a%ngh; a%ovl = .false.; a%ngh = 0
     b%isg = a%isg; b%isall = a%isall; b%xg = a%xg; b%sct = a%sct
     b%sg => a%sg; a%sg => null()
@@ -686,8 +727,8 @@ contains
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
   end subroutine gmg_vcycle
 
-  !> PC-shell entry points of the pair_w (1), Shat (2), rho (3), T (4) and
-  !! v_par (5) hierarchies. gmg_vcycle_apply is instance 1's historical name and is kept
+  !> PC-shell entry points of the pair_w (1), Shat (2), rho (3), T (4),
+  !! v_par (5) and S1 (6) hierarchies. gmg_vcycle_apply is instance 1's historical name and is kept
   !! so the research path's PCShellSetApply is unchanged; gmg_pc_apply_1 is the
   !! same callback under the uniform name the production path selects by index.
   subroutine gmg_pc_apply_1(pc, b, x, ierr)
@@ -729,6 +770,15 @@ contains
     ierr = 0
   end subroutine gmg_pc_apply_5
 
+  !> ... and of the flux arm's S1 (6)
+  subroutine gmg_pc_apply_6(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call gmg_vcycle(6, b, x)
+    ierr = 0
+  end subroutine gmg_pc_apply_6
+
   logical function gmg_is_ready()
     gmg_is_ready = p_ready
   end function gmg_is_ready
@@ -768,6 +818,7 @@ contains
     integer :: me, np, mpierr, r, first, ci, cj, dd, own_, ff, mm, lr, nloc
     PetscInt :: rs0, re0, nglob
     PetscErrorCode :: ierr
+    logical :: mc_rings                  !< smoother 8 with the multi-colour ring sweep
 
     ok = .false.
     gcomm = comm; gme = my_id
@@ -777,6 +828,15 @@ contains
     call opt_real("ring_aspect", gopt%ring_aspect)
     semi_r = max(gopt%semi_r, -1)
     call opt_int("semi_r", semi_r)
+    ! as gmg_setup_operator will resolve them (same options): only for the switch ring below
+    block
+      integer :: smo, nco
+      smo = gopt%smoother
+      call opt_int("smoother", smo)
+      nco = gopt%ncol
+      call opt_int("ncol", nco)
+      mc_rings = (smo == 8 .and. nco /= 2)
+    end block
     eps_s = [1, -1, -1, 1]
     eps_t = [1, 1, -1, -1]
 
@@ -1090,6 +1150,11 @@ contains
             ring_is = ii; exit
           endif
         enddo
+        ! multi-colour ring sweep with rings everywhere (no ring reaches
+        ! ring_aspect): the boundary ring is a ring block as well, rather
+        ! than one-node radial lines coloured by J, so that ncol >= R + 1
+        ! leaves no within-colour coupling at the edge either
+        if (mc_rings .and. all(rm(1:n_flux - 2) < gopt%ring_aspect)) ring_is = n_flux
         if (my_id == 0) then
           nshow = min(n_flux - 2, ring_is + 2)
           write(*,'(A,F5.2,A,I0,A)', advance="no") "[Physics PC]   GMG ring medians rdtheta/dr (switch at ", &
@@ -1402,8 +1467,17 @@ contains
     rovl = 0
     if (sm_type == 4) rovl = max(o%ring_overlap, 0)
     if (sm_type == 4) call opt_int("ring_overlap", rovl)
+    ! the multi-colour ring sweep (smoother 8 only) and super-node rings
+    ncol_o = 2
+    if (sm_type == 8) ncol_o = o%ncol
+    if (sm_type == 8) call opt_int("ncol", ncol_o)
+    rsup = 0
+    if (sm_type == 4 .or. sm_type == 8) rsup = o%ring_super
+    if (sm_type == 4 .or. sm_type == 8) call opt_int("ring_super", rsup)
+    if (rsup == 1) rsup = 0
     rsolv = o%ring_solver
     call opt_int("ring_solver", rsolv)
+    if (rsolv < 0 .and. hpair < 2 .and. rsup /= 0) rsolv = RS_THOMAS   ! super-nodes need a ring solver
     if (rsolv < 0) rsolv = merge(RS_HYB, RS_LAPACK, hpair >= 2)
     rseg = max(o%ring_segs, 0)
     call opt_int("ring_segs", rseg)
@@ -1620,7 +1694,7 @@ contains
 
   !> Runtime overrides of the V-cycle shape for scaling experiments:
   !! -sf_gmg_<name>, then -sf_gmg<k>_<name> for hierarchy instance k
-  !! (1 pair_w, 2 pair_psi, 3 rho, 4 T). Absent = v unchanged.
+  !! (1 pair_w, 2 pair_psi, 3 rho, 4 T, 5 v_par, 6 S1). Absent = v unchanged.
   subroutine opt_int(name, v)
     character(len=*), intent(in) :: name
     integer, intent(inout) :: v
@@ -1712,6 +1786,10 @@ contains
     call PetscLogEventRegister("GMG5_Smooth0", cid, gev_smooth0(5), ierr)
     call PetscLogEventRegister("GMG5_SmoothC", cid, gev_smooth(5),  ierr)
     call PetscLogEventRegister("GMG5_Coarse",  cid, gev_coarse(5),  ierr)
+    call PetscLogEventRegister("GMG6_VCycle",  cid, gev_vcycle(6),  ierr)
+    call PetscLogEventRegister("GMG6_Smooth0", cid, gev_smooth0(6), ierr)
+    call PetscLogEventRegister("GMG6_SmoothC", cid, gev_smooth(6),  ierr)
+    call PetscLogEventRegister("GMG6_Coarse",  cid, gev_coarse(6),  ierr)
     call PetscLogEventRegister("GMG_Lines",    cid, gev_lines(1),   ierr)
     call PetscLogEventRegister("GMG_AxSolve",  cid, gev_axsolve(1), ierr)
     call PetscLogEventRegister("GMG2_Lines",   cid, gev_lines(2),   ierr)
@@ -1722,6 +1800,8 @@ contains
     call PetscLogEventRegister("GMG4_AxSolve", cid, gev_axsolve(4), ierr)
     call PetscLogEventRegister("GMG5_Lines",   cid, gev_lines(5),   ierr)
     call PetscLogEventRegister("GMG5_AxSolve", cid, gev_axsolve(5), ierr)
+    call PetscLogEventRegister("GMG6_Lines",   cid, gev_lines(6),   ierr)
+    call PetscLogEventRegister("GMG6_AxSolve", cid, gev_axsolve(6), ierr)
     gev_ready = .true.
   end subroutine gmg_register_events
 
@@ -1923,6 +2003,46 @@ contains
         enddo
       endif
       B%axsparse = (axis_k /= 0)
+      ! the multi-colour ring sweep's colours and the super-node size, from
+      ! the operator's reach (blk_t, MULTI-COLOUR RING SWEEP); the zebra
+      ! (ncol 2) without super-nodes measures nothing and keeps ncol = 2
+      B%mcol = (sm_type == 8 .and. ncol_o /= 2)
+      B%ncol = 2; B%nsup = 1
+      if (B%mcol .or. rsup /= 0) then
+        call blk_reach(g, A, B%rreach, B%jreach)        ! collective on gcomm
+        if (B%mcol) then
+          if (ncol_o > 0) then
+            B%ncol = max(ncol_o, 2)
+          else
+            B%ncol = max(B%rreach + 1, 2)
+          endif
+        endif
+        ! a group smaller than the reach along the ring would break the
+        ! block-tridiagonal chain (dense LU of the whole ring): never below it
+        if (rsup > 1) B%nsup = max(rsup, B%jreach)
+        if (rsup < 0) B%nsup = max(B%jreach, 1)
+        block
+          integer :: ncl
+          ncl = nth0
+          if (g > 0) ncl = glv(g)%nj
+          if (gme == 0) then
+            write(*,'(A,I0,A,I0,A,I0,A,I0)', advance="no") "[Physics PC]   GMG", cur_inst, " level ", g, &
+              ": operator reach radial ", B%rreach, ", along a ring ", B%jreach
+            if (B%mcol) write(*,'(A,I0,A)', advance="no") "; ring sweep in ", B%ncol, " colours"
+            if (B%mcol .and. ncol_o <= 0) write(*,'(A)', advance="no") " (auto: radial reach + 1)"
+            if (B%nsup > 1 .and. rsolv /= RS_LAPACK .and. ncl / B%nsup >= 4) &
+              write(*,'(A,I0,A,I0,A)', advance="no") "; ring super-nodes of >= ", B%nsup, " nodes (", &
+              ncl / B%nsup, " per ring)"
+            if (B%nsup > 1 .and. rsolv /= RS_LAPACK .and. ncl / B%nsup < 4) &
+              write(*,'(A,I0,A)', advance="no") "; ring super-nodes of ", B%nsup, &
+              " nodes: fewer than 4 per ring, not used"
+            if (B%nsup > 1 .and. rsolv == RS_LAPACK) write(*,'(A)', advance="no") &
+              "; ring super-nodes need ring_solver 1 or 2, not used"
+            write(*,*)
+          endif
+          if (rsolv == RS_LAPACK .or. ncl / B%nsup < 4) B%nsup = 1
+        end block
+      endif
       allocate(B%bcol(B%nb))
       B%bcol = 0
       if (sm_type == 7 .or. sm_type == 8) then
@@ -1934,8 +2054,9 @@ contains
             I = glv(g)%rnode(r) / glv(g)%nj; J = mod(glv(g)%rnode(r), glv(g)%nj)
           endif
           if (I /= 0 .and. .not. B%axblk(bb)) B%bcol(bb) = mod(J, 2)
-          ! smoother 8: ring blocks alternate in I (zebra over rings)
-          if (sm_type == 8 .and. I < ring_lim(g) .and. .not. B%axblk(bb)) B%bcol(bb) = mod(I, 2)
+          ! smoother 8: ring blocks alternate in I (zebra over rings), or
+          ! cycle through ncol colours (B%ncol = 2 unless mcol)
+          if (sm_type == 8 .and. I < ring_lim(g) .and. .not. B%axblk(bb)) B%bcol(bb) = mod(I, B%ncol)
         enddo
       endif
       if (B%axsparse) then
@@ -1994,6 +2115,16 @@ contains
         call blk_pattern(B, A, rst, ren)
         call PetscLogEventEnd(gev_blkpat, ierr)
         B%pat_id = int(aid, 8); B%pat_nz = int(nzst, 8)
+        if (B%mcol) then
+          ! the multi-colour sweep's dropped couplings (0 when ncol >= R + 1)
+          block
+            integer :: nx
+            nx = B%nxc
+            call MPI_Allreduce(MPI_IN_PLACE, nx, 1, MPI_INTEGER, MPI_SUM, gcomm, mpierr)
+            if (gme == 0) write(*,'(A,I0,A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, " level ", g, &
+              ": ", nx, " within-colour coupling(s) between blocks dropped by the ", B%ncol, "-colour sweep"
+          end block
+        endif
       else if (B%ovl) then
         call MatCreateSubMatrices(A, one, [B%isg], [B%isall], MAT_REUSE_MATRIX, B%sg, ierr)
       endif
@@ -2100,11 +2231,24 @@ contains
   !! rank's rings of this level are fewer than its threads, else 1. Splitting
   !! rings only pays then: at 16 rings on 12 threads, 3 segments cost 15% in
   !! the ring solves (tok s540, bandwidth-bound) and 1 equals block Thomas.
+  !!
+  !! Super-nodes (ring_super, B%nsup = s > 1): a ring coupling to J +- s is
+  !! block-tridiagonal in the super-nodes of a partition of its nc nodes into
+  !! nns = nc / s runs of consecutive J, each of floor or ceil(nc / nns) >= s
+  !! nodes, so that two nodes at a (periodic) J distance <= s lie in the same
+  !! or in neighbouring runs. (A short last run, nc not divisible by s, would
+  !! not do: a node near its start and one near J = 0 could be <= s apart yet
+  !! two runs away.) qn then holds the super-node and the node blocks of
+  !! mod_gmg_ring_btd are the super-nodes' (all rows of their nodes, in J
+  !! order), so every ring path -- Thomas, hybrid, single precision -- applies
+  !! unchanged. A ring that still couples beyond its neighbouring super-nodes
+  !! falls back to the LAPACK LU in blk_pattern (its warning).
   subroutine btd_mark(g, B)
     integer, intent(in) :: g
     type(blk_t), intent(inout) :: B
     integer :: nc, nall, r, bb, q, I, ns, nthr, n, k
-    integer, allocatable :: key(:), cnt(:,:)
+    integer :: sn, nns, kk, jj
+    integer, allocatable :: key(:), cnt(:,:), sup(:), bsup(:)
     nall = B%nrow + B%ngh
     if (allocated(B%btd)) deallocate(B%btd, B%jac, B%rg, B%qn)
     allocate(B%btd(B%nb), B%jac(B%nb), B%rg(B%nb), B%qn(nall))
@@ -2116,6 +2260,23 @@ contains
       nc = glv(g)%nj
     endif
     if (nc < 4) return
+    ! node J -> super-node sup(J) (identity without super-nodes)
+    sn = max(B%nsup, 1)
+    if (nc / sn < 4) sn = 1
+    allocate(sup(0:nc - 1))
+    if (sn > 1) then
+      nns = nc / sn
+      do kk = 0, nns - 1
+        do jj = (kk * nc) / nns, ((kk + 1) * nc) / nns - 1
+          sup(jj) = kk
+        enddo
+      enddo
+    else
+      nns = nc
+      do jj = 0, nc - 1
+        sup(jj) = jj
+      enddo
+    endif
     allocate(key(nall), cnt(0:nc - 1, B%nb))
     do r = 1, nall
       if (r <= B%nrow) then
@@ -2156,7 +2317,7 @@ contains
       do q = 1, B%sz(bb)
         r = B%rows(B%off(bb) + q)
         B%pos(r + 1) = q
-        B%qn(B%off(bb) + q) = key(r + 1)
+        B%qn(B%off(bb) + q) = sup(key(r + 1))
       enddo
       B%btd(bb) = .true.
     enddo
@@ -2168,9 +2329,21 @@ contains
       ns = 1
       if (n < nthr) ns = (nthr + n - 1) / n
     endif
+    allocate(bsup(0:nns - 1))
     do bb = 1, B%nb
-      if (B%btd(bb)) call btd_plan(B%rg(bb), rsolv, nc, cnt(:, bb), ns)
+      if (.not. B%btd(bb)) cycle
+      if (sn > 1) then
+        ! a super-node's rows: those of its nodes
+        bsup = 0
+        do jj = 0, nc - 1
+          bsup(sup(jj)) = bsup(sup(jj)) + cnt(jj, bb)
+        enddo
+        call btd_plan(B%rg(bb), rsolv, nns, bsup, ns)
+      else
+        call btd_plan(B%rg(bb), rsolv, nc, cnt(:, bb), ns)
+      endif
     enddo
+    deallocate(sup, bsup)
     ! smoother 4 with segmented rings: the hybrid threaded over (block,
     ! segment) work items, one item for every other non-axis block
     if (allocated(B%wk)) deallocate(B%wk, B%lb, B%lk)
@@ -2191,6 +2364,66 @@ contains
       enddo
     endif
   end subroutine btd_mark
+
+  !> Reach of level g's operator A (mesh part of build_blocks, first build):
+  !! rr = max |I_row - I_col|, jr = the largest periodic J distance between
+  !! two nodes of the same ring I > axis block (the axis value couples to
+  !! every J), over the entries of the rank's diagonal part -- the couplings
+  !! the smoother blocks and the zebra CSR can see (off-rank columns are left
+  !! out of both; the line overlap's ghosts sit on radial lines, which do not
+  !! take part in either reach) -- maximised over the ranks. Collective on
+  !! gcomm.
+  subroutine blk_reach(g, A, rr, jr)
+    integer, intent(in)  :: g
+    Mat, intent(in)      :: A
+    integer, intent(out) :: rr   !< radial reach (rings)
+    integer, intent(out) :: jr   !< reach along a ring (nodes)
+    Mat :: Ad, Ao
+    PetscInt, pointer :: garr(:), dia(:), dja(:)
+    PetscInt :: nd, k
+    logical :: has_o
+    integer :: r, c, nc, ilim, Ir, Jr_, Ic, Jc, dj, red(2), mpierr
+
+    if (g == 0) then
+      nc = nth0
+    else
+      nc = glv(g)%nj
+    endif
+    ilim = 0
+    if (axis_k /= 0) ilim = axis_lim(g)
+    rr = 0; jr = 0
+    call aij_parts(A, Ad, Ao, garr, has_o)
+    call get_ij(Ad, .false., nd, dia, dja)
+    do r = 1, int(nd)
+      call node_ij(r, Ir, Jr_)
+      do k = dia(r), dia(r + 1) - 1
+        c = int(dja(k + 1)) + 1
+        call node_ij(c, Ic, Jc)
+        rr = max(rr, abs(Ir - Ic))
+        if (Ir == Ic .and. Ir > ilim) then
+          dj = abs(Jr_ - Jc)
+          jr = max(jr, min(dj, nc - dj))
+        endif
+      enddo
+    enddo
+    call put_ij(Ad, .false., nd, dia, dja)
+    red = [rr, jr]
+    call MPI_Allreduce(MPI_IN_PLACE, red, 2, MPI_INTEGER, MPI_MAX, gcomm, mpierr)
+    rr = red(1); jr = red(2)
+
+  contains
+
+    !> (I, J) of the rank's local row r_ (1-based) on level g
+    subroutine node_ij(r_, I_, J_)
+      integer, intent(in)  :: r_
+      integer, intent(out) :: I_, J_
+      if (g == 0) then
+        I_ = fine_node(r_) / nth0; J_ = mod(fine_node(r_), nth0)
+      else
+        I_ = glv(g)%rnode(r_) / nc; J_ = mod(glv(g)%rnode(r_), nc)
+      endif
+    end subroutine node_ij
+  end subroutine blk_reach
 
   !> hybrid on smoother 4: the segments of all the rank's rings on the
   !! threads, then every ring's separators. One parallel region.
@@ -2377,6 +2610,7 @@ contains
     endif
     nall = B%nrow + B%ngh
     nbad = 0
+    B%nxc = 0
     B%kl = 0; B%ku = 0
     if (allocated(B%zp)) deallocate(B%zp)
     allocate(B%zp(nall + 1))
@@ -2430,14 +2664,25 @@ contains
 
   contains
 
-    !> entry (R, C) with source src: into the zebra CSR, into the block, or nowhere
+    !> entry (R, C) with source src: into the zebra CSR, into the block, or
+    !! nowhere. The CSR takes the couplings to blocks of an EARLIER colour
+    !! (zebra: colour 1 -> 0; mcol: c -> 0..c-1 and -> the axis block, solved
+    !! before the sweep); couplings to later colours meet y = 0 in the
+    !! forward sweep from zero and are not needed
     subroutine visit(C, src, ghost)
       integer, intent(in) :: C, src
       logical, intent(in) :: ghost
       integer :: cb, pr, pc
+      logical :: earlier
       if (C < 0) return                           ! outside the rank's rows and ghosts
       cb = B%bid(C + 1)
-      if ((sm_type == 7 .or. sm_type == 8) .and. B%bcol(bb) == 1 .and. B%bcol(cb) == 0) then
+      earlier = (B%bcol(cb) < B%bcol(bb))         ! ncol 2: bcol(bb) == 1 and bcol(cb) == 0
+      if (B%mcol) then
+        if (B%axblk(cb) .and. .not. B%axblk(bb)) earlier = .true.
+        if (pass == 1 .and. cb /= bb .and. B%bcol(cb) == B%bcol(bb) .and. &
+            .not. (B%axblk(bb) .or. B%axblk(cb))) B%nxc = B%nxc + 1
+      endif
+      if ((sm_type == 7 .or. sm_type == 8) .and. earlier) then
         if (pass == 1) then
           B%zp(R + 2) = B%zp(R + 2) + 1
         else
@@ -3522,6 +3767,8 @@ contains
     !! line pass as smoother 5, plus half a local matvec. With the line overlap
     !! the colour-0 solutions on the ghost rows are kept (yg), and the
     !! extended colour-1 lines couple to them: no second communication.
+    !! Smoother 8 with mcol: B%ncol colours in turn, the same way (blk_t,
+    !! MULTI-COLOUR RING SWEEP); every colour but the last keeps its ghosts.
     subroutine zebra_solve(xx, yy)
       Vec :: xx, yy
       PetscScalar, pointer :: xp(:), yp(:), gp(:)
@@ -3532,7 +3779,9 @@ contains
       ! first, while the ranks are in step (see blk_apply)
       if (B%axsparse) call ax_solve(xx, yy)
       call ghosts_in(xx, gp)
-      do c = 0, 1
+      ! colours 0, 1 (zebra) or 0 .. ncol-1 (smoother 8's multi-colour ring
+      ! sweep, blk_t): colour c from x minus its couplings to colours < c
+      do c = 0, B%ncol - 1
         call PetscLogEventBegin(gev_lines(cur_inst), ie)
         call VecGetArrayRead(xx, xp, ie)
         call VecGetArray(yy, yp, ie)
@@ -3549,7 +3798,7 @@ contains
             else
               blk_t_work(q, t) = gp(r - nr + 1)
             endif
-            ! colour 1: minus the couplings to the colour-0 solution
+            ! colour c > 0: minus the couplings to the earlier colours' solution
             do k = B%zp(r + 1), B%zp(r + 2) - 1
               zc_ = B%zc(k)
               if (zc_ < nr) then
@@ -3564,7 +3813,7 @@ contains
             r = B%rows(B%off(bb) + q)
             if (r < nr) then
               yp(r + 1) = blk_t_work(q, t)
-            else if (c == 0) then
+            else if (c < B%ncol - 1) then             ! ghosts later colours couple to
               B%yg(r - nr + 1) = blk_t_work(q, t)
             endif
           enddo

@@ -74,11 +74,15 @@ def parse_log(path, row):
     row['rt_its_mean'] = means('rho/T')
 
     # the SF path: "[Physics PC]   inner pair_psi KSP (...): mean 2.00 its, ..." per step
-    def sf_means(tag):
-        v = re.findall(r'inner ' + re.escape(tag) + r'[^\n]*?: mean\s+' + RE_FLOAT + r' its', txt)
+    # (flux-Schur arm: the pair_psi slot solves S1, the pair_w slot D_v)
+    def sf_means(*tags):
+        for tag in tags:
+            v = re.findall(r'inner ' + re.escape(tag) + r'[^\n]*?: mean\s+' + RE_FLOAT + r' its', txt)
+            if v:
+                break
         return ' '.join('%.2f' % fnum(x) for x in v)
-    row['sf_pj_mean'] = sf_means('pair_psi')
-    row['sf_w_mean'] = sf_means('pair_w')
+    row['sf_pj_mean'] = sf_means('pair_psi', 'S1 KSP')
+    row['sf_w_mean'] = sf_means('pair_w', 'D_v KSP')
     row['sf_rho_mean'] = sf_means('rho-block')
     row['sf_T_mean'] = sf_means('T-block')
 

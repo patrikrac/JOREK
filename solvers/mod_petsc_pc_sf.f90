@@ -9,7 +9,7 @@ module mod_petsc_pc_sf
        pcev_extract, pcev_convert, pcev_build_suu, pcev_fact_pj, pcev_fact_w, &
        pcev_fact_rhot, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, pcev_apply
   use mod_petsc_pc_blocks, only: create_variable_index_sets, extract_sub_blocks_h, &
-       pack_pair_aij, make_pair_block_scale, make_field_block_scale, &
+       pack_pair_aij, pack_blocks_aij, make_pair_block_scale, make_field_block_scale, &
        split_vars, merge_vars, harm_band
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather, sfg_cross_weights
@@ -17,10 +17,11 @@ module mod_petsc_pc_sf
   use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, sfm_nf
   use mod_petsc_raw_csr, only: blockmv_attach
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
+  use mod_petsc_pc_sf_spai, only: spai_t, spai_build, spai_refill, spai_check
   use mod_petsc_pc_sf_fam, only: fam_op_t, sff_comm, sff_decompose, sff_op_build, &
        sff_op_fill, sff_vec_setup, sff_scatter_in, sff_scatter_out, &
        sff_cross_addmult, sff_cross_scale, sff_copy_local, sff_add_local, sff_lift, &
-       sff_band_rows, sff_index_count
+       sff_band_rows, sff_index_count, sff_fam
   implicit none
   private
 
@@ -112,6 +113,33 @@ module mod_petsc_pc_sf
   !!         -sf_vpar_w bit 2 adds W_uv. Mode split and Eq. (17) only.
   !! Not with the cross-|n| band (physics_pc_sf_harm_couple /= 0).
   !!
+  !! FLUX_SCHUR (physics_pc_sf_suu = "flux")
+  !! ---------------------------------------
+  !! The opposite elimination order (Tang et al., JCP 454 (2022) 110967;
+  !! design note flux_schur_design.md): velocity first, then the flux-side
+  !! Schur surrogate on (psi, j),
+  !!
+  !!   S1 = [[B_11 + (1/varsigma) B_12^T C_w B_12, B_13], [B_31, B_33]],
+  !!
+  !! C_w ~ M_w^-1 the banded SPAI (mod_petsc_pc_sf_spai) of the inertia-weighted
+  !! mass M_w = (v, f)_{R^3 rho0}. The bending term factors through the
+  !! assembled B_12 on both sides, so it inherits ker B_12 (Tang's discrete
+  !! commutation G K_{R^3 rho}^-1 G M^-1 K ~ G M_{R^3 rho}^-1 G). The sweep
+  !! (sf_flux_sweep):
+  !!   1. rho* = B_55^-1 x_rho,  T* = B_66^-1 (x_T - B_65 rho*)
+  !!   2. r_u = x_u - B_25 rho* - B_26 T*
+  !!   3. (u*, w*) = D_v^-1 (r_u, x_w),  D_v = [[B_22 + W_c, B_24], [B_42, B_44]]
+  !!   4. r_psi = x_psi - B_12 u* - B_16 T*  (-sf_flux_b16 0 drops B_16 T*)
+  !!   5. (psi, j) = S1^-1 (r_psi, x_j)
+  !!   6. (u, w) = D_v^-1 (r_u - B_21 psi - B_23 j, x_w)
+  !!   7. rho, T re-solved against the final psi, j, u (as corrector 4)
+  !! slv_pj solves S1 (GMG hierarchy 6, multi-colour ring sweep, -sf_gmg6_*),
+  !! slv_w D_v (hierarchy 1). Mode split, model199, no v_par, no band, no
+  !! -sf_seq. PETSc options: -sf_flux_spai_r (C_w's pattern M_w^r, default
+  !! 2), -sf_flux_b16, -sf_flux_bend_sign and -sf_flux_bend_form (T0),
+  !! -sf_flux_spai_check, -sf_flux_dump <dir> (the family blocks for the
+  !! offline checks of util/physics_pc_scaling/flux_checks, once).
+  !!
   !! CONFIGURATION
   !! -------------
   !! The GMG smoothers, V-cycle shapes, axis rings and boundary drop are fixed
@@ -156,8 +184,8 @@ module mod_petsc_pc_sf
   integer, parameter :: VC71 = 1, VC72 = 2, VC75 = 3, VC76 = 4, VC57 = 5, VC67 = 6
   Mat, save :: a_vc(6)
   !> the W sources of the mode split's operators (fam_op_t wid): W, W_vv,
-  !! W_vu, W_uv
-  integer, parameter :: WS_C = 1, WS_VV = 2, WS_VU = 3, WS_UV = 4, WS_N = 4
+  !! W_vu, W_uv; and the flux arm's R^3 rho0 mass M_w
+  integer, parameter :: WS_C = 1, WS_VV = 2, WS_VU = 3, WS_UV = 4, WS_MW = 5, WS_N = 5
   !> the global path's extracted v_par blocks, and "b0"'s sums with W
   Mat, save :: gB_71 = PETSC_NULL_MAT, gB_72 = PETSC_NULL_MAT, gB_75 = PETSC_NULL_MAT, &
                gB_76 = PETSC_NULL_MAT, gB_77 = PETSC_NULL_MAT, gB_57 = PETSC_NULL_MAT, &
@@ -210,6 +238,24 @@ module mod_petsc_pc_sf
   type(fam_op_t), save :: o_m
   Mat, save :: a_m
   type(mass_cheb_t), save :: mcm
+
+  !--- the flux arm (physics_pc_sf_suu = "flux", FLUX_SCHUR below) ----------
+  !> M_w = (v, f)_{R^3 rho0}, the family's scalar field (element-assembled,
+  !! Dirichlet rows / columns identity); C_w its banded SPAI; G = B_12 with
+  !! fmask = 0 on the Dirichlet rows; f_g = D C_w D, D = diag(fmask); Bb =
+  !! (s / varsigma) D B_12^T f_g B_12 D; bpk Bb in pair_psi's packed (psi, j)
+  !! layout; s1 = P_J + bpk, the operator slv_pj solves on this arm.
+  type(fam_op_t), save :: o_mw, o_w0          !< o_w0: (u, omega) without W, for -sf_flux_dump only
+  type(spai_t), save :: fspai
+  Mat, save :: f_g, f_bb, f_bpk, f_s1
+  Vec, save :: fmask
+  logical, save :: f_ready = .false., f_bpk_ready = .false., f_dumped = .false.
+  integer, save :: f_r = 2                     !< -sf_flux_spai_r: C_w's pattern = M_w^r
+  logical, save :: f_b16 = .true.              !< -sf_flux_b16 0: drop B_16 T* from the flux rhs
+  real*8, save  :: f_sign = 1.0d0              !< -sf_flux_bend_sign: the bending term's sign (T0)
+  logical, save :: f_check = .false.           !< -sf_flux_spai_check 1: C_w's definiteness at every build
+  integer, save :: f_form = 0                  !< -sf_flux_bend_form: 0 B_12^T C_w B_12, 1 B_12 C_w B_12^T
+  character(len=256), save :: f_dump = ""      !< -sf_flux_dump <dir>: write the family blocks once
 
   !--- ... with a cross-|n| band (physics_pc_sf_harm_couple /= 0): each
   !--- operator's cross-family part C (global comm, mod_petsc_pc_sf_fam). The
@@ -287,7 +333,7 @@ contains
     block
       logical :: ok
       call sf_suu_parse(physics_pc_sf_suu, sform, ok)
-      if (.not. ok) call fatal("physics_pc_sf_suu must be schur | w | wj | wpj, got '"// &
+      if (.not. ok) call fatal("physics_pc_sf_suu must be schur | w | wj | wpj | flux, got '"// &
                                trim(physics_pc_sf_suu)//"'")
     end block
     suu   = sform%form
@@ -351,7 +397,42 @@ contains
     banded = famode .and. harm_band /= 0
     if (famode .and. (suu == SF_SUU_SCHUR .or. suu == SF_SUU_WJ)) &
       call fatal("physics_pc_sf_mode_split needs pair_w assembled entry by entry from A and W: "// &
-                 "physics_pc_sf_suu = w | wpj")
+                 "physics_pc_sf_suu = w | wpj | flux")
+
+    !--- the flux arm (FLUX_SCHUR): its own sweep, built on the family
+    !--- operators only; corrector auto (-1) resolves to 0 above
+    if (suu == SF_SUU_FLUX) then
+      if (.not. famode) call fatal("physics_pc_sf_suu = flux needs physics_pc_sf_mode_split = .t.")
+      if (banded) call fatal("physics_pc_sf_suu = flux needs physics_pc_sf_harm_couple = 0")
+      if (jorek_model /= 199) call fatal("physics_pc_sf_suu = flux supports model199 only")
+      if (with_v) call fatal("physics_pc_sf_suu = flux has no v_par stage")
+      block
+        PetscInt  :: iv
+        PetscReal :: rv
+        PetscBool :: set
+        character(len=256) :: sv
+        iv = f_r
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_spai_r", iv, set, ierr)
+        f_r = int(iv)
+        iv = 1
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_b16", iv, set, ierr)
+        f_b16 = (iv /= 0)
+        iv = 0
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_spai_check", iv, set, ierr)
+        f_check = (iv /= 0)
+        iv = f_form
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_bend_form", iv, set, ierr)
+        f_form = int(iv)
+        rv = f_sign
+        call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_bend_sign", rv, set, ierr)
+        f_sign = rv
+        sv = ""
+        call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_dump", sv, set, ierr)
+        if (set) f_dump = sv
+      end block
+      if (f_r < 1) call fatal("-sf_flux_spai_r must be >= 1")
+      if (f_form /= 0 .and. f_form /= 1) call fatal("-sf_flux_bend_form must be 0 or 1")
+    endif
 
     !--- the band's harmonic-coupled Schwarz smoother (-sf_as_*)
     call opt_i("-sf_as_mask", as_mask);   call opt_i("-sf_as_width", as_w)
@@ -410,6 +491,13 @@ contains
       case (SF_SUU_WPJ)
         write(*,'(A,A,A)') "[Physics PC]   S_uu     : ", trim(physics_pc_sf_suu), &
           " (pair_w mixed (u, omega, psi, j): B_22 + W's curvature, psi channel through psi, j)"
+      case (SF_SUU_FLUX)
+        write(*,'(A)') "[Physics PC]   S_uu     : flux (flux-Schur sweep: D_v = [B_22+W_c,B_24;B_42,B_44] first, "// &
+                       "then S1 = P_J + (1/varsigma) B_12^T C_w B_12 on (psi, j), then D_v and rho / T re-solves)"
+        write(*,'(A,I0,A,L1,A,F5.2)') "[Physics PC]   flux     : C_w = SPAI of M_{R^3 rho0} on pattern M_w^", f_r, &
+          ", B_16 T* in the flux rhs ", f_b16, ", bending sign ", f_sign
+        if (len_trim(f_dump) > 0) write(*,'(A,A)') "[Physics PC]   flux     : family blocks dumped once to ", &
+          trim(f_dump)
       end select
       write(*,'(A,A)') "[Physics PC]   pair_psi : ", trim(physics_pc_sf_pair_psi)
       write(*,'(A,A)') "[Physics PC]   pair_w   : ", trim(physics_pc_sf_pair_w)
@@ -452,7 +540,11 @@ contains
       endif
       select case (corr)
       case (0)
-        write(*,'(A)') "[Physics PC]   corrector: Eq. (16), second pair_psi solve"
+        if (suu == SF_SUU_FLUX) then
+          write(*,'(A)') "[Physics PC]   corrector: none (the flux sweep re-solves D_v and rho / T itself)"
+        else
+          write(*,'(A)') "[Physics PC]   corrector: Eq. (16), second pair_psi solve"
+        endif
       case (1)
         write(*,'(A)') "[Physics PC]   corrector: Eq. (17), (psi, j) from pair_w, B_16 T* on its psi row"
       case (2)
@@ -537,7 +629,8 @@ contains
     endif
     ! exact axis extent per block (see SF_GMG_AXIS_RINGS_MIXED_PAIRS)
     ax_pair = SF_GMG_AXIS_RINGS;  ax_rhot = SF_GMG_AXIS_RINGS
-    if (mixed) then
+    ! flux: the production arm's axis extents (not measured on S1 / D_v yet)
+    if (mixed .or. suu == SF_SUU_FLUX) then
       ax_pair = SF_GMG_AXIS_RINGS_MIXED_PAIRS;  ax_rhot = SF_GMG_AXIS_RINGS_MIXED_RHOT
     endif
 
@@ -555,6 +648,7 @@ contains
     if (famode) then
       call family_operators(first)
       comm_s = sff_comm
+      if (suu == SF_SUU_FLUX) call flux_operators(first)
     else
       if (first) then
         call first_build_operators()
@@ -601,11 +695,26 @@ contains
     !--- packed (psi, j) pair, both fields in every smoother block. Set up
     !--- before pair_w, whose schur shell applies it.
     call PetscLogEventBegin(pcev_fact_pj, ierr)
-    call sf_solver_setup(slv_pj, a_pj, bk_pj, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
-                         comm_s, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2, &
-                         smoother=pj_sm, maxits=SF_GMG_MAXITS, &
-                         pre0=SF_PJ_PRE0, post0=pj_post0, nsmooth_c=SF_PJ_NSC, &
-                         line_overlap=pj_ovl, rich_from=pj_rich, axis_rings=ax_pair)
+    if (suu == SF_SUU_FLUX) then
+      ! S1 on its own hierarchy (6): rings everywhere, a harmonic's cos / sin
+      ! together, radial semi-coarsening, and as many ring colours as S1's
+      ! radial reach + 1 (2 + r with C_w's pattern M_w^r), so the sweep is
+      ! exact block Gauss-Seidel (FLUX_SCHUR)
+      call sf_solver_setup(slv_pj, a_pj, bk_pj, "S1 KSP ([B_11+Bb,B_13;B_31,B_33])", &
+                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=SF_GMG_INST_FLUX, nfields=2, &
+                           smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=SF_PJ_PRE0, post0=pj_post0, nsmooth_c=SF_PJ_NSC, &
+                           line_overlap=SF_GMG_LINE_OVERLAP_FLUX, rich_from=pj_rich, axis_rings=ax_pair, &
+                           harm_pair=SF_GMG_HARM_PAIR_FLUX, semi_r=SF_GMG_SEMI_R_MIXED, &
+                           ncol=SF_GMG_NCOL_FLUX, ring_aspect=SF_GMG_RING_ASPECT_FLUX, &
+                           ring_super=SF_GMG_RING_SUPER_FLUX, ring_solver=SF_GMG_RING_SOLVER_FLUX)
+    else
+      call sf_solver_setup(slv_pj, a_pj, bk_pj, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
+                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2, &
+                           smoother=pj_sm, maxits=SF_GMG_MAXITS, &
+                           pre0=SF_PJ_PRE0, post0=pj_post0, nsmooth_c=SF_PJ_NSC, &
+                           line_overlap=pj_ovl, rich_from=pj_rich, axis_rings=ax_pair)
+    endif
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
     !--- pair_w: the scaling balances the operator pair_w SOLVES -- schur on
@@ -651,6 +760,15 @@ contains
     else if (mixed) then
       call sf_solver_setup(slv_w, a_w, bk_w, "pair_w KSP (mixed)", &
                            comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=nf_w, &
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC_MIXED, &
+                           harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
+                           semi_r=SF_GMG_SEMI_R_MIXED, axis_rings=ax_pair)
+    else if (suu == SF_SUU_FLUX) then
+      ! D_v: no parallel stiffness, the collective ring smoother with radial
+      ! semi-coarsening (design note S5.2), as the mixed pair_w
+      call sf_solver_setup(slv_w, a_w, bk_w, "D_v KSP ([B_22+W_c,B_24;B_42,B_44])", &
+                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
                            smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
                            pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC_MIXED, &
                            harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
@@ -770,6 +888,14 @@ contains
       if (g_ctx%w_v_ready) then
         ws(WS_VV) = g_ctx%W_vv; ws(WS_VU) = g_ctx%W_vu; ws(WS_UV) = g_ctx%W_uv
       endif
+      if (suu == SF_SUU_FLUX) then
+        if (.not. g_ctx%M_w_ready) then
+          if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: the flux arm's M_w was never assembled "// &
+            "(petsc_assemble_pc_matrices, sf_needs_mass_w)."
+          call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+        endif
+        ws(WS_MW) = g_ctx%M_w
+      endif
       if (first_) then
         if (.not. g_ctx%w_force_ready) then
           if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: W_force was never assembled "// &
@@ -785,6 +911,10 @@ contains
         call sff_op_build(o_T,   A_full, ws, sf_opz(), my_id)
         if (with_v .and. vstage /= SF_VPAR_B1) call sff_op_build(o_v, A_full, ws, sf_opz(), my_id)
         if (corr == 3) call sff_op_build(o_m, A_full, ws, sf_opz(), my_id)
+        if (suu == SF_SUU_FLUX) then
+          call sff_op_build(o_mw, A_full, ws, sf_opz(), my_id)
+          if (len_trim(f_dump) > 0) call sff_op_build(o_w0, A_full, ws, sf_opz(), my_id)
+        endif
         do k = 1, ncb_on
           call sff_op_build(o_cb(k), A_full, ws, sf_opz(), my_id)
         enddo
@@ -805,6 +935,7 @@ contains
         call sff_op_fill(o_rho, A_full, ws, sf_opz())
         call sff_op_fill(o_T,   A_full, ws, sf_opz())
         if (with_v .and. vstage /= SF_VPAR_B1) call sff_op_fill(o_v, A_full, ws, sf_opz())
+        if (suu == SF_SUU_FLUX) call sff_op_fill(o_mw, A_full, ws, sf_opz())
         do k = 1, ncb_on
           call sff_op_fill(o_cb(k), A_full, ws, sf_opz())
         enddo
@@ -860,6 +991,191 @@ contains
       endif
     end subroutine family_operators
 
+    !> The flux arm's S1 (FLUX_SCHUR), on this rank's family, after the
+    !! family operators: C_w = SPAI(M_w); G = B_12 with M_w's Dirichlet rows
+    !! and columns zeroed (the constrained space C_w acts on); Bb =
+    !! (s / varsigma) G^T C_w G; S1 = P_J + [[Bb, 0], [0, 0]]. The first call
+    !! fixes every pattern (C_w, Bb, S1 = the union with P_J); later calls
+    !! refill in place. a_pj becomes S1: the sweep's slv_pj solves it.
+    subroutine flux_operators(first_)
+      logical, intent(in) :: first_
+      Mat :: blk(2, 2)
+      real*8 :: gmin, lmin, lmax
+      integer :: me_s, mpierr
+      logical, parameter :: have(2, 2) = reshape([.true., .false., .false., .false.], [2, 2])
+
+      call PetscLogEventBegin(pcev_build_suu, ierr)
+      call MPI_Comm_rank(comm_s, me_s, mpierr)
+      !--- the Dirichlet mask (1 free, 0 constrained), from M_w's identity rows
+      if (first_) call MatCreateVecs(o_mw%fam, fmask, PETSC_NULL_VEC, ierr)
+      call flux_dirichlet_mask(o_mw%fam, fmask)
+
+      !--- C_w
+      if (first_) then
+        call spai_build(fspai, o_mw%fam, f_r, ierr)
+      else
+        call spai_refill(fspai, o_mw%fam, ierr)
+      endif
+      if (ierr /= 0) then
+        if (me_s == 0) write(*,'(A,I0)') "[Physics PC]   FATAL: flux: the SPAI of M_w failed, family ", sff_fam
+        call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+      endif
+      if (f_check .or. first_) then
+        call spai_check(fspai, o_mw%fam, gmin, lmin, lmax, ierr)
+        if (ierr /= 0) then
+          if (me_s == 0) write(*,'(A,I0)') "[Physics PC]   FATAL: flux: spai_check failed, family ", sff_fam
+          call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+        endif
+        if (me_s == 0) write(*,'(A,I0,A,ES10.3,A,ES10.3,A,ES10.3)') "[Physics PC]   flux: family ", sff_fam, &
+          " C_w Gershgorin min ", gmin, ", lambda(C_w M_w) in [", lmin, ", ", lmax
+      endif
+
+      !--- Bb = (D G D)^T C_w (D G D) = D (G^T (D C_w D) G) D, D = diag(fmask):
+      !--- G on the constrained space. a_12 itself is left alone (it carries
+      !--- the threaded matvec, which MatDuplicate must not copy), so the mask
+      !--- goes on a copy of C_w (f_g) and on the product. Patterns are fixed
+      !--- by the first product and reused after.
+      if (first_) then
+        call MatDuplicate(fspai%C, MAT_COPY_VALUES, f_g, ierr)
+      else
+        call MatCopy(fspai%C, f_g, SAME_NONZERO_PATTERN, ierr)
+      endif
+      call MatDiagonalScale(f_g, fmask, fmask, ierr)
+      ! -sf_flux_bend_form 1: B_12 C_w B_12^T, C_w on the velocity space as in
+      ! the Schur term B_12 Sigma_u B_23; equal to the default when D B_12 D is
+      ! exactly skew (T0). Differs where psi's and u's Dirichlet sets do
+      ! (free boundary: the mask is u's).
+      if (f_form == 1) then
+        if (first_) then
+          call MatRARt(f_g, a_12, MAT_INITIAL_MATRIX, 2.0d0, f_bb, ierr)
+        else
+          call MatRARt(f_g, a_12, MAT_REUSE_MATRIX, 2.0d0, f_bb, ierr)
+        endif
+      else
+        if (first_) then
+          call MatPtAP(f_g, a_12, MAT_INITIAL_MATRIX, 2.0d0, f_bb, ierr)
+        else
+          call MatPtAP(f_g, a_12, MAT_REUSE_MATRIX, 2.0d0, f_bb, ierr)
+        endif
+      endif
+      call MatDiagonalScale(f_bb, fmask, fmask, ierr)
+      call MatScale(f_bb, f_sign / sf_opz(), ierr)
+
+      !--- into pair_psi's packed (psi, j) layout (field 1 = psi), then S1
+      blk = f_bb
+      call pack_blocks_aij(blk, have, f_bpk, f_bpk_ready, comm_s)
+      if (first_) then
+        call MatDuplicate(o_pj%fam, MAT_COPY_VALUES, f_s1, ierr)
+        call MatSetOption(f_s1, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_FALSE, ierr)
+        call MatAXPY(f_s1, 1.0d0, f_bpk, DIFFERENT_NONZERO_PATTERN, ierr)
+        call MatSetOption(f_s1, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
+      else
+        call MatZeroEntries(f_s1, ierr)
+        call MatAXPY(f_s1, 1.0d0, o_pj%fam, SUBSET_NONZERO_PATTERN, ierr)
+        call MatAXPY(f_s1, 1.0d0, f_bpk, SUBSET_NONZERO_PATTERN, ierr)
+      endif
+      a_pj = f_s1
+      f_ready = .true.
+      call PetscLogEventEnd(pcev_build_suu, ierr)
+
+      !--- -sf_flux_dump: once, before the solver setups scale the pairs
+      if (len_trim(f_dump) > 0 .and. .not. f_dumped) call flux_dump(my_id)
+    end subroutine flux_operators
+
+    !> mask = 0 on the rows of M where M is an identity row (diagonal 1, no
+    !! other nonzero value: the Dirichlet rows the element pass set), 1 else.
+    subroutine flux_dirichlet_mask(M, mask)
+      Mat :: M
+      Vec :: mask
+      PetscInt :: rs, re, i, ncols, q
+      PetscInt, pointer :: cols(:)
+      PetscScalar, pointer :: vals(:)
+      PetscScalar, pointer :: mk(:)
+      real*8 :: d, off
+      call MatGetOwnershipRange(M, rs, re, ierr)
+      call VecGetArray(mask, mk, ierr)
+      do i = rs, re - 1
+        call MatGetRow(M, i, ncols, cols, vals, ierr)
+        d = 0.d0; off = 0.d0
+        do q = 1, ncols
+          if (cols(q) == i) then
+            d = vals(q)
+          else
+            off = off + abs(vals(q))
+          endif
+        enddo
+        call MatRestoreRow(M, i, ncols, cols, vals, ierr)
+        mk(i - rs + 1) = 1.d0
+        if (off == 0.d0 .and. abs(d - 1.d0) < 1.d-12) mk(i - rs + 1) = 0.d0
+      enddo
+      call VecRestoreArray(mask, mk, ierr)
+    end subroutine flux_dirichlet_mask
+
+    !> -sf_flux_dump <dir>: the family blocks of the flux arm as PETSc binary
+    !! files <dir>/fam<f>/<name>.bin, plus meta.txt (family, nslot, nindex,
+    !! varsigma, theta_dt, the Dirichlet rows). Only on families with ONE
+    !! rank, whose packed pairs are then [field 1 | field 2] globally (the
+    !! layout util/physics_pc_scaling/flux_checks reads); others are skipped.
+    subroutine flux_dump(my_id_)
+      use phys_module, only: time_evol_theta, tstep
+      use mod_petsc_pc_harm, only: pc_ntor
+      integer, intent(in) :: my_id_
+      integer :: np_s, me_d, k, u, ios, mpierr
+      PetscInt :: rs, re, i, nloc
+      PetscScalar, pointer :: mk(:)
+      character(len=512) :: dir
+      character(len=4), parameter :: cn(12) = ["B12 ", "B16 ", "B21 ", "B23 ", "B25 ", "B26 ", &
+                                                "B51 ", "B52 ", "B61 ", "B62 ", "B63 ", "B65 "]
+      f_dumped = .true.
+      call MPI_Comm_size(comm_s, np_s, mpierr)
+      call MPI_Comm_rank(comm_s, me_d, mpierr)
+      if (np_s /= 1) then
+        if (me_d == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   flux: WARNING -sf_flux_dump skips family ", &
+          sff_fam, " (", np_s, " ranks; the dump needs one rank per family)"
+        return
+      endif
+      write(dir,'(A,A,I0)') trim(f_dump), "/fam", sff_fam
+      call execute_command_line("mkdir -p '"//trim(dir)//"'", exitstat=ios)
+      call flux_dump_mat(o_mw%fam, dir, "Mw");   call flux_dump_mat(fspai%C, dir, "Cw")
+      call flux_dump_mat(f_bb, dir, "Bb");       call flux_dump_mat(o_pj%fam, dir, "PJ")
+      call flux_dump_mat(f_s1, dir, "S1");       call flux_dump_mat(o_w%fam, dir, "Dv")
+      call flux_dump_mat(o_w0%fam, dir, "Dv0");  call flux_dump_mat(o_rho%fam, dir, "B55")
+      call flux_dump_mat(o_T%fam, dir, "B66")
+      do k = 1, 12
+        call flux_dump_mat(o_cb(k)%fam, dir, trim(cn(k)))
+      enddo
+      call MatGetOwnershipRange(o_mw%fam, rs, re, ierr)
+      nloc = re - rs
+      open(newunit=u, file=trim(dir)//"/meta.txt", action="write", status="replace", iostat=ios)
+      if (ios /= 0) return
+      write(u,'(A,I0)') "family ", sff_fam
+      write(u,'(A,I0)') "nslot ", int(pc_ntor)
+      write(u,'(A,I0)') "nindex ", int(nloc) / max(1, int(pc_ntor))
+      write(u,'(A,ES24.16)') "varsigma ", sf_opz()
+      write(u,'(A,ES24.16)') "theta_dt ", time_evol_theta * tstep
+      write(u,'(A,ES24.16)') "bend_sign ", f_sign
+      write(u,'(A)', advance="no") "dirichlet"
+      call VecGetArray(fmask, mk, ierr)
+      do i = 1, nloc
+        if (mk(i) == 0.d0) write(u,'(A,I0)', advance="no") " ", int(i - 1)
+      enddo
+      call VecRestoreArray(fmask, mk, ierr)
+      write(u,'(A)') ""
+      close(u)
+      write(*,'(A,I0,A,A,A,I0,A)') "[Physics PC]   flux: family ", sff_fam, " dumped to ", trim(dir), &
+        " (global rank ", my_id_, ")"
+    end subroutine flux_dump
+
+    !> flux_dump's writer: A as PETSc binary <dir>/<nm>.bin on comm_s.
+    subroutine flux_dump_mat(A, dir, nm)
+      Mat :: A
+      character(len=*), intent(in) :: dir, nm
+      PetscViewer :: vw
+      call PetscViewerBinaryOpen(comm_s, trim(dir)//"/"//nm//".bin", FILE_MODE_WRITE, vw, ierr)
+      call MatView(A, vw, ierr)
+      call PetscViewerDestroy(vw, ierr)
+    end subroutine flux_dump_mat
+
     !> The family operators' blocks, as the global path packs them: pair_psi
     !! [[B_11, B_13], [B_31, B_33]]; pair_w [[B_22 + W, B_24], [B_42, B_44]]
     !! or, wpj, [[B_22 + W, B_24, B_21, B_23], [B_42, B_44, 0, 0],
@@ -912,6 +1228,13 @@ contains
       endif
       ! tags 1 .. 2 (NDIAG + NCB) are the family and cross parts'
       if (corr == 3) call full_op(o_m, "B_44", 2 * (NDIAG + NCB) + 1, [var_w])
+      ! flux: M_w alone (W source WS_MW, no A part), and for -sf_flux_dump the
+      ! velocity pair without W (the exact D_v of the offline checks)
+      if (suu == SF_SUU_FLUX) then
+        o_mw%label = "M_w (R^3 rho0 mass)"; o_mw%nf = 1; o_mw%tagb = 2 * (NDIAG + NCB) + 2
+        o_mw%se(1, 1) = 0; o_mw%sv(1, 1) = 0; o_mw%wid(1, 1) = WS_MW
+        call full_op(o_w0, "pair_w without W", 2 * (NDIAG + NCB) + 3, [var_u, var_w])
+      endif
       do k = 1, ncb_on
         o_cb(k)%nf = 1; o_cb(k)%tagb = NDIAG + k
         if (k <= 12) then
@@ -1697,6 +2020,8 @@ contains
       call sf_solver_apply(slv, rhs, sol, ierr)
       return
     endif
+    ! the band has solvers for hierarchies 1 .. 4 only (flux and v_par forbid it)
+    if (slv%gmg_inst < 1 .or. slv%gmg_inst > size(bks)) call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     associate (b => bks(slv%gmg_inst))
       t0 = MPI_Wtime()
       if (slv%scaled) call VecPointwiseMult(rhs, rhs, slv%dscale, ierr)
@@ -1798,6 +2123,11 @@ contains
     sweep: block
     if (seq /= 0) then
       call sf_core_sweep(x_psi, x_u, x_j, x_w, x_rho, x_T, y_psi, y_u, y_j, y_w, y_rho, y_T)
+      exit sweep
+    endif
+    ! the flux arm (FLUX_SCHUR): its own order, velocity first
+    if (suu == SF_SUU_FLUX) then
+      call sf_flux_sweep(x_psi, x_u, x_j, x_w, x_rho, x_T, y_psi, y_u, y_j, y_w, y_rho, y_T)
       exit sweep
     endif
 
@@ -2116,6 +2446,97 @@ contains
       call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
     endif
   end subroutine sf_core_sweep
+
+  !--------------------------------------------------------------------
+  !> The flux arm's sweep (FLUX_SCHUR; design note S4): y2 predictor,
+  !! velocity predictor on D_v, the stiff S1 solve on (psi, j), velocity
+  !! re-solve, y2 re-solve. One S1 solve, two D_v, two B_55, two B_66.
+  !! slv_pj holds S1 (a_pj = f_s1), slv_w holds D_v.
+  !--------------------------------------------------------------------
+  subroutine sf_flux_sweep(x_psi, x_u, x_j, x_w, x_rho, x_T, y_psi, y_u, y_j, y_w, y_rho, y_T)
+    Vec :: x_psi, x_u, x_j, x_w, x_rho, x_T
+    Vec :: y_psi, y_u, y_j, y_w, y_rho, y_T
+    PetscErrorCode :: ierr
+
+    !--- 1: y2 predictor  rho* = B_55^-1 x_rho,  T* = B_66^-1 (x_T - B_65 rho*)
+    call VecCopy(x_rho, w4, ierr)
+    call PetscLogEventBegin(pcev_solve_rhot, ierr)
+    call bsolve(slv_rho, w4, t_rho)
+    call PetscLogEventEnd(pcev_solve_rhot, ierr)
+    call VecCopy(x_T, w4, ierr)
+    if (use_b65) then
+      call cmult(a_65, 12, t_rho, w3)
+      call VecAXPY(w4, -1.0d0, w3, ierr)
+    endif
+    call PetscLogEventBegin(pcev_solve_rhot, ierr)
+    call bsolve(slv_T, w4, t_T)
+    call PetscLogEventEnd(pcev_solve_rhot, ierr)
+
+    !--- 2: velocity rhs  r_u = x_u - B_25 rho* - B_26 T*  (w5, kept for 6);
+    !--- the omega row's is x_w (L_2 has only a u row)
+    call VecCopy(x_u, w5, ierr)
+    call cmult(a_25, 5, t_rho, w3)
+    call VecAXPY(w5, -1.0d0, w3, ierr)
+    call cmult(a_26, 6, t_T, w3)
+    call VecAXPY(w5, -1.0d0, w3, ierr)
+
+    !--- 3: velocity predictor  (u*, w*) = D_v^-1 (r_u, x_w)
+    call sf_split_halves(rhs_W, w5, x_w, .true.)
+    call PetscLogEventBegin(pcev_solve_w, ierr)
+    call bsolve(slv_w, rhs_W, sol_W)
+    call PetscLogEventEnd(pcev_solve_w, ierr)
+    call sf_split_halves(sol_W, y_u, y_w, .false.)          ! u*, w* (w* is overwritten in 6)
+
+    !--- 4: flux rhs  r_psi = x_psi - B_12 u* - B_16 T*,  r_j = x_j
+    call cmult(a_12, 1, y_u, w3)
+    call VecWAXPY(w4, -1.0d0, w3, x_psi, ierr)
+    if (f_b16) then
+      call cmult(a_16, 2, t_T, w3)
+      call VecAXPY(w4, -1.0d0, w3, ierr)
+    endif
+
+    !--- 5: THE stiff solve  (psi, j) = S1^-1 (r_psi, x_j)
+    call sf_split_halves(rhs_PJ, w4, x_j, .true.)
+    call PetscLogEventBegin(pcev_solve_pj, ierr)
+    call bsolve(slv_pj, rhs_PJ, sol_PJ)
+    call PetscLogEventEnd(pcev_solve_pj, ierr)
+    call sf_split_halves(sol_PJ, y_psi, y_j, .false.)       ! psi, j: final
+
+    !--- 6: velocity re-solve  (u, w) = D_v^-1 (r_u - B_21 psi - B_23 j, x_w)
+    call cmult(a_21, 3, y_psi, w3)
+    call VecWAXPY(w4, -1.0d0, w3, w5, ierr)
+    call cmult(a_23, 4, y_j, w3)
+    call VecAXPY(w4, -1.0d0, w3, ierr)
+    call sf_split_halves(rhs_W, w4, x_w, .true.)
+    call PetscLogEventBegin(pcev_solve_w, ierr)
+    call bsolve(slv_w, rhs_W, sol_W)
+    call PetscLogEventEnd(pcev_solve_w, ierr)
+    call sf_split_halves(sol_W, y_u, y_w, .false.)          ! u, w: final
+
+    !--- 7: y2 re-solve against the final psi, j, u, as corrections of the
+    !--- predictor: rho = rho* - B_55^-1 (B_51 psi + B_52 u),
+    !--- T = T* - B_66^-1 (B_61 psi + B_63 j + B_62 u - B_65 drho)
+    call cmult(a_51, 7, y_psi, w3)
+    call cmult(a_52, 8, y_u, w4)
+    call VecAXPY(w3, 1.0d0, w4, ierr)
+    call PetscLogEventBegin(pcev_solve_rhot, ierr)
+    call bsolve(slv_rho, w3, w5)
+    call PetscLogEventEnd(pcev_solve_rhot, ierr)
+    call VecWAXPY(y_rho, -1.0d0, w5, t_rho, ierr)
+    call cmult(a_61, 9, y_psi, w3)
+    call cmult(a_63, 11, y_j, w4)
+    call VecAXPY(w3, 1.0d0, w4, ierr)
+    call cmult(a_62, 10, y_u, w4)
+    call VecAXPY(w3, 1.0d0, w4, ierr)
+    if (use_b65) then
+      call cmult(a_65, 12, w5, w4)
+      call VecAXPY(w3, -1.0d0, w4, ierr)
+    endif
+    call PetscLogEventBegin(pcev_solve_rhot, ierr)
+    call bsolve(slv_T, w3, w5)
+    call PetscLogEventEnd(pcev_solve_rhot, ierr)
+    call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
+  end subroutine sf_flux_sweep
 
   !> -sf_vpar_wcheck 1 ("b0", global path, first apply): v_par's W terms
   !! against the discrete Schur terms they stand for, on x (the first v_par

@@ -143,6 +143,11 @@ module mod_petsc_pc_sf_solver
   integer, parameter, public :: SF_SUU_SCHUR = 2
   integer, parameter, public :: SF_SUU_WJ    = 3
   integer, parameter, public :: SF_SUU_WPJ   = 4
+  !> "flux": the flux-Schur arm (Tang 2022 ordering): velocity first, then
+  !! the (psi, j) surrogate S1 = P_J + (1/varsigma) B_12^T C_w B_12, with
+  !! C_w a banded SPAI of the R^3 rho0 mass (mod_petsc_pc_sf_spai), then the
+  !! velocity and rho / T re-solves. Mode split, model199 only.
+  integer, parameter, public :: SF_SUU_FLUX  = 5
 
   !--- v_par (model600 with_vpar, physics_pc_sf_vpar_stage) ------------------
   !> "v0": B_77 solved last, against the final psi, u, rho, T, no feedback.
@@ -264,6 +269,31 @@ module mod_petsc_pc_sf_solver
   !! preconditioner, R6). Ring damping 0.8 on s540 (n_tor 7, all slots per
   !! block): 311 s against 313 s, pair_w 5.17 V-cycles per solve against 5.26.
   real*8,  parameter, public :: SF_GMG_RICH_OMEGA_ZEBRA = 1.0d0, SF_GMG_RICH_OMEGA_ADDITIVE = 0.8d0
+  !--- the flux arm's S1 (SF_SUU_FLUX), GMG hierarchy 6 ----------------------
+  !> S1 = P_J + (1/varsigma) B_12^T C_w B_12, C_w a radius-r banded SPAI
+  !! (-sf_flux_spai_r, default 2), reaches 2 + r rings radially and 2 + r
+  !! nodes along a ring, against 1 for P_J. On pair_psi's hierarchy (Stage 1)
+  !! the zebra over rings leaves each colour block Jacobi (rings I, I +- 2 of
+  !! one colour are coupled) and the radial lines outside I_s miss the long
+  !! ring couplings. Instance 6 instead: ring blocks everywhere (the switch
+  !! aspect never reached; with ncol /= 2 the boundary ring too), swept in
+  !! ncol = (radial reach + 1) colours per level -- exact block Gauss-Seidel
+  !! on each rank's rows (mod_petsc_pc_gmg, MULTI-COLOUR RING SWEEP) --, radial
+  !! semi-coarsening as the mixed pair_w, cos / sin slots in one block. No
+  !! line overlap: there are no radial-line blocks left to extend. UNTUNED
+  !! starting point (-sf_gmg6_* override every gmg_opts_t entry).
+  integer, parameter, public :: SF_GMG_INST_FLUX        = 6
+  integer, parameter, public :: SF_GMG_NCOL_FLUX        = 0        !< auto: reach + 1 per level
+  real*8,  parameter, public :: SF_GMG_RING_ASPECT_FLUX = 1.0d30   !< no ring reaches it: rings everywhere
+  integer, parameter, public :: SF_GMG_HARM_PAIR_FLUX   = 1
+  integer, parameter, public :: SF_GMG_LINE_OVERLAP_FLUX = 0
+  !> The ring blocks of S1 couple to J +- (2 + r): the block-tridiagonal ring
+  !! solvers then need super-nodes (gmg_opts_t%ring_super; -1 = from each
+  !! level's reach, with ring_solver -1 -> block Thomas). OFF until checked
+  !! on a run (-sf_gmg6_ring_super -1 -sf_gmg6_ring_check 1): the ring blocks
+  !! keep the LAPACK band LU (exact as well, more storage at reach 4).
+  integer, parameter, public :: SF_GMG_RING_SUPER_FLUX  = 0
+  integer, parameter, public :: SF_GMG_RING_SOLVER_FLUX = -1       !< gmg_opts_t default
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (30 for the packed pairs, 10 for the scalar transport blocks), so the
@@ -287,7 +317,7 @@ module mod_petsc_pc_sf_solver
   public :: sf_solver_setup, sf_solver_apply
   public :: sf_solver_reset_counters, sf_solver_report
   public :: sf_backend_name, sf_split_halves, sf_split_parts
-  public :: sf_suu_parse, sf_force_terms, sf_opz
+  public :: sf_suu_parse, sf_force_terms, sf_needs_mass_w, sf_opz
   public :: sf_vpar_stage, sf_vpar_wmask, sf_vpar_gamma_w, sf_vpar_w_assembled, sf_vpar_wvu_full
 
 contains
@@ -303,6 +333,7 @@ contains
     case ("w");        f%form = SF_SUU_W
     case ("wj");       f%form = SF_SUU_WJ
     case ("wpj");      f%form = SF_SUU_WPJ
+    case ("flux");     f%form = SF_SUU_FLUX
     case default;      ok = .false.
     end select
   end subroutine sf_suu_parse
@@ -319,7 +350,18 @@ contains
     if (.not. ok) return
     if (f%form == SF_SUU_WJ)  sf_force_terms = 5      ! kink + curvature
     if (f%form == SF_SUU_WPJ) sf_force_terms = 6      ! curvature
+    if (f%form == SF_SUU_FLUX) sf_force_terms = 6     ! curvature (W_c of D_v)
   end function sf_force_terms
+
+  !> .true. when the arm needs the element-assembled R^3 rho0 mass M_w
+  !! (physics_pc_ctx%M_w): the flux arm.
+  logical function sf_needs_mass_w()
+    use phys_module, only: physics_pc_sf_suu
+    type(suu_form_t) :: f
+    logical :: ok
+    call sf_suu_parse(physics_pc_sf_suu, f, ok)
+    sf_needs_mass_w = ok .and. (f%form == SF_SUU_FLUX)
+  end function sf_needs_mass_w
 
   !> physics_pc_sf_vpar_stage -> SF_VPAR_V0 | SF_VPAR_B0; -1 for an unknown string.
   integer function sf_vpar_stage()
@@ -399,16 +441,17 @@ contains
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
                              nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
                              line_overlap, axis_sectors, rich_from, harm_pair, ring_overlap, &
-                             semi_r, axis_rings, rich_omega)
+                             semi_r, axis_rings, rich_omega, ncol, ring_aspect, ring_super, ring_solver)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
-                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
+                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, &
+                                gmg_pc_apply_6, gmg_opts_t
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
     integer, intent(in)          :: backend, comm, my_id
     character(len=*), intent(in) :: label
     real*8, intent(in)           :: rtol
-    integer, intent(in)          :: gmg_inst  !< SF_GMG: hierarchy instance (1..5)
+    integer, intent(in)          :: gmg_inst  !< SF_GMG: hierarchy instance (1..6)
     integer, intent(in)          :: nfields   !< SF_GMG: fields packed per node in
                                               !< A -- 2 for the mixed pairs, 1 for a
                                               !< scalar block
@@ -431,6 +474,11 @@ contains
     integer, intent(in), optional :: axis_rings !< SF_GMG: per-block override of SF_GMG_AXIS_RINGS
     real*8,  intent(in), optional :: rich_omega !< SF_GMG: coarse-level Richardson damping (default:
                                               !< SF_GMG_RICH_OMEGA_ADDITIVE on lines and rings, else _ZEBRA)
+    integer, intent(in), optional :: ncol       !< SF_GMG, smoother 8: ring-sweep colours (gmg_opts_t;
+                                              !< default 2 = the zebra, 0 = reach + 1)
+    real*8,  intent(in), optional :: ring_aspect !< SF_GMG, smoother 8: switch-ring aspect (default 1)
+    integer, intent(in), optional :: ring_super !< SF_GMG: ring super-nodes (gmg_opts_t; default 0 = off)
+    integer, intent(in), optional :: ring_solver !< SF_GMG: ring blocks' solver (gmg_opts_t; default -1)
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -497,6 +545,10 @@ contains
       if (present(semi_r))       o%semi_r       = semi_r
       if (present(axis_rings))   o%axis_rings   = axis_rings
       if (present(rich_omega))   o%rich_omega   = rich_omega
+      if (present(ncol))         o%ncol         = ncol
+      if (present(ring_aspect))  o%ring_aspect  = ring_aspect
+      if (present(ring_super))   o%ring_super   = ring_super
+      if (present(ring_solver))  o%ring_solver  = ring_solver
 
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)
@@ -543,6 +595,7 @@ contains
         case (3); call PCShellSetApply(pc, gmg_pc_apply_3, ierr)
         case (4); call PCShellSetApply(pc, gmg_pc_apply_4, ierr)
         case (5); call PCShellSetApply(pc, gmg_pc_apply_5, ierr)
+        case (6); call PCShellSetApply(pc, gmg_pc_apply_6, ierr)
         end select
         call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       endif
