@@ -153,8 +153,9 @@
 
 ! --- physics PC -------------------------------------------------------
 ! use_physics_pc = .t.: the split-field (SF) preconditioner in its production
-! configuration (the physics_pc_sf_* defaults, models/phys_module.f90). Its
-! mode split needs >= (n_tor+1)/2 MPI ranks; for fewer set
-! physics_pc_sf_mode_split = .f.
+! configuration (the physics_pc_sf_* defaults, models/phys_module.f90): all
+! toroidal harmonics coupled. physics_pc_sf_harm_couple = .f. gives the
+! |n|-diagonal blocks on one rank group per |n| family (mode split, needs
+! >= (n_tor+1)/2 MPI ranks; for fewer also set physics_pc_sf_mode_split = .f.)
  use_physics_pc               = .t.
 /

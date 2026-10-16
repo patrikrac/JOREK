@@ -194,21 +194,22 @@ module mod_petsc_pc_sf_solver
   !! 1.86 -> 2.05, outer its unchanged. 1 step: pair_w 2.7 V-cycles, no faster.
   !! rho / T stay at 4 (2: outer its 50 -> 60).
   integer, parameter, public :: SF_W_NSC_MIXED = 2
-  !> The mixed pair_w ("wj" / "wpj"): its psi - u coupling carries theta dt
-  !! F0/R d_phi, first order, which maps a harmonic's cos slot to its sin slot
-  !! and outgrows the psi mass as dt grows. With one smoother block per slot
-  !! it sits outside every block: 41x32, tstep 1, pair_w stalls at a 1e-4
-  !! reduction after 150 FGMRES its with ANY smoother (zebra lines, rings,
-  !! GMRES coarse levels) and the outer iteration with it; with cos and sin in
-  !! one block it reaches 1e-8 in ~20 and the outer count is the LU's (3).
-  integer, parameter, public :: SF_GMG_HARM_PAIR_MIXED = 1
-  !> ... and the T block: its parallel conduction also couples a harmonic's
-  !! cos and sin slots (d_phi), so the radial lines hold both. 2026-10-05, nt7
-  !! 161x64 tstep 3 saturated, np 16: T V-cycles 4.43 -> 3.43 (global path),
-  !! 4.20 -> 3.37 on the highest-n mode-split family, 5.40 -> 4.15 with all
-  !! harmonics coupled; solve per step -1..-3 %, outer its unchanged. Not on
-  !! rho: one V-cycle already, the bigger blocks only cost (+5-10 %).
-  integer, parameter, public :: SF_GMG_HARM_PAIR_T = 1
+  !> The toroidal slots of every GMG smoother block (gmg_opts_t%harm_pair),
+  !! one value for all hierarchies, set by physics_pc_sf_harm_couple:
+  !! SF_GMG_HARM_ALL with the cross-|n| coupling (every slot of a node in one
+  !! block: a nonlinear or 3D equilibrium couples n to n' at O(1); W7-X 2%,
+  !! pair_w hit its 30-its cap on every solve with cos / sin blocks, 3.7 its
+  !! with all slots), SF_GMG_HARM_PAIR without (a harmonic's cos and sin
+  !! slots in one block). One block per slot is not offered: d_phi terms map
+  !! a harmonic's cos slot to its sin slot. In the mixed pair_w the psi - u
+  !! coupling theta dt F0/R d_phi outgrows the psi mass as dt grows -- 41x32,
+  !! tstep 1, with one block per slot pair_w stalled at a 1e-4 reduction
+  !! after 150 FGMRES its with ANY smoother, with cos and sin in one block it
+  !! reaches 1e-8 in ~20 and the outer count is the LU's (3); in T the
+  !! parallel conduction (2026-10-05, nt7 161x64 tstep 3 saturated: T
+  !! V-cycles 4.43 -> 3.43).
+  integer, parameter, public :: SF_GMG_HARM_PAIR = 1, SF_GMG_HARM_ALL = 2
+  integer, save, public :: sf_gmg_harm = SF_GMG_HARM_ALL
   !> The mixed pair_w's hierarchy coarsens radially only (J kept) until the
   !! median cell aspect r dtheta/dr is 2, then in both directions (-1 = that
   !! count from the grid: 1 level at 41x32, aspect 3.75; 2 at 121x48 and
@@ -398,7 +399,7 @@ contains
   !--------------------------------------------------------------------
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
                              nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
-                             line_overlap, axis_sectors, rich_from, harm_pair, ring_overlap, &
+                             line_overlap, axis_sectors, rich_from, ring_overlap, &
                              semi_r, axis_rings, rich_omega)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
@@ -425,7 +426,6 @@ contains
     integer, intent(in), optional :: line_overlap, axis_sectors, rich_from  !< SF_GMG: per-block
                                               !< overrides of SF_GMG_LINE_OVERLAP, SF_GMG_AXIS_SECTORS,
                                               !< SF_GMG_RICH_FROM
-    integer, intent(in), optional :: harm_pair  !< SF_GMG: 1 = cos/sin slots share the smoother blocks
     integer, intent(in), optional :: ring_overlap !< SF_GMG: ring blocks cut by a rank boundary, extended
     integer, intent(in), optional :: semi_r     !< SF_GMG: radial-only coarse levels (gmg_opts_t)
     integer, intent(in), optional :: axis_rings !< SF_GMG: per-block override of SF_GMG_AXIS_RINGS
@@ -492,7 +492,7 @@ contains
       if (present(line_overlap)) o%line_overlap = line_overlap
       if (present(axis_sectors)) o%axis_sectors = axis_sectors
       if (present(rich_from))    o%rich_from    = rich_from
-      if (present(harm_pair))    o%harm_pair    = harm_pair
+      o%harm_pair    = sf_gmg_harm
       if (present(ring_overlap)) o%ring_overlap = ring_overlap
       if (present(semi_r))       o%semi_r       = semi_r
       if (present(axis_rings))   o%axis_rings   = axis_rings

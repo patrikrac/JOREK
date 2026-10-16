@@ -135,12 +135,12 @@ contains
   !! and |n|-group distance d, r_ev(d) = ||A_ev,d||_F / ||A_ev,0||_F, with
   !! A_ev,d the entries between slots whose groups (m+1)/2 are d apart. The
   !! ratio is per block, so it is free of the equations' units. Rank 0 prints
-  !! the band in use and, per d, the median over the blocks with a same-|n|
+  !! the coupling in use and, per d, the median over the blocks with a same-|n|
   !! part and every block above CW_SHOW, largest first. Collective on comm.
   !--------------------------------------------------------------------
   subroutine sfg_cross_weights(A, comm, my_id)
     use mod_parameters, only: n_tor, n_var
-    use mod_petsc_pc_blocks, only: harm_band
+    use mod_petsc_pc_blocks, only: harm_all
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
     real*8, parameter :: CW_SHOW = 0.1d0       !< blocks listed individually above this
@@ -203,8 +203,8 @@ contains
     call MPI_Allreduce(sl, sg, size(sl), MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
 
     if (my_id == 0) then
-      write(*,'(A,I0,A)') "[Physics PC]   SF: cross-|n| weight ||A_d||/||A_0|| per block (band ", &
-        harm_band, " kept):"
+      write(*,'(A,A,A)') "[Physics PC]   SF: cross-|n| weight ||A_d||/||A_0|| per block (", &
+        trim(merge("all kept ", "none kept", harm_all)), "):"
       allocate(r(n_var * n_var), rs_(n_var * n_var), ie(n_var * n_var), iv(n_var * n_var), &
                ord(n_var * n_var))
       do d = 1, ngrp - 1
@@ -428,10 +428,9 @@ contains
       m = int(mod(sr_, int(n_tor, 8))); q = int(mod(sc_, int(n_tor, 8)))
       arow = (sr_ / n_tor) * bsa + (e - 1) * n_tor + m
       acol = (sc_ / n_tor) * bsa + (v - 1) * n_tor + q
-      ! A contributes only between the slots the extraction's harm_split filter
-      ! keeps (harm_kept: |n| groups at most harm_band apart; band 0 = cos and
-      ! sin of one n). W is NOT filtered, so pair_w's S_uu holds cross-|n|
-      ! entries from W at any band.
+      ! A contributes only between the slots the extraction keeps (harm_kept:
+      ! all with harm_all, else cos and sin of one n). W is NOT filtered, so
+      ! pair_w's S_uu holds W's cross-|n| entries either way.
       mk = 0
       if (harm_kept(m, q)) mk = find_baij(arow, acol, bsa, rs_node(), aia, aja, oia, oja, ga)
       if (t%with_w .and. fr == 1 .and. fc == 1) &

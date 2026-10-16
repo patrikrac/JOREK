@@ -11,7 +11,7 @@ module mod_petsc_pc_sf_fam
   !--------------------------------------------------------------------
   !> The SF path on one |n| family per rank (physics_pc_sf_mode_split).
   !!
-  !! At physics_pc_sf_harm_couple = 0 every SF block is |n|-diagonal, so the
+  !! With physics_pc_sf_harm_couple = .f. every SF block is |n|-diagonal, so the
   !! whole SF sweep falls apart into independent problems, one per |n|
   !! family: the n = 0 slot, then the cos and sin slots of each n. The global
   !! path still solves them together, every block on every rank, one block
@@ -45,18 +45,7 @@ module mod_petsc_pc_sf_fam
   !! computes the final values (A, opz A, or the B_22 + W sum) and sends them
   !! straight into the slice of the owner's value array they belong to.
   !! Entries outside the family (W's cross-|n| part; A's are already
-  !! outside the band) are dropped and counted.
-  !!
-  !! CROSS-|n| BAND (physics_pc_sf_harm_couple k /= 0). Every operator also
-  !! gets its cross-family part C: the entries of my family's rows in the
-  !! columns of the families within the band (|n| groups at most k apart, all
-  !! for k = -1), W's included -- one band for every operator. C lives on the
-  !! global communicator, its columns numbered family-major (family g's
-  !! operator rows start at nf n_idx s0(g), s0(g) its first slot), so its
-  !! local rows are exactly the family operator's and a family vector is its
-  !! local part. It is extracted the same way, in the same pass structure, as
-  !! a second fam_op_t (part = 1). The family part stays what the GMG
-  !! factorizes; the sweep applies D + C (sff_cross_addmult).
+  !! filtered out) are dropped and counted.
   !--------------------------------------------------------------------
 
   !> A family operator extracted directly. Block (a, b) of its nf x nf fields
@@ -68,7 +57,6 @@ module mod_petsc_pc_sf_fam
   type, public :: fam_op_t
     character(len=24) :: label = ""
     integer :: nf = 0, tagb = 0
-    integer :: part = 0                              !< 0: family part (family comm); 1: cross-family (global comm)
     integer :: se(SFF_NFMAX, SFF_NFMAX) = 0, sv(SFF_NFMAX, SFF_NFMAX) = 0, scl(SFF_NFMAX, SFF_NFMAX) = 0
     integer :: wid(SFF_NFMAX, SFF_NFMAX) = 0
     logical :: has_w = .false.                       !< any wid > 0 (set by the build)
@@ -84,9 +72,6 @@ module mod_petsc_pc_sf_fam
     integer(c_int32_t), allocatable :: sa(:), sw(:)  !< +k / -k: A's (W's) diagonal / off-diagonal part
     integer(c_int8_t), allocatable :: ss(:)          !< the W source of sw (wid), 0 = none
     integer(c_int8_t), allocatable :: sc(:)          !< 1: times opz
-    !--- part 1: global-comm work vectors of the matvec (sff_cross_addmult)
-    logical :: vec_ok = .false.
-    Vec     :: xg, yg
   end type fam_op_t
 
   logical, save, public :: sff_on = .false.   !< decomposed and active
@@ -112,8 +97,7 @@ module mod_petsc_pc_sf_fam
   integer, parameter :: TAG_STRIDE = 32
 
   public :: sff_decompose, sff_op_build, sff_op_fill, &
-            sff_vec_setup, sff_scatter_in, sff_scatter_out, sff_banded, sff_cross_addmult, &
-            sff_cross_scale, sff_copy_local, sff_add_local, sff_lift, sff_band_rows, sff_index_count
+            sff_vec_setup, sff_scatter_in, sff_scatter_out
 
 contains
 
@@ -295,10 +279,10 @@ contains
     PetscInt :: nad, nao, nwd, nwo, bsx
     integer :: bsa, nloc_i, me0, pass, f, q, qa, qb, a, b, l, i, ia_, ib_, s, sq, m, qslot, k, u
     integer :: nmsg, ns_f, ent, row, e, v, nq, jq, qj, nu
-    integer :: ig, g, ns_g, nbs, ccomm
+    integer :: ns_g
     integer(8) :: na_d, na_o, nw_d, nw_o, ndrop, nd_glob
-    integer, allocatable :: sl(:), slg(:), cf(:)
-    integer :: cbase, iw0, iw
+    integer, allocatable :: sl(:)
+    integer :: iw0, iw
     integer, allocatable :: uj(:), ka(:), kw(:)          ! one index's block columns: A / W block (+-k, 0)
     integer, allocatable :: srow(:), scol(:), smrow(:), smcol(:)
     integer :: nrow_tot
@@ -356,15 +340,6 @@ contains
       do f = 1, sff_nfam
         sl = fslots(f); ns_f = size(sl)
         if (nloc_i == 0) cycle
-        ! the column families: f itself (part 0), or the others in the band
-        ! (part 1); nbs = the slots of all of them, for the drop count
-        cf = [integer ::]
-        nbs = 0
-        do g = 1, sff_nfam
-          if (.not. sff_banded(f, g)) cycle
-          nbs = nbs + size(fslots(g))
-          if ((op%part == 0) .eqv. (g == f)) cf = [cf, g]
-        enddo
         qa = fowner(f, me0); qb = fowner(f, me0 + nloc_i - 1)
         do q = qa, qb
           ia_ = max(me0, frange(f, q)); ib_ = min(me0 + nloc_i, frange(f, q + 1))
@@ -385,35 +360,31 @@ contains
                 m = sl(s)
                 nrow_tot = nrow_tot + 1
                 row = 0
-                ! entries: column families ascending; inside one, owner
-                ! groups of the block columns in ascending order; inside a
-                ! group b, then index, then slot -- the owner's column order
-                do ig = 1, size(cf)
-                g = cf(ig)
-                slg = fslots(g); ns_g = size(slg)
-                cbase = 0
-                if (op%part == 1) cbase = nf * n_idx * slg(1)
+                ! entries: owner groups of the block columns in ascending
+                ! order; inside a group b, then index, then slot -- the
+                ! owner's column order
+                ns_g = ns_f
                 u = 1
                 do while (u <= nu)
-                  qj = fowner(g, uj(u))
+                  qj = fowner(f, uj(u))
                   k = u
                   do while (k < nu)
-                    if (fowner(g, uj(k + 1)) /= qj) exit
+                    if (fowner(f, uj(k + 1)) /= qj) exit
                     k = k + 1
                   enddo
-                  nq = frange(g, qj + 1) - frange(g, qj)
+                  nq = frange(f, qj + 1) - frange(f, qj)
                   do b = 1, nf
                     e = op%se(a, b); v = op%sv(a, b)
                     do jq = u, k
                       if (.not. ((e > 0 .and. ka(jq) /= 0) .or. &
                                  (op%wid(a, b) > 0 .and. kw(jq) /= 0))) cycle
                       do sq = 1, ns_g
-                        qslot = slg(sq)
+                        qslot = sl(sq)
                         row = row + 1
                         ent = ent + 1
                         if (pass == 2) then
-                          scol(ent) = cbase + nf * frange(g, qj) * ns_g + (b - 1) * nq * ns_g &
-                                      + (uj(jq) - frange(g, qj)) * ns_g + sq - 1
+                          scol(ent) = nf * frange(f, qj) * ns_g + (b - 1) * nq * ns_g &
+                                      + (uj(jq) - frange(f, qj)) * ns_g + sq - 1
                           op%sa(ent) = 0
                           if (e > 0 .and. ka(jq) /= 0) &
                             op%sa(ent) = apos(ka(jq), (e - 1) * n_tor + m, (v - 1) * n_tor + qslot, bsa)
@@ -431,12 +402,11 @@ contains
                   enddo
                   u = k + 1
                 enddo
-                enddo
                 if (pass == 2) srow(nrow_tot) = row
-                ! W's entries of this row outside the band
-                if (pass == 1 .and. any(op%wid(a, 1:nf) > 0) .and. op%part == 0) then
+                ! W's entries of this row outside the family
+                if (pass == 1 .and. any(op%wid(a, 1:nf) > 0)) then
                   do jq = 1, nu
-                    if (kw(jq) /= 0) ndrop = ndrop + (n_tor - nbs)
+                    if (kw(jq) /= 0) ndrop = ndrop + (n_tor - ns_f)
                   enddo
                 endif
               enddo
@@ -460,10 +430,10 @@ contains
     if (op%has_w) then
       call put_ij(Wd, .true., nwd, wia, wja); call put_ij(Wo, .true., nwo, woia, woja)
     endif
-    if (op%has_w .and. op%part == 0) then
+    if (op%has_w) then
       call MPI_Allreduce(ndrop, nd_glob, 1, MPI_INTEGER8, MPI_SUM, gcomm, mpierr)
       if (my_id == 0 .and. nd_glob > 0) write(*,'(A,A,A,I0,A)') "[Physics PC]   SF mode split: ", &
-        trim(op%label), ": ", nd_glob, " W entries outside the cross-|n| band dropped"
+        trim(op%label), ": ", nd_glob, " cross-|n| W entries dropped"
     endif
 
     !--- owner side: my rows of every field come from the source ranks of
@@ -542,12 +512,10 @@ contains
     end block
     deallocate(srow, scol, smrow, smcol, rlen, rrow0, rnrow, reqs)
 
-    !--- the operator, on the family communicator (part 1: the global one)
+    !--- the operator, on the family communicator
     allocate(op%val(max(int(fi(nloc + 1)), 1)))
     op%val = 0.d0
-    ccomm = sff_comm
-    if (op%part == 1) ccomm = gcomm
-    call MatCreateMPIAIJWithArrays(ccomm, int(nloc, kind(fi)), int(nloc, kind(fi)), PETSC_DETERMINE, &
+    call MatCreateMPIAIJWithArrays(sff_comm, int(nloc, kind(fi)), int(nloc, kind(fi)), PETSC_DETERMINE, &
                                    PETSC_DETERMINE, fi, fj, op%val, op%fam, ierr)
     deallocate(fi, fj)
     op%ready = .true.
@@ -725,186 +693,6 @@ contains
     ! the GMG keep their handles); the object state tells MUMPS and the GMG
     call MatUpdateMPIAIJWithArray(op%fam, op%val, ierr)
   end subroutine sff_op_fill
-
-  !> Are families f and g within the cross-|n| band (physics_pc_sf_harm_couple)?
-  !! Family f holds |n| group f - 1.
-  logical function sff_banded(f, g)
-    use mod_petsc_pc_blocks, only: harm_band
-    integer, intent(in) :: f, g
-    sff_banded = (f == g) .or. harm_band < 0 .or. abs(f - g) <= harm_band
-  end function sff_banded
-
-  !--------------------------------------------------------------------
-  !> yf += C xf: the cross-family part of an operator (part 1) on family
-  !! vectors xf, yf (family comm, the operator's local layout). Collective on
-  !! the global communicator: the other families' values come in by C's
-  !! ghost scatter.
-  !--------------------------------------------------------------------
-  subroutine sff_cross_addmult(c, xf, yf)
-    type(fam_op_t), intent(inout) :: c
-    Vec :: xf, yf
-    PetscErrorCode :: ierr
-    if (.not. c%vec_ok) then
-      call MatCreateVecs(c%fam, c%xg, c%yg, ierr)
-      c%vec_ok = .true.
-    endif
-    call sff_copy_local(xf, c%xg)
-    call MatMult(c%fam, c%xg, c%yg, ierr)
-    call sff_add_local(yf, c%yg)
-  end subroutine sff_cross_addmult
-
-  !> C <- S_f C S_g: the block scaling of the family operators (an exact
-  !! similarity, applied to D in place) carried over to the cross part; the
-  !! family vector df holds this rank's S. After every refill.
-  subroutine sff_cross_scale(c, df)
-    type(fam_op_t), intent(inout) :: c
-    Vec :: df
-    PetscErrorCode :: ierr
-    if (.not. c%vec_ok) then
-      call MatCreateVecs(c%fam, c%xg, c%yg, ierr)
-      c%vec_ok = .true.
-    endif
-    call sff_copy_local(df, c%xg)
-    call MatDiagonalScale(c%fam, c%xg, c%xg, ierr)
-  end subroutine sff_cross_scale
-
-  !> Mg = Mf lifted from the family communicator onto the global one: the
-  !! same local rows and columns, every index shifted by the family's offset.
-  !! The families hold contiguous rank blocks in order and a family matrix
-  !! couples its own family only, so a family index i is global index
-  !! i + (my global start - my family start), the starts being the rank's
-  !! ownership in each numbering (rows and columns separately) -- the
-  !! family-major numbering C's columns already use. reuse: Mg exists with
-  !! this pattern; only the values are written. Any AIJ type (one-rank
-  !! families may hold sequential matrices).
-  subroutine sff_lift(Mf, Mg, reuse)
-    Mat, intent(in)     :: Mf
-    Mat, intent(inout)  :: Mg
-    logical, intent(in) :: reuse
-    PetscInt :: m, n, rf0, rf1, cf0, cf1, rg0, cg0, ncol, i, j
-    PetscInt, allocatable :: dnz(:), onz(:), cols(:)
-    PetscInt, pointer :: fc(:)
-    PetscScalar, pointer :: fv(:)
-    integer(8) :: loc(2), st(2)
-    integer :: mpierr
-    PetscErrorCode :: ierr
-    call MatGetLocalSize(Mf, m, n, ierr)
-    call MatGetOwnershipRange(Mf, rf0, rf1, ierr)
-    call MatGetOwnershipRangeColumn(Mf, cf0, cf1, ierr)
-    loc = [int(m, 8), int(n, 8)]; st = 0
-    call MPI_Exscan(loc, st, 2, MPI_INTEGER8, MPI_SUM, gcomm, mpierr)
-    if (gme == 0) st = 0
-    rg0 = int(st(1), kind(rg0)); cg0 = int(st(2), kind(cg0))
-    if (.not. reuse) then
-      allocate(dnz(max(m, 1)), onz(max(m, 1)))
-      dnz = 0; onz = 0
-      do i = 0, m - 1
-        call MatGetRow(Mf, rf0 + i, ncol, fc, PETSC_NULL_SCALAR_POINTER, ierr)
-        do j = 1, ncol
-          if (fc(j) - cf0 >= 0 .and. fc(j) - cf0 < n) then
-            dnz(i + 1) = dnz(i + 1) + 1
-          else
-            onz(i + 1) = onz(i + 1) + 1
-          endif
-        enddo
-        call MatRestoreRow(Mf, rf0 + i, ncol, fc, PETSC_NULL_SCALAR_POINTER, ierr)
-      enddo
-      call MatCreateAIJ(gcomm, m, n, PETSC_DETERMINE, PETSC_DETERMINE, 0, dnz, 0, onz, Mg, ierr)
-      call MatSetOption(Mg, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE, ierr)
-      deallocate(dnz, onz)
-    endif
-    allocate(cols(1))
-    do i = 0, m - 1
-      call MatGetRow(Mf, rf0 + i, ncol, fc, fv, ierr)
-      if (size(cols) < ncol) then
-        deallocate(cols); allocate(cols(ncol))
-      endif
-      cols(1:ncol) = fc(1:ncol) - cf0 + cg0
-      call MatSetValues(Mg, 1, [rg0 + i], ncol, cols, fv, INSERT_VALUES, ierr)
-      call MatRestoreRow(Mf, rf0 + i, ncol, fc, fv, ierr)
-    enddo
-    deallocate(cols)
-    call MatAssemblyBegin(Mg, MAT_FINAL_ASSEMBLY, ierr)
-    call MatAssemblyEnd(Mg, MAT_FINAL_ASSEMBLY, ierr)
-  end subroutine sff_lift
-
-  !> The JOREK indices (A's block rows) the families split.
-  integer function sff_index_count()
-    sff_index_count = n_idx
-  end function sff_index_count
-
-  !> The global band rows (sff_lift's / C's family-major numbering) of the
-  !! JOREK indices idx(:) (0-based, any order): every family, its nf fields
-  !! and every slot. Family f's rank q holds rows (field a, index i, slot m)
-  !! at start(q) + (a nl_q + i - i0_q) ns_f + m, start(q) the global ranks'
-  !! row counts before it (families on contiguous ranks, in order).
-  subroutine sff_band_rows(nf, idx, rows)
-    integer, intent(in) :: nf
-    integer, intent(in) :: idx(:)
-    PetscInt, allocatable, intent(out) :: rows(:)
-    integer(8), allocatable :: base(:)
-    integer :: f, q, r, ns, a, m, j, i, ia, nl, ntot
-    allocate(base(0:gnp))
-    base(0) = 0
-    do f = 1, sff_nfam
-      ns = size(fslots(f))
-      do q = 0, fr0(f + 1) - fr0(f) - 1
-        r = fr0(f) + q
-        base(r + 1) = base(r) + int(nf, 8) * (frange(f, q + 1) - frange(f, q)) * ns
-      enddo
-    enddo
-    ntot = 0
-    do f = 1, sff_nfam
-      ntot = ntot + nf * size(fslots(f)) * size(idx)
-    enddo
-    allocate(rows(ntot))
-    j = 0
-    do f = 1, sff_nfam
-      ns = size(fslots(f))
-      do ia = 1, size(idx)
-        i = idx(ia)
-        if (i < 0 .or. i >= n_idx) call fail("sff_band_rows: index out of range")
-        q = fowner(f, i)
-        r = fr0(f) + q
-        ia_blk: block
-          integer :: i0q
-          i0q = frange(f, q)
-          nl  = frange(f, q + 1) - i0q
-          do a = 0, nf - 1
-            do m = 0, ns - 1
-              j = j + 1
-              rows(j) = int(base(r) + (int(a, 8) * nl + (i - i0q)) * ns + m, kind(rows))
-            enddo
-          enddo
-        end block ia_blk
-      enddo
-    enddo
-  end subroutine sff_band_rows
-
-  !> dst = src on the local entries (vectors on different communicators,
-  !! same local length).
-  subroutine sff_copy_local(src, dst)
-    Vec :: src, dst
-    PetscScalar, pointer :: sa(:), da(:)
-    PetscErrorCode :: ierr
-    call VecGetArrayRead(src, sa, ierr)
-    call VecGetArray(dst, da, ierr)
-    da = sa
-    call VecRestoreArray(dst, da, ierr)
-    call VecRestoreArrayRead(src, sa, ierr)
-  end subroutine sff_copy_local
-
-  !> dst += src on the local entries.
-  subroutine sff_add_local(dst, src)
-    Vec :: dst, src
-    PetscScalar, pointer :: sa(:), da(:)
-    PetscErrorCode :: ierr
-    call VecGetArrayRead(src, sa, ierr)
-    call VecGetArray(dst, da, ierr)
-    da = da + sa
-    call VecRestoreArray(dst, da, ierr)
-    call VecRestoreArrayRead(src, sa, ierr)
-  end subroutine sff_add_local
 
   subroutine fail(msg)
     character(len=*), intent(in) :: msg

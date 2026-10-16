@@ -11,9 +11,9 @@ module mod_petsc_pc_blocks
   !> Leaf primitives shared by the physics preconditioner paths.
   !!
   !! Nothing here decides anything: every routine is a pure operation on
-  !! PETSc objects plus g_ctx%is_var. The block extraction keeps the |n|
-  !! groups at most harm_band apart (harm_kept); mod_petsc_pc_sf sets
-  !! harm_band from physics_pc_sf_harm_couple.
+  !! PETSc objects plus g_ctx%is_var. The block extraction keeps every slot
+  !! pair with harm_all, else only those of one |n| group (harm_kept);
+  !! mod_petsc_pc_sf sets harm_all from physics_pc_sf_harm_couple.
   !--------------------------------------------------------------------
 
   public :: pc_print_block_setup
@@ -22,11 +22,11 @@ module mod_petsc_pc_blocks
   public :: pack_pair_aij, pack_blocks_aij
   public :: make_pair_block_scale, make_field_block_scale
   public :: split_vars, merge_vars
-  public :: harm_band, harm_kept
+  public :: harm_all, harm_kept
 
-  !> Cross-|n| band of the block extraction: 0 = same |n| group only (cos and
-  !! sin of one n together), k > 0 = groups at most k apart, < 0 = all.
-  integer, save :: harm_band = 0
+  !> Cross-|n| coupling of the block extraction: .true. = every slot pair,
+  !! .false. = one |n| group only (cos and sin of one n together).
+  logical, save :: harm_all = .false.
 
 contains
 
@@ -34,7 +34,7 @@ contains
   !! Slot m belongs to |n| group (m+1)/2 (slot 0 = n = 0, then cos/sin pairs).
   pure logical function harm_kept(m, q)
     integer, intent(in) :: m, q
-    harm_kept = (harm_band < 0) .or. (abs((m + 1) / 2 - (q + 1) / 2) <= harm_band)
+    harm_kept = harm_all .or. ((m + 1) / 2 == (q + 1) / 2)
   end function harm_kept
 
   !--------------------------------------------------------------------
@@ -114,8 +114,8 @@ contains
   !> Extract the blocks Mb(k) = A(eqs(k), vrs(k)) of the full system matrix in
   !! ONE pass over A_full's rows: each equation row is read once (MatGetRow on
   !! JOREK's BAIJ matrix expands the whole n_var*n_tor-wide block row) and its
-  !! entries are dispatched to every requested block of that equation. Only
-  !! the entries between |n| groups at most harm_band apart are kept
+  !! entries are dispatched to every requested block of that equation. Every
+  !! entry is kept with harm_all, else only those of one |n| group
   !! (harm_kept; slot m is in group (m+1)/2, cos and sin of one n together).
   !!
   !! The blocks are read straight out of A_full's rows (MatGetRow), so no

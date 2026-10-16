@@ -7,9 +7,11 @@ default PETSc preconditioner. The SF arms run the reference physics case
 `namelist/model199/inxflow_shaped_pcbench`; the `jorek` arms run the committed
 benchmark `namelist/model199/intear_island_demo`, a 2/1 tearing mode.
 
-**The production configuration is `sf_gmg_wpj_ms`**: pair_w mixed (`wpj`)
-with the Eq. (17) corrector, one |n| family per rank group (mode split), and
-every block on its C¹ GMG. These are the namelist defaults: `use_physics_pc =
+**The production configuration is `sf_gmg_wpj_hcall`**: pair_w mixed (`wpj`)
+with the consistent corrector, all toroidal harmonics coupled (in the blocks
+and in the GMG smoother blocks, `physics_pc_sf_harm_couple`), and every block
+on its C¹ GMG. Until 2026-10-15 it was `sf_gmg_wpj_ms` (|n|-diagonal blocks,
+one |n| family per rank group). These are the namelist defaults: `use_physics_pc =
 .t.` alone runs it. Every other `sf_*` arm is a reference.
 
 The research arms of the earlier physics PC (`sfm2_*`, the `physics_pc_gmg_*`,
@@ -71,7 +73,7 @@ submitted again. `results.tsv` is rewritten after every case.
 
 | arm | preconditioner |
 |---|---|
-| `sf_gmg_wpj_ms` | **production**: see "The SF arms" below |
+| `sf_gmg_wpj_hcall` | **production**: see "The SF arms" below |
 | `sf_*` | the SF reference arms, see "The SF arms" below |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
 | `jorek_fresh` | `jorek` with the PC rebuilt at every step (`iter_precon = 0`): separates the loss of the mode coupling from a stale factorisation |
@@ -116,12 +118,13 @@ The GMG arm needs n_flux − 1 divisible by 4 and n_tht divisible by 8 (at least
 faster than the DOF count). Run it on whole nodes (`--mem=0`), or leave it out
 of the large cases.
 
-## The SF arms (`sf_gmg_wpj_ms`, `sf_gmg`, `sf_gmg_w`, `sf_gmg_wpj`, `sf_lu`, `sf_lu_w`, `sf_lu_wpj`, `sf_jorek`, `sf_direct`)
+## The SF arms (`sf_gmg_wpj_hcall`, `sf_gmg_wpj_ms`, `sf_gmg`, `sf_gmg_w`, `sf_gmg_wpj`, `sf_lu`, `sf_lu_w`, `sf_lu_wpj`, `sf_jorek`, `sf_direct`)
 
 Every SF arm sets each `physics_pc_sf_*` flag it depends on (`mknml.py`), so
-an arm means the same whatever the namelist defaults. The arms without `_ms`
-run the global operators (every block on every rank), the `_ms` arms the mode
-split, which needs np >= (n_tor+1)/2.
+an arm means the same whatever the namelist defaults. The arms without
+`_hcall` keep |n|-diagonal blocks; of those, the arms without `_ms` run the
+global operators (every block on every rank), the `_ms` arms the mode split,
+which needs np >= (n_tor+1)/2.
 
 The split-field preconditioner of `mod_petsc_pc_sf*` (workstream H) runs on the
 reference physics case `namelist/model199/inxflow_shaped_pcbench`, not on the
@@ -134,13 +137,14 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 
 | arm | blocks |
 |---|---|
-| `sf_gmg_wpj_ms` | **production**: `sf_gmg_wpj` on one \|n\| family per rank group (`physics_pc_sf_mode_split`) |
+| `sf_gmg_wpj_hcall` | **production**: `sf_gmg_wpj` with all toroidal harmonics coupled |
+| `sf_gmg_wpj_ms` | `sf_gmg_wpj` on one \|n\| family per rank group (`physics_pc_sf_mode_split`) |
 | `sf_gmg` | S_uu = `schur`: every block on its C¹ GMG, pair_psi split (ψ, j) and pair_w on zebra lines, ρ / T on radial lines |
 | `sf_gmg_w` | the same with S_uu = `w`, B₂₂ + W assembled |
 | `sf_gmg_wpj` | the same with pair_w mixed (u, ω, ψ, j), ring smoother |
 | `sf_gmg_wpj_eq16` | `sf_gmg_wpj` with the Eq. (16) corrector (a second pair_psi solve) instead of the default Eq. (17) |
 | `sf_lu` / `sf_lu_w` / `sf_lu_wpj` | every block by MUMPS LU: the exact references, for approximation quality (`sf_lu_wj`: the lumped-mass form; `sf_lugw_wpj`: LU except pair_w) |
-| `sf_gmg_wpj_hc1` / `_hcall`, `sf_lu_wpj_hc1` / `_hcall` | `sf_gmg_wpj` / `sf_lu_wpj` keeping the cross-\|n\| couplings of the \|n\| groups at most 1 apart / all (`physics_pc_sf_harm_couple` = 1 / -1, fixed for the run), with the per-build cross-\|n\| weight report on (`physics_pc_sf_cross_weights`) |
+| `sf_gmg_wpj_hcall`, `sf_lu_wpj_hcall` | `sf_gmg_wpj` / `sf_lu_wpj` keeping all cross-\|n\| couplings (`physics_pc_sf_harm_couple` = .t.: in the blocks and all slots per GMG smoother block, fixed for the run), with the per-build cross-\|n\| weight report on (`physics_pc_sf_cross_weights`) |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
 | `sf_direct` | full-system direct solve: one MUMPS LU of the whole coupled Jacobian (`-jorek_pc_full_lu`, in-core), refactorised every step (`iter_precon = 0`); FGMRES only checks it |
 

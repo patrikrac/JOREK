@@ -10,7 +10,7 @@ module mod_petsc_pc_sf
        pcev_fact_rhot, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, pcev_apply
   use mod_petsc_pc_blocks, only: create_variable_index_sets, extract_sub_blocks_h, &
        pack_pair_aij, make_pair_block_scale, make_field_block_scale, &
-       split_vars, merge_vars, harm_band
+       split_vars, merge_vars, harm_all
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather, sfg_cross_weights
   use mod_petsc_pc_sf_pairw, only: sfw_structure, sfw_numeric, sfw_shell, sfw_dh, sfw_lines
@@ -18,9 +18,7 @@ module mod_petsc_pc_sf
   use mod_petsc_raw_csr, only: blockmv_attach
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
   use mod_petsc_pc_sf_fam, only: fam_op_t, sff_comm, sff_decompose, sff_op_build, &
-       sff_op_fill, sff_vec_setup, sff_scatter_in, sff_scatter_out, &
-       sff_cross_addmult, sff_cross_scale, sff_copy_local, sff_add_local, sff_lift, &
-       sff_band_rows, sff_index_count
+       sff_op_fill, sff_vec_setup, sff_scatter_in, sff_scatter_out
   implicit none
   private
 
@@ -34,12 +32,15 @@ module mod_petsc_pc_sf
   !!   physics_pc_sf_suu        = "wpj"   pair_w mixed (u, omega, psi, j)
   !!   physics_pc_sf_corrector  = -1      auto: the consistent corrector 4
   !!                                      for wpj
-  !!   physics_pc_sf_mode_split = .t.     one |n| family per rank group
   !!   physics_pc_sf_pair_psi / _pair_w / _rho / _T = "gmg"
-  !!   physics_pc_sf_harm_couple = 0      |n|-diagonal blocks
-  !! Everything else -- the S_uu forms schur / w / wj, the global (not mode
-  !! split) operators, the cross-|n| band, the LU backends, the Eq. (16)
-  !! corrector -- is a reference arm, kept for comparison.
+  !!   physics_pc_sf_harm_couple = .t.    cross-|n| coupling kept: in the
+  !!                                      blocks and in the GMG smoother
+  !!                                      blocks (all slots of a node in one
+  !!                                      block), on the global operators
+  !! Everything else -- the S_uu forms schur / w / wj, the |n|-diagonal
+  !! blocks (harm_couple .f., with or without the mode split), the LU
+  !! backends, the Eq. (16) corrector -- is a reference arm, kept for
+  !! comparison.
   !!
   !! THE SWEEP
   !! ---------
@@ -65,9 +66,8 @@ module mod_petsc_pc_sf
   !!     row, or (u, omega, j) with psi eliminated by the node-lumped psi mass.
   !!     Restores the discrete projections and the resistive damping of the
   !!     psi response that W lacks, with every block sparse and every row
-  !!     second order. Its multigrid smooths with flux-surface ring blocks, a
-  !!     harmonic's cos and sin slots in one block (SF_GMG_SMOOTHER_RINGS,
-  !!     SF_GMG_HARM_PAIR_MIXED), and coarsens radially only on its first
+  !!     second order. Its multigrid smooths with flux-surface ring blocks
+  !!     (SF_GMG_SMOOTHER_RINGS), and coarsens radially only on its first
   !!     levels (SF_GMG_SEMI_R_MIXED). With wpj, step 3 reads (psi, j) off
   !!     pair_w's own solution (Eq. (17)) instead of a second pair_psi solve.
   !!   "w": S_uu = B_22 + W, assembled. W is the continuum operator: it lacks
@@ -76,15 +76,22 @@ module mod_petsc_pc_sf
   !!     (mod_petsc_pc_sf_pairw), S_uu u = B_22 u - B_21 psi - B_23 j with
   !!     [psi; j] = pair_psi^-1 [B_12 u; 0]; its multigrid keeps B_22 + W.
   !!
-  !! THE MODE SPLIT
-  !! --------------
-  !! With physics_pc_sf_harm_couple = 0 every block is |n|-diagonal, so each
-  !! |n| family (n = 0, then each cos/sin pair) is solved on its own rank
-  !! group, all families concurrently (mod_petsc_pc_sf_fam). The operators
-  !! are extracted straight from A and W into the family layout; no global
-  !! operator exists. It needs at least one rank per family. A band k /= 0
-  !! keeps cross-|n| couplings: each block solve then becomes FGMRES over all
-  !! families on D + C, the family solvers as block-Jacobi preconditioner.
+  !! HARMONIC COUPLING AND THE MODE SPLIT
+  !! ------------------------------------
+  !! physics_pc_sf_harm_couple is one switch for both places the toroidal
+  !! harmonics meet: the block extraction (harm_kept) and the GMG smoother
+  !! blocks (gmg_opts_t%harm_pair, sf_gmg_harm). .t.: every cross-|n| entry
+  !! is kept and a node's slots all sit in one smoother block, so the
+  !! coupling a nonlinear or 3D equilibrium carries at fine radial scales
+  !! is smoothed where no coarse level resolves it; the ring blocks are
+  !! then solved by the block Thomas / hybrid solvers (mod_gmg_ring_btd).
+  !! .f.: every block is |n|-diagonal and a harmonic's cos and sin slots
+  !! share the smoother blocks (d_phi maps one to the other). Then each |n|
+  !! family (n = 0, then each cos/sin pair) is solved on its own rank group,
+  !! all families concurrently (physics_pc_sf_mode_split,
+  !! mod_petsc_pc_sf_fam). The operators are extracted straight from A and W
+  !! into the family layout; no global operator exists. It needs at least
+  !! one rank per family.
   !!
   !! V_PAR
   !! -----
@@ -110,14 +117,14 @@ module mod_petsc_pc_sf
   !!         right-hand side x_V - B_71 psi* - B_75 rho* - B_76 T*; V read off
   !!         pair_w's solution with (psi_w, j_w), then the correctors as in b0.
   !!         -sf_vpar_w bit 2 adds W_uv. Mode split and Eq. (17) only.
-  !! Not with the cross-|n| band (physics_pc_sf_harm_couple /= 0).
   !!
   !! CONFIGURATION
   !! -------------
   !! The GMG smoothers, V-cycle shapes, axis rings and boundary drop are fixed
   !! in mod_petsc_pc_sf_solver; the GMG receives its whole configuration
   !! explicitly (gmg_opts_t). The namelist picks S_uu, gmg | lu per block, the
-  !! shared inner tolerance, the corrector, the band and the mode split.
+  !! shared inner tolerance, the corrector, the harmonic coupling and the
+  !! mode split.
   !--------------------------------------------------------------------
 
   logical, save :: sf_init_done = .false.
@@ -211,57 +218,6 @@ module mod_petsc_pc_sf
   Mat, save :: a_m
   type(mass_cheb_t), save :: mcm
 
-  !--- ... with a cross-|n| band (physics_pc_sf_harm_couple /= 0): each
-  !--- operator's cross-family part C (global comm, mod_petsc_pc_sf_fam). The
-  !--- sweep's coupling blocks apply D + C; each block solve becomes FGMRES on
-  !--- the global communicator over D + C, preconditioned by the families'
-  !--- own solvers (their V-cycles, all families at once): block Jacobi over
-  !--- the |n| families inside a Krylov method that sees the coupling.
-  logical, save :: banded = .false.
-  type(fam_op_t), save :: x_pj, x_w, x_rho, x_T, x_cb(NCB)
-  type :: band_ksp_t
-    logical :: ready = .false.
-    KSP :: ksp
-    Mat :: op                          !< MATSHELL, D + C
-    Vec :: bx, by                      !< global comm
-    Vec :: fx, fy                      !< family comm, D's layout
-  end type band_ksp_t
-  type(band_ksp_t), save :: bks(4)     !< by GMG instance: 1 pair_w, 2 pair_psi, 3 rho, 4 T (v_par: no band)
-  !--- ... and its harmonic-coupled Schwarz smoother (-sf_as_mask, experimental):
-  !--- the cross-|n| coupling lives at fine radial scales (the resistive
-  !--- layers), which no coarse level resolves, so it is smoothed on the fine
-  !--- level instead -- by restricted additive Schwarz on B = D + C assembled
-  !--- on the global communicator, over subdomains of a few rings (or ring
-  !--- sectors) that hold every family, field, C1 DOF and slot:
-  !---   y = M r;  y += S (r - B y)   [; y += M (r - B y)]
-  !--- Each subdomain is factored exactly (sequential LU, -sf_as<k>_sub_*).
-  !--- Subdomains: -sf_as_width rings, -sf_as_overlap rings each side,
-  !--- -sf_as_sectors poloidal sectors per ring band (overlapped by as many
-  !--- node columns), only in the ring window -sf_as_ring0 .. -sf_as_ring1
-  !--- (rows outside it get no Schwarz correction). -sf_as_order 1: S first;
-  !--- -sf_as_post 1: the second V-cycle step.
-  type :: as_t
-    logical :: on = .false., ready = .false.
-    Mat :: Dg                           !< lifted family operator D
-    Mat :: B                            !< D + C, global comm
-    Vec :: t1, t2                       !< the band's global layout
-    integer :: nb = 0                   !< my subdomains
-    IS, allocatable :: iso(:)           !< their rows (sorted, global band numbering)
-    Mat, pointer :: sub(:) => null()    !< their matrices B(iso, iso)
-    KSP, allocatable :: sk(:)           !< their LU
-    Vec, allocatable :: xi(:), yi(:)    !< their rhs / solution
-    integer, allocatable :: off(:)      !< their offsets in lx / ly
-    Vec :: lx, ly                       !< all my subdomains' rhs / solutions, concatenated
-    VecScatter :: sr, sp                !< gather r(iso); add back the non-overlapping parts
-    integer :: napply = 0
-    real*8  :: t_sum = 0.d0, t_fact = 0.d0
-  end type as_t
-  type(as_t), save :: ass(4)
-  integer, save :: as_mask = 0, as_w = 4, as_o = 1, as_nsec = 1, as_r0 = 0, as_r1 = -1
-  integer, save :: as_order = 0, as_post = 0
-  logical, save :: as_any = .false.
-  logical, save :: as_check = .false.        !< -sf_as_check: test S and the two-level PC on B x
-
   public :: sf_build, sf_apply, sf_report
 
 contains
@@ -309,10 +265,11 @@ contains
                  "with with_TiTe, with_neutrals and with_impurities off")
     if (mod(n_tor, 2) /= 1) call fatal("physics_pc_sf needs n_tor odd (n = 0 plus cos/sin pairs)")
 
-    !--- the cross-|n| band of that filter: one value for the run
-    if (physics_pc_sf_harm_couple < -1) &
-      call fatal("physics_pc_sf_harm_couple must be -1 (all), 0 or a band k > 0")
-    harm_band = physics_pc_sf_harm_couple
+    !--- the cross-|n| coupling, one switch for the run: the extraction keeps
+    !--- every slot pair (harm_kept) and every GMG smoother block holds all
+    !--- of a node's slots, or both stay |n|-diagonal / cos-sin paired
+    harm_all = physics_pc_sf_harm_couple
+    sf_gmg_harm = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
 
     !--- the corrector: Eq. (17) reads (psi, j) off pair_w, so it needs the
     !--- one form that carries both explicitly
@@ -338,36 +295,16 @@ contains
       seq = int(iv)
     end block
     if (seq < 0 .or. seq > 2) call fatal("-sf_seq must be 0, 1 or 2")
-    ! the cross-|n| coupling works on the global path, where every block keeps
-    ! it alike (harm_kept); the mode split's banded solves are not wired in
-    if (seq /= 0 .and. (suu /= SF_SUU_WPJ .or. with_v .or. &
-                        (physics_pc_sf_mode_split .and. harm_band /= 0))) &
-      call fatal("-sf_seq 1 | 2 needs physics_pc_sf_suu = wpj, no v_par, and physics_pc_sf_harm_couple = 0 "// &
-                 "under the mode split")
+    if (seq /= 0 .and. (suu /= SF_SUU_WPJ .or. with_v)) &
+      call fatal("-sf_seq 1 | 2 needs physics_pc_sf_suu = wpj and no v_par")
 
-    !--- one |n| family per rank: only where every block is |n|-diagonal, and
-    !--- only for the assembled pair_w forms (the schur shell is not split)
-    famode = physics_pc_sf_mode_split
-    banded = famode .and. harm_band /= 0
+    !--- one |n| family per rank: only where every block is |n|-diagonal
+    !--- (physics_pc_sf_mode_split is read only then), and only for the
+    !--- assembled pair_w forms (the schur shell is not split)
+    famode = physics_pc_sf_mode_split .and. .not. harm_all
     if (famode .and. (suu == SF_SUU_SCHUR .or. suu == SF_SUU_WJ)) &
       call fatal("physics_pc_sf_mode_split needs pair_w assembled entry by entry from A and W: "// &
                  "physics_pc_sf_suu = w | wpj")
-
-    !--- the band's harmonic-coupled Schwarz smoother (-sf_as_*)
-    call opt_i("-sf_as_mask", as_mask);   call opt_i("-sf_as_width", as_w)
-    call opt_i("-sf_as_overlap", as_o);   call opt_i("-sf_as_sectors", as_nsec)
-    call opt_i("-sf_as_ring0", as_r0);    call opt_i("-sf_as_ring1", as_r1)
-    call opt_i("-sf_as_order", as_order); call opt_i("-sf_as_post", as_post)
-    as_any = (as_mask /= 0)
-    block
-      integer :: ic
-      ic = 0;  call opt_i("-sf_as_check", ic);  as_check = (ic /= 0)
-    end block
-    if (as_any .and. .not. banded) &
-      call fatal("-sf_as_mask (the coupled Schwarz smoother) needs the cross-|n| band: "// &
-                 "physics_pc_sf_mode_split and physics_pc_sf_harm_couple /= 0")
-    if (as_any .and. (as_w < 1 .or. as_o < 0 .or. as_nsec < 1)) &
-      call fatal("-sf_as_width >= 1, -sf_as_overlap >= 0, -sf_as_sectors >= 1")
 
     !--- v_par: its backend, its place in the sweep, and the W terms of "b0"
     if (with_v) then
@@ -375,7 +312,6 @@ contains
       vstage = sf_vpar_stage()
       if (vstage < 0) call fatal("physics_pc_sf_vpar_stage must be v0 | b0 | b1, got '"// &
                                  trim(physics_pc_sf_vpar_stage)//"'")
-      if (banded) call fatal("physics_pc_sf_harm_couple /= 0 has no v_par blocks yet: run with 0")
       ncb_on = 16
       if (vstage /= SF_VPAR_V0) then
         ncb_on = 18
@@ -390,7 +326,8 @@ contains
       ! b1 packs v_par into the mixed pair_w, which only the mode split builds
       ! with v_par, and reads it off pair_w's solution like (psi_w, j_w)
       if (vstage == SF_VPAR_B1) then
-        if (.not. famode) call fatal("physics_pc_sf_vpar_stage = b1 needs physics_pc_sf_mode_split = .t.")
+        if (.not. famode) call fatal("physics_pc_sf_vpar_stage = b1 needs the mode split "// &
+                                     "(physics_pc_sf_harm_couple = .f., physics_pc_sf_mode_split = .t.)")
         if (suu /= SF_SUU_WPJ) call fatal("physics_pc_sf_vpar_stage = b1 needs physics_pc_sf_suu = wpj")
         if (corr /= 1 .and. corr /= 2) &
           call fatal("physics_pc_sf_vpar_stage = b1 needs the Eq. (17) corrector (physics_pc_sf_corrector 1 | 2)")
@@ -416,22 +353,19 @@ contains
       write(*,'(A,A,A,A)') "[Physics PC]   rho / T  : ", trim(physics_pc_sf_rho), " / ", &
                            trim(physics_pc_sf_T)
       write(*,'(A,ES9.2)') "[Physics PC]   inner rtol: ", physics_pc_sf_rtol
-      select case (harm_band)
-      case (-1)
-        write(*,'(A)') "[Physics PC]   cross-|n|: all kept (physics_pc_sf_harm_couple = -1)"
-      case (0)
-        write(*,'(A)') "[Physics PC]   cross-|n|: none, |n|-diagonal blocks (physics_pc_sf_harm_couple = 0)"
-      case default
-        write(*,'(A,I0,A)') "[Physics PC]   cross-|n|: |n| groups at most ", harm_band, &
-          " apart kept (physics_pc_sf_harm_couple)"
-      end select
-      if (famode) write(*,'(A)') "[Physics PC]   layout   : one |n| family per rank, families concurrent "// &
-                                 "(physics_pc_sf_mode_split)"
-      if (banded) write(*,'(A)') "[Physics PC]   band     : block solves = FGMRES over all families on "// &
-                                 "D + C (W too), the family solvers as block-Jacobi preconditioner"
-      if (as_any) write(*,'(A,7(I0,A))') "[Physics PC]   band     : + harmonic-coupled Schwarz smoother, "// &
-        "block mask ", as_mask, ", ", as_w, " rings + ", as_o, " overlap, ", as_nsec, " sector(s), rings ", &
-        as_r0, "..", as_r1, " (-1 = last), order ", as_order, ", post ", as_post, " (-sf_as_*)"
+      if (harm_all) then
+        write(*,'(A)') "[Physics PC]   cross-|n|: all kept, all slots per GMG smoother block "// &
+                       "(physics_pc_sf_harm_couple = .t.)"
+      else
+        write(*,'(A)') "[Physics PC]   cross-|n|: none, |n|-diagonal blocks, cos / sin per GMG smoother block "// &
+                       "(physics_pc_sf_harm_couple = .f.)"
+      endif
+      if (famode) then
+        write(*,'(A)') "[Physics PC]   layout   : one |n| family per rank, families concurrent "// &
+                       "(physics_pc_sf_mode_split)"
+      else
+        write(*,'(A)') "[Physics PC]   layout   : global operators, every block on every rank"
+      endif
       if (with_v) then
         write(*,'(A,A)') "[Physics PC]   v_par    : ", trim(physics_pc_sf_vpar)
         if (vstage == SF_VPAR_V0) then
@@ -477,16 +411,6 @@ contains
     sf_init_done = .true.
 
   contains
-
-    subroutine opt_i(nm, v)
-      character(len=*), intent(in) :: nm
-      integer, intent(inout) :: v
-      PetscInt :: iv
-      PetscBool :: set
-      iv = v
-      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, nm, iv, set, ierr)
-      v = int(iv)
-    end subroutine opt_i
 
     integer function backend_of(s, nm)
       character(len=*), intent(in) :: s, nm
@@ -595,7 +519,6 @@ contains
     if (slv_pj%scaled) call VecDestroy(slv_pj%dscale, ierr)
     call make_pair_block_scale(a_pj, n1_loc, slv_pj%dscale, comm_s, my_id, "pair_psi")
     slv_pj%scaled = .true.
-    if (banded) call sff_cross_scale(x_pj, slv_pj%dscale)
 
     !--- pair_psi is solved SPLIT (see the module header): the GMG runs on the
     !--- packed (psi, j) pair, both fields in every smoother block. Set up
@@ -629,7 +552,6 @@ contains
       call make_pair_block_scale(a_w, n1_loc, slv_w%dscale, comm_s, my_id, "pair_w")
     endif
     slv_w%scaled = .true.
-    if (banded) call sff_cross_scale(x_w, slv_w%dscale)
 
     call PetscLogEventBegin(pcev_fact_w, ierr)
     if (suu == SF_SUU_SCHUR) then
@@ -653,7 +575,7 @@ contains
                            comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=nf_w, &
                            smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
                            pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC_MIXED, &
-                           harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
+                           ring_overlap=SF_GMG_RING_OVERLAP, &
                            semi_r=SF_GMG_SEMI_R_MIXED, axis_rings=ax_pair)
     else
       call sf_solver_setup(slv_w, a_w, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
@@ -669,25 +591,23 @@ contains
                          smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
     call sf_solver_setup(slv_T,   a_T,   bk_T,   "T-block KSP", &
                          comm_s, my_id, physics_pc_sf_rtol, gmg_inst=4, nfields=1, &
-                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot, &
-                         harm_pair=SF_GMG_HARM_PAIR_T)
+                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
     !--- v_par (GMG hierarchy 5). v0: B_77 is mass-dominated and nearly
     !--- isotropic (mass + poloidal visco_par), so the rho / T setup. b0: the
     !--- W_vv sound term is diffusion ALONG B -- along the flux surfaces, and
-    !--- cos <-> sin through d_phi -- so pair_w's ring blocks with the cos /
-    !--- sin slots together and its radial semi-coarsening; Richardson damped
+    !--- cos <-> sin through d_phi -- so pair_w's ring blocks and its radial
+    !--- semi-coarsening; Richardson damped
     !--- as on the lines. Both untuned starting points (-sf_gmg5_* override).
     if (with_v .and. vstage /= SF_VPAR_B1) then         ! b1: v_par is in pair_w
       if (vstage == SF_VPAR_V0) then
         call sf_solver_setup(slv_v, a_v, bk_v, "v_par-block KSP (B_77)", &
                              comm_s, my_id, physics_pc_sf_rtol, gmg_inst=5, nfields=1, &
-                             smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot, &
-                             harm_pair=SF_GMG_HARM_PAIR_T)
+                             smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
       else
         call sf_solver_setup(slv_v, a_v, bk_v, "v_par-block KSP (B_77 + W_vv)", &
                              comm_s, my_id, physics_pc_sf_rtol, gmg_inst=5, nfields=1, &
                              smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, axis_rings=ax_rhot, &
-                             harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
+                             ring_overlap=SF_GMG_RING_OVERLAP, &
                              semi_r=SF_GMG_SEMI_R_MIXED, rich_omega=SF_GMG_RICH_OMEGA_ADDITIVE)
       endif
     endif
@@ -702,13 +622,6 @@ contains
       end block
     endif
     call PetscLogEventEnd(pcev_fact_rhot, ierr)
-    if (banded .and. first) then
-      call band_setup(1, o_w,   SF_GMG_MAXITS)
-      call band_setup(2, o_pj,  SF_GMG_MAXITS)
-      call band_setup(3, o_rho, SF_GMG_MAXITS_RHOT)
-      call band_setup(4, o_T,   SF_GMG_MAXITS_RHOT)
-    endif
-    if (banded .and. as_any) call as_update(my_id)
     call physics_pc_mem("SF build: solvers set up", my_id)
 
     !--- work vectors: the operators keep their layout for the run.
@@ -788,15 +701,6 @@ contains
         do k = 1, ncb_on
           call sff_op_build(o_cb(k), A_full, ws, sf_opz(), my_id)
         enddo
-        if (banded) then
-          call sff_op_build(x_pj,  A_full, ws, sf_opz(), my_id)
-          call sff_op_build(x_w,   A_full, ws, sf_opz(), my_id)
-          call sff_op_build(x_rho, A_full, ws, sf_opz(), my_id)
-          call sff_op_build(x_T,   A_full, ws, sf_opz(), my_id)
-          do k = 1, ncb_on
-            call sff_op_build(x_cb(k), A_full, ws, sf_opz(), my_id)
-          enddo
-        endif
         call PetscLogEventEnd(pcev_extract, ierr)
       else
         call PetscLogEventBegin(pcev_extract, ierr)
@@ -808,15 +712,6 @@ contains
         do k = 1, ncb_on
           call sff_op_fill(o_cb(k), A_full, ws, sf_opz())
         enddo
-        if (banded) then
-          call sff_op_fill(x_pj,  A_full, ws, sf_opz())
-          call sff_op_fill(x_w,   A_full, ws, sf_opz())
-          call sff_op_fill(x_rho, A_full, ws, sf_opz())
-          call sff_op_fill(x_T,   A_full, ws, sf_opz())
-          do k = 1, ncb_on
-            call sff_op_fill(x_cb(k), A_full, ws, sf_opz())
-          enddo
-        endif
         call PetscLogEventEnd(pcev_extract, ierr)
       endif
       a_pj = o_pj%fam;  a_w = o_w%fam;  a_rho = o_rho%fam;  a_T = o_T%fam
@@ -843,17 +738,6 @@ contains
           do k = 1, ncb_on
             if (.not. blockmv_attach(o_cb(k)%fam, int(pc_ntor))) nno = nno + 1
           enddo
-          ! the cross parts: rows of one family, columns of several, so no
-          ! common harmonic block -- the kernel row by row
-          if (banded) then
-            if (.not. blockmv_attach(x_pj%fam, 1))  nno = nno + 1
-            if (.not. blockmv_attach(x_w%fam, 1))   nno = nno + 1
-            if (.not. blockmv_attach(x_rho%fam, 1)) nno = nno + 1
-            if (.not. blockmv_attach(x_T%fam, 1))   nno = nno + 1
-            do k = 1, ncb_on
-              if (.not. blockmv_attach(x_cb(k)%fam, 1)) nno = nno + 1
-            enddo
-          endif
           if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   SF: WARNING ", nno, &
             " family coupling block(s) not AIJ, left on PETSc's single-threaded matvec"
         end block
@@ -910,8 +794,8 @@ contains
           o_v%wid(1, 1) = WS_VV; o_v%label = "B_77 + W_vv"
         endif
       endif
-      ! tags 1 .. 2 (NDIAG + NCB) are the family and cross parts'
-      if (corr == 3) call full_op(o_m, "B_44", 2 * (NDIAG + NCB) + 1, [var_w])
+      ! tags 1 .. NDIAG + NCB are the diagonal and coupling operators'
+      if (corr == 3) call full_op(o_m, "B_44", NDIAG + NCB + 1, [var_w])
       do k = 1, ncb_on
         o_cb(k)%nf = 1; o_cb(k)%tagb = NDIAG + k
         if (k <= 12) then
@@ -924,23 +808,7 @@ contains
           endif
         endif
       enddo
-      ! the cross-family parts: the same blocks, part 1, own message tags
-      if (banded) then
-        call cross_of(o_pj, x_pj);  call cross_of(o_w, x_w)
-        call cross_of(o_rho, x_rho);  call cross_of(o_T, x_T)
-        do k = 1, ncb_on
-          call cross_of(o_cb(k), x_cb(k))
-        enddo
-      endif
     end subroutine define_family_operators
-
-    subroutine cross_of(d, c)
-      type(fam_op_t), intent(in)    :: d
-      type(fam_op_t), intent(inout) :: c
-      ! tags 1 .. NDIAG + NCB are the family parts', so the cross parts start above
-      c%label = d%label; c%nf = d%nf; c%tagb = d%tagb + NDIAG + NCB; c%part = 1
-      c%se = d%se; c%sv = d%sv; c%scl = d%scl; c%wid = d%wid
-    end subroutine cross_of
 
     subroutine full_op(op, label, tagb, vars)
       type(fam_op_t), intent(inout) :: op
@@ -1145,575 +1013,6 @@ contains
 
   end subroutine sf_build
 
-  !====================================================================
-  ! the cross-|n| band under the mode split
-  !====================================================================
-
-  !> The banded solve of block k (GMG instance numbering): FGMRES on the
-  !! global communicator over the shell D + C, preconditioned by one
-  !! application of the family solver's own preconditioner (its V-cycle).
-  !! Once: the shell reads the operators in place and the family solvers are
-  !! re-pointed at every rebuild.
-  subroutine band_setup(k, d, maxits)
-    use phys_module, only: physics_pc_sf_rtol
-    integer, intent(in)        :: k, maxits
-    type(fam_op_t), intent(in) :: d
-    PetscInt :: nloc
-    PC :: pc
-    PetscErrorCode :: ierr
-    character(len=16) :: pfx
-    associate (b => bks(k))
-      call MatGetLocalSize(d%fam, nloc, PETSC_NULL_INTEGER, ierr)
-      call MatCreateShell(comm_g, nloc, nloc, PETSC_DETERMINE, PETSC_DETERMINE, PETSC_NULL_INTEGER, b%op, ierr)
-      select case (k)
-      case (1); call MatShellSetOperation(b%op, MATOP_MULT, band_mult_1, ierr)
-      case (2); call MatShellSetOperation(b%op, MATOP_MULT, band_mult_2, ierr)
-      case (3); call MatShellSetOperation(b%op, MATOP_MULT, band_mult_3, ierr)
-      case (4); call MatShellSetOperation(b%op, MATOP_MULT, band_mult_4, ierr)
-      end select
-      call MatCreateVecs(d%fam, b%fx, b%fy, ierr)
-      call MatCreateVecs(b%op, b%bx, b%by, ierr)
-      call KSPCreate(comm_g, b%ksp, ierr)
-      call KSPSetType(b%ksp, KSPFGMRES, ierr)
-      call KSPGMRESSetRestart(b%ksp, max(maxits, 2), ierr)
-      call KSPSetTolerances(b%ksp, physics_pc_sf_rtol, 1.d-50, 1.d6, maxits, ierr)
-      write(pfx, '(A,I0,A)') "sf_band", k, "_"            ! -sf_band<k>_ksp_monitor etc.
-      call KSPSetOptionsPrefix(b%ksp, trim(pfx), ierr)
-      call KSPSetFromOptions(b%ksp, ierr)
-      call KSPSetOperators(b%ksp, b%op, b%op, ierr)
-      call KSPGetPC(b%ksp, pc, ierr)
-      call PCSetType(pc, PCSHELL, ierr)
-      select case (k)
-      case (1); call PCShellSetApply(pc, band_pc_1, ierr)
-      case (2); call PCShellSetApply(pc, band_pc_2, ierr)
-      case (3); call PCShellSetApply(pc, band_pc_3, ierr)
-      case (4); call PCShellSetApply(pc, band_pc_4, ierr)
-      end select
-      call PCShellSetName(pc, "family solvers, block Jacobi over |n|", ierr)
-      call KSPSetUp(b%ksp, ierr)
-      b%ready = .true.
-    end associate
-  end subroutine band_setup
-
-  !> y = (D + C) x for block k, x and y on the global communicator.
-  subroutine band_mult(k, x, y)
-    integer, intent(in) :: k
-    Vec :: x, y
-    select case (k)
-    case (1); call mult_dc(o_w,   x_w)
-    case (2); call mult_dc(o_pj,  x_pj)
-    case (3); call mult_dc(o_rho, x_rho)
-    case (4); call mult_dc(o_T,   x_T)
-    end select
-  contains
-    subroutine mult_dc(d, c)
-      type(fam_op_t), intent(inout) :: d, c
-      PetscErrorCode :: ierr
-      call MatMult(c%fam, x, y, ierr)
-      call sff_copy_local(x, bks(k)%fx)
-      call MatMult(d%fam, bks(k)%fx, bks(k)%fy, ierr)
-      call sff_add_local(y, bks(k)%fy)
-    end subroutine mult_dc
-  end subroutine band_mult
-
-  !> y = P_k^-1 x: the family solvers' preconditioner (all families at once),
-  !! with the harmonic-coupled Schwarz step (as_t) where it is on.
-  subroutine band_pc(k, x, y)
-    integer, intent(in) :: k
-    Vec :: x, y
-    if (ass(k)%on) then
-      call as_pc(k, x, y)
-    else
-      call fam_pc(k, x, y)
-    endif
-  end subroutine band_pc
-  !> y = M x: block Jacobi over the families, each family's own V-cycle.
-  subroutine fam_pc(k, x, y)
-    integer, intent(in) :: k
-    Vec :: x, y
-    PC :: pc
-    PetscErrorCode :: ierr
-    select case (k)
-    case (1); call KSPGetPC(slv_w%ksp, pc, ierr)
-    case (2); call KSPGetPC(slv_pj%ksp, pc, ierr)
-    case (3); call KSPGetPC(slv_rho%ksp, pc, ierr)
-    case (4); call KSPGetPC(slv_T%ksp, pc, ierr)
-    end select
-    call sff_copy_local(x, bks(k)%fx)
-    call PCApply(pc, bks(k)%fx, bks(k)%fy, ierr)
-    call sff_copy_local(bks(k)%fy, y)
-  end subroutine fam_pc
-
-  !> r = b - (D + C) y on the band's global layout.
-  subroutine band_residual(k, b, y, r)
-    integer, intent(in) :: k
-    Vec :: b, y, r
-    PetscErrorCode :: ierr
-    call band_mult(k, y, r)
-    call VecAYPX(r, -1.d0, b, ierr)
-  end subroutine band_residual
-
-  !> y = the band preconditioner with the harmonic-coupled Schwarz step:
-  !! y = M x;  y += S (x - B y)  [; y += M (x - B y)]  (order 1: S first).
-  subroutine as_pc(k, x, y)
-    integer, intent(in) :: k
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    real*8 :: t0
-    t0 = MPI_Wtime()
-    associate (s => ass(k))
-      if (as_order == 0) then
-        call fam_pc(k, x, y)
-      else
-        call as_apply(k, x, y)
-      endif
-      call band_residual(k, x, y, s%t1)
-      if (as_order == 0) then
-        call as_apply(k, s%t1, s%t2)
-      else
-        call fam_pc(k, s%t1, s%t2)
-      endif
-      call VecAXPY(y, 1.d0, s%t2, ierr)
-      if (as_post /= 0) then
-        call band_residual(k, x, y, s%t1)
-        call fam_pc(k, s%t1, s%t2)
-        call VecAXPY(y, 1.d0, s%t2, ierr)
-      endif
-      s%napply = s%napply + 1
-      s%t_sum = s%t_sum + (MPI_Wtime() - t0)
-    end associate
-  end subroutine as_pc
-
-  !> z = S r, restricted additive Schwarz over my subdomains: gather each
-  !! subdomain's rows of r (any owner), solve exactly, and add the solution's
-  !! non-overlapping part into z at its rows -- wherever they are owned (the
-  !! families sit on different ranks, which PCASM's local-only prolongation
-  !! does not allow).
-  subroutine as_apply(k, r, z)
-    integer, intent(in) :: k
-    Vec :: r, z
-    integer :: i, n0, n1
-    PetscScalar, pointer :: la(:), lb(:), va(:)
-    PetscErrorCode :: ierr
-    associate (s => ass(k))
-      call VecSet(z, 0.d0, ierr)
-      call VecScatterBegin(s%sr, r, s%lx, INSERT_VALUES, SCATTER_FORWARD, ierr)
-      call VecScatterEnd(s%sr, r, s%lx, INSERT_VALUES, SCATTER_FORWARD, ierr)
-      call VecGetArrayRead(s%lx, la, ierr)
-      call VecGetArray(s%ly, lb, ierr)
-      do i = 1, s%nb
-        n0 = s%off(i) + 1;  n1 = s%off(i + 1)
-        call VecGetArray(s%xi(i), va, ierr)
-        va = la(n0:n1)
-        call VecRestoreArray(s%xi(i), va, ierr)
-        call KSPSolve(s%sk(i), s%xi(i), s%yi(i), ierr)
-        call VecGetArrayRead(s%yi(i), va, ierr)
-        lb(n0:n1) = va
-        call VecRestoreArrayRead(s%yi(i), va, ierr)
-      enddo
-      call VecRestoreArray(s%ly, lb, ierr)
-      call VecRestoreArrayRead(s%lx, la, ierr)
-      call VecScatterBegin(s%sp, s%ly, z, ADD_VALUES, SCATTER_FORWARD, ierr)
-      call VecScatterEnd(s%sp, s%ly, z, ADD_VALUES, SCATTER_FORWARD, ierr)
-    end associate
-  end subroutine as_apply
-
-  !> Build (first call) or refresh the Schwarz smoothers of the blocks in
-  !! as_mask, after the family operators and cross parts of this rebuild.
-  subroutine as_update(my_id)
-    integer, intent(in) :: my_id
-    call as_build(1, o_w,   x_w,   my_id)
-    call as_build(2, o_pj,  x_pj,  my_id)
-    call as_build(3, o_rho, x_rho, my_id)
-    call as_build(4, o_T,   x_T,   my_id)
-  end subroutine as_update
-
-  subroutine as_build(k, d, xc_op, my_id)
-    integer, intent(in) :: k, my_id
-    type(fam_op_t), intent(in) :: d, xc_op
-    character(len=8), parameter :: lbl(4) = ["pair_w  ", "pair_psi", "rho     ", "T       "]
-    real*8 :: t0
-    integer :: i
-    PetscInt :: nb
-    PetscErrorCode :: ierr
-    if (.not. btest(as_mask, k - 1)) return
-    associate (s => ass(k))
-      t0 = MPI_Wtime()
-      if (.not. s%ready) then
-        call sff_lift(d%fam, s%Dg, .false.)
-        call MatDuplicate(s%Dg, MAT_COPY_VALUES, s%B, ierr)
-        call MatAXPY(s%B, 1.d0, xc_op%fam, DIFFERENT_NONZERO_PATTERN, ierr)
-        call VecDuplicate(bks(k)%bx, s%t1, ierr)
-        call VecDuplicate(bks(k)%bx, s%t2, ierr)
-        call as_subdomains(k, d%nf, my_id)
-        nb = s%nb
-        call MatCreateSubMatrices(s%B, nb, s%iso, s%iso, MAT_INITIAL_MATRIX, s%sub, ierr)
-        allocate(s%sk(s%nb))
-        do i = 1, s%nb
-          call KSPCreate(PETSC_COMM_SELF, s%sk(i), ierr)
-          call KSPSetType(s%sk(i), KSPPREONLY, ierr)
-          block
-            PC :: pc
-            character(len=24) :: pfx
-            call KSPGetPC(s%sk(i), pc, ierr)
-            call PCSetType(pc, PCLU, ierr)
-            call PCFactorSetMatOrderingType(pc, MATORDERINGND, ierr)
-            write(pfx, '(A,I0,A)') "sf_as", k, "_sub_"          ! -sf_as<k>_sub_pc_factor_mat_solver_type mumps
-            call KSPSetOptionsPrefix(s%sk(i), trim(pfx), ierr)
-          end block
-          call KSPSetFromOptions(s%sk(i), ierr)
-          call KSPSetOperators(s%sk(i), s%sub(i), s%sub(i), ierr)
-          call KSPSetUp(s%sk(i), ierr)
-        enddo
-      else
-        call sff_lift(d%fam, s%Dg, .true.)
-        call MatZeroEntries(s%B, ierr)
-        call MatAXPY(s%B, 1.d0, s%Dg, SUBSET_NONZERO_PATTERN, ierr)
-        call MatAXPY(s%B, 1.d0, xc_op%fam, SUBSET_NONZERO_PATTERN, ierr)
-        nb = s%nb
-        call MatCreateSubMatrices(s%B, nb, s%iso, s%iso, MAT_REUSE_MATRIX, s%sub, ierr)
-        do i = 1, s%nb
-          call KSPSetOperators(s%sk(i), s%sub(i), s%sub(i), ierr)
-          call KSPSetUp(s%sk(i), ierr)
-        enddo
-      endif
-      s%t_fact = s%t_fact + (MPI_Wtime() - t0)
-      if (.not. s%ready) then
-        call as_mem_report(k, lbl(k), MPI_Wtime() - t0, my_id)
-        if (as_check) call as_selfcheck(k, lbl(k), my_id)
-      endif
-      s%on = .true.;  s%ready = .true.
-    end associate
-  end subroutine as_build
-
-  !> -sf_as_check: B against the band's D + C, and S and the whole two-level
-  !! preconditioner P on B x (both exact for one subdomain over everything).
-  subroutine as_selfcheck(k, lbl, my_id)
-    integer, intent(in) :: k, my_id
-    character(len=*), intent(in) :: lbl
-    PetscRandom :: rnd
-    Vec :: x0, bx0, z
-    real*8 :: nb_, nd_, nx_, ns_, nm_
-    PetscErrorCode :: ierr
-    associate (s => ass(k))
-      call VecDuplicate(s%t1, x0, ierr);  call VecDuplicate(s%t1, bx0, ierr);  call VecDuplicate(s%t1, z, ierr)
-      call PetscRandomCreate(comm_g, rnd, ierr)
-      call VecSetRandom(x0, rnd, ierr)
-      call PetscRandomDestroy(rnd, ierr)
-      call VecNorm(x0, NORM_2, nx_, ierr)
-      call MatMult(s%B, x0, bx0, ierr)
-      call VecNorm(bx0, NORM_2, nb_, ierr)
-      call band_mult(k, x0, z)
-      call VecAXPY(z, -1.d0, bx0, ierr);  call VecNorm(z, NORM_2, nd_, ierr)
-      call as_apply(k, bx0, z)
-      call VecAXPY(z, -1.d0, x0, ierr);  call VecNorm(z, NORM_2, ns_, ierr)
-      s%on = .true.
-      call as_pc(k, bx0, z)
-      call VecAXPY(z, -1.d0, x0, ierr);  call VecNorm(z, NORM_2, nm_, ierr)
-      s%napply = 0;  s%t_sum = 0.d0
-      if (my_id == 0) write(*,'(A,A,A,ES10.3,A,ES10.3,A,ES10.3)') "[Physics PC]   band Schwarz ", trim(lbl), &
-        ": |B x - (D+C) x| / |B x| = ", nd_ / max(nb_, tiny(1.d0)), ", |S B x - x| / |x| = ", ns_ / nx_, &
-        ", |P B x - x| / |x| = ", nm_ / nx_
-      call VecDestroy(x0, ierr);  call VecDestroy(bx0, ierr);  call VecDestroy(z, ierr)
-    end associate
-  end subroutine as_selfcheck
-
-  !> The ring-band subdomains of block k (nf fields), each with every
-  !! family's rows of its JOREK indices, dealt to the global ranks in
-  !! contiguous runs, and their gather / add-back scatters.
-  subroutine as_subdomains(k, nf, my_id)
-    use nodes_elements, only: node_list
-    use phys_module,    only: n_flux, n_tht
-    use mod_parameters, only: n_degrees
-    integer, intent(in) :: k, nf, my_id
-    integer :: me, np, mpierr, nidx, r0, r1, nstrip, nsub, s0, s1, sb, st, sec, n, i, j, l, ib
-    integer :: ra, rb, ja, jb, wsec
-    integer(8) :: cov(2), covg(2)
-    logical, allocatable :: mo(:), ml(:)
-    integer, allocatable :: io(:), il(:)
-    PetscInt, allocatable :: rows(:), pos(:), gat(:), gl(:)
-    PetscInt, pointer :: po(:), pl(:)
-    PetscInt :: nloc, no, nl_, a
-    IS, allocatable :: isl(:)
-    IS :: isp, isg
-    PetscErrorCode :: ierr
-
-    if (node_list%n_nodes /= n_flux * n_tht) &
-      call fatal_k("-sf_as_mask needs the flux-surface grid (n_nodes = n_flux n_tht)")
-    call MPI_Comm_rank(comm_g, me, mpierr)
-    call MPI_Comm_size(comm_g, np, mpierr)
-    nidx = sff_index_count()
-    r0 = max(0, as_r0)
-    r1 = as_r1;  if (r1 < 0 .or. r1 > n_flux - 1) r1 = n_flux - 1
-    if (r1 < r0) call fatal_k("-sf_as_ring0 > -sf_as_ring1")
-    nstrip = (r1 - r0 + as_w) / as_w
-    nsub = nstrip * as_nsec
-    wsec = max(1, n_tht / as_nsec)
-    s0 = int(int(me, 8) * nsub / np);  s1 = int(int(me + 1, 8) * nsub / np)
-    associate (s => ass(k))
-    s%nb = s1 - s0
-    allocate(s%iso(s%nb), isl(s%nb), s%xi(s%nb), s%yi(s%nb), s%off(s%nb + 1))
-    allocate(mo(0:nidx - 1), ml(0:nidx - 1))
-    cov = 0
-    do sb = s0, s1 - 1
-      ib = sb - s0 + 1
-      st = sb / as_nsec;  sec = mod(sb, as_nsec)
-      ra = r0 + st * as_w;  rb = min(r0 + (st + 1) * as_w, r1 + 1)                 ! rings [ra, rb)
-      ja = sec * wsec;  jb = merge(n_tht, (sec + 1) * wsec, sec == as_nsec - 1)   ! columns [ja, jb)
-      mo = .false.;  ml = .false.
-      do n = 0, node_list%n_nodes - 1
-        i = n / n_tht;  j = mod(n, n_tht)
-        if (i < ra - as_o .or. i >= rb + as_o) cycle
-        if (as_nsec > 1) then
-          if (.not. in_cols(j, ja - as_o, jb + as_o)) cycle
-        endif
-        do l = 1, n_degrees
-          if (node_list%node(n + 1)%index(l) < 1 .or. node_list%node(n + 1)%index(l) > nidx) cycle
-          mo(node_list%node(n + 1)%index(l) - 1) = .true.
-          if (i >= ra .and. i < rb .and. (as_nsec == 1 .or. in_cols(j, ja, jb))) &
-            ml(node_list%node(n + 1)%index(l) - 1) = .true.
-        enddo
-      enddo
-      io = pack([(l, l = 0, nidx - 1)], mo)
-      il = pack([(l, l = 0, nidx - 1)], ml)
-      call sff_band_rows(nf, io, rows)
-      cov(2) = max(cov(2), int(size(rows), 8))
-      call ISCreateGeneral(PETSC_COMM_SELF, int(size(rows), kind(nloc)), rows, PETSC_COPY_VALUES, s%iso(ib), ierr)
-      call ISSort(s%iso(ib), ierr)
-      call sff_band_rows(nf, il, rows)
-      cov(1) = cov(1) + size(rows)
-      call ISCreateGeneral(PETSC_COMM_SELF, int(size(rows), kind(nloc)), rows, PETSC_COPY_VALUES, isl(ib), ierr)
-      call ISSort(isl(ib), ierr)
-    enddo
-
-    !--- every band row in at most one non-overlapping part (and, without a
-    !--- window, in exactly one)
-    block
-      Vec :: cnt
-      PetscScalar, pointer :: ca(:)
-      real*8 :: cmn, cmx
-      real*8, allocatable :: one(:)
-      call MatCreateVecs(s%B, cnt, PETSC_NULL_VEC, ierr)
-      call VecSet(cnt, 0.d0, ierr)
-      do ib = 1, s%nb
-        call ISGetLocalSize(isl(ib), nl_, ierr)
-        if (nl_ == 0) cycle
-        call ISGetIndices(isl(ib), pl, ierr)
-        allocate(one(nl_));  one = 1.d0
-        call VecSetValues(cnt, nl_, pl, one, ADD_VALUES, ierr)
-        deallocate(one)
-        call ISRestoreIndices(isl(ib), pl, ierr)
-      enddo
-      call VecAssemblyBegin(cnt, ierr);  call VecAssemblyEnd(cnt, ierr)
-      call VecGetArrayRead(cnt, ca, ierr)
-      cmn = 1.d30;  cmx = -1.d30
-      if (size(ca) > 0) then
-        cmn = minval(ca);  cmx = maxval(ca)
-      endif
-      call VecRestoreArrayRead(cnt, ca, ierr)
-      call MPI_Allreduce(MPI_IN_PLACE, cmn, 1, MPI_DOUBLE_PRECISION, MPI_MIN, comm_g, mpierr)
-      call MPI_Allreduce(MPI_IN_PLACE, cmx, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm_g, mpierr)
-      call VecDestroy(cnt, ierr)
-      if (cmx > 1.5d0 .or. (r0 == 0 .and. r1 == n_flux - 1 .and. cmn < 0.5d0)) then
-        if (my_id == 0) write(*,'(A,2F6.1)') "[Physics PC]   Schwarz cover count min / max ", cmn, cmx
-        call fatal_k("the Schwarz subdomains do not tile the band (index -> node map?)")
-      endif
-    end block
-    call MPI_Allreduce(cov(1), covg(1), 1, MPI_INTEGER8, MPI_SUM, comm_g, mpierr)
-    call MPI_Allreduce(cov(2), covg(2), 1, MPI_INTEGER8, MPI_MAX, comm_g, mpierr)
-    call MatGetSize(s%B, nloc, PETSC_NULL_INTEGER, ierr)
-    if (my_id == 0) write(*,'(A,A,A,I0,A,I0,A,I0,A,F6.3,A)') "[Physics PC]   band Schwarz ", trim(lbl_k(k)), &
-      ": ", nsub, " subdomains on ", np, " ranks, largest ", covg(2), " rows, window covers ", &
-      dble(covg(1)) / dble(nloc), " of the band"
-
-    !--- gather: r(iso_1, iso_2, ...) -> lx; add back: ly(positions of the
-    !--- isl in their iso) -> z(isl). One scatter each, on every rank (the
-    !--- creation is collective), my subdomains concatenated.
-    s%off(1) = 0
-    do ib = 1, s%nb
-      call ISGetLocalSize(s%iso(ib), no, ierr)
-      s%off(ib + 1) = s%off(ib) + int(no)
-    enddo
-    allocate(gat(s%off(s%nb + 1)), pos(0), gl(0))
-    do ib = 1, s%nb
-      call ISGetLocalSize(s%iso(ib), no, ierr)
-      call ISGetLocalSize(isl(ib), nl_, ierr)
-      call VecCreateSeq(PETSC_COMM_SELF, no, s%xi(ib), ierr)
-      call VecDuplicate(s%xi(ib), s%yi(ib), ierr)
-      call ISGetIndices(s%iso(ib), po, ierr)
-      gat(s%off(ib) + 1:s%off(ib + 1)) = po(1:no)
-      call ISGetIndices(isl(ib), pl, ierr)
-      a = 1
-      do l = 1, int(nl_)                       ! both sorted: merge
-        do while (po(a) < pl(l))
-          a = a + 1
-        enddo
-        if (po(a) /= pl(l)) call fatal_k("a non-overlapping part is not inside its subdomain")
-        pos = [pos, int(s%off(ib), kind(a)) + a - 1]
-      enddo
-      gl = [gl, pl(1:nl_)]
-      call ISRestoreIndices(isl(ib), pl, ierr)
-      call ISRestoreIndices(s%iso(ib), po, ierr)
-      call ISDestroy(isl(ib), ierr)
-    enddo
-    call VecCreateSeq(PETSC_COMM_SELF, int(s%off(s%nb + 1), kind(no)), s%lx, ierr)
-    call VecDuplicate(s%lx, s%ly, ierr)
-    call ISCreateGeneral(PETSC_COMM_SELF, int(size(gat), kind(no)), gat, PETSC_COPY_VALUES, isp, ierr)
-    call VecScatterCreate(s%t1, isp, s%lx, PETSC_NULL_IS, s%sr, ierr)
-    call ISDestroy(isp, ierr)
-    call ISCreateGeneral(PETSC_COMM_SELF, int(size(pos), kind(no)), pos, PETSC_COPY_VALUES, isp, ierr)
-    call ISCreateGeneral(PETSC_COMM_SELF, int(size(gl), kind(no)), gl, PETSC_COPY_VALUES, isg, ierr)
-    call VecScatterCreate(s%ly, isp, s%t1, isg, s%sp, ierr)
-    call ISDestroy(isp, ierr);  call ISDestroy(isg, ierr)
-    end associate
-  contains
-    logical function in_cols(jj, a_, b_)       ! jj in [a_, b_) modulo n_tht
-      integer, intent(in) :: jj, a_, b_
-      if (b_ - a_ >= n_tht) then
-        in_cols = .true.
-      else
-        in_cols = modulo(jj - a_, n_tht) < b_ - a_
-      endif
-    end function in_cols
-    character(len=8) function lbl_k(kk)
-      integer, intent(in) :: kk
-      character(len=8), parameter :: lb(4) = ["pair_w  ", "pair_psi", "rho     ", "T       "]
-      lbl_k = lb(kk)
-    end function lbl_k
-    subroutine fatal_k(msg)
-      character(len=*), intent(in) :: msg
-      if (my_id == 0) write(*,'(A,A)') "[Physics PC]   FATAL: ", msg
-      call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
-    end subroutine fatal_k
-  end subroutine as_subdomains
-
-  !> [Mem] line of a fresh Schwarz smoother: the subdomain LU factors' entries
-  !! (summed over the ranks, and the largest rank).
-  subroutine as_mem_report(k, lbl, tb, my_id)
-    integer, intent(in) :: k, my_id
-    character(len=*), intent(in) :: lbl
-    real*8, intent(in) :: tb
-    PC :: spc
-    Mat :: F
-    MatInfo :: finfo
-    MatSolverType :: st
-    real*8 :: nz, nzg(2)
-    integer :: i, mpierr
-    PetscErrorCode :: ierr
-    nz = 0.d0
-    st = "petsc"
-    do i = 1, ass(k)%nb
-      call KSPGetPC(ass(k)%sk(i), spc, ierr)
-      call PCFactorGetMatSolverType(spc, st, ierr)
-      if (st == MATSOLVERPETSC) then              ! MUMPS' factor has no MatGetInfo
-        call PCFactorGetMatrix(spc, F, ierr)
-        call MatGetInfo(F, MAT_LOCAL, finfo, ierr)
-        nz = nz + finfo%nz_used
-      endif
-    enddo
-    call MPI_Allreduce(nz, nzg(1), 1, MPI_DOUBLE_PRECISION, MPI_SUM, comm_g, mpierr)
-    call MPI_Allreduce(nz, nzg(2), 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm_g, mpierr)
-    if (my_id == 0) write(*,'(A,A,A,ES10.3,A,ES10.3,A,F8.3,A)') "[Mem] band Schwarz ", trim(lbl), &
-      ": subdomain LU entries ", nzg(1), " (largest rank ", nzg(2), "; 0 = MUMPS), built and factored in ", tb, " s"
-  end subroutine as_mem_report
-
-  !> The Schwarz smoothers since the last report: applications, their time
-  !! (max over the ranks, incl. the V-cycles) and the refactorisation time.
-  subroutine as_report(my_id)
-    integer, intent(in) :: my_id
-    character(len=8), parameter :: lbl(4) = ["pair_w  ", "pair_psi", "rho     ", "T       "]
-    real*8 :: v(2), vm(2)
-    integer :: k, mpierr
-    do k = 1, 4
-      if (.not. ass(k)%on) cycle
-      v = [ass(k)%t_sum, ass(k)%t_fact]
-      call MPI_Allreduce(v, vm, 2, MPI_DOUBLE_PRECISION, MPI_MAX, comm_g, mpierr)
-      if (my_id == 0) write(*,'(A,A,A,I0,A,F8.3,A,F8.3,A)') "[Physics PC]   band Schwarz ", trim(lbl(k)), &
-        ": ", ass(k)%napply, " applications, ", vm(1), " s (incl. the V-cycles), build ", vm(2), " s"
-      ass(k)%napply = 0;  ass(k)%t_sum = 0.d0;  ass(k)%t_fact = 0.d0
-    enddo
-  end subroutine as_report
-
-  subroutine band_mult_1(A, x, y, ierr)
-    Mat :: A
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call band_mult(1, x, y);  ierr = 0
-  end subroutine band_mult_1
-  subroutine band_mult_2(A, x, y, ierr)
-    Mat :: A
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call band_mult(2, x, y);  ierr = 0
-  end subroutine band_mult_2
-  subroutine band_mult_3(A, x, y, ierr)
-    Mat :: A
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call band_mult(3, x, y);  ierr = 0
-  end subroutine band_mult_3
-  subroutine band_mult_4(A, x, y, ierr)
-    Mat :: A
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call band_mult(4, x, y);  ierr = 0
-  end subroutine band_mult_4
-  subroutine band_pc_1(pc, x, y, ierr)
-    PC :: pc
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call band_pc(1, x, y);  ierr = 0
-  end subroutine band_pc_1
-  subroutine band_pc_2(pc, x, y, ierr)
-    PC :: pc
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call band_pc(2, x, y);  ierr = 0
-  end subroutine band_pc_2
-  subroutine band_pc_3(pc, x, y, ierr)
-    PC :: pc
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call band_pc(3, x, y);  ierr = 0
-  end subroutine band_pc_3
-  subroutine band_pc_4(pc, x, y, ierr)
-    PC :: pc
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call band_pc(4, x, y);  ierr = 0
-  end subroutine band_pc_4
-
-  !> A block solve of the sweep: the solver's own, or with a band the
-  !! FGMRES over D + C (the same scaling similarity, the same counters).
-  subroutine bsolve(slv, rhs, sol)
-    type(block_solver_t), intent(inout) :: slv
-    Vec :: rhs, sol
-    PetscErrorCode :: ierr
-    PetscInt :: its
-    KSPConvergedReason :: reason
-    real*8 :: t0
-    ierr = 0
-    if (.not. banded) then
-      call sf_solver_apply(slv, rhs, sol, ierr)
-      return
-    endif
-    associate (b => bks(slv%gmg_inst))
-      t0 = MPI_Wtime()
-      if (slv%scaled) call VecPointwiseMult(rhs, rhs, slv%dscale, ierr)
-      call sff_copy_local(rhs, b%bx)
-      call KSPSolve(b%ksp, b%bx, b%by, ierr)
-      call sff_copy_local(b%by, sol)
-      if (slv%scaled) call VecPointwiseMult(sol, sol, slv%dscale, ierr)
-      slv%t_sum = slv%t_sum + (MPI_Wtime() - t0)
-      call KSPGetIterationNumber(b%ksp, its, ierr)
-      slv%its_sum = slv%its_sum + int(its)
-      slv%its_max = max(slv%its_max, int(its))
-      slv%nsolve  = slv%nsolve + 1
-      call KSPGetConvergedReason(b%ksp, reason, ierr)
-      if (reason%v < 0) slv%nfail = slv%nfail + 1
-    end associate
-  end subroutine bsolve
-
   !> use_b65 = B_65 has a nonzero entry anywhere (comm: the operators'
   !! communicator; on the mode split the families' union, i.e. comm_g).
   subroutine set_use_b65(a, comm)
@@ -1730,17 +1029,6 @@ contains
     if (me == 0 .and. use_b65) write(*,'(A,ES10.3,A)') "[Physics PC]   SF: B_65 (T row, rho column) |.|_F = ", &
       sqrt(nrm), " (max over ranks): applied in the rho -> T sweep"
   end subroutine set_use_b65
-
-  !> y = B x for a coupling block of the sweep (k: its index in o_cb), with
-  !! a band plus its cross-family part.
-  subroutine cmult(a, k, x, y)
-    Mat :: a
-    integer, intent(in) :: k
-    Vec :: x, y
-    PetscErrorCode :: ierr
-    call MatMult(a, x, y, ierr)
-    if (banded) call sff_cross_addmult(x_cb(k), x, y)
-  end subroutine cmult
 
   !--------------------------------------------------------------------
   !> y = P^-1 x: the block-LDU sweep.
@@ -1807,30 +1095,30 @@ contains
     ! back-substitution M_j^-1 (x_j - B_31 psi*).
     call sf_split_halves(rhs_PJ, x_psi, x_j, .true.)
     call PetscLogEventBegin(pcev_solve_pj, ierr)
-    call bsolve(slv_pj, rhs_PJ, sol_PJ)
+    call sf_solver_apply(slv_pj, rhs_PJ, sol_PJ, ierr)
     call PetscLogEventEnd(pcev_solve_pj, ierr)
     call sf_split_halves(sol_PJ, y_psi, y_j, .false.)     ! psi*, j*
 
     !--- Step 1: predictor density   rho* = B_55^-1 (x_rho - B_51 psi*) ---
-    call cmult(a_51, 7, y_psi, w3)
+    call MatMult(a_51, y_psi, w3, ierr)
     call VecWAXPY(w4, -1.0d0, w3, x_rho, ierr)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
-    call bsolve(slv_rho, w4, t_rho)
+    call sf_solver_apply(slv_rho, w4, t_rho, ierr)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
 
     !--- Step 1: predictor temperature  T* = B_66^-1 (x_T - B_61 psi* - B_63 j*)
     ! B_61 and B_63 act against the EXPLICIT predictor pair. No j-folded
     ! lower-triangular block is needed or wanted here.
-    call cmult(a_61, 9, y_psi, w3)
+    call MatMult(a_61, y_psi, w3, ierr)
     call VecWAXPY(w4, -1.0d0, w3, x_T, ierr)
-    call cmult(a_63, 11, y_j, w3)
+    call MatMult(a_63, y_j, w3, ierr)
     call VecAXPY(w4, -1.0d0, w3, ierr)
     if (use_b65) then                                   ! - B_65 rho*
-      call cmult(a_65, 12, t_rho, w3)
+      call MatMult(a_65, t_rho, w3, ierr)
       call VecAXPY(w4, -1.0d0, w3, ierr)
     endif
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
-    call bsolve(slv_T, w4, t_T)
+    call sf_solver_apply(slv_T, w4, t_T, ierr)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
 
     !--- Step 2: the ONE packed wave solve -------------------------------
@@ -1841,13 +1129,13 @@ contains
     !   RHS_om = x_w VERBATIM -- the omega row of the lower coupling is
     ! identically zero, so no fold and no correction term.
     call VecCopy(x_u, w5, ierr)
-    call cmult(a_21, 3, y_psi, w3)
+    call MatMult(a_21, y_psi, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
-    call cmult(a_23, 4, y_j, w3)
+    call MatMult(a_23, y_j, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
-    call cmult(a_25, 5, t_rho, w3)
+    call MatMult(a_25, t_rho, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
-    call cmult(a_26, 6, t_T, w3)
+    call MatMult(a_26, t_T, w3, ierr)
     call VecAXPY(w5, -1.0d0, w3, ierr)
     ! mixed: the psi / j rows' right-hand side is zero (the predictor has
     ! consumed x_psi, x_j). With the Eq. (16) corrector their solution is
@@ -1858,16 +1146,16 @@ contains
     ! b1: v_par is pair_w's 5th field, its right-hand side
     ! x_V - B_71 psi* - B_75 rho* - B_76 T* (psi*, not psi_w: see V_PAR)
     if (vb1) then
-      call cmult(a_vc(VC71), 12 + VC71, y_psi, wv1)
+      call MatMult(a_vc(VC71), y_psi, wv1, ierr)
       call VecWAXPY(wv2, -1.0d0, wv1, x_v, ierr)
-      call cmult(a_vc(VC75), 12 + VC75, t_rho, wv1)
+      call MatMult(a_vc(VC75), t_rho, wv1, ierr)
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
-      call cmult(a_vc(VC76), 12 + VC76, t_T, wv1)
+      call MatMult(a_vc(VC76), t_T, wv1, ierr)
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
     endif
     if (mixed) then
       if (corr == 1 .or. corr == 4) then
-        call cmult(a_16, 2, t_T, w4)
+        call MatMult(a_16, t_T, w4, ierr)
         call VecScale(w4, -1.0d0, ierr)
         parts = [w5, x_w, w4, zv, wv2]
       else
@@ -1878,7 +1166,7 @@ contains
       call sf_split_halves(rhs_W, w5, x_w, .true.)
     endif
     call PetscLogEventBegin(pcev_solve_w, ierr)
-    call bsolve(slv_w, rhs_W, sol_W)
+    call sf_solver_apply(slv_w, rhs_W, sol_W, ierr)
     call PetscLogEventEnd(pcev_solve_w, ierr)
     if (corr /= 0) then
       parts = [y_u, y_w, w3, w4, y_v]                     ! w3, w4 = psi_w, j_w; b1: y_v = V
@@ -1897,20 +1185,20 @@ contains
     ! enter (mod_pc_elt_matrix_force_fft, V_PAR) -- unless -sf_vpar_wvu_full
     ! keeps that part in W_vu, and then psi_w enters explicitly.
     if (vb0) then
-      call cmult(a_vc(VC71), 12 + VC71, y_psi, wv1)
+      call MatMult(a_vc(VC71), y_psi, wv1, ierr)
       call VecWAXPY(wv2, -1.0d0, wv1, x_v, ierr)
       if (vfull) then                                   ! - B_71 psi_w (w3, corr /= 0)
-        call cmult(a_vc(VC71), 12 + VC71, w3, wv1)
+        call MatMult(a_vc(VC71), w3, wv1, ierr)
         call VecAXPY(wv2, -1.0d0, wv1, ierr)
       endif
-      call cmult(a_vc(VC75), 12 + VC75, t_rho, wv1)
+      call MatMult(a_vc(VC75), t_rho, wv1, ierr)
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
-      call cmult(a_vc(VC76), 12 + VC76, t_T, wv1)
+      call MatMult(a_vc(VC76), t_T, wv1, ierr)
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
-      call cmult(a_vc(VC72), 12 + VC72, y_u, wv1)
+      call MatMult(a_vc(VC72), y_u, wv1, ierr)
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
       call PetscLogEventBegin(pcev_solve_rhot, ierr)
-      call bsolve(slv_v, wv2, y_v)
+      call sf_solver_apply(slv_v, wv2, y_v, ierr)
       call PetscLogEventEnd(pcev_solve_rhot, ierr)
     endif
 
@@ -1920,9 +1208,9 @@ contains
     !--- drops. Kept in y_rho / y_T (free until the correctors) while w3, w4
     !--- still hold psi_w, j_w. The same block solves as corrector 1.
     if (corr == 4) then
-      call cmult(a_51, 7, w3, y_rho)
-      call cmult(a_61, 9, w3, y_T)
-      call cmult(a_63, 11, w4, w5)
+      call MatMult(a_51, w3, y_rho, ierr)
+      call MatMult(a_61, w3, y_T, ierr)
+      call MatMult(a_63, w4, w5, ierr)
       call VecAXPY(y_T, 1.0d0, w5, ierr)
     endif
 
@@ -1934,13 +1222,13 @@ contains
     else
       ! Here the j-component of the RHS IS zero, because the j-row of the upper
       ! coupling U is identically zero. (Contrast the predictor above.)
-      call cmult(a_12, 1, y_u, w3)
-      call cmult(a_16, 2, t_T, w4)
+      call MatMult(a_12, y_u, w3, ierr)
+      call MatMult(a_16, t_T, w4, ierr)
       call VecAXPY(w3, 1.0d0, w4, ierr)                     ! B_12 u + B_16 T*
       call VecZeroEntries(w4, ierr)
       call sf_split_halves(rhs_PJ, w3, w4, .true.)
       call PetscLogEventBegin(pcev_solve_pj, ierr)
-      call bsolve(slv_pj, rhs_PJ, sol_PJ)
+      call sf_solver_apply(slv_pj, rhs_PJ, sol_PJ, ierr)
       call PetscLogEventEnd(pcev_solve_pj, ierr)
       call sf_split_halves(sol_PJ, w3, w4, .false.)         ! dpsi, dj
 
@@ -1952,39 +1240,39 @@ contains
     if (corr == 3) then
       ! Eq. (17) strict: M^-1 ~ the time derivative's, (opz B_44)^-1; no B_65
       ! (zero in model199), no block solve
-      call cmult(a_52, 8, y_u, w3)
+      call MatMult(a_52, y_u, w3, ierr)
       call mass_cheb_solve(mcm, w3, w5)
       call VecWAXPY(y_rho, -1.0d0 / sf_opz(), w5, t_rho, ierr)
-      call cmult(a_62, 10, y_u, w3)
+      call MatMult(a_62, y_u, w3, ierr)
       call mass_cheb_solve(mcm, w3, w5)
       call VecWAXPY(y_T, -1.0d0 / sf_opz(), w5, t_T, ierr)
     else
       ! "b0" / "b1": the upper couplings of v_par too, (B_52 u + B_57 V, B_62 u + B_67 V)
-      call cmult(a_52, 8, y_u, w3)
+      call MatMult(a_52, y_u, w3, ierr)
       if (corr == 4) call VecAXPY(w3, 1.0d0, y_rho, ierr)  ! + B_51 psi_w
       if (vcor) then
-        call cmult(a_vc(VC57), 12 + VC57, y_v, w4)
+        call MatMult(a_vc(VC57), y_v, w4, ierr)
         call VecAXPY(w3, 1.0d0, w4, ierr)
       endif
       call PetscLogEventBegin(pcev_solve_rhot, ierr)
-      call bsolve(slv_rho, w3, w5)
+      call sf_solver_apply(slv_rho, w3, w5, ierr)
       call PetscLogEventEnd(pcev_solve_rhot, ierr)
       call VecWAXPY(y_rho, -1.0d0, w5, t_rho, ierr)
 
       ! [[B_55, 0], [B_65, B_66]] (drho, dT) = (B_52 u, B_62 u): with B_65 the
       ! T correction sees the rho correction just computed (w5)
-      call cmult(a_62, 10, y_u, w3)
+      call MatMult(a_62, y_u, w3, ierr)
       if (corr == 4) call VecAXPY(w3, 1.0d0, y_T, ierr)    ! + B_61 psi_w + B_63 j_w
       if (vcor) then
-        call cmult(a_vc(VC67), 12 + VC67, y_v, w4)
+        call MatMult(a_vc(VC67), y_v, w4, ierr)
         call VecAXPY(w3, 1.0d0, w4, ierr)
       endif
       if (use_b65) then
-        call cmult(a_65, 12, w5, w4)
+        call MatMult(a_65, w5, w4, ierr)
         call VecAXPY(w3, -1.0d0, w4, ierr)
       endif
       call PetscLogEventBegin(pcev_solve_rhot, ierr)
-      call bsolve(slv_T, w3, w5)
+      call sf_solver_apply(slv_T, w3, w5, ierr)
       call PetscLogEventEnd(pcev_solve_rhot, ierr)
       call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
     endif
@@ -1992,16 +1280,16 @@ contains
     !--- v_par, "v0": last, against the final psi, u, rho, T ---------------
     !   B_77 V = x_V - B_71 psi - B_72 u - B_75 rho - B_76 T
     if (with_v .and. .not. vcor) then
-      call cmult(a_vc(VC71), 12 + VC71, y_psi, wv1)
+      call MatMult(a_vc(VC71), y_psi, wv1, ierr)
       call VecWAXPY(wv2, -1.0d0, wv1, x_v, ierr)
-      call cmult(a_vc(VC72), 12 + VC72, y_u, wv1)
+      call MatMult(a_vc(VC72), y_u, wv1, ierr)
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
-      call cmult(a_vc(VC75), 12 + VC75, y_rho, wv1)
+      call MatMult(a_vc(VC75), y_rho, wv1, ierr)
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
-      call cmult(a_vc(VC76), 12 + VC76, y_T, wv1)
+      call MatMult(a_vc(VC76), y_T, wv1, ierr)
       call VecAXPY(wv2, -1.0d0, wv1, ierr)
       call PetscLogEventBegin(pcev_solve_rhot, ierr)
-      call bsolve(slv_v, wv2, y_v)
+      call sf_solver_apply(slv_v, wv2, y_v, ierr)
       call PetscLogEventEnd(pcev_solve_rhot, ierr)
     endif
     end block sweep
@@ -2045,15 +1333,15 @@ contains
     !--- seq 2: transport predictor, without the core
     if (seq == 2) then
       call PetscLogEventBegin(pcev_solve_rhot, ierr)
-      call bsolve(slv_rho, x_rho, t_rho)
+      call sf_solver_apply(slv_rho, x_rho, t_rho, ierr)
       call PetscLogEventEnd(pcev_solve_rhot, ierr)
       call VecCopy(x_T, w4, ierr)
       if (use_b65) then
-        call cmult(a_65, 12, t_rho, w3)
+        call MatMult(a_65, t_rho, w3, ierr)
         call VecAXPY(w4, -1.0d0, w3, ierr)
       endif
       call PetscLogEventBegin(pcev_solve_rhot, ierr)
-      call bsolve(slv_T, w4, t_T)
+      call sf_solver_apply(slv_T, w4, t_T, ierr)
       call PetscLogEventEnd(pcev_solve_rhot, ierr)
     endif
 
@@ -2061,29 +1349,29 @@ contains
     call VecCopy(x_u, w5, ierr)
     call VecCopy(x_psi, w4, ierr)
     if (seq == 2) then
-      call cmult(a_25, 5, t_rho, w3)
+      call MatMult(a_25, t_rho, w3, ierr)
       call VecAXPY(w5, -1.0d0, w3, ierr)
-      call cmult(a_26, 6, t_T, w3)
+      call MatMult(a_26, t_T, w3, ierr)
       call VecAXPY(w5, -1.0d0, w3, ierr)
-      call cmult(a_16, 2, t_T, w3)
+      call MatMult(a_16, t_T, w3, ierr)
       call VecAXPY(w4, -1.0d0, w3, ierr)
     endif
     parts = [w5, x_w, w4, x_j]
     call sf_split_parts(rhs_W, parts, .true.)
     call PetscLogEventBegin(pcev_solve_w, ierr)
-    call bsolve(slv_w, rhs_W, sol_W)
+    call sf_solver_apply(slv_w, rhs_W, sol_W, ierr)
     call PetscLogEventEnd(pcev_solve_w, ierr)
     parts = [y_u, y_w, y_psi, y_j]
     call sf_split_parts(sol_W, parts, .false.)
 
     !--- transport: B_55 drho = B_51 psi + B_52 u (seq 2: the correction;
     !--- seq 1: rho = B_55^-1 (x_rho - that))
-    call cmult(a_51, 7, y_psi, w3)
-    call cmult(a_52, 8, y_u, w4)
+    call MatMult(a_51, y_psi, w3, ierr)
+    call MatMult(a_52, y_u, w4, ierr)
     call VecAXPY(w3, 1.0d0, w4, ierr)
     if (seq == 1) call VecAYPX(w3, -1.0d0, x_rho, ierr)     ! x_rho - (B_51 psi + B_52 u)
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
-    call bsolve(slv_rho, w3, w5)
+    call sf_solver_apply(slv_rho, w3, w5, ierr)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
     if (seq == 1) then
       call VecCopy(w5, y_rho, ierr)
@@ -2092,23 +1380,23 @@ contains
     endif
 
     ! B_66 dT = B_61 psi + B_63 j + B_62 u - B_65 drho
-    call cmult(a_61, 9, y_psi, w3)
-    call cmult(a_63, 11, y_j, w4)
+    call MatMult(a_61, y_psi, w3, ierr)
+    call MatMult(a_63, y_j, w4, ierr)
     call VecAXPY(w3, 1.0d0, w4, ierr)
-    call cmult(a_62, 10, y_u, w4)
+    call MatMult(a_62, y_u, w4, ierr)
     call VecAXPY(w3, 1.0d0, w4, ierr)
     if (seq == 1) then
       call VecAYPX(w3, -1.0d0, x_T, ierr)                   ! x_T - (...)
       if (use_b65) then
-        call cmult(a_65, 12, y_rho, w4)
+        call MatMult(a_65, y_rho, w4, ierr)
         call VecAXPY(w3, -1.0d0, w4, ierr)
       endif
     else if (use_b65) then
-      call cmult(a_65, 12, w5, w4)
+      call MatMult(a_65, w5, w4, ierr)
       call VecAXPY(w3, -1.0d0, w4, ierr)
     endif
     call PetscLogEventBegin(pcev_solve_rhot, ierr)
-    call bsolve(slv_T, w3, w5)
+    call sf_solver_apply(slv_T, w3, w5, ierr)
     call PetscLogEventEnd(pcev_solve_rhot, ierr)
     if (seq == 1) then
       call VecCopy(w5, y_T, ierr)
@@ -2142,24 +1430,24 @@ contains
       return
     endif
     ! (drho, dT) from (B_57 x, B_67 x): drho in wv1, dT in wv2
-    call cmult(a_vc(VC57), 12 + VC57, x, w3)
-    call bsolve(slv_rho, w3, wv1)                         ! drho
-    call cmult(a_vc(VC67), 12 + VC67, x, w3)
+    call MatMult(a_vc(VC57), x, w3, ierr)
+    call sf_solver_apply(slv_rho, w3, wv1, ierr)                         ! drho
+    call MatMult(a_vc(VC67), x, w3, ierr)
     if (use_b65) then
-      call cmult(a_65, 12, wv1, w4)
+      call MatMult(a_65, wv1, w4, ierr)
       call VecAXPY(w3, -1.0d0, w4, ierr)
     endif
-    call bsolve(slv_T, w3, wv2)                           ! dT
+    call sf_solver_apply(slv_T, w3, wv2, ierr)                           ! dT
     ! v_par row: W_vv x against -(B_75 drho + B_76 dT)
-    call cmult(a_vc(VC75), 12 + VC75, wv1, w3)
-    call cmult(a_vc(VC76), 12 + VC76, wv2, w4)
+    call MatMult(a_vc(VC75), wv1, w3, ierr)
+    call MatMult(a_vc(VC76), wv2, w4, ierr)
     call VecAXPY(w3, 1.0d0, w4, ierr)
     call VecScale(w3, -1.0d0, ierr)
     call MatMult(g_ctx%W_vv, x, w5, ierr)
     call compare("W_vv x vs -(B_75 drho + B_76 dT)", w5, w3)
     ! u row: W_uv x against -(B_25 drho + B_26 dT)
-    call cmult(a_25, 5, wv1, w3)
-    call cmult(a_26, 6, wv2, w4)
+    call MatMult(a_25, wv1, w3, ierr)
+    call MatMult(a_26, wv2, w4, ierr)
     call VecAXPY(w3, 1.0d0, w4, ierr)
     call VecScale(w3, -1.0d0, ierr)
     call MatMult(g_ctx%W_uv, x, w5, ierr)
@@ -2167,16 +1455,16 @@ contains
     ! -sf_vpar_wvu_full: v_par row, u column, on xu (the first u right-hand
     ! side): W_vu xu against -(B_75 drho + B_76 dT), (drho, dT) from (B_52 xu, B_62 xu)
     if (vfull) then
-      call cmult(a_52, 8, xu, w3)
-      call bsolve(slv_rho, w3, wv1)
-      call cmult(a_62, 10, xu, w3)
+      call MatMult(a_52, xu, w3, ierr)
+      call sf_solver_apply(slv_rho, w3, wv1, ierr)
+      call MatMult(a_62, xu, w3, ierr)
       if (use_b65) then
-        call cmult(a_65, 12, wv1, w4)
+        call MatMult(a_65, wv1, w4, ierr)
         call VecAXPY(w3, -1.0d0, w4, ierr)
       endif
-      call bsolve(slv_T, w3, wv2)
-      call cmult(a_vc(VC75), 12 + VC75, wv1, w3)
-      call cmult(a_vc(VC76), 12 + VC76, wv2, w4)
+      call sf_solver_apply(slv_T, w3, wv2, ierr)
+      call MatMult(a_vc(VC75), wv1, w3, ierr)
+      call MatMult(a_vc(VC76), wv2, w4, ierr)
       call VecAXPY(w3, 1.0d0, w4, ierr)
       call VecScale(w3, -1.0d0, ierr)
       call MatMult(g_ctx%W_vu, xu, w5, ierr)
@@ -2211,7 +1499,6 @@ contains
       call sf_solver_report(slv_T,   my_id)
       if (with_v) call sf_solver_report(slv_v, my_id)
     endif
-    if (as_any) call as_report(my_id)
     call sf_solver_reset_counters(slv_pj)
     call sf_solver_reset_counters(slv_w)
     call sf_solver_reset_counters(slv_rho)

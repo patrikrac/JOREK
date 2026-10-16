@@ -63,10 +63,11 @@ module mod_petsc_pc_gmg
     integer :: ring_overlap = 0      !< smoother 4 (and 9's rings): a ring cut by a rank
                                      !< boundary is extended by up to this many nodes along
                                      !< J into the ranks owning the rest (RAS, as the lines)
-    integer :: harm_pair    = 0      !< 1 = a harmonic's cos and sin slots share every
+    integer :: harm_pair    = 1      !< 1 = a harmonic's cos and sin slots share every
                                      !< smoother block (first-order d_phi couplings, which
                                      !< map cos <-> sin, then lie inside the blocks);
-                                     !< 2 = every slot in one block (cross-|n| coupling)
+                                     !< 2 = every slot in one block (cross-|n| coupling).
+                                     !< Set by the caller only (physics_pc_sf_harm_couple)
     integer :: ring_solver  = -1     !< ring blocks (smoothers 4, 8): 0 LAPACK band / dense LU,
                                      !< 1 periodic block Thomas, 2 Thomas / reduction hybrid
                                      !< threaded across the rank's rings and their segments
@@ -252,7 +253,7 @@ module mod_petsc_pc_gmg
   ! radial lines outside (GMGPolar). Rings 0..axis_k form the axis block.
   integer, save :: ring_is = 1, axis_k = 0
   integer, save :: lovl = 0                 !< line overlap in nodes (gmg_opts_t%line_overlap)
-  integer, save :: hpair = 0                !< gmg_opts_t%harm_pair
+  integer, save :: hpair = 1                !< gmg_opts_t%harm_pair
   integer, save :: rovl = 0                 !< gmg_opts_t%ring_overlap (ring blocks)
   integer, save :: rsolv = 0, rbmin = 0, rchk = 0   !< gmg_opts_t%ring_solver / ring_btd_min / ring_check
   integer, save :: rseg = 0                         !< gmg_opts_t%ring_segs
@@ -283,7 +284,7 @@ module mod_petsc_pc_gmg
   integer, parameter :: MAX_INST = 5
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
-    integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 0, rovl = 0
+    integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 1, rovl = 0
     integer :: rsolv = 0, rbmin = 0, rchk = 0, rseg = 0
     logical :: rsp = .false.
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
@@ -1397,14 +1398,17 @@ contains
     lovl = 0
     if (sm_type /= 4) lovl = max(o%line_overlap, 0)
     if (sm_type /= 4) call opt_int("line_overlap", lovl)
-    hpair = max(o%harm_pair, 0)
-    call opt_int("harm_pair", hpair)
+    hpair = o%harm_pair
+    if (hpair /= 1 .and. hpair /= 2) then
+      if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: GMG harm_pair must be 1 or 2"
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    endif
     rovl = 0
     if (sm_type == 4) rovl = max(o%ring_overlap, 0)
     if (sm_type == 4) call opt_int("ring_overlap", rovl)
     rsolv = o%ring_solver
     call opt_int("ring_solver", rsolv)
-    if (rsolv < 0) rsolv = merge(RS_HYB, RS_LAPACK, hpair >= 2)
+    if (rsolv < 0) rsolv = merge(RS_HYB, RS_LAPACK, hpair == 2)
     rseg = max(o%ring_segs, 0)
     call opt_int("ring_segs", rseg)
     rbmin = max(o%ring_btd_min, 0)
@@ -1415,7 +1419,7 @@ contains
       integer :: isp
       isp = o%ring_single
       call opt_int("ring_single", isp)
-      if (isp < 0) isp = merge(1, 0, hpair >= 2)
+      if (isp < 0) isp = merge(1, 0, hpair == 2)
       rsp = (isp > 0 .and. rsolv > 0)
     end block
     if (rsolv > RS_HYB) then
@@ -1509,16 +1513,19 @@ contains
           " steps per side below"
         write(*,'(A,I0,A,I0,A,I0,A,I0,A)', advance="no") ", blocks ", ibg(1), " on level 0 (", &
           ibg(2), " banded, max kl ", ib(1), "; ", ibg(3), " singular -> point)"
-        if (hpair >= 2) write(*,'(A)', advance="no") ", all slots per block"
-        select case (rsolv)
-        case (RS_THOMAS)
-          write(*,'(A)', advance="no") ", ring blocks by block Thomas"
-        case (RS_HYB)
-          write(*,'(A,I0,A)', advance="no") ", ring blocks by the Thomas / reduction hybrid (", nseg, &
-            " segments on level 0)"
-        end select
-        if (rsolv > 0) write(*,'(A,I0,A)', advance="no") " (", nbtd, " over all levels)"
-        if (rsp) write(*,'(A)', advance="no") ", single precision"
+        if (hpair == 2) write(*,'(A)', advance="no") ", all slots per block"
+        ! the ring solver's line only where it has blocks (not on line smoothers)
+        if (nbtd > 0) then
+          select case (rsolv)
+          case (RS_THOMAS)
+            write(*,'(A)', advance="no") ", ring blocks by block Thomas"
+          case (RS_HYB)
+            write(*,'(A,I0,A)', advance="no") ", ring blocks by the Thomas / reduction hybrid (", nseg, &
+              " segments on level 0)"
+          end select
+          write(*,'(A,I0,A)', advance="no") " (", nbtd, " over all levels)"
+          if (rsp) write(*,'(A)', advance="no") ", single precision"
+        endif
         write(*,'(A,F9.2,A,F9.2,A)') "; factors ", st(1) * 8.d-6, " MB (max rank ", st(2) * 8.d-6, " MB)"
         if (sm_type == 8) write(*,'(A,I0,A)', advance="no") &
           "[Physics PC]   GMG hybrid smoother: ring blocks on fine rings I < ", ring_is, &
@@ -2616,8 +2623,8 @@ contains
     ilim = 0
     if (axis_k /= 0) ilim = axis_lim(g)
     ! the local segments, and the block of every (line or ring, slot): a line
-    ! is keyed by J, a ring by I; every slot of the block is registered (with
-    ! harm_pair a block holds a harmonic's cos and sin slots)
+    ! is keyed by J, a ring by I; every slot of the block is registered (a
+    ! block holds a harmonic's cos and sin slots, with harm_pair 2 all slots)
     nkey = nc
     if (rings) then
       nkey = 1
@@ -3249,11 +3256,12 @@ contains
     integer, intent(in) :: g, I, J, m_
     integer :: is_g, m
     m = m_
-    if (hpair == 1) m = pc_grp(m_)         ! slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs
+    ! harm_pair 1: slots 0 | 1, 2 | 3, 4 | ...: n = 0, then cos/sin pairs.
     ! harm_pair 2: every slot in one block. Cross-|n| couplings (a nonlinear
     ! or 3D equilibrium couples n to n' at O(1), at fine radial scales that
     ! no coarse level resolves) then lie inside the smoother's blocks.
-    if (hpair >= 2) m = 0
+    m = pc_grp(m_)
+    if (hpair == 2) m = 0
     if (I == 0 .or. I <= axis_lim(g)) then
       blk_id = m + 1
     else if (sm_type == 4) then

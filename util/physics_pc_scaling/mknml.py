@@ -43,16 +43,18 @@ ARMS = {
 # Every block has two backends: gmg (production) and lu (the exact
 # reference). The multigrid configuration is fixed in mod_petsc_pc_sf_solver
 # (smoothers, V-cycle shapes, line overlap, axis block), not in the namelist.
-# The namelist defaults are the production configuration (wpj + mode split +
-# gmg everywhere); the arms below set every SF flag they depend on, so each
-# arm means the same whatever the defaults. The arms without an S_uu suffix
-# run "schur", the _w arms "w" = B_22 + W; the arms without _ms run the
-# global (not mode-split) operators. The production arm is sf_gmg_wpj_ms.
+# The namelist defaults are the production configuration (wpj + all
+# harmonics coupled + gmg everywhere); the arms below set every SF flag they
+# depend on, so each arm means the same whatever the defaults. The arms
+# without an S_uu suffix run "schur", the _w arms "w" = B_22 + W; the arms
+# without _hcall keep |n|-diagonal blocks, on the global operators or (_ms)
+# the mode split. The production arm is sf_gmg_wpj_hcall.
 SF_BASE = 'inxflow_shaped_pcbench'
 SF_COMMON = {
     'use_physics_pc': '.t.',
     'eliminate_boundary_dofs': '.t.',
     'physics_pc_sf_suu': '"schur"',
+    'physics_pc_sf_harm_couple': '.f.',
     'physics_pc_sf_mode_split': '.f.',
     'physics_pc_sf_rtol': '1.d-1',
 }
@@ -76,14 +78,14 @@ for _v in ('wj', 'wpj'):
 # LU, isolating the V-cycle) and the whole path (sf_gmg_*)
 ARMS['sf_lugw_wpj'] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_pair_w='"gmg"')
 ARMS['sf_gmg_wpj'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"wpj"')
-# Cross-|n| couplings kept in the SF blocks (physics_pc_sf_harm_couple):
-# hc1 = |n| groups at most 1 apart, hcall = all; fixed for the run. The LU arm
-# with all couplings is the exact-block floor of the coupled path.
-for _b, _k in (('hc1', '1'), ('hcall', '-1')):
-    ARMS['sf_gmg_wpj_' + _b] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple=_k,
-                                    physics_pc_sf_cross_weights='.t.')
-    ARMS['sf_lu_wpj_' + _b] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple=_k,
-                                   physics_pc_sf_cross_weights='.t.')
+# All cross-|n| couplings kept (physics_pc_sf_harm_couple, fixed for the
+# run): in the SF blocks and in the GMG smoother blocks (all slots of a node
+# in one block). sf_gmg_wpj_hcall is production; the LU arm is the
+# exact-block floor of the coupled path.
+ARMS['sf_gmg_wpj_hcall'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple='.t.',
+                                physics_pc_sf_cross_weights='.t.')
+ARMS['sf_lu_wpj_hcall'] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple='.t.',
+                               physics_pc_sf_cross_weights='.t.')
 # The wpj corrector (physics_pc_sf_corrector): the default (auto) is Chacon
 # Eq. (17), (psi, j) read off pair_w; this arm keeps Eq. (16), the second
 # pair_psi solve, for the A/B comparison.
@@ -101,16 +103,10 @@ ARMS['sf_gmg_wpj_fresh'] = dict(ARMS['sf_gmg_wpj'], iter_precon='0',
                                 physics_pc_sf_cross_weights='.f.')
 ARMS['sf_gmg_wpj_hcall_fresh'] = dict(ARMS['sf_gmg_wpj_hcall'], iter_precon='0',
                                       physics_pc_sf_cross_weights='.f.')
-# ... and the SF solvers on one |n| family per rank, the families concurrent
-# (physics_pc_sf_mode_split; np >= (n_tor+1)/2). With a cross-|n| band (_hc1,
-# _hcall: the same band on every operator, W included) the block solves become
-# FGMRES over all families, the family solvers as block-Jacobi preconditioner.
+# ... and the |n|-diagonal SF solvers on one |n| family per rank, the
+# families concurrent (physics_pc_sf_mode_split; np >= (n_tor+1)/2).
 ARMS['sf_gmg_wpj_ms'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_mode_split='.t.')
 ARMS['sf_gmg_wpj_fresh_ms'] = dict(ARMS['sf_gmg_wpj_fresh'], physics_pc_sf_mode_split='.t.')
-for _b in ('hc1', 'hcall'):
-    ARMS['sf_gmg_wpj_ms_' + _b] = dict(ARMS['sf_gmg_wpj_' + _b], physics_pc_sf_mode_split='.t.',
-                                       physics_pc_sf_cross_weights='.f.')
-    ARMS['sf_gmg_wpj_fresh_ms_' + _b] = dict(ARMS['sf_gmg_wpj_ms_' + _b], iter_precon='0')
 
 # v_par (model600 built with_vpar; base PCS_BASE=namelist/model600/
 # inxflow_shaped_vpar_pcbench): its block's backend follows the arm (lu / gmg),
