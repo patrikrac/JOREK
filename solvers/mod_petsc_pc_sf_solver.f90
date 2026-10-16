@@ -33,9 +33,9 @@ module mod_petsc_pc_sf_solver
   integer, parameter, public :: SF_GMG = 2
 
   !--- GMG smoothers (codes of mod_petsc_pc_gmg) ----------------------------
-  !> Collective radial-line block Jacobi: rho, T. Workstream H: at least as
-  !! good as the point and node smoothers on rho and T at 41x64 and tstep
-  !! 0.1 / 1 / 10.
+  !> Collective radial-line block Jacobi: rho (T until 2026-10, see
+  !! SF_GMG_SMOOTHER_RINGS). Workstream H: at least as good as the point and
+  !! node smoothers on rho and T at 41x64 and tstep 0.1 / 1 / 10.
   integer, parameter, public :: SF_GMG_SMOOTHER_LINES = 5
   !> Zebra (red-black) radial-line block Gauss-Seidel on the split (psi, j)
   !! pair: Chacon's collective smoothing of the split system (JCP 526 (2025)
@@ -59,7 +59,7 @@ module mod_petsc_pc_sf_solver
   !! run-to-run spread (outer its 91-115 vs 93-109, mean solve 216 vs 230 s;
   !! pair_w hits its 30-iteration cap at tstep 1, which makes that arm's
   !! outer count vary by +-10% between identical runs). Kept for uniformity.
-  !! Not on rho / T (line Jacobi there; smoother 8: T 2.0 -> 8.8 V-cycles).
+  !! Not on rho / T (lines / rings there; smoother 8: T 2.0 -> 8.8 V-cycles).
   integer, parameter, public :: SF_GMG_SMOOTHER_ZEBRA_RINGS = 8
   !> Flux-surface ring blocks (all J at one I), block Jacobi inside the
   !! level-0 GMRES smoothing: the mixed pair_w ("wj" / "wpj"). At large dt its
@@ -68,6 +68,14 @@ module mod_petsc_pc_sf_solver
   !! pair_w to 1e-8 (harmonics paired): rings 9-11 FGMRES its and the LU's
   !! outer count (6); zebra radial lines (smoother 8) and zebra over all rings
   !! (8 with the switch ring moved out) both stall at a 1e-2 .. 3e-3 reduction.
+  !! Also the T block, for the same reason: chi_par diffuses along B, and
+  !! radial lines leave that coupling between the blocks. intear_dtm 65x32,
+  !! n_tor 7, np 32 x 8, tstep 10, rebuilt every step (2026-10-16), T
+  !! V-cycles per solve lines -> rings (ring overlap 2, semi_r -1):
+  !! ZK_par 1: 1.0-1.26 -> 1.00; ZK_par 100: 3.6-4.4 -> 1.00; ZK_par 1000:
+  !! 5.0-5.1 (40% at the 10-cycle cap) -> 1.00-1.02. Outer its +0..0.6;
+  !! setup + solve per step +1..5% at ZK_par 1, -2..+2% at 100, -6..7% at
+  !! 1000; ring factors 13 MB on the largest rank.
   integer, parameter, public :: SF_GMG_SMOOTHER_RINGS = 4
   !> ... and a ring cut by a rank boundary is completed from the neighbours
   !! (restricted additive Schwarz along J). 41x32 np 4, tstep 10: without it

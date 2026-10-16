@@ -589,11 +589,14 @@ contains
     call sf_solver_setup(slv_rho, a_rho, bk_rho, "rho-block KSP", &
                          comm_s, my_id, physics_pc_sf_rtol, gmg_inst=3, nfields=1, &
                          smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
+    ! T: chi_par diffuses along B, around the flux surfaces -- pair_w's ring
+    ! blocks and radial semi-coarsening (see SF_GMG_SMOOTHER_RINGS)
     call sf_solver_setup(slv_T,   a_T,   bk_T,   "T-block KSP", &
                          comm_s, my_id, physics_pc_sf_rtol, gmg_inst=4, nfields=1, &
-                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot)
+                         smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS_RHOT, axis_rings=ax_rhot, &
+                         ring_overlap=SF_GMG_RING_OVERLAP, semi_r=SF_GMG_SEMI_R_MIXED)
     !--- v_par (GMG hierarchy 5). v0: B_77 is mass-dominated and nearly
-    !--- isotropic (mass + poloidal visco_par), so the rho / T setup. b0: the
+    !--- isotropic (mass + poloidal visco_par), so the rho setup. b0: the
     !--- W_vv sound term is diffusion ALONG B -- along the flux surfaces, and
     !--- cos <-> sin through d_phi -- so pair_w's ring blocks and its radial
     !--- semi-coarsening; Richardson damped
