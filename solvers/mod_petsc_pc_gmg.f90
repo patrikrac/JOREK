@@ -3407,6 +3407,8 @@ contains
       PetscScalar, pointer :: xp(:), yp(:), gp(:)
       PetscErrorCode :: ie
       integer :: bb, k, p
+      ! B%rg(bb) is spelled out: an associate inside these OpenMP loops
+      ! crashes ifx (internal compiler error)
       call PetscLogEventBegin(gev_lines(cur_inst), ie)
       call ghosts_in(xx, gp)
       call VecGetArrayRead(xx, xp, ie)
@@ -3422,43 +3424,37 @@ contains
           call scat(bb, 1, B%sz(bb), .false., yp)
           cycle
         endif
-        associate (rg => B%rg(bb))
-          call gath(bb, rg%rp(rg%sep(k)) + 1, rg%rp(hyb_end(rg, k) + 1), rsp, xp, gp)
-          if (rsp) then
-            call hyb_sol_fwd_sp(rg, B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), B%wk4(B%off(bb) + 1), k)
-          else
-            call hyb_sol_fwd(rg, B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), B%wk(B%off(bb) + 1), k)
-          endif
-        end associate
+        call gath(bb, B%rg(bb)%rp(B%rg(bb)%sep(k)) + 1, B%rg(bb)%rp(hyb_end(B%rg(bb), k) + 1), rsp, xp, gp)
+        if (rsp) then
+          call hyb_sol_fwd_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), B%wk4(B%off(bb) + 1), k)
+        else
+          call hyb_sol_fwd(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), B%wk(B%off(bb) + 1), k)
+        endif
       enddo
       !$omp end do
       !$omp do schedule(dynamic, 1)
       do bb = 1, B%nb
         if (.not. reduced(bb)) cycle
-        associate (rg => B%rg(bb))
-          if (rsp) then
-            call hyb_sol_sep_sp(rg, B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), B%wk4(B%off(bb) + 1))
-          else
-            call hyb_sol_sep(rg, B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), B%wk(B%off(bb) + 1))
-          endif
-          do k = 0, rg%ns - 1
-            call scat(bb, rg%rp(rg%sep(k)) + 1, rg%rp(rg%sep(k) + 1), rsp, yp)
-          enddo
-        end associate
+        if (rsp) then
+          call hyb_sol_sep_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), B%wk4(B%off(bb) + 1))
+        else
+          call hyb_sol_sep(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), B%wk(B%off(bb) + 1))
+        endif
+        do k = 0, B%rg(bb)%ns - 1
+          call scat(bb, B%rg(bb)%rp(B%rg(bb)%sep(k)) + 1, B%rg(bb)%rp(B%rg(bb)%sep(k) + 1), rsp, yp)
+        enddo
       enddo
       !$omp end do
       !$omp do schedule(dynamic, 1)
       do p = 1, size(B%lb)
         bb = B%lb(p); k = B%lk(p)
         if (.not. reduced(bb)) cycle
-        associate (rg => B%rg(bb))
-          if (rsp) then
-            call hyb_sol_bwd_sp(rg, B%lu4(B%loff4(bb) + 1), B%wk4(B%off(bb) + 1), k)
-          else
-            call hyb_sol_bwd(rg, B%lu(B%loff(bb) + 1), B%wk(B%off(bb) + 1), k)
-          endif
-          call scat(bb, rg%rp(rg%sep(k) + 1) + 1, rg%rp(hyb_end(rg, k) + 1), rsp, yp)
-        end associate
+        if (rsp) then
+          call hyb_sol_bwd_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%wk4(B%off(bb) + 1), k)
+        else
+          call hyb_sol_bwd(B%rg(bb), B%lu(B%loff(bb) + 1), B%wk(B%off(bb) + 1), k)
+        endif
+        call scat(bb, B%rg(bb)%rp(B%rg(bb)%sep(k) + 1) + 1, B%rg(bb)%rp(hyb_end(B%rg(bb), k) + 1), rsp, yp)
       enddo
       !$omp end do
       !$omp end parallel
