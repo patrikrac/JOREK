@@ -603,7 +603,6 @@ contains
   !! global communicator.
   !--------------------------------------------------------------------
   subroutine sff_op_fill(op, Aj, Wf, opz)
-    use mod_parameters, only: n_tor, n_var
     type(fam_op_t), intent(inout) :: op
     Mat, intent(in)    :: Aj, Wf(:)
     real*8, intent(in) :: opz

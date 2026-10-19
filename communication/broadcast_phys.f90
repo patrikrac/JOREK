@@ -767,11 +767,7 @@ if (my_id .eq. 0) then
   call MPI_PACK(use_strumpack_prj,      1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(strumpack_matching,     1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(use_physics_pc,         1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
-  ! These four were added with the Workstream B mixed-pair arm and were never
-  ! broadcast: on np > 1 every non-root rank silently kept the preset default,
-  ! which is a wrong preconditioner with no error message. Serial-only gating on
-  ! that arm hid it. Order here must match the UNPACK block exactly.
-  call MPI_PACK(physics_pc_sf_suu, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  ! the physics PC's flags; the order must match the UNPACK block
   call MPI_PACK(physics_pc_sf_pair_psi, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_pair_w, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_rho, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -780,7 +776,6 @@ if (my_id .eq. 0) then
   call MPI_PACK(physics_pc_sf_harm_couple, 1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_mode_split, 1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_corrector, 1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
-  call MPI_PACK(physics_pc_sf_cross_weights, 1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_vpar, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_vpar_stage, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(eliminate_boundary_dofs,1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -1649,7 +1644,6 @@ if (my_id .ne. 0) then
   call MPI_UNPACK(buffer,bufsize,position,use_strumpack_prj,      1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,strumpack_matching,     1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,use_physics_pc,         1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
-  call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_suu, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_pair_psi, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_pair_w, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_rho, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
@@ -1658,7 +1652,6 @@ if (my_id .ne. 0) then
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_harm_couple, 1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_mode_split, 1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_corrector, 1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
-  call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_cross_weights, 1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_vpar, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_vpar_stage, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,eliminate_boundary_dofs,1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)

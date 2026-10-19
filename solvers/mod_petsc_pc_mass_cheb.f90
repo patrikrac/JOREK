@@ -8,42 +8,17 @@ module mod_petsc_pc_mass_cheb
   private
 
   !--------------------------------------------------------------------
-  !> A constraint mass B (B_33) applied as B^-1 by a Chebyshev iteration of
-  !! fixed degree, preconditioned by additive Schwarz: one subdomain per
-  !! rank, overlap 1, local ICC(0) on a nested-dissection ordering.
+  !> A mass matrix B applied as B^-1 by a fixed-degree Chebyshev iteration,
+  !! preconditioned by additive Schwarz (one subdomain per rank, overlap 1,
+  !! local ICC(0) on a nested-dissection ordering): corrector 3's rho / T
+  !! mass inverse in the SF sweep.
   !!
-  !! WHY. The SF path's schur arm applies B_33^-1 in the level-0 operator of
-  !! pair_w's multigrid (mod_petsc_pc_sf_pairw, sfw_dh): in every smoother
-  !! step and V-cycle residual. The exact factor (mod_petsc_pc_mass_slot,
-  !! MUMPS with a centralized RHS) GROWS with the rank count there (161x64
-  !! cluster: 90 s at np 1, 312 s at np 32), and the mass needs no
-  !! exactness: it sits inside a preconditioner whose pair solves stop at
-  !! rtol 1e-1. Measured (shaped pcbench, tstep 1, 3 steps, with the mass
-  !! then also in pair_w's Krylov operator): outer and pair_w counts equal
-  !! MUMPS's to round-off at 61x48 / 81x32 / 121x48, np 1x4 and 4x1, down to
-  !! a Chebyshev energy-norm bound of ~5%; the diagonal Qi alone gives 2.5x
-  !! the outer its and 10x the pair_w its.
-  !!
-  !! WHY THIS PRECONDITIONER. The preconditioned C1 Hermite mass is
-  !! mesh-independent (Wathen, IMA J. Numer. Anal. 7 (1987) 449), and the
-  !! local factor's ordering decides the constant: kappa = 3.25 (np 1) and
-  !! 4.7 (np 4) with ND, 17.9 / 33.6 with the natural ordering, 552 with
-  !! point Jacobi, 21 with a rank-local FSAI, 39 with ParaSails. Overlap
-  !! only raises lambda_max, bounded by how many subdomains share a row.
-  !!
-  !! WHY THE DEGREE IS NOT A CONSTANT. It follows kappa: 2 rho^d <= TARGET,
-  !! rho = (sqrt k - 1)/(sqrt k + 1). A fixed degree measured at np 1 fails
-  !! at np 4 once kappa doubles (natural ordering, degree 3: 52 -> 77 outer
-  !! its; degree 5 restores 55), and a Chebyshev polynomial below its
-  !! degree floor is not a small perturbation (FSAI degree 3: 130 its).
-  !! The bounds come from one CG (Lanczos) run per run -- B is
-  !! geometry-only -- and are GATED: the measured B-norm error of the
-  !! apply must meet the bound the degree was chosen for, or the bounds were
-  !! wrong and the setup widens them and retries.
-  !!
-  !! A fixed degree with no norms makes the apply a FIXED LINEAR operator,
-  !! so the shell stays linear inside FGMRES; the only communication is the
-  !! halo exchange of B's matvec and of the Schwarz restriction.
+  !! The preconditioned C1 Hermite mass is mesh-independent (Wathen, IMA J.
+  !! Numer. Anal. 7 (1987) 449). The degree follows kappa, 2 rho^d <= TARGET
+  !! with rho = (sqrt k - 1)/(sqrt k + 1), from bounds of one Lanczos run per
+  !! run (B is geometry-only), gated: the measured B-norm error must meet the
+  !! bound, or the bounds are widened and the setup retries. Without norms
+  !! the apply is a fixed linear operator, so FGMRES around it stays valid.
   !--------------------------------------------------------------------
   real*8, parameter  :: TARGET = 1.d-1   !< Chebyshev B-norm error bound per apply
   integer, parameter :: DEG_MIN = 2
@@ -55,7 +30,7 @@ module mod_petsc_pc_mass_cheb
     real*8  :: lo = 0.d0, hi = 0.d0, err = 0.d0
   end type mass_cheb_t
 
-  public :: mass_cheb_setup, mass_cheb_solve, mass_cheb_destroy
+  public :: mass_cheb_setup, mass_cheb_solve
 
 contains
 
@@ -162,12 +137,6 @@ contains
 
   end subroutine mass_cheb_setup
 
-  subroutine mass_cheb_destroy(MC)
-    type(mass_cheb_t), intent(inout) :: MC
-    PetscErrorCode :: ierr
-    if (MC%ready) call KSPDestroy(MC%ksp, ierr)
-    MC%ready = .false.
-  end subroutine mass_cheb_destroy
 
   !> y = B^-1 x, to the chosen degree
   subroutine mass_cheb_solve(MC, x, y)

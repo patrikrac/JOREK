@@ -29,7 +29,6 @@ contains
     PetscCallA(KSPGetPC(ksp, pc, ierr))
     PetscCallA(PCSetType(pc, PCSHELL, ierr))
     PetscCallA(PCShellSetApply(pc, physics_pc_apply, ierr))
-    g_ctx%initialized = .true.
   end subroutine petsc_setup_physics_pc
 
   !--------------------------------------------------------------------

@@ -645,15 +645,13 @@ subroutine preset_parameters
   
   ! the physics-based (SF) preconditioner; the defaults are its production configuration
   use_physics_pc              = .false.     ! Use the physics-based (SF) preconditioner (PETSc)
-  physics_pc_sf_suu           = "wpj"       ! pair_w's S_uu: wpj | wj | w | schur
   physics_pc_sf_pair_psi      = "gmg"       ! pair_psi backend: gmg | lu
   physics_pc_sf_pair_w        = "gmg"       ! pair_w backend: gmg | lu
   physics_pc_sf_rho           = "gmg"       ! rho block backend: gmg | lu
   physics_pc_sf_T             = "gmg"       ! T block backend: gmg | lu
   physics_pc_sf_rtol          = 1.d-1       ! shared inner rtol for the iterative backends
-  physics_pc_sf_corrector     = -1          ! -1 = auto (4 on wpj, else Eq.16), 0 = Eq.16, 1 = Eq.17, 2 = Eq.17 without B_16 T*, 3 = strict Eq.17 (mass-only rho/T), 4 = consistent (1 + B_51 psi_w, B_61 psi_w + B_63 j_w in the rho/T corrections)
+  physics_pc_sf_corrector     = 4           ! 4 consistent | 0 Eq.16 | 1 Eq.17 | 2 Eq.17 w/o B_16 T* | 3 strict Eq.17
   physics_pc_sf_harm_couple   = .true.      ! cross-|n| coupling in the blocks and the smoothers; .false. = |n|-diagonal
-  physics_pc_sf_cross_weights = .false.     ! per-build cross-|n| weight report (diagnostic, one pass over A)
   physics_pc_sf_mode_split    = .true.      ! harm_couple .false. only: SF solvers on one |n| family per rank group, families concurrent
   physics_pc_sf_vpar          = "gmg"       ! v_par block backend (model600 with_vpar): gmg | lu
   physics_pc_sf_vpar_stage    = "v0"        ! v_par in the sweep: v0 (last, no feedback) | b0 (velocity stage + sound Schur W) | b1 (in pair_w)

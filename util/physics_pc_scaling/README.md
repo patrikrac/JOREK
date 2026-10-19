@@ -118,7 +118,7 @@ The GMG arm needs n_flux − 1 divisible by 4 and n_tht divisible by 8 (at least
 faster than the DOF count). Run it on whole nodes (`--mem=0`), or leave it out
 of the large cases.
 
-## The SF arms (`sf_gmg_wpj_hcall`, `sf_gmg_wpj_ms`, `sf_gmg`, `sf_gmg_w`, `sf_gmg_wpj`, `sf_lu`, `sf_lu_w`, `sf_lu_wpj`, `sf_jorek`, `sf_direct`)
+## The SF arms (`sf_gmg_wpj_hcall`, `sf_gmg_wpj_ms`, `sf_gmg_wpj`, `sf_lu_wpj`, `sf_jorek`, `sf_direct`)
 
 Every SF arm sets each `physics_pc_sf_*` flag it depends on (`mknml.py`), so
 an arm means the same whatever the namelist defaults. The arms without
@@ -139,12 +139,10 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 |---|---|
 | `sf_gmg_wpj_hcall` | **production**: `sf_gmg_wpj` with all toroidal harmonics coupled |
 | `sf_gmg_wpj_ms` | `sf_gmg_wpj` on one \|n\| family per rank group (`physics_pc_sf_mode_split`) |
-| `sf_gmg` | S_uu = `schur`: every block on its C¹ GMG, pair_psi split (ψ, j) and pair_w on zebra lines, ρ / T on radial lines |
-| `sf_gmg_w` | the same with S_uu = `w`, B₂₂ + W assembled |
-| `sf_gmg_wpj` | the same with pair_w mixed (u, ω, ψ, j), ring smoother |
-| `sf_gmg_wpj_eq16` | `sf_gmg_wpj` with the Eq. (16) corrector (a second pair_psi solve) instead of the default Eq. (17) |
-| `sf_lu` / `sf_lu_w` / `sf_lu_wpj` | every block by MUMPS LU: the exact references, for approximation quality (`sf_lu_wj`: the lumped-mass form; `sf_lugw_wpj`: LU except pair_w) |
-| `sf_gmg_wpj_hcall`, `sf_lu_wpj_hcall` | `sf_gmg_wpj` / `sf_lu_wpj` keeping all cross-\|n\| couplings (`physics_pc_sf_harm_couple` = .t.: in the blocks and all slots per GMG smoother block, fixed for the run), with the per-build cross-\|n\| weight report on (`physics_pc_sf_cross_weights`) |
+| `sf_gmg_wpj` | every block on its C¹ GMG, \|n\|-diagonal blocks on the global operators: pair_psi (ψ, j) on zebra rings / lines, pair_w (u, ω, ψ, j) and T on rings, ρ on radial lines |
+| `sf_gmg_wpj_eq16` | `sf_gmg_wpj` with the Eq. (16) corrector (a second pair_psi solve) instead of the default consistent one |
+| `sf_lu_wpj` | every block by MUMPS LU: the exact reference, for approximation quality (`sf_lugw_wpj`: LU except pair_w) |
+| `sf_gmg_wpj_hcall`, `sf_lu_wpj_hcall` | `sf_gmg_wpj` / `sf_lu_wpj` keeping all cross-\|n\| couplings (`physics_pc_sf_harm_couple` = .t.: in the blocks and all slots per GMG smoother block, fixed for the run) |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
 | `sf_direct` | full-system direct solve: one MUMPS LU of the whole coupled Jacobian (`-jorek_pc_full_lu`, in-core), refactorised every step (`iter_precon = 0`); FGMRES only checks it |
 
@@ -153,14 +151,17 @@ sweep needs M⁻¹ U δv. Chacon's Eq. (16) applies the full M⁻¹ (a second pa
 solve); Eq. (17) replaces it by the surrogate P_SF is built on. On `wpj` that
 surrogate is pair_w's own small-flow ψ row, so the correction is the ψ, j part
 of pair_w's solution, which the sweep used to discard: no extra solve. `B₁₆ T*`
-goes onto pair_w's ψ-row right-hand side (2 drops it). The default (−1) picks
-Eq. (17) on `wpj` and Eq. (16) elsewhere. 41×32, np 1 × 4, ramp 1e-3 … 10:
+goes onto pair_w's ψ-row right-hand side (2 drops it). The default is now
+the consistent corrector 4 (Eq. (17) plus pair_w's (ψ, j) in the ρ / T
+corrections). 41×32, np 1 × 4, ramp 1e-3 … 10:
 identical outer counts (53 in 13 steps) with Eq. (16), (17) and (17) without
 B₁₆; pair_psi solves 106 → 53, PC apply 7.55 → 6.49 s. The tables below
 predate it (Eq. 16).
 
-**The two pair_w operators** (`physics_pc_sf_suu`, the only namelist entry
-that picks the method; the rest of the sweep is shared):
+**The pair_w operators.** Only `wpj` remains in the code (2026-10-19); the
+`schur`, `w` and `wj` forms (`physics_pc_sf_suu`), their arms and the
+measurements below that use them are history, with the code on the branch
+`archive/sf-suu-variants`:
 
 - `schur`: S_uu is the ψ-channel Schur complement of the Jacobian, applied
   matrix-free, with pair_psi's own solver inside (one V-cycle per pair_w
@@ -235,7 +236,7 @@ np 4 × 1, outer its per step (pair_w V-cycles), wall s:
 | `sf_gmg` (schur) | 121×48 | 7/7/7 (4.1) | | 85.5 |
 | `sf_gmg_w` | 121×48 | 56/58/55 | | 115.2 |
 
-**The mixed pair_w's V-cycle: radial semi-coarsening** (`SF_GMG_SEMI_R_MIXED`,
+**The mixed pair_w's V-cycle: radial semi-coarsening** (`SF_GMG_SEMI_R`,
 `-sf_gmg1_semi_r k`). On these grids the cells are long in θ (median
 r·dθ/dr 3.75 at 41×32, 7.6 at 81×32, 121×48 and 161×64), so the elliptic
 couplings are strongest radially; the ring blocks do not smooth them and a

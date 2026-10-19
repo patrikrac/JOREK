@@ -43,10 +43,8 @@ module mod_petsc_pc_gmg
   implicit none
   private
 
-  public :: gmg_build_prolongations, gmg_setup_operator, gmg_vcycle_apply, gmg_is_ready
-  public :: gmg_select, gmg_vcycle, gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5
-  public :: gmg_pc_apply_1, gmg_pc_apply_2
-  public :: gmg_push, gmg_pop
+  public :: gmg_build_prolongations, gmg_setup_operator, gmg_is_ready, gmg_select
+  public :: gmg_pc_apply_1, gmg_pc_apply_2, gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5
   public :: gmg_opts_t
 
   !> Everything that configures a hierarchy, passed EXPLICITLY by the caller
@@ -104,7 +102,7 @@ module mod_petsc_pc_gmg
   !! semi-coarsened ones keep more rows per level and may use MAX_LEV
   integer, parameter :: MAX_LEV_FULL = 6
   integer, parameter :: CRS_MUMPS_MIN = 2000  !< coarsest LU rows from which MUMPS (SCOTCH) factors
-  integer, parameter :: SM_STEPS  = 4      !< GMRES iterations per smoothing (the paper's, and stage C1's)
+  integer, parameter :: SM_STEPS  = 4      !< default smoothing steps
   integer, parameter :: MAX_ENT   = 16     !< max nonzeros per scalar row of P (2x2 sources x 4 DOFs)
   !> semi_r < 0: levels coarsen radially only while the median r dtheta/dr of
   !! their cells exceeds this; each such level halves it, a full one keeps it
@@ -132,8 +130,6 @@ module mod_petsc_pc_gmg
   Mat, save         :: gA(0:MAX_LEV-1)      !< gA(0) borrowed (the fine operator), gA(g>0) owned
   KSP, save         :: gSm(0:MAX_LEV-1)
   Vec, save         :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1)
-  Mat, save         :: gF                   !< fine-level matvec operator: gA(0), or a
-                                            !< matrix-free equivalent (Workstream D)
   logical, save     :: p_ready = .false., op_ready = .false., vec_ready = .false.
 
   !> A direct solve of A(rows, rows) done REDUNDANTLY on the ranks that own
@@ -143,8 +139,8 @@ module mod_petsc_pc_gmg
   !! the hierarchy's communicator -- only an Allgatherv among the members when
   !! the rows span ranks -- and non-members skip it. loc = the rank's rows
   !! (local, 0-based, ascending; set before the first rds_setup), cnt/dsp =
-  !! the members' row counts/offsets. Used for the stage-D13 axis blocks and
-  !! the coarsest level, which both live on a few ranks at scale.
+  !! the members' row counts/offsets. Used for the axis blocks and the
+  !! coarsest level, which both live on a few ranks at scale.
   type :: rds_t
     logical :: ready = .false., member = .false.
     integer :: comm = MPI_COMM_NULL, np = 0, me = 0
@@ -168,11 +164,10 @@ module mod_petsc_pc_gmg
     logical, allocatable :: band(:)
     integer(8), allocatable :: loff(:)
     real*8, allocatable  :: lu(:)
-    ! Stage D13: with gmg_opts_t%axis_rings /= 0 the axis block (rings
-    ! 0..axis_lim(g), every slot) is not factored dense but by MUMPS on its
-    ! submatrix: it holds a fixed fraction of the level's rows (~I_s/n_flux),
-    ! so a dense LU would cost O(N^3). axblk(b) marks its blocks.
-    ! The solve is an rds_t: only the ranks owning axis rows take part.
+    ! With axis_rings /= 0 the axis block (rings 0..axis_lim(g), every slot)
+    ! is a sparse direct solve on its submatrix (rds_t, only the ranks owning
+    ! axis rows take part): a dense LU of a fixed fraction of the level's rows
+    ! would cost O(N^3). axblk(b) marks its blocks.
     logical :: axsparse = .false.
     logical, allocatable :: axblk(:)
     IS  :: axis_is
@@ -243,7 +238,6 @@ module mod_petsc_pc_gmg
   integer, allocatable, save :: fine_harm(:) !< level-0 row -> toroidal slot m
   integer, save :: nth0 = 0                  !< n_tht (level-0 nj)
   integer, save :: nf_s = 0, cur_lev = 0
-  integer, save :: stk_inst(8), stk_lev(8), nstk = 0
   integer, save :: sm_type = 0, sm_nstep = 4
   real*8, allocatable, save :: blk_t_work(:,:)   !< (max block size, 0:threads-1)
   integer, parameter :: LINES_OMP_MIN = 4000     !< rows below which lines_solve stays serial
@@ -274,13 +268,10 @@ module mod_petsc_pc_gmg
   ! J-sector axis solve, whose submatrices are pattern-bound, gives way to the LU.
   logical, save :: pat_fresh = .false.
 
-  ! Workstream D (pair_psi): several independent hierarchies in one module.
-  ! The routines below work on the module-level state; gmg_select(k) parks
-  ! the active instance's state in inst(cur_inst) and loads instance k.
-  ! PETSc handles are pointers and the arrays move with move_alloc, so a
-  ! switch is O(1). Instance 1 = pair_w, 2 = pair_psi, 3 = B_55 (rho),
-  ! 4 = B_66 (T), 5 = v_par (model600 with_vpar). V-cycles of different instances nest only through
-  ! gmg_push / gmg_pop (the schur arm's pair_w shell applying pair_psi).
+  ! Several independent hierarchies: the routines work on the module-level
+  ! state, and gmg_select(k) parks the active instance's state in
+  ! inst(cur_inst) and loads instance k (handles copied, arrays moved, O(1)).
+  ! Instance 1 = pair_w, 2 = pair_psi, 3 = rho, 4 = T, 5 = v_par.
   integer, parameter :: MAX_INST = 5
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
@@ -289,7 +280,7 @@ module mod_petsc_pc_gmg
     logical :: rsp = .false.
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false.
-    Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gF
+    Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1)
     KSP :: gSm(0:MAX_LEV-1)
     type(rds_t) :: gcrs
     Vec :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1)
@@ -305,16 +296,11 @@ module mod_petsc_pc_gmg
   integer, save :: st_pre0(MAX_INST) = SM_STEPS, st_post0(MAX_INST) = SM_STEPS
   integer, save :: st_crs(MAX_INST) = SM_STEPS
 
-  ! -log_view events (Workstream D cost audit). Registered here, not in the
-  ! physics-PC ctx, so this module keeps no dependency on it.
+  ! -log_view events; the apply-side ones per instance (GMG_*, GMG<k>_*)
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1
   PetscLogEvent, save :: gev_prolong = -1
   PetscLogEvent, save :: gev_blkmesh = -1, gev_blkpat = -1, gev_blknum = -1, gev_axnum = -1, gev_axtry = -1
-  ! Workstream G, finding D3: these are per INSTANCE, like gev_vcycle. While
-  ! they were shared, no -log_view number could attribute line or axis time to
-  ! pair_w rather than to Shat / rho / T, which is what left C1's rank soft.
   PetscLogEvent, save :: gev_lines(MAX_INST) = -1, gev_axsolve(MAX_INST) = -1   !< the block smoother's two halves
-  ! per hierarchy instance (1 = pair_w keeps the original names, 2 = GMG2_*)
   PetscLogEvent, save :: gev_vcycle(MAX_INST) = -1, gev_smooth0(MAX_INST) = -1, gev_smooth(MAX_INST) = -1
   PetscLogEvent, save :: gev_coarse(MAX_INST) = -1
   logical, save       :: gev_ready = .false.
@@ -330,22 +316,6 @@ module mod_petsc_pc_gmg
 
 contains
 
-  !> Save / restore the active hierarchy and level around a NESTED use of
-  !! another hierarchy -- the pair_w shell applying pair_psi's V-cycle
-  !! (instance 2) while instance 1 is active.
-  subroutine gmg_push()
-    nstk = nstk + 1
-    if (nstk > size(stk_inst)) stop "gmg_push: stack overflow"
-    stk_inst(nstk) = cur_inst; stk_lev(nstk) = cur_lev
-  end subroutine gmg_push
-
-  subroutine gmg_pop()
-    if (nstk < 1) stop "gmg_pop: empty stack"
-    call gmg_select(stk_inst(nstk))
-    cur_lev = stk_lev(nstk)
-    nstk = nstk - 1
-  end subroutine gmg_pop
-
   !> Make hierarchy k the active one (see gmg_inst_t).
   subroutine gmg_select(k)
     integer, intent(in) :: k
@@ -359,7 +329,7 @@ contains
       S%rsolv = rsolv; S%rbmin = rbmin; S%rchk = rchk; S%rsp = rsp; S%rseg = rseg
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready
-      S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm
+      S%gP = gP; S%gA = gA; S%gSm = gSm
       S%gx = gx; S%gb = gb; S%gr = gr
       do g = 0, MAX_LEV - 1
         call move_blk(gBk(g), S%gBk(g))
@@ -377,7 +347,7 @@ contains
       rsolv = S%rsolv; rbmin = S%rbmin; rchk = S%rchk; rsp = S%rsp; rseg = S%rseg
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready
-      gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm
+      gP = S%gP; gA = S%gA; gSm = S%gSm
       gx = S%gx; gb = S%gb; gr = S%gr
       do g = 0, MAX_LEV - 1
         call move_blk(S%gBk(g), gBk(g))
@@ -535,16 +505,16 @@ contains
         ! coarsest levels (287-574 rows) cost < 0.1 s in all and keep PETSc's.
         block
           PetscInt :: nsub
-          call MatGetSize(rds_op(R), nsub, PETSC_NULL_INTEGER, ierr)
+          call MatGetSize(R%sub(1), nsub, PETSC_NULL_INTEGER, ierr)
           if (what == "coarse" .and. nsub >= CRS_MUMPS_MIN) then
             call rds_make_ksp(MATSOLVERMUMPS)
           else
             call rds_make_ksp(MATSOLVERPETSC)
           endif
         end block
-        call MatCreateVecs(rds_op(R), R%x, R%b, ierr)
+        call MatCreateVecs(R%sub(1), R%x, R%b, ierr)
       else
-        call KSPSetOperators(R%ksp, rds_op(R), rds_op(R), ierr)
+        call KSPSetOperators(R%ksp, R%sub(1), R%sub(1), ierr)
       endif
     endif
     if (R%member) then
@@ -590,7 +560,7 @@ contains
     subroutine rds_make_ksp(stype)
       character(len=*), intent(in) :: stype   ! not MatSolverType (len=80): ifort rejects the short constants
       call KSPCreate(PETSC_COMM_SELF, R%ksp, ierr)
-      call KSPSetOperators(R%ksp, rds_op(R), rds_op(R), ierr)
+      call KSPSetOperators(R%ksp, R%sub(1), R%sub(1), ierr)
       call KSPSetType(R%ksp, KSPPREONLY, ierr)
       call KSPGetPC(R%ksp, pc, ierr)
       call PCSetType(pc, PCLU, ierr)
@@ -621,13 +591,6 @@ contains
       call KSPSetFromOptions(R%ksp, ierr)
     end subroutine rds_make_ksp
   end subroutine rds_setup
-
-  !> The matrix the KSP factors.
-  function rds_op(R) result(M_)
-    type(rds_t), intent(in) :: R
-    Mat :: M_
-    M_ = R%sub(1)
-  end function rds_op
 
   !> yy(R%loc) = A(rows, rows)^-1 xx(R%loc) on the members; others return.
   subroutine rds_solve(R, xx, yy)
@@ -675,9 +638,43 @@ contains
     call VecRestoreArrayRead(R%x, bp, ie)
   end subroutine rds_solve_arr
 
-  !> One V-cycle of hierarchy k on b (x out), outside any PC: the pair_psi
-  !! eta-Schur applies it to Shat.
-  subroutine gmg_vcycle(k, b, x)
+  !> PC-shell entry points, one per hierarchy instance: x = one V-cycle on b.
+  subroutine gmg_pc_apply_1(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call vcycle_of(1, b, x, ierr)
+  end subroutine gmg_pc_apply_1
+
+  subroutine gmg_pc_apply_2(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call vcycle_of(2, b, x, ierr)
+  end subroutine gmg_pc_apply_2
+
+  subroutine gmg_pc_apply_3(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call vcycle_of(3, b, x, ierr)
+  end subroutine gmg_pc_apply_3
+
+  subroutine gmg_pc_apply_4(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call vcycle_of(4, b, x, ierr)
+  end subroutine gmg_pc_apply_4
+
+  subroutine gmg_pc_apply_5(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call vcycle_of(5, b, x, ierr)
+  end subroutine gmg_pc_apply_5
+
+  subroutine vcycle_of(k, b, x, ierr)
     integer, intent(in) :: k
     Vec :: b, x
     PetscErrorCode :: ierr
@@ -685,50 +682,8 @@ contains
     call PetscLogEventBegin(gev_vcycle(cur_inst), ierr)
     call vcycle(0, b, x)
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
-  end subroutine gmg_vcycle
-
-  !> PC-shell entry points of the pair_w (1), Shat (2), rho (3), T (4) and
-  !! v_par (5) hierarchies. gmg_vcycle_apply is instance 1's historical name and is kept
-  !! so the research path's PCShellSetApply is unchanged; gmg_pc_apply_1 is the
-  !! same callback under the uniform name the production path selects by index.
-  subroutine gmg_pc_apply_1(pc, b, x, ierr)
-    PC  :: pc
-    Vec :: b, x
-    PetscErrorCode :: ierr
-    call gmg_vcycle_apply(pc, b, x, ierr)
-  end subroutine gmg_pc_apply_1
-
-  subroutine gmg_pc_apply_2(pc, b, x, ierr)
-    PC  :: pc
-    Vec :: b, x
-    PetscErrorCode :: ierr
-    call gmg_vcycle(2, b, x)
     ierr = 0
-  end subroutine gmg_pc_apply_2
-
-  subroutine gmg_pc_apply_3(pc, b, x, ierr)
-    PC  :: pc
-    Vec :: b, x
-    PetscErrorCode :: ierr
-    call gmg_vcycle(3, b, x)
-    ierr = 0
-  end subroutine gmg_pc_apply_3
-
-  subroutine gmg_pc_apply_4(pc, b, x, ierr)
-    PC  :: pc
-    Vec :: b, x
-    PetscErrorCode :: ierr
-    call gmg_vcycle(4, b, x)
-    ierr = 0
-  end subroutine gmg_pc_apply_4
-
-  subroutine gmg_pc_apply_5(pc, b, x, ierr)
-    PC  :: pc
-    Vec :: b, x
-    PetscErrorCode :: ierr
-    call gmg_vcycle(5, b, x)
-    ierr = 0
-  end subroutine gmg_pc_apply_5
+  end subroutine vcycle_of
 
   logical function gmg_is_ready()
     gmg_is_ready = p_ready
@@ -759,13 +714,14 @@ contains
     logical, allocatable :: oset(:,:)
     integer :: n_inact
     ! (lv is handed to the module-level glv at the end, for the block maps)
-    integer :: n_idx, e, iv, n, k, i, j, ni, nj, g, cand(4), nent, nrow_s, ncol_s
+    integer :: n_idx, e, iv, n, k, i, j, ni, nj, g, cand(4), nent, nrow_s
     integer :: eps_s(4), eps_t(4), cols(MAX_ENT), vi(4), vj(4), idx
     real*8  :: w(MAX_ENT)
     integer, allocatable :: rs(:), cs(:)
     real*8,  allocatable :: ws(:)
     logical, allocatable :: done(:)
     integer :: ns, nlev_cap
+    real*8, allocatable :: asp(:,:), asp_sorted(:)
     type(lay_t), allocatable :: ly(:)
     integer, allocatable :: rstarts(:)
     integer :: me, np, mpierr, r, first, ci, cj, dd, own_, ff, mm, lr, nloc
@@ -837,33 +793,32 @@ contains
     if (my_id == 0 .and. n_inact > 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, &
       ": ", n_inact, " axis DOFs inactive (fix_axis_nodes), P leaves them out"
 
+    !--- cell aspect r dtheta/dr (> 1: long in theta) of every cell off the
+    !--- axis, ring by ring, and sorted for the medians
+    allocate(asp(n_tht, n_flux - 2))
+    do i = 1, n_flux - 2
+      do j = 0, n_tht - 1
+        asp(j + 1, i) = cell_aspect(i, j)
+      enddo
+    enddo
+    asp_sorted = reshape(asp, [size(asp)])
+    call sort_real(asp_sorted)
+
     !--- coarse levels. Radial semi-coarsening (semi_r): on cells long in theta
-    !--- the elliptic couplings are strongest radially, which the ring blocks do
-    !--- not smooth, and a full-coarsening coarse grid cannot take the error
-    !--- they leave; the levels that coarsen in I alone can (line relaxation
-    !--- with semi-coarsening across the lines, robust for either anisotropy).
+    !--- the couplings are strongest radially, which the ring blocks do not
+    !--- smooth and a full-coarsening coarse grid cannot take; levels that
+    !--- coarsen in I alone can.
     if (semi_r < 0) then
       block
-        real*8, allocatable :: ar(:)
-        real*8 :: asp, xa(2), xb(2), xc(2)
-        integer :: na, ii, jj
-        allocate(ar((n_flux - 2) * n_tht))
-        na = 0
-        do ii = 1, n_flux - 2
-          do jj = 0, n_tht - 1
-            na = na + 1
-            ar(na) = cell_aspect(ii, jj)
-          enddo
-        enddo
-        call sort_real(ar(1:na))
-        asp = ar((na + 1) / 2)
+        real*8 :: a_
+        a_ = asp_sorted((size(asp_sorted) + 1) / 2)
         semi_r = 0
-        do while (asp > SEMI_ASPECT .and. semi_r < MAX_LEV - 1)
-          semi_r = semi_r + 1; asp = asp / 2
+        do while (a_ > SEMI_ASPECT .and. semi_r < MAX_LEV - 1)
+          semi_r = semi_r + 1; a_ = a_ / 2
         enddo
         if (my_id == 0) write(*,'(A,I0,A,I0,A,F6.2,A)') "[Physics PC]   GMG", cur_inst, &
-          ": radial semi-coarsening on levels 1..", semi_r, " (median r dtheta/dr ", ar((na + 1) / 2), ")"
-        deallocate(ar)
+          ": radial semi-coarsening on levels 1..", semi_r, " (median r dtheta/dr ", &
+          asp_sorted((size(asp_sorted) + 1) / 2), ")"
       end block
     endif
     allocate(lv(1:MAX_LEV - 1))
@@ -992,8 +947,8 @@ contains
       deallocate(rs, cs, ws)
     enddo
 
-    !--- Workstream D: packed LOCAL row -> (node, harmonic) maps for the block
-    !--- smoothers, fine level (fine_node/fine_harm) and every coarse level
+    !--- packed LOCAL row -> (node, harmonic) maps for the block smoothers,
+    !--- fine level (fine_node/fine_harm) and every coarse level
     nf_s = n_fields
     nth0 = n_tht
     nloc = n_fields * pc_ntor * ly(0)%nl(me)
@@ -1054,58 +1009,37 @@ contains
     deallocate(ly, rstarts)
     call move_alloc(lv, glv)
 
-    !--- Workstream D (flux-geometry robustness): cell aspect ratio, from the
-    !--- vertex positions, skipping the axis ring where the angular side vanishes
+    !--- the switch ring I_s of smoother 8 / axis_rings -1: the first ring
+    !--- whose median aspect reaches ring_aspect (GMGPolar's criterion); ring
+    !--- ii holds the cells between flux surfaces ii and ii+1
     block
-      real*8, allocatable :: ar(:)
-      real*8 :: dr, dt, xa(2), xb(2), xc(2), tmp
-      integer :: na, ii, jj, kk
-      allocate(ar((n_flux - 2) * n_tht))
-      na = 0
-      do ii = 1, n_flux - 2
-        do jj = 0, n_tht - 1
-          na = na + 1
-          ar(na) = cell_aspect(ii, jj)          ! > 1: cell long in theta
-        enddo
-      enddo
-      call sort_real(ar(1:na))                   ! na = (n_flux-2) n_tht cells
+      real*8 :: rm(n_flux - 2), row(n_tht)
+      integer :: ii, na
+      na = size(asp_sorted)
       if (my_id == 0) write(*,'(A,F8.2,A,F8.2,A,F8.2)') &
-        "[Physics PC]   GMG grid cells, rdtheta/dr: median ", ar((na + 1) / 2), &
-        ", max ", ar(na), ", min ", ar(1)
-      deallocate(ar)
-
-      ! Per-ring median and the switch ring I_s: the first ring whose median
-      ! reaches gmg_opts_t%ring_aspect (GMGPolar's circle/radial criterion).
-      ! Ring ii holds the cells between flux surfaces ii and ii+1.
-      block
-        real*8, allocatable :: rm(:), row(:)
-        integer :: nshow
-        allocate(rm(n_flux - 2), row(n_tht))
-        do ii = 1, n_flux - 2
-          do jj = 0, n_tht - 1
-            row(jj + 1) = cell_aspect(ii, jj)
-          enddo
-          call sort_real(row)
-          rm(ii) = row((n_tht + 1) / 2)
-        enddo
-        ring_is = n_flux - 1
-        do ii = 1, n_flux - 2
-          if (rm(ii) >= gopt%ring_aspect) then
-            ring_is = ii; exit
-          endif
-        enddo
-        if (my_id == 0) then
-          nshow = min(n_flux - 2, ring_is + 2)
-          write(*,'(A,F5.2,A,I0,A)', advance="no") "[Physics PC]   GMG ring medians rdtheta/dr (switch at ", &
-            gopt%ring_aspect, ": rings I < ", ring_is, "):"
-          do ii = 1, nshow
-            write(*,'(A,F6.2)', advance="no") " ", rm(ii)
-          enddo
-          write(*,*)
+        "[Physics PC]   GMG grid cells, rdtheta/dr: median ", asp_sorted((na + 1) / 2), &
+        ", max ", asp_sorted(na), ", min ", asp_sorted(1)
+      do ii = 1, n_flux - 2
+        row = asp(:, ii)
+        call sort_real(row)
+        rm(ii) = row((n_tht + 1) / 2)
+      enddo
+      ring_is = n_flux - 1
+      do ii = 1, n_flux - 2
+        if (rm(ii) >= gopt%ring_aspect) then
+          ring_is = ii; exit
         endif
-        deallocate(rm, row)
-      end block
+      enddo
+      if (my_id == 0) then
+        write(*,'(A,F5.2,A,I0,A)', advance="no") "[Physics PC]   GMG ring medians rdtheta/dr (switch at ", &
+          gopt%ring_aspect, ": rings I < ", ring_is, "):"
+        do ii = 1, min(n_flux - 2, ring_is + 2)
+          write(*,'(A,F6.2)', advance="no") " ", rm(ii)
+        enddo
+        write(*,*)
+      endif
     end block
+    deallocate(asp, asp_sorted)
 
     if (my_id == 0) then
       write(*,'(A,I0,A)', advance="no") "[Physics PC]   GMG hierarchy: ", nlev, " levels, grid "
@@ -1216,7 +1150,7 @@ contains
 
   !> Canonical DOF numbering of one coarse level. The axis keeps the shared
   !! value and per-node a and c; its angular slope b is dropped (see header).
-  !! bnd_drop (stage D13): the boundary ring also drops u and the angular
+  !! bnd_drop: the boundary ring also drops u and the angular
   !! slope b, the two DOFs JOREK's Dirichlet condition fixes. A coarse function
   !! with u = b = 0 on the boundary prolongs to a fine one with u = b = 0 there
   !! (C1 subdivision along the boundary edge), so the constrained spaces stay
@@ -1309,15 +1243,9 @@ contains
   !! at every PC rebuild with new values in A; P is reused, and with an
   !! unchanged pattern so are the coarse operators and the LUs' symbolic phase.
   !--------------------------------------------------------------------
-  subroutine gmg_setup_operator(A, comm, my_id, Afine, tag, opts, Ablk)
+  subroutine gmg_setup_operator(A, comm, my_id, tag, opts)
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
-    Mat, intent(in), optional :: Afine  !< Workstream D: applies the fine operator
-                                        !< for every level-0 matvec; A still gives the
-                                        !< Galerkin chain, Jacobi diagonal and axis block
-    Mat, intent(in), optional :: Ablk   !< the level-0 smoother blocks (lines, zebra
-                                        !< coupling, axis block) from Ablk instead of A;
-                                        !< same layout as A, frozen pattern
     character(len=*), intent(in), optional :: tag   !< label for the prints
     type(gmg_opts_t), intent(in) :: opts    !< the whole configuration
     type(gmg_opts_t) :: o
@@ -1368,8 +1296,6 @@ contains
 
     call gmg_register_events()
     gA(0) = A
-    gF = A
-    if (present(Afine)) gF = Afine
     call PetscLogEventBegin(gev_ptap, ierr)
     do g = 1, nlev - 1
       if (reuse) then
@@ -1412,7 +1338,6 @@ contains
           okb = blockmv_attach(gA(gg), int(pc_ntor))
           if (gg > 0) okb = blockmv_attach(gP(gg), 1)
         enddo
-        if (gF /= gA(0)) okb = blockmv_attach(gF, int(pc_ntor))   ! a shell: left alone
         if (.not. op_ready .and. my_id == 0) write(*,'(A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, &
           ": level matvecs on the OpenMP block kernel (bs ", pc_ntor, ", ", nlev, " levels)"
       end block
@@ -1485,11 +1410,7 @@ contains
       ! Created and configured once per hierarchy; a rebuild only re-points
       ! the operators and refactors the smoother blocks.
       if (.not. op_ready) call KSPCreate(comm, gSm(g), ierr)
-      if (g == 0) then
-        call KSPSetOperators(gSm(g), gF, gA(g), ierr)     ! the blocks read the Pmat
-      else
-        call KSPSetOperators(gSm(g), gA(g), gA(g), ierr)
-      endif
+      call KSPSetOperators(gSm(g), gA(g), gA(g), ierr)
       if (.not. op_ready) then
         if (g >= rich_from) then
           call KSPSetType(gSm(g), KSPRICHARDSON, ierr)
@@ -1512,11 +1433,7 @@ contains
         call PCShellSetApply(pc, blk_apply, ierr)
         call PCShellSetName(pc, "C1 block smoother", ierr)
       endif
-      if (g == 0 .and. present(Ablk)) then
-        call build_blocks(g, Ablk)
-      else
-        call build_blocks(g, gA(g))
-      endif
+      call build_blocks(g, gA(g))
       call KSPSetUp(gSm(g), ierr)
     enddo
     call axd_factor_pending()
@@ -1609,7 +1526,7 @@ contains
     if (op_ready) return
     op_ready = .true.
 
-    ! Operator complexity: the whole point against GAMG's C_op ~ 1.00 (T2).
+    ! operator complexity
     call MatGetInfo(gA(0), MAT_GLOBAL_SUM, minfo, ierr)
     nz0 = minfo%nz_used; nzt = nz0
     if (my_id == 0) write(*,'(A)', advance="no") "[Physics PC]   GMG levels n (nnz/row):"
@@ -1697,36 +1614,6 @@ contains
     v = pv
   end subroutine opt_real
 
-  !> Options prefix gmg<k>_<what>_ for a direct-solve KSP of hierarchy k, and
-  !! MUMPS' centralized RHS under that prefix unless the user set it: PETSc's
-  !! np > 1 default (distributed RHS) corrupts the heap on our builds and is
-  !! read only from the options database (see mod_petsc petsc_initialize).
-  subroutine set_prefix_mumps(ksp, what)
-    KSP :: ksp
-    character(len=*), intent(in) :: what
-    character(len=64) :: pre, nm
-    PetscBool :: has
-    PetscErrorCode :: ierr
-    write(pre, '(A,I0,A,A,A)') "gmg", cur_inst, "_", what, "_"
-    call KSPSetOptionsPrefix(ksp, trim(pre), ierr)
-    nm = "-"//trim(pre)//"mat_mumps_icntl_20"
-    call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), has, ierr)
-    if (.not. has) call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(nm), "0", ierr)
-    call KSPSetFromOptions(ksp, ierr)
-  end subroutine set_prefix_mumps
-
-  !> PCSHELL apply: x = one V-cycle applied to b.
-  subroutine gmg_vcycle_apply(pc, b, x, ierr)
-    PC  :: pc
-    Vec :: b, x
-    PetscErrorCode :: ierr
-    call gmg_select(1)                  ! the PC-shell entry point is pair_w's
-    call PetscLogEventBegin(gev_vcycle(cur_inst), ierr)
-    call vcycle(0, b, x)
-    call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
-    ierr = 0
-  end subroutine gmg_vcycle_apply
-
   subroutine gmg_register_events()
     PetscErrorCode :: ierr
     PetscClassId, parameter :: cid = 0
@@ -1798,11 +1685,7 @@ contains
     if (npre == 0) then
       call VecCopy(b, gr(g), ierr)                        ! x is still 0: r = b
     else
-      if (g == 0) then
-        call MatMult(gF, x, gr(g), ierr)
-      else
-        call MatMult(gA(g), x, gr(g), ierr)
-      endif
+      call MatMult(gA(g), x, gr(g), ierr)
       call VecAYPX(gr(g), -1.0d0, b, ierr)                ! r = b - A x
     endif
     call MatMultTranspose(gP(g + 1), gr(g), gb(g + 1), ierr)
@@ -1854,7 +1737,6 @@ contains
   !!  - numeric part, every rebuild: gather through the maps (blk_fill), then
   !!    factor. A singular block falls back to its diagonal (nsing).
   subroutine build_blocks(g, A)
-    use mod_petsc_pc_harm, only: pc_ntor
     integer, intent(in) :: g
     Mat, intent(in)     :: A
     type(blk_t), pointer :: B
@@ -1888,26 +1770,10 @@ contains
         endif
         B%bid(r) = blk_id(g, I, J, m)
         if (sm_type == 5 .or. sm_type == 7) key(r) = I
-        if (sm_type == 4) then
-          ! a ring is periodic in J: ordered 0, nc-1, 1, nc-2, ... (as smoother
-          ! 8's rings) its J +- 1 couplings, the wrap included, lie within two
-          ! nodes -- a band instead of a dense block
-          if (J < nc - J) then
-            key(r) = 2 * J
-          else
-            key(r) = 2 * (nc - 1 - J) + 1
-          endif
-        endif
+        if (sm_type == 4) key(r) = ring_key(J, nc)
         if (sm_type == 8) then
-          ! a ring is periodic in J: ordered 0, nc-1, 1, nc-2, ... its J +- 1
-          ! couplings, the wrap included, lie within two nodes -- a narrow band
-          ! instead of a dense block
           if (I < ring_lim(g)) then
-            if (J < nc - J) then
-              key(r) = 2 * J
-            else
-              key(r) = 2 * (nc - 1 - J) + 1
-            endif
+            key(r) = ring_key(J, nc)
           else
             key(r) = I
           endif
@@ -1956,7 +1822,7 @@ contains
         enddo
       enddo
       deallocate(cnt, key)
-      ! Stage D13: the axis block(s) go to a sparse direct solve
+      ! the axis block(s) go to a sparse direct solve
       allocate(B%axblk(B%nb))
       B%axblk = .false.
       if (axis_k /= 0) then
@@ -2836,11 +2702,7 @@ contains
         else
           J = gJ(r - nr)
         endif
-        if (J < nc - J) then
-          rkey(r) = 2 * J
-        else
-          rkey(r) = 2 * (nc - 1 - J) + 1
-        endif
+        rkey(r) = ring_key(J, nc)
       enddo
       do bb = 1, B%nb
         if (nsz(bb) == B%sz(bb)) cycle
@@ -3320,6 +3182,18 @@ contains
     endif
   end function blk_id
 
+  !> Position of node J in a periodic ring's band order 0, nc-1, 1, nc-2, ...:
+  !! the J +- 1 couplings, the wrap included, then lie within two nodes, a
+  !! narrow band instead of a dense block.
+  pure integer function ring_key(J, nc)
+    integer, intent(in) :: J, nc
+    if (J < nc - J) then
+      ring_key = 2 * J
+    else
+      ring_key = 2 * (nc - 1 - J) + 1
+    endif
+  end function ring_key
+
   !> Switch ring of level g: coarse ring I sits at fine ring I*2^g, so the
   !! same physical radius as the fine ring_is (the ratio r*dtheta/dr does not
   !! change under standard coarsening).
@@ -3330,7 +3204,7 @@ contains
 
   !> Last ring of the axis block on level g: axis_k (>= 0) on every level, or
   !! with axis_k < 0 the rings below the switch radius, 0..ring_lim(g)-1 (at
-  !! least ring 1). Stage D13: the circle-dominated rings only help when they
+  !! least ring 1). The circle-dominated rings only help when they
   !! are solved TOGETHER with the pole; as separate ring blocks they hurt.
   integer function axis_lim(g)
     integer, intent(in) :: g

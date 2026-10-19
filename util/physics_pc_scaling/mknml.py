@@ -41,54 +41,36 @@ ARMS = {
 # The physics PC (use_physics_pc, mod_petsc_pc_sf*) on the reference physics
 # case, inxflow_shaped_pcbench, ramped from a fresh equilibrium up to tstep 1.
 # Every block has two backends: gmg (production) and lu (the exact
-# reference). The multigrid configuration is fixed in mod_petsc_pc_sf_solver
-# (smoothers, V-cycle shapes, line overlap, axis block), not in the namelist.
-# The namelist defaults are the production configuration (wpj + all
-# harmonics coupled + gmg everywhere); the arms below set every SF flag they
-# depend on, so each arm means the same whatever the defaults. The arms
-# without an S_uu suffix run "schur", the _w arms "w" = B_22 + W; the arms
-# without _hcall keep |n|-diagonal blocks, on the global operators or (_ms)
-# the mode split. The production arm is sf_gmg_wpj_hcall.
+# reference); the multigrid configuration is fixed in mod_petsc_pc_sf_solver.
+# The arms set every SF flag they depend on, so each means the same whatever
+# the defaults. Without _hcall the blocks are |n|-diagonal, on the global
+# operators or (_ms) the mode split. The production arm is sf_gmg_wpj_hcall.
+# (The S_uu forms schur / w / wj of the sf_gmg, sf_lu, *_w, *_wj arms were
+# removed; their code is on the branch archive/sf-suu-variants.)
 SF_BASE = 'inxflow_shaped_pcbench'
 SF_COMMON = {
     'use_physics_pc': '.t.',
     'eliminate_boundary_dofs': '.t.',
-    'physics_pc_sf_suu': '"schur"',
     'physics_pc_sf_harm_couple': '.f.',
     'physics_pc_sf_mode_split': '.f.',
     'physics_pc_sf_rtol': '1.d-1',
 }
-ARMS['sf_gmg'] = dict(SF_COMMON, **{
+ARMS['sf_gmg_wpj'] = dict(SF_COMMON, **{
     'physics_pc_sf_pair_psi': '"gmg"', 'physics_pc_sf_pair_w': '"gmg"',
     'physics_pc_sf_rho': '"gmg"', 'physics_pc_sf_T': '"gmg"',
 })
-ARMS['sf_lu'] = dict(SF_COMMON, **{
+ARMS['sf_lu_wpj'] = dict(SF_COMMON, **{
     'physics_pc_sf_pair_psi': '"lu"', 'physics_pc_sf_pair_w': '"lu"',
     'physics_pc_sf_rho': '"lu"', 'physics_pc_sf_T': '"lu"',
 })
-ARMS['sf_gmg_w'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"w"')
-ARMS['sf_lu_w'] = dict(ARMS['sf_lu'], physics_pc_sf_suu='"w"')
-# pair_w mixed (mod_petsc_pc_sf_mixed): B_22 + W with W's psi-channel terms
-# taken out and the channel put back through explicit j (wj: psi by the lumped
-# mass) or psi and j (wpj: the small-flow psi row). LU on pair_w only, as the
-# gate before any multigrid.
-for _v in ('wj', 'wpj'):
-    ARMS['sf_lu_' + _v] = dict(ARMS['sf_lu'], physics_pc_sf_suu='"%s"' % _v)
-# ... and on the multigrid: pair_w alone (sf_lugw_*: everything else on its
-# LU, isolating the V-cycle) and the whole path (sf_gmg_*)
+# pair_w alone on the multigrid, everything else on its LU (isolates the V-cycle)
 ARMS['sf_lugw_wpj'] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_pair_w='"gmg"')
-ARMS['sf_gmg_wpj'] = dict(ARMS['sf_gmg'], physics_pc_sf_suu='"wpj"')
-# All cross-|n| couplings kept (physics_pc_sf_harm_couple, fixed for the
-# run): in the SF blocks and in the GMG smoother blocks (all slots of a node
-# in one block). sf_gmg_wpj_hcall is production; the LU arm is the
-# exact-block floor of the coupled path.
-ARMS['sf_gmg_wpj_hcall'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple='.t.',
-                                physics_pc_sf_cross_weights='.t.')
-ARMS['sf_lu_wpj_hcall'] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple='.t.',
-                               physics_pc_sf_cross_weights='.t.')
-# The wpj corrector (physics_pc_sf_corrector): the default (auto) is Chacon
-# Eq. (17), (psi, j) read off pair_w; this arm keeps Eq. (16), the second
-# pair_psi solve, for the A/B comparison.
+# All cross-|n| couplings kept, in the SF blocks and in the GMG smoother
+# blocks: sf_gmg_wpj_hcall is production; the LU arm is its exact-block floor.
+ARMS['sf_gmg_wpj_hcall'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_harm_couple='.t.')
+ARMS['sf_lu_wpj_hcall'] = dict(ARMS['sf_lu_wpj'], physics_pc_sf_harm_couple='.t.')
+# The corrector (physics_pc_sf_corrector): the default is the consistent one
+# (4); this arm keeps Eq. (16), the second pair_psi solve, for comparison.
 ARMS['sf_gmg_wpj_eq16'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_corrector='0')
 # JOREK's default PC on the same case and ramp
 ARMS['sf_jorek'] = {'use_physics_pc': '.f.'}
@@ -98,11 +80,8 @@ ARMS['sf_direct'] = {'use_physics_pc': '.f.', 'iter_precon': '0'}
 
 # SF arms rebuilt at EVERY step (iter_precon = 0), like jorek_fresh: the
 # like-for-like comparison of per-step setup + solve against JOREK's PC.
-# The cross-|n| weight report is a diagnostic pass over A: off in these timing arms.
-ARMS['sf_gmg_wpj_fresh'] = dict(ARMS['sf_gmg_wpj'], iter_precon='0',
-                                physics_pc_sf_cross_weights='.f.')
-ARMS['sf_gmg_wpj_hcall_fresh'] = dict(ARMS['sf_gmg_wpj_hcall'], iter_precon='0',
-                                      physics_pc_sf_cross_weights='.f.')
+ARMS['sf_gmg_wpj_fresh'] = dict(ARMS['sf_gmg_wpj'], iter_precon='0')
+ARMS['sf_gmg_wpj_hcall_fresh'] = dict(ARMS['sf_gmg_wpj_hcall'], iter_precon='0')
 # ... and the |n|-diagonal SF solvers on one |n| family per rank, the
 # families concurrent (physics_pc_sf_mode_split; np >= (n_tor+1)/2).
 ARMS['sf_gmg_wpj_ms'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_mode_split='.t.')

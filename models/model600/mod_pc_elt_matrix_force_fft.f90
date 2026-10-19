@@ -1,130 +1,21 @@
-!> model600's copy of the force operator W (models/model199/
-!! mod_pc_elt_matrix_force_fft.f90), for the SF path on model600 run with
-!! its extensions off (n_var = 6, the slots of model199).
+!> model600's force operator W (see models/model199/mod_pc_elt_matrix_force_fft.f90):
+!! with its extensions off model600's blocks entering W are model199's (the
+!! u row's pressure coupling one integration by parts apart, the T equation
+!! in pressure form giving the same dp), so W is model199's curvature term,
+!! with GAMMA from phys_module.
 !!
-!! WHY A COPY IS ENOUGH. With tauIC = 0, TG, NEO and v_par off, model600's
-!! blocks entering W are model199's:
-!!   - psi row: the same B_11 mass v psi/R and B_12 = Bpar;
-!!   - u row: the same R^3 rho mass (model199's r0_hat = R^2 rho), B_21, B_23;
-!!   - zj row: the same weak form of Delta* psi, v zj/R + grad v.grad psi/R;
-!!   - pressure: model600 writes the u row's coupling as -R^2 [v, dp], model199
-!!     as +2R v dZ dp -- one integration by parts apart, the same operator;
-!!     and model600's T equation is in pressure form (mass v R (rho0 dT +
-!!     T0 drho) = v R dp, u column -v R^2 [p0, du] - 2 gamma R p0 dZ du v),
-!!     which gives the dp model199 builds from its separate rho and T rows.
-!! So the continuum W is the same; only GAMMA differs (model600 reads it from
-!! phys_module). The model600-only terms -- tauIC (B_15, B_16, B_56 and the
-!! diamagnetic parts of B_11, B_22), eta(T), TG, the conservative-form
-!! terms -- are not in W; they stay in the blocks the SF path extracts from A.
-!!
-!! The term sets (terms) are model199's.
-!!
-!! V_PAR (with_vpar, the SF path's "b0" stage; optional ELM_v). The same
-!! element pass also assembles v_par's sound-wave Schur terms: the p-channel
-!! of S = B - L M^-1 U with v_par's couplings, the (rho, T) block eliminated
-!! by its mass only. With D_B f = (F0/R) d_phi f + [f, psi0] (R B.grad f, the
-!! operator of amat(var_vpar, var_rho/T) and amat(var_T, var_vpar)),
-!! P_B = D_B p0, c = (theta dt)^2/opz and the T row's mass R opz dp:
-!!   B_7p dp   = theta dt v D_B(dp)                    (v_par row: rho, T columns)
-!!   B_p7 V    = theta dt v (V P_B + gamma p0 D_B V)   (T row: v_par column)
-!!   B_pu u    = theta dt v (-R^2 [p0,u] - 2 gamma R p0 dZ u)
-!! so, after one integration by parts (v = 0 on the Dirichlet boundary),
-!!   W_vv(v,V) = + c (D_B v) (V P_B + gamma p0 D_B V) / R          (-B_7p M^-1 B_p7)
-!!   W_vu(v,u) = - 2 c gamma p0 (D_B v) dZ u                       (-B_7p M^-1 B_pu, R[p0,u] dropped)
-!!   W_uv(v,V) = + 2 c dZ v (V P_B + gamma p0 D_B V)               (-B_up M^-1 B_p7)
-!! W_vu drops the R[p0,u] half of dp_u: for an axisymmetric p0 = p0(psi0) it
-!! cancels exactly against the psi channel's -B_71 M_psi^-1 B_12 u, which is
-!! why the sweep takes B_71 psi* (not psi_w) on v_par's right-hand side. With
-!! P_B = 0 (p0 a flux function) W_vu(a,b) = -W_uv(b,a): the (u, v_par) block
-!! is symmetric after flipping the u row's sign, and its gamma p0 part is
-!! positive semi-definite. gamma_w replaces GAMMA in these three terms only.
-!! vu_full keeps the dropped half instead (the whole p channel,
-!!   W_vu(v,u) = - c (D_B v) (R [p0,u] + 2 gamma p0 dZ u) ),
-!! for a sweep that puts psi_w into v_par's row itself (-sf_vpar_wvu_full).
-!!
-!! model199's documentation follows.
-!!
-!> Workstream E: the reduced-MHD momentum-Schur FORCE OPERATOR, assembled
-!! directly instead of formed as a matrix triple product.
-!!
-!! WHY THIS EXISTS. JOREK builds the (u,u) entry of pair_w as
-!!
-!!   S_uu = B_22 - Ltil * Shat^-1 * B_12 ,  Ltil = B_21 - B_23 M_j^-1 B_31
-!!
-!! i.e. by multiplying discrete operators together. Chacon (JCP 526 (2025)
-!! 113789, Eqs. 17-19) instead composes the two off-diagonal DIFFERENTIAL
-!! operators analytically into one closed-form operator W and discretises that
-!! once. Composing at the continuous level never introduces the Riesz map that
-!! composing bilinear-form matrices requires, so the mass inverse M_j^-1 --
-!! 312 s of PhysPC_MjSolve at np 32, and the reason the fine pair_w operator has
-!! to be a MATSHELL at all -- simply does not arise. The stencil drops from
-!! 5-ring (318-612 nnz/row) to the plain C1 element stencil (58 nnz/row).
-!!
-!! THE OPERATOR. Derivation and proofs:
-!! docs/physics_pc/note_pair_w_force_operator/force_operator.tex, and
-!! docs/physics_pc/workstream_E_pair_w_composition.md S2. With
-!! [a,b] := a_R b_Z - a_Z b_R, chi := R[du,psi0], zeta := R[v,psi0], j0 = Delta* psi0
-!! and p0 = rho0*T0, the weak form is
-!!
-!!   a(du,v) = - int (1/R) grad(zeta).grad(chi) dV      <- field-line bending
-!!             - int R [du,psi0] [v,j0] dV              <- current-driven (kink)
-!!             - 2 int R^2 (dZ v) [p0,du] dV            <- toroidal curvature
-!!
-!! and S_uu = B_22 + (theta*dt)^2/opz * a(du,v). THIS ROUTINE ASSEMBLES
-!! (theta*dt)^2/opz * a, i.e. exactly the matrix to ADD to B_22 -- so the bench
-!! can form B_22 + W and compare against the dumped S_uu directly.
-!!
-!! SELF-ADJOINTNESS, AND WHY ALL THREE TERMS ARE HERE. The continuous operator is
-!! symmetric if and only if [psi0,j0] = 2 R dZ p0, which is reduced-MHD force
-!! balance j0 x B0 = grad p0. The defect is exactly
-!!   a(du,v) - a(v,du) = int R [du,v] ( 2R dZ p0 - [psi0,j0] ) dV .
-!! DROPPING THE CURVATURE TERM IS NOT ALLOWED: without it the criterion collapses
-!! to the FORCE-FREE condition [psi0,j0] = 0, which a finite-beta Grad-Shafranov
-!! equilibrium does not satisfy (j0 = -R^2 p'(psi0) - F F'(psi0) gives
-!! [psi0,j0] = 2R p'(psi0) dZ psi0 /= 0). JOREK's default schur_channels = 1 drops
-!! exactly this term; the ~1e-4 that justifies it bounds the channels' MAGNITUDE,
-!! whereas they carry 100% of the ANTISYMMETRY. So symmetry of the assembled
-!! matrix at equilibrium is the correctness gate for this routine.
-!!
-!! TWO DERIVATIVES ON EACH SIDE. grad(zeta) and grad(chi) each carry two
-!! derivatives of the test/trial function -- which is what the C1 Hermite space
-!! supplies, and is why a fourth-order operator is assemblable here at all. Both
-!! MIXED second derivatives (f_xy) and the background's second derivatives
-!! (ps0_xx, ps0_xy, ps0_yy) are therefore needed; eq_ss/eq_st/eq_tt are
-!! accumulated below for that reason (the reduced-PDE routine does not need them).
-!!
-!! PARALLEL GRADIENT. B_12 and B_23 are the SAME operator -- the parallel
-!! gradient
-!!
-!!     Bpar f := [f, psi0] + (eps_cyl * F0 / R) d_phi f      ( = B_0 . grad f )
-!!
-!! (amat(var_psi,var_u) + amat_n(var_psi,var_u) and amat(var_u,var_zj) +
-!! amat_n(var_u,var_zj) in mod_elt_matrix_fft.f90 -- identical structure).
-!! built on Bpar throughout, which is what makes it Chacon's "dv x B_0" rather
-!! than a poloidal special case. Bpar is still ANTISYMMETRIC under int . dV (the
-!! bracket by cyclic invariance, d_phi because eps_cyl*F0/R is phi-independent),
-!! so the integration-by-parts chain and the weak form are unchanged in form.
-!!
-!! Since F0 is a constant (phys_module: B_phi = F0/R), R*Bpar f = R[f,psi0] +
-!! eps_cyl*F0*d_phi f needs no grad(F0). The bending term is bilinear in Bpar,
-!! so it populates all four toroidal channels (p/n/k/kn); the kink term is
-!! linear in Bpar and populates p and n; curvature is poloidal (p only).
-!!
-!! An earlier version of this routine dropped the toroidal parts ("assumption
-!! 5", n = 0). Measured per harmonic slot against the discrete correction, that
-!! cost 10x on n /= 0 (vs 1.9x on n = 0) and made B_22 + W FAIL as a
-!! preconditioner. Do not reintroduce the restriction.
-!!
-!! PRESSURE. The p-channel solve keeps BOTH halves of Chacon Eq. (19)'s
-!! -grad[dv.grad p0 + gamma p0 div dv]. From amat_52/amat_62 (:559,:588) with
-!! the R-weighted mass matrices amat_55/amat_66,
-!!
-!!     drho = theta*dt/opz * ( R[du,rho0] - 2 rho0 dZ du )
-!!     dT   = theta*dt/opz * ( R[du,T0]   - 2(gamma-1) T0 dZ du )
-!!  => dp   = theta*dt/opz * ( R[du,p0]   - 2 gamma p0 dZ du )
-!!
-!! The second term (compressional, gamma*p0*div dv) is symmetric and negative
-!! semi-definite, so it reinforces rather than disturbs Thm. 4.
+!! V_PAR (with_vpar, stages b0 / b1; optional ELM_v): the same pass assembles
+!! v_par's sound-wave Schur terms, the p channel of S = B - L M^-1 U with
+!! (rho, T) eliminated by their mass. With D_B f = (F0/R) d_phi f + [f, psi0]
+!! (R B.grad f), P_B = D_B p0 and c = (theta dt)^2/opz:
+!!   W_vv(v,V) = + c (D_B v) (V P_B + gamma p0 D_B V) / R       (-B_7p M^-1 B_p7)
+!!   W_vu(v,u) = - 2 c gamma p0 (D_B v) dZ u                    (-B_7p M^-1 B_pu)
+!!   W_uv(v,V) = + 2 c dZ v (V P_B + gamma p0 D_B V)            (-B_up M^-1 B_p7)
+!! W_vu drops the R[p0,u] half of dp_u, which for an axisymmetric p0(psi0)
+!! cancels against the psi channel -B_71 M_psi^-1 B_12 u; vu_full keeps it,
+!!   W_vu(v,u) = - c (D_B v) (R [p0,u] + 2 gamma p0 dZ u),
+!! for a sweep that puts psi_w into v_par's row. gamma_w replaces GAMMA in
+!! these three terms only.
 module mod_pc_elt_matrix_force_fft
 
   use mod_pc_fft_scatter, only: scatter_fft_to_elm, scatter_fft_to_elm_n, &
@@ -137,100 +28,52 @@ module mod_pc_elt_matrix_force_fft
 
 contains
 
-subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
-                                   R_axis, Z_axis, psi_axis, psi_bnd, &
-                                   R_xpoint, Z_xpoint, ELM, terms, ELM_v, gamma_w, vu_full)
+subroutine pc_elt_matrix_force_fft(element, nodes, ELM, ELM_v, gamma_w, vu_full)
 
-  use constants
   use mod_parameters
   use data_structure, only: type_element, type_node
   use gauss
   use basis_at_gaussian
   use phys_module
-  use corr_neg
 
   implicit none
 
   type(type_element), intent(in) :: element
   type(type_node),    intent(in) :: nodes(n_vertex_max)
-  logical,            intent(in) :: xpoint2
-  integer,            intent(in) :: xcase2
-  real*8,             intent(in) :: R_axis, Z_axis, psi_axis, psi_bnd
-  real*8,             intent(in) :: R_xpoint(2), Z_xpoint(2)
 
-  ! One variable (u): poloidal-block and toroidally-expanded dimensions
 #define NFV (n_vertex_max*n_degrees)
 #define DFV (n_tor*n_vertex_max*n_degrees)
 
   real*8, dimension(DFV, DFV), intent(out) :: ELM
-  !> The term selection (sf_force_terms): 1 all, 5 kink + curvature, 6 curvature
-  integer, intent(in) :: terms
-  !> v_par's sound-wave Schur terms (see the header, V_PAR): 1 = W_vv (v_par
-  !! row, v_par column), 2 = W_vu (v_par row, u column), 3 = W_uv (u row,
-  !! v_par column). Assembled only when present.
+  !> v_par's W terms, assembled when present: 1 = W_vv, 2 = W_vu, 3 = W_uv
   real*8, dimension(DFV, DFV, 3), intent(out), optional :: ELM_v
-  !> ... their adiabatic index (default GAMMA)
-  real*8, intent(in), optional :: gamma_w
-  !> ... W_vu with the R [p0,u] half kept (default: dropped)
-  logical, intent(in), optional :: vu_full
+  real*8, intent(in), optional :: gamma_w    !< their adiabatic index (default GAMMA)
+  logical, intent(in), optional :: vu_full   !< W_vu with the R [p0,u] half
 
-  !> Four toroidal channels: _n carries d_phi on the trial function, _k on the
-  !! test function, _kn on both (see header, PARALLEL GRADIENT).
-  real*8, dimension(n_plane, NFV, NFV) :: ELM_p, ELM_n, ELM_k, ELM_kn
-  !> ... and v_par's three blocks (allocated only with ELM_v)
+  real*8, dimension(n_plane, NFV, NFV) :: ELM_p
+  !> v_par's blocks per toroidal channel: p, d_phi on trial (n), test (k), both (kn)
   real*8, allocatable, dimension(:,:,:,:) :: EV_p, EV_n, EV_k, EV_kn
-  logical :: do_v
-  integer :: b
+  logical :: do_v, vfull
 
-  real*8, dimension(n_gauss,n_gauss) :: x_g, x_s, x_t, x_ss, x_st, x_tt
-  real*8, dimension(n_gauss,n_gauss) :: y_g, y_s, y_t, y_ss, y_st, y_tt
-
-  !> Background fields. Second (s,t) derivatives ARE needed here, for ps0.
-  real*8, dimension(n_plane, n_var, n_gauss, n_gauss) :: eq_g, eq_s, eq_t
-  real*8, dimension(n_plane, n_var, n_gauss, n_gauss) :: eq_ss, eq_st, eq_tt
-  !> d_phi of rho0 and T0 (v_par's P_B = D_B p0 only)
+  real*8, dimension(n_gauss, n_gauss) :: x_g, x_s, x_t, y_s, y_t
+  !> psi0 (1), rho0 (2), T0 (3) and their s, t derivatives; d_phi of rho0, T0
+  real*8, dimension(n_plane, 3, n_gauss, n_gauss) :: eq_g, eq_s, eq_t
   real*8, dimension(n_plane, 2, n_gauss, n_gauss) :: eqp_rt
+  real*8 :: f_v(NFV), f_x(NFV), f_y(NFV)    !< basis values and gradients at the Gauss point
+  integer, parameter :: vpt(3) = [var_psi, var_rho, var_T]
 
-  integer :: i, j, k, l, ms, mt, mp, in
+  integer :: i, j, k, ms, mt, mp, in, q, b
   integer :: index_ij, index_kl
-
-  real*8 :: wst, xjac, xjac_x, xjac_y, BigR
-  real*8 :: theta, zeta_t, pref, eps_cyl, GAMMA_l, p0
-
-  ! Test function
-  real*8 :: v, v_x, v_y, v_s, v_t, v_ss, v_st, v_tt, v_xx, v_xy, v_yy
-  ! Trial function
-  real*8 :: u, u_x, u_y, u_s, u_t, u_ss, u_st, u_tt, u_xx, u_xy, u_yy
-  ! v_par's terms: gamma_w, P_B = D_B p0, and the trial's V P_B + g p0 D_B V
-  ! (poloidal part qv, the coefficient of d_phi V: qv_n)
-  real*8 :: g_v, p0_p, P_B, qv, qv_n, cv, qu
-  logical :: vfull
-
-  ! Background at the Gauss point
-  real*8 :: ps0_x, ps0_y, ps0_s, ps0_t, ps0_ss, ps0_st, ps0_tt
-  real*8 :: ps0_xx, ps0_xy, ps0_yy
-  real*8 :: zj0_x, zj0_y
-  real*8 :: r0, r0_x, r0_y, T0, T0_x, T0_y, p0_x, p0_y
-
-  ! Brackets and their gradients
-  real*8 :: b_tst, b_tri
-  real*8 :: bR_tst, bZ_tst, bR_tri, bZ_tri
-  real*8 :: zeta_x, zeta_y, chi_x, chi_y
-  !> Toroidal halves of R*Bpar: the coefficient multiplying d_phi of the
-  !! test (ztor_*) and trial (ctor_*) function.
-  real*8 :: ztor_x, ztor_y, ctor_x, ctor_y, bj_tst
-  real*8 :: a_bend, a_kink, a_curv, a_uu
-  real*8 :: a_uu_n, a_uu_k, a_uu_kn
-
+  real*8  :: wst, xjac, BigR, theta, zeta_t, pref, GAMMA_l, sz, f_s, f_t
+  real*8  :: ps0_x, ps0_y, r0, r0_x, r0_y, T0, T0_x, T0_y, p0, p0_x, p0_y
+  real*8  :: v, v_y, u, u_x, u_y, a_curv, a_uu
+  real*8  :: g_v, p0_p, P_B, cv, b_tst, b_tri, qv, qv_n, qu
   real*8     :: in_fft(1:n_plane)
   complex*16 :: out_fft(1:n_plane)
 
-  ELM    = 0.d0
-  ELM_p  = 0.d0
-  ELM_n  = 0.d0
-  ELM_k  = 0.d0
-  ELM_kn = 0.d0
-  do_v   = present(ELM_v)
+  ELM   = 0.d0
+  ELM_p = 0.d0
+  do_v  = present(ELM_v)
   if (do_v) then
     ELM_v = 0.d0
     allocate(EV_p(n_plane, NFV, NFV, 3), EV_n(n_plane, NFV, NFV, 3), &
@@ -238,10 +81,7 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
     EV_p = 0.d0; EV_n = 0.d0; EV_k = 0.d0; EV_kn = 0.d0
   endif
 
-  ! model600's element routine takes GAMMA from phys_module (no local
-  ! override, unlike model199) and has no eps_cyl, i.e. eps_cyl = 1.
   GAMMA_l = gamma
-  eps_cyl = 1.d0
   g_v     = gamma
   if (present(gamma_w)) g_v = gamma_w
   vfull   = .false.
@@ -249,388 +89,125 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
 
   theta  = time_evol_theta
   zeta_t = time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
-  ! (theta*dt)^2 / opz -- the prefactor that turns a(du,v) into the matrix to be
-  ! ADDED to B_22. opz = 1 + zeta, matching build_schur_mixed_prod.
   pref   = (theta * tstep)**2 / (1.d0 + zeta_t)
 
-  x_g = 0.d0; x_s = 0.d0; x_t = 0.d0; x_ss = 0.d0; x_st = 0.d0; x_tt = 0.d0
-  y_g = 0.d0; y_s = 0.d0; y_t = 0.d0; y_ss = 0.d0; y_st = 0.d0; y_tt = 0.d0
-  eq_g = 0.d0; eq_s = 0.d0; eq_t = 0.d0
-  eq_ss = 0.d0; eq_st = 0.d0; eq_tt = 0.d0
-  eqp_rt = 0.d0
-
+  x_g = 0.d0; x_s = 0.d0; x_t = 0.d0; y_s = 0.d0; y_t = 0.d0
+  eq_g = 0.d0; eq_s = 0.d0; eq_t = 0.d0; eqp_rt = 0.d0
   do i = 1, n_vertex_max
     do j = 1, n_degrees
+      sz = element%size(i,j)
       do ms = 1, n_gauss
         do mt = 1, n_gauss
-
-          x_g(ms,mt)  = x_g(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * H(i,j,ms,mt)
-          x_s(ms,mt)  = x_s(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * H_s(i,j,ms,mt)
-          x_t(ms,mt)  = x_t(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * H_t(i,j,ms,mt)
-          x_ss(ms,mt) = x_ss(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H_ss(i,j,ms,mt)
-          x_st(ms,mt) = x_st(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H_st(i,j,ms,mt)
-          x_tt(ms,mt) = x_tt(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H_tt(i,j,ms,mt)
-
-          y_g(ms,mt)  = y_g(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * H(i,j,ms,mt)
-          y_s(ms,mt)  = y_s(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * H_s(i,j,ms,mt)
-          y_t(ms,mt)  = y_t(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * H_t(i,j,ms,mt)
-          y_ss(ms,mt) = y_ss(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H_ss(i,j,ms,mt)
-          y_st(ms,mt) = y_st(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H_st(i,j,ms,mt)
-          y_tt(ms,mt) = y_tt(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H_tt(i,j,ms,mt)
-
+          x_g(ms,mt) = x_g(ms,mt) + nodes(i)%x(1,j,1) * sz * H(i,j,ms,mt)
+          x_s(ms,mt) = x_s(ms,mt) + nodes(i)%x(1,j,1) * sz * H_s(i,j,ms,mt)
+          x_t(ms,mt) = x_t(ms,mt) + nodes(i)%x(1,j,1) * sz * H_t(i,j,ms,mt)
+          y_s(ms,mt) = y_s(ms,mt) + nodes(i)%x(1,j,2) * sz * H_s(i,j,ms,mt)
+          y_t(ms,mt) = y_t(ms,mt) + nodes(i)%x(1,j,2) * sz * H_t(i,j,ms,mt)
           do mp = 1, n_plane
-            do k = 1, n_var
+            do k = 1, 3
               do in = 1, n_tor
-                eq_g (mp,k,ms,mt) = eq_g (mp,k,ms,mt) &
-                     + nodes(i)%values(in,j,k) * element%size(i,j) * H(i,j,ms,mt)    * HZ(in,mp)
-                eq_s (mp,k,ms,mt) = eq_s (mp,k,ms,mt) &
-                     + nodes(i)%values(in,j,k) * element%size(i,j) * H_s(i,j,ms,mt)  * HZ(in,mp)
-                eq_t (mp,k,ms,mt) = eq_t (mp,k,ms,mt) &
-                     + nodes(i)%values(in,j,k) * element%size(i,j) * H_t(i,j,ms,mt)  * HZ(in,mp)
-                eq_ss(mp,k,ms,mt) = eq_ss(mp,k,ms,mt) &
-                     + nodes(i)%values(in,j,k) * element%size(i,j) * H_ss(i,j,ms,mt) * HZ(in,mp)
-                eq_st(mp,k,ms,mt) = eq_st(mp,k,ms,mt) &
-                     + nodes(i)%values(in,j,k) * element%size(i,j) * H_st(i,j,ms,mt) * HZ(in,mp)
-                eq_tt(mp,k,ms,mt) = eq_tt(mp,k,ms,mt) &
-                     + nodes(i)%values(in,j,k) * element%size(i,j) * H_tt(i,j,ms,mt) * HZ(in,mp)
+                eq_g(mp,k,ms,mt) = eq_g(mp,k,ms,mt) &
+                     + nodes(i)%values(in,j,vpt(k)) * sz * H(i,j,ms,mt)   * HZ(in,mp)
+                eq_s(mp,k,ms,mt) = eq_s(mp,k,ms,mt) &
+                     + nodes(i)%values(in,j,vpt(k)) * sz * H_s(i,j,ms,mt) * HZ(in,mp)
+                eq_t(mp,k,ms,mt) = eq_t(mp,k,ms,mt) &
+                     + nodes(i)%values(in,j,vpt(k)) * sz * H_t(i,j,ms,mt) * HZ(in,mp)
               enddo
             enddo
             if (do_v) then
               do in = 1, n_tor
                 eqp_rt(mp,1,ms,mt) = eqp_rt(mp,1,ms,mt) &
-                     + nodes(i)%values(in,j,5) * element%size(i,j) * H(i,j,ms,mt) * HZ_p(in,mp)
+                     + nodes(i)%values(in,j,var_rho) * sz * H(i,j,ms,mt) * HZ_p(in,mp)
                 eqp_rt(mp,2,ms,mt) = eqp_rt(mp,2,ms,mt) &
-                     + nodes(i)%values(in,j,6) * element%size(i,j) * H(i,j,ms,mt) * HZ_p(in,mp)
+                     + nodes(i)%values(in,j,var_T) * sz * H(i,j,ms,mt) * HZ_p(in,mp)
               enddo
             endif
           enddo
-
         enddo
       enddo
     enddo
   enddo
 
-  !--------------------------------------------------------------------------
-  ! Gauss integration
-  !--------------------------------------------------------------------------
   do ms = 1, n_gauss
    do mt = 1, n_gauss
-
     wst  = wgauss(ms)*wgauss(mt)
     xjac = x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
-
-    xjac_x = (x_ss(ms,mt)*y_t(ms,mt)**2 - y_ss(ms,mt)*x_t(ms,mt)*y_t(ms,mt)             &
-            - 2.d0*x_st(ms,mt)*y_s(ms,mt)*y_t(ms,mt)                                    &
-            + y_st(ms,mt)*(x_s(ms,mt)*y_t(ms,mt) + x_t(ms,mt)*y_s(ms,mt))               &
-            + x_tt(ms,mt)*y_s(ms,mt)**2 - y_tt(ms,mt)*x_s(ms,mt)*y_s(ms,mt)) / xjac
-
-    xjac_y = (y_tt(ms,mt)*x_s(ms,mt)**2 - x_tt(ms,mt)*y_s(ms,mt)*x_s(ms,mt)             &
-            - 2.d0*y_st(ms,mt)*x_t(ms,mt)*x_s(ms,mt)                                    &
-            + x_st(ms,mt)*(y_t(ms,mt)*x_s(ms,mt) + y_s(ms,mt)*x_t(ms,mt))               &
-            + y_ss(ms,mt)*x_t(ms,mt)**2 - x_ss(ms,mt)*y_t(ms,mt)*x_t(ms,mt)) / xjac
-
     BigR = x_g(ms,mt)
+    do q = 1, NFV
+      i = (q - 1) / n_degrees + 1; j = mod(q - 1, n_degrees) + 1
+      f_v(q) = h(i,j,ms,mt) * element%size(i,j)
+      f_s    = h_s(i,j,ms,mt) * element%size(i,j)
+      f_t    = h_t(i,j,ms,mt) * element%size(i,j)
+      f_x(q) = (  y_t(ms,mt)*f_s - y_s(ms,mt)*f_t ) / xjac
+      f_y(q) = ( -x_t(ms,mt)*f_s + x_s(ms,mt)*f_t ) / xjac
+    enddo
 
     do mp = 1, n_plane
-
-      ps0_s  = eq_s (mp,1,ms,mt)
-      ps0_t  = eq_t (mp,1,ms,mt)
-      ps0_ss = eq_ss(mp,1,ms,mt)
-      ps0_st = eq_st(mp,1,ms,mt)
-      ps0_tt = eq_tt(mp,1,ms,mt)
-      ps0_x  = (  y_t(ms,mt)*ps0_s - y_s(ms,mt)*ps0_t ) / xjac
-      ps0_y  = ( -x_t(ms,mt)*ps0_s + x_s(ms,mt)*ps0_t ) / xjac
-
-      ! Second physical derivatives. The xx and yy forms are those of
-      ! mod_elt_matrix_fft; xy is the same construction applied as
-      ! d_y(f_x) = (-x_t d_s + x_s d_t)(f_x)/xjac.
-      ps0_xx = (ps0_ss*y_t(ms,mt)**2 - 2.d0*ps0_st*y_s(ms,mt)*y_t(ms,mt)                &
-              + ps0_tt*y_s(ms,mt)**2                                                    &
-              + ps0_s*(y_st(ms,mt)*y_t(ms,mt) - y_tt(ms,mt)*y_s(ms,mt))                 &
-              + ps0_t*(y_st(ms,mt)*y_s(ms,mt) - y_ss(ms,mt)*y_t(ms,mt)) ) / xjac**2     &
-              - xjac_x*ps0_x / xjac
-
-      ps0_yy = (ps0_ss*x_t(ms,mt)**2 - 2.d0*ps0_st*x_s(ms,mt)*x_t(ms,mt)                &
-              + ps0_tt*x_s(ms,mt)**2                                                    &
-              + ps0_s*(x_st(ms,mt)*x_t(ms,mt) - x_tt(ms,mt)*x_s(ms,mt))                 &
-              + ps0_t*(x_st(ms,mt)*x_s(ms,mt) - x_ss(ms,mt)*x_t(ms,mt)) ) / xjac**2     &
-              - xjac_y*ps0_y / xjac
-
-      ps0_xy = (-ps0_ss*x_t(ms,mt)*y_t(ms,mt)                                           &
-              + ps0_st*(x_t(ms,mt)*y_s(ms,mt) + x_s(ms,mt)*y_t(ms,mt))                  &
-              - ps0_tt*x_s(ms,mt)*y_s(ms,mt)                                            &
-              + ps0_s*(-x_t(ms,mt)*y_st(ms,mt) + x_s(ms,mt)*y_tt(ms,mt))                &
-              + ps0_t*( x_t(ms,mt)*y_ss(ms,mt) - x_s(ms,mt)*y_st(ms,mt)) ) / xjac**2    &
-              - xjac_y*ps0_x / xjac
-
-      zj0_x = (  y_t(ms,mt)*eq_s(mp,3,ms,mt) - y_s(ms,mt)*eq_t(mp,3,ms,mt) ) / xjac
-      zj0_y = ( -x_t(ms,mt)*eq_s(mp,3,ms,mt) + x_s(ms,mt)*eq_t(mp,3,ms,mt) ) / xjac
-
-      r0   = abs(eq_g(mp,5,ms,mt))
-      r0_x = (  y_t(ms,mt)*eq_s(mp,5,ms,mt) - y_s(ms,mt)*eq_t(mp,5,ms,mt) ) / xjac
-      r0_y = ( -x_t(ms,mt)*eq_s(mp,5,ms,mt) + x_s(ms,mt)*eq_t(mp,5,ms,mt) ) / xjac
-      T0   = abs(eq_g(mp,6,ms,mt))
-      T0_x = (  y_t(ms,mt)*eq_s(mp,6,ms,mt) - y_s(ms,mt)*eq_t(mp,6,ms,mt) ) / xjac
-      T0_y = ( -x_t(ms,mt)*eq_s(mp,6,ms,mt) + x_s(ms,mt)*eq_t(mp,6,ms,mt) ) / xjac
-
-      ! p0 = rho0 * T0, so the curvature drive needs both channels -- which is
-      ! why schur_channels = 1 cannot represent it (see header).
+      ps0_x = (  y_t(ms,mt)*eq_s(mp,1,ms,mt) - y_s(ms,mt)*eq_t(mp,1,ms,mt) ) / xjac
+      ps0_y = ( -x_t(ms,mt)*eq_s(mp,1,ms,mt) + x_s(ms,mt)*eq_t(mp,1,ms,mt) ) / xjac
+      r0   = abs(eq_g(mp,2,ms,mt))
+      r0_x = (  y_t(ms,mt)*eq_s(mp,2,ms,mt) - y_s(ms,mt)*eq_t(mp,2,ms,mt) ) / xjac
+      r0_y = ( -x_t(ms,mt)*eq_s(mp,2,ms,mt) + x_s(ms,mt)*eq_t(mp,2,ms,mt) ) / xjac
+      T0   = abs(eq_g(mp,3,ms,mt))
+      T0_x = (  y_t(ms,mt)*eq_s(mp,3,ms,mt) - y_s(ms,mt)*eq_t(mp,3,ms,mt) ) / xjac
+      T0_y = ( -x_t(ms,mt)*eq_s(mp,3,ms,mt) + x_s(ms,mt)*eq_t(mp,3,ms,mt) ) / xjac
       p0_x = r0_x*T0 + r0*T0_x
       p0_y = r0_y*T0 + r0*T0_y
-      ! p0 itself, for the compressional (gamma p0 div dv) half of Eq. (19)
       p0   = r0 * T0
-      ! v_par: P_B = D_B p0 = (F0/R) d_phi p0 + [p0, psi0] (zero for an
-      ! axisymmetric p0 = p0(psi0)); d_phi p0 formed like p0_x above
       if (do_v) then
+        ! P_B = (F0/R) d_phi p0 + [p0, psi0] (zero for p0 = p0(psi0))
         p0_p = eqp_rt(mp,1,ms,mt) * T0 + r0 * eqp_rt(mp,2,ms,mt)
         P_B  = F0 / BigR * p0_p + ( p0_x*ps0_y - p0_y*ps0_x )
         cv   = pref * xjac
       endif
 
-      !--------------------------------------------------------------------
-      ! Test function loop
-      !--------------------------------------------------------------------
-      do i = 1, n_vertex_max
-       do j = 1, n_degrees
-
-        index_ij = n_degrees*(i-1) + j
-
-        v    = h   (i,j,ms,mt) * element%size(i,j)
-        v_s  = h_s (i,j,ms,mt) * element%size(i,j)
-        v_t  = h_t (i,j,ms,mt) * element%size(i,j)
-        v_ss = h_ss(i,j,ms,mt) * element%size(i,j)
-        v_st = h_st(i,j,ms,mt) * element%size(i,j)
-        v_tt = h_tt(i,j,ms,mt) * element%size(i,j)
-        v_x  = (  y_t(ms,mt)*v_s - y_s(ms,mt)*v_t ) / xjac
-        v_y  = ( -x_t(ms,mt)*v_s + x_s(ms,mt)*v_t ) / xjac
-
-        v_xx = (v_ss*y_t(ms,mt)**2 - 2.d0*v_st*y_s(ms,mt)*y_t(ms,mt) + v_tt*y_s(ms,mt)**2 &
-              + v_s*(y_st(ms,mt)*y_t(ms,mt) - y_tt(ms,mt)*y_s(ms,mt))                     &
-              + v_t*(y_st(ms,mt)*y_s(ms,mt) - y_ss(ms,mt)*y_t(ms,mt)) ) / xjac**2         &
-              - xjac_x*v_x / xjac
-
-        v_yy = (v_ss*x_t(ms,mt)**2 - 2.d0*v_st*x_s(ms,mt)*x_t(ms,mt) + v_tt*x_s(ms,mt)**2 &
-              + v_s*(x_st(ms,mt)*x_t(ms,mt) - x_tt(ms,mt)*x_s(ms,mt))                     &
-              + v_t*(x_st(ms,mt)*x_s(ms,mt) - x_ss(ms,mt)*x_t(ms,mt)) ) / xjac**2         &
-              - xjac_y*v_y / xjac
-
-        v_xy = (-v_ss*x_t(ms,mt)*y_t(ms,mt)                                               &
-              + v_st*(x_t(ms,mt)*y_s(ms,mt) + x_s(ms,mt)*y_t(ms,mt))                      &
-              - v_tt*x_s(ms,mt)*y_s(ms,mt)                                                &
-              + v_s*(-x_t(ms,mt)*y_st(ms,mt) + x_s(ms,mt)*y_tt(ms,mt))                    &
-              + v_t*( x_t(ms,mt)*y_ss(ms,mt) - x_s(ms,mt)*y_st(ms,mt)) ) / xjac**2        &
-              - xjac_y*v_x / xjac
-
-        ! zeta = R*Bpar v = R[v,psi0] + eps_cyl*F0*d_phi v.
-        ! Poloidal half: grad(R[v,psi0]) = [v,psi0] e_R + R grad[v,psi0].
-        b_tst  = v_x*ps0_y - v_y*ps0_x
-        bR_tst = v_xx*ps0_y + v_x*ps0_xy - v_xy*ps0_x - v_y*ps0_xx
-        bZ_tst = v_xy*ps0_y + v_x*ps0_yy - v_yy*ps0_x - v_y*ps0_xy
-        zeta_x = b_tst + BigR*bR_tst
-        zeta_y =         BigR*bZ_tst
-        ! Toroidal half: grad(eps_cyl*F0*d_phi v) = eps_cyl*F0*d_phi(grad v),
-        ! so these are the coefficients of d_phi (F0 constant => no grad F0).
-        ztor_x = eps_cyl * F0 * v_x
-        ztor_y = eps_cyl * F0 * v_y
-
-        ! [v, j0] -- the kink term's test-side factor, trial-independent
-        bj_tst = v_x*zj0_y - v_y*zj0_x
-
-        !--------------------------------------------------------------------
-        ! Trial function loop
-        !--------------------------------------------------------------------
-        do k = 1, n_vertex_max
-         do l = 1, n_degrees
-
-          index_kl = n_degrees*(k-1) + l
-
-          u    = h   (k,l,ms,mt) * element%size(k,l)
-          u_s  = h_s (k,l,ms,mt) * element%size(k,l)
-          u_t  = h_t (k,l,ms,mt) * element%size(k,l)
-          u_ss = h_ss(k,l,ms,mt) * element%size(k,l)
-          u_st = h_st(k,l,ms,mt) * element%size(k,l)
-          u_tt = h_tt(k,l,ms,mt) * element%size(k,l)
-          u_x  = (  y_t(ms,mt)*u_s - y_s(ms,mt)*u_t ) / xjac
-          u_y  = ( -x_t(ms,mt)*u_s + x_s(ms,mt)*u_t ) / xjac
-
-          u_xx = (u_ss*y_t(ms,mt)**2 - 2.d0*u_st*y_s(ms,mt)*y_t(ms,mt) + u_tt*y_s(ms,mt)**2 &
-                + u_s*(y_st(ms,mt)*y_t(ms,mt) - y_tt(ms,mt)*y_s(ms,mt))                     &
-                + u_t*(y_st(ms,mt)*y_s(ms,mt) - y_ss(ms,mt)*y_t(ms,mt)) ) / xjac**2         &
-                - xjac_x*u_x / xjac
-
-          u_yy = (u_ss*x_t(ms,mt)**2 - 2.d0*u_st*x_s(ms,mt)*x_t(ms,mt) + u_tt*x_s(ms,mt)**2 &
-                + u_s*(x_st(ms,mt)*x_t(ms,mt) - x_tt(ms,mt)*x_s(ms,mt))                     &
-                + u_t*(x_st(ms,mt)*x_s(ms,mt) - x_ss(ms,mt)*x_t(ms,mt)) ) / xjac**2         &
-                - xjac_y*u_y / xjac
-
-          u_xy = (-u_ss*x_t(ms,mt)*y_t(ms,mt)                                               &
-                + u_st*(x_t(ms,mt)*y_s(ms,mt) + x_s(ms,mt)*y_t(ms,mt))                      &
-                - u_tt*x_s(ms,mt)*y_s(ms,mt)                                                &
-                + u_s*(-x_t(ms,mt)*y_st(ms,mt) + x_s(ms,mt)*y_tt(ms,mt))                    &
-                + u_t*( x_t(ms,mt)*y_ss(ms,mt) - x_s(ms,mt)*y_st(ms,mt)) ) / xjac**2        &
-                - xjac_y*u_x / xjac
-
-          ! chi = R*Bpar du, same decomposition as zeta above
-          b_tri  = u_x*ps0_y - u_y*ps0_x
-          bR_tri = u_xx*ps0_y + u_x*ps0_xy - u_xy*ps0_x - u_y*ps0_xx
-          bZ_tri = u_xy*ps0_y + u_x*ps0_yy - u_yy*ps0_x - u_y*ps0_xy
-          chi_x  = b_tri + BigR*bR_tri
-          chi_y  =         BigR*bZ_tri
-          ctor_x = eps_cyl * F0 * u_x
-          ctor_y = eps_cyl * F0 * u_y
-
-          !------------------------------------------------------------------
-          ! Bending: - int (1/R) grad(zeta).grad(chi), bilinear in Bpar, so it
-          ! spreads over all four channels. Symmetric, negative semi-definite.
-          !------------------------------------------------------------------
-          a_bend = - ( zeta_x*chi_x + zeta_y*chi_y ) / BigR
-
-          !------------------------------------------------------------------
-          ! Kink: - int (R*Bpar du) [v,j0], linear in Bpar -> p and n only.
-          !------------------------------------------------------------------
-          a_kink = - BigR * b_tri * bj_tst
-
-          !------------------------------------------------------------------
-          ! Curvature/pressure, BOTH halves of Eq. (19):
-          !   + 2 R^2 (dZ v) [du,p0]        (dv.grad p0)
-          !   - 4 gamma R p0 (dZ v)(dZ du)  (gamma p0 div dv -- symmetric, nsd)
-          ! Poloidal only: amat_52/amat_62 have no _n partner.
-          !------------------------------------------------------------------
+      do index_ij = 1, NFV
+        v = f_v(index_ij); v_y = f_y(index_ij)
+        b_tst = f_x(index_ij)*ps0_y - v_y*ps0_x                ! [v, psi0]
+        do index_kl = 1, NFV
+          u = f_v(index_kl); u_x = f_x(index_kl); u_y = f_y(index_kl)
           a_curv = - 2.d0 * BigR**2 * v_y * ( p0_x*u_y - p0_y*u_x ) &
                    - 4.d0 * GAMMA_l * BigR * p0 * v_y * u_y
+          a_uu = pref * ( a_curv ) * xjac
+          ELM_p(mp,index_ij,index_kl) = ELM_p(mp,index_ij,index_kl) + wst * a_uu
 
-          ! terms (sf_force_terms) selects which terms are assembled: the mixed
-          ! pair_w forms carry the bending (and kink) through explicit fields
-          ! and take them back out of W:
-          !   1 = bending + kink + curvature   (the full Eq. (19) operator: schur, w)
-          !   5 = kink + curvature             ("wj": bending through j)
-          !   6 = curvature only               ("wpj": psi channel through psi, j)
-          if (terms == 6) then
-            a_uu  = pref * ( a_curv ) * xjac
-          else if (terms == 5) then
-            a_uu  = pref * ( a_kink + a_curv ) * xjac
-          else
-            a_uu  = pref * ( a_bend + a_kink + a_curv ) * xjac
-          endif
-          ! d_phi on trial: bending cross-term + the kink's toroidal half
-          if (terms == 5) then
-            a_uu_n = pref * ( - eps_cyl * F0 * bj_tst ) * xjac
-          else if (terms == 6) then
-            a_uu_n = 0.d0
-          else
-            a_uu_n = pref * ( - ( zeta_x*ctor_x + zeta_y*ctor_y ) / BigR   &
-                              - eps_cyl * F0 * bj_tst ) * xjac
-          endif
-          ! d_phi on test / on both: bending cross-terms only
-          if (terms == 5 .or. terms == 6) then
-            a_uu_k  = 0.d0
-            a_uu_kn = 0.d0
-          else
-            a_uu_k  = pref * ( - ( ztor_x*chi_x + ztor_y*chi_y ) / BigR ) * xjac
-            a_uu_kn = pref * ( - ( ztor_x*ctor_x + ztor_y*ctor_y ) / BigR ) * xjac
-          endif
-
-          ELM_p (mp,index_ij,index_kl) = ELM_p (mp,index_ij,index_kl) + wst * a_uu
-          ELM_n (mp,index_ij,index_kl) = ELM_n (mp,index_ij,index_kl) + wst * a_uu_n
-          ELM_k (mp,index_ij,index_kl) = ELM_k (mp,index_ij,index_kl) + wst * a_uu_k
-          ELM_kn(mp,index_ij,index_kl) = ELM_kn(mp,index_ij,index_kl) + wst * a_uu_kn
-
-          !------------------------------------------------------------------
-          ! v_par's sound-wave Schur terms (header, V_PAR). The trial u is the
-          ! v_par basis function V in W_vv / W_uv. D_B v = (F0/R) v_p + b_tst,
-          ! D_B V = (F0/R) V_p + b_tri; _n / _k / _kn: the coefficient of the
-          ! trial's / test's / both d_phi.
-          !------------------------------------------------------------------
-          if (do_v) then
-            qv   = u * P_B + g_v * p0 * b_tri               ! V P_B + g p0 [V, psi0]
-            qv_n = g_v * p0 * F0 / BigR * u                 ! g p0 (F0/R) d_phi V
-            ! W_vv = c (D_B v)(V P_B + g p0 D_B V) / R
-            EV_p (mp,index_ij,index_kl,1) = EV_p (mp,index_ij,index_kl,1) + wst * cv * b_tst * qv / BigR
-            EV_n (mp,index_ij,index_kl,1) = EV_n (mp,index_ij,index_kl,1) + wst * cv * b_tst * qv_n / BigR
-            EV_k (mp,index_ij,index_kl,1) = EV_k (mp,index_ij,index_kl,1) + wst * cv * F0 / BigR**2 * v * qv
-            EV_kn(mp,index_ij,index_kl,1) = EV_kn(mp,index_ij,index_kl,1) + wst * cv * F0 / BigR**2 * v * qv_n
-            ! W_vu = - c (D_B v) (2 g p0 dZ u [+ R [p0,u] with vu_full])
-            qu = 2.d0 * g_v * p0 * u_y
-            if (vfull) qu = qu + BigR * ( p0_x*u_y - p0_y*u_x )
-            EV_p (mp,index_ij,index_kl,2) = EV_p (mp,index_ij,index_kl,2) - wst * cv * b_tst * qu
-            EV_k (mp,index_ij,index_kl,2) = EV_k (mp,index_ij,index_kl,2) - wst * cv * F0 / BigR * v * qu
-            ! W_uv = 2 c dZ v (V P_B + g p0 D_B V)
-            EV_p (mp,index_ij,index_kl,3) = EV_p (mp,index_ij,index_kl,3) + wst * cv * 2.d0 * v_y * qv
-            EV_n (mp,index_ij,index_kl,3) = EV_n (mp,index_ij,index_kl,3) + wst * cv * 2.d0 * v_y * qv_n
-          endif
-
-         enddo  ! l
-        enddo   ! k
-
-       enddo  ! j
-      enddo   ! i
-
-    enddo  ! mp
-
-   enddo  ! mt
-  enddo   ! ms
-
-  !--------------------------------------------------------------------------
-  ! Transform the single toroidal channel and scatter into the mode-space ELM
-  !--------------------------------------------------------------------------
-  do i = 1, NFV
-    do j = 1, NFV
-
-      if (maxval(abs(ELM_p(1:n_plane,i,j))) .ne. 0.d0) then
-        in_fft = ELM_p(1:n_plane,i,j)
-#ifdef USE_FFTW
-        call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#else
-        call pc_my_fft(in_fft, out_fft, n_plane)
-#endif
-        call scatter_fft_to_elm(out_fft, i, j, ELM, DFV)
-      endif
-
-      if (maxval(abs(ELM_n(1:n_plane,i,j))) .ne. 0.d0) then
-        in_fft = ELM_n(1:n_plane,i,j)
-#ifdef USE_FFTW
-        call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#else
-        call pc_my_fft(in_fft, out_fft, n_plane)
-#endif
-        call scatter_fft_to_elm_n(out_fft, i, j, ELM, DFV)
-      endif
-
-      if (maxval(abs(ELM_k(1:n_plane,i,j))) .ne. 0.d0) then
-        in_fft = ELM_k(1:n_plane,i,j)
-#ifdef USE_FFTW
-        call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#else
-        call pc_my_fft(in_fft, out_fft, n_plane)
-#endif
-        call scatter_fft_to_elm_k(out_fft, i, j, ELM, DFV)
-      endif
-
-      if (maxval(abs(ELM_kn(1:n_plane,i,j))) .ne. 0.d0) then
-        in_fft = ELM_kn(1:n_plane,i,j)
-#ifdef USE_FFTW
-        call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
-#else
-        call pc_my_fft(in_fft, out_fft, n_plane)
-#endif
-        call scatter_fft_to_elm_kn(out_fft, i, j, ELM, DFV)
-      endif
-
+          if (.not. do_v) cycle
+          ! D_B v = (F0/R) v_p + b_tst; the trial u is V in W_vv / W_uv
+          b_tri = u_x*ps0_y - u_y*ps0_x
+          qv   = u * P_B + g_v * p0 * b_tri               ! V P_B + g p0 [V, psi0]
+          qv_n = g_v * p0 * F0 / BigR * u                 ! g p0 (F0/R) d_phi V
+          EV_p (mp,index_ij,index_kl,1) = EV_p (mp,index_ij,index_kl,1) + wst * cv * b_tst * qv / BigR
+          EV_n (mp,index_ij,index_kl,1) = EV_n (mp,index_ij,index_kl,1) + wst * cv * b_tst * qv_n / BigR
+          EV_k (mp,index_ij,index_kl,1) = EV_k (mp,index_ij,index_kl,1) + wst * cv * F0 / BigR**2 * v * qv
+          EV_kn(mp,index_ij,index_kl,1) = EV_kn(mp,index_ij,index_kl,1) + wst * cv * F0 / BigR**2 * v * qv_n
+          qu = 2.d0 * g_v * p0 * u_y
+          if (vfull) qu = qu + BigR * ( p0_x*u_y - p0_y*u_x )
+          EV_p (mp,index_ij,index_kl,2) = EV_p (mp,index_ij,index_kl,2) - wst * cv * b_tst * qu
+          EV_k (mp,index_ij,index_kl,2) = EV_k (mp,index_ij,index_kl,2) - wst * cv * F0 / BigR * v * qu
+          EV_p (mp,index_ij,index_kl,3) = EV_p (mp,index_ij,index_kl,3) + wst * cv * 2.d0 * v_y * qv
+          EV_n (mp,index_ij,index_kl,3) = EV_n (mp,index_ij,index_kl,3) + wst * cv * 2.d0 * v_y * qv_n
+        enddo
+      enddo
     enddo
+   enddo
   enddo
 
-  ! The scatter routines accumulate each (row, col) pair twice; same convention
-  ! as mod_elt_matrix_fft and mod_pc_elt_matrix_reduced_fft.
+  do i = 1, NFV
+    do j = 1, NFV
+      call one_channel(ELM_p(:,i,j), 0, ELM)
+    enddo
+  enddo
+  ! the scatter accumulates each (row, col) pair twice (as mod_elt_matrix_fft)
   ELM = 0.5d0 * ELM
 
   if (do_v) then
     do b = 1, 3
       do i = 1, NFV
         do j = 1, NFV
-          call one_channel(EV_p (:,i,j,b), 0)
-          call one_channel(EV_n (:,i,j,b), 1)
-          call one_channel(EV_k (:,i,j,b), 2)
-          call one_channel(EV_kn(:,i,j,b), 3)
+          call one_channel(EV_p (:,i,j,b), 0, ELM_v(:,:,b))
+          call one_channel(EV_n (:,i,j,b), 1, ELM_v(:,:,b))
+          call one_channel(EV_k (:,i,j,b), 2, ELM_v(:,:,b))
+          call one_channel(EV_kn(:,i,j,b), 3, ELM_v(:,:,b))
         enddo
       enddo
     enddo
@@ -640,11 +217,11 @@ subroutine pc_elt_matrix_force_fft(element, nodes, xpoint2, xcase2, &
 
 contains
 
-  !> One toroidal channel of one v_par block entry (i, j, b) into ELM_v(:,:,b):
-  !! ch 0 = p, 1 = n, 2 = k, 3 = kn.
-  subroutine one_channel(c, ch)
-    real*8, intent(in)  :: c(n_plane)
-    integer, intent(in) :: ch
+  !> One toroidal channel of entry (i, j) into E: 0 = p, 1 = n, 2 = k, 3 = kn.
+  subroutine one_channel(c, ch, E)
+    real*8, intent(in)    :: c(n_plane)
+    integer, intent(in)   :: ch
+    real*8, intent(inout) :: E(DFV, DFV)
     if (maxval(abs(c)) == 0.d0) return
     in_fft = c
 #ifdef USE_FFTW
@@ -653,10 +230,10 @@ contains
     call pc_my_fft(in_fft, out_fft, n_plane)
 #endif
     select case (ch)
-    case (0); call scatter_fft_to_elm   (out_fft, i, j, ELM_v(:,:,b), DFV)
-    case (1); call scatter_fft_to_elm_n (out_fft, i, j, ELM_v(:,:,b), DFV)
-    case (2); call scatter_fft_to_elm_k (out_fft, i, j, ELM_v(:,:,b), DFV)
-    case (3); call scatter_fft_to_elm_kn(out_fft, i, j, ELM_v(:,:,b), DFV)
+    case (0); call scatter_fft_to_elm   (out_fft, i, j, E, DFV)
+    case (1); call scatter_fft_to_elm_n (out_fft, i, j, E, DFV)
+    case (2); call scatter_fft_to_elm_k (out_fft, i, j, E, DFV)
+    case (3); call scatter_fft_to_elm_kn(out_fft, i, j, E, DFV)
     end select
   end subroutine one_channel
 

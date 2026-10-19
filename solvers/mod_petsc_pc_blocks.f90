@@ -3,24 +3,19 @@ module mod_petsc_pc_blocks
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: g_ctx
   implicit none
   private
 
   !--------------------------------------------------------------------
-  !> Leaf primitives shared by the physics preconditioner paths.
-  !!
-  !! Nothing here decides anything: every routine is a pure operation on
-  !! PETSc objects plus g_ctx%is_var. The block extraction keeps every slot
-  !! pair with harm_all, else only those of one |n| group (harm_kept);
-  !! mod_petsc_pc_sf sets harm_all from physics_pc_sf_harm_couple.
+  !> Block primitives of the SF preconditioner: extraction, packing, scaling
+  !! and the variable split of vectors. The extraction keeps every slot pair
+  !! with harm_all, else only those of one |n| group (harm_kept).
   !--------------------------------------------------------------------
 
   public :: pc_print_block_setup
-  public :: create_variable_index_sets
   public :: extract_sub_blocks_h
   public :: pack_pair_aij, pack_blocks_aij
-  public :: make_pair_block_scale, make_field_block_scale
+  public :: make_field_block_scale
   public :: split_vars, merge_vars
   public :: harm_all, harm_kept
 
@@ -51,64 +46,6 @@ contains
     call MPI_Comm_rank(comm, rank, ierr)
     if (rank == 0) write(*,'(A)') "[Physics PC]   " // trim(label) // ": " // trim(method)
   end subroutine pc_print_block_setup
-
-  !--------------------------------------------------------------------
-  !> Create variable index sets for extracting sub-vectors from the
-  !! full 6-variable system vector.
-  !!
-  !! DOF ordering within each BAIJ block (block_size = n_var*n_tor):
-  !!   var v (0-based) at node block i: i*block_size + v*n_tor + m
-  !!   for m = 0..n_tor-1
-  !--------------------------------------------------------------------
-  subroutine create_variable_index_sets(A_full, comm)
-    use mod_parameters, only: n_var, n_tor
-
-    Mat, intent(in) :: A_full
-    integer, intent(in) :: comm
-
-    PetscInt :: n_local, n_global, rstart, rend
-    PetscInt :: block_size, n_block_local, n_var_dofs, n_block_global
-    !PetscInt :: out_local, out_global, out_start, out_end
-    PetscInt, allocatable :: indices(:)
-    PetscErrorCode :: ierr
-    integer :: v, i, m, k
-
-    ! Get parallel layout from the full system matrix
-    PetscCallA(MatGetLocalSize(A_full, n_local, PETSC_NULL_INTEGER, ierr))
-    PetscCallA(MatGetSize(A_full, n_global, PETSC_NULL_INTEGER, ierr))
-    PetscCallA(MatGetOwnershipRange(A_full, rstart, rend, ierr))
-
-    !write(*,'(A,I8,A,I8)') "[Physics PC]   Creating variable index sets: local DOFs ", n_local, " [", rstart, "-", rend-1, "]"
-
-    block_size    = n_var * n_tor
-    n_block_local = n_local / block_size
-    n_block_global = n_global / block_size
-    n_var_dofs    = n_block_local * n_tor
-
-    allocate(indices(n_var_dofs))
-
-    do v = 1, 6
-      k = 0
-      do i = 0, n_block_local - 1
-        do m = 0, n_tor - 1
-          k = k + 1
-          !k = i*(n_tor-1) + m + 1
-          indices(k) = rstart + i * block_size + (v-1) * n_tor + m
-        enddo
-      enddo
-      PetscCallA(ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, g_ctx%is_var(v), ierr))
-
-      ! Print information about the created IS for debugging
-      !PetscCallA(ISGetSize(g_ctx%is_var(v), out_global, ierr))
-      !PetscCallA(ISGetLocalSize(g_ctx%is_var(v), out_local, ierr))
-      !PetscCallA(ISGetMinMax(g_ctx%is_var(v), out_start, out_end, ierr))
-      !write(*,*) "[Physics PC]     Variable ", v, ": local DOFs : ", out_local," global DOFs ", out_global, " [", out_start, "-", out_end, "]"
-    enddo
-
-    deallocate(indices)
-    g_ctx%is_created = .true.
-  end subroutine create_variable_index_sets
-
 
   !--------------------------------------------------------------------
   !> Extract the blocks Mb(k) = A(eqs(k), vrs(k)) of the full system matrix in
@@ -384,63 +321,12 @@ contains
   end subroutine pack_blocks_aij
 
   !--------------------------------------------------------------------
-  !> Workstream B, Step 2: symmetric BLOCK scaling of a packed 2-field pair.
-  !!
-  !!   A <- D A D,   D = diag(I, s I)
-  !!
-  !! The caller then solves (D A D) z = D b and recovers x = D z, so this is an
-  !! exact similarity: it changes the conditioning the inner solver sees and
-  !! NOTHING else.
-  !!
-  !! WHY. Both packed pairs pit an operator block against a mass block, and in
-  !! both the two carry very different scale. Measured over the full ramp (the
-  !! former inner-solver probe, meas_B/pr_ramp_m8), the two behave DIFFERENTLY
-  !! and it matters:
-  !!
-  !!   pair_w   |diag| spread 5.3e9 -> 2.2e10 -> 1.2e12 -> 3.1e13 at tstep
-  !!            1 / 10 / 100 / 1000. min is pinned at 1.858e-5 (the dt-independent
-  !!            B_44 mass rows) while max tracks dt. Genuinely dt-driven.
-  !!   pair_psi |diag| spread CONSTANT at 1.78e10 across the whole ramp. Its
-  !!            mismatch is static, not dt-driven.
-  !!
-  !! So the dt story holds for pair_w only. It is NOT the ZBIG penalty rows in
-  !! either case -- eliminate_boundary_dofs has already removed those, and no
-  !! measured diagonal reaches 1e12 until pair_w does so on its own at tstep=100.
-  !!
-  !! Note also that spread alone does NOT predict solvability: pair_psi holds a
-  !! constant 1.78e10 spread while GMRES+ILU(0) on it improves from err 7.3e+1 at
-  !! tstep=1 to 3.5e-5 at tstep=1000. Scaling is therefore expected to pay on
-  !! pair_w, where the spread grows four decades and every candidate (INCLUDING
-  !! the MUMPS LU, err 1.7e-6 at tstep=1000) degrades with it. It is applied to
-  !! both because it is an exact similarity and costs one MatDiagonalScale.
-  !!
-  !! s is MEASURED from the two block diagonals, not assumed from a power of dt.
-  !! pair_w's max does not follow a clean power of dt (ratios 1.9 / 37 / 26 across
-  !! the ramp's decades) because S_uu carries both a mass part and the dt^2
-  !! channel correction, so an assumed exponent would be wrong; and pair_psi has
-  !! no dt dependence to assume in the first place.
-  !!
-  !! One scalar per block, deliberately: the block structure that a PCFIELDSPLIT
-  !! or a point-block smoother needs is preserved exactly. Per-row equilibration
-  !! would flatten the diagonal further but destroy that structure.
-  !--------------------------------------------------------------------
-  subroutine make_pair_block_scale(A, n1_loc, dvec, comm, my_id, label)
-    Mat, intent(inout)           :: A
-    PetscInt, intent(in)         :: n1_loc   !< LOCAL rows in the FIRST field: the
-                                             !< Nest->AIJ pack is [f1 local | f2 local] per rank
-    Vec, intent(inout)           :: dvec     !< out: D, kept for the apply
-    integer, intent(in)          :: comm
-    integer, intent(in)          :: my_id
-    character(len=*), intent(in) :: label
-    PetscInt :: rstart, rend
-    PetscErrorCode :: ierr
-    call MatGetOwnershipRange(A, rstart, rend, ierr)
-    call make_field_block_scale(A, [n1_loc, rend - rstart - n1_loc], dvec, comm, my_id, label)
-  end subroutine make_pair_block_scale
-
-  !--------------------------------------------------------------------
-  !> make_pair_block_scale for nf packed fields: D = diag(I, s_2 I, ..., s_nf I),
-  !! s_f = sqrt(mean|diag| of field 1 / mean|diag| of field f).
+  !> Symmetric block scaling of a packed operator, A <- D A D with
+  !! D = diag(I, s_2 I, ..., s_nf I), s_f = sqrt(mean|diag| of field 1 /
+  !! mean|diag| of field f). The caller solves (D A D) z = D b and takes
+  !! x = D z: an exact similarity that only evens out the scales of the
+  !! operator and mass blocks (pair_w's spread grows with dt). One scalar per
+  !! field keeps the block structure the smoothers rely on.
   !--------------------------------------------------------------------
   subroutine make_field_block_scale(A, nloc, dvec, comm, my_id, label)
     Mat, intent(inout)           :: A
@@ -482,9 +368,7 @@ contains
     call MPI_Allreduce(MPI_IN_PLACE, acc, 2 * nf, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
     m = acc(1:nf) / max(acc(nf + 1:2 * nf), 1.d0)
 
-    ! Fall back to the identity rather than guessing. A zero mean means the block
-    ! is not the shape this routine assumes, and a silently wrong scaling would be
-    ! indistinguishable from a bad preconditioner in every downstream number.
+    ! a field with zero mean |diag| is not the shape assumed here: identity
     if (all(m > 0.d0)) then
       sc = sqrt(m(1) / m)
     else
@@ -503,8 +387,7 @@ contains
 
     call MatDiagonalScale(A, dvec, dvec, ierr)
 
-    !--- The spread actually achieved. This is the number the scaling exists to
-    !--- move, so it belongs in the log next to the unscaled one.
+    !--- the |diag| spread achieved
     call MatCreateVecs(A, chk, PETSC_NULL_VEC, ierr)
     call MatGetDiagonal(A, chk, ierr)
     call VecAbs(chk, ierr)

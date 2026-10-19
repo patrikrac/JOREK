@@ -64,15 +64,14 @@ contains
   end subroutine petsc_create_pc_matrix
 
 
-  !> Assemble the element-level operators of the physics PC: the composed
-  !! force operator W (models/model*/mod_pc_elt_matrix_force_fft.f90). It
-  !! needs mhd_sim (the linearisation state), which is why it is assembled
-  !! here and not in the PC build.
+  !> Assemble the physics PC's element-level operator W (and v_par's W
+  !! terms). It needs mhd_sim, the linearisation state, so it is assembled
+  !! here rather than in the PC build.
   subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
     use construct_pc_matrix_mod, only: construct_force_operator_matrix
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
-    use mod_petsc_pc_sf_solver, only: sf_force_terms, sf_vpar_w_assembled, sf_vpar_gamma_w, sf_vpar_wvu_full
+    use mod_petsc_pc_sf_solver, only: sf_vpar_w_assembled, sf_vpar_gamma_w, sf_vpar_wvu_full
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
@@ -81,29 +80,21 @@ contains
     type(type_MHD_SIM),   intent(in) :: mhd_sim
     PetscErrorCode :: ierr
 
-    ! This routine runs before the PC build on the first step, so the events
-    ! are registered here too (idempotent).
-    call physics_pc_log_events_register()
+    call physics_pc_log_events_register()       ! runs before the first PC build
     call PetscLogEventBegin(pcev_elem_asm, ierr)
 
-    ! Created once and zeroed before every refill: the element routine only
-    ! ADDs, so this is the same operator as a fresh matrix, and W keeps its
-    ! identity and pattern for the run -- which the SF path's value maps rely on.
+    ! created once, zeroed before every refill: W keeps its identity and
+    ! pattern for the run, which the SF path relies on
     if (g_ctx%w_force_ready) then
       PetscCallA(MatZeroEntries(g_ctx%W_force, ierr))
     else
       call petsc_create_pc_matrix(g_ctx%W_force, a_mat, 1)
-      ! The boundary rows are zeroed by MatZeroRows after every assembly;
-      ! without this it also DELETES their pattern, so the next assembly
-      ! would insert outside the (compressed) structure.
+      ! MatZeroRows on the boundary rows must keep their pattern
       PetscCallA(MatSetOption(g_ctx%W_force, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
     endif
 
-    ! the mixed pair_w forms carry the bending term (or the whole psi
-    ! channel) through explicit fields, and take it out of W here
     if (sf_vpar_w_assembled()) then
-      ! v_par's sound-wave Schur terms in the same element pass (one matrix
-      ! each, the same lifecycle as W)
+      ! v_par's sound-wave Schur terms, the same lifecycle as W
       if (g_ctx%w_v_ready) then
         PetscCallA(MatZeroEntries(g_ctx%W_vv, ierr))
         PetscCallA(MatZeroEntries(g_ctx%W_vu, ierr))
@@ -117,13 +108,13 @@ contains
         PetscCallA(MatSetOption(g_ctx%W_uv, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
       endif
       call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
-                                           mhd_sim, g_ctx%W_force, terms=sf_force_terms(), &
+                                           mhd_sim, g_ctx%W_force, &
                                            W_vv=g_ctx%W_vv, W_vu=g_ctx%W_vu, W_uv=g_ctx%W_uv, &
                                            gamma_w=sf_vpar_gamma_w(), vu_full=sf_vpar_wvu_full())
       g_ctx%w_v_ready = .true.
     else
       call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
-                                           mhd_sim, g_ctx%W_force, terms=sf_force_terms())
+                                           mhd_sim, g_ctx%W_force)
     endif
     g_ctx%w_force_ready = .true.
     call PetscLogEventEnd(pcev_elem_asm, ierr)
@@ -136,8 +127,6 @@ contains
       endif
     endif
   end subroutine petsc_assemble_pc_matrices
-
-
 
 #endif
 end module mod_petsc_pc_physics_element
