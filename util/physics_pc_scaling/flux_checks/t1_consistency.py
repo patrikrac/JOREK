@@ -52,6 +52,10 @@ RUNS = [
     ("PRODUCTION (Dv, S1.bin, step6=L1, B16 rhs)", "A", dict(dv="dumped", s1="dumped", step6="L1", b16="rhs"), False),
     ("PRODUCTION + step6=L1h", "A", dict(dv="dumped", s1="dumped", step6="L1h", b16="rhs"), False),
     ("PRODUCTION with Mw^-1 instead of Cw", "A", dict(dv="dumped", s1="mwinv", step6="L1", b16="rhs"), False),
+    # hpatch dumps (H.bin): S1~ = PJ + Dpsi B12 H rebuilt from H.bin (n/a without H.bin)
+    ("S1~ = PJ + B12 H (hpatch, H.bin)", "A0", dict(dv="exact", s1="hpatch", step6="L1h", b16="off"), False),
+    ("PRODUCTION hpatch (Dv, PJ+B12 H, step6=L1)", "A", dict(dv="dumped", s1="hpatch", step6="L1", b16="rhs"), False),
+    ("PRODUCTION hpatch + step6=L1h", "A", dict(dv="dumped", s1="hpatch", step6="L1h", b16="rhs"), False),
 ]
 
 
@@ -82,8 +86,11 @@ def main():
     a = ap.parse_args()
     f = Family(a.famdir, int64=True if a.int64 else None)
     N = 6 * f.n
-    print("family %s  nslot %d  n %d  N=6n=%d  varsigma %g  theta_dt %g"
-          % (f.meta["family"], f.nslot, f.n, N, f.varsigma, f.theta))
+    print("family %s  nslot %d  n %d  N=6n=%d  varsigma %g  theta_dt %g  s1 %s  bend_form %d"
+          % (f.meta["family"], f.nslot, f.n, N, f.varsigma, f.theta, f.s1, f.meta["bend_form"]))
+    if f.hform:
+        print("%s dump: Mw / Cw based runs are n/a where the file is missing; 'S1.bin' runs use the %s S1"
+              % (f.s1, f.s1))
     print("absent blocks (zero): %s;  not dumped (zero by contract): B14 B15 B32 B34 B35 B36 B41 B43 "
           "B45 B46 B53 B54 B56 B64" % (" ".join(f.absent) or "-"))
     t0 = time.time()
@@ -107,18 +114,19 @@ def main():
             print("cond_2(A0) %.2e   cond_2(Ruiz-scaled A0) %.2e" % (np.linalg.cond(At), np.linalg.cond(Ah)))
     print("round-off reference max|LU_ruiz(A)^-1 A - I|:  A0 %.2e   A %.2e" % (ref["A0"], ref["A"]))
     print("gate (EXACT runs): max|P^-1 A - I| <= max(tol=%.0e, %g * reference)" % (a.tol, a.ref_factor))
-    sel = range(len(RUNS)) if not a.runs else [int(i) for i in a.runs.split(",")]
+    runs = [(nm.replace("(Cw)", "(%s)" % f.s1) if f.hform else nm, t, o, g_) for nm, t, o, g_ in RUNS]
+    sel = range(len(runs)) if not a.runs else [int(i) for i in a.runs.split(",")]
     hdr = "%-44s %-3s %10s %10s %10s %10s %10s %10s %10s %9s" % (
         "run", "vs", "max|PA-I|", "|E^2|/|E|", "res(rand)", "Re min", "Re max", "max|Im|", "rho(I-PA)",
         "#D2 solve")
     print("\n" + hdr + "\n" + "-" * len(hdr))
     nfail = 0
     for i in sel:
-        name, tgt, opt, gate = RUNS[i]
+        name, tgt, opt, gate = runs[i]
         try:
             P = Sweep(blk, **opt)
         except ValueError as e:
-            print("%-44s skipped (%s)" % (name, e))
+            print("%-44s n/a (%s)" % (name, e))
             continue
         At = A0 if tgt == "A0" else A
         PA = P(At)

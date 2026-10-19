@@ -48,6 +48,8 @@ ARMS = {
 # arm means the same whatever the defaults. The arms without an S_uu suffix
 # run "schur", the _w arms "w" = B_22 + W; the arms without _ms run the
 # global (not mode-split) operators. The production arm is sf_gmg_wpj_ms.
+# (The flux arms, further down, are global by default and take the mode split
+# and the S1 variant from PETSc options.)
 SF_BASE = 'inxflow_shaped_pcbench'
 SF_COMMON = {
     'use_physics_pc': '.t.',
@@ -116,10 +118,29 @@ for _b in ('hc1', 'hcall'):
 # S1 on (psi, j), then velocity and rho/T re-solves; no corrector. The pair_psi
 # slot solves S1, the pair_w slot D_v. _lu: those two by MUMPS LU (the exact
 # reference for the T0-T3 checks, util/physics_pc_scaling/flux_checks/README.md).
-ARMS['sf_gmg_flux_ms'] = dict(ARMS['sf_gmg_wpj_ms'], physics_pc_sf_suu='"flux"',
-                              physics_pc_sf_corrector='0')
-ARMS['sf_lu_flux_ms'] = dict(ARMS['sf_gmg_flux_ms'], physics_pc_sf_pair_psi='"lu"',
-                             physics_pc_sf_pair_w='"lu"')
+# The flux arm runs on the GLOBAL path by default (all toroidal harmonics
+# coupled) and ignores the namelist flags physics_pc_sf_mode_split and
+# physics_pc_sf_harm_couple. The per-family mode split is selected by the PETSc
+# option -sf_flux_mode_split 1 (ARM_PETSC_OPTS below): the _ms arms. The S1
+# surrogate is -sf_flux_s1 hpatch (default, H-form S1 = B11 + B12 H) or spai
+# (the earlier bending term B12^T C_w B12 / varsigma): the _spai arms.
+ARMS['sf_gmg_flux'] = dict(ARMS['sf_gmg_wpj'], physics_pc_sf_suu='"flux"',
+                           physics_pc_sf_corrector='0', physics_pc_sf_mode_split='.f.')
+ARMS['sf_lu_flux'] = dict(ARMS['sf_gmg_flux'], physics_pc_sf_pair_psi='"lu"',
+                          physics_pc_sf_pair_w='"lu"')
+# the same namelists: the arms differ in the PETSc options only
+ARMS['sf_gmg_flux_spai'] = dict(ARMS['sf_gmg_flux'])
+ARMS['sf_lu_flux_spai'] = dict(ARMS['sf_lu_flux'])
+# mode split (the namelist flag is ignored by flux; kept .t. for the record)
+ARMS['sf_gmg_flux_ms'] = dict(ARMS['sf_gmg_flux'], physics_pc_sf_mode_split='.t.')
+ARMS['sf_lu_flux_ms'] = dict(ARMS['sf_lu_flux'], physics_pc_sf_mode_split='.t.')
+ARMS['sf_lu_flux_ms_spai'] = dict(ARMS['sf_lu_flux_ms'])
+# split-M (-sf_flux_s1 splitm): the H-form with Tang's commuted part kept exactly
+# (robust at large theta); the _ms arms for the dumps / t5 gate (add -sf_flux_hp_group 1)
+ARMS['sf_gmg_flux_splitm'] = dict(ARMS['sf_gmg_flux'])
+ARMS['sf_lu_flux_splitm'] = dict(ARMS['sf_lu_flux'])
+ARMS['sf_gmg_flux_ms_splitm'] = dict(ARMS['sf_gmg_flux_ms'])
+ARMS['sf_lu_flux_ms_splitm'] = dict(ARMS['sf_lu_flux_ms'])
 
 # v_par (model600 built with_vpar; base PCS_BASE=namelist/model600/
 # inxflow_shaped_vpar_pcbench): its block's backend follows the arm (lu / gmg),
@@ -140,9 +161,20 @@ ARMS['jorek_fresh_ms'] = dict(ARMS['jorek_fresh'])
 
 # PETSc options an arm needs besides its namelist (`mknml.py petscopts <arm>`).
 ARM_PETSC_OPTS = {'sf_direct': '-jorek_pc_full_lu',
-                  'jorek_fresh_ms': '-jorek_pc_mode_split'}
-# Flux-Schur T0-T3 checks: add e.g. (needs an existing directory)
-#   ARM_PETSC_OPTS['sf_lu_flux_ms'] = '-sf_flux_dump /path/to/dumpdir -sf_flux_spai_check'
+                  'jorek_fresh_ms': '-jorek_pc_mode_split',
+                  # flux: global path by default; the mode split is a PETSc option
+                  'sf_gmg_flux_spai': '-sf_flux_s1 spai',
+                  'sf_lu_flux_spai': '-sf_flux_s1 spai',
+                  'sf_gmg_flux_ms': '-sf_flux_mode_split 1',
+                  'sf_lu_flux_ms': '-sf_flux_mode_split 1',
+                  'sf_lu_flux_ms_spai': '-sf_flux_mode_split 1 -sf_flux_s1 spai',
+                  'sf_gmg_flux_splitm': '-sf_flux_s1 splitm',
+                  'sf_lu_flux_splitm': '-sf_flux_s1 splitm',
+                  'sf_gmg_flux_ms_splitm': '-sf_flux_mode_split 1 -sf_flux_s1 splitm',
+                  'sf_lu_flux_ms_splitm': '-sf_flux_mode_split 1 -sf_flux_s1 splitm'}
+# Flux-Schur T0-T3 checks (need the mode split, i.e. an _ms arm): add e.g.
+# (needs an existing directory; T0 Bb gates and T2/T3 Cw comparisons need spai)
+#   ARM_PETSC_OPTS['sf_lu_flux_ms_spai'] += ' -sf_flux_dump /path/to/dumpdir -sf_flux_spai_check'
 
 
 def is_sf(arm):

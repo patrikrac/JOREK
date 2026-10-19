@@ -71,6 +71,9 @@ def main():
     def inf(name, val, info=""):
         res.append((name, val, "info", info))
 
+    def na(name, info="", tag="hpatch"):
+        res.append((name, np.nan, "n/a (%s)" % tag, info))
+
     print("family %s  nslot %d  nindex %d  n %d  free %d  varsigma %g  theta_dt %g"
           % (f.meta["family"], f.nslot, f.nindex, f.n, fr.size, vs, th))
     print("absent blocks (zero): %s" % (" ".join(f.absent) or "-"))
@@ -86,9 +89,79 @@ def main():
     lo, hi = eig_range(B33, a.max_dense)
     sy = rel(B33 - B33.T, B33)
     chk("B33 SPD  lambda_min", lo, sy < a.tol_skew and lo > 0, "lambda_max %.3e, asym %.1e" % (hi, sy))
-    if f.has("Bb"):
+    hp = f.hform                        # hpatch or splitm: H.bin, no Cw
+    form = f.meta["bend_form"]
+    print("s1 %s  bend_form %d  #dirichlet(u) %d  #dirichlet_psi %d"
+          % (f.s1, form, len(f.dirichlet), len(f.dirichlet_psi)))
+
+    def bb_dirichlet_and_s1(Bb_full, D):
+        """Bb zero on the Dirichlet rows/cols D; S1 = PJ + [[Bb,0],[0,0]]"""
+        if D.size:
+            Bc = sp.csr_matrix(Bb_full)
+            m = max(abs(Bc[D]).max() if Bc[D].nnz else 0.0, abs(Bc[:, D]).max() if Bc[:, D].nnz else 0.0)
+            chk("Bb zero on psi Dirichlet rows/cols", m, m <= a.tol_formula * max(abs(Bb_full).max(), 1e-300))
+        if "S1" in f.packed and "PJ" in f.packed:
+            n = f.n
+            Z = sp.csr_matrix((n, n))
+            S1f = f.packed["PJ"] + sp.bmat([[Bb_full, Z], [Z, Z]])
+            e = rel(f.packed["S1"] - S1f, f.packed["S1"])
+            chk("S1 = PJ + [[Bb,0],[0,0]]", e, e < a.tol_formula)
+
+    if hp:
+        # hpatch: Bb = Dpsi B12 H is nonsymmetric; no Cw; symmetric-PSD and Cw formula gates do not apply
+        na("Bb symmetric PSD", "hpatch: Bb is nonsymmetric by construction")
+        na("Bb = (bend_sign/vs) B12^T Cw B12 formulas", "hpatch: no Cw")
+        na("Cw SPD / SPAI quality", "hpatch: no Cw")
+        if not (f.has("H") and f.has("Bb")):
+            chk("H.bin and Bb.bin present", 0.0, False, "absent: %s" % " ".join(f.absent))
+        else:
+            H, Bb_full = f.blk("H"), f.blk("Bb")
+            dp = np.zeros(f.n); dp[f.free_psi()] = 1.0
+            Bf = sp.diags(dp) @ f.blk("B12") @ H
+            e = rel(Bf - Bb_full, Bb_full)
+            chk("Bb = Dpsi B12 H", e, e < a.tol_formula)
+            bb_dirichlet_and_s1(Bb_full, f.dirichlet_psi)
+            Du = f.dirichlet
+            if Du.size:
+                Hc = sp.csr_matrix(H)
+                m = abs(Hc[Du]).max() if Hc[Du].nnz else 0.0
+                chk("H zero on u Dirichlet rows", m, m <= a.tol_formula * max(abs(Hc).max(), 1e-300))
+            # info: H sparsity, asymmetry and definiteness of the bending term
+            Hc = sp.csc_matrix(H)
+            cnt = np.diff(Hc.indptr)
+            cnt = cnt[cnt > 0]          # empty columns = psi Dirichlet columns
+            inf("H nnz per nonempty column (min)", float(cnt.min()) if cnt.size else 0.0,
+                "mean %.1f, max %d, total nnz %d (p %s r %s g %s vel %s)"
+                % (cnt.mean() if cnt.size else 0.0, cnt.max() if cnt.size else 0, Hc.nnz, f.meta.get("p", "?"),
+                   f.meta.get("r", "?"), f.meta.get("g", "?"), f.meta.get("vel", "?")))
+            frp = f.free_psi()
+            Bp = sp.csr_matrix(Bb_full)[frp][:, frp]
+            inf("Bb asymmetry  ||Bb-Bb^T||/||Bb||", rel(Bp - Bp.T, Bp) if fro(Bp) > 0 else 0.0)
+            if frp.size <= a.max_dense and fro(Bp) > 0:
+                lo, hi = eig_range(Bp, a.max_dense)
+                inf("min eig of sym(Bb)", lo, "max %.3e (sym part, free psi)" % hi)
+                # psi Schur of S1 (free psi, j eliminated), Jacobi-whitened
+                PJ = f.packed.get("PJ")
+                if PJ is not None:
+                    n = f.n
+                    B11, B13 = PJ[:n, :n], PJ[:n, n:]
+                    B31, B33 = PJ[n:, :n], PJ[n:, n:]
+                    fj = f.free()
+                    idx = frp
+                    X = sla.solve(B33[fj][:, fj].toarray(), B31[fj][:, idx].toarray())
+                    Sp = (B11[idx][:, idx] + Bp).toarray() - B13[idx][:, fj].toarray() @ X
+                    dg = np.sqrt(np.abs(np.diag(Sp)))
+                    dg[dg == 0] = 1.0
+                    W = Sp / dg[:, None] / dg[None, :]
+                    ev = sla.eigvalsh(0.5 * (W + W.T))
+                    inf("min eig of whitened psi-Schur sym part", ev[0],
+                        "max %.3e; D^-1/2 (B11 + Bb - B13 B33^-1 B31) D^-1/2, D = |diag|" % ev[-1])
+            else:
+                na("min eig of sym(Bb) / whitened psi-Schur", "skipped: %d free psi > --max-dense" % frp.size, tag="skip")
+    elif f.has("Bb"):
         Bb_full = f.blk("Bb")
-        Bb = R(Bb_full)
+        frp = f.free_psi() if form == 2 else fr
+        Bb = Bb_full[frp][:, frp]
         sgn = 1.0 if f.meta["bend_sign"] >= 0 else -1.0
         lo, hi = eig_range(sgn * Bb, a.max_dense)
         sy = rel(Bb - Bb.T, Bb)
@@ -97,35 +170,29 @@ def main():
         if f.has("Cw"):
             dm = np.zeros(f.n); dm[fr] = 1.0
             Dm = sp.diags(dm)
+            dpm = np.zeros(f.n); dpm[f.free_psi()] = 1.0
+            Dp = sp.diags(dpm)
             B = Dm @ f.blk("B12") @ Dm
             C = Dm @ f.blk("Cw") @ Dm
             sg = f.meta["bend_sign"] / vs
             F0 = sg * (B.T @ C @ B)          # form 0 (default)
             F1 = sg * (B @ C @ B.T)          # form 1 (-sf_flux_bend_form 1)
-            form = f.meta["bend_form"]
-            e0, e1 = rel(F0 - Bb_full, Bb_full), rel(F1 - Bb_full, Bb_full)
+            F2 = sg * (Dp @ f.blk("B12") @ C @ f.blk("B12").T @ Dp)    # form 2
+            e0, e1, e2 = (rel(F - Bb_full, Bb_full) for F in (F0, F1, F2))
             ed = rel(F0 - F1, F0)
-            chk("Bb = (bend_sign/vs) D B12^T(DCwD)B12 D (form 0)", e0, e0 < a.tol_formula or form == 1,
+            chk("Bb = (bend_sign/vs) D B12^T(DCwD)B12 D (form 0)", e0, e0 < a.tol_formula or form != 0,
                 "bend_sign %g, meta bend_form %d%s" % (f.meta["bend_sign"], form,
                                                       "" if form == 0 else " (not the selected form)"))
-            chk("Bb = (bend_sign/vs) D B12(DCwD)B12^T D (form 1)", e1, e1 < a.tol_formula or form == 0,
+            chk("Bb = (bend_sign/vs) D B12(DCwD)B12^T D (form 1)", e1, e1 < a.tol_formula or form != 1,
                 "" if form == 1 else "(not the selected form)")
+            chk("Bb = (bend_sign/vs) Dpsi B12(DuCwDu)B12^T Dpsi (form 2)", e2, e2 < a.tol_formula or form != 2,
+                "" if form == 2 else "(not the selected form)")
             inf("||B12^T C B12 - B12 C B12^T|| / ||B12^T C B12||", ed,
                 "zero iff B12 skew on the free space; form difference")
             if sg < 0:
                 res.append(("bend_sign/varsigma < 0: bending term negative", sg, "info",
                             "PSD check above then applies to -Bb"))
-        D = f.dirichlet
-        if D.size:
-            Bc = sp.csr_matrix(Bb_full)
-            m = max(abs(Bc[D]).max() if Bc[D].nnz else 0.0, abs(Bc[:, D]).max() if Bc[:, D].nnz else 0.0)
-            chk("Bb zero on Dirichlet rows/cols", m, m <= a.tol_formula * abs(Bb_full).max())
-        if "S1" in f.packed and "PJ" in f.packed:
-            n = f.n
-            Z = sp.csr_matrix((n, n))
-            S1f = f.packed["PJ"] + sp.bmat([[Bb_full, Z], [Z, Z]])
-            e = rel(f.packed["S1"] - S1f, f.packed["S1"])
-            chk("S1 = PJ + [[Bb,0],[0,0]]", e, e < a.tol_formula)
+        bb_dirichlet_and_s1(Bb_full, f.dirichlet_psi if form == 2 else f.dirichlet)
     if f.has("Mw"):
         Mw = R(f.blk("Mw"))
         lo, hi = eig_range(Mw, a.max_dense)
@@ -158,10 +225,10 @@ def main():
         inf("B22 eig range", lo22, "lambda [%.3e, %.3e]" % (lo22, hi22))
 
     w = max(len(r[0]) for r in res)
-    print("\n%-*s  %12s  %-6s  %s" % (w, "check", "value", "result", "info"))
-    print("-" * (w + 40))
+    print("\n%-*s  %12s  %-12s  %s" % (w, "check", "value", "result", "info"))
+    print("-" * (w + 46))
     for name, val, st, info in res:
-        print("%-*s  %12.4e  %-6s  %s" % (w, name, val, st, info))
+        print("%-*s  %12.4e  %-12s  %s" % (w, name, val, st, info))
     nf = sum(r[2] == "FAIL" for r in res)
     print("\nT0 %s (%d FAIL)" % ("PASS" if nf == 0 else "FAIL", nf))
     raise SystemExit(0 if nf == 0 else 1)

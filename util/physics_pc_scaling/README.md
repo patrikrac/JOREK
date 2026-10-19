@@ -73,7 +73,7 @@ submitted again. `results.tsv` is rewritten after every case.
 |---|---|
 | `sf_gmg_wpj_ms` | **production**: see "The SF arms" below |
 | `sf_*` | the SF reference arms, see "The SF arms" below |
-| `sf_gmg_flux_ms` / `sf_lu_flux_ms` | flux-Schur SF arm (`physics_pc_sf_suu = "flux"`) on the mode split, GMG / pair_psi+pair_w by LU; see "Flux-Schur arm (flux)" |
+| `sf_gmg_flux` / `sf_lu_flux` (`_ms`, `_spai`) | flux-Schur SF arm (`physics_pc_sf_suu = "flux"`), global path by default; GMG / pair_psi+pair_w by LU; `_ms` = mode split, `_spai` = SPAI S1; see "Flux-Schur arm (flux)" |
 | `jorek` | JOREK's default: fieldsplit per toroidal harmonic + MUMPS |
 | `jorek_fresh` | `jorek` with the PC rebuilt at every step (`iter_precon = 0`): separates the loss of the mode coupling from a stale factorisation |
 
@@ -142,29 +142,57 @@ keeps the case's own ratio, `n_radial = 2 n_flux - 1`, `n_pol = 2 n_tht`, so
 | `sf_gmg_wpj_eq16` | `sf_gmg_wpj` with the Eq. (16) corrector (a second pair_psi solve) instead of the default Eq. (17) |
 | `sf_lu` / `sf_lu_w` / `sf_lu_wpj` | every block by MUMPS LU: the exact references, for approximation quality (`sf_lu_wj`: the lumped-mass form; `sf_lugw_wpj`: LU except pair_w) |
 | `sf_gmg_wpj_hc1` / `_hcall`, `sf_lu_wpj_hc1` / `_hcall` | `sf_gmg_wpj` / `sf_lu_wpj` keeping the cross-\|n\| couplings of the \|n\| groups at most 1 apart / all (`physics_pc_sf_harm_couple` = 1 / -1, fixed for the run), with the per-build cross-\|n\| weight report on (`physics_pc_sf_cross_weights`) |
-| `sf_gmg_flux_ms` | flux-Schur (`physics_pc_sf_suu = "flux"`, `physics_pc_sf_corrector = 0`) on top of `sf_gmg_wpj_ms`: D_v first, then S1 on (ψ, j), then velocity and ρ / T re-solves |
-| `sf_lu_flux_ms` | `sf_gmg_flux_ms` with the pair_psi (S1) and pair_w (D_v) slots by MUMPS LU: the exact-block reference for the flux checks |
+| `sf_gmg_flux` | flux-Schur (`physics_pc_sf_suu = "flux"`, `physics_pc_sf_corrector = 0`) on top of `sf_gmg_wpj`, **global path** (all harmonics coupled): D_v first, then S1 on (ψ, j), then velocity and ρ / T re-solves; S1 by the H-form (`hpatch`) |
+| `sf_lu_flux` | `sf_gmg_flux` with the pair_psi (S1) and pair_w (D_v) slots by MUMPS LU |
+| `sf_gmg_flux_spai` / `sf_lu_flux_spai` | the same with `-sf_flux_s1 spai` (the earlier bending-term S1) |
+| `sf_gmg_flux_ms` / `sf_lu_flux_ms` | the same with the per-family mode split (`-sf_flux_mode_split 1`); the `_lu_` one is the exact-block reference for the flux checks (dumps need an `_ms` arm) |
+| `sf_lu_flux_ms_spai` | `sf_lu_flux_ms` with `-sf_flux_s1 spai`: the earlier evaluation's configuration, and the arm for the T0 / T2 / T3 Bb and C_w checks |
+| `sf_{gmg,lu}_flux_splitm`, `sf_{gmg,lu}_flux_ms_splitm` | the flux arms with `-sf_flux_s1 splitm`: the H-form with Tang's commuted part kept exactly, H = H_T + cut_r(remainder), H_T = -(1/varsigma) M_w^-1 B_23 on radius-q patches (`-sf_flux_hp_q`, default p + 1). Same quality as `hpatch` at small theta, robust at large theta where the H-form's S1 turns indefinite; H's reach q, about +35-50 % nnz in S1's psi rows. Needs M_w (assembled automatically). `_ms_` + `-sf_flux_hp_group 1 -sf_flux_dump <dir>` for the t5 gate |
 | `sf_jorek` | JOREK's default PC on the same case and ramp |
 | `sf_direct` | full-system direct solve: one MUMPS LU of the whole coupled Jacobian (`-jorek_pc_full_lu`, in-core), refactorised every step (`iter_precon = 0`); FGMRES only checks it |
 
 **Flux-Schur arm (`flux`).** `physics_pc_sf_suu = "flux"` (arms
-`sf_gmg_flux_ms`, `sf_lu_flux_ms`) solves the velocity block D_v first, then S1
+`sf_{gmg,lu}_flux*`) solves the velocity block D_v first, then S1
 on (ψ, j), then re-solves velocity and ρ / T. The pair_psi solver slot solves
 S1 (log label `S1 KSP`), the pair_w slot D_v (`D_v KSP`); `collect.py` reads
 both labels into the `sf_pj_mean` / `sf_w_mean` columns. The T0-T3 checks and
-how to run them: `util/physics_pc_scaling/flux_checks/README.md`. PETSc options
-(see the FLUX_SCHUR header of `solvers/mod_petsc_pc_sf.f90`; add them via
-`ARM_PETSC_OPTS` in `mknml.py`):
+how to run them: `util/physics_pc_scaling/flux_checks/README.md`.
+
+**The flux arm runs on the global path by default** (all toroidal harmonics
+coupled) and ignores the namelist flags `physics_pc_sf_mode_split` and
+`physics_pc_sf_harm_couple`; use `-sf_flux_mode_split 1` / `-sf_flux_harm_couple`
+instead. The `_ms` arms add `-sf_flux_mode_split 1`, the `_spai` arms
+`-sf_flux_s1 spai`, through `ARM_PETSC_OPTS` in `mknml.py` (`mknml.py petscopts
+<arm>` prints them; `pc_case.sh` passes them on). **The dump and the T0-T3
+checks need the `_ms` arms** (the dump is per family). PETSc options (see the
+FLUX_SCHUR header of `solvers/mod_petsc_pc_sf.f90`; `-sf_gmg6_*` override every
+`gmg_opts_t` entry of instance 6):
 
 | option | meaning |
 |---|---|
-| `-sf_flux_spai_r` | C_w's sparsity pattern = M_w^r (default 2) |
-| `-sf_flux_b16` | `0` drops the B_16 T* term from the flux right-hand side (default on) |
-| `-sf_flux_bend_sign` | sign of the bending term (T0; default 1) |
-| `-sf_flux_bend_form` | `0` B_12^T C_w B_12 (design note, default), `1` B_12 C_w B_12^T (C_w on the velocity space) |
-| `-sf_gmg6_ncol`, `-sf_gmg6_ring_super` | S1's GMG (hierarchy 6): ring colours (`0` auto = radial reach + 1), super-node ring solve (`-1` auto from the reach along a ring, off by default) |
-| `-sf_flux_spai_check` | `1`: check C_w's definiteness at every build |
-| `-sf_flux_dump <dir>` | write the family blocks once, as PETSc binary, for the T0-T3 checks |
+| `-sf_flux_mode_split 1` | per-family mode split (default 0 = global path); required for `-sf_flux_dump` and the T0-T3 checks |
+| `-sf_flux_harm_couple k` | cross-\|n\| band on the global path (default -1 = all) |
+| `-sf_flux_s1 hpatch\|spai` | S1 surrogate: `hpatch` (default) H-form S1_ψψ = B11 + B12 H, H a banded local velocity response from graph-ball patch solves; `spai` the earlier bending term (1/ς) B12^T C_w B12 |
+| `-sf_flux_hp_p` / `-sf_flux_hp_r` / `-sf_flux_hp_group` | `hpatch` only: patch radius p (graph distance in B_33's graph, default 3) / cut radius r of H (default 3) / nodes per column group g (default 4); all >= 1 |
+| `-sf_flux_hp_vel 0\|1` | `hpatch` only: `0` (default) Y = (B_22 + W_c)^-1 R; `1` the u part of D_v^-1 [R; 0] (the (u, ω) patch) |
+| `-sf_flux_step6 0\|1` | `1` (default): consistent velocity re-solve with L1hat (one extra ρ / T solve pair per application); `0` the spec form |
+| `-sf_flux_spai_r` | `spai` only: C_w's sparsity pattern = M_w^r (default 2) |
+| `-sf_flux_spai_replicate 0\|1` | `spai` only: `1` (default) SPAI of the scalar slot-0 mass M_0, replicated per slot (exact while M_w is slot-diagonal, checked at every build; falls back to the whole M_w otherwise); `0` forces the SPAI of the whole M_w |
+| `-sf_flux_bend_form 0\|1\|2` | `spai` only: `0` B_12^T C_w B_12 (default), `1` B_12 C_w B_12^T by MatRARt, `2` the same on the explicit B_12^T, zero on ψ's Dirichlet set |
+| `-sf_flux_bend_sign` | `spai` only: sign of the bending term (T0; default 1) |
+| `-sf_flux_b16 0\|1` | `0` drops the B_16 T* term from the flux right-hand side (default 1 = kept) |
+| `-sf_flux_spai_check 0\|1` | `1`: check C_w's definiteness at every build (`spai`; default 0) |
+| `-sf_flux_dump <dir>` | write the family blocks once, as PETSc binary (`<dir>/fam<f>/*.bin`, `meta.txt`), for the T0-T3 checks; needs `-sf_flux_mode_split 1` (fatal otherwise), families with more than one rank are skipped |
+| `-sf_gmg6_ncol` | S1's GMG (instance 6): ring-sweep colours (default `0` = auto, radial reach + 1 per level) |
+| `-sf_gmg6_ring_super` | super-node ring solve (global path default -1 = from the along-ring reach; mode split 0 = off) |
+| `-sf_gmg6_ring_overlap` | rings cut by a rank boundary are completed from the neighbouring ranks (global path default 2, as the mixed pair_w; mode split 0) |
+| `-sf_gmg6_ring_par -1\|0\|1` | hybrid ring solver: each colour threaded over (ring, segment) work items; default -1 = 1 when `ring_overlap` > 0, else 0 |
+| `-sf_gmg6_ring_single -1\|0\|1` | single-precision ring factors; S1 default 0 (double: the bending term is too stiff for single), D_v (instance 1) keeps -1 = 1 with `harm_pair` 2 |
+
+GMG instance 6 (S1) on the global path: `harm_pair 2` (all slots of a ring in
+one block), axis rings ceil(reach/2) with S1's radial reach = 1 + `hp_r`
+(hpatch) or 2 + `spai_r` (spai), i.e. 2 by default, `ring_overlap` (rings
+completed across rank cuts). D_v (instance 1) also uses `harm_pair 2` on the global path.
 
 **The wpj corrector** (`physics_pc_sf_corrector`, 2026-10-02). Step 3 of the
 sweep needs M⁻¹ U δv. Chacon's Eq. (16) applies the full M⁻¹ (a second pair_psi

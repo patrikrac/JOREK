@@ -2,13 +2,18 @@
 ! included with RK (the real kind of the factors and the vector), GEMV /
 ! GETRS (d* / s*) and the routine names defined. a holds the factors as
 ! btd_factor leaves them, piv their pivots, x a vector in block order.
+! w / ipv (optional): the hybrid separators' workspace, >= rg%nf entries
+! each, which the smoothing solves take from per-thread heap arrays; absent,
+! it is an automatic array on the (thread) stack.
 
   !> x = A^-1 x, serially
-  subroutine BTD_SOLVE(rg, a, piv, x)
+  subroutine BTD_SOLVE(rg, a, piv, x, w, ipv)
     type(btd_ring), intent(in) :: rg
     real(RK), intent(in)    :: a(*)
     integer, intent(in)     :: piv(*)
     real(RK), intent(inout) :: x(*)
+    real(RK), intent(inout), optional :: w(*)     !< hybrid: separator workspace (>= rg%nf)
+    integer, intent(inout), optional  :: ipv(*)   !< hybrid: separator pivot workspace (>= rg%nf)
     integer :: k
     if (rg%meth == RS_THOMAS) then
       call THOMAS_SOLVE(rg, a, piv, x)
@@ -17,7 +22,7 @@
     do k = 0, rg%ns - 1
       call HYB_SOL_FWD(rg, a, piv, x, k)
     enddo
-    call HYB_SOL_SEP(rg, a, piv, x)
+    call HYB_SOL_SEP(rg, a, piv, x, w, ipv)
     do k = 0, rg%ns - 1
       call HYB_SOL_BWD(rg, a, x, k)
     enddo
@@ -70,15 +75,37 @@
   end subroutine HYB_SOL_FWD
 
   !> hybrid, after all segments' forward sweeps: every separator's x -= L z
-  !! of the previous segment's last node, then the separators' system
-  subroutine HYB_SOL_SEP(rg, a, piv, x)
+  !! of the previous segment's last node, then the separators' system (w /
+  !! ipv: the caller's workspace, else automatic)
+  subroutine HYB_SOL_SEP(rg, a, piv, x, w, ipv)
     type(btd_ring), intent(in) :: rg
     real(RK), intent(in)    :: a(*)
     integer, intent(in)     :: piv(*)
     real(RK), intent(inout) :: x(*)
+    real(RK), intent(inout), optional :: w(*)     !< separator workspace (>= rg%nf)
+    integer, intent(inout), optional  :: ipv(*)   !< separator pivot workspace (>= rg%nf)
+    if (present(w) .and. present(ipv)) then
+      call HYB_SEP_CORE(rg, a, piv, x, w, ipv)
+    else
+      block
+        real(RK) :: ws(rg%nf)
+        integer  :: iw(rg%nf)
+        call HYB_SEP_CORE(rg, a, piv, x, ws, iw)
+      end block
+    endif
+  end subroutine HYB_SOL_SEP
+
+  !> HYB_SOL_SEP on the workspace w / ipv: the separators' right-hand sides
+  !! and pivots gathered in separator order, solved, scattered back
+  subroutine HYB_SEP_CORE(rg, a, piv, x, w, ipv)
+    type(btd_ring), intent(in) :: rg
+    real(RK), intent(in)    :: a(*)
+    integer, intent(in)     :: piv(*)
+    real(RK), intent(inout) :: x(*)
+    real(RK), intent(inout) :: w(rg%nf)
+    integer, intent(inout)  :: ipv(rg%nf)
     real(RK), parameter :: one = 1, mone = -1
-    integer :: k, n, np, b, q, info, ipv(rg%nf)
-    real(RK) :: w(rg%nf)
+    integer :: k, n, np, b, q, info
     q = 0
     do k = 0, rg%ns - 1
       n = rg%sep(k); b = rg%bs(n); np = modulo(n - 1, rg%nn)
@@ -98,7 +125,7 @@
       x(rg%rp(n) + 1 : rg%rp(n) + b) = w(q + 1 : q + b)
       q = q + b
     enddo
-  end subroutine HYB_SOL_SEP
+  end subroutine HYB_SEP_CORE
 
   !> hybrid, segment k backward: x_J = z_J - H_J x_a - G_J x_J+1 (x_b at the end)
   subroutine HYB_SOL_BWD(rg, a, x, k)

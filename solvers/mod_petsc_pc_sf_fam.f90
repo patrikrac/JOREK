@@ -299,6 +299,19 @@ contains
     integer(8) :: na_d, na_o, nw_d, nw_o, ndrop, nd_glob
     integer, allocatable :: sl(:), slg(:), cf(:)
     integer :: cbase, iw0, iw
+    !> the W sources' value arrays, for the drop count: an entry outside the
+    !! band counts only where it is nonzero (a slot-diagonal source such as
+    !! the flux arm's M_w stores structural zeros there)
+    type :: wv_t
+      Mat :: d, o
+      type(c_ptr) :: pd, po
+      real(c_double), pointer :: vd(:) => null(), vo(:) => null()
+      logical :: on = .false.
+    end type wv_t
+    type(wv_t), allocatable :: wv(:)
+    PetscInt, pointer :: gq(:)
+    integer(c_int) :: rc
+    logical, allocatable :: inb(:)                       ! the slots of the band's families
     integer, allocatable :: uj(:), ka(:), kw(:)          ! one index's block columns: A / W block (+-k, 0)
     integer, allocatable :: srow(:), scol(:), smrow(:), smcol(:)
     integer :: nrow_tot
@@ -349,7 +362,19 @@ contains
     !--- source side: two passes (count, then fill) over my rows of every
     !--- family. Messages go out per (family owner, field), rows ordered
     !--- (index, slot), entries in the owner's column order.
-    allocate(uj(64), ka(64), kw(64))
+    allocate(uj(64), ka(64), kw(64), inb(0:n_tor - 1))
+    allocate(wv(size(Wf)))
+    if (op%has_w .and. op%part == 0) then
+      do iw = 1, size(Wf)
+        if (.not. any(op%wid(1:nf, 1:nf) == iw)) cycle
+        wv(iw)%on = .true.
+        call split_parts(Wf(iw), .true., wv(iw)%d, wv(iw)%o, gq)
+        rc = c_baij_get(transfer(wv(iw)%d%v, 0_c_intptr_t), wv(iw)%pd)
+        call c_f_pointer(wv(iw)%pd, wv(iw)%vd, [huge(1)])
+        rc = c_baij_get(transfer(wv(iw)%o%v, 0_c_intptr_t), wv(iw)%po)
+        call c_f_pointer(wv(iw)%po, wv(iw)%vo, [huge(1)])
+      enddo
+    endif
     ndrop = 0
     do pass = 1, 2
       nmsg = 0; ent = 0; nrow_tot = 0
@@ -360,9 +385,11 @@ contains
         ! (part 1); nbs = the slots of all of them, for the drop count
         cf = [integer ::]
         nbs = 0
+        inb = .false.
         do g = 1, sff_nfam
           if (.not. sff_banded(f, g)) cycle
           nbs = nbs + size(fslots(g))
+          inb(fslots(g)) = .true.
           if ((op%part == 0) .eqv. (g == f)) cf = [cf, g]
         enddo
         qa = fowner(f, me0); qb = fowner(f, me0 + nloc_i - 1)
@@ -433,10 +460,21 @@ contains
                 enddo
                 enddo
                 if (pass == 2) srow(nrow_tot) = row
-                ! W's entries of this row outside the band
-                if (pass == 1 .and. any(op%wid(a, 1:nf) > 0) .and. op%part == 0) then
+                ! W's nonzero entries of this row outside the band (slot m,
+                ! column slot qslot of the band's complement)
+                if (pass == 1 .and. any(op%wid(a, 1:nf) > 0) .and. op%part == 0 .and. nbs < n_tor) then
                   do jq = 1, nu
-                    if (kw(jq) /= 0) ndrop = ndrop + (n_tor - nbs)
+                    if (kw(jq) == 0) cycle
+                    do qslot = 0, n_tor - 1
+                      if (inb(qslot)) cycle
+                      do b = 1, nf
+                        if (op%wid(a, b) <= 0) cycle
+                        if (wval(op%wid(a, b), kw(jq), m, qslot) /= 0.d0) then
+                          ndrop = ndrop + 1
+                          exit
+                        endif
+                      enddo
+                    enddo
                   enddo
                 endif
               enddo
@@ -455,7 +493,13 @@ contains
         smrow(nmsg + 1) = nrow_tot; smcol(nmsg + 1) = ent
       endif
     enddo
-    deallocate(uj, ka, kw)
+    deallocate(uj, ka, kw, inb)
+    do iw = 1, size(Wf)
+      if (.not. wv(iw)%on) cycle
+      rc = c_baij_restore(transfer(wv(iw)%o%v, 0_c_intptr_t), wv(iw)%po)
+      rc = c_baij_restore(transfer(wv(iw)%d%v, 0_c_intptr_t), wv(iw)%pd)
+    enddo
+    deallocate(wv)
     call put_ij(Ad, .true., nad, aia, aja); call put_ij(Ao, .true., nao, oia, oja)
     if (op%has_w) then
       call put_ij(Wd, .true., nwd, wia, wja); call put_ij(Wo, .true., nwo, woia, woja)
@@ -463,7 +507,7 @@ contains
     if (op%has_w .and. op%part == 0) then
       call MPI_Allreduce(ndrop, nd_glob, 1, MPI_INTEGER8, MPI_SUM, gcomm, mpierr)
       if (my_id == 0 .and. nd_glob > 0) write(*,'(A,A,A,I0,A)') "[Physics PC]   SF mode split: ", &
-        trim(op%label), ": ", nd_glob, " W entries outside the cross-|n| band dropped"
+        trim(op%label), ": ", nd_glob, " (block column, slot) pairs with nonzero W outside the cross-|n| band dropped (first build)"
     endif
 
     !--- owner side: my rows of every field come from the source ranks of
@@ -554,6 +598,19 @@ contains
     call sff_op_fill(op, Aj, Wf, opz)
 
   contains
+
+    !> Value of W source iw at scalar (rw, cw) of its block +-k (block_cols'
+    !! kw: + diagonal part, - off-diagonal part), for the drop count.
+    real*8 function wval(iw_, k_, rw, cw)
+      integer, intent(in) :: iw_, k_, rw, cw
+      integer(c_int32_t) :: p
+      p = apos(k_, rw, cw, n_tor)
+      if (p > 0) then
+        wval = wv(iw_)%vd(p)
+      else
+        wval = wv(iw_)%vo(-p)
+      endif
+    end function wval
 
     !> Fail unless W source Wm has the block pattern of Wf(iw0) read above.
     subroutine same_pattern(Wm)

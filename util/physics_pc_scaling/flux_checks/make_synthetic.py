@@ -211,6 +211,16 @@ def main():
     ap.add_argument("--n-plane", type=int, default=8, help="FFT slot normalisation factor")
     ap.add_argument("--no-b65", action="store_true", help="do not write B65")
     ap.add_argument("--no-b16", action="store_true", help="do not write B16")
+    ap.add_argument("--bend-form", type=int, choices=[0, 1, 2], default=0,
+                    help="spai dumps: 0 B12^T Cw B12 (default), 2 Dpsi B12 (Du Cw Du) B12^T Dpsi "
+                         "(meta bend_form + dirichlet_psi; form 1 is not generated)")
+    ap.add_argument("--hpatch", choices=["off", "banded", "patch"], default="off",
+                    help="write an hpatch-style dump (meta s1 hpatch, H.bin, Bb = Dpsi B12 H, no Cw.bin): "
+                         "'banded' = SPAI-banded nonsymmetric H, 'patch' = the t5_hpatch patch construction")
+    ap.add_argument("--hp-p", type=int, default=3, help="hpatch patch radius (meta p; 'patch' mode)")
+    ap.add_argument("--hp-r", type=int, default=3, help="hpatch band radius (meta r)")
+    ap.add_argument("--hp-g", type=int, default=1, help="hpatch group size (meta g; 1 = exact t5 gate)")
+    ap.add_argument("--hp-vel", type=int, default=0, help="hpatch velocity block (meta vel)")
     ap.add_argument("--int64", action="store_true", help="write 64-bit PetscInt files")
     ap.add_argument("--physical-dofs", action="store_true", help="unscaled derivative DOFs")
     a = ap.parse_args()
@@ -354,7 +364,12 @@ def main():
         IDs = sp.csr_matrix((np.ones(len(Dix)), (Dix, Dix)), shape=Cw_s.shape)
         Mw = kr(dirichlet_fix(fn * Mw_s, Dix, True))
         Cw = kr((Cw_s - IDs) / fn + IDs)                      # SPAI of the normalised Mw
-        Bb = (B["B12"].T @ Cw @ B["B12"]) / vs
+        dmk = np.ones(nn); dmk[D] = 0.0                       # u / psi free mask (the same here)
+        Dm_ = sp.diags(dmk)
+        if a.bend_form == 2:    # Dpsi B12 (Du Cw Du) B12^T Dpsi / vs
+            Bb = Dm_ @ B["B12"] @ Dm_ @ Cw @ Dm_ @ B["B12"].T @ Dm_ / vs
+        else:
+            Bb = (B["B12"].T @ Cw @ B["B12"]) / vs
         Z = sp.csr_matrix((nn, nn))
         PJ = sp.bmat([[B["B11"], B["B13"]], [B["B31"], B["B33"]]], format="csr")
         S1 = PJ + sp.bmat([[Bb, Z], [Z, Z]], format="csr")
@@ -369,18 +384,42 @@ def main():
         if a.no_b16:
             out.pop("B16")
         out.update(Mw=Mw, Cw=Cw, Bb=Bb, PJ=PJ, S1=S1, Dv0=Dv0, Dv=Dv)
+        hp = a.hpatch != "off"
+        if hp:      # hpatch-style dump: H.bin, Bb = Dpsi B12 H, no Cw
+            out.pop("Cw")
         for k, A in out.items():
             write_petsc_mat(os.path.join(od, k + ".bin"), A, int64=a.int64)
-        for k in ["B65", "B16"]:
+        for k in ["B65", "B16"] + (["Cw"] if hp else ["H"]):
             p = os.path.join(od, k + ".bin")
             if k not in out and os.path.exists(p):
                 os.remove(p)
-        with open(os.path.join(od, "meta.txt"), "w") as fh:
-            fh.write("family %d\nnslot %d\nnindex %d\nvarsigma %.17g\ntheta_dt %.17g\n"
-                     % (fam, nslot, g.nindex, vs, th))
-            fh.write("dirichlet " + " ".join(str(i) for i in D) + "\n")
-            fh.write("bend_sign 1\n")
-            fh.write("# synthetic: n_tor %d %s\n" % (n, " ".join("%s=%s" % kv for kv in sorted(vars(a).items()))))
+
+        def write_meta():
+            with open(os.path.join(od, "meta.txt"), "w") as fh:
+                fh.write("family %d\nnslot %d\nnindex %d\nvarsigma %.17g\ntheta_dt %.17g\n"
+                         % (fam, nslot, g.nindex, vs, th))
+                fh.write("dirichlet " + " ".join(str(i) for i in D) + "\n")
+                fh.write("bend_sign 1\n")
+                if hp:
+                    fh.write("bend_form 0\ns1 hpatch\np %d\nr %d\ng %d\nvel %d\n" % (a.hp_p, a.hp_r, a.hp_g, a.hp_vel))
+                else:
+                    fh.write("bend_form %d\ns1 spai\n" % a.bend_form)
+                if hp or a.bend_form == 2:
+                    fh.write("dirichlet_psi " + " ".join(str(i) for i in D) + "\n")
+                fh.write("# synthetic: n_tor %d %s\n" % (n, " ".join("%s=%s" % kv for kv in sorted(vars(a).items()))))
+        write_meta()
+        if hp:
+            Dpm = sp.diags(dmk)
+            if a.hpatch == "patch":     # the patch construction of t5_hpatch (g == 1 passes its gate)
+                from petsc_bin import Family
+                from t5_hpatch import rebuild_H
+                Hm, _ = rebuild_H(Family(od), a.hp_p, a.hp_r, a.hp_g, a.hp_vel)
+            else:                       # banded H on the SPAI pattern; the triu term makes Bb nonsymmetric
+                Hm = (Dpm @ (Cw + 0.3 * sp.triu(Cw, 1)) @ B["B12"].T @ Dpm / vs).tocsr()
+            Bb_h = (Dpm @ B["B12"] @ Hm).tocsr()
+            S1_h = PJ + sp.bmat([[Bb_h, Z], [Z, Z]], format="csr")
+            for k, A in (("H", Hm), ("Bb", Bb_h), ("S1", S1_h)):
+                write_petsc_mat(os.path.join(od, k + ".bin"), A, int64=a.int64)
         print("wrote %s  (n=%d, nslot=%d, nindex=%d, %d Dirichlet rows)" % (od, n, nslot, g.nindex, len(D)))
 
 

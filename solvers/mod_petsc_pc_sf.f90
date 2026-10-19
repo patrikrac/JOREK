@@ -18,6 +18,7 @@ module mod_petsc_pc_sf
   use mod_petsc_raw_csr, only: blockmv_attach
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
   use mod_petsc_pc_sf_spai, only: spai_t, spai_build, spai_refill, spai_check
+  use mod_petsc_pc_sf_hpatch, only: hpatch_t, hpatch_build
   use mod_petsc_pc_sf_fam, only: fam_op_t, sff_comm, sff_decompose, sff_op_build, &
        sff_op_fill, sff_vec_setup, sff_scatter_in, sff_scatter_out, &
        sff_cross_addmult, sff_cross_scale, sff_copy_local, sff_add_local, sff_lift, &
@@ -117,28 +118,77 @@ module mod_petsc_pc_sf
   !! ---------------------------------------
   !! The opposite elimination order (Tang et al., JCP 454 (2022) 110967;
   !! design note flux_schur_design.md): velocity first, then the flux-side
-  !! Schur surrogate on (psi, j),
+  !! Schur surrogate on (psi, j), -sf_flux_s1:
   !!
-  !!   S1 = [[B_11 + (1/varsigma) B_12^T C_w B_12, B_13], [B_31, B_33]],
+  !!   hpatch (default):  S1 = [[B_11 + B_12 H, B_13], [B_31, B_33]]
+  !!   splitm:            the same with H = H_T + cut_r(remainder) (below)
+  !!   spai:              S1 = [[B_11 + (1/varsigma) B_12^T C_w B_12, B_13], [B_31, B_33]]
   !!
-  !! C_w ~ M_w^-1 the banded SPAI (mod_petsc_pc_sf_spai) of the inertia-weighted
-  !! mass M_w = (v, f)_{R^3 rho0}. The bending term factors through the
-  !! assembled B_12 on both sides, so it inherits ker B_12 (Tang's discrete
-  !! commutation G K_{R^3 rho}^-1 G M^-1 K ~ G M_{R^3 rho}^-1 G). The sweep
+  !! H-FORM (mod_petsc_pc_sf_hpatch). H is the banded local velocity
+  !! response to psi: per group of g nodes (-sf_flux_hp_group, 4), on the
+  !! patch P of the indices within graph distance p of it (B_33's graph,
+  !! -sf_flux_hp_p, 3), X = B_33^-1 B_31, R = B_23 X - B_21, Y = (B_22 +
+  !! W_c)^-1 R (-sf_flux_hp_vel 1: the u part of D_v^-1 [R; 0]), H = Y cut to
+  !! distance r (-sf_flux_hp_r, 3); free DOFs only, Bb = B_12 H zero on psi's
+  !! Dirichlet rows. S1 is nonsymmetric. It replaces the SPAI form because
+  !! Tang's commutation fails on JOREK's shaped toroidal Hermite grid:
+  !! sigma(S~1(M_w^-1)^-1 S1) = [0.67, 1.62] on the real dumps, no symmetric
+  !! middle operator fixes it; GMRES on the production sweep 18-19 / 21 (spai)
+  !! -> 8 / 10 (hpatch), exact S1 7 / 7-8.
+  !! SPLIT-M (-sf_flux_s1 splitm). The H-form truncates all of R, including
+  !! the part that carries ker B_12; at large theta that makes S1 indefinite
+  !! (shaped toroidal Hermite testbed, n = 2, theta = 100: lambda = -34).
+  !! Split-M keeps Tang's commuted part exactly and truncates only the
+  !! commutator remainder (the shear term at rational surfaces, the R^3 rho0
+  !! vs 1/R weight mismatch): H_T = -(1/varsigma) M_w^-1 B_23 from local mass
+  !! patches of radius q (-sf_flux_hp_q, default p + 1), H = H_T + cut_r(
+  !! (B_22 + W_c)[P]^-1 (R - D_v H_T)[P]). Same quality as hpatch at small
+  !! theta (real dumps), robust at large theta; H's reach q, S1's 1 + q.
+  !! Needs M_w (assembled as for spai).
+  !! SPAI FORM. C_w ~ M_w^-1 the banded SPAI (mod_petsc_pc_sf_spai) of the
+  !! inertia-weighted mass M_w = (v, f)_{R^3 rho0}. The bending term factors
+  !! through the assembled B_12 on both sides, so it inherits ker B_12 (Tang's
+  !! discrete commutation G K_{R^3 rho}^-1 G M^-1 K ~ G M_{R^3 rho}^-1 G);
+  !! M_w is assembled only for it (and for -sf_flux_dump). The sweep
   !! (sf_flux_sweep):
   !!   1. rho* = B_55^-1 x_rho,  T* = B_66^-1 (x_T - B_65 rho*)
   !!   2. r_u = x_u - B_25 rho* - B_26 T*
   !!   3. (u*, w*) = D_v^-1 (r_u, x_w),  D_v = [[B_22 + W_c, B_24], [B_42, B_44]]
   !!   4. r_psi = x_psi - B_12 u* - B_16 T*  (-sf_flux_b16 0 drops B_16 T*)
   !!   5. (psi, j) = S1^-1 (r_psi, x_j)
-  !!   6. (u, w) = D_v^-1 (r_u - B_21 psi - B_23 j, x_w)
+  !!   6. (u, w) = D_v^-1 (r_u - B_21 psi - B_23 j + B_25 drho + B_26 dT, x_w),
+  !!      drho = B_55^-1 B_51 psi, dT = B_66^-1 (B_61 psi + B_63 j - B_65 drho)
+  !!      (-sf_flux_step6 1, default: exact when the parts are; 0 drops the
+  !!      drho / dT terms and their two solves, as the design note's S4)
   !!   7. rho, T re-solved against the final psi, j, u (as corrector 4)
-  !! slv_pj solves S1 (GMG hierarchy 6, multi-colour ring sweep, -sf_gmg6_*),
-  !! slv_w D_v (hierarchy 1). Mode split, model199, no v_par, no band, no
-  !! -sf_seq. PETSc options: -sf_flux_spai_r (C_w's pattern M_w^r, default
-  !! 2), -sf_flux_b16, -sf_flux_bend_sign and -sf_flux_bend_form (T0),
-  !! -sf_flux_spai_check, -sf_flux_dump <dir> (the family blocks for the
-  !! offline checks of util/physics_pc_scaling/flux_checks, once).
+  !! Per apply: one S1 solve, two D_v, three B_55 and three B_66 (two and two
+  !! with -sf_flux_step6 0). slv_pj solves S1 (GMG hierarchy 6, multi-colour
+  !! ring sweep, -sf_gmg6_*), slv_w D_v (hierarchy 1). model199, no v_par,
+  !! no -sf_seq.
+  !! LAYOUT. The GLOBAL path by default, whatever physics_pc_sf_mode_split
+  !! says: all n_tor slots on every rank, every cross-|n| coupling kept in
+  !! the extracted blocks (harm_band -1; -sf_flux_harm_couple k keeps the
+  !! |n| groups at most k apart, 0 the |n|-diagonal blocks; the namelist's
+  !! physics_pc_sf_harm_couple is ignored); S1's and D_v's smoother blocks
+  !! hold every slot (SF_GMG_HARM_PAIR_FLUX_G). -sf_flux_mode_split 1: the
+  !! |n|-diagonal family operators of the mode split instead (one family per
+  !! rank group), which -sf_flux_dump needs; an explicitly given
+  !! -sf_flux_harm_couple other than 0 is refused there (the option's
+  !! default, -1, is ignored under the mode split).
+  !! C_W (spai). The SPAI of M_w runs once on the scalar slot-0 mass M_0 (n_plane
+  !! M_pol on the global path) and is replicated per slot, C_w = (f_0 / f_m)
+  !! C_0 on slot m (2 C_0 on cos / sin): exact, as M_w is slot-diagonal with
+  !! slot m = (f_m / f_0) M_0 -- checked at every build (one Dirichlet set in
+  !! all slots, i.e. not with a free boundary); otherwise the SPAI of the
+  !! whole M_w (-sf_flux_spai_replicate 0 forces that).
+  !! PETSc options: -sf_flux_s1 hpatch | splitm | spai, -sf_flux_hp_p / _r /
+  !! _group / _vel (hpatch, splitm), -sf_flux_hp_q (splitm); -sf_flux_spai_r (spai: C_w's pattern M_w^r, default 2),
+  !! -sf_flux_b16, -sf_flux_bend_sign and -sf_flux_bend_form (spai: 0 B_12^T C_w
+  !! B_12, default; 1 B_12 C_w B_12^T by MatRARt; 2 the same on the explicit
+  !! B_12^T, zero on psi's Dirichlet set), -sf_flux_spai_check,
+  !! -sf_flux_mode_split, -sf_flux_harm_couple, -sf_flux_spai_replicate,
+  !! -sf_flux_step6, -sf_flux_dump <dir> (the family blocks for the offline
+  !! checks of util/physics_pc_scaling/flux_checks, once; mode split only).
   !!
   !! CONFIGURATION
   !! -------------
@@ -240,22 +290,51 @@ module mod_petsc_pc_sf
   type(mass_cheb_t), save :: mcm
 
   !--- the flux arm (physics_pc_sf_suu = "flux", FLUX_SCHUR below) ----------
-  !> M_w = (v, f)_{R^3 rho0}, the family's scalar field (element-assembled,
-  !! Dirichlet rows / columns identity); C_w its banded SPAI; G = B_12 with
-  !! fmask = 0 on the Dirichlet rows; f_g = D C_w D, D = diag(fmask); Bb =
-  !! (s / varsigma) D B_12^T f_g B_12 D; bpk Bb in pair_psi's packed (psi, j)
-  !! layout; s1 = P_J + bpk, the operator slv_pj solves on this arm.
+  !> M_w = (v, f)_{R^3 rho0}, u's scalar field (element-assembled, Dirichlet
+  !! rows / columns identity): g_ctx%M_w on the global path, the family's
+  !! o_mw under the mode split. C_w (f_c) its banded SPAI: built once on the
+  !! scalar slot-0 matrix M_0 (f_m0) and replicated over the slots (f_cw), or
+  !! on the whole of M_w (fspai%C). G = B_12 with fmask = 0 on u's Dirichlet
+  !! rows; f_g = D C_w D, D = diag(fmask); Bb = (s / varsigma) D B_12^T f_g
+  !! B_12 D (form 0), or (s / varsigma) P B_12 f_g B_12^T P with P =
+  !! diag(pmask), psi's Dirichlet set (form 2, f_t12 = B_12^T); bpk Bb in
+  !! pair_psi's packed (psi, j) layout; s1 = P_J + bpk, the operator slv_pj
+  !! solves on this arm.
   type(fam_op_t), save :: o_mw, o_w0          !< o_w0: (u, omega) without W, for -sf_flux_dump only
   type(spai_t), save :: fspai
   Mat, save :: f_g, f_bb, f_bpk, f_s1
-  Vec, save :: fmask
+  !> (not PETSC_NULL_MAT-initialised, as vop_g: PETSc's Fortran stubs read a
+  !! null output argument as "not wanted")
+  Mat, save :: f_m0, f_cw, f_t12, f_mfull
+  Mat, save :: f_c                             !< C_w: f_cw, or fspai%C (a copy of the handle)
+  Vec, save :: fmask, pmask
   logical, save :: f_ready = .false., f_bpk_ready = .false., f_dumped = .false.
+  logical, save :: f_mfull_all = .false.       !< the whole-M_w copy keeps off-slot entries (some nonzero)
   integer, save :: f_r = 2                     !< -sf_flux_spai_r: C_w's pattern = M_w^r
   logical, save :: f_b16 = .true.              !< -sf_flux_b16 0: drop B_16 T* from the flux rhs
   real*8, save  :: f_sign = 1.0d0              !< -sf_flux_bend_sign: the bending term's sign (T0)
   logical, save :: f_check = .false.           !< -sf_flux_spai_check 1: C_w's definiteness at every build
-  integer, save :: f_form = 0                  !< -sf_flux_bend_form: 0 B_12^T C_w B_12, 1 B_12 C_w B_12^T
+  !> -sf_flux_bend_form: 0 B_12^T C_w B_12 (default), 1 B_12 C_w B_12^T by
+  !! MatRARt, 2 B_12 C_w B_12^T by MatPtAP on the explicit B_12^T, psi's mask
+  integer, save :: f_form = 0
   character(len=256), save :: f_dump = ""      !< -sf_flux_dump <dir>: write the family blocks once
+  logical, save :: f_ms = .false.              !< -sf_flux_mode_split 1: the mode split (else global)
+  integer, save :: f_hc = -1                   !< -sf_flux_harm_couple: the global path's band (-1 all)
+  logical, save :: f_rep = .true.              !< -sf_flux_spai_replicate: C_w from M_0, per slot
+  logical, save :: f_rep_on = .false.          !< ... in use (decided at the first build)
+  integer, save :: f_step6 = 1                 !< -sf_flux_step6: 0 the spec's velocity re-solve, 1 consistent
+  character(len=16), save :: f_lbl = ""        !< "global" | "family <k>": the messages' label
+  !> -sf_flux_s1: S1's surrogate, SF_FLUX_S1_HPATCH (default: Bb = B_12 H,
+  !! mod_petsc_pc_sf_hpatch), SF_FLUX_S1_SPLITM (the same with Tang's part
+  !! kept, SPLIT-M) or SF_FLUX_S1_SPAI (the C_w bending term above)
+  integer, save :: f_s1k = SF_FLUX_S1_HPATCH
+  type(hpatch_t), save :: fhp                  !< hpatch: H and its structure
+  integer, save :: f_hp_p = 3                  !< -sf_flux_hp_p: patch radius (graph distance)
+  integer, save :: f_hp_r = 3                  !< -sf_flux_hp_r: H's cut radius
+  integer, save :: f_hp_g = 4                  !< -sf_flux_hp_group: nodes per column group
+  integer, save :: f_hp_vel = 0                !< -sf_flux_hp_vel 1: the (u, omega) D_v patch
+  integer, save :: f_hp_q = -1                 !< -sf_flux_hp_q: split-M's H_T patch radius (-1: p + 1)
+  logical, save :: f_needmw = .true.           !< M_w assembled and used (spai, or the dump)
 
   !--- ... with a cross-|n| band (physics_pc_sf_harm_couple /= 0): each
   !--- operator's cross-family part C (global comm, mod_petsc_pc_sf_fam). The
@@ -399,17 +478,18 @@ contains
       call fatal("physics_pc_sf_mode_split needs pair_w assembled entry by entry from A and W: "// &
                  "physics_pc_sf_suu = w | wpj | flux")
 
-    !--- the flux arm (FLUX_SCHUR): its own sweep, built on the family
-    !--- operators only; corrector auto (-1) resolves to 0 above
+    !--- the flux arm (FLUX_SCHUR): its own sweep; corrector auto (-1)
+    !--- resolves to 0 above. Its layout and band are its own: the global
+    !--- path with every cross-|n| coupling, whatever the namelist's mode
+    !--- split and band say, unless -sf_flux_mode_split 1 (the |n|-diagonal
+    !--- family operators, which -sf_flux_dump and the offline checks need)
     if (suu == SF_SUU_FLUX) then
-      if (.not. famode) call fatal("physics_pc_sf_suu = flux needs physics_pc_sf_mode_split = .t.")
-      if (banded) call fatal("physics_pc_sf_suu = flux needs physics_pc_sf_harm_couple = 0")
       if (jorek_model /= 199) call fatal("physics_pc_sf_suu = flux supports model199 only")
       if (with_v) call fatal("physics_pc_sf_suu = flux has no v_par stage")
       block
         PetscInt  :: iv
         PetscReal :: rv
-        PetscBool :: set
+        PetscBool :: set, hset
         character(len=256) :: sv
         iv = f_r
         call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_spai_r", iv, set, ierr)
@@ -429,9 +509,64 @@ contains
         sv = ""
         call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_dump", sv, set, ierr)
         if (set) f_dump = sv
+        iv = 0
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_mode_split", iv, set, ierr)
+        f_ms = (iv /= 0)
+        iv = f_hc
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_harm_couple", iv, hset, ierr)
+        f_hc = int(iv)
+        iv = 1
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_spai_replicate", iv, set, ierr)
+        f_rep = (iv /= 0)
+        iv = f_step6
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_step6", iv, set, ierr)
+        f_step6 = int(iv)
+        ! S1's surrogate and the H-form's patches
+        f_s1k = sf_flux_s1_kind()
+        iv = f_hp_p
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_hp_p", iv, set, ierr)
+        f_hp_p = int(iv)
+        iv = f_hp_r
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_hp_r", iv, set, ierr)
+        f_hp_r = int(iv)
+        iv = f_hp_g
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_hp_group", iv, set, ierr)
+        f_hp_g = int(iv)
+        iv = f_hp_vel
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_hp_vel", iv, set, ierr)
+        f_hp_vel = int(iv)
+        iv = f_hp_q
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_hp_q", iv, set, ierr)
+        f_hp_q = int(iv)
+        if (f_hp_q < 0) f_hp_q = f_hp_p + 1
+        ! the mode split's flux arm is |n|-diagonal only (no banded solves);
+        ! checked only when -sf_flux_harm_couple is given explicitly (its
+        ! default -1 is the global path's, ignored under the mode split)
+        if (f_ms .and. hset .and. f_hc /= 0) &
+          call fatal("-sf_flux_mode_split 1 needs -sf_flux_harm_couple 0 (the family operators are |n|-diagonal)")
       end block
       if (f_r < 1) call fatal("-sf_flux_spai_r must be >= 1")
-      if (f_form /= 0 .and. f_form /= 1) call fatal("-sf_flux_bend_form must be 0 or 1")
+      if (f_form < 0 .or. f_form > 2) call fatal("-sf_flux_bend_form must be 0, 1 or 2")
+      if (f_hc < -1) call fatal("-sf_flux_harm_couple must be -1 (all), 0 or a band k > 0")
+      if (f_step6 /= 0 .and. f_step6 /= 1) call fatal("-sf_flux_step6 must be 0 or 1")
+      if (len_trim(f_dump) > 0 .and. .not. f_ms) &
+        call fatal("-sf_flux_dump writes the |n| family blocks: add -sf_flux_mode_split 1")
+      if (f_s1k < 0) call fatal("-sf_flux_s1 must be hpatch | splitm | spai")
+      if (f_hp_p < 1 .or. f_hp_r < 1 .or. f_hp_g < 1 .or. f_hp_vel < 0 .or. f_hp_vel > 1) &
+        call fatal("-sf_flux_hp_p, -sf_flux_hp_r, -sf_flux_hp_group must be >= 1, -sf_flux_hp_vel 0 or 1")
+      ! H's cut is measured inside the patch (exact for r <= p), and S1's
+      ! reach 1 + r (the axis rings) assumes the cut is the binding one
+      if (f_s1k /= SF_FLUX_S1_SPAI .and. f_hp_r > f_hp_p) &
+        call fatal("-sf_flux_hp_r must not exceed -sf_flux_hp_p (H's cut lies inside the patch)")
+      ! split-M: D_v H_T on the patch's rows needs H_T one node beyond it
+      if (f_s1k == SF_FLUX_S1_SPLITM .and. f_hp_q < f_hp_p + 1) &
+        call fatal("-sf_flux_hp_q must be at least -sf_flux_hp_p + 1")
+      ! M_w: the SPAI's, and the dump's Mw (= sf_needs_mass_w, which decides its assembly)
+      f_needmw = sf_needs_mass_w()
+      famode = f_ms
+      harm_band = 0
+      if (.not. f_ms) harm_band = f_hc
+      banded = .false.
     endif
 
     !--- the band's harmonic-coupled Schwarz smoother (-sf_as_*)
@@ -493,9 +628,39 @@ contains
           " (pair_w mixed (u, omega, psi, j): B_22 + W's curvature, psi channel through psi, j)"
       case (SF_SUU_FLUX)
         write(*,'(A)') "[Physics PC]   S_uu     : flux (flux-Schur sweep: D_v = [B_22+W_c,B_24;B_42,B_44] first, "// &
-                       "then S1 = P_J + (1/varsigma) B_12^T C_w B_12 on (psi, j), then D_v and rho / T re-solves)"
-        write(*,'(A,I0,A,L1,A,F5.2)') "[Physics PC]   flux     : C_w = SPAI of M_{R^3 rho0} on pattern M_w^", f_r, &
-          ", B_16 T* in the flux rhs ", f_b16, ", bending sign ", f_sign
+                       "then the flux Schur surrogate S1 on (psi, j), then D_v and rho / T re-solves)"
+        write(*,'(A,L1)') "[Physics PC]   flux     : B_16 T* in the flux rhs ", f_b16
+        if (f_s1k == SF_FLUX_S1_HPATCH) then
+          write(*,'(A,4(I0,A))') "[Physics PC]   flux     : S1 = H-form, B_11 + B_12 H, H = cut(r = ", f_hp_r, &
+            ") of the patch velocity response (patch radius p = ", f_hp_p, ", groups of ", f_hp_g, &
+            " nodes, velocity block ", f_hp_vel + 1, " field(s)) (-sf_flux_s1 hpatch, -sf_flux_hp_*)"
+        else if (f_s1k == SF_FLUX_S1_SPLITM) then
+          write(*,'(A,5(I0,A))') "[Physics PC]   flux     : S1 = split-M, B_11 + B_12 H, H = H_T(q = ", f_hp_q, &
+            ") + cut(r = ", f_hp_r, ") of the patch response to R - D_v H_T (p = ", f_hp_p, ", groups of ", &
+            f_hp_g, " nodes, velocity block ", f_hp_vel + 1, " field(s)) (-sf_flux_s1 splitm, -sf_flux_hp_*)"
+          write(*,'(A)') "[Physics PC]   flux     : split-M: H_T = -(1/varsigma) M_w^-1 B_23 (Tang's commuted "// &
+                         "part, local mass patches)"
+        else
+          write(*,'(A)') "[Physics PC]   flux     : S1 = SPAI form, B_11 + (s/varsigma) B_12^T C_w B_12 "// &
+                         "(-sf_flux_s1 spai)"
+          write(*,'(A,I0,A,F5.2,A,I0)') "[Physics PC]   flux     : C_w = SPAI of M_{R^3 rho0} on pattern M_w^", &
+            f_r, ", bending sign ", f_sign, ", bending form ", f_form
+          write(*,'(A,L1,A)') "[Physics PC]   flux     : C_w built once on the slot-0 mass and replicated per "// &
+            "slot ", f_rep, " (-sf_flux_spai_replicate; the slot relation checked at every build)"
+        endif
+        if (f_step6 == 1) then
+          write(*,'(A)') "[Physics PC]   flux     : step 6 consistent, D_v rhs r_u - L_1 y_1 + L_2 D_2^-1 C_21 y_1 "// &
+                         "(-sf_flux_step6 1; one more B_55, B_66 solve)"
+        else
+          write(*,'(A)') "[Physics PC]   flux     : step 6 as the design note, D_v rhs r_u - B_21 psi - B_23 j "// &
+                         "(-sf_flux_step6 0)"
+        endif
+        if (f_ms) then
+          write(*,'(A)') "[Physics PC]   flux     : mode split, |n|-diagonal family operators (-sf_flux_mode_split 1)"
+        else
+          write(*,'(A,L1,A)') "[Physics PC]   flux     : global path, all toroidal slots on every rank; "// &
+            "physics_pc_sf_mode_split = ", physics_pc_sf_mode_split, " ignored (-sf_flux_mode_split 1 for the mode split)"
+        endif
         if (len_trim(f_dump) > 0) write(*,'(A,A)') "[Physics PC]   flux     : family blocks dumped once to ", &
           trim(f_dump)
       end select
@@ -504,17 +669,29 @@ contains
       write(*,'(A,A,A,A)') "[Physics PC]   rho / T  : ", trim(physics_pc_sf_rho), " / ", &
                            trim(physics_pc_sf_T)
       write(*,'(A,ES9.2)') "[Physics PC]   inner rtol: ", physics_pc_sf_rtol
-      select case (harm_band)
-      case (-1)
-        write(*,'(A)') "[Physics PC]   cross-|n|: all kept (physics_pc_sf_harm_couple = -1)"
-      case (0)
-        write(*,'(A)') "[Physics PC]   cross-|n|: none, |n|-diagonal blocks (physics_pc_sf_harm_couple = 0)"
-      case default
-        write(*,'(A,I0,A)') "[Physics PC]   cross-|n|: |n| groups at most ", harm_band, &
-          " apart kept (physics_pc_sf_harm_couple)"
-      end select
+      block
+        ! the flux arm sets its band itself (namelist value ignored)
+        character(len=64) :: hsrc
+        hsrc = "physics_pc_sf_harm_couple"
+        if (suu == SF_SUU_FLUX .and. f_ms) hsrc = "flux mode split"
+        if (suu == SF_SUU_FLUX .and. .not. f_ms) hsrc = "-sf_flux_harm_couple, flux default -1"
+        select case (harm_band)
+        case (-1)
+          write(*,'(A)') "[Physics PC]   cross-|n|: all kept ("//trim(hsrc)//")"
+        case (0)
+          write(*,'(A)') "[Physics PC]   cross-|n|: none, |n|-diagonal blocks ("//trim(hsrc)//")"
+        case default
+          write(*,'(A,I0,A)') "[Physics PC]   cross-|n|: |n| groups at most ", harm_band, &
+            " apart kept ("//trim(hsrc)//")"
+        end select
+        if (suu == SF_SUU_FLUX .and. physics_pc_sf_harm_couple /= harm_band) &
+          write(*,'(A,I0,A)') "[Physics PC]   cross-|n|: physics_pc_sf_harm_couple = ", &
+            physics_pc_sf_harm_couple, " ignored by the flux arm"
+      end block
       if (famode) write(*,'(A)') "[Physics PC]   layout   : one |n| family per rank, families concurrent "// &
                                  "(physics_pc_sf_mode_split)"
+      if (.not. famode .and. suu == SF_SUU_FLUX) &
+        write(*,'(A)') "[Physics PC]   layout   : global operators, all n_tor slots (flux arm default)"
       if (banded) write(*,'(A)') "[Physics PC]   band     : block solves = FGMRES over all families on "// &
                                  "D + C (W too), the family solvers as block-Jacobi preconditioner"
       if (as_any) write(*,'(A,7(I0,A))') "[Physics PC]   band     : + harmonic-coupled Schwarz smoother, "// &
@@ -648,7 +825,17 @@ contains
     if (famode) then
       call family_operators(first)
       comm_s = sff_comm
-      if (suu == SF_SUU_FLUX) call flux_operators(first)
+      if (suu == SF_SUU_FLUX) then
+        block
+          use mod_petsc_pc_harm, only: pc_ntor
+          ! the family's slots: n = 0 alone, or one cos / sin pair, whose
+          ! FFT slot factors are equal (n_plane / 2)
+          write(f_lbl, '(A,I0)') "family ", sff_fam
+          ! (o_mw only exists with f_needmw; hpatch does not read Mw, splitm does)
+          call flux_operators(first, o_mw%fam, o_pj%fam, o_w%fam, o_cb(1)%fam, o_cb(3)%fam, o_cb(4)%fam, &
+                              int(pc_ntor), spread(1.0d0, 1, int(pc_ntor)))
+        end block
+      endif
     else
       if (first) then
         call first_build_operators()
@@ -679,6 +866,25 @@ contains
         if (c72_on) a_vc(VC72) = c72_g
       endif
       comm_s = comm
+      !--- the flux arm on the global operators: S1 from P_J = K_pj_aij, B_12
+      !--- and the BAIJ M_w (all n_tor slots, slot factor n_plane on n = 0 and
+      !--- n_plane / 2 on cos / sin, see mod_pc_elt_mass_w)
+      if (suu == SF_SUU_FLUX) then
+        if (f_needmw .and. .not. g_ctx%M_w_ready) then
+          if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: the flux arm's M_w was never assembled "// &
+            "(petsc_assemble_pc_matrices, sf_needs_mass_w)."
+          call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+        endif
+        block
+          use mod_parameters, only: n_tor
+          real*8 :: rat(n_tor)
+          rat = 0.5d0;  rat(1) = 1.0d0                  ! f_m / f_0
+          f_lbl = "global"
+          ! D_v = S_W_aij, unscaled here (refilled by the gather; slv_w scales it later)
+          call flux_operators(first, g_ctx%M_w, g_ctx%K_pj_aij, g_ctx%S_W_aij, g_ctx%B_12, g_ctx%B_21, &
+                              g_ctx%B_23, n_tor, rat)
+        end block
+      endif
     endif
     if (first .and. with_v .and. vstage /= SF_VPAR_V0) call vpar_w_report()
     call physics_pc_mem("SF build: operators filled", my_id)
@@ -695,11 +901,13 @@ contains
     !--- packed (psi, j) pair, both fields in every smoother block. Set up
     !--- before pair_w, whose schur shell applies it.
     call PetscLogEventBegin(pcev_fact_pj, ierr)
-    if (suu == SF_SUU_FLUX) then
+    if (suu == SF_SUU_FLUX .and. famode) then
       ! S1 on its own hierarchy (6): rings everywhere, a harmonic's cos / sin
       ! together, radial semi-coarsening, and as many ring colours as S1's
-      ! radial reach + 1 (2 + r with C_w's pattern M_w^r), so the sweep is
-      ! exact block Gauss-Seidel (FLUX_SCHUR)
+      ! radial reach + 1 (1 + r for the H-form, r = -sf_flux_hp_r; 1 + q for
+      ! split-M; 2 + r with the SPAI's pattern M_w^r; flux_s1_reach), so the
+      ! sweep is exact block Gauss-Seidel
+      ! (FLUX_SCHUR)
       call sf_solver_setup(slv_pj, a_pj, bk_pj, "S1 KSP ([B_11+Bb,B_13;B_31,B_33])", &
                            comm_s, my_id, physics_pc_sf_rtol, gmg_inst=SF_GMG_INST_FLUX, nfields=2, &
                            smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
@@ -708,6 +916,21 @@ contains
                            harm_pair=SF_GMG_HARM_PAIR_FLUX, semi_r=SF_GMG_SEMI_R_MIXED, &
                            ncol=SF_GMG_NCOL_FLUX, ring_aspect=SF_GMG_RING_ASPECT_FLUX, &
                            ring_super=SF_GMG_RING_SUPER_FLUX, ring_solver=SF_GMG_RING_SOLVER_FLUX)
+    else if (suu == SF_SUU_FLUX) then
+      ! global path: as above, but every slot and both fields of a ring in one
+      ! block (the cross-|n| couplings inside it), super-nodes from the
+      ! along-ring reach, the cut rings completed, and the rings within the
+      ! bending term's reach of the axis node in the axis block
+      call sf_solver_setup(slv_pj, a_pj, bk_pj, "S1 KSP ([B_11+Bb,B_13;B_31,B_33])", &
+                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=SF_GMG_INST_FLUX, nfields=2, &
+                           smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=SF_PJ_PRE0, post0=pj_post0, nsmooth_c=SF_PJ_NSC, &
+                           line_overlap=SF_GMG_LINE_OVERLAP_FLUX, rich_from=pj_rich, &
+                           axis_rings=sf_gmg_axis_rings_flux(flux_s1_reach()), &
+                           harm_pair=SF_GMG_HARM_PAIR_FLUX_G, ring_overlap=SF_GMG_RING_OVERLAP_FLUX_G, &
+                           semi_r=SF_GMG_SEMI_R_MIXED, ncol=SF_GMG_NCOL_FLUX, &
+                           ring_aspect=SF_GMG_RING_ASPECT_FLUX, ring_super=SF_GMG_RING_SUPER_FLUX_G, &
+                           ring_solver=SF_GMG_RING_SOLVER_FLUX_G, ring_single=SF_GMG_RING_SINGLE_FLUX_G)
     else
       call sf_solver_setup(slv_pj, a_pj, bk_pj, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
                            comm_s, my_id, physics_pc_sf_rtol, gmg_inst=2, nfields=2, &
@@ -766,13 +989,19 @@ contains
                            semi_r=SF_GMG_SEMI_R_MIXED, axis_rings=ax_pair)
     else if (suu == SF_SUU_FLUX) then
       ! D_v: no parallel stiffness, the collective ring smoother with radial
-      ! semi-coarsening (design note S5.2), as the mixed pair_w
-      call sf_solver_setup(slv_w, a_w, bk_w, "D_v KSP ([B_22+W_c,B_24;B_42,B_44])", &
-                           comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
-                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
-                           pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC_MIXED, &
-                           harm_pair=SF_GMG_HARM_PAIR_MIXED, ring_overlap=SF_GMG_RING_OVERLAP, &
-                           semi_r=SF_GMG_SEMI_R_MIXED, axis_rings=ax_pair)
+      ! semi-coarsening (design note S5.2), as the mixed pair_w; on the
+      ! global path all slots of a ring in one block (SF_GMG_HARM_PAIR_FLUX_G)
+      block
+        integer :: hp
+        hp = SF_GMG_HARM_PAIR_MIXED
+        if (.not. famode) hp = SF_GMG_HARM_PAIR_FLUX_G
+        call sf_solver_setup(slv_w, a_w, bk_w, "D_v KSP ([B_22+W_c,B_24;B_42,B_44])", &
+                             comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
+                             smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                             pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC_MIXED, &
+                             harm_pair=hp, ring_overlap=SF_GMG_RING_OVERLAP, &
+                             semi_r=SF_GMG_SEMI_R_MIXED, axis_rings=ax_pair)
+      end block
     else
       call sf_solver_setup(slv_w, a_w, bk_w, "pair_w KSP ([B_22+W,B_24;B_42,B_44])", &
                            comm_s, my_id, physics_pc_sf_rtol, gmg_inst=1, nfields=2, &
@@ -888,7 +1117,7 @@ contains
       if (g_ctx%w_v_ready) then
         ws(WS_VV) = g_ctx%W_vv; ws(WS_VU) = g_ctx%W_vu; ws(WS_UV) = g_ctx%W_uv
       endif
-      if (suu == SF_SUU_FLUX) then
+      if (suu == SF_SUU_FLUX .and. f_needmw) then
         if (.not. g_ctx%M_w_ready) then
           if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: the flux arm's M_w was never assembled "// &
             "(petsc_assemble_pc_matrices, sf_needs_mass_w)."
@@ -912,7 +1141,7 @@ contains
         if (with_v .and. vstage /= SF_VPAR_B1) call sff_op_build(o_v, A_full, ws, sf_opz(), my_id)
         if (corr == 3) call sff_op_build(o_m, A_full, ws, sf_opz(), my_id)
         if (suu == SF_SUU_FLUX) then
-          call sff_op_build(o_mw, A_full, ws, sf_opz(), my_id)
+          if (f_needmw) call sff_op_build(o_mw, A_full, ws, sf_opz(), my_id)
           if (len_trim(f_dump) > 0) call sff_op_build(o_w0, A_full, ws, sf_opz(), my_id)
         endif
         do k = 1, ncb_on
@@ -935,7 +1164,7 @@ contains
         call sff_op_fill(o_rho, A_full, ws, sf_opz())
         call sff_op_fill(o_T,   A_full, ws, sf_opz())
         if (with_v .and. vstage /= SF_VPAR_B1) call sff_op_fill(o_v, A_full, ws, sf_opz())
-        if (suu == SF_SUU_FLUX) call sff_op_fill(o_mw, A_full, ws, sf_opz())
+        if (suu == SF_SUU_FLUX .and. f_needmw) call sff_op_fill(o_mw, A_full, ws, sf_opz())
         do k = 1, ncb_on
           call sff_op_fill(o_cb(k), A_full, ws, sf_opz())
         enddo
@@ -991,102 +1220,643 @@ contains
       endif
     end subroutine family_operators
 
-    !> The flux arm's S1 (FLUX_SCHUR), on this rank's family, after the
-    !! family operators: C_w = SPAI(M_w); G = B_12 with M_w's Dirichlet rows
-    !! and columns zeroed (the constrained space C_w acts on); Bb =
-    !! (s / varsigma) G^T C_w G; S1 = P_J + [[Bb, 0], [0, 0]]. The first call
-    !! fixes every pattern (C_w, Bb, S1 = the union with P_J); later calls
-    !! refill in place. a_pj becomes S1: the sweep's slv_pj solves it.
-    subroutine flux_operators(first_)
+    !> S1's radial reach in rings (its axis block, sf_gmg_axis_rings_flux):
+    !! 2 + r for the SPAI form, 1 + r for the H-form, 1 + q for split-M.
+    integer function flux_s1_reach()
+      select case (f_s1k)
+      case (SF_FLUX_S1_SPAI);   flux_s1_reach = 2 + f_r
+      case (SF_FLUX_S1_SPLITM); flux_s1_reach = 1 + f_hp_q
+      case default;             flux_s1_reach = 1 + f_hp_r
+      end select
+    end function flux_s1_reach
+
+    !> The flux arm's S1 (FLUX_SCHUR), after the path's operators (this
+    !! rank's family under the mode split, the global ones otherwise): C_w ~
+    !! Mw^-1 (flux_middle); G = B_12 on the constrained spaces; Bb by
+    !! -sf_flux_bend_form (flux_bend); S1 = P_J + [[Bb, 0], [0, 0]]. The first
+    !! call fixes every pattern (C_w, Bb, S1 = the union with P_J); later
+    !! calls refill in place. a_pj becomes S1: the sweep's slv_pj solves it.
+    !! Layout-agnostic: Mw is u's scalar field, row = index ns + slot, with
+    !! the Dirichlet rows / columns identity and the column layout of a12;
+    !! the middle operator (C_w ~ Mw^-1) is confined to flux_middle, so
+    !! another SPD Mw (or another approximate inverse) swaps in there.
+    subroutine flux_operators(first_, Mw, PJ, DV, a12, a21, a23, ns, rat)
       logical, intent(in) :: first_
-      Mat :: blk(2, 2)
-      real*8 :: gmin, lmin, lmax
+      Mat                 :: Mw     !< spai / splitm: M_w, g_ctx%M_w (BAIJ) or o_mw (AIJ)
+      Mat                 :: PJ     !< P_J = [[B_11, B_13], [B_31, B_33]], pair_psi's packed layout
+      Mat                 :: DV     !< hpatch: D_v = [[B_22 + W_c, B_24], [B_42, B_44]] packed, unscaled
+      Mat                 :: a12    !< B_12: psi rows, u columns (Mw's layout)
+      Mat                 :: a21    !< hpatch: B_21 (u rows, psi columns)
+      Mat                 :: a23    !< hpatch: B_23 (u rows, j columns)
+      integer, intent(in) :: ns     !< toroidal slots per index in Mw's rows
+      real*8, intent(in)  :: rat(:) !< spai: Mw's slot factors f_m / f_0, m = 1 .. ns (checked)
+      Mat :: blk(2, 2), src
+      MatType :: mt
       integer :: me_s, mpierr
+      logical :: hform
       logical, parameter :: have(2, 2) = reshape([.true., .false., .false., .false.], [2, 2])
 
       call PetscLogEventBegin(pcev_build_suu, ierr)
       call MPI_Comm_rank(comm_s, me_s, mpierr)
-      !--- the Dirichlet mask (1 free, 0 constrained), from M_w's identity rows
-      if (first_) call MatCreateVecs(o_mw%fam, fmask, PETSC_NULL_VEC, ierr)
-      call flux_dirichlet_mask(o_mw%fam, fmask)
+      hform = (f_s1k == SF_FLUX_S1_HPATCH .or. f_s1k == SF_FLUX_S1_SPLITM)
+      !--- the Dirichlet masks (1 free, 0 constrained): psi's (pmask, a12's
+      !--- row layout; hpatch, splitm and spai form 2) from P_J's diagonal-only
+      !--- psi rows; spai: u's (fmask, a12's column layout) from Mw's identity rows
+      if (first_) call MatCreateVecs(a12, fmask, pmask, ierr)
+      if (hform .or. f_form == 2) call flux_psi_mask(PJ, pmask, first_, me_s)
+      if (f_needmw .and. first_) call flux_layout_check(Mw, a12, ns, me_s)
+      if (f_needmw) call flux_dirichlet_mask(Mw, fmask, .true.)   ! spai, and the dump's list
 
-      !--- C_w
-      if (first_) then
-        call spai_build(fspai, o_mw%fam, f_r, ierr)
-      else
-        call spai_refill(fspai, o_mw%fam, ierr)
-      endif
-      if (ierr /= 0) then
-        if (me_s == 0) write(*,'(A,I0)') "[Physics PC]   FATAL: flux: the SPAI of M_w failed, family ", sff_fam
-        call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
-      endif
-      if (f_check .or. first_) then
-        call spai_check(fspai, o_mw%fam, gmin, lmin, lmax, ierr)
+      if (hform) then
+        !--- Bb = P B_12 H, P = diag(pmask) (H-form / split-M,
+        !--- mod_petsc_pc_sf_hpatch; H is zero on u's Dirichlet rows and psi's
+        !--- Dirichlet columns)
+        if (f_s1k == SF_FLUX_S1_SPLITM) then
+          ! split-M reads M_w's rows: a BAIJ M_w (global path) as its AIJ
+          ! copy of the in-slot entries (the SPAI's f_mfull, unused here)
+          call MatGetType(Mw, mt, ierr)
+          if (index(mt, "baij") > 0) then
+            call flux_extract(Mw, ns, .false., f_mfull, first_)
+            src = f_mfull
+          else
+            src = Mw
+          endif
+          call hpatch_build(fhp, PJ, DV, a21, a23, pmask, ns, f_hp_p, f_hp_r, f_hp_g, f_hp_vel, first_, ierr, &
+                            "flux "//trim(f_lbl), Mw=src, q=f_hp_q, vsg=sf_opz())
+        else
+          call hpatch_build(fhp, PJ, DV, a21, a23, pmask, ns, f_hp_p, f_hp_r, f_hp_g, f_hp_vel, first_, ierr, &
+                            "flux "//trim(f_lbl))
+        endif
         if (ierr /= 0) then
-          if (me_s == 0) write(*,'(A,I0)') "[Physics PC]   FATAL: flux: spai_check failed, family ", sff_fam
+          if (me_s == 0) write(*,'(A,A)') "[Physics PC]   FATAL: flux: the H-form's H failed, ", trim(f_lbl)
           call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
         endif
-        if (me_s == 0) write(*,'(A,I0,A,ES10.3,A,ES10.3,A,ES10.3)') "[Physics PC]   flux: family ", sff_fam, &
-          " C_w Gershgorin min ", gmin, ", lambda(C_w M_w) in [", lmin, ", ", lmax
-      endif
+        if (first_) then
+          call MatMatMult(a12, fhp%H, MAT_INITIAL_MATRIX, 2.0d0, f_bb, ierr)
+        else
+          call MatMatMult(a12, fhp%H, MAT_REUSE_MATRIX, 2.0d0, f_bb, ierr)
+        endif
+        call MatDiagonalScale(f_bb, pmask, PETSC_NULL_VEC, ierr)
+        if (first_) call flux_nnz_report(f_bb, "B_12 H", me_s)
+      else
+        !--- C_w (f_c), u's layout
+        call flux_middle(first_, Mw, ns, rat, me_s)
 
-      !--- Bb = (D G D)^T C_w (D G D) = D (G^T (D C_w D) G) D, D = diag(fmask):
-      !--- G on the constrained space. a_12 itself is left alone (it carries
-      !--- the threaded matvec, which MatDuplicate must not copy), so the mask
-      !--- goes on a copy of C_w (f_g) and on the product. Patterns are fixed
-      !--- by the first product and reused after.
-      if (first_) then
-        call MatDuplicate(fspai%C, MAT_COPY_VALUES, f_g, ierr)
-      else
-        call MatCopy(fspai%C, f_g, SAME_NONZERO_PATTERN, ierr)
-      endif
-      call MatDiagonalScale(f_g, fmask, fmask, ierr)
-      ! -sf_flux_bend_form 1: B_12 C_w B_12^T, C_w on the velocity space as in
-      ! the Schur term B_12 Sigma_u B_23; equal to the default when D B_12 D is
-      ! exactly skew (T0). Differs where psi's and u's Dirichlet sets do
-      ! (free boundary: the mask is u's).
-      if (f_form == 1) then
+        !--- f_g = D C_w D, D = diag(fmask): C_w on u's constrained space.
+        !--- a12 itself is left alone (it carries the threaded matvec, which
+        !--- MatDuplicate must not copy), so the masks go on a copy of C_w and
+        !--- on the product. Patterns are fixed by the first build.
         if (first_) then
-          call MatRARt(f_g, a_12, MAT_INITIAL_MATRIX, 2.0d0, f_bb, ierr)
+          call MatDuplicate(f_c, MAT_COPY_VALUES, f_g, ierr)
         else
-          call MatRARt(f_g, a_12, MAT_REUSE_MATRIX, 2.0d0, f_bb, ierr)
+          call MatCopy(f_c, f_g, SAME_NONZERO_PATTERN, ierr)
         endif
-      else
-        if (first_) then
-          call MatPtAP(f_g, a_12, MAT_INITIAL_MATRIX, 2.0d0, f_bb, ierr)
-        else
-          call MatPtAP(f_g, a_12, MAT_REUSE_MATRIX, 2.0d0, f_bb, ierr)
-        endif
+        call MatDiagonalScale(f_g, fmask, fmask, ierr)
+        call flux_bend(first_, a12)
       endif
-      call MatDiagonalScale(f_bb, fmask, fmask, ierr)
-      call MatScale(f_bb, f_sign / sf_opz(), ierr)
 
       !--- into pair_psi's packed (psi, j) layout (field 1 = psi), then S1
       blk = f_bb
       call pack_blocks_aij(blk, have, f_bpk, f_bpk_ready, comm_s)
       if (first_) then
-        call MatDuplicate(o_pj%fam, MAT_COPY_VALUES, f_s1, ierr)
+        call MatDuplicate(PJ, MAT_COPY_VALUES, f_s1, ierr)
         call MatSetOption(f_s1, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_FALSE, ierr)
         call MatAXPY(f_s1, 1.0d0, f_bpk, DIFFERENT_NONZERO_PATTERN, ierr)
         call MatSetOption(f_s1, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
       else
         call MatZeroEntries(f_s1, ierr)
-        call MatAXPY(f_s1, 1.0d0, o_pj%fam, SUBSET_NONZERO_PATTERN, ierr)
+        call MatAXPY(f_s1, 1.0d0, PJ, SUBSET_NONZERO_PATTERN, ierr)
         call MatAXPY(f_s1, 1.0d0, f_bpk, SUBSET_NONZERO_PATTERN, ierr)
       endif
       a_pj = f_s1
       f_ready = .true.
       call PetscLogEventEnd(pcev_build_suu, ierr)
 
-      !--- -sf_flux_dump: once, before the solver setups scale the pairs
-      if (len_trim(f_dump) > 0 .and. .not. f_dumped) call flux_dump(my_id)
+      !--- -sf_flux_dump (mode split only, sf_init): once, before the solver
+      !--- setups scale the pairs
+      if (famode .and. len_trim(f_dump) > 0 .and. .not. f_dumped) call flux_dump(my_id)
     end subroutine flux_operators
 
+    !> First build: stored entries per row of A (mean / max over comm_s), rank 0.
+    subroutine flux_nnz_report(A, nm, me_s)
+      Mat                          :: A
+      character(len=*), intent(in) :: nm
+      integer, intent(in)          :: me_s
+      PetscInt :: rs, re, i, nc
+      PetscInt, pointer :: cols(:)
+      PetscScalar, pointer :: vals(:)
+      real*8 :: st(2), mx
+      integer :: mpierr
+      call MatGetOwnershipRange(A, rs, re, ierr)
+      st = [0.d0, dble(re - rs)];  mx = 0.d0
+      do i = rs, re - 1
+        call MatGetRow(A, i, nc, cols, vals, ierr)
+        st(1) = st(1) + dble(nc);  mx = max(mx, dble(nc))
+        call MatRestoreRow(A, i, nc, cols, vals, ierr)
+      enddo
+      call MPI_Allreduce(MPI_IN_PLACE, st, 2, MPI_DOUBLE_PRECISION, MPI_SUM, comm_s, mpierr)
+      call MPI_Allreduce(MPI_IN_PLACE, mx, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm_s, mpierr)
+      if (me_s == 0) write(*,'(A,A,A,A,A,F9.1,A,I0,A,ES10.3)') "[Physics PC]   flux: ", trim(f_lbl), ": nnz(", &
+        nm, ") per row mean ", st(1) / max(st(2), 1.d0), " max ", nint(mx), ", total ", st(1)
+    end subroutine flux_nnz_report
+
+    !> The middle operator C_w ~ Mw^-1 (f_c, Mw's layout): the banded SPAI of
+    !! radius f_r. With -sf_flux_spai_replicate 1 (default) and Mw slot
+    !! diagonal with slot m = (f_m / f_0) slot 0 on the free DOFs and the same
+    !! Dirichlet set in every slot (flux_slot_check, collective, at every
+    !! build), the SPAI runs once on the scalar slot-0 matrix M_0 (f_m0) and
+    !! C_w = blockdiag_m((f_0 / f_m) C_0) (flux_replicate) -- what the SPAI of
+    !! the whole Mw gives, exactly: the Jacobi-scaled SPAI is equivariant
+    !! under M -> a M (C -> C / a), and the slots never meet in its graph
+    !! (stored zeros are no edges); the identity Dirichlet rows keep c = 1.
+    !! Otherwise the SPAI of the whole Mw (a BAIJ Mw first copied to AIJ,
+    !! f_mfull, its in-slot entries only: Mw is slot-diagonal by construction).
+    subroutine flux_middle(first_, Mw, ns, rat, me_s)
+      logical, intent(in) :: first_
+      Mat                 :: Mw
+      integer, intent(in) :: ns, me_s
+      real*8, intent(in)  :: rat(:)
+      Mat :: src
+      MatType :: mt
+      logical :: ok
+      real*8 :: emax, gmin, lmin, lmax
+      integer :: why, mpierr
+      character(len=48) :: what
+
+      !--- which construction: decided at the first build, checked after (one
+      !--- slot: nothing to replicate, the SPAI of Mw itself)
+      if (first_) then
+        f_rep_on = .false.
+        if (f_rep .and. ns > 1) then
+          call flux_slot_check(Mw, ns, rat, ok, why, emax)
+          f_rep_on = ok
+          if (me_s == 0) then
+            if (ok) then
+              write(*,'(A,A,A,I0,A,ES9.2,A)') "[Physics PC]   flux: ", trim(f_lbl), ": C_w by replication, SPAI "// &
+                "of the slot-0 mass on ", ns, " slot(s) (slot relation checked, max rel. defect ", emax, ")"
+            else
+              write(*,'(A,A,A,I0,A,ES9.2,A)') "[Physics PC]   flux: ", trim(f_lbl), ": C_w = SPAI of the whole "// &
+                "M_w: the slots differ (reason ", why, ": 1 Dirichlet sets, 2 off-slot entries, 3 slot factor; "// &
+                "rel. defect ", emax, ")"
+            endif
+          endif
+        else if (ns > 1) then
+          if (me_s == 0) write(*,'(A,A,A)') "[Physics PC]   flux: ", trim(f_lbl), &
+            ": C_w = SPAI of the whole M_w (-sf_flux_spai_replicate 0)"
+        endif
+      else if (f_rep_on) then
+        call flux_slot_check(Mw, ns, rat, ok, why, emax)
+        if (.not. ok) then
+          if (me_s == 0) write(*,'(A,A,A,I0,A)') "[Physics PC]   FATAL: flux: ", trim(f_lbl), &
+            ": M_w's slots no longer replicate slot 0 (reason ", why, "); run with -sf_flux_spai_replicate 0"
+          call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+        endif
+      endif
+
+      !--- the SPAI's matrix: M_0, Mw itself (AIJ), or Mw copied to AIJ
+      call MatGetType(Mw, mt, ierr)
+      if (f_rep_on) then
+        call flux_extract(Mw, ns, .true., f_m0, first_)
+        src = f_m0
+        what = "lambda(C_0 M_0)"
+      else if (index(mt, "baij") > 0) then
+        call flux_extract(Mw, ns, .false., f_mfull, first_)
+        src = f_mfull
+        what = "lambda(C_w M_w)"
+      else
+        src = Mw
+        what = "lambda(C_w M_w)"
+      endif
+      if (first_) then
+        call spai_build(fspai, src, f_r, ierr, label="flux "//trim(f_lbl)//" C_w")
+      else
+        call spai_refill(fspai, src, ierr)
+      endif
+      if (ierr /= 0) then
+        if (me_s == 0) write(*,'(A,A)') "[Physics PC]   FATAL: flux: the SPAI of M_w failed, ", trim(f_lbl)
+        call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+      endif
+      if (f_check .or. first_) then
+        call spai_check(fspai, src, gmin, lmin, lmax, ierr)
+        if (ierr /= 0) then
+          if (me_s == 0) write(*,'(A,A)') "[Physics PC]   FATAL: flux: spai_check failed, ", trim(f_lbl)
+          call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+        endif
+        if (me_s == 0) write(*,'(A,A,A,ES10.3,A,A,ES10.3,A,ES10.3)') "[Physics PC]   flux: ", trim(f_lbl), &
+          " C_w Gershgorin min ", gmin, ", ", trim(what)//" in [", lmin, ", ", lmax
+      endif
+
+      !--- C_w
+      if (f_rep_on) then
+        call flux_replicate(first_, ns, rat)
+        f_c = f_cw
+      else
+        f_c = fspai%C
+      endif
+    end subroutine flux_middle
+
+    !> The bending term Bb, the patterns of the first build reused after:
+    !!   form 0: (s / varsigma) D B_12^T f_g B_12 D           (MatPtAP)
+    !!   form 1: (s / varsigma) D B_12 f_g B_12^T D           (MatRARt)
+    !!   form 2: (s / varsigma) P B_12 f_g B_12^T P,  P = diag(pmask)
+    !! f_g = D C_w D, D = diag(fmask) (u's Dirichlet set). Forms 1 and 2 put
+    !! C_w on the velocity space, as in the Schur term B_12 Sigma_u B_23 it
+    !! stands for; both equal form 0 when D B_12 D is exactly skew (T0), and
+    !! differ where psi's and u's Dirichlet sets do (free boundary). Form 2
+    !! is form 1 with Bb's rows / columns cleared on psi's own Dirichlet set
+    !! instead of u's, and computed as MatPtAP(f_g, B_12^T) on the explicit
+    !! transpose f_t12 (no reliance on MatRARt for MPIAIJ).
+    subroutine flux_bend(first_, a12)
+      logical, intent(in) :: first_
+      Mat                 :: a12
+      select case (f_form)
+      case (1)
+        if (first_) then
+          call MatRARt(f_g, a12, MAT_INITIAL_MATRIX, 2.0d0, f_bb, ierr)
+        else
+          call MatRARt(f_g, a12, MAT_REUSE_MATRIX, 2.0d0, f_bb, ierr)
+        endif
+      case (2)
+        if (first_) then
+          call MatTranspose(a12, MAT_INITIAL_MATRIX, f_t12, ierr)
+          call MatPtAP(f_g, f_t12, MAT_INITIAL_MATRIX, 2.0d0, f_bb, ierr)
+        else
+          call MatTranspose(a12, MAT_REUSE_MATRIX, f_t12, ierr)
+          call MatPtAP(f_g, f_t12, MAT_REUSE_MATRIX, 2.0d0, f_bb, ierr)
+        endif
+      case default
+        if (first_) then
+          call MatPtAP(f_g, a12, MAT_INITIAL_MATRIX, 2.0d0, f_bb, ierr)
+        else
+          call MatPtAP(f_g, a12, MAT_REUSE_MATRIX, 2.0d0, f_bb, ierr)
+        endif
+      end select
+      if (f_form == 2) then
+        call MatDiagonalScale(f_bb, pmask, pmask, ierr)
+      else
+        call MatDiagonalScale(f_bb, fmask, fmask, ierr)
+      endif
+      call MatScale(f_bb, f_sign / sf_opz(), ierr)
+    end subroutine flux_bend
+
+    !> First build: Mw, B_12 and the slot layout must agree -- Mw square
+    !! with B_12's column ownership, whole indices (ns slots) per rank.
+    !! Collective on comm_s; fatal otherwise.
+    subroutine flux_layout_check(Mw, a12, ns, me_s)
+      Mat                 :: Mw, a12
+      integer, intent(in) :: ns, me_s
+      PetscInt :: rs, re, cs, ce, bs0, be0, pns
+      integer :: bad, mpierr
+      pns = int(ns, kind(pns))
+      call MatGetOwnershipRange(Mw, rs, re, ierr)
+      call MatGetOwnershipRangeColumn(Mw, cs, ce, ierr)
+      call MatGetOwnershipRangeColumn(a12, bs0, be0, ierr)
+      bad = 0
+      if (cs /= rs .or. ce /= re) bad = 1
+      if (bs0 /= rs .or. be0 /= re) bad = 1
+      if (mod(rs, pns) /= 0 .or. mod(re - rs, pns) /= 0) bad = 1
+      call MPI_Allreduce(MPI_IN_PLACE, bad, 1, MPI_INTEGER, MPI_MAX, comm_s, mpierr)
+      if (bad /= 0) then
+        if (me_s == 0) write(*,'(A,A,A)') "[Physics PC]   FATAL: flux: ", trim(f_lbl), &
+          ": M_w's row / column layout is not B_12's column layout (whole indices per rank)"
+        call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+      endif
+    end subroutine flux_layout_check
+
+    !> Is Mw = blockdiag_m(rat(m+1) M_0) on its free DOFs, with the same
+    !! Dirichlet (identity) rows in every slot? Row index ns + m of Mw is slot
+    !! m of index i. Checked entry by entry against slot 0's row: identity
+    !! rows alike, off-slot entries exactly zero, the same nonzero count and
+    !! |M_m(i, j) - rat_m M_0(i, j)| <= 1e-10 rat_m max_j |M_0(i, j)|.
+    !! ok and the reason (why: 0 ok, 1 Dirichlet sets differ, 2 off-slot
+    !! entries, 3 slot factor or pattern) and the largest relative defect
+    !! emax are global on comm_s.
+    subroutine flux_slot_check(Mw, ns, rat, ok, why, emax)
+      Mat                  :: Mw
+      integer, intent(in)  :: ns
+      real*8, intent(in)   :: rat(:)
+      logical, intent(out) :: ok
+      integer, intent(out) :: why
+      real*8, intent(out)  :: emax
+      real*8, parameter :: TOL = 1.d-10
+      PetscInt :: rs, re, li, r0, nc, q, pns, gj, k, n0
+      PetscInt, pointer :: cols(:)
+      PetscScalar, pointer :: vals(:)
+      PetscInt, allocatable :: c0(:)
+      real*8, allocatable :: v0(:)
+      integer :: m, nz0, nzm, mpierr
+      logical :: dir0, dirm
+      real*8 :: rmax, v0x
+
+      why = 0; emax = 0.d0
+      pns = int(ns, kind(pns))
+      call MatGetOwnershipRange(Mw, rs, re, ierr)
+      allocate(c0(64), v0(64))
+      if (ns > 1) then
+        do li = 0, (re - rs) / pns - 1
+          r0 = rs + li * pns
+          !--- slot 0's row: its in-slot entries by index column
+          call MatGetRow(Mw, r0, nc, cols, vals, ierr)
+          if (nc > size(c0)) then
+            deallocate(c0, v0);  allocate(c0(2 * nc), v0(2 * nc))
+          endif
+          dir0 = unit_row(r0, nc, cols, vals)
+          n0 = 0
+          do q = 1, nc
+            if (mod(cols(q), pns) /= 0) then
+              if (vals(q) /= 0.d0) why = max(why, 2)
+              cycle
+            endif
+            n0 = n0 + 1;  c0(n0) = cols(q) / pns;  v0(n0) = vals(q)
+          enddo
+          call MatRestoreRow(Mw, r0, nc, cols, vals, ierr)
+          nz0  = count(v0(1:n0) /= 0.d0)
+          rmax = 0.d0
+          if (n0 > 0) rmax = maxval(abs(v0(1:n0)))
+          !--- every other slot against it
+          do m = 1, ns - 1
+            call MatGetRow(Mw, r0 + m, nc, cols, vals, ierr)
+            dirm = unit_row(r0 + m, nc, cols, vals)
+            if (dirm .neqv. dir0) why = max(why, 1)
+            nzm = 0
+            do q = 1, nc
+              if (mod(cols(q), pns) /= m) then
+                if (vals(q) /= 0.d0) why = max(why, 2)
+                cycle
+              endif
+              if (vals(q) /= 0.d0) nzm = nzm + 1
+              if (dir0 .or. dirm) cycle                   ! identity rows: compared above
+              gj = cols(q) / pns
+              k = isearch(c0(1:n0), gj)
+              v0x = 0.d0
+              if (k > 0) v0x = v0(k)
+              emax = max(emax, abs(vals(q) - rat(m + 1) * v0x) / max(rat(m + 1) * rmax, tiny(1.d0)))
+            enddo
+            call MatRestoreRow(Mw, r0 + m, nc, cols, vals, ierr)
+            if (.not. (dir0 .or. dirm) .and. nzm /= nz0) why = max(why, 3)
+          enddo
+        enddo
+      endif
+      deallocate(c0, v0)
+      if (emax > TOL) why = max(why, 3)
+      call MPI_Allreduce(MPI_IN_PLACE, why, 1, MPI_INTEGER, MPI_MAX, comm_s, mpierr)
+      call MPI_Allreduce(MPI_IN_PLACE, emax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm_s, mpierr)
+      ok = (why == 0)
+    end subroutine flux_slot_check
+
+    !> Is row i (nc entries) an identity row: diagonal 1, nothing else nonzero?
+    logical function unit_row(i, nc, cols, vals)
+      PetscInt, intent(in)    :: i, nc
+      PetscInt, intent(in)    :: cols(:)
+      PetscScalar, intent(in) :: vals(:)
+      PetscInt :: q
+      real*8 :: d, off
+      d = 0.d0; off = 0.d0
+      do q = 1, nc
+        if (cols(q) == i) then
+          d = vals(q)
+        else
+          off = off + abs(vals(q))
+        endif
+      enddo
+      unit_row = (off == 0.d0 .and. abs(d - 1.d0) < 1.d-12)
+    end function unit_row
+
+    !> Position of key in a (ascending, as MatGetRow returns its columns), 0
+    !! if absent.
+    integer function isearch(a, key)
+      PetscInt, intent(in) :: a(:), key
+      integer :: lo, hi, mid
+      isearch = 0
+      lo = 1; hi = size(a)
+      do while (lo <= hi)
+        mid = (lo + hi) / 2
+        if (a(mid) == key) then
+          isearch = mid
+          return
+        else if (a(mid) < key) then
+          lo = mid + 1
+        else
+          hi = mid - 1
+        endif
+      enddo
+    end function isearch
+
+    !> Mout = Mw as MPIAIJ on comm_s: with slot0, the scalar slot-0 matrix
+    !! M_0(i, j) = Mw(i ns, j ns), rows / columns numbered by index (each rank
+    !! its own indices); else Mw's in-slot entries (column slot = row slot),
+    !! so neither the copy nor the SPAI's halo carries the n_tor x stored
+    !! zeros of the slot-diagonal BAIJ blocks -- unless some off-slot entry
+    !! is nonzero at the first build (f_mfull_all: then every stored entry
+    !! is kept, for the run). The first call
+    !! preallocates exactly and freezes the pattern; later calls overwrite
+    !! the values in place (the same structure: Mw's pattern is kept).
+    subroutine flux_extract(Mw, ns, slot0, Mout, first_x)
+      Mat                 :: Mw, Mout
+      integer, intent(in) :: ns
+      logical, intent(in) :: slot0, first_x
+      PetscInt :: rs, re, ng, nloc, lo, hi, li, r0, nc, q, c, cnt, step, one_, pns
+      PetscInt, pointer :: cols(:)
+      PetscScalar, pointer :: vals(:)
+      PetscInt, allocatable :: dnz(:), onz(:), cc(:)
+      PetscScalar, allocatable :: vv(:)
+      integer :: pass, noff, mpierr_
+
+      one_ = 1
+      pns  = int(ns, kind(pns))
+      step = 1
+      if (slot0) step = pns
+      call MatGetOwnershipRange(Mw, rs, re, ierr)
+      call MatGetSize(Mw, ng, PETSC_NULL_INTEGER, ierr)
+      ! the whole-Mw copy keeps the off-slot entries only where some are
+      ! nonzero (a Mw that is not slot-diagonal): decided once, collectively
+      ! (no BLOCK here: ifx 2023.1 aborts with an internal compiler error on it)
+      if (.not. slot0 .and. first_x) then
+        noff = 0
+        do li = 0, re - rs - 1
+          r0 = rs + li
+          call MatGetRow(Mw, r0, nc, cols, vals, ierr)
+          do q = 1, nc
+            if (mod(cols(q), pns) /= mod(r0, pns) .and. vals(q) /= 0.d0) noff = 1
+          enddo
+          call MatRestoreRow(Mw, r0, nc, cols, vals, ierr)
+        enddo
+        call MPI_Allreduce(MPI_IN_PLACE, noff, 1, MPI_INTEGER, MPI_MAX, comm_s, mpierr_)
+        f_mfull_all = (noff /= 0)
+      endif
+      if (.not. slot0 .and. f_mfull_all) pns = 1        ! the filter below then keeps every entry
+      nloc = (re - rs) / step
+      lo = rs / step;  hi = lo + nloc
+      if (first_x) then
+        allocate(dnz(max(nloc, one_)), onz(max(nloc, one_)))
+        dnz = 0; onz = 0
+      endif
+      allocate(cc(64), vv(64))
+      do pass = merge(1, 2, first_x), 2                 ! 1 = count (first call), 2 = fill
+        do li = 0, nloc - 1
+          r0 = rs + li * step
+          call MatGetRow(Mw, r0, nc, cols, vals, ierr)
+          if (nc > size(cc)) then
+            deallocate(cc, vv);  allocate(cc(2 * nc), vv(2 * nc))
+          endif
+          cnt = 0
+          do q = 1, nc
+            ! slot0: slot 0's columns only; else the row's own slot's (the
+            ! off-slot entries of a slot-diagonal Mw are stored zeros)
+            if (mod(cols(q), pns) /= mod(r0, pns)) cycle
+            c = cols(q) / step
+            cnt = cnt + 1
+            if (pass == 1) then
+              if (c >= lo .and. c < hi) then
+                dnz(li + 1) = dnz(li + 1) + 1
+              else
+                onz(li + 1) = onz(li + 1) + 1
+              endif
+            else
+              cc(cnt) = c;  vv(cnt) = vals(q)
+            endif
+          enddo
+          call MatRestoreRow(Mw, r0, nc, cols, vals, ierr)
+          if (pass == 2 .and. cnt > 0) &
+            call MatSetValues(Mout, one_, [lo + li], cnt, cc(1:cnt), vv(1:cnt), INSERT_VALUES, ierr)
+        enddo
+        if (pass == 1) then
+          call MatCreate(comm_s, Mout, ierr)
+          call MatSetSizes(Mout, nloc, nloc, ng / step, ng / step, ierr)
+          call MatSetType(Mout, MATMPIAIJ, ierr)
+          call MatMPIAIJSetPreallocation(Mout, PETSC_DEFAULT_INTEGER, dnz, PETSC_DEFAULT_INTEGER, onz, ierr)
+          call MatSetOption(Mout, MAT_NO_OFF_PROC_ENTRIES, PETSC_TRUE, ierr)
+          call MatSetOption(Mout, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE, ierr)
+          deallocate(dnz, onz)
+        endif
+      enddo
+      deallocate(cc, vv)
+      call MatAssemblyBegin(Mout, MAT_FINAL_ASSEMBLY, ierr)
+      call MatAssemblyEnd(Mout, MAT_FINAL_ASSEMBLY, ierr)
+      if (first_x) call MatSetOption(Mout, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
+    end subroutine flux_extract
+
+    !> C_w = blockdiag_m((f_0 / f_m) C_0) in Mw's layout (row index ns + m),
+    !! from the SPAI C_0 of M_0 (fspai%C, index layout): C_w(i ns + m, j ns +
+    !! m) = C_0(i, j) / rat(m+1), and 1 x C_0 on the Dirichlet rows (the
+    !! identity rows of every slot, where C_0 is e_k). The first call
+    !! preallocates exactly (C_0's pattern per slot) and freezes it; later
+    !! calls overwrite the values in place.
+    subroutine flux_replicate(first_x, ns, rat)
+      logical, intent(in) :: first_x
+      integer, intent(in) :: ns
+      real*8, intent(in)  :: rat(:)
+      PetscInt :: lo, hi, nidx, li, gi, nc, q, pns, row, one_
+      PetscInt, pointer :: cols(:)
+      PetscScalar, pointer :: vals(:)
+      PetscScalar, pointer :: mk(:)
+      PetscInt, allocatable :: dnz(:), onz(:), cc(:)
+      PetscScalar, allocatable :: vv(:)
+      real*8 :: fac
+      integer :: pass, m
+
+      one_ = 1
+      pns = int(ns, kind(pns))
+      call MatGetOwnershipRange(fspai%C, lo, hi, ierr)
+      nidx = hi - lo
+      if (first_x) then
+        allocate(dnz(max(nidx * pns, one_)), onz(max(nidx * pns, one_)))
+        dnz = 0; onz = 0
+      endif
+      allocate(cc(64), vv(64))
+      call VecGetArrayRead(fmask, mk, ierr)
+      do pass = merge(1, 2, first_x), 2                 ! 1 = count (first call), 2 = fill
+        do li = 0, nidx - 1
+          gi = lo + li
+          call MatGetRow(fspai%C, gi, nc, cols, vals, ierr)
+          if (nc > size(cc)) then
+            deallocate(cc, vv);  allocate(cc(2 * nc), vv(2 * nc))
+          endif
+          do m = 0, ns - 1
+            row = li * pns + m                          ! local row, 0-based
+            if (pass == 1) then
+              do q = 1, nc
+                if (cols(q) >= lo .and. cols(q) < hi) then
+                  dnz(row + 1) = dnz(row + 1) + 1
+                else
+                  onz(row + 1) = onz(row + 1) + 1
+                endif
+              enddo
+            else if (nc > 0) then
+              fac = 1.d0 / rat(m + 1)
+              if (mk(row + 1) == 0.d0) fac = 1.d0       ! Dirichlet: the identity row's c = 1
+              cc(1:nc) = cols(1:nc) * pns + m
+              vv(1:nc) = vals(1:nc) * fac
+              call MatSetValues(f_cw, one_, [gi * pns + m], nc, cc(1:nc), vv(1:nc), INSERT_VALUES, ierr)
+            endif
+          enddo
+          call MatRestoreRow(fspai%C, gi, nc, cols, vals, ierr)
+        enddo
+        if (pass == 1) then
+          call MatCreate(comm_s, f_cw, ierr)
+          call MatSetSizes(f_cw, nidx * pns, nidx * pns, PETSC_DETERMINE, PETSC_DETERMINE, ierr)
+          call MatSetType(f_cw, MATMPIAIJ, ierr)
+          call MatMPIAIJSetPreallocation(f_cw, PETSC_DEFAULT_INTEGER, dnz, PETSC_DEFAULT_INTEGER, onz, ierr)
+          call MatSetOption(f_cw, MAT_NO_OFF_PROC_ENTRIES, PETSC_TRUE, ierr)
+          call MatSetOption(f_cw, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE, ierr)
+          deallocate(dnz, onz)
+        endif
+      enddo
+      call VecRestoreArrayRead(fmask, mk, ierr)
+      deallocate(cc, vv)
+      call MatAssemblyBegin(f_cw, MAT_FINAL_ASSEMBLY, ierr)
+      call MatAssemblyEnd(f_cw, MAT_FINAL_ASSEMBLY, ierr)
+      if (first_x) call MatSetOption(f_cw, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
+    end subroutine flux_replicate
+
+    !> pmask = 1 on psi's free rows, 0 on its Dirichlet rows: P_J's psi rows
+    !! (field 1 of the packed pair, the first local rows) with nothing but a
+    !! nonzero diagonal -- the boundary rows of eliminate_boundary_dofs (a
+    !! ZBIG penalty row keeps its couplings and stays 1: there Bb is
+    !! negligible against the penalty anyway). The first build reports how
+    !! many it found, and warns when none (penalty BCs: the mask inactive).
+    subroutine flux_psi_mask(PJ, mask, first_x, me_s)
+      Mat :: PJ
+      Vec :: mask
+      logical, intent(in) :: first_x
+      integer, intent(in) :: me_s
+      Vec :: tp
+      PetscInt :: n1
+      PetscScalar, pointer :: a(:), b(:)
+      integer(8) :: nd
+      integer :: mpierr
+      call MatCreateVecs(PJ, PETSC_NULL_VEC, tp, ierr)
+      call flux_dirichlet_mask(PJ, tp, .false.)
+      call VecGetLocalSize(mask, n1, ierr)
+      call VecGetArrayRead(tp, a, ierr)
+      call VecGetArray(mask, b, ierr)
+      b(1:n1) = a(1:n1)
+      nd = count(b(1:n1) == 0.d0)
+      call VecRestoreArray(mask, b, ierr)
+      call VecRestoreArrayRead(tp, a, ierr)
+      call VecDestroy(tp, ierr)
+      if (first_x) then
+        call MPI_Allreduce(MPI_IN_PLACE, nd, 1, MPI_INTEGER8, MPI_SUM, comm_s, mpierr)
+        if (me_s == 0) then
+          if (nd > 0) then
+            write(*,'(A,A,A,I0,A)') "[Physics PC]   flux: ", trim(f_lbl), ": psi Dirichlet DOFs (Bb's row mask) ", &
+              nd, " (diagonal-only rows of P_J)"
+          else
+            write(*,'(A,A,A)') "[Physics PC]   flux: WARNING ", trim(f_lbl), ": no diagonal-only psi rows in P_J "// &
+              "(penalty BCs, eliminate_boundary_dofs = .f.?): the psi mask of Bb (H-form, form 2) is inactive"
+          endif
+        endif
+      endif
+    end subroutine flux_psi_mask
+
     !> mask = 0 on the rows of M where M is an identity row (diagonal 1, no
-    !! other nonzero value: the Dirichlet rows the element pass set), 1 else.
-    subroutine flux_dirichlet_mask(M, mask)
+    !! other nonzero value: the Dirichlet rows the element pass set), 1 else;
+    !! with unitd = .false. on every diagonal-only row (any nonzero diagonal:
+    !! the Jacobian's eliminated boundary rows).
+    subroutine flux_dirichlet_mask(M, mask, unitd)
       Mat :: M
       Vec :: mask
+      logical, intent(in) :: unitd   !< .true.: identity rows only
       PetscInt :: rs, re, i, ncols, q
       PetscInt, pointer :: cols(:)
       PetscScalar, pointer :: vals(:)
@@ -1106,16 +1876,22 @@ contains
         enddo
         call MatRestoreRow(M, i, ncols, cols, vals, ierr)
         mk(i - rs + 1) = 1.d0
-        if (off == 0.d0 .and. abs(d - 1.d0) < 1.d-12) mk(i - rs + 1) = 0.d0
+        if (unitd) then
+          if (off == 0.d0 .and. abs(d - 1.d0) < 1.d-12) mk(i - rs + 1) = 0.d0
+        else
+          if (off == 0.d0 .and. d /= 0.d0) mk(i - rs + 1) = 0.d0
+        endif
       enddo
       call VecRestoreArray(mask, mk, ierr)
     end subroutine flux_dirichlet_mask
 
     !> -sf_flux_dump <dir>: the family blocks of the flux arm as PETSc binary
     !! files <dir>/fam<f>/<name>.bin, plus meta.txt (family, nslot, nindex,
-    !! varsigma, theta_dt, the Dirichlet rows). Only on families with ONE
-    !! rank, whose packed pairs are then [field 1 | field 2] globally (the
-    !! layout util/physics_pc_scaling/flux_checks reads); others are skipped.
+    !! varsigma, theta_dt, bend_sign, bend_form, the Dirichlet rows, and with
+    !! form 2 psi's as dirichlet_psi). Only on families with ONE rank, whose
+    !! packed pairs are then [field 1 | field 2] globally (the layout
+    !! util/physics_pc_scaling/flux_checks reads); others are skipped. Mode
+    !! split only (sf_init refuses it on the global path).
     subroutine flux_dump(my_id_)
       use phys_module, only: time_evol_theta, tstep
       use mod_petsc_pc_harm, only: pc_ntor
@@ -1136,7 +1912,12 @@ contains
       endif
       write(dir,'(A,A,I0)') trim(f_dump), "/fam", sff_fam
       call execute_command_line("mkdir -p '"//trim(dir)//"'", exitstat=ios)
-      call flux_dump_mat(o_mw%fam, dir, "Mw");   call flux_dump_mat(fspai%C, dir, "Cw")
+      call flux_dump_mat(o_mw%fam, dir, "Mw")
+      if (f_s1k == SF_FLUX_S1_SPAI) then
+        call flux_dump_mat(f_c, dir, "Cw")
+      else
+        call flux_dump_mat(fhp%H, dir, "H")
+      endif
       call flux_dump_mat(f_bb, dir, "Bb");       call flux_dump_mat(o_pj%fam, dir, "PJ")
       call flux_dump_mat(f_s1, dir, "S1");       call flux_dump_mat(o_w%fam, dir, "Dv")
       call flux_dump_mat(o_w0%fam, dir, "Dv0");  call flux_dump_mat(o_rho%fam, dir, "B55")
@@ -1154,6 +1935,21 @@ contains
       write(u,'(A,ES24.16)') "varsigma ", sf_opz()
       write(u,'(A,ES24.16)') "theta_dt ", time_evol_theta * tstep
       write(u,'(A,ES24.16)') "bend_sign ", f_sign
+      write(u,'(A,I0)') "bend_form ", f_form
+      if (f_s1k /= SF_FLUX_S1_SPAI) then
+        if (f_s1k == SF_FLUX_S1_SPLITM) then
+          write(u,'(A)') "s1 splitm"
+          write(u,'(A,I0)') "q ", f_hp_q
+        else
+          write(u,'(A)') "s1 hpatch"
+        endif
+        write(u,'(A,I0)') "p ", f_hp_p
+        write(u,'(A,I0)') "r ", f_hp_r
+        write(u,'(A,I0)') "g ", f_hp_g
+        write(u,'(A,I0)') "vel ", f_hp_vel
+      else
+        write(u,'(A)') "s1 spai"
+      endif
       write(u,'(A)', advance="no") "dirichlet"
       call VecGetArray(fmask, mk, ierr)
       do i = 1, nloc
@@ -1161,6 +1957,15 @@ contains
       enddo
       call VecRestoreArray(fmask, mk, ierr)
       write(u,'(A)') ""
+      if (f_form == 2 .or. f_s1k /= SF_FLUX_S1_SPAI) then
+        write(u,'(A)', advance="no") "dirichlet_psi"
+        call VecGetArray(pmask, mk, ierr)
+        do i = 1, nloc
+          if (mk(i) == 0.d0) write(u,'(A,I0)', advance="no") " ", int(i - 1)
+        enddo
+        call VecRestoreArray(pmask, mk, ierr)
+        write(u,'(A)') ""
+      endif
       close(u)
       write(*,'(A,I0,A,A,A,I0,A)') "[Physics PC]   flux: family ", sff_fam, " dumped to ", trim(dir), &
         " (global rank ", my_id_, ")"
@@ -2450,8 +3255,17 @@ contains
   !--------------------------------------------------------------------
   !> The flux arm's sweep (FLUX_SCHUR; design note S4): y2 predictor,
   !! velocity predictor on D_v, the stiff S1 solve on (psi, j), velocity
-  !! re-solve, y2 re-solve. One S1 solve, two D_v, two B_55, two B_66.
-  !! slv_pj holds S1 (a_pj = f_s1), slv_w holds D_v.
+  !! re-solve, y2 re-solve. With -sf_flux_step6 1 (default) the velocity
+  !! re-solve sees y_2' = D_2^-1 (x_2 - C_21 y_1), the thermodynamic fields
+  !! re-solved against the flux fields first:
+  !!   y_2' = D_2^-1 (x_2 - C_21 y_1),  v = D_v^-1 (x_v - L_2 y_2' - L_1 y_1),
+  !!   y_2  = D_2^-1 (x_2 - C_21 y_1 - U_2 v),
+  !! which is A^-1 (E_16 aside) when every part is exact -- S1 the Schur
+  !! complement with L^_1 = L_1 - L_2 D_2^-1 C_21, exact inner solves (the
+  !! design note's step 6, -sf_flux_step6 0, leaves a nilpotent error that
+  !! costs one outer iteration). Solves: one S1, two D_v, three B_55 and
+  !! three B_66 (two and two with -sf_flux_step6 0). slv_pj holds S1 (a_pj =
+  !! f_s1), slv_w holds D_v.
   !--------------------------------------------------------------------
   subroutine sf_flux_sweep(x_psi, x_u, x_j, x_w, x_rho, x_T, y_psi, y_u, y_j, y_w, y_rho, y_T)
     Vec :: x_psi, x_u, x_j, x_w, x_rho, x_T
@@ -2502,11 +3316,37 @@ contains
     call PetscLogEventEnd(pcev_solve_pj, ierr)
     call sf_split_halves(sol_PJ, y_psi, y_j, .false.)       ! psi, j: final
 
-    !--- 6: velocity re-solve  (u, w) = D_v^-1 (r_u - B_21 psi - B_23 j, x_w)
+    !--- 6: velocity re-solve  (u, w) = D_v^-1 (r_u - B_21 psi - B_23 j [+ L_2 dy_2], x_w)
+    !--- -sf_flux_step6 1 (consistent): against y_2' = D_2^-1 (x_2 - C_21 y_1)
+    !--- = y_2* - dy_2 instead of y_2*, dy_2 = (drho, dT) the flux fields'
+    !--- part, drho = B_55^-1 B_51 psi, dT = B_66^-1 (B_61 psi + B_63 j -
+    !--- B_65 drho), kept in y_rho / y_T (free until 7, which overwrites them)
+    if (f_step6 == 1) then
+      call cmult(a_51, 7, y_psi, w3)
+      call PetscLogEventBegin(pcev_solve_rhot, ierr)
+      call bsolve(slv_rho, w3, y_rho)                        ! drho
+      call PetscLogEventEnd(pcev_solve_rhot, ierr)
+      call cmult(a_61, 9, y_psi, w3)
+      call cmult(a_63, 11, y_j, w4)
+      call VecAXPY(w3, 1.0d0, w4, ierr)
+      if (use_b65) then
+        call cmult(a_65, 12, y_rho, w4)
+        call VecAXPY(w3, -1.0d0, w4, ierr)
+      endif
+      call PetscLogEventBegin(pcev_solve_rhot, ierr)
+      call bsolve(slv_T, w3, y_T)                            ! dT
+      call PetscLogEventEnd(pcev_solve_rhot, ierr)
+    endif
     call cmult(a_21, 3, y_psi, w3)
     call VecWAXPY(w4, -1.0d0, w3, w5, ierr)
     call cmult(a_23, 4, y_j, w3)
     call VecAXPY(w4, -1.0d0, w3, ierr)
+    if (f_step6 == 1) then                                   ! + B_25 drho + B_26 dT
+      call cmult(a_25, 5, y_rho, w3)
+      call VecAXPY(w4, 1.0d0, w3, ierr)
+      call cmult(a_26, 6, y_T, w3)
+      call VecAXPY(w4, 1.0d0, w3, ierr)
+    endif
     call sf_split_halves(rhs_W, w4, x_w, .true.)
     call PetscLogEventBegin(pcev_solve_w, ierr)
     call bsolve(slv_w, rhs_W, sol_W)
@@ -2514,8 +3354,9 @@ contains
     call sf_split_halves(sol_W, y_u, y_w, .false.)          ! u, w: final
 
     !--- 7: y2 re-solve against the final psi, j, u, as corrections of the
-    !--- predictor: rho = rho* - B_55^-1 (B_51 psi + B_52 u),
-    !--- T = T* - B_66^-1 (B_61 psi + B_63 j + B_62 u - B_65 drho)
+    !--- predictor: rho = rho* - c_rho, c_rho = B_55^-1 (B_51 psi + B_52 u)
+    !--- (w5; not step 6's drho), T = T* - B_66^-1 (B_61 psi + B_63 j +
+    !--- B_62 u - B_65 c_rho)
     call cmult(a_51, 7, y_psi, w3)
     call cmult(a_52, 8, y_u, w4)
     call VecAXPY(w3, 1.0d0, w4, ierr)

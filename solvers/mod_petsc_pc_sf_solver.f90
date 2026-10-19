@@ -146,8 +146,23 @@ module mod_petsc_pc_sf_solver
   !> "flux": the flux-Schur arm (Tang 2022 ordering): velocity first, then
   !! the (psi, j) surrogate S1 = P_J + (1/varsigma) B_12^T C_w B_12, with
   !! C_w a banded SPAI of the R^3 rho0 mass (mod_petsc_pc_sf_spai), then the
-  !! velocity and rho / T re-solves. Mode split, model199 only.
+  !! velocity and rho / T re-solves. model199 only. The global path (all
+  !! toroidal slots, every cross-|n| coupling kept) regardless of
+  !! physics_pc_sf_mode_split; -sf_flux_mode_split 1 for the mode split.
   integer, parameter, public :: SF_SUU_FLUX  = 5
+  !> ... its S1 surrogate (-sf_flux_s1): "hpatch" (default), S1 = P_J +
+  !! [[B_12 H, 0], [0, 0]] with H the banded local velocity response of
+  !! patch solves (mod_petsc_pc_sf_hpatch); "spai", the bending term
+  !! B_12^T C_w B_12 / varsigma with C_w ~ M_w^-1 -- Tang's commutation,
+  !! which fails on JOREK's shaped toroidal grid (sigma(S~1^-1 S1) = [0.67,
+  !! 1.62] on the dumps; GMRES 18-19 / 21 against 8 / 10 for hpatch and 7 /
+  !! 7-8 for the exact S1). Kept for comparison. "splitm": the H-form with
+  !! Tang's commuted part kept exactly, H = H_T + cut_r(remainder), H_T =
+  !! -(1/varsigma) M_w^-1 B_23 on radius-q patches (mod_petsc_pc_sf_hpatch,
+  !! SPLIT-M): robust at large theta where the H-form's S1 turns indefinite.
+  integer, parameter, public :: SF_FLUX_S1_HPATCH = 1
+  integer, parameter, public :: SF_FLUX_S1_SPAI   = 2
+  integer, parameter, public :: SF_FLUX_S1_SPLITM = 3
 
   !--- v_par (model600 with_vpar, physics_pc_sf_vpar_stage) ------------------
   !> "v0": B_77 solved last, against the final psi, u, rho, T, no feedback.
@@ -281,7 +296,10 @@ module mod_petsc_pc_sf_solver
   !! on each rank's rows (mod_petsc_pc_gmg, MULTI-COLOUR RING SWEEP) --, radial
   !! semi-coarsening as the mixed pair_w, cos / sin slots in one block. No
   !! line overlap: there are no radial-line blocks left to extend. UNTUNED
-  !! starting point (-sf_gmg6_* override every gmg_opts_t entry).
+  !! starting point (-sf_gmg6_* override every gmg_opts_t entry). The same
+  !! for the H-form S1 = P_J + B_12 H (-sf_flux_s1 hpatch, the default),
+  !! nonsymmetric, reach 1 + r (-sf_flux_hp_r); the auto colours and
+  !! super-nodes follow the operator.
   integer, parameter, public :: SF_GMG_INST_FLUX        = 6
   integer, parameter, public :: SF_GMG_NCOL_FLUX        = 0        !< auto: reach + 1 per level
   real*8,  parameter, public :: SF_GMG_RING_ASPECT_FLUX = 1.0d30   !< no ring reaches it: rings everywhere
@@ -294,6 +312,30 @@ module mod_petsc_pc_sf_solver
   !! keep the LAPACK band LU (exact as well, more storage at reach 4).
   integer, parameter, public :: SF_GMG_RING_SUPER_FLUX  = 0
   integer, parameter, public :: SF_GMG_RING_SOLVER_FLUX = -1       !< gmg_opts_t default
+  !> ... on the flux arm's GLOBAL path (its default, all n_tor slots and every
+  !! cross-|n| coupling in the operators), S1 (instance 6) and D_v (instance
+  !! 1): every toroidal slot and both fields of a ring in one smoother block
+  !! (harm_pair 2), so the cross-|n| couplings lie inside the blocks; with it
+  !! ring_solver -1 resolves to the Thomas / reduction hybrid and ring_single
+  !! -1 to single-precision ring factors (mod_petsc_pc_gmg; D_v only, S1 see
+  !! SF_GMG_RING_SINGLE_FLUX_G). The mode split
+  !! keeps SF_GMG_HARM_PAIR_FLUX / SF_GMG_HARM_PAIR_MIXED. For S1 also:
+  !! super-nodes from each level's along-ring reach (ring_super -1: S1 couples
+  !! to J +- (2 + r)); the ring blocks cut by a rank boundary completed as the
+  !! mixed pair_w's (SF_GMG_RING_OVERLAP); and the rings within the bending
+  !! term's reach of the axis node in the exact axis block
+  !! (sf_gmg_axis_rings_flux): those rings couple through the axis node to
+  !! the whole ring, which no ring block holds. UNTUNED (-sf_gmg6_* and
+  !! -sf_gmg1_* override).
+  integer, parameter, public :: SF_GMG_HARM_PAIR_FLUX_G    = 2
+  integer, parameter, public :: SF_GMG_RING_SUPER_FLUX_G   = -1    !< auto: along-ring reach
+  integer, parameter, public :: SF_GMG_RING_SOLVER_FLUX_G  = -1    !< -> the hybrid with harm_pair 2
+  integer, parameter, public :: SF_GMG_RING_OVERLAP_FLUX_G = SF_GMG_RING_OVERLAP
+  !> ... but S1's ring factors stay in double precision (harm_pair 2 would
+  !! make ring_single -1 resolve to 1): S1's ring blocks carry the stiff
+  !! bending term, conditioning ~ A_h, which single-precision factors do not
+  !! resolve. D_v keeps the default. -sf_gmg6_ring_single overrides.
+  integer, parameter, public :: SF_GMG_RING_SINGLE_FLUX_G  = 0
   !> FGMRES budget around a V-cycle, per block. These are not free parameters:
   !! they are the budgets the workstream D/G measurements were taken at
   !! (30 for the packed pairs, 10 for the scalar transport blocks), so the
@@ -319,8 +361,21 @@ module mod_petsc_pc_sf_solver
   public :: sf_backend_name, sf_split_halves, sf_split_parts
   public :: sf_suu_parse, sf_force_terms, sf_needs_mass_w, sf_opz
   public :: sf_vpar_stage, sf_vpar_wmask, sf_vpar_gamma_w, sf_vpar_w_assembled, sf_vpar_wvu_full
+  public :: sf_gmg_axis_rings_flux, sf_flux_s1_kind
 
 contains
+
+  !> The flux arm's S1 axis block on the global path: rings 0 .. k with
+  !! k = ceil(R / 2), R = S1's radial reach in rings: 2 + r for the SPAI form
+  !! (B_12^T C_w B_12, r = -sf_flux_spai_r), 1 + r for the H-form (B_12 H, r
+  !! = -sf_flux_hp_r), 1 + q for split-M (H's reach q = -sf_flux_hp_q). The
+  !! rings within half that reach of ring 0 couple
+  !! through the axis node to the whole ring, so they go to the exact axis
+  !! solve (2 for both defaults).
+  pure integer function sf_gmg_axis_rings_flux(reach)
+    integer, intent(in) :: reach   !< S1's radial reach (rings)
+    sf_gmg_axis_rings_flux = (max(reach, 0) + 1) / 2
+  end function sf_gmg_axis_rings_flux
 
   !> physics_pc_sf_suu -> form; ok = .false. for an unknown string.
   subroutine sf_suu_parse(str, f, ok)
@@ -354,14 +409,40 @@ contains
   end function sf_force_terms
 
   !> .true. when the arm needs the element-assembled R^3 rho0 mass M_w
-  !! (physics_pc_ctx%M_w): the flux arm.
+  !! (physics_pc_ctx%M_w): the flux arm with the SPAI or split-M surrogate
+  !! (-sf_flux_s1 spai | splitm), or with -sf_flux_dump (the dump writes Mw
+  !! for the offline checks).
   logical function sf_needs_mass_w()
     use phys_module, only: physics_pc_sf_suu
     type(suu_form_t) :: f
     logical :: ok
+    character(len=256) :: sv
+    PetscBool :: set
+    PetscErrorCode :: ierr
     call sf_suu_parse(physics_pc_sf_suu, f, ok)
     sf_needs_mass_w = ok .and. (f%form == SF_SUU_FLUX)
+    if (.not. sf_needs_mass_w) return
+    sv = ""
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_dump", sv, set, ierr)
+    sf_needs_mass_w = any(sf_flux_s1_kind() == [SF_FLUX_S1_SPAI, SF_FLUX_S1_SPLITM]) .or. set
   end function sf_needs_mass_w
+
+  !> The flux arm's S1 surrogate (-sf_flux_s1): SF_FLUX_S1_HPATCH ("hpatch",
+  !! default), SF_FLUX_S1_SPAI ("spai") or SF_FLUX_S1_SPLITM ("splitm"); -1
+  !! for an unknown string.
+  integer function sf_flux_s1_kind()
+    character(len=64) :: sv
+    PetscBool :: set
+    PetscErrorCode :: ierr
+    sv = "hpatch"
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_s1", sv, set, ierr)
+    select case (trim(adjustl(sv)))
+    case ("hpatch"); sf_flux_s1_kind = SF_FLUX_S1_HPATCH
+    case ("spai");   sf_flux_s1_kind = SF_FLUX_S1_SPAI
+    case ("splitm"); sf_flux_s1_kind = SF_FLUX_S1_SPLITM
+    case default;    sf_flux_s1_kind = -1
+    end select
+  end function sf_flux_s1_kind
 
   !> physics_pc_sf_vpar_stage -> SF_VPAR_V0 | SF_VPAR_B0; -1 for an unknown string.
   integer function sf_vpar_stage()
@@ -441,7 +522,8 @@ contains
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, &
                              nfields, smoother, maxits, Aop, Ablk, Amg, pre0, post0, nsmooth_c, &
                              line_overlap, axis_sectors, rich_from, harm_pair, ring_overlap, &
-                             semi_r, axis_rings, rich_omega, ncol, ring_aspect, ring_super, ring_solver)
+                             semi_r, axis_rings, rich_omega, ncol, ring_aspect, ring_super, ring_solver, &
+                             ring_single)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, &
@@ -479,6 +561,8 @@ contains
     real*8,  intent(in), optional :: ring_aspect !< SF_GMG, smoother 8: switch-ring aspect (default 1)
     integer, intent(in), optional :: ring_super !< SF_GMG: ring super-nodes (gmg_opts_t; default 0 = off)
     integer, intent(in), optional :: ring_solver !< SF_GMG: ring blocks' solver (gmg_opts_t; default -1)
+    integer, intent(in), optional :: ring_single !< SF_GMG: single-precision ring factors (gmg_opts_t;
+                                              !< default -1 = 1 with a ring solver and harm_pair 2)
 
     PC :: pc
     PetscErrorCode :: ierr
@@ -549,6 +633,7 @@ contains
       if (present(ring_aspect))  o%ring_aspect  = ring_aspect
       if (present(ring_super))   o%ring_super   = ring_super
       if (present(ring_solver))  o%ring_solver  = ring_solver
+      if (present(ring_single))  o%ring_single  = ring_single
 
       !--- the hierarchy: built once per instance, then refilled per rebuild
       call gmg_select(slv%gmg_inst)

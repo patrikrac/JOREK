@@ -60,9 +60,10 @@ module mod_petsc_pc_gmg
     integer :: nsmooth_c    = -1     !< pre and post steps on the coarse levels; <= 0 = nsmooth
     integer :: axis_rings   = 0      !< axis block extent: rings 0..k; -1 = by physical radius
     integer :: bnd_drop     = 0      !< drop Dirichlet DOFs from the coarse spaces
-    integer :: ring_overlap = 0      !< smoother 4 (and 9's rings): a ring cut by a rank
-                                     !< boundary is extended by up to this many nodes along
-                                     !< J into the ranks owning the rest (RAS, as the lines)
+    integer :: ring_overlap = 0      !< smoothers 4 and 8 (8's ring blocks): > 0 = a ring cut
+                                     !< by a rank boundary is completed along J from the
+                                     !< ranks owning the rest (RAS, as the lines), so that
+                                     !< every ring block spans its ring (ring solver)
     integer :: harm_pair    = 0      !< 1 = a harmonic's cos and sin slots share every
                                      !< smoother block (first-order d_phi couplings, which
                                      !< map cos <-> sin, then lie inside the blocks);
@@ -74,6 +75,12 @@ module mod_petsc_pc_gmg
                                      !< with ring_super /= 0, else 0
     integer :: ring_segs    = 0      !< hybrid: segments per ring; 0 = ceil(threads / rings)
                                      !< when a rank has fewer rings than threads, else 1
+                                     !< (smoother 8 with ring_par: rings of the ring's colour)
+    integer :: ring_par     = -1     !< smoother 8, ring_solver 2: 1 = each colour of the sweep
+                                     !< threaded over (ring, segment) work items, the
+                                     !< segments sized by the rank's rings per colour;
+                                     !< 0 = off (rings on threads, segments serial);
+                                     !< -1 = 1 with ring_overlap > 0, else 0
     integer :: ring_btd_min = 0      !< ring blocks with fewer rows keep the LAPACK LU
     integer :: ring_check   = 0      !< 1 = residual of every ring solve after the first factorisation,
                                      !< 2 = and the Thomas fill's decay along the ring
@@ -209,12 +216,27 @@ module mod_petsc_pc_gmg
     ! between different blocks that it drops (none then). ncol <= 0 picks
     ! R + 1 per level. With mcol the boundary ring is a ring block too when
     ! no interior ring reaches ring_aspect (gmg_build_prolongations).
+    ! Couplings to the axis block do not count in R (blk_reach): the axis
+    ! is solved before colour 0, so they always meet its final values.
     ! Rings cut by a rank boundary stay one block per rank (block Jacobi
-    ! across the cut, as in the zebra). jreach: the largest J distance
-    ! (periodic) of a coupling within a ring outside the axis block; nsup:
-    ! the ring solver's super-node size (ring_super, btd_mark), 1 = off.
+    ! across the cut, as in the zebra) unless ring_overlap > 0 completes
+    ! them with the other ranks' rows as ghosts (ovl_extend; RAS below):
+    ! each rank then solves the whole ring, writes back its own rows and
+    ! keeps the ghosts' solution in yg for the later colours, so the sweep
+    ! stays block Gauss-Seidel over the rank's rows and ghosts -- every own
+    ! row is written once, by its own block, in its colour; a ghost is read
+    ! only through the coupling CSR, i.e. from blocks of later colours,
+    ! after its own block was solved; couplings to rows that are neither own
+    ! nor ghosts are dropped, the restricted additive Schwarz across ranks
+    ! (R is then measured over the ghosts' couplings too). jreach: the
+    ! largest J distance (periodic) of a coupling within a ring outside the
+    ! axis block; nsup: the ring solver's super-node size (ring_super,
+    ! btd_mark), 1 = off. nfb: ring blocks not on the ring solver, by
+    ! reason (1 cut by a rank boundary, 2 below ring_btd_min, 3 coupling
+    ! beyond the neighbouring (super-)nodes, 4 fewer than 4 nodes per ring).
     logical :: mcol = .false.
     integer :: ncol = 2, rreach = -1, jreach = -1, nsup = 1, nxc = 0
+    integer :: nfb(4) = 0
     ! Overlapping line segments (restricted additive Schwarz, Cai & Sarkis,
     ! SISC 21 (1999) 792). The partition is ring-major, so every rank boundary
     ! cuts every radial line; with lovl > 0 each local line segment is
@@ -254,13 +276,15 @@ module mod_petsc_pc_gmg
     ! are in natural J order (node by node), qn(off(b)+q) = the node (0..nn-1)
     ! of block position q, rg(b) the layout, factor and pivots in lu / piv
     ! as the LAPACK blocks'. jac(b): a singular node block, point Jacobi.
-    ! ghJ: J of each ghost row (ovl_extend). Hybrid on smoother 4: the
-    ! (block lb, segment lk) work items of all the rank's rings, and the work
-    ! vector wk (block order) the threaded solve runs on.
+    ! ghI / ghJ: I / J of each ghost row (ovl_extend). Hybrid on smoother 4:
+    ! the (block lb, segment lk) work items of all the rank's rings, and the
+    ! work vector wk (block order) the threaded solve runs on. Smoother 8
+    ! (ring_par): the same items grouped by colour, colour c's at
+    ! lcp(c)+1 .. lcp(c+1) (zebra_solve_par).
     logical, allocatable :: btd(:), jac(:)
-    integer, allocatable :: qn(:), ghJ(:)
+    integer, allocatable :: qn(:), ghJ(:), ghI(:)
     type(btd_ring), allocatable :: rg(:)
-    integer, allocatable :: lb(:), lk(:)
+    integer, allocatable :: lb(:), lk(:), lcp(:)
     real*8, allocatable :: wk(:)
     ! ring_single: the ring blocks' factors rounded to single (lu4, block b at
     ! loff4(b)), which the solves read instead of lu; wk4 = wk's single copy
@@ -277,6 +301,13 @@ module mod_petsc_pc_gmg
   integer, save :: stk_inst(8), stk_lev(8), nstk = 0
   integer, save :: sm_type = 0, sm_nstep = 4
   real*8, allocatable, save :: blk_t_work(:,:)   !< (max block size, 0:threads-1)
+  ! per-thread heap workspace of the ring solves (one_solve's single copy of
+  ! a block, the hybrid separators' system), sized in the mesh part of
+  ! build_blocks: no block-sized automatic arrays on the threads' stacks
+  real*4, allocatable, save :: blk_t_work4(:,:)  !< (max block size, 0:threads-1)
+  real*8, allocatable, save :: blk_t_sep(:,:)    !< (max separator rows nf, 0:threads-1)
+  real*4, allocatable, save :: blk_t_sep4(:,:)   !< (max nf, 0:threads-1)
+  integer, allocatable, save :: blk_t_ipv(:,:)   !< (max nf, 0:threads-1)
   integer, parameter :: LINES_OMP_MIN = 4000     !< rows below which lines_solve stays serial
   ! Axis treatment (Bourne et al., JCP 488 (2023) 112249 S2-S3). Fine rings
   ! I < ring_is have median r*dtheta/dr below gmg_opts_t%ring_aspect: the
@@ -289,6 +320,7 @@ module mod_petsc_pc_gmg
   integer, save :: rsolv = 0, rbmin = 0, rchk = 0   !< gmg_opts_t%ring_solver / ring_btd_min / ring_check
   integer, save :: rseg = 0                         !< gmg_opts_t%ring_segs
   logical, save :: rsp = .false.                    !< gmg_opts_t%ring_single
+  logical, save :: rpar = .false.                   !< gmg_opts_t%ring_par, resolved (smoother 8)
   integer, save :: ncol_o = 2                       !< gmg_opts_t%ncol (smoother 8; 2 = the zebra)
   integer, save :: rsup = 0                         !< gmg_opts_t%ring_super
   integer, save :: semi_r = 0               !< gmg_opts_t%semi_r, of the hierarchy being built
@@ -321,7 +353,7 @@ module mod_petsc_pc_gmg
     integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 0, rovl = 0
     integer :: rsolv = 0, rbmin = 0, rchk = 0, rseg = 0
     integer :: ncol_o = 2, rsup = 0
-    logical :: rsp = .false.
+    logical :: rsp = .false., rpar = .false.
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false.
     Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gF
@@ -392,7 +424,7 @@ contains
       S%ring_is = ring_is; S%axis_k = axis_k
       S%lovl = lovl; S%axsec = axsec; S%hpair = hpair; S%rovl = rovl
       S%rsolv = rsolv; S%rbmin = rbmin; S%rchk = rchk; S%rsp = rsp; S%rseg = rseg
-      S%ncol_o = ncol_o; S%rsup = rsup
+      S%ncol_o = ncol_o; S%rsup = rsup; S%rpar = rpar
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready
       S%gP = gP; S%gA = gA; S%gF = gF; S%gSm = gSm
@@ -411,7 +443,7 @@ contains
       ring_is = S%ring_is; axis_k = S%axis_k
       lovl = S%lovl; axsec = S%axsec; hpair = S%hpair; rovl = S%rovl
       rsolv = S%rsolv; rbmin = S%rbmin; rchk = S%rchk; rsp = S%rsp; rseg = S%rseg
-      ncol_o = S%ncol_o; rsup = S%rsup
+      ncol_o = S%ncol_o; rsup = S%rsup; rpar = S%rpar
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready
       gP = S%gP; gA = S%gA; gF = S%gF; gSm = S%gSm
@@ -451,8 +483,8 @@ contains
     if (allocated(a%zc))   call move_alloc(a%zc,   b%zc)
     if (allocated(a%zv))   call move_alloc(a%zv,   b%zv)
     b%mcol = a%mcol; b%ncol = a%ncol; b%rreach = a%rreach; b%jreach = a%jreach
-    b%nsup = a%nsup; b%nxc = a%nxc
-    a%mcol = .false.; a%ncol = 2; a%rreach = -1; a%jreach = -1; a%nsup = 1; a%nxc = 0
+    b%nsup = a%nsup; b%nxc = a%nxc; b%nfb = a%nfb
+    a%mcol = .false.; a%ncol = 2; a%rreach = -1; a%jreach = -1; a%nsup = 1; a%nxc = 0; a%nfb = 0
     b%ovl = a%ovl; b%ngh = a%ngh; a%ovl = .false.; a%ngh = 0
     b%isg = a%isg; b%isall = a%isall; b%xg = a%xg; b%sct = a%sct
     b%sg => a%sg; a%sg => null()
@@ -470,9 +502,11 @@ contains
     if (allocated(a%jac))  call move_alloc(a%jac,  b%jac)
     if (allocated(a%qn))   call move_alloc(a%qn,   b%qn)
     if (allocated(a%ghJ))  call move_alloc(a%ghJ,  b%ghJ)
+    if (allocated(a%ghI))  call move_alloc(a%ghI,  b%ghI)
     if (allocated(a%rg))   call move_alloc(a%rg,   b%rg)
     if (allocated(a%lb))   call move_alloc(a%lb,   b%lb)
     if (allocated(a%lk))   call move_alloc(a%lk,   b%lk)
+    if (allocated(a%lcp))  call move_alloc(a%lcp,  b%lcp)
     if (allocated(a%wk))   call move_alloc(a%wk,   b%wk)
     if (allocated(a%lu4))  call move_alloc(a%lu4,  b%lu4)
     if (allocated(a%wk4))  call move_alloc(a%wk4,  b%wk4)
@@ -1464,9 +1498,11 @@ contains
     if (sm_type /= 4) call opt_int("line_overlap", lovl)
     hpair = max(o%harm_pair, 0)
     call opt_int("harm_pair", hpair)
+    ! ring completion across rank cuts: smoother 4's rings, and smoother 8's
+    ! ring blocks (opt-in there: ring_overlap > 0)
     rovl = 0
-    if (sm_type == 4) rovl = max(o%ring_overlap, 0)
-    if (sm_type == 4) call opt_int("ring_overlap", rovl)
+    if (sm_type == 4 .or. sm_type == 8) rovl = max(o%ring_overlap, 0)
+    if (sm_type == 4 .or. sm_type == 8) call opt_int("ring_overlap", rovl)
     ! the multi-colour ring sweep (smoother 8 only) and super-node rings
     ncol_o = 2
     if (sm_type == 8) ncol_o = o%ncol
@@ -1491,6 +1527,16 @@ contains
       call opt_int("ring_single", isp)
       if (isp < 0) isp = merge(1, 0, hpair >= 2)
       rsp = (isp > 0 .and. rsolv > 0)
+    end block
+    ! smoother 8: each colour threaded over the hybrid's (ring, segment) work
+    ! items (zebra_solve_par); by default with ring_overlap > 0, whose rings
+    ! are whole and so all on the ring solver
+    block
+      integer :: ipar
+      ipar = o%ring_par
+      if (sm_type == 8) call opt_int("ring_par", ipar)
+      if (ipar < 0) ipar = merge(1, 0, rovl > 0)
+      rpar = (sm_type == 8 .and. ipar > 0 .and. rsolv == RS_HYB)
     end block
     if (rsolv > RS_HYB) then
       if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: GMG ring_solver must be -1..2"
@@ -1607,6 +1653,9 @@ contains
           " (scale ", rich_omega, ", no reductions)"
       endif
     end block
+    ! smoother 8: which solver level 0's ring blocks run on (collective;
+    ! first build only, op_ready is set below)
+    if (sm_type == 8 .and. nlev > 1 .and. .not. op_ready) call ring_report(0)
 
     ! Coarse and axis LUs carry an options prefix (gmg<k>_coarse_, gmg<k>_axis_,
     ! gmg<k>_axblk<g>_) for MUMPS options without a rebuild.
@@ -2003,13 +2052,55 @@ contains
         enddo
       endif
       B%axsparse = (axis_k /= 0)
+      if (B%axsparse) then
+        allocate(axr(sum(B%sz, mask=B%axblk)))
+        n = 0
+        do bb = 1, B%nb
+          if (.not. B%axblk(bb)) cycle
+          do q = 1, B%sz(bb)
+            n = n + 1
+            axr(n) = rst + B%rows(B%off(bb) + q)
+          enddo
+        enddo
+        call ISCreateGeneral(gcomm, int(n, kind(nr)), axr, PETSC_COPY_VALUES, B%axis_is, ierr)
+        call ISSort(B%axis_is, ierr)
+        ! the same rows, local and ascending, for its direct solve
+        allocate(B%axg(1), key(B%nrow))
+        key = 0
+        do q = 1, n
+          key(axr(q) - rst + 1) = 1
+        enddo
+        allocate(B%axg(1)%loc(count(key == 1)))
+        n = 0
+        do r = 1, B%nrow
+          if (key(r) /= 1) cycle
+          n = n + 1; B%axg(1)%loc(n) = int(r) - 1
+        enddo
+        deallocate(axr, key)
+      endif
+      ! the ghost rows: radial lines extended by line_overlap, rings completed
+      ! across rank cuts (ring_overlap; smoother 8's ring blocks opt in), in
+      ! one walk for smoother 8, whose rings and lines may both be extended
+      if (sm_type == 8 .and. rovl > 0) then
+        call ovl_extend(g, A, B, rst, ren, lovl, rovl)
+      else if (lovl > 0 .and. sm_type /= 4) then
+        call ovl_extend(g, A, B, rst, ren, lovl, 0)
+      else if (rovl > 0 .and. sm_type == 4) then
+        call ovl_extend(g, A, B, rst, ren, 0, rovl)
+      endif
       ! the multi-colour ring sweep's colours and the super-node size, from
       ! the operator's reach (blk_t, MULTI-COLOUR RING SWEEP); the zebra
-      ! (ncol 2) without super-nodes measures nothing and keeps ncol = 2
+      ! (ncol 2) without super-nodes measures nothing and keeps ncol = 2.
+      ! After the ghosts: with smoother 8's completed rings the reach counts
+      ! the couplings of the ghost rows too.
       B%mcol = (sm_type == 8 .and. ncol_o /= 2)
       B%ncol = 2; B%nsup = 1
       if (B%mcol .or. rsup /= 0) then
-        call blk_reach(g, A, B%rreach, B%jreach)        ! collective on gcomm
+        block
+          integer :: rr_, jr_
+          call blk_reach(g, A, B, rr_, jr_)              ! collective on gcomm
+          B%rreach = rr_; B%jreach = jr_
+        end block
         if (B%mcol) then
           if (ncol_o > 0) then
             B%ncol = max(ncol_o, 2)
@@ -2047,53 +2138,51 @@ contains
       B%bcol = 0
       if (sm_type == 7 .or. sm_type == 8) then
         do bb = 1, B%nb
-          r = B%rows(B%off(bb) + 1) + 1
-          if (g == 0) then
-            I = fine_node(r) / nth0; J = mod(fine_node(r), nth0)
-          else
-            I = glv(g)%rnode(r) / glv(g)%nj; J = mod(glv(g)%rnode(r), glv(g)%nj)
-          endif
+          ! from an own row (a block's first row may be a ghost now)
+          call blk_own_node(g, B, bb, I, J)
           if (I /= 0 .and. .not. B%axblk(bb)) B%bcol(bb) = mod(J, 2)
           ! smoother 8: ring blocks alternate in I (zebra over rings), or
           ! cycle through ncol colours (B%ncol = 2 unless mcol)
           if (sm_type == 8 .and. I < ring_lim(g) .and. .not. B%axblk(bb)) B%bcol(bb) = mod(I, B%ncol)
         enddo
       endif
-      if (B%axsparse) then
-        allocate(axr(sum(B%sz, mask=B%axblk)))
-        n = 0
-        do bb = 1, B%nb
-          if (.not. B%axblk(bb)) cycle
-          do q = 1, B%sz(bb)
-            n = n + 1
-            axr(n) = rst + B%rows(B%off(bb) + q)
-          enddo
-        enddo
-        call ISCreateGeneral(gcomm, int(n, kind(nr)), axr, PETSC_COPY_VALUES, B%axis_is, ierr)
-        call ISSort(B%axis_is, ierr)
-        ! the same rows, local and ascending, for its direct solve
-        allocate(B%axg(1), key(B%nrow))
-        key = 0
-        do q = 1, n
-          key(axr(q) - rst + 1) = 1
-        enddo
-        allocate(B%axg(1)%loc(count(key == 1)))
-        n = 0
-        do r = 1, B%nrow
-          if (key(r) /= 1) cycle
-          n = n + 1; B%axg(1)%loc(n) = int(r) - 1
-        enddo
-        deallocate(axr, key)
-      endif
-      if (lovl > 0 .and. sm_type /= 4) call ovl_extend(g, A, B, rst, ren, lovl, .false.)
-      if (rovl > 0 .and. sm_type == 4) call ovl_extend(g, A, B, rst, ren, rovl, .true.)
       call btd_mark(g, B)
       nthr = 1
       !$ nthr = omp_get_max_threads()
-      if (allocated(blk_t_work)) then
-        if (size(blk_t_work, 1) < maxval(B%sz) .or. size(blk_t_work, 2) < nthr) deallocate(blk_t_work)
-      endif
-      if (.not. allocated(blk_t_work)) allocate(blk_t_work(maxval(B%sz), 0:nthr - 1))
+      ! the per-thread workspaces of the block solves (blk_t_work: lines /
+      ! zebra; blk_t_work4, blk_t_sep*: one_solve's single copy and the
+      ! hybrid's separators), shared by all levels and instances: grown here,
+      ! never inside the smoothing, and never shrunk in either dimension
+      ! (old size kept where it is larger), so no earlier level's or
+      ! instance's solve can index beyond them
+      block
+        integer :: nsz_, nnf, d1, d2
+        nsz_ = 1
+        if (B%nb > 0) nsz_ = max(maxval(B%sz), 1)
+        nnf = 1
+        do bb = 1, B%nb
+          if (B%btd(bb)) nnf = max(nnf, B%rg(bb)%nf)
+        enddo
+        d1 = nsz_; d2 = nthr
+        if (allocated(blk_t_work)) then
+          d1 = max(d1, size(blk_t_work, 1)); d2 = max(d2, size(blk_t_work, 2))
+          if (size(blk_t_work, 1) < d1 .or. size(blk_t_work, 2) < d2) deallocate(blk_t_work)
+        endif
+        if (.not. allocated(blk_t_work)) allocate(blk_t_work(d1, 0:d2 - 1))
+        d1 = nsz_; d2 = nthr
+        if (allocated(blk_t_work4)) then
+          d1 = max(d1, size(blk_t_work4, 1)); d2 = max(d2, size(blk_t_work4, 2))
+          if (size(blk_t_work4, 1) < d1 .or. size(blk_t_work4, 2) < d2) deallocate(blk_t_work4)
+        endif
+        if (.not. allocated(blk_t_work4)) allocate(blk_t_work4(d1, 0:d2 - 1))
+        d1 = nnf; d2 = nthr
+        if (allocated(blk_t_sep)) then
+          d1 = max(d1, size(blk_t_sep, 1)); d2 = max(d2, size(blk_t_sep, 2))
+          if (size(blk_t_sep, 1) < d1 .or. size(blk_t_sep, 2) < d2) deallocate(blk_t_sep, blk_t_sep4, blk_t_ipv)
+        endif
+        if (.not. allocated(blk_t_sep)) allocate(blk_t_sep(d1, 0:d2 - 1), blk_t_sep4(d1, 0:d2 - 1), &
+                                                 blk_t_ipv(d1, 0:d2 - 1))
+      end block
       call PetscLogEventEnd(gev_blkmesh, ierr)
     endif
 
@@ -2115,6 +2204,28 @@ contains
         call blk_pattern(B, A, rst, ren)
         call PetscLogEventEnd(gev_blkpat, ierr)
         B%pat_id = int(aid, 8); B%pat_nz = int(nzst, 8)
+        ! ring blocks left to the LAPACK LU although a ring solver was asked
+        ! for, by reason (btd_mark, blk_pattern): one warning per level
+        if (rsolv /= RS_LAPACK .and. (sm_type == 4 .or. sm_type == 8)) then
+          block
+            integer :: nf(4)
+            nf = B%nfb
+            call MPI_Allreduce(MPI_IN_PLACE, nf, 4, MPI_INTEGER, MPI_SUM, gcomm, mpierr)
+            if (gme == 0 .and. any(nf > 0)) then
+              write(*,'(A,I0,A,I0,A,I0,A)', advance="no") "[Physics PC]   GMG", cur_inst, " level ", g, &
+                " WARNING: ", sum(nf), " ring block(s) on the LAPACK LU instead of the ring solver:"
+              if (nf(1) > 0) write(*,'(A,I0,A)', advance="no") " ", nf(1), " cut by a rank boundary"
+              if (nf(1) > 0 .and. rovl == 0) write(*,'(A)', advance="no") " (ring_overlap > 0 completes them)"
+              if (nf(2) > 0) write(*,'(A,I0,A)', advance="no") " ", nf(2), " below ring_btd_min rows"
+              if (nf(3) > 0) write(*,'(A,I0,A,I0,A)', advance="no") " ", nf(3), &
+                " coupling beyond the neighbouring super-nodes (of ", B%nsup, " nodes)"
+              if (nf(3) > 0 .and. B%nsup == 1 .and. rsup == 0) write(*,'(A)', advance="no") &
+                " (ring_super -1 groups the nodes by the reach)"
+              if (nf(4) > 0) write(*,'(A,I0,A)', advance="no") " ", nf(4), " with fewer than 4 nodes per ring"
+              write(*,*)
+            endif
+          end block
+        endif
         if (B%mcol) then
           ! the multi-colour sweep's dropped couplings (0 when ncol >= R + 1)
           block
@@ -2243,13 +2354,22 @@ contains
   !! order), so every ring path -- Thomas, hybrid, single precision -- applies
   !! unchanged. A ring that still couples beyond its neighbouring super-nodes
   !! falls back to the LAPACK LU in blk_pattern (its warning).
+  !!
+  !! Smoother 8 with ring_par (zebra_solve_par): the sweep threads one colour
+  !! at a time, so a ring's segments (ring_segs 0) are ceil(threads / the
+  !! rank's rings of its colour) -- 1 where those are as many as the threads,
+  !! and on levels too small for threads (LINES_OMP_MIN) -- and the work
+  !! items are grouped by colour (lcp). B%nfb counts the ring blocks left to
+  !! the LAPACK LU here, by reason (blk_t).
   subroutine btd_mark(g, B)
     integer, intent(in) :: g
     type(blk_t), intent(inout) :: B
-    integer :: nc, nall, r, bb, q, I, ns, nthr, n, k
+    integer :: nc, nall, r, bb, q, ns, nthr, n, k, c
     integer :: sn, nns, kk, jj
-    integer, allocatable :: key(:), cnt(:,:), sup(:), bsup(:)
+    integer, allocatable :: key(:), cnt(:,:), sup(:), bsup(:), nsb(:), nbc(:)
+    logical :: cpar
     nall = B%nrow + B%ngh
+    B%nfb = 0
     if (allocated(B%btd)) deallocate(B%btd, B%jac, B%rg, B%qn)
     allocate(B%btd(B%nb), B%jac(B%nb), B%rg(B%nb), B%qn(nall))
     B%btd = .false.; B%jac = .false.; B%qn = 0
@@ -2259,7 +2379,12 @@ contains
     else
       nc = glv(g)%nj
     endif
-    if (nc < 4) return
+    if (nc < 4) then
+      do bb = 1, B%nb
+        if (ring_blk(g, B, bb)) B%nfb(4) = B%nfb(4) + 1
+      enddo
+      return
+    endif
     ! node J -> super-node sup(J) (identity without super-nodes)
     sn = max(B%nsup, 1)
     if (nc / sn < 4) sn = 1
@@ -2290,29 +2415,21 @@ contains
       endif
     enddo
     do bb = 1, B%nb
-      if (B%axblk(bb) .or. B%sz(bb) < max(rbmin, 1)) cycle
-      ! the ring's I, from one of its own rows
-      I = -1
-      do q = 1, B%sz(bb)
-        r = B%rows(B%off(bb) + q) + 1
-        if (r > B%nrow) cycle
-        if (g == 0) then
-          I = fine_node(r) / nth0
-        else
-          I = glv(g)%rnode(r) / nc
-        endif
-        exit
-      enddo
-      if (I <= 0) cycle
-      if (sm_type == 8) then
-        if (I >= ring_lim(g)) cycle
+      ! rings only (smoother 4's, 8's inside ring_lim), not the axis
+      if (.not. ring_blk(g, B, bb)) cycle
+      if (B%sz(bb) < max(rbmin, 1)) then
+        B%nfb(2) = B%nfb(2) + 1
+        cycle
       endif
       cnt(:, bb) = 0
       do q = 1, B%sz(bb)
         r = B%rows(B%off(bb) + q) + 1
         cnt(key(r), bb) = cnt(key(r), bb) + 1
       enddo
-      if (any(cnt(:, bb) == 0)) cycle               ! still cut by a rank boundary
+      if (any(cnt(:, bb) == 0)) then                ! still cut by a rank boundary
+        B%nfb(1) = B%nfb(1) + 1
+        cycle
+      endif
       call sort_rows_by_key(B%rows(B%off(bb) + 1:B%off(bb) + B%sz(bb)), key)
       do q = 1, B%sz(bb)
         r = B%rows(B%off(bb) + q)
@@ -2321,13 +2438,35 @@ contains
       enddo
       B%btd(bb) = .true.
     enddo
+    nthr = 1
+    !$ nthr = omp_get_max_threads()
     ns = rseg
     if (ns == 0) then
-      nthr = 1
-      !$ nthr = omp_get_max_threads()
       n = max(count(B%btd), 1)
       ns = 1
       if (n < nthr) ns = (nthr + n - 1) / n
+    endif
+    ! segments per ring: the level's ns, or by the rings of the ring's
+    ! colour (smoother 8, ring_par)
+    allocate(nsb(B%nb))
+    nsb = ns
+    cpar = (rpar .and. sm_type == 8 .and. rsolv == RS_HYB)
+    if (cpar) then
+      allocate(nbc(0:B%ncol - 1))
+      nbc = 0
+      do bb = 1, B%nb
+        if (B%btd(bb)) nbc(B%bcol(bb)) = nbc(B%bcol(bb)) + 1
+      enddo
+      do bb = 1, B%nb
+        if (.not. B%btd(bb)) cycle
+        if (rseg > 0) then
+          nsb(bb) = rseg
+        else if (B%nrow < LINES_OMP_MIN) then
+          nsb(bb) = 1                               ! the sweep runs serially there
+        else
+          nsb(bb) = (nthr + nbc(B%bcol(bb)) - 1) / nbc(B%bcol(bb))
+        endif
+      enddo
     endif
     allocate(bsup(0:nns - 1))
     do bb = 1, B%nb
@@ -2338,15 +2477,16 @@ contains
         do jj = 0, nc - 1
           bsup(sup(jj)) = bsup(sup(jj)) + cnt(jj, bb)
         enddo
-        call btd_plan(B%rg(bb), rsolv, nns, bsup, ns)
+        call btd_plan(B%rg(bb), rsolv, nns, bsup, nsb(bb))
       else
-        call btd_plan(B%rg(bb), rsolv, nc, cnt(:, bb), ns)
+        call btd_plan(B%rg(bb), rsolv, nc, cnt(:, bb), nsb(bb))
       endif
     enddo
     deallocate(sup, bsup)
     ! smoother 4 with segmented rings: the hybrid threaded over (block,
     ! segment) work items, one item for every other non-axis block
     if (allocated(B%wk)) deallocate(B%wk, B%lb, B%lk)
+    if (allocated(B%lcp)) deallocate(B%lcp)
     if (rsolv == RS_HYB .and. sm_type == 4 .and. ns > 1 .and. any(B%btd)) then
       allocate(B%wk(nall))
       do q = 1, 2
@@ -2362,27 +2502,164 @@ contains
         enddo
         if (q == 1) allocate(B%lb(n), B%lk(n))
       enddo
+    else if (cpar .and. any(B%btd)) then
+      ! smoother 8: the same items, colour by colour (colour c's at
+      ! lcp(c)+1 .. lcp(c+1)); only where some ring is segmented
+      if (maxval(nsb, mask=B%btd) > 1) then
+        allocate(B%wk(nall), B%lcp(0:B%ncol))
+        do q = 1, 2
+          n = 0
+          do c = 0, B%ncol - 1
+            B%lcp(c) = n
+            do bb = 1, B%nb
+              if (B%axblk(bb) .or. B%bcol(bb) /= c) cycle
+              do k = 0, merge(B%rg(bb)%ns, 1, B%btd(bb)) - 1
+                n = n + 1
+                if (q == 2) then
+                  B%lb(n) = bb; B%lk(n) = k
+                endif
+              enddo
+            enddo
+          enddo
+          B%lcp(B%ncol) = n
+          if (q == 1) allocate(B%lb(n), B%lk(n))
+        enddo
+      endif
     endif
   end subroutine btd_mark
+
+  !> (I, J) of the node of block bb's first OWN row on level g (a block's
+  !! first row may be a ghost of the overlap); I = J = -1 for none
+  subroutine blk_own_node(g, B, bb, I, J)
+    integer, intent(in)  :: g, bb
+    type(blk_t), intent(in) :: B
+    integer, intent(out) :: I, J
+    integer :: q, r
+    I = -1; J = -1
+    do q = 1, B%sz(bb)
+      r = B%rows(B%off(bb) + q) + 1
+      if (r > B%nrow) cycle
+      if (g == 0) then
+        I = fine_node(r) / nth0; J = mod(fine_node(r), nth0)
+      else
+        I = glv(g)%rnode(r) / glv(g)%nj; J = mod(glv(g)%rnode(r), glv(g)%nj)
+      endif
+      return
+    enddo
+  end subroutine blk_own_node
+
+  !> Is block bb of level g a ring block (smoother 4's, 8's inside
+  !! ring_lim), the axis block and the per-slot I = 0 blocks excluded?
+  logical function ring_blk(g, B, bb)
+    integer, intent(in) :: g, bb
+    type(blk_t), intent(in) :: B
+    integer :: I, J
+    ring_blk = .false.
+    if (B%axblk(bb)) return
+    call blk_own_node(g, B, bb, I, J)
+    if (I <= 0) return
+    if (sm_type == 4) ring_blk = .true.
+    if (sm_type == 8) ring_blk = (I < ring_lim(g))
+  end function ring_blk
+
+  !> Smoother 8: level g's ring blocks by solver on rank 0's log, summed over
+  !! the ranks (a ring completed across a rank cut counts on every rank that
+  !! solves it), with the super-node size, the colours and the sweep CSR's
+  !! storage. Collective on gcomm.
+  subroutine ring_report(g)
+    integer, intent(in) :: g
+    type(blk_t), pointer :: B
+    integer :: bb, I, J, mpierr, iv(7), mx(2)
+    real*8 :: csr
+    B => gBk(g)
+    ! iv: rings, block Thomas, hybrid, point Jacobi, banded LU, dense LU,
+    ! radial lines; mx: the hybrid's segments, the colour-threaded sweep
+    iv = 0; mx = 0
+    do bb = 1, B%nb
+      if (B%axblk(bb)) cycle
+      if (.not. ring_blk(g, B, bb)) then
+        call blk_own_node(g, B, bb, I, J)
+        if (I > 0) iv(7) = iv(7) + 1
+        cycle
+      endif
+      iv(1) = iv(1) + 1
+      if (B%btd(bb)) then
+        if (B%jac(bb)) then
+          iv(4) = iv(4) + 1
+        else if (B%rg(bb)%meth == RS_THOMAS) then
+          iv(2) = iv(2) + 1
+        else
+          iv(3) = iv(3) + 1
+          mx(1) = max(mx(1), B%rg(bb)%ns)
+        endif
+      else if (B%band(bb)) then
+        iv(5) = iv(5) + 1
+      else
+        iv(6) = iv(6) + 1
+      endif
+    enddo
+    if (allocated(B%wk)) mx(2) = 1
+    csr = 0.d0
+    if (allocated(B%zv)) csr = 12.d0 * size(B%zv, kind=8)
+    call MPI_Allreduce(MPI_IN_PLACE, iv, 7, MPI_INTEGER, MPI_SUM, gcomm, mpierr)
+    call MPI_Allreduce(MPI_IN_PLACE, mx, 2, MPI_INTEGER, MPI_MAX, gcomm, mpierr)
+    call MPI_Allreduce(MPI_IN_PLACE, csr, 1, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
+    if (gme /= 0) return
+    write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A)', advance="no") "[Physics PC]   GMG", cur_inst, " level ", g, &
+      " ring blocks: ", iv(1), " (", iv(2) + iv(3), " on the ring solver"
+    if (iv(2) + iv(3) > 0) then
+      write(*,'(A,I0,A,I0,A)', advance="no") ": ", iv(2), " block Thomas, ", iv(3), " hybrid"
+      if (iv(3) > 0) write(*,'(A,I0,A)', advance="no") " of up to ", mx(1), " segments"
+      write(*,'(A)', advance="no") merge(", single precision", ", double precision", rsp)
+    endif
+    write(*,'(A,I0,A,I0,A,I0,A)', advance="no") "; ", iv(5), " banded LU, ", iv(6), " dense LU, ", iv(4), &
+      " point Jacobi)"
+    write(*,'(A,I0,A,I0,A)', advance="no") ", super-nodes of ", B%nsup, " node(s), ", B%ncol, " colours"
+    if (B%ovl .and. rovl > 0) write(*,'(A)', advance="no") ", rings completed across rank cuts"
+    if (mx(2) > 0) write(*,'(A)', advance="no") ", each colour threaded over ring segments"
+    if (iv(7) > 0) write(*,'(A,I0,A)', advance="no") "; ", iv(7), " radial line blocks"
+    write(*,'(A,F9.2,A)') "; sweep coupling CSR ", csr * 1.d-6, " MB"
+  end subroutine ring_report
 
   !> Reach of level g's operator A (mesh part of build_blocks, first build):
   !! rr = max |I_row - I_col|, jr = the largest periodic J distance between
   !! two nodes of the same ring I > axis block (the axis value couples to
-  !! every J), over the entries of the rank's diagonal part -- the couplings
-  !! the smoother blocks and the zebra CSR can see (off-rank columns are left
-  !! out of both; the line overlap's ghosts sit on radial lines, which do not
-  !! take part in either reach) -- maximised over the ranks. Collective on
-  !! gcomm.
-  subroutine blk_reach(g, A, rr, jr)
+  !! every J), over the couplings the smoother blocks and the zebra CSR can
+  !! see -- the entries of the rank's diagonal part, and with completed rings
+  !! those of their ghost rows (below; off-rank columns that are no ghosts
+  !! are left out of both; the line overlap's ghosts sit on radial lines,
+  !! which do not take part in either reach) -- maximised over the ranks.
+  !! Called after ovl_extend. Collective on gcomm.
+  !!
+  !! With an axis block (axis_k /= 0) rr leaves out every coupling with a row
+  !! or column in it. Exact: rr only sets the sweep's colours (ncol = rr + 1,
+  !! no two blocks of one colour coupled), and the axis block is no colour --
+  !! it is solved before colour 0 from x alone, and the coupling CSR holds
+  !! every ring's entries to it as couplings to an EARLIER block (blk_pattern),
+  !! so they meet its final solution whatever the colours. Counting them
+  !! would only add colours: through the shared axis value the rings next to
+  !! the axis block reach far in I on the coarse levels.
+  !!
+  !! Completed rings (smoothers 4 and 8, ring_overlap > 0): the ghost rows'
+  !! couplings are in the blocks (and smoother 8's CSR) as well, so both
+  !! reaches also take the own rows' couplings to ghosts (off-diagonal part)
+  !! and the ghost rows' couplings to own rows and ghosts (A(ghosts, :)).
+  !! Smoother 4 calls this only with ring_super /= 0 (rr is unused there; jr
+  !! sizes the super-nodes), so its results change only in that case.
+  subroutine blk_reach(g, A, B, rr, jr)
     integer, intent(in)  :: g
     Mat, intent(in)      :: A
+    type(blk_t), intent(in) :: B   !< the level's blocks (ghosts: ovl_extend)
     integer, intent(out) :: rr   !< radial reach (rings)
     integer, intent(out) :: jr   !< reach along a ring (nodes)
+    PetscInt, parameter :: one = 1
     Mat :: Ad, Ao
-    PetscInt, pointer :: garr(:), dia(:), dja(:)
-    PetscInt :: nd, k
+    Mat, pointer :: sub(:)
+    PetscInt, pointer :: garr(:), dia(:), dja(:), oia(:), oja(:), sia(:), sja(:)
+    PetscInt :: nd, no, ns, k, rst, ren
+    PetscErrorCode :: ierr
     logical :: has_o
-    integer :: r, c, nc, ilim, Ir, Jr_, Ic, Jc, dj, red(2), mpierr
+    integer :: r, c, h, nc, ilim, Ir, Jr_, Ic, Jc, red(2), mpierr
 
     if (g == 0) then
       nc = nth0
@@ -2399,19 +2676,76 @@ contains
       do k = dia(r), dia(r + 1) - 1
         c = int(dja(k + 1)) + 1
         call node_ij(c, Ic, Jc)
-        rr = max(rr, abs(Ir - Ic))
-        if (Ir == Ic .and. Ir > ilim) then
-          dj = abs(Jr_ - Jc)
-          jr = max(jr, min(dj, nc - dj))
-        endif
+        call pair(Ir, Jr_, Ic, Jc)
       enddo
     enddo
     call put_ij(Ad, .false., nd, dia, dja)
+    if ((sm_type == 4 .or. sm_type == 8) .and. rovl > 0 .and. B%ovl) then
+      call MatGetOwnershipRange(A, rst, ren, ierr)
+      if (has_o) then                              ! own rows -> ghost columns
+        call get_ij(Ao, .false., no, oia, oja)
+        do r = 1, int(no)
+          call node_ij(r, Ir, Jr_)
+          do k = oia(r), oia(r + 1) - 1
+            h = ghost_of(garr(oja(k + 1) + 1))
+            if (h > 0) call pair(Ir, Jr_, B%ghI(h), B%ghJ(h))
+          enddo
+        enddo
+        call put_ij(Ao, .false., no, oia, oja)
+      endif
+      ! ghost rows -> own and ghost columns (collective on A)
+      call MatCreateSubMatrices(A, one, [B%isg], [B%isall], MAT_INITIAL_MATRIX, sub, ierr)
+      call get_ij(sub(1), .false., ns, sia, sja)
+      do h = 1, B%ngh
+        do k = sia(h), sia(h + 1) - 1
+          if (sja(k + 1) >= rst .and. sja(k + 1) < ren) then
+            call node_ij(int(sja(k + 1) - rst) + 1, Ic, Jc)
+          else
+            c = ghost_of(sja(k + 1))
+            if (c == 0) cycle
+            Ic = B%ghI(c); Jc = B%ghJ(c)
+          endif
+          call pair(B%ghI(h), B%ghJ(h), Ic, Jc)
+        enddo
+      enddo
+      call put_ij(sub(1), .false., ns, sia, sja)
+      call MatDestroySubMatrices(one, sub, ierr)
+    endif
     red = [rr, jr]
     call MPI_Allreduce(MPI_IN_PLACE, red, 2, MPI_INTEGER, MPI_MAX, gcomm, mpierr)
     rr = red(1); jr = red(2)
 
   contains
+
+    !> one coupling between nodes (I1, J1) and (I2, J2) into rr and jr
+    subroutine pair(I1, J1, I2, J2)
+      integer, intent(in) :: I1, J1, I2, J2
+      integer :: dj
+      if (axis_k == 0 .or. (I1 > ilim .and. I2 > ilim)) rr = max(rr, abs(I1 - I2))
+      if (I1 == I2 .and. I1 > ilim) then
+        dj = abs(J1 - J2)
+        jr = max(jr, min(dj, nc - dj))
+      endif
+    end subroutine pair
+
+    !> ghost (1-based, ascending gidx) of global row gc, or 0
+    integer function ghost_of(gc)
+      PetscInt, intent(in) :: gc
+      integer :: lo, hi, mid
+      ghost_of = 0
+      lo = 1; hi = B%ngh
+      do while (lo <= hi)
+        mid = (lo + hi) / 2
+        if (B%gidx(mid) == gc) then
+          ghost_of = mid
+          return
+        else if (B%gidx(mid) < gc) then
+          lo = mid + 1
+        else
+          hi = mid - 1
+        endif
+      enddo
+    end function ghost_of
 
     !> (I, J) of the rank's local row r_ (1-based) on level g
     subroutine node_ij(r_, I_, J_)
@@ -2425,8 +2759,9 @@ contains
     end subroutine node_ij
   end subroutine blk_reach
 
-  !> hybrid on smoother 4: the segments of all the rank's rings on the
-  !! threads, then every ring's separators. One parallel region.
+  !> hybrid with work items (smoother 4, smoother 8 with ring_par): the
+  !! segments of all the rank's rings on the threads, then every ring's
+  !! separators. One parallel region.
   subroutine hyb_par_factor(B, binfo)
     type(blk_t), intent(inout) :: B
     integer, intent(inout) :: binfo(:)
@@ -2636,8 +2971,11 @@ contains
         endif
       enddo
       if (pass == 2) exit
-      if (nbad > 0) write(*,'(A,I0,A)') "[Physics PC]   GMG WARNING: ", nbad, &
-        " ring block(s) couple beyond J +- 1: dense LU instead of the ring solver"
+      ! ring blocks coupling beyond their neighbouring (super-)nodes: the
+      ! LAPACK LU instead of the ring solver (build_blocks' warning). Summed
+      ! over the pattern builds: a revoked block is no ring-solver block at
+      ! the next one, so each is counted once, as btd_mark's reasons are
+      B%nfb(3) = B%nfb(3) + nbad
       ! storage: banded where the band is narrow, dense otherwise
       tot = 0
       do bb = 1, B%nb
@@ -2827,14 +3165,23 @@ contains
   !! scatter of a code vector; then they are inserted into their blocks in
   !! line order (rings, then global index, the owners' own row order), and
   !! the ghost scatter is built. Collective on A's communicator.
-  subroutine ovl_extend(g, A, B, rst, ren, depth, rings)
+  !! Ring blocks (smoother 4's, 8's inside ring_lim; rdep > 0) are completed
+  !! instead: every row of the same ring and slot that other ranks own, in
+  !! the ring's periodic J order, the walk running up to max(ldep, rdep, nc)
+  !! steps (a ring's remainder is reached along J). Smoother 8 extends its
+  !! rings (rdep) and its radial lines (ldep) in that one walk; a candidate
+  !! of a local ring block's ring and slot goes to that ring block, which
+  !! takes precedence over any line block, and only otherwise to a line
+  !! segment within ldep -- each ghost row joins exactly one block. ldep = 0
+  !! or rdep = 0 is the line-only or ring-only walk of before.
+  subroutine ovl_extend(g, A, B, rst, ren, ldep, rdep)
     use mod_petsc_pc_harm, only: pc_ntor
     integer, intent(in) :: g
     Mat, intent(in) :: A
     type(blk_t), intent(inout) :: B
     PetscInt, intent(in) :: rst, ren
-    integer, intent(in) :: depth        !< nodes to extend by (lovl, or rovl for rings)
-    logical, intent(in) :: rings        !< ring blocks: extend along J within the ring
+    integer, intent(in) :: ldep         !< line blocks: nodes to extend by along I (lovl); 0 = none
+    integer, intent(in) :: rdep         !< ring blocks: > 0 = complete them along J (rovl); 0 = none
     PetscInt, parameter :: one = 1, zero = 0
     Mat :: Ad, Ao
     Mat, pointer :: sub(:)
@@ -2846,10 +3193,11 @@ contains
     VecScatter :: sc
     PetscErrorCode :: ierr
     logical :: has_o
-    integer :: nc, nr, r, bb, I, J, m, ilim, d, q, t, ngh, nlo, mpierr, code, nkey, qtot
+    integer :: nc, nr, r, bb, I, J, m, ilim, d, q, t, ngh, nlo, mpierr, code, nkr, qtot
     integer :: gtot(2), gloc(2), dmax, ninc
-    integer, allocatable :: Ia(:), Ib(:), blkof(:), gb(:), gI(:), nsz(:), noff(:), nrows(:), fill(:)
+    integer, allocatable :: Ia(:), Ib(:), blkl(:), blkr(:), gb(:), gI(:), nsz(:), noff(:), nrows(:), fill(:)
     integer, allocatable :: tb(:), tI(:), tJ(:), gJ(:), lst(:), rkey(:)
+    logical, allocatable :: isr(:)
     PetscInt, allocatable :: cand(:), gl(:), tl(:), perm(:)
 
     nr = B%nrow
@@ -2861,32 +3209,34 @@ contains
     ilim = 0
     if (axis_k /= 0) ilim = axis_lim(g)
     ! the local segments, and the block of every (line or ring, slot): a line
-    ! is keyed by J, a ring by I; every slot of the block is registered (with
-    ! harm_pair a block holds a harmonic's cos and sin slots)
-    nkey = nc
-    if (rings) then
-      nkey = 1
+    ! is keyed by J (blkl), a ring by I (blkr); every slot of the block is
+    ! registered (with harm_pair a block holds a harmonic's cos and sin slots)
+    nkr = 1
+    if (rdep > 0) then
       do r = 1, nr
         call node_of(r, I, J, m)
-        nkey = max(nkey, I + 1)
+        nkr = max(nkr, I + 1)
       enddo
     endif
-    allocate(Ia(B%nb), Ib(B%nb), blkof(0:nkey * pc_ntor - 1))
-    Ia = -1; Ib = -1; blkof = 0
+    allocate(Ia(B%nb), Ib(B%nb), isr(B%nb), blkl(0:nc * pc_ntor - 1), blkr(0:nkr * pc_ntor - 1))
+    Ia = -1; Ib = -1; isr = .false.; blkl = 0; blkr = 0
     do bb = 1, B%nb
       if (B%axblk(bb)) cycle
       call node_of(B%rows(B%off(bb) + 1) + 1, I, J, m)
       if (I <= ilim) cycle                           ! the per-slot I = 0 blocks
-      if (sm_type == 8 .and. I < ring_lim(g)) cycle  ! ring blocks: whole rings, on one rank
+      ! ring blocks: smoother 4's, and 8's inside ring_lim; the rest are lines
+      isr(bb) = (sm_type == 4 .or. (sm_type == 8 .and. I < ring_lim(g)))
+      if (isr(bb) .and. rdep == 0) cycle             ! rings left as they are, cut or not
+      if (.not. isr(bb) .and. ldep == 0) cycle
       Ia(bb) = I
-      if (rings) Ia(bb) = huge(1)                    ! ring ghosts all go before the own rows
+      if (isr(bb)) Ia(bb) = huge(1)                  ! ring ghosts all go before the own rows
       do q = 1, B%sz(bb)
         call node_of(B%rows(B%off(bb) + q) + 1, I, J, m)
-        if (.not. rings) Ib(bb) = max(Ib(bb), I)
-        if (rings) then
-          blkof(I * pc_ntor + m) = bb
+        if (isr(bb)) then
+          blkr(I * pc_ntor + m) = bb
         else
-          blkof(J * pc_ntor + m) = bb
+          Ib(bb) = max(Ib(bb), I)
+          blkl(J * pc_ntor + m) = bb
         endif
       enddo
     enddo
@@ -2911,8 +3261,8 @@ contains
     ! A ring is completed whole: a rank holding part of a ring and no whole
     ! neighbouring ring (a coarse level, whose rings lie 2^g fine rings apart,
     ! or < 2 rings per rank) reaches the rest only along J, one node per step.
-    dmax = depth
-    if (rings) dmax = max(depth, nc)
+    dmax = ldep
+    if (rdep > 0) dmax = max(ldep, rdep, nc)
     do d = 1, dmax
       ! drop the candidates already accepted
       allocate(tl(nn))
@@ -2934,16 +3284,17 @@ contains
         code = nint(cp(k))
         m = mod(code, pc_ntor); J = mod(code / pc_ntor, nc); I = code / pc_ntor / nc
         if (I <= ilim) cycle
-        if (rings) then
-          ! same ring and slot as a local ring block; the walk bounds the reach
-          if (I >= nkey) cycle
-          bb = blkof(I * pc_ntor + m)
-          if (bb == 0) cycle
-        else
-          bb = blkof(J * pc_ntor + m)
-          if (bb == 0) cycle
-          if (.not. ((I < Ia(bb) .and. Ia(bb) - I <= lovl) .or. (I > Ib(bb) .and. I - Ib(bb) <= lovl))) cycle
+        bb = 0
+        ! same ring and slot as a local ring block; the walk bounds the reach
+        if (rdep > 0 .and. I < nkr) bb = blkr(I * pc_ntor + m)
+        ! else: same line and slot as a local line segment, within ldep of it
+        if (bb == 0 .and. ldep > 0) then
+          bb = blkl(J * pc_ntor + m)
+          if (bb /= 0) then
+            if (.not. ((I < Ia(bb) .and. Ia(bb) - I <= ldep) .or. (I > Ib(bb) .and. I - Ib(bb) <= ldep))) bb = 0
+          endif
         endif
+        if (bb == 0) cycle
         q = q + 1
         tl(q) = tl(k); tb(q) = bb; tI(q) = I; tJ(q) = J
       enddo
@@ -3025,7 +3376,7 @@ contains
     ! nc-2, ...), own rows and ghosts together: in the order above (ghosts
     ! first) its J +- 1 couplings span the ring, and a ring cut by a rank
     ! boundary was factored dense -- at 321x128, 4096 rows per cos/sin block.
-    if (rings) then
+    if (rdep > 0) then
       allocate(rkey(nr + ngh))
       do r = 1, nr + ngh
         if (r <= nr) then
@@ -3040,7 +3391,7 @@ contains
         endif
       enddo
       do bb = 1, B%nb
-        if (nsz(bb) == B%sz(bb)) cycle
+        if (.not. isr(bb) .or. nsz(bb) == B%sz(bb)) cycle   ! line segments keep their I order
         call sort_rows_by_key(nrows(noff(bb) + 1 : noff(bb) + nsz(bb)), rkey)
       enddo
       ! every ring block must now span its ring (a cut ring leaves the
@@ -3049,7 +3400,7 @@ contains
       block
         logical :: seen(0:nc - 1)
         do bb = 1, B%nb
-          if (B%axblk(bb) .or. Ia(bb) < 0) cycle
+          if (.not. isr(bb) .or. Ia(bb) < 0) cycle
           seen = .false.
           do q = 1, nsz(bb)
             r = nrows(noff(bb) + q) + 1
@@ -3086,6 +3437,9 @@ contains
     if (allocated(B%ghJ)) deallocate(B%ghJ)
     allocate(B%ghJ(ngh))
     B%ghJ = gJ
+    if (allocated(B%ghI)) deallocate(B%ghI)
+    allocate(B%ghI(ngh))
+    B%ghI = gI
     call ISCreateGeneral(PETSC_COMM_SELF, int(ngh, kind(nn)), gl, PETSC_COPY_VALUES, B%isg, ierr)
     call VecCreateSeq(PETSC_COMM_SELF, int(ngh, kind(nn)), B%xg, ierr)
     call VecScatterCreate(kv, B%isg, B%xg, PETSC_NULL_IS, B%sct, ierr)
@@ -3093,11 +3447,14 @@ contains
     B%ovl = .true.
     gloc = [ngh, nr]
     call MPI_Allreduce(gloc, gtot, 2, MPI_INTEGER, MPI_SUM, gcomm, mpierr)
-    if (gme == 0 .and. g == 0 .and. rings) write(*,'(A,I0,A,F5.1,A)') &
+    if (gme == 0 .and. g == 0 .and. rdep > 0 .and. ldep == 0) write(*,'(A,I0,A,F5.1,A)') &
       "[Physics PC]   GMG rings completed across rank cuts: ", gtot(1), &
       " ghost rows on level 0 (", 100.d0 * gtot(1) / max(gtot(2), 1), "% of the rows)"
-    if (gme == 0 .and. g == 0 .and. .not. rings) write(*,'(A,I0,A,I0,A,F5.1,A)') &
-      "[Physics PC]   GMG line overlap ", depth, &
+    if (gme == 0 .and. g == 0 .and. ldep > 0 .and. rdep == 0) write(*,'(A,I0,A,I0,A,F5.1,A)') &
+      "[Physics PC]   GMG line overlap ", ldep, &
+      " node(s): ", gtot(1), " ghost rows on level 0 (", 100.d0 * gtot(1) / max(gtot(2), 1), "% of the rows)"
+    if (gme == 0 .and. g == 0 .and. ldep > 0 .and. rdep > 0) write(*,'(A,I0,A,I0,A,F5.1,A)') &
+      "[Physics PC]   GMG rings completed across rank cuts and line overlap ", ldep, &
       " node(s): ", gtot(1), " ghost rows on level 0 (", 100.d0 * gtot(1) / max(gtot(2), 1), "% of the rows)"
 
   contains
@@ -3544,7 +3901,11 @@ contains
 
     B => gBk(cur_lev)
     if (sm_type == 7 .or. sm_type == 8) then
-      call zebra_solve(x, y)
+      if (allocated(B%wk)) then                 ! smoother 8, ring_par: segments threaded
+        call zebra_solve_par(x, y)
+      else
+        call zebra_solve(x, y)
+      endif
     else
       ! axis first: it depends on x only, and the ranks enter here in step
       ! (GMRES's reductions just synchronised them), which a J-sector solve
@@ -3561,27 +3922,30 @@ contains
   contains
 
     !> w = block bb's solve of w (block order): LAPACK band / dense, or the
-    !! ring solver (point Jacobi for a ring with a singular node block)
+    !! ring solver (point Jacobi for a ring with a singular node block). The
+    !! single copy and the separators' system use the calling thread's heap
+    !! workspace (blk_t_work4, blk_t_sep*, sized at setup), not its stack.
     subroutine one_solve(bb, w)
       integer, intent(in)   :: bb
       real*8, intent(inout) :: w(*)
-      integer :: n, q, info
+      integer :: n, q, info, t
       external :: dgetrs
       n = B%sz(bb)
+      t = 0
+      !$ t = omp_get_thread_num()
       if (B%btd(bb)) then
         if (B%jac(bb)) then
           do q = 1, n
             w(q) = w(q) / B%lu(lu_index(B, bb, q, q))
           enddo
         else if (rsp) then
-          block
-            real*4 :: w4(n)
-            w4 = real(w(1:n), 4)
-            call btd_solve_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), w4)
-            w(1:n) = w4
-          end block
+          blk_t_work4(1:n, t) = real(w(1:n), 4)
+          call btd_solve_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), blk_t_work4(1, t), &
+                            blk_t_sep4(1, t), blk_t_ipv(1, t))
+          w(1:n) = blk_t_work4(1:n, t)
         else
-          call btd_solve(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), w)
+          call btd_solve(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), w, blk_t_sep(1, t), &
+                         blk_t_ipv(1, t))
         endif
       else if (B%band(bb)) then
         call band_solve(n, B%kl(bb), B%ku(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), w)
@@ -3601,12 +3965,14 @@ contains
       Vec :: xx, yy
       PetscScalar, pointer :: xp(:), yp(:), gp(:)
       PetscErrorCode :: ie
-      integer :: bb, k, p
+      integer :: bb, k, p, t
       call PetscLogEventBegin(gev_lines(cur_inst), ie)
       call ghosts_in(xx, gp)
       call VecGetArrayRead(xx, xp, ie)
       call VecGetArray(yy, yp, ie)
-      !$omp parallel private(bb, k, p) if (B%nrow >= LINES_OMP_MIN)
+      !$omp parallel private(bb, k, p, t) if (B%nrow >= LINES_OMP_MIN)
+      t = 0
+      !$ t = omp_get_thread_num()
       !$omp do schedule(dynamic, 1)
       do p = 1, size(B%lb)
         bb = B%lb(p); k = B%lk(p)
@@ -3632,9 +3998,11 @@ contains
         if (.not. reduced(bb)) cycle
         associate (rg => B%rg(bb))
           if (rsp) then
-            call hyb_sol_sep_sp(rg, B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), B%wk4(B%off(bb) + 1))
+            call hyb_sol_sep_sp(rg, B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), B%wk4(B%off(bb) + 1), &
+                                blk_t_sep4(1, t), blk_t_ipv(1, t))
           else
-            call hyb_sol_sep(rg, B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), B%wk(B%off(bb) + 1))
+            call hyb_sol_sep(rg, B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), B%wk(B%off(bb) + 1), &
+                             blk_t_sep(1, t), blk_t_ipv(1, t))
           endif
           do k = 0, rg%ns - 1
             call scat(bb, rg%rp(rg%sep(k)) + 1, rg%rp(rg%sep(k) + 1), rsp, yp)
@@ -3825,6 +4193,155 @@ contains
       enddo
       call ghosts_done(gp)
     end subroutine zebra_solve
+
+    !> Smoother 8 with ring_par: zebra_solve's sweep, the same colours in the
+    !! same order, with each colour's rings split into the hybrid's segments
+    !! and threaded over the colour's (block, segment) work items
+    !! B%lb / B%lk (lcp(c)+1 .. lcp(c+1)) -- lines_solve_par's three phases
+    !! per colour: (1) every segment gathers its nodes (left separator and
+    !! interior) as x minus the couplings to the earlier colours' solution
+    !! and runs its forward sweep, the colour's other blocks are solved whole;
+    !! (2) every ring's separators are solved and scattered; (3) every segment
+    !! runs its backward sweep and scatters its interior. One parallel region,
+    !! three barriers per colour (the worksharing loops' own). A phase writes
+    !! only colour-c rows (yp, own; yg, ghosts if a later colour couples to
+    !! them) and reads only earlier colours' (the coupling CSR), so no row is
+    !! read in the colour that writes it; the barrier closing phase (3) makes
+    !! colour c complete before colour c+1 reads it. Same operations as
+    !! zebra_solve with one_solve for the same segments.
+    subroutine zebra_solve_par(xx, yy)
+      Vec :: xx, yy
+      PetscScalar, pointer :: xp(:), yp(:), gp(:)
+      PetscErrorCode :: ie
+      integer :: bb, k, p, c, t
+      logical :: keep
+      ! the axis block first, from x only (see zebra_solve)
+      if (B%axsparse) call ax_solve(xx, yy)
+      call PetscLogEventBegin(gev_lines(cur_inst), ie)    ! as lines_solve_par: the ghost scatter included
+      call ghosts_in(xx, gp)
+      call VecGetArrayRead(xx, xp, ie)
+      call VecGetArray(yy, yp, ie)
+      !$omp parallel private(bb, k, p, c, t, keep) if (B%nrow >= LINES_OMP_MIN)
+      t = 0
+      !$ t = omp_get_thread_num()
+      do c = 0, B%ncol - 1
+        keep = (c < B%ncol - 1)                     ! ghosts later colours couple to
+        !$omp do schedule(dynamic, 1)
+        do p = B%lcp(c) + 1, B%lcp(c + 1)
+          bb = B%lb(p); k = B%lk(p)
+          if (.not. reduced(bb)) then
+            if (k > 0) cycle
+            call gath_z(bb, 1, B%sz(bb), .false., xp, gp, yp)
+            call one_solve(bb, B%wk(B%off(bb) + 1))
+            call scat_z(bb, 1, B%sz(bb), .false., yp, keep)
+            cycle
+          endif
+          associate (rg => B%rg(bb))
+            call gath_z(bb, rg%rp(rg%sep(k)) + 1, rg%rp(hyb_end(rg, k) + 1), rsp, xp, gp, yp)
+            if (rsp) then
+              call hyb_sol_fwd_sp(rg, B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), B%wk4(B%off(bb) + 1), k)
+            else
+              call hyb_sol_fwd(rg, B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), B%wk(B%off(bb) + 1), k)
+            endif
+          end associate
+        enddo
+        !$omp end do
+        !$omp do schedule(dynamic, 1)
+        do p = B%lcp(c) + 1, B%lcp(c + 1)
+          bb = B%lb(p)
+          if (B%lk(p) /= 0 .or. .not. reduced(bb)) cycle   ! once per ring
+          associate (rg => B%rg(bb))
+            if (rsp) then
+              call hyb_sol_sep_sp(rg, B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), B%wk4(B%off(bb) + 1), &
+                                  blk_t_sep4(1, t), blk_t_ipv(1, t))
+            else
+              call hyb_sol_sep(rg, B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), B%wk(B%off(bb) + 1), &
+                               blk_t_sep(1, t), blk_t_ipv(1, t))
+            endif
+            do k = 0, rg%ns - 1
+              call scat_z(bb, rg%rp(rg%sep(k)) + 1, rg%rp(rg%sep(k) + 1), rsp, yp, keep)
+            enddo
+          end associate
+        enddo
+        !$omp end do
+        !$omp do schedule(dynamic, 1)
+        do p = B%lcp(c) + 1, B%lcp(c + 1)
+          bb = B%lb(p); k = B%lk(p)
+          if (.not. reduced(bb)) cycle
+          associate (rg => B%rg(bb))
+            if (rsp) then
+              call hyb_sol_bwd_sp(rg, B%lu4(B%loff4(bb) + 1), B%wk4(B%off(bb) + 1), k)
+            else
+              call hyb_sol_bwd(rg, B%lu(B%loff(bb) + 1), B%wk(B%off(bb) + 1), k)
+            endif
+            call scat_z(bb, rg%rp(rg%sep(k) + 1) + 1, rg%rp(hyb_end(rg, k) + 1), rsp, yp, keep)
+          end associate
+        enddo
+        !$omp end do
+      enddo
+      !$omp end parallel
+      call VecRestoreArrayRead(xx, xp, ie)
+      call VecRestoreArray(yy, yp, ie)
+      call ghosts_done(gp)
+      call PetscLogEventEnd(gev_lines(cur_inst), ie)
+    end subroutine zebra_solve_par
+
+    !> zebra_solve_par: block bb's positions q1..q2 of x (owned rows xp,
+    !! ghosts gp) minus their couplings to the earlier colours' solution
+    !! (owned yp, ghosts yg; zebra_solve's sums, in its order) -> B%wk, or
+    !! B%wk4 (sp)
+    subroutine gath_z(bb, q1, q2, sp, xp, gp, yp)
+      integer, intent(in) :: bb, q1, q2
+      logical, intent(in) :: sp
+      PetscScalar, intent(in) :: xp(:), yp(:)
+      PetscScalar, pointer, intent(in) :: gp(:)            !< null without overlap
+      integer :: q, r, k, zc_
+      real*8 :: v
+      do q = q1, q2
+        r = B%rows(B%off(bb) + q)
+        if (r < B%nrow) then
+          v = xp(r + 1)
+        else
+          v = gp(r - B%nrow + 1)
+        endif
+        do k = B%zp(r + 1), B%zp(r + 2) - 1
+          zc_ = B%zc(k)
+          if (zc_ < B%nrow) then
+            v = v - B%zv(k) * yp(zc_ + 1)
+          else
+            v = v - B%zv(k) * B%yg(zc_ - B%nrow + 1)
+          endif
+        enddo
+        if (sp) then
+          B%wk4(B%off(bb) + q) = real(v, 4)
+        else
+          B%wk(B%off(bb) + q) = v
+        endif
+      enddo
+    end subroutine gath_z
+
+    !> zebra_solve_par: B%wk (B%wk4) at block bb's positions q1..q2 -> yp on
+    !! the owned rows, and with keep -> yg on the ghost rows
+    subroutine scat_z(bb, q1, q2, sp, yp, keep)
+      integer, intent(in) :: bb, q1, q2
+      logical, intent(in) :: sp, keep
+      PetscScalar, intent(inout) :: yp(:)
+      integer :: q, r
+      real*8 :: v
+      do q = q1, q2
+        r = B%rows(B%off(bb) + q)
+        if (sp) then
+          v = B%wk4(B%off(bb) + q)
+        else
+          v = B%wk(B%off(bb) + q)
+        endif
+        if (r < B%nrow) then
+          yp(r + 1) = v
+        else if (keep) then
+          B%yg(r - B%nrow + 1) = v
+        endif
+      enddo
+    end subroutine scat_z
 
     !> gp = the input's values on the ghost rows (empty without overlap)
     subroutine ghosts_in(xx, gp)

@@ -78,6 +78,7 @@ class Blocks:
         self.E16 = np.block([[Z, b("B16")], [Z, Z]])
         self.Mw = b("Mw") if fam.has("Mw") else None
         self.Cw = b("Cw") if fam.has("Cw") else None
+        self.H = b("H") if fam.has("H") else None          # hpatch dumps: u rows x psi cols
         self.B12 = b("B12")
         self.S1_dump = dense(fam.packed["S1"]) if "S1" in fam.packed else None
         self.Bb = b("Bb") if fam.has("Bb") else None
@@ -98,17 +99,41 @@ class Blocks:
 
     def S1_bend(self, Cmid, form=None):
         """P_J + [[ (bend_sign/varsigma) D B12^T (D Cmid D) B12 D, 0 ], [0, 0]]
-        (form 1: B12 (D Cmid D) B12^T), D = diag(free mask)"""
+        (form 1: B12 (D Cmid D) B12^T; form 2: Dpsi B12 (Du Cmid Du) B12^T Dpsi
+        with Dpsi from dirichlet_psi and Du the u mask), D = diag(free mask)"""
         n = self.n
         m = self.fam.meta
         form = m["bend_form"] if form is None else form
         d = np.zeros(n)
         d[self.fam.free()] = 1.0
-        B = d[:, None] * self.B12 * d[None, :]
-        C = d[:, None] * Cmid * d[None, :]
-        Bb = (B @ C @ B.T) if form == 1 else (B.T @ C @ B)
+        if form == 2:
+            dp = np.zeros(n)
+            dp[self.fam.free_psi()] = 1.0
+            C = d[:, None] * Cmid * d[None, :]
+            Bb = dp[:, None] * (self.B12 @ C @ self.B12.T) * dp[None, :]
+        else:
+            B = d[:, None] * self.B12 * d[None, :]
+            C = d[:, None] * Cmid * d[None, :]
+            Bb = (B @ C @ B.T) if form == 1 else (B.T @ C @ B)
         S = self.PJ.copy()
         S[:n, :n] += m["bend_sign"] / self.fam.varsigma * Bb
+        return S
+
+    def Bb_hpatch(self):
+        """Dpsi B12 H (hpatch Bb; Dpsi = diag of the psi free mask, H from H.bin); None without H"""
+        if self.H is None:
+            return None
+        dp = np.zeros(self.n)
+        dp[self.fam.free_psi()] = 1.0
+        return dp[:, None] * (self.B12 @ self.H)
+
+    def S1_hpatch(self):
+        """P_J + [[ Dpsi B12 H, 0 ], [0, 0]]  (H from H.bin)"""
+        Bb = self.Bb_hpatch()
+        if Bb is None:
+            raise ValueError("H.bin not in dump")
+        S = self.PJ.copy()
+        S[:self.n, :self.n] += Bb
         return S
 
     def Mw_inv(self):
@@ -121,7 +146,7 @@ class Sweep:
     dv    : 'exact' (Dvh = Dv0 - L2 D2^{-1} U2) | 'dumped' (Dv = Dv0 + W_c) | 'dv0'
     s1    : 'exact' (P_J - U1 Dvh^{-1} L1h) | 'schur_l1' (P_J - U1 Dvh^{-1} L1)
             | 'mwinv' (P_J + B12^T Mw^{-1} B12 / varsigma) | 'cw' (same with Cw)
-            | 'dumped' (S1.bin)
+            | 'dumped' (S1.bin) | 'hpatch' (P_J + Dpsi B12 H from H.bin)
     step6 : 'L1'  : r_u - B21 psi - B23 j        (spec section 4 as written)
             'L1h' : r_u - B21 psi - B23 j + [L2 D2^{-1} C21 y1]_u   (exact L1h)
     b16   : 'off' | 'rhs' (step 4: - B16 T*, T* = B66^{-1}... spec)
@@ -148,9 +173,15 @@ class Sweep:
         elif s1 == "schur_l1":
             St = blk.S1_exact(L1=blk.L1)
         elif s1 == "mwinv":
+            if blk.Mw is None:
+                raise ValueError("Mw.bin not in dump")
             St = blk.S1_bend(blk.Mw_inv())
         elif s1 == "cw":
+            if blk.Cw is None:
+                raise ValueError("Cw.bin not in dump")
             St = blk.S1_bend(blk.Cw)
+        elif s1 == "hpatch":
+            St = blk.S1_hpatch()
         elif s1 == "dumped":
             if blk.S1_dump is None:
                 raise ValueError("S1.bin not in dump")

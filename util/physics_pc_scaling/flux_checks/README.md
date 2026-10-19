@@ -8,6 +8,25 @@ also read a synthetic dump in the same format.
 Python: `/shares/users/code/racpat/venvs/jorek-plot/bin/python` (numpy, scipy, sympy, matplotlib).
 Run every script from this directory, or put the directory on `PYTHONPATH`.
 
+**Which dumps.** `-sf_flux_dump` needs the per-family mode split (`-sf_flux_mode_split 1`: the
+`sf_*_flux_ms*` arms; the global path writes no dump). The dump depends on `-sf_flux_s1`:
+- `spai`: the dump contains Cw and the symmetric Bb = (1/varsigma) B12^T Cw B12 (or the form
+  selected by `-sf_flux_bend_form`). All checks below apply (arm `sf_lu_flux_ms_spai`).
+- `hpatch` (default): the dump contains H.bin and Bb = Dpsi B12 H, which is nonsymmetric, and no
+  Cw.bin (Mw.bin is still written). meta.txt has `s1 hpatch`, `p r g vel` and `dirichlet_psi`.
+  A dump without an `s1` key is read as `spai` (old dumps).
+- `splitm`: as `hpatch` (H.bin, Bb = Dpsi B12 H, no Cw.bin), meta `s1 splitm` with `q` as well.
+  Every script treats it like `hpatch` (`Family.hform`); t5 rebuilds the split-M H.
+
+What each script does per variant:
+
+| script | `spai` | `hpatch` |
+|---|---|---|
+| `t0_forms.py` | Bb symmetric PSD, Bb = formula (form 0 / 1 / 2, the selected one gated), Cw SPD, SPAI quality | the Bb-PSD, Cw-formula and Cw/SPAI gates are reported `n/a (hpatch)`. Gated instead: Bb = Dpsi B12 H, S1 = PJ + Bb, Bb zero on psi Dirichlet rows/cols, H zero on u Dirichlet rows. Info: nnz per H column, Bb asymmetry, min eig of sym(Bb) and of the Jacobi-whitened psi-Schur (skipped above `--max-dense`) |
+| `t1_consistency.py` | all runs; `S1.bin` = SPAI S1 | Mw-based runs as before, Cw-based ones `n/a`; extra runs `S1~ = PJ + B12 H`, `PRODUCTION hpatch`, `+ step6=L1h` (`S1.bin` equals it) |
+| `t2_t3_spectrum.py` | T2 (Mw^-1), T3 (Cw), T3d, SPAI | T3 / SPAI `n/a (no Cw.bin)`; T2 (Mw^-1) still printed; new `T2h` = sigma(S~^-1 S1) with S~ = PJ + Dpsi B12 H from H.bin; T3d |
+| `t5_hpatch.py` | not applicable | rebuilds H from the dumped blocks and compares with H.bin / Bb.bin (see below) |
+
 ## Files
 
 | file | purpose |
@@ -17,7 +36,8 @@ Run every script from this directory, or put the directory on `PYTHONPATH`.
 | `t0_forms.py` | T0 form checks (PASS/FAIL table) |
 | `t1_consistency.py` | T1 algebraic consistency and sigma(P^-1 A) per surrogate |
 | `t2_t3_spectrum.py` | T2 / T3: sigma(S1~^-1 S1) with Mw^-1 and with Cw, optional plot |
-| `make_synthetic.py` | writes a synthetic family dump (bicubic Hermite slab annulus) to validate the machinery |
+| `t5_hpatch.py` | T5: independent rebuild of H from an hpatch dump, compared with H.bin / Bb.bin |
+| `make_synthetic.py` | writes a synthetic family dump (bicubic Hermite slab annulus) to validate the machinery; `--bend-form 2`, `--hpatch banded` / `--hpatch patch` write the new variants |
 
 ## Dump contract (what the reader expects)
 
@@ -29,21 +49,29 @@ Run every script from this directory, or put the directory on `PYTHONPATH`.
     PETSc builds are read without a flag. `--int64` forces 64-bit indices.
   - Complex PETSc builds are not supported.
 - Scalar-field blocks: row = idx*nslot + m. The files are `B12 B16 B21 B23 B25 B26 B51 B52 B61
-  B62 B63 B65 B55 B66 Mw Cw Bb`.
+  B62 B63 B65 B55 B66 Mw Cw H Bb` (Cw only with `spai`, H only with `hpatch`).
   - An absent file counts as a zero block.
   - Mw and Cw may also be given at size nindex; they are then expanded with kron(., I_nslot).
 - Two-field packed blocks (field-major): `PJ = [[B11,B13],[B31,B33]]`, `S1 = PJ + [[Bb,0],[0,0]]`,
   `Dv0 = [[B22,B24],[B42,B44]]`, `Dv = Dv0 + [[W_c,0],[0,0]]`.
 - `meta.txt` holds `key value` lines: `family`, `nslot`, `nindex`, `varsigma`, `theta_dt`, and
   `dirichlet` followed by 0-based scalar row indices (row = idx*nslot + m).
+  - The code also writes `bend_sign`, `bend_form`, and `s1 hpatch` (then `p`, `r`, `g`, `vel`)
+    or `s1 spai`. `dirichlet_psi` (psi's Dirichlet rows) is written for `hpatch` and for
+    `bend_form 2`.
   - The optional `dirichlet_index` key gives index-level entries, which are expanded over the slots.
-  - `bend_sign <real>` (default 1) and `bend_form 0|1` (default 0) are read. Any other unknown
+  - `bend_sign <real>` (default 1) and `bend_form 0|1|2` (default 0) are read. `s1` defaults to
+    `spai`; `p r g vel` are ints; `dirichlet_psi` defaults to `dirichlet`. Any other unknown
     key is kept and ignored.
   - Lines starting with `#` are ignored.
 - All blocks, Mw included, carry JOREK's FFT slot normalisation: n_plane on the n = 0 slot and
   n_plane/2 on the cos/sin slots. Every check is invariant to this factor.
-- Bb = (bend_sign/varsigma) D B12^T (D Cw D) B12 D, with D = diag(free mask). With
-  `-sf_flux_bend_form 1` it is B12 (D Cw D) B12^T instead.
+- `-sf_flux_s1 spai`: Bb = (bend_sign/varsigma) D B12^T (D Cw D) B12 D, with D = diag(free mask).
+  With `-sf_flux_bend_form 1` it is B12 (D Cw D) B12^T instead. With `-sf_flux_bend_form 2` it is
+  (bend_sign/varsigma) Dpsi B12 (Du Cw Du) B12^T Dpsi, Dpsi from `dirichlet_psi`, Du from the
+  `dirichlet` (u) mask.
+- `-sf_flux_s1 hpatch`: Bb = Dpsi B12 H (nonsymmetric, zero on psi's Dirichlet rows); H.bin
+  (u rows x psi columns, scalar layout) is written as well, and Cw is not. S1 = PJ + [[Bb,0],[0,0]].
 - Full family operator, unknown order (psi, u, j, omega, rho, T): A is assembled from these blocks
   only, and every other block is zero (B14, B32, B56, ...). **T1 checks consistency against this
   block-assembled A, not against the full JOREK matrix.**
@@ -57,7 +85,28 @@ $P make_synthetic.py /path/syn                 # fam1 (n=0), fam2 (n=1); 6 rings
 $P t0_forms.py        /path/syn/fam2           # exit 0 = PASS
 $P t1_consistency.py  /path/syn/fam2           # ~3 min for n=1 at 6x12 (N = 3456, dense eig)
 $P t2_t3_spectrum.py  /path/syn/fam2 --plot    # PNG into /shares/users/code/racpat/plots/
+$P make_synthetic.py /path/synh --hpatch patch # hpatch-style dump (H from the t5 construction, g = 1)
+$P t5_hpatch.py      /path/synh/fam2           # exit 0 = PASS
 ```
+
+**T5 (`t5_hpatch.py`, hpatch dumps).** It rebuilds H with dense patch solves from the dumped
+PJ, Dv, B21, B23 and B12 only, following the definition in `mod_petsc_pc_sf_hpatch.f90`: index
+graph from B33's structure, free rows = rows with an off-diagonal entry (psi, j from PJ; u, omega
+from Dv), patch radius p, band radius r, X = B33^-1 B31, R = B23 X - B21, Y = Dv11^-1 R (`vel 0`)
+or the u part of Dv^-1 [R; 0] (`vel 1`), H cut to node distance <= r, Bb = Dpsi B12 H.
+- For the exact gate dump with `-sf_flux_hp_group 1` (mode split arm, one rank per family). Then
+  ||H_py - H.bin||/||H.bin|| and ||Bb_py - Bb.bin||/||Bb.bin|| must be < `--tol` (1e-10).
+- For g > 1 the greedy grouping here may break ties differently from the Fortran one, so the
+  differences are only reported (info, exit 0).
+- Both variants also get sigma(S~^-1 S1) (S1 the exact flux Schur complement, free psi/j; skipped
+  above `--max-dense` rows or with `--no-sigma`).
+- Split-M dumps (`s1 splitm`): additionally Q = nodes within q of the group, H_T = -(1/varsigma)
+  Mw[Qu,Qu]^-1 B23[Qu,cols] cut to q, the velocity rhs R - Dv[Pu,Qu] H_T (omega rows -Dv[Pw,Qu] H_T
+  with `vel 1`), H = H_T + (Y within r). The Fortran solves M_w and B33 per toroidal slot when
+  slot-diagonal (off-slot entries below 1e-12 of the row's largest), which is the same to round-off.
+  Cross-check of `rebuild_H(..., q=4)` on the 2026-10-16 11x16 dump (an `s1 spai` dump, so not via
+  the t5 command line; g = 1 / 4): sigma max|lam - 1| = 0.053 / 0.054 (fam1), 0.251 / 0.248 (fam2),
+  against 0.065 / 0.250 for hpatch.
 
 ## What PASS means
 
@@ -148,6 +197,10 @@ T solves need -B65 rho.
   - Cw is the l2 SPAI (r = 2) of the Jacobi-scaled Mw, mapped back, as in the Fortran.
     `--spai-plain` gives the unscaled SPAI.
   - All blocks carry the slot normalisation (`--n-plane 8`), and meta.txt has `bend_sign 1`.
+- **New variants.** `--bend-form 2` writes the form-2 Bb with `dirichlet_psi`. `--hpatch banded`
+  writes an hpatch-style dump (meta `s1 hpatch`, `--hp-p/-r/-g/-vel`, no Cw.bin) with a banded
+  nonsymmetric H on the SPAI pattern (T5 must then FAIL). `--hpatch patch` uses the T5
+  construction itself (a plumbing test of the new code paths, not an independent check of the Fortran).
 - **Not a force-balanced equilibrium.** The curvature operator is fake. Use it to validate the
   machinery, not the physics.
 - **Calibration against the LFA.** With `--beta 0 --j0 zero --u0 0 --rcos 0 --rho-var 0 --eps 0

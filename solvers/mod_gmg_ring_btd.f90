@@ -405,6 +405,7 @@ contains
 #define THOMAS_SOLVE thomas_solve
 #define HYB_SOL_FWD hyb_sol_fwd
 #define HYB_SOL_SEP hyb_sol_sep
+#define HYB_SEP_CORE hyb_sep_core
 #define HYB_SOL_BWD hyb_sol_bwd
 #include "mod_gmg_ring_btd_solve.inc"
 #undef RK
@@ -414,6 +415,7 @@ contains
 #undef THOMAS_SOLVE
 #undef HYB_SOL_FWD
 #undef HYB_SOL_SEP
+#undef HYB_SEP_CORE
 #undef HYB_SOL_BWD
 #define RK 4
 #define GEMV sgemv
@@ -422,6 +424,7 @@ contains
 #define THOMAS_SOLVE thomas_solve_sp
 #define HYB_SOL_FWD hyb_sol_fwd_sp
 #define HYB_SOL_SEP hyb_sol_sep_sp
+#define HYB_SEP_CORE hyb_sep_core_sp
 #define HYB_SOL_BWD hyb_sol_bwd_sp
 #include "mod_gmg_ring_btd_solve.inc"
 

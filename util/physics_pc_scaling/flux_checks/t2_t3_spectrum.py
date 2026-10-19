@@ -50,21 +50,35 @@ def main():
         Lsel[:n, :n] -= b.L1[:n, :n]
     S1 = b.PJ - b.U1 @ np.linalg.solve(Dsel, Lsel)
     fr = f.free()
-    idx = np.concatenate([fr, n + fr])                     # free psi and j
+    idx = np.concatenate([f.free_psi(), n + fr])           # free psi (dirichlet_psi) and j
     R = lambda X: X[np.ix_(idx, idx)]
     print("family %s  nslot %d  n %d  2n_free %d  varsigma %g  theta_dt %g   exact S1: dv=%s l1=%s kink=%s"
           % (f.meta["family"], f.nslot, n, idx.size, f.varsigma, f.theta, a.dv, a.l1, not a.no_kink))
+    print("s1 %s  bend_form %d" % (f.s1, f.meta["bend_form"]))
     cases = []
+    na = []                                                # (case, reason) not computable
     if b.Mw is not None:
         cases.append(("T2  S1~(Mw^-1)^-1 S1", b.S1_bend(b.Mw_inv()), S1))
+    else:
+        na.append(("T2  S1~(Mw^-1)^-1 S1", "no Mw.bin"))
     if b.Cw is not None:
         cases.append(("T3  S1~(Cw)^-1 S1", b.S1_bend(b.Cw), S1))
+    else:
+        na.append(("T3  S1~(Cw)^-1 S1", "no Cw.bin" + (" (%s)" % f.s1 if f.hform else "")))
+    if b.H is not None:
+        cases.append(("T2h S1~(H)^-1 S1 (PJ+B12 H)", b.S1_hpatch(), S1))
+    elif f.hform:
+        na.append(("T2h S1~(H)^-1 S1 (PJ+B12 H)", "no H.bin"))
     if b.S1_dump is not None:
         cases.append(("T3d S1.bin^-1 S1", b.S1_dump, S1))
     if b.Mw is not None and b.Cw is not None:
         cases.append(("SPAI S1~(Cw)^-1 S1~(Mw^-1)", b.S1_bend(b.Cw), b.S1_bend(b.Mw_inv())))
+    else:
+        na.append(("SPAI S1~(Cw)^-1 S1~(Mw^-1)", "needs Mw.bin and Cw.bin"))
     print("\n%-30s %10s %10s %10s %8s" % ("case", "Re min", "Re max", "max|Im|", "#Re<0"))
     print("-" * 72)
+    for name, why in na:
+        print("%-30s n/a (%s)" % (name, why))
     eigs = {}
     for name, St, Sx in cases:
         e = np.linalg.eigvals(np.linalg.solve(R(St), R(Sx)))

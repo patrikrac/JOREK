@@ -19,10 +19,14 @@ layout is auto-detected from the file size (``int64=None``); pass
 Family dump layout (one directory per toroidal family, ``<dir>/fam<f>/``):
 
     scalar-field matrices  (row = idx*nslot + m)  B12 B16 B21 B23 B25 B26 B51
-                           B52 B61 B62 B63 B65 B55 B66 Mw Cw Bb
+                           B52 B61 B62 B63 B65 B55 B66 Mw Cw H Bb
+                           (Cw only with ``s1 spai``, H only with ``s1 hpatch``;
+                           H = u rows x psi cols)
     two-field packed       (field-major)          PJ S1 Dv0 Dv
     meta.txt               key value lines; ``dirichlet i0 i1 ...``; unknown keys are kept
-                           (bend_sign default 1, bend_form default 0)
+                           (bend_sign default 1, bend_form default 0, 1 or 2,
+                           s1 default "spai" or "hpatch" with p r g vel,
+                           dirichlet_psi default = dirichlet)
 
 All blocks, Mw included, carry JOREK's FFT slot normalisation (n_plane on the
 n = 0 slot, n_plane/2 on cos/sin slots); the checks are invariant to it.
@@ -38,7 +42,7 @@ import scipy.sparse as sp
 MAT_FILE_CLASSID = 1211216
 
 SCALAR_BLOCKS = ["B12", "B16", "B21", "B23", "B25", "B26", "B51", "B52",
-                 "B61", "B62", "B63", "B65", "B55", "B66", "Mw", "Cw", "Bb"]
+                 "B61", "B62", "B63", "B65", "B55", "B66", "Mw", "Cw", "H", "Bb"]
 PACKED_BLOCKS = {"PJ":  (("B11", "B13"), ("B31", "B33")),
                  "Dv0": (("B22", "B24"), ("B42", "B44"))}
 PACKED_ONLY = ["S1", "Dv"]          # kept packed (2n x 2n)
@@ -130,7 +134,7 @@ def read_meta(path):
             if not tok or tok[0].startswith("#"):
                 continue
             key, vals = tok[0], tok[1:]
-            if key in ("dirichlet", "dirichlet_index"):
+            if key in ("dirichlet", "dirichlet_index", "dirichlet_psi"):
                 meta.setdefault(key, [])
                 meta[key].extend(int(v) for v in vals)
             elif len(vals) == 1:
@@ -150,7 +154,13 @@ def read_meta(path):
     meta.setdefault("varsigma", 1.0)
     meta.setdefault("theta_dt", 1.0)
     meta.setdefault("bend_sign", 1.0)     # Bb = (bend_sign/varsigma) D B12^T (D Cw D) B12 D
-    meta.setdefault("bend_form", 0)       # 1: Bb = B12 (D Cw D) B12^T (-sf_flux_bend_form 1)
+    meta.setdefault("bend_form", 0)       # 1: Bb = B12 (D Cw D) B12^T; 2: Dpsi B12 (Du Cw Du) B12^T Dpsi
+    meta.setdefault("s1", "spai")         # absent (old dumps) = spai; "hpatch" / "splitm" (H.bin, Bb = B12 H)
+    meta["s1"] = str(meta["s1"])
+    for k in ("p", "r", "g", "vel", "q"):  # hpatch / splitm parameters (q: splitm only)
+        if k in meta:
+            meta[k] = int(meta[k])
+    meta["bend_form"] = int(meta["bend_form"])    # 0, 1 or 2
     meta["bend_sign"] = float(meta["bend_sign"])
     meta["varsigma"] = float(meta["varsigma"])
     meta["theta_dt"] = float(meta["theta_dt"])
@@ -163,6 +173,14 @@ def read_meta(path):
     if d.size and (d.min() < 0 or d.max() >= n):
         raise ValueError("%s: dirichlet index out of range [0,%d)" % (path, n))
     meta["dirichlet"] = d
+    # psi's Dirichlet rows (hpatch, bend_form 2); default: the same as the (u) list above
+    if "dirichlet_psi" in meta:
+        dp = np.array(sorted(set(int(i) for i in meta["dirichlet_psi"])), dtype=np.int64)
+        if dp.size and (dp.min() < 0 or dp.max() >= n):
+            raise ValueError("%s: dirichlet_psi index out of range [0,%d)" % (path, n))
+    else:
+        dp = d.copy()
+    meta["dirichlet_psi"] = dp
     return meta
 
 
@@ -183,6 +201,9 @@ class Family:
         self.varsigma = self.meta["varsigma"]
         self.theta = self.meta["theta_dt"]
         self.dirichlet = self.meta["dirichlet"]
+        self.dirichlet_psi = self.meta["dirichlet_psi"]
+        self.s1 = self.meta["s1"]                 # "spai" (default), "hpatch" or "splitm"
+        self.hform = self.s1 in ("hpatch", "splitm")   # H.bin, Bb = Dpsi B12 H, no Cw.bin
         self.blocks = {}
         self.packed = {}
         self.absent = []
@@ -241,6 +262,12 @@ class Family:
         mask[self.dirichlet] = False
         return np.nonzero(mask)[0]
 
+    def free_psi(self):
+        """unconstrained psi row indices (dirichlet_psi; = free() if the key is absent)"""
+        mask = np.ones(self.n, bool)
+        mask[self.dirichlet_psi] = False
+        return np.nonzero(mask)[0]
+
 
 def load_family(famdir, int64=None, verbose=False):
     """-> (dict of blocks, meta).  See Family for the object interface."""
@@ -259,4 +286,5 @@ if __name__ == "__main__":
     f = Family(a.famdir, int64=True if a.int64 else None, verbose=True)
     print("family %s nslot %d nindex %d n %d varsigma %g theta_dt %g  #dirichlet %d"
           % (f.meta["family"], f.nslot, f.nindex, f.n, f.varsigma, f.theta, len(f.dirichlet)))
+    print("s1 %s  bend_form %d  #dirichlet_psi %d" % (f.s1, f.meta["bend_form"], len(f.dirichlet_psi)))
     print("absent (treated as zero):", " ".join(f.absent) or "-")
