@@ -82,12 +82,36 @@ module mod_petsc_pc_sf_hpatch
   !! the band storage would be larger. Groups run on the OpenMP threads.
   !! Cost per group ~ 2 n b^2 + 4 n b n_c flops, n ~ |P| ns, b ~ the RCM band
   !! (about one patch width of nodes, x 4 ns), n_c ~ 4 g ns columns.
+  !!
+  !! FAST REBUILDS (-sf_flux_hp_fast 1, the default; 0: the plain path above).
+  !! The same H to round-off, at about half the cost per rebuild (cbm18
+  !! pcbench, n_tor 3: 2.6 s -> 1.2 s), from three observations on the
+  !! production operators:
+  !!  - B_31 / B_33 (j = Delta* psi) are geometric: X = B_33^-1 B_31 is kept
+  !!    per group (its exact nonzeros) and reused while the gathered B_31 /
+  !!    B_33 values and psi's free set are bitwise those it was built from;
+  !!  - the velocity block's off-slot entries are the nonlinear n <-> n'
+  !!    coupling, ~1e-11 .. 1e-9 of the row in the linear phase but above
+  !!    SD_TOL, so the block is coupled: it is solved as D + E (D the per-slot
+  !!    part, E the off-slot entries), X_k+1 = D^-1 (B - E X_k), stopped at an
+  !!    estimated relative error <= REF_TOL (one step at rho ~ 1e-9), the
+  !!    coupled LU when the contraction rho = |D^-1 E| exceeds 1/2;
+  !!  - the cos and sin slots of a harmonic carry bitwise identical matrices:
+  !!    one factorisation serves both (any slots with equal matrices share).
+  !! B_23 X skips B_23's stored zeros and, per column, the slots where X is
+  !! zero. -sf_flux_hp_verify 1 also runs the plain solves and reports the
+  !! largest relative deviation of X and of the velocity solves (~1e-14).
   !--------------------------------------------------------------------
 
   PetscInt, parameter :: zero = 0, one = 1
   !> off-slot entries below SD_TOL x (row's largest |entry|) count as zero in
   !! the slot-diagonal test (the FFT assembly leaves round-off there)
   real*8, parameter :: SD_TOL = 1.0d-12
+  !> a coupled system solved on its per-slot factors (solve_refined): done at
+  !! an estimated relative error <= REF_TOL, at most REF_MAXIT steps, given
+  !! up (coupled LU) when a step contracts by less than 2x
+  real*8, parameter  :: REF_TOL = 1.0d-14
+  integer, parameter :: REF_MAXIT = 8
 
   !> One source's gathered rows (row k = U position (k-1) / ns + 1, slot
   !! mod(k-1, ns)): CSR with the columns as (field, local id), id = (U
@@ -100,6 +124,23 @@ module mod_petsc_pc_sf_hpatch
     real*8, allocatable     :: val(:)
     logical, allocatable    :: dir(:)
   end type grows_t
+
+  !> A group's cached X = B_33^-1 B_31 (nj x nc), its exact nonzeros by
+  !! column: entries cp(c)+1 .. cp(c+1), rows ri, values v.
+  type :: xcache_t
+    integer :: nj = 0, nc = 0
+    integer, allocatable :: cp(:), ri(:)
+    real*8, allocatable  :: v(:)
+  end type xcache_t
+
+  !> One slot's LU factors in a local solve: rows rl(1:nr) of the system,
+  !! banded (kl, ku, ldab) or dense (dns = 1); src > 0: the slot src - 1's
+  !! factors serve (bitwise identical matrix), ab / ipiv then unallocated.
+  type :: lfac_t
+    integer :: nr = 0, kl = 0, ku = 0, ldab = 1, dns = 0, src = 0
+    integer, allocatable :: rl(:), ipiv(:)
+    real*8, allocatable  :: ab(:, :)
+  end type lfac_t
 
   !> One group's rows of H^T: psi rows row(1:nr), entries rp(q)+1 .. rp(q+1).
   type :: hres_t
@@ -131,6 +172,16 @@ module mod_petsc_pc_sf_hpatch
     !> the first build's structure of H^T per group: entries and a hash of
     !! (rows, row pointers, columns); a rebuild must reproduce it
     integer(8), allocatable :: sig_nnz(:), sig_hash(:)
+    !> -sf_flux_hp_fast 1 (default): X cached across rebuilds while B_31 /
+    !! B_33 and psi's free set are unchanged, coupled systems solved by
+    !! per-slot factors + iterative refinement to round-off (coupled LU when
+    !! that stalls), slots with bitwise identical matrices share factors.
+    !! 0: every system factored as before. -sf_flux_hp_verify 1: also the
+    !! reference solves, the largest relative deviation reported.
+    integer :: fast = 1, verify = 0
+    type(xcache_t), allocatable :: xc(:)        !< per group (fast)
+    real*8, allocatable  :: xkey(:)             !< the B_31 / B_33 values the cache was built from
+    logical, allocatable :: xkeyp(:)            !< and psi's free owned DOFs
   end type hpatch_t
 
   PetscLogEvent, save :: ev_h = -1
@@ -167,6 +218,8 @@ contains
     PetscClassId, parameter :: cid = 0
     PetscErrorCode :: ie
     integer :: qq
+    PetscInt :: iv
+    PetscBool :: set
     if (ev_h < 0) call PetscLogEventRegister("PhysPC_FluxH", cid, ev_h, ie)
     call PetscLogEventBegin(ev_h, ie)
     ierr = 0
@@ -181,6 +234,10 @@ contains
       if (first) then
         h%q = qq
         if (qq > 0) h%vsg = vsg
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_hp_fast", iv, set, ie)
+        if (set) h%fast = merge(1, 0, iv /= 0)
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_flux_hp_verify", iv, set, ie)
+        if (set) h%verify = merge(1, 0, iv /= 0)
       else if (qq /= h%q) then
         ierr = 1
         write(*,'(A,A,A)') "[Physics PC]   ", trim(label), ": H: q changed since the first build"
@@ -219,6 +276,9 @@ contains
     if (allocated(h%qix))      deallocate(h%qix)
     if (allocated(h%sig_nnz))  deallocate(h%sig_nnz)
     if (allocated(h%sig_hash)) deallocate(h%sig_hash)
+    if (allocated(h%xc))       deallocate(h%xc)
+    if (allocated(h%xkey))     deallocate(h%xkey)
+    if (allocated(h%xkeyp))    deallocate(h%xkeyp)
     h%nu = 0; h%no = 0; h%o0 = 0; h%ngrp = 0
     h%built = .false.
   end subroutine hpatch_destroy
@@ -247,6 +307,10 @@ contains
     integer, allocatable :: lq(:), tq(:), to(:), lo(:)
     integer, allocatable :: pp(:), px(:)
     integer :: ri, bi, di, ii, si, sd
+    type(xcache_t), allocatable :: xc(:)
+    integer :: xmode
+    integer(8) :: fst(5)        !< fast-path counts: X reused, refined, refinement sweeps, LU fallbacks, shared factors
+    real*8 :: vdev, refmax      !< -sf_flux_hp_verify: largest relative deviation; largest final backward error
 
     ierr = 0
     t0 = MPI_Wtime()
@@ -317,20 +381,44 @@ contains
     call VecRestoreArrayRead(pmask, pm, ierr); if (ierr /= 0) return
     nfreep = count(freep(0:nloc - 1))
 
+    !--- X = B_33^-1 B_31 per group: cached (fast) while B_31 / B_33 (exactly)
+    !--- and psi's free set are those it was built from; xmode 1 = reuse,
+    !--- 2 = compute and store, 0 = compute only
+    xmode = 0
+    if (h%fast == 1) then
+      xmode = 2
+      if (.not. first .and. allocated(h%xc) .and. allocated(h%xkey) .and. allocated(h%xkeyp)) then
+        if (size(h%xkey) == size(sj%val) .and. size(h%xkeyp) == nloc) then
+          if (all(h%xkey == sj%val) .and. all(h%xkeyp .eqv. freep(0:nloc - 1))) xmode = 1
+        endif
+      endif
+      if (xmode == 2) then
+        if (allocated(h%xc)) deallocate(h%xc)
+        allocate(h%xc(h%ngrp))
+        h%xkey  = sj%val
+        h%xkeyp = freep(0:nloc - 1)
+      endif
+      call move_alloc(h%xc, xc)       ! the groups write their entries (h stays intent(in) there)
+    else
+      allocate(xc(1))
+    endif
+
     !--- the groups' local solves, on the threads
     allocate(res(h%ngrp))
     nbad = 0; ndense = 0; nrmax = 0; bwmax = 0; nrsum = 0; bwsum = 0; flops = 0.d0; nsys = 0; nsd = 0
+    fst = 0; vdev = 0.d0; refmax = 0.d0
     !$omp parallel private(lj, tj, lu, tu, lw, tw, lc, tc, tp, lp, lq, tq, to, lo, k, ri, bi, di, ii, si, sd)
     allocate(lj(0:h%nu * h%ns - 1), tj(0:h%nu * h%ns - 1), lu(0:h%nu * h%ns - 1), tu(0:h%nu * h%ns - 1), &
              lw(0:h%nu * h%ns - 1), tw(0:h%nu * h%ns - 1), lc(0:h%nu * h%ns - 1), tc(0:h%nu * h%ns - 1), &
              lq(0:h%nu * h%ns - 1), tq(0:h%nu * h%ns - 1), tp(h%nu), lp(h%nu), to(h%nu), lo(h%nu))
     tj = 0; tu = 0; tw = 0; tc = 0; tp = 0; lj = 0; lu = 0; lw = 0; lc = 0; lp = 0
     tq = 0; lq = 0; to = 0; lo = 0
-    !$omp do schedule(dynamic, 1) reduction(+:nbad, ndense, nrsum, bwsum, flops, nsys, nsd) &
-    !$omp reduction(max:nrmax, bwmax)
+    !$omp do schedule(dynamic, 1) reduction(+:nbad, ndense, nrsum, bwsum, flops, nsys, nsd, fst) &
+    !$omp reduction(max:nrmax, bwmax, vdev, refmax)
     do k = 1, h%ngrp
       call hp_group(h, k, sj, su, sw, s21, s23, smw, freep, res(k), lj, tj, lu, tu, lw, tw, lc, tc, tp, lp, &
-                    lq, tq, to, lo, ri, bi, di, ii, si, sd, flops)
+                    lq, tq, to, lo, ri, bi, di, ii, si, sd, flops, &
+                    xmode, xc(min(k, size(xc))), fst, vdev, refmax)
       nbad = nbad + ii; ndense = ndense + di
       nrsum = nrsum + ri; bwsum = bwsum + bi
       nrmax = max(nrmax, ri); bwmax = max(bwmax, bi)
@@ -339,9 +427,15 @@ contains
     !$omp end do
     deallocate(lj, tj, lu, tu, lw, tw, lc, tc, tp, lp, lq, tq, to, lo)
     !$omp end parallel
+    if (h%fast == 1) then
+      call move_alloc(xc, h%xc)
+    else
+      deallocate(xc)
+    endif
     call MPI_Allreduce(MPI_IN_PLACE, nbad, 1, MPI_INTEGER, MPI_SUM, h%comm, mierr)
     if (nbad > 0) then
       ierr = 1
+      if (allocated(h%xkey)) deallocate(h%xkey)      ! no reuse of a partial cache
       if (h%me == 0) write(*,'(A,A,A,I0,A)') "[Physics PC]   ", trim(label), ": H: ", nbad, &
         " singular patch system(s) (LAPACK info /= 0)"
       return
@@ -398,6 +492,22 @@ contains
         write(*,'(A,A,A,ES10.3,A,I0,A,F8.1,A,F8.3,A)') "[Physics PC]   ", trim(label), &
           ": H: factor + solve flops ", st(4), ", nnz(H) ", nnzh, " (", dble(nnzh) / max(dble(nfreep), 1.d0), &
           " per free psi column), setup ", mx(3), " s (max over ranks)"
+      endif
+    endif
+
+    !--- the fast path's summary: first build, and every build when verifying
+    if (h%fast == 1 .and. (first .or. h%verify == 1)) then
+      call MPI_Allreduce(MPI_IN_PLACE, fst, 5, MPI_INTEGER8, MPI_SUM, h%comm, mierr)
+      mx(1:2) = [vdev, refmax]
+      call MPI_Allreduce(MPI_IN_PLACE, mx, 2, MPI_DOUBLE_PRECISION, MPI_MAX, h%comm, mierr)
+      if (h%me == 0) then
+        write(*,'(A,A,A,I0,A,I0,A,F5.2,A,ES9.2,A,I0,A,I0,A)') "[Physics PC]   ", trim(label), &
+          ": H fast (-sf_flux_hp_fast): X = B_33^-1 B_31 reused in ", fst(1), " groups, ", &
+          fst(2), " coupled systems refined on per-slot factors (", &
+          dble(fst(3)) / max(dble(fst(2)), 1.d0), " steps, est. relative error <= ", mx(2), &
+          "), ", fst(4), " LU fallbacks, ", fst(5), " slot factors shared"
+        if (h%verify == 1) write(*,'(A,A,A,ES10.3)') "[Physics PC]   ", trim(label), &
+          ": H verify (-sf_flux_hp_verify): largest relative deviation from the reference solves ", mx(1)
       endif
     endif
 
@@ -819,7 +929,7 @@ contains
   !! by slot), and adds its flops.
   !--------------------------------------------------------------------
   subroutine hp_group(h, k, sj, su, sw, s21, s23, smw, freep, res, lj, tj, lu, tu, lw, tw, lc, tc, tp, lp, &
-                      lq, tq, to, lo, nrow, band, dense, bad, nsys, nsd, flops)
+                      lq, tq, to, lo, nrow, band, dense, bad, nsys, nsd, flops, xmode, xc, fst, vdev, refmax)
     type(hpatch_t), intent(in)  :: h
     integer, intent(in)         :: k
     type(grows_t), intent(in)   :: sj, su, sw, s21, s23, smw
@@ -829,10 +939,16 @@ contains
     integer, intent(inout)      :: lq(0:), tq(0:), to(:), lo(:)
     integer, intent(out)        :: nrow, band, dense, bad, nsys, nsd
     real*8, intent(inout)       :: flops
+    integer, intent(in)         :: xmode     !< X: 1 reuse xc, 2 compute and store in xc, 0 compute
+    type(xcache_t), intent(inout) :: xc      !< this group's cached X (xmode 1, 2)
+    integer(8), intent(inout)   :: fst(5)    !< fast-path counts (hp_build)
+    real*8, intent(inout)       :: vdev      !< -sf_flux_hp_verify: largest relative deviation
+    real*8, intent(inout)       :: refmax    !< largest final backward error of a refinement
     integer, allocatable :: did(:), dkind(:), jid(:), cgi(:), dd(:, :), que(:), qid(:)
     PetscInt, allocatable :: crow(:)
-    real*8, allocatable :: Xs(:, :), Rm(:, :), v23(:), HT(:, :)
-    integer, allocatable :: rp23(:), cj23(:)
+    real*8, allocatable :: Xs(:, :), Rm(:, :), v23(:), HT(:, :), Xr(:, :)
+    integer, allocatable :: rp23(:), cj23(:), rps(:, :)
+    logical, allocatable :: xsl(:)
     integer, allocatable :: opix(:)
     integer :: np_, npo, ns, q, pos, m, id, nj, nd, nc, nq, ngi, gi, a, b, l0, n, e2, cnt, c, ub, dmax, dst
     integer(8) :: e
@@ -845,6 +961,11 @@ contains
     integer, allocatable :: smap(:)
     integer :: kl, ku, ldab, pass, dns, ckw
     real*8 :: rmax, omax
+    !--- solve_refined's coupled matrix (CSR, rows of the system; put's passes 3, 4)
+    integer(8), allocatable :: crp(:)
+    integer, allocatable :: ccol(:)
+    real*8, allocatable  :: cval(:)
+    integer(8) :: ccnt
 
     nrow = 0; band = 0; dense = 0; bad = 0; nsys = 0; nsd = 0
     ns = h%ns
@@ -909,23 +1030,45 @@ contains
     b1 = 0;  d1 = 0;  b3 = 0;  d3 = 0
 
     !--- X = B_33^-1 B_31 on the patch (j rows: field 2 = j, field 1 = psi);
-    !--- no free j in the patch: X = 0 and R = -B_21 below
+    !--- no free j in the patch: X = 0 and R = -B_21 below. xmode 1: the
+    !--- cached X (B_31, B_33 and the free sets as at its build: the same
+    !--- numbers); 2: computed and stored
     if (nj > 0) then
       allocate(Xs(nj, nc))
       Xs = 0.d0
-      do q = 1, np_
-        pos = h%pix(h%pptr(k) + q)
-        do m = 0, ns - 1
-          id = (pos - 1) * ns + m
-          if (tj(id) /= k) cycle
-          do e = sj%ptr(id + 1) + 1, sj%ptr(id + 2)
-            if (sj%fld(e) /= 1 .or. sj%cid(e) < 0) cycle
-            if (tc(sj%cid(e)) == k) Xs(lj(id), lc(sj%cid(e))) = Xs(lj(id), lc(sj%cid(e))) + sj%val(e)
+      if (xmode == 1 .and. xc%nj == nj .and. xc%nc == nc .and. allocated(xc%cp)) then
+        do c = 1, nc
+          do e2 = xc%cp(c) + 1, xc%cp(c + 1)
+            Xs(xc%ri(e2), c) = xc%v(e2)
           enddo
         enddo
-      enddo
-      call solve_sys(1, nj, Xs, b1, d1)
-      if (bad /= 0) return
+        fst(1) = fst(1) + 1
+        if (h%verify == 1) then
+          call x_rhs(Xr)
+          call solve_sys(1, nj, Xr, b1, d1)
+          if (bad /= 0) return
+          call note_dev(Xs, Xr)
+          deallocate(Xr)
+        endif
+      else
+        call x_rhs(Xs)
+        call solve_sys(1, nj, Xs, b1, d1)
+        if (bad /= 0) return
+        if (xmode >= 1) then
+          xc%nj = nj;  xc%nc = nc
+          if (allocated(xc%cp)) deallocate(xc%cp, xc%ri, xc%v)
+          cnt = count(Xs /= 0.d0)
+          allocate(xc%cp(nc + 1), xc%ri(max(cnt, 1)), xc%v(max(cnt, 1)))
+          cnt = 0;  xc%cp(1) = 0
+          do c = 1, nc
+            do a = 1, nj
+              if (Xs(a, c) == 0.d0) cycle
+              cnt = cnt + 1;  xc%ri(cnt) = a;  xc%v(cnt) = Xs(a, c)
+            enddo
+            xc%cp(c + 1) = cnt
+          enddo
+        endif
+      endif
     endif
 
     !--- R = B_23 X - B_21 (velocity rows; the omega rows' are zero). B_23's
@@ -933,7 +1076,58 @@ contains
     !--- column over Xs and Rm (column-major)
     allocate(Rm(nd, nc))
     Rm = 0.d0
-    if (nj > 0) then
+    if (nj > 0 .and. h%fast == 1) then
+      ! fast: B_23's patch entries per row grouped by their column's slot
+      ! (stored zeros dropped), and per column of X only the slots where X
+      ! has nonzeros (X = B_33^-1 B_31 is slot-diagonal in practice): the
+      ! terms left out are exact zeros
+      allocate(rps(0:ns, nd), xsl(0:ns - 1))
+      rps = 0
+      do a = 1, nd
+        if (dkind(a) /= 1) cycle
+        id = did(a)
+        do e = s23%ptr(id + 1) + 1, s23%ptr(id + 2)
+          if (s23%cid(e) < 0) cycle
+          if (tj(s23%cid(e)) /= k .or. s23%val(e) == 0.d0) cycle
+          m = mod(jid(lj(s23%cid(e))), ns)
+          rps(m + 1, a) = rps(m + 1, a) + 1
+        enddo
+      enddo
+      cnt = 0
+      do a = 1, nd                                  ! counts -> segment starts
+        do m = 0, ns
+          b = rps(m, a);  rps(m, a) = cnt;  cnt = cnt + b
+        enddo
+      enddo
+      allocate(cj23(max(cnt, 1)), v23(max(cnt, 1)))
+      do a = 1, nd
+        if (dkind(a) /= 1) cycle
+        id = did(a)
+        do e = s23%ptr(id + 1) + 1, s23%ptr(id + 2)
+          if (s23%cid(e) < 0) cycle
+          if (tj(s23%cid(e)) /= k .or. s23%val(e) == 0.d0) cycle
+          m = mod(jid(lj(s23%cid(e))), ns)
+          rps(m + 1, a) = rps(m + 1, a) + 1
+          cj23(rps(m + 1, a)) = lj(s23%cid(e));  v23(rps(m + 1, a)) = s23%val(e)
+        enddo
+      enddo
+      ! now segment m of row a: rps(m, a) + 1 .. rps(m + 1, a)
+      do c = 1, nc
+        xsl = .false.
+        do a = 1, nj
+          if (Xs(a, c) /= 0.d0) xsl(mod(jid(a), ns)) = .true.
+        enddo
+        do a = 1, nd
+          do m = 0, ns - 1
+            if (.not. xsl(m)) cycle
+            do b = rps(m, a) + 1, rps(m + 1, a)
+              Rm(a, c) = Rm(a, c) + v23(b) * Xs(cj23(b), c)
+            enddo
+          enddo
+        enddo
+      enddo
+      deallocate(Xs, rps, xsl, cj23, v23)
+    else if (nj > 0) then
       allocate(rp23(nd + 1))
       do pass = 1, 2                                ! count, then fill
         cnt = 0
@@ -1116,13 +1310,15 @@ contains
     !> Bm (nn x ncol) <- A^-1 Bm for the patch system `which` (1: B_33 on the
     !! j numbering; 2: the velocity block on the u / omega numbering; 3: M_w
     !! on the mass numbering): slot by slot when it is slot-diagonal
-    !! (slot_diag), else coupled. bw = the largest kl + ku + 1, dn = 1 when a
-    !! solve went dense; a failure counts in bad.
+    !! (slot_diag), else coupled -- with h%fast, by iterative refinement on the
+    !! per-slot factors (solve_refined), else one LU. bw = the largest kl +
+    !! ku + 1, dn = 1 when a solve went dense; a failure counts in bad.
     subroutine solve_sys(which, nn, Bm, bw, dn)
       integer, intent(in)    :: which, nn
       real*8, intent(inout)  :: Bm(:, :)
       integer, intent(out)   :: bw, dn
       integer, allocatable :: rl(:)
+      type(lfac_t), allocatable :: fac(:)
       integer :: mm, cn, rr, bw1, dn1
       logical :: sdg
       nsys = nsys + 1
@@ -1130,7 +1326,11 @@ contains
       allocate(rl(nn), smap(nn))
       sdg = .false.
       if (ns > 1) sdg = slot_diag(which, nn)
-      if (sdg) then
+      if (sdg .and. h%fast == 1) then
+        nsd = nsd + 1
+        call slot_factors(which, nn, fac, bw, dn)
+        if (bad == 0) call slot_apply(fac, Bm)
+      else if (sdg) then
         nsd = nsd + 1
         do mm = 0, ns - 1
           cn = 0
@@ -1144,12 +1344,214 @@ contains
           bw = max(bw, bw1);  dn = max(dn, dn1)
           if (bad /= 0) exit
         enddo
+      else if (ns > 1 .and. h%fast == 1) then
+        call solve_refined(which, nn, Bm, bw, dn)
       else
         rl = [(rr, rr = 1, nn)]
         call solve_rows(which, nn, rl, Bm, bw, dn)
       endif
       deallocate(rl, smap)
     end subroutine solve_sys
+
+    !> The per-slot factors fac(0:ns-1) of system `which` (its off-slot
+    !! entries left out); a slot whose matrix is bitwise that of an earlier
+    !! slot shares its factors (fac%src). bw, dn as solve_sys.
+    subroutine slot_factors(which, nn, fac, bw, dn)
+      integer, intent(in)  :: which, nn
+      type(lfac_t), allocatable, intent(out) :: fac(:)
+      integer, intent(out) :: bw, dn
+      type(lfac_t), allocatable :: ab0(:)     ! the slots' unfactored matrices (in %ab), for the sharing test
+      integer, allocatable :: rl(:)
+      integer :: mm, m2, cn, rr, info
+      allocate(fac(0:ns - 1), ab0(0:ns - 1), rl(nn))
+      bw = 0;  dn = 0
+      do mm = 0, ns - 1
+        cn = 0
+        do rr = 1, nn
+          if (rslot(which, rr) == mm) then
+            cn = cn + 1;  rl(cn) = rr
+          endif
+        enddo
+        fac(mm)%nr = cn
+        if (cn == 0) cycle
+        fac(mm)%rl = rl(1:cn)
+        call fill_rows(which, cn, rl)
+        fac(mm)%kl = kl;  fac(mm)%ku = ku;  fac(mm)%ldab = ldab;  fac(mm)%dns = dns
+        bw = max(bw, kl + ku + 1);  dn = max(dn, dns)
+        ! an earlier slot with the bitwise same matrix: its factors serve
+        do m2 = 0, mm - 1
+          if (fac(m2)%src /= 0 .or. .not. allocated(ab0(m2)%ab)) cycle
+          if (fac(m2)%nr /= cn .or. fac(m2)%kl /= kl .or. fac(m2)%ku /= ku .or. fac(m2)%dns /= dns) cycle
+          if (all(ab0(m2)%ab == ab)) then
+            fac(mm)%src = m2 + 1
+            fst(5) = fst(5) + 1
+            exit
+          endif
+        enddo
+        if (fac(mm)%src /= 0) then
+          deallocate(ab)
+          cycle
+        endif
+        if (mm < ns - 1) ab0(mm)%ab = ab      ! unfactored, while a later slot may match
+        allocate(fac(mm)%ipiv(cn))
+        if (dns == 1) then
+          call dgetrf(cn, cn, ab, cn, fac(mm)%ipiv, info)
+          flops = flops + 2.d0 / 3.d0 * dble(cn)**3
+        else
+          call dgbtrf(cn, cn, kl, ku, ab, ldab, fac(mm)%ipiv, info)
+          flops = flops + 2.d0 * dble(cn) * dble(kl) * dble(kl + ku)
+        endif
+        if (info /= 0) bad = bad + 1
+        call move_alloc(ab, fac(mm)%ab)
+        if (bad /= 0) exit
+      enddo
+      deallocate(ab0, rl)
+    end subroutine slot_factors
+
+    !> Bm(slot rows, :) <- (slot's matrix)^-1 Bm(slot rows, :), every slot.
+    subroutine slot_apply(fac, Bm)
+      type(lfac_t), intent(in) :: fac(0:)
+      real*8, intent(inout)    :: Bm(:, :)
+      real*8, allocatable :: Bs(:, :)
+      integer :: mm, f, ncl, info, cn
+      ncl = size(Bm, 2)
+      do mm = 0, ns - 1
+        cn = fac(mm)%nr
+        if (cn == 0) cycle
+        f = mm
+        if (fac(mm)%src /= 0) f = fac(mm)%src - 1
+        allocate(Bs(cn, ncl))
+        Bs = Bm(fac(mm)%rl, :)
+        if (fac(f)%dns == 1) then
+          call dgetrs('N', cn, ncl, fac(f)%ab, cn, fac(f)%ipiv, Bs, cn, info)
+          flops = flops + 2.d0 * dble(cn)**2 * dble(ncl)
+        else
+          call dgbtrs('N', cn, fac(f)%kl, fac(f)%ku, ncl, fac(f)%ab, fac(f)%ldab, fac(f)%ipiv, Bs, cn, info)
+          flops = flops + 2.d0 * dble(cn) * dble(2 * fac(f)%kl + fac(f)%ku) * dble(ncl)
+        endif
+        if (info /= 0) bad = bad + 1
+        Bm(fac(mm)%rl, :) = Bs
+        deallocate(Bs)
+      enddo
+    end subroutine slot_apply
+
+    !> A coupled system A = D + E, D its per-slot part (slot_factors), E the
+    !! off-slot entries: X_0 = D^-1 B, X_k+1 = D^-1 (B - E X_k). The error
+    !! contracts by rho ~ |D^-1 E| per step; with q_k = max_c |X_k - X_k-1|_inf
+    !! / |X_k|_inf and rho estimated as q_1, then q_k / q_k-1, the remaining
+    !! relative error is ~ q_k rho / (1 - rho): done when that is <= REF_TOL
+    !! -- the coupled LU's accuracy, the same solution to round-off (with
+    !! rho ~ 1e-9, one step). rho >= 1/2, or REF_MAXIT steps: one coupled LU.
+    subroutine solve_refined(which, nn, Bm, bw, dn)
+      integer, intent(in)    :: which, nn
+      real*8, intent(inout)  :: Bm(:, :)
+      integer, intent(out)   :: bw, dn
+      type(lfac_t), allocatable :: fac(:)
+      real*8, allocatable :: B0(:, :), Rres(:, :), Xref(:, :)
+      integer, allocatable :: rl(:)
+      real*8 :: qk, qp, rho, est, xn, rn
+      integer :: it, rr, c, ncl
+      integer(8) :: ee
+      logical :: ok
+      ncl = size(Bm, 2)
+      call slot_factors(which, nn, fac, bw, dn)
+      if (bad /= 0) return
+      ! E: the off-slot entries, rows 1 .. nn (CSR; stored zeros dropped)
+      ckw = which
+      allocate(crp(nn + 1))
+      do pass = 3, 4
+        ccnt = 0
+        do rr = 1, nn
+          crp(rr) = ccnt
+          call row_entries(which, rr)
+        enddo
+        crp(nn + 1) = ccnt
+        if (pass == 3) allocate(ccol(max(ccnt, 1)), cval(max(ccnt, 1)))
+      enddo
+      allocate(B0(nn, ncl), Rres(nn, ncl))
+      B0 = Bm
+      call slot_apply(fac, Bm)
+      fst(2) = fst(2) + 1
+      ok = (crp(nn + 1) == 0)                       ! E = 0: D^-1 B is the solution
+      est = 0.d0;  qp = 0.d0
+      do it = 1, REF_MAXIT
+        if (ok) exit
+        ! Rres = D^-1 (B - E X) (E X column by column: contiguous)
+        do c = 1, ncl
+          do rr = 1, nn
+            rn = B0(rr, c)
+            do ee = crp(rr) + 1, crp(rr + 1)
+              rn = rn - cval(ee) * Bm(ccol(ee), c)
+            enddo
+            Rres(rr, c) = rn
+          enddo
+        enddo
+        flops = flops + 2.d0 * dble(crp(nn + 1)) * dble(ncl)
+        call slot_apply(fac, Rres)
+        fst(3) = fst(3) + 1
+        qk = 0.d0
+        do c = 1, ncl
+          xn = maxval(abs(Rres(:, c)))
+          if (xn > 0.d0) qk = max(qk, maxval(abs(Rres(:, c) - Bm(:, c))) / xn)
+        enddo
+        Bm = Rres
+        rho = qk
+        if (it > 1 .and. qp > 0.d0) rho = qk / qp
+        qp = qk
+        if (rho >= 0.5d0) exit
+        est = qk * rho / (1.d0 - rho)
+        if (est <= REF_TOL) ok = .true.
+      enddo
+      if (ok) then
+        refmax = max(refmax, est)
+      else
+        ! no convergence on the slot factors: the coupled LU
+        fst(4) = fst(4) + 1
+        Bm = B0
+        allocate(rl(nn))
+        rl = [(rr, rr = 1, nn)]
+        call solve_rows(which, nn, rl, Bm, bw, dn)
+        deallocate(rl)
+      endif
+      if (h%verify == 1 .and. ok .and. bad == 0) then
+        allocate(rl(nn), Xref(nn, ncl))
+        rl = [(rr, rr = 1, nn)]
+        Xref = B0
+        call solve_rows(which, nn, rl, Xref, bw, dn)
+        call note_dev(Bm, Xref)
+        deallocate(rl, Xref)
+      endif
+      deallocate(crp, ccol, cval, B0, Rres)
+    end subroutine solve_refined
+
+    !> The rhs of X = B_33^-1 B_31: B_31's patch rows and the group's columns.
+    subroutine x_rhs(Bx)
+      real*8, allocatable, intent(inout) :: Bx(:, :)
+      integer :: qq, mm, idd
+      integer(8) :: ee
+      if (allocated(Bx)) deallocate(Bx)
+      allocate(Bx(nj, nc))
+      Bx = 0.d0
+      do qq = 1, np_
+        pos = h%pix(h%pptr(k) + qq)
+        do mm = 0, ns - 1
+          idd = (pos - 1) * ns + mm
+          if (tj(idd) /= k) cycle
+          do ee = sj%ptr(idd + 1) + 1, sj%ptr(idd + 2)
+            if (sj%fld(ee) /= 1 .or. sj%cid(ee) < 0) cycle
+            if (tc(sj%cid(ee)) == k) Bx(lj(idd), lc(sj%cid(ee))) = Bx(lj(idd), lc(sj%cid(ee))) + sj%val(ee)
+          enddo
+        enddo
+      enddo
+    end subroutine x_rhs
+
+    !> -sf_flux_hp_verify: vdev <- max(vdev, |Xn - Xr|_max / |Xr|_max).
+    subroutine note_dev(Xn, Xr_)
+      real*8, intent(in) :: Xn(:, :), Xr_(:, :)
+      real*8 :: am
+      am = maxval(abs(Xr_))
+      if (am > 0.d0) vdev = max(vdev, maxval(abs(Xn - Xr_)) / am)
+    end subroutine note_dev
 
     !> Is system `which` slot-diagonal: in every row, the off-slot entries
     !! at most SD_TOL x the row's largest |entry|? (put's check mode, pass 0)
@@ -1179,30 +1581,11 @@ contains
       integer, intent(out)   :: bw, dn
       integer, allocatable :: ipiv(:)
       real*8, allocatable :: Bs(:, :)
-      integer :: info, rr, ncl
+      integer :: info, ncl
 
       ncl = size(Bm, 2)
-      smap = 0
-      do rr = 1, nr
-        smap(rl(rr)) = rr
-      enddo
-      kl = 0; ku = 0; dns = 0; ldab = 1
+      call fill_rows(which, nr, rl)
       allocate(ipiv(nr))
-      do pass = 1, 2
-        if (pass == 2) then
-          if (2 * kl + ku + 1 >= nr) then
-            dns = 1
-            allocate(ab(nr, nr))
-          else
-            ldab = 2 * kl + ku + 1
-            allocate(ab(ldab, nr))
-          endif
-          ab = 0.d0
-        endif
-        do rr = 1, nr
-          call row_entries(which, rl(rr))
-        enddo
-      enddo
       bw = kl + ku + 1;  dn = dns
       allocate(Bs(nr, ncl))
       Bs = Bm(rl(1:nr), :)
@@ -1223,6 +1606,35 @@ contains
       Bm(rl(1:nr), :) = Bs
       deallocate(ab, ipiv, Bs)
     end subroutine solve_rows
+
+    !> ab <- rows rl(1:nr) of system `which` in their order (entries to rows
+    !! outside rl left out): banded (kl, ku, ldab) or dense (dns = 1) where
+    !! the band storage would be larger.
+    subroutine fill_rows(which, nr, rl)
+      integer, intent(in) :: which, nr
+      integer, intent(in) :: rl(:)
+      integer :: rr
+      smap = 0
+      do rr = 1, nr
+        smap(rl(rr)) = rr
+      enddo
+      kl = 0; ku = 0; dns = 0; ldab = 1
+      do pass = 1, 2
+        if (pass == 2) then
+          if (2 * kl + ku + 1 >= nr) then
+            dns = 1
+            allocate(ab(nr, nr))
+          else
+            ldab = 2 * kl + ku + 1
+            allocate(ab(ldab, nr))
+          endif
+          ab = 0.d0
+        endif
+        do rr = 1, nr
+          call row_entries(which, rl(rr))
+        enddo
+      enddo
+    end subroutine fill_rows
 
     !> Row `row` of system wh: its entries in the local numbering, to put
     !! (check mode, band or values).
@@ -1281,6 +1693,16 @@ contains
       if (pass == 0) then
         rmax = max(rmax, abs(v_))
         if (rslot(ckw, ii_) /= rslot(ckw, jj_)) omax = max(omax, abs(v_))
+        return
+      endif
+      if (pass >= 3) then
+        ! solve_refined's off-slot part E: count (3), then fill (4); stored
+        ! zeros add nothing
+        if (v_ == 0.d0 .or. rslot(ckw, ii_) == rslot(ckw, jj_)) return
+        ccnt = ccnt + 1
+        if (pass == 4) then
+          ccol(ccnt) = jj_;  cval(ccnt) = v_
+        endif
         return
       endif
       i2 = smap(ii_);  j2 = smap(jj_)

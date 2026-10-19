@@ -182,7 +182,8 @@ module mod_petsc_pc_sf
   !! all slots, i.e. not with a free boundary); otherwise the SPAI of the
   !! whole M_w (-sf_flux_spai_replicate 0 forces that).
   !! PETSc options: -sf_flux_s1 hpatch | splitm | spai, -sf_flux_hp_p / _r /
-  !! _group / _vel (hpatch, splitm), -sf_flux_hp_q (splitm); -sf_flux_spai_r (spai: C_w's pattern M_w^r, default 2),
+  !! _group / _vel (hpatch, splitm), -sf_flux_hp_q (splitm), -sf_flux_hp_fast /
+  !! _verify (H's rebuild path, mod_petsc_pc_sf_hpatch); -sf_flux_spai_r (spai: C_w's pattern M_w^r, default 2),
   !! -sf_flux_b16, -sf_flux_bend_sign and -sf_flux_bend_form (spai: 0 B_12^T C_w
   !! B_12, default; 1 B_12 C_w B_12^T by MatRARt; 2 the same on the explicit
   !! B_12^T, zero on psi's Dirichlet set), -sf_flux_spai_check,
