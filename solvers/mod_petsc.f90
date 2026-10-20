@@ -541,6 +541,21 @@ contains
     PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
     PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for FGMRES
 
+    ! -jorek_dump_outer <file>: the outer operator in PETSc binary, once
+    ! (diagnostics of the outer matvec's cost)
+    block
+      character(len=256) :: dfile
+      PetscBool :: dset
+      PetscViewer :: dv
+      logical, save :: dumped = .false.
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_dump_outer", dfile, dset, ierr)
+      if (dset .and. .not. dumped) then
+        call PetscViewerBinaryOpen(comm, trim(dfile), FILE_MODE_WRITE, dv, ierr)
+        call MatView(petsc_sys%A_aij, dv, ierr)
+        call PetscViewerDestroy(dv, ierr)
+        dumped = .true.
+      endif
+    end block
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
