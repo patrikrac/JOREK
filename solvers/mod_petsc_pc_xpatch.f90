@@ -20,11 +20,18 @@
 !! SOL and the core lattice (they share the value and the cross-line
 !! derivative DOFs, not the along-line one: the separatrix bends there).
 !!
-!! CLASSIFICATION. An element is inside the separatrix when the mean psi_n
-!! of its vertices is below 1 (psi_n from the axis and the X-point node);
-!! inside and above the X-point is the core, inside and below is the private
-!! region, the rest the SOL. Only the lower single null is handled. A patch
-!! that does not come out logically rectangular is refused.
+!! CLASSIFICATION. By the grid's topology, not by psi: once the plasma has
+!! evolved, the current psi_n = 1 no longer runs along the grid's separatrix
+!! and the elements next to it would change patch (43 of 4352 on the 41x65
+!! deck at t ~ 1000, which broke the core's rectangle). The core is every
+!! element within the shallowest breadth-first layer from the axis that
+!! touches the X-point (layer k = flux ring k + 1, the SOL meets the core
+!! only across the separatrix). The eight elements around the X-point form a
+!! cycle core, core, SOL, SOL, private, private, SOL, SOL; the private region
+!! is the flood fill from its two X-point elements that does not cross the
+!! two leg separatrices, walked edge by edge from the X-point to the
+!! targets; the rest is the SOL. Only the lower single null is handled. A
+!! patch that does not come out logically rectangular is refused.
 !!
 !! OVERLAP. delta element rows are hung off a patch by pure B steps, so the
 !! core's periodic seam and the private region's seam stay cuts: below the
@@ -90,9 +97,6 @@ contains
 
     integer :: nn, ne, e, k, n, c, pax, pxp, j
     integer, allocatable :: pid(:), pcnt(:), cls(:), owner(:)
-    real*8, allocatable  :: psn(:)
-    real*8 :: psi_ax, psi_x, z_x, zc, pm
-    integer :: n_ax, n_xp
 
     ok = .false.; msg = ""
     if (xcase /= LOWER_XPOINT) then
@@ -118,35 +122,10 @@ contains
       msg = "no X-point (no position with four co-located nodes)"
       return
     endif
-    n_ax = 0; n_xp = 0
-    do n = 1, nn
-      if (pid(n) == pax .and. n_ax == 0) n_ax = n
-      if (pid(n) == pxp .and. n_xp == 0) n_xp = n
-    enddo
-
-    !--- classification by psi_n and the X-point's Z
-    psi_ax = node_list%node(n_ax)%values(1, 1, 1)
-    psi_x  = node_list%node(n_xp)%values(1, 1, 1)
-    z_x    = node_list%node(n_xp)%x(1, 1, 2)
-    allocate(psn(nn), cls(ne))
-    do n = 1, nn
-      psn(n) = (node_list%node(n)%values(1, 1, 1) - psi_ax) / (psi_x - psi_ax)
-    enddo
-    do e = 1, ne
-      pm = 0.d0; zc = 0.d0
-      do k = 1, 4
-        pm = pm + psn(element_list%element(e)%vertex(k))
-        zc = zc + node_list%node(element_list%element(e)%vertex(k))%x(1, 1, 2)
-      enddo
-      pm = pm / 4; zc = zc / 4
-      if (pm < 1.d0 .and. zc > z_x) then
-        cls(e) = XP_CORE
-      else if (pm < 1.d0) then
-        cls(e) = XP_PRIV
-      else
-        cls(e) = XP_SOL
-      endif
-    enddo
+    !--- classification by the grid's topology (not by the evolving psi)
+    allocate(cls(ne))
+    call classify_topological(pid, pax, pxp, cls, ok, msg)
+    if (.not. ok) return
 
     !--- the patches
     do c = 1, XP_NPATCH
@@ -486,6 +465,201 @@ contains
       pcnt(pid(n)) = pcnt(pid(n)) + 1
     enddo
   end subroutine position_ids
+
+  !--------------------------------------------------------------------
+  !> cls(e) = XP_CORE / XP_SOL / XP_PRIV from the element adjacency alone
+  !! (see CLASSIFICATION in the module header). pax / pxp: the axis and
+  !! X-point position ids. ok = .false. (and msg) when the grid around the
+  !! X-point is not the single-null pattern.
+  !--------------------------------------------------------------------
+  subroutine classify_topological(pid, pax, pxp, cls, ok, msg)
+    use nodes_elements, only: element_list
+    integer, intent(in)           :: pid(:), pax, pxp
+    integer, intent(out)          :: cls(:)
+    logical, intent(out)          :: ok
+    character(len=*), intent(out) :: msg
+
+    integer :: ne, e, k, nb_, q, head, tail, rstar, nx, i, leg, s, p, s2, p2, last, qpos, a, b
+    integer :: xel(8), xadj(2, 8), ring(6), cores(2), nc, nsep
+    integer, allocatable :: depth(:), queue(:), sep(:,:)
+    logical :: found
+
+    ok = .false.
+    ne = element_list%n_elements
+    allocate(depth(ne), queue(ne), sep(2, ne))
+
+    !--- the core: breadth-first layers from the axis elements
+    depth = -1
+    tail = 0
+    do e = 1, ne
+      if (has_pos(e, pax)) then
+        depth(e) = 0; tail = tail + 1; queue(tail) = e
+      endif
+    enddo
+    head = 1
+    do while (head <= tail)
+      e = queue(head); head = head + 1
+      do k = 1, 4
+        nb_ = element_list%element(e)%neighbours(k)
+        if (nb_ <= 0 .or. nb_ > ne) cycle
+        if (depth(nb_) >= 0) cycle
+        if (.not. edge_of(e, nb_, a, b)) cycle
+        depth(nb_) = depth(e) + 1; tail = tail + 1; queue(tail) = nb_
+      enddo
+    enddo
+    nx = 0
+    do e = 1, ne
+      if (.not. has_pos(e, pxp)) cycle
+      nx = nx + 1
+      if (nx > 8) exit
+      xel(nx) = e
+    enddo
+    if (nx /= 8) then
+      write(msg, '(A,I0,A)') "the X-point has ", nx, " elements around it, not 8"; return
+    endif
+    rstar = minval(depth(xel))
+    if (rstar < 0) then
+      msg = "the X-point is not connected to the axis"; return
+    endif
+    do e = 1, ne
+      cls(e) = XP_SOL
+      if (depth(e) >= 0 .and. depth(e) <= rstar) cls(e) = XP_CORE
+    enddo
+
+    !--- the cycle of the X-point's elements: core, core, s, s, p, p, s, s
+    do i = 1, 8
+      q = 0
+      do k = 1, 8
+        if (k == i) cycle
+        if (.not. edge_of(xel(i), xel(k), a, b)) cycle
+        if (a /= pxp .and. b /= pxp) cycle
+        q = q + 1
+        if (q <= 2) xadj(q, i) = k
+      enddo
+      if (q /= 2) then
+        msg = "the elements around the X-point do not form a cycle"; return
+      endif
+    enddo
+    nc = 0
+    do i = 1, 8
+      if (cls(xel(i)) /= XP_CORE) cycle
+      nc = nc + 1
+      if (nc <= 2) cores(nc) = i
+    enddo
+    if (nc /= 2 .or. all(xadj(:, cores(1)) /= cores(2))) then
+      msg = "the X-point does not have two adjacent core elements"; return
+    endif
+    last = cores(1); i = cores(2)
+    do q = 1, 6
+      k = xadj(1, i)
+      if (k == last) k = xadj(2, i)
+      ring(q) = k; last = i; i = k
+      if (cls(xel(k)) == XP_CORE) then
+        msg = "more than two core elements at the X-point"; return
+      endif
+    enddo
+
+    !--- the two leg separatrices, edge by edge from the X-point to the targets
+    nsep = 0
+    do leg = 1, 2
+      if (leg == 1) then
+        s = xel(ring(2)); p = xel(ring(3))
+      else
+        s = xel(ring(5)); p = xel(ring(4))
+      endif
+      last = pxp
+      do
+        if (.not. edge_of(s, p, a, b)) then
+          msg = "broken leg separatrix"; return
+        endif
+        nsep = nsep + 1; sep(:, nsep) = [a, b]
+        qpos = a
+        if (a == last) qpos = b
+        found = .false.
+        do k = 1, 4
+          s2 = element_list%element(s)%neighbours(k)
+          if (.not. leg_step(s, s2, p, qpos)) cycle
+          do i = 1, 4
+            p2 = element_list%element(p)%neighbours(i)
+            if (.not. leg_step(p, p2, s, qpos)) cycle
+            if (.not. edge_of(s2, p2, a, b)) cycle
+            if (a /= qpos .and. b /= qpos) cycle
+            found = .true.; exit
+          enddo
+          if (found) exit
+        enddo
+        if (.not. found) exit                     ! qpos is on the target
+        last = qpos; s = s2; p = p2
+        if (nsep >= ne) then
+          msg = "the leg separatrix does not end"; return
+        endif
+      enddo
+    enddo
+
+    !--- the private region: flood from its X-point elements, not across the legs
+    tail = 0
+    do q = 3, 4
+      e = xel(ring(q)); cls(e) = XP_PRIV; tail = tail + 1; queue(tail) = e
+    enddo
+    head = 1
+    do while (head <= tail)
+      e = queue(head); head = head + 1
+      do k = 1, 4
+        nb_ = element_list%element(e)%neighbours(k)
+        if (nb_ <= 0 .or. nb_ > ne) cycle
+        if (cls(nb_) /= XP_SOL) cycle
+        if (.not. edge_of(e, nb_, a, b)) cycle
+        if (any(sep(1, 1:nsep) == a .and. sep(2, 1:nsep) == b)) cycle
+        cls(nb_) = XP_PRIV; tail = tail + 1; queue(tail) = nb_
+      enddo
+    enddo
+    ok = .true.
+
+  contains
+
+    logical function has_pos(e1, ps)
+      integer, intent(in) :: e1, ps
+      integer :: kk
+      has_pos = .false.
+      do kk = 1, 4
+        if (pid(element_list%element(e1)%vertex(kk)) == ps) has_pos = .true.
+      enddo
+    end function has_pos
+
+    !> e1 and e2 share an edge (two vertex positions); pa < pb its positions.
+    logical function edge_of(e1, e2, pa, pb)
+      integer, intent(in)  :: e1, e2
+      integer, intent(out) :: pa, pb
+      integer :: k1, k2, ns, sp(4), p1
+      ns = 0
+      do k1 = 1, 4
+        p1 = pid(element_list%element(e1)%vertex(k1))
+        if (any(sp(1:ns) == p1)) cycle
+        do k2 = 1, 4
+          if (pid(element_list%element(e2)%vertex(k2)) == p1) then
+            ns = ns + 1; sp(ns) = p1; exit
+          endif
+        enddo
+      enddo
+      edge_of = (ns == 2)
+      pa = 0; pb = 0
+      if (edge_of) then
+        pa = min(sp(1), sp(2)); pb = max(sp(1), sp(2))
+      endif
+    end function edge_of
+
+    !> e2, an edge neighbour of e1 other than its partner o1 and not core,
+    !! whose shared edge with e1 runs through position ps.
+    logical function leg_step(e1, e2, o1, ps)
+      integer, intent(in) :: e1, e2, o1, ps
+      integer :: pa, pb
+      leg_step = .false.
+      if (e2 <= 0 .or. e2 > ne .or. e2 == o1) return
+      if (cls(e2) == XP_CORE) return
+      if (.not. edge_of(e1, e2, pa, pb)) return
+      leg_step = (pa == ps .or. pb == ps)
+    end function leg_step
+  end subroutine classify_topological
 
   !> Stable merge sort of ord by (k1, k2).
   subroutine msort(ord, k1, k2)
