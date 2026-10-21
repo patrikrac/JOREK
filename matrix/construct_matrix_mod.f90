@@ -178,7 +178,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
       call get_element_and_nodes(ielm, element, element_father, nodes, nodes_father, aux_nodes, harmonic_matrix)
 
       ! --- Build element matrix
-      call build_element_matrix(element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint, omp_tid, ife, n_local_elms, node_list, a_mat%i_tor_min, a_mat%i_tor_max, aux_nodes, harmonic_matrix)
+      call build_element_matrix(element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint, omp_tid, ife, ielm, n_local_elms, node_list, a_mat%i_tor_min, a_mat%i_tor_max, aux_nodes, harmonic_matrix)
 
       ! --- Transform basis functions for axis nodes if required
       if(treat_axis .and. (nodes(1)%axis_node .or. nodes(2)%axis_node .or. nodes(3)%axis_node .or. nodes(4)%axis_node) ) then
@@ -314,7 +314,7 @@ end subroutine decrypt_index
 
 subroutine build_element_matrix(element, nodes, xpoint2, xcase2, R_axis,         &
       &                             Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint,   &
-      &                             omp_tid, ife, n_local_elms, node_list, i_tor_min, i_tor_max, &
+      &                             omp_tid, ife, ielm, n_local_elms, node_list, i_tor_min, i_tor_max, &
                                     aux_nodes, harmonic_matrix)
 
   use mod_parameters,           only : n_tor, jorek_model, n_vertex_max, n_degrees, unified_element_matrix, n_var
@@ -338,6 +338,7 @@ subroutine build_element_matrix(element, nodes, xpoint2, xcase2, R_axis,        
   real*8,                           intent(in)     :: Z_xpoint(2)
   integer,                          intent(in)     :: omp_tid
   integer,                          intent(in)     :: ife
+  integer,                          intent(in)     :: ielm
   integer,                          intent(in)     :: n_local_elms
   integer,                          intent(in)     :: i_tor_min   
   integer,                          intent(in)     :: i_tor_max   
@@ -347,7 +348,8 @@ subroutine build_element_matrix(element, nodes, xpoint2, xcase2, R_axis,        
   
   ! -- internal parameters
   integer :: iv, iv2, iv3, iv4, inode1, inode2, inode3, inode4, i, j
-  !integer :: vertex(2), direction(n_degrees_1d), bnd1, bnd2, side1, side2
+  integer :: vertex(2), direction(n_degrees_1d), bnd1, bnd2, side1, side2
+  type (type_node) :: bnd_nodes(n_vertex_max)   ! the edge's nodes, rotated for boundary_matrix_open
   integer :: i_max   
   integer :: n_tor_local
 
@@ -374,8 +376,114 @@ subroutine build_element_matrix(element, nodes, xpoint2, xcase2, R_axis,        
       i_tor_min, i_tor_max, aux_nodes)
   endif
 
+  ! --- Apply sheath boundary conditions at the targets
   if (bc_natural_open) then
-    ! ... (Implementation of sheath boundary conditions as in original) ...
+    ! --- Loop over the 4 nodes
+    do iv = 1, n_vertex_max
+      
+      iv2  = mod(iv, n_vertex_max) + 1
+      iv3 = mod(iv2, n_vertex_max) + 1
+      iv4 = mod(iv3, n_vertex_max) + 1
+      
+      inode1 = element%vertex(iv)
+      inode2 = element%vertex(iv2)
+      inode3 = element%vertex(iv3)
+      inode4 = element%vertex(iv4)
+      
+      bnd1 = node_list%node(inode1)%boundary
+      bnd2 = node_list%node(inode2)%boundary
+      
+      ! --- carry on only if on boundary
+      if ( (bnd1 .eq. 0) .or. (bnd2 .eq. 0)) cycle
+      
+      bnd_nodes(1) = node_list%node(inode1)
+      bnd_nodes(2) = node_list%node(inode2)
+      bnd_nodes(3) = node_list%node(inode3)
+      bnd_nodes(4) = node_list%node(inode4)
+
+      vertex    = (/ iv, iv2 /)
+      
+      if ( (grid_to_wall) .and. (n_wall_blocks .gt. 0) ) then
+        side1 = 0                  ; side2 = 0
+        if (bnd1 .eq. 1) side1 = 2 ; if (bnd2 .eq. 1) side2 = 2
+        if (bnd1 .eq.11) side1 = 2 ; if (bnd2 .eq.11) side2 = 2
+        if (bnd1 .eq. 5) side1 = 3 ; if (bnd2 .eq. 5) side2 = 3
+        if (bnd1 .eq.15) side1 = 3 ; if (bnd2 .eq.15) side2 = 3
+        if (bnd1 .eq. 2) side1 = 3 ; if (bnd2 .eq. 2) side2 = 3
+        if (bnd1 .eq.12) side1 = 2 ; if (bnd2 .eq.12) side2 = 2
+        if (bnd1 .eq. 4) side1 = 2 ; if (bnd2 .eq. 4) side2 = 2
+        direction(1) = 1
+        if     ( (side1 .eq. 2) .or. (side2 .eq. 2) ) then
+          direction(2) = 2
+          if (n_order .ge. 5) direction(3) = 5
+        elseif ( (side1 .eq. 3) .or. (side2 .eq. 3) ) then
+          direction(2) = 3
+          if (n_order .ge. 5) direction(3) = 6
+        endif
+        ! --- This should never happen, but just in case...
+        if (     ((side1 .eq. 2) .and. (side2 .eq. 3)) &
+            .or. ((side1 .eq. 3) .and. (side2 .eq. 2)) ) then
+          write(*,'(A,4i8)') 'WARNING: boundary_matrix_open, boundary element incoherent ',&
+                             inode1,node_list%node(inode1)%boundary,inode2,node_list%node(inode2)%boundary  
+          cycle
+        endif
+      else
+        ! --- The target has boundary 1 or 3
+        direction(1) = 1
+        if ((bnd1 .eq. 9) .and. (bnd2 .eq. 9)) then ! for removed triangle, we get 9 - 9 boundary, where it could be either s=const or t=const
+          ! so we use the fact that the nodes are consistently defining which sides are the s and t sides (identical to that in grids/mod_boundary.f90)
+          if ( mod(iv,2) == 1 ) then
+            direction(2) = 2
+          else
+            direction(2) = 3
+          end if
+            
+        elseif ( (  ((bnd1 .eq. 1) .or. (bnd1 .eq. 3)) .and. ((bnd2 .eq. 1) .or. (bnd2 .eq. 3))  ) &
+            .or. (  ((bnd1 .eq. 1) .or. (bnd1 .eq. 9)) .and. ((bnd2 .eq. 1) .or. (bnd2 .eq. 9))  ) &
+            .or. (  ((bnd1 .eq. 4) .or. (bnd1 .eq. 9)) .and. ((bnd2 .eq. 4) .or. (bnd2 .eq. 9))  ) &
+            .or. (  ((bnd1 .eq. 1) .or. (bnd1 .eq. 4)) .and. ((bnd2 .eq. 4) .or. (bnd2 .eq. 1))  ) ) then
+          
+          direction(2) = 2
+          if (n_order .ge. 5) direction(3) = 5
+          
+        elseif (  ((bnd1 .eq. 5) .or. (bnd1 .eq. 9)) .and. ((bnd2 .eq. 5) .or. (bnd2 .eq. 9)) ) then
+          
+          direction(2) = 3
+          if (n_order .ge. 5) direction(3) = 6
+          
+        elseif (  ((bnd1 .eq. 2) .or. (bnd1 .eq. 3)) .and. ((bnd2 .eq. 2) .or. (bnd2 .eq. 3)) ) then
+          
+          direction(2) = 3
+          if (n_order .ge. 5) direction(3) = 6
+          
+        else
+          write(*,'(A,4i8)') 'WARNING: boundary_matrix_open, boundary element not included ',&
+                             inode1,node_list%node(inode1)%boundary,inode2,node_list%node(inode2)%boundary  
+          cycle
+        endif
+      endif
+
+      ! sanity check of the above code: the side between node 1 and 2 (iv=1), and nodes 3 and 4 (iv=3) should have direction(2)=2 (i.e. t=const.), while 
+      ! the other two sides between nodes 2 and 3 (iv=2), and 4 and 1 (iv=4) should have direction(2)=3 (i.e. s=cont.)
+      if (((direction(2)==2) .and. ( mod(iv,2) /= 1 )) .or. ((direction(2)==3) .and. (mod(iv,2) /= 0))) then
+        !$omp critical
+        write(*,"(A,3I6)") "ERROR: There seems to be an inconsistency in direction(2) in matrix/construct_matrix_mod.f90, (direction(2) / iv / node)=", direction(2),iv,inode1
+        !$omp end critical
+      end if
+        
+
+      ! --- Build matrix elements for boundary
+#if JOREK_MODEL == 183
+      call boundary_matrix_open(vertex, direction, element, bnd_nodes, & 
+                                xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint, &
+                                thread_struct(omp_tid)%ELM, thread_struct(omp_tid)%RHS, i_tor_min, i_tor_max, ielm)
+#else
+      call boundary_matrix_open(vertex, direction, element, bnd_nodes, &
+                                xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint, &
+                                thread_struct(omp_tid)%ELM, thread_struct(omp_tid)%RHS, i_tor_min, i_tor_max)
+#endif
+
+    enddo
   endif
 
   n_tor_local = i_tor_max - i_tor_min + 1
