@@ -249,6 +249,18 @@ module mod_petsc_pc_gmg
   integer, allocatable, save :: fine_col(:)  !< X-point grids: level-0 row -> radial column
   logical, save :: xgrid = .false.           !< the hierarchy is an X-point grid's (virtual lattice)
   type(xring_t), save :: xrg(0:MAX_LEV-1)    !< X-point grids: ring tables per level
+  ! X-point grids on several ranks: JOREK numbers the divertor legs column by
+  ! column (every private and SOL ring at one poloidal position), so a rank
+  ! there holds short pieces of all leg rings and the ring overlap completes
+  ! each of them (xg65 at 64 ranks: 572% ghost rows, closed grid 152%). The
+  ! hierarchy then works in its own layout: the same rows per rank, the DOFs
+  ! in ring-major order. xp_is: old global row of every new local row;
+  ! xp_A = A(xp_is, xp_is); xp_sc scatters the PC's vectors in and out.
+  logical, save :: xperm = .false.
+  IS, save :: xp_is
+  Mat, save :: xp_A
+  Vec, save :: xp_b, xp_x
+  VecScatter, save :: xp_sc
   integer, save :: nth0 = 0                  !< n_tht (level-0 nj)
   integer, save :: nf_s = 0, cur_lev = 0
   integer, save :: sm_type = 0, sm_nstep = 4
@@ -302,6 +314,11 @@ module mod_petsc_pc_gmg
     integer, allocatable :: fine_node(:), fine_harm(:), fine_col(:)
     logical :: xgrid = .false.
     type(xring_t) :: xrg(0:MAX_LEV-1)
+    logical :: xperm = .false.
+    IS :: xp_is
+    Mat :: xp_A
+    Vec :: xp_b, xp_x
+    VecScatter :: xp_sc
   end type gmg_inst_t
   type(gmg_inst_t), save :: inst(MAX_INST)
   integer, save :: cur_inst = 1
@@ -361,6 +378,7 @@ contains
       if (allocated(fine_harm)) call move_alloc(fine_harm, S%fine_harm)
       if (allocated(fine_col)) call move_alloc(fine_col, S%fine_col)
       S%xgrid = xgrid
+      S%xperm = xperm; S%xp_is = xp_is; S%xp_A = xp_A; S%xp_b = xp_b; S%xp_x = xp_x; S%xp_sc = xp_sc
       do g = 0, MAX_LEV - 1
         if (allocated(xrg(g)%nn)) call move_alloc(xrg(g)%nn, S%xrg(g)%nn)
         if (allocated(xrg(g)%per)) call move_alloc(xrg(g)%per, S%xrg(g)%per)
@@ -385,6 +403,7 @@ contains
       if (allocated(S%fine_harm)) call move_alloc(S%fine_harm, fine_harm)
       if (allocated(S%fine_col)) call move_alloc(S%fine_col, fine_col)
       xgrid = S%xgrid
+      xperm = S%xperm; xp_is = S%xp_is; xp_A = S%xp_A; xp_b = S%xp_b; xp_x = S%xp_x; xp_sc = S%xp_sc
       do g = 0, MAX_LEV - 1
         if (allocated(S%xrg(g)%nn)) call move_alloc(S%xrg(g)%nn, xrg(g)%nn)
         if (allocated(S%xrg(g)%per)) call move_alloc(S%xrg(g)%per, xrg(g)%per)
@@ -713,7 +732,15 @@ contains
     PetscErrorCode :: ierr
     call gmg_select(k)
     call PetscLogEventBegin(gev_vcycle(cur_inst), ierr)
-    call vcycle(0, b, x)
+    if (xperm) then
+      call VecScatterBegin(xp_sc, b, xp_b, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call VecScatterEnd(xp_sc, b, xp_b, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      call vcycle(0, xp_b, xp_x)
+      call VecScatterBegin(xp_sc, xp_x, x, INSERT_VALUES, SCATTER_REVERSE, ierr)
+      call VecScatterEnd(xp_sc, xp_x, x, INSERT_VALUES, SCATTER_REVERSE, ierr)
+    else
+      call vcycle(0, b, x)
+    endif
     call PetscLogEventEnd(gev_vcycle(cur_inst), ierr)
     ierr = 0
   end subroutine vcycle_of
@@ -1413,6 +1440,49 @@ contains
     if (len_trim(msg) > 0) then
       call fail(trim(msg)); return
     endif
+    !--- several ranks: the hierarchy's own layout, ring-major (see xperm)
+    xperm = .false.
+    q = 1
+    call opt_int("xperm", q)
+    if (q > 0 .and. np > 1) then
+      block
+        integer, allocatable :: ord(:), okey(:), own0(:), lpos0(:)
+        PetscInt, allocatable :: ix(:)
+        integer :: nj1, rk_, fill_
+        own0 = ly(0)%own; lpos0 = ly(0)%lpos
+        nj1 = maxval(xl(0)%rJ(1:xl(0)%n)) + 1
+        allocate(ord(n_idx), okey(n_idx))
+        do idx = 0, n_idx - 1
+          ord(idx + 1) = idx
+          k = xl(0)%lmap(idx + 1)
+          okey(idx + 1) = huge(1)                 ! outside the patches (refused below)
+          if (k > 0) okey(idx + 1) = xl(0)%rI(k) * nj1 + xl(0)%rJ(k)
+        enddo
+        call sort_rows_by_key(ord, okey)          ! stable: a node's DOFs stay together
+        rk_ = 0; fill_ = 0
+        do k = 1, n_idx
+          do while (fill_ >= ly(0)%nl(rk_))
+            rk_ = rk_ + 1; fill_ = 0
+          enddo
+          ly(0)%own(ord(k)) = rk_; ly(0)%lpos(ord(k)) = fill_
+          fill_ = fill_ + 1
+        enddo
+        nloc = n_fields * pc_ntor * ly(0)%nl(me)
+        allocate(ix(nloc))
+        do idx = 0, n_idx - 1
+          if (ly(0)%own(idx) /= me) cycle
+          do ff = 0, n_fields - 1
+            do mm = 0, pc_ntor - 1
+              lr = (ff * ly(0)%nl(me) + ly(0)%lpos(idx)) * pc_ntor + mm + 1
+              ix(lr) = ly(0)%ps(own0(idx)) + (ff * ly(0)%nl(own0(idx)) + lpos0(idx)) * pc_ntor + mm
+            enddo
+          enddo
+        enddo
+        call ISCreateGeneral(comm, int(nloc, kind(rs0)), ix, PETSC_COPY_VALUES, xp_is, ierr)
+      end block
+      xperm = .true.
+    endif
+
     nlev = 1
     shape = ""
     do g = 1, min(MAX_LEV, max(nlev_cap, 2)) - 1
@@ -1876,9 +1946,9 @@ contains
     end subroutine level_dofs
 
     !> P(gg) as scalar triplets (rr: level gg-1 DOF, cc: level gg DOF,
-    !! 0-based) in rr/cc/ww(1:ntrip), every patch's elements; a fine row
-    !! seen by several (coarse cell, fine element, slot) instances gets
-    !! their average.
+    !! 0-based) in rr/cc/ww(1:ntrip) of the rank's own fine rows, every
+    !! patch's elements; a fine row seen by several (coarse cell, fine
+    !! element, slot) instances gets their average.
     subroutine make_p(gg)
       integer, intent(in) :: gg
       integer :: cp, aa, bb, kc, dc, da, db, kf, dq, fr, gc, t, cap, i0, j0, e, u, v, nrow
@@ -1889,13 +1959,6 @@ contains
       if (allocated(cnt)) deallocate(cnt)
       allocate(cnt(nrow))
       cnt = 0
-      cap = 0
-      do cp = 1, XP_NPATCH
-        cap = cap + xl(gg)%p(cp)%na * xl(gg)%p(cp)%nb * 16 * 4 * 16
-      enddo
-      if (allocated(rr)) deallocate(rr, cc, ww)
-      allocate(rr(cap), cc(cap), ww(cap))
-      ntrip = 0
       do cp = 1, XP_NPATCH
         associate (Lf => xl(gg - 1)%p(cp), Lc => xl(gg)%p(cp), Xf => xl(gg - 1), Xc => xl(gg))
         do bb = 0, Lc%nb - 1
@@ -1908,11 +1971,26 @@ contains
                     fr = Xf%lmap(node_list%node(Lf%vt(kf, Lc%a0(aa) + da, Lc%b0(bb) + db))%index(dq))
                     if (fr == 0) cycle
                     if (drop(Xf%dof(fr))) cycle
+                    if (ly(gg - 1)%own(fr - 1) /= me) cycle
                     cnt(fr) = cnt(fr) + 1
                   enddo
                 enddo
               enddo
             enddo
+          enddo
+        enddo
+        end associate
+      enddo
+      ! at most one triplet per (instance, coarse DOF of its cell)
+      cap = 16 * sum(cnt)
+      if (allocated(rr)) deallocate(rr, cc, ww)
+      allocate(rr(max(cap, 1)), cc(max(cap, 1)), ww(max(cap, 1)))
+      ntrip = 0
+      do cp = 1, XP_NPATCH
+        associate (Lf => xl(gg - 1)%p(cp), Lc => xl(gg)%p(cp), Xf => xl(gg - 1), Xc => xl(gg))
+        do bb = 0, Lc%nb - 1
+          do aa = 0, Lc%na - 1
+            Sc = Lc%sz(:, :, aa, bb)
             do kc = 1, 4
               do dc = 1, 4
                 gc = Xc%lmap(node_list%node(Lc%vt(kc, aa, bb))%index(dc))
@@ -1933,6 +2011,7 @@ contains
                         fr = Xf%lmap(node_list%node(Lf%vt(kf, Lc%a0(aa) + da, Lc%b0(bb) + db))%index(dq))
                         if (fr == 0) cycle
                         if (drop(Xf%dof(fr))) cycle
+                        if (ly(gg - 1)%own(fr - 1) /= me) cycle
                         if (Dm(dq, kf) == 0.d0) cycle
                         ntrip = ntrip + 1
                         rr(ntrip) = fr; cc(ntrip) = gc; ww(ntrip) = Dm(dq, kf)
@@ -2250,6 +2329,25 @@ contains
 
     call gmg_register_events()
     gA(0) = A
+    if (xperm) then
+      ! the hierarchy's ring-major copy of A (see xperm); the scatter once
+      if (op_ready .and. reuse) then
+        call MatCreateSubMatrix(A, xp_is, xp_is, MAT_REUSE_MATRIX, xp_A, ierr)
+      else
+        if (op_ready) call MatDestroy(xp_A, ierr)
+        call MatCreateSubMatrix(A, xp_is, xp_is, MAT_INITIAL_MATRIX, xp_A, ierr)
+      endif
+      if (.not. op_ready) then
+        call MatCreateVecs(xp_A, xp_x, xp_b, ierr)
+        block
+          Vec :: va
+          call MatCreateVecs(A, va, PETSC_NULL_VEC, ierr)
+          call VecScatterCreate(va, xp_is, xp_b, PETSC_NULL_IS, xp_sc, ierr)
+          call VecDestroy(va, ierr)
+        end block
+      endif
+      gA(0) = xp_A
+    endif
     call PetscLogEventBegin(gev_ptap, ierr)
     do g = 1, nlev - 1
       if (reuse) then
@@ -2349,14 +2447,13 @@ contains
     axsec = 0
     if (axis_k /= 0) axsec = o%axis_sectors
     if (axis_k /= 0) call opt_int("axis_sectors", axsec)
-    ! X-point grids: the overlaps and the axis J-sectors find a line's or the
-    ! axis's continuation by the polar (I, J); not yet on the virtual
-    ! lattice, so lines and rings cut by a rank boundary are solved per rank
-    ! (block Jacobi there) and the axis block by its LU
-    if (xgrid .and. (lovl > 0 .or. rovl > 0 .or. axsec /= 0)) then
+    ! X-point grids: the axis J-sectors split the axis block by the polar J,
+    ! not yet on the virtual lattice (its LU instead); the line and ring
+    ! overlaps walk the virtual lattice (rings, columns)
+    if (xgrid .and. axsec /= 0) then
       if (my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   GMG", cur_inst, &
-        ": X-point grid, line / ring overlap and axis J-sectors off"
-      lovl = 0; rovl = 0; axsec = 0
+        ": X-point grid, axis J-sectors off"
+      axsec = 0
     endif
     ! Levels g >= rich_from smooth with Richardson on the same blocks instead
     ! of GMRES: no norm, no inner product, so no global reduction below that
@@ -3491,9 +3588,9 @@ contains
     PetscErrorCode :: ierr
     logical :: has_o
     integer :: nc, nr, r, bb, I, J, m, ilim, d, q, t, ngh, nlo, mpierr, code, nkey, qtot
-    integer :: gtot(2), gloc(2), dmax, ninc
+    integer :: gtot(2), gloc(2), dmax, ninc, ncd
     integer, allocatable :: Ia(:), Ib(:), blkof(:), gb(:), gI(:), nsz(:), noff(:), nrows(:), fill(:)
-    integer, allocatable :: tb(:), tI(:), tJ(:), gJ(:), lst(:), rkey(:)
+    integer, allocatable :: tb(:), tI(:), tJ(:), gJ(:), lst(:), rk(:)
     PetscInt, allocatable :: cand(:), gl(:), tl(:), perm(:)
 
     nr = B%nrow
@@ -3502,12 +3599,21 @@ contains
     else
       nc = glv(g)%nj
     endif
+    ! an X-point grid's lines are its virtual lattice's columns (node_of
+    ! returns the column as J there), which can outnumber the ring positions
+    ncd = nc
+    if (xgrid .and. .not. rings) then
+      do r = 1, nr
+        ncd = max(ncd, row_col(g, r, 0) + 1)
+      enddo
+      call MPI_Allreduce(MPI_IN_PLACE, ncd, 1, MPI_INTEGER, MPI_MAX, gcomm, mpierr)
+    endif
     ilim = 0
     if (axis_k /= 0) ilim = axis_lim(g)
     ! the local segments, and the block of every (line or ring, slot): a line
     ! is keyed by J, a ring by I; every slot of the block is registered (a
     ! block holds a harmonic's cos and sin slots, with harm_pair 2 all slots)
-    nkey = nc
+    nkey = ncd
     if (rings) then
       nkey = 1
       do r = 1, nr
@@ -3539,7 +3645,7 @@ contains
     call VecGetArray(kv, kp, ierr)
     do r = 1, nr
       call node_of(r, I, J, m)
-      kp(r) = dble((I * nc + J) * pc_ntor + m)
+      kp(r) = dble((I * ncd + J) * pc_ntor + m)
     enddo
     call VecRestoreArray(kv, kp, ierr)
     call MatGetSize(A, nglob, PETSC_NULL_INTEGER, ierr)
@@ -3576,7 +3682,7 @@ contains
       q = 0
       do k = 1, ns
         code = nint(cp(k))
-        m = mod(code, pc_ntor); J = mod(code / pc_ntor, nc); I = code / pc_ntor / nc
+        m = mod(code, pc_ntor); J = mod(code / pc_ntor, ncd); I = code / pc_ntor / ncd
         if (I <= ilim) cycle
         if (rings) then
           ! same ring and slot as a local ring block; the walk bounds the reach
@@ -3586,7 +3692,9 @@ contains
         else
           bb = blkof(J * pc_ntor + m)
           if (bb == 0) cycle
-          if (.not. ((I < Ia(bb) .and. Ia(bb) - I <= lovl) .or. (I > Ib(bb) .and. I - Ib(bb) <= lovl))) cycle
+          ! X-point grid: a column's ring indices jump at the separatrix (core
+          ! | private | SOL numbering), so the walk depth alone bounds the reach
+          if (.not. xgrid .and. .not. ((I < Ia(bb) .and. Ia(bb) - I <= lovl) .or. (I > Ib(bb) .and. I - Ib(bb) <= lovl))) cycle
         endif
         q = q + 1
         tl(q) = tl(k); tb(q) = bb; tI(q) = I; tJ(q) = J
@@ -3670,43 +3778,46 @@ contains
     ! first) its J +- 1 couplings span the ring, and a ring cut by a rank
     ! boundary was factored dense -- at 321x128, 4096 rows per cos/sin block.
     if (rings) then
-      allocate(rkey(nr + ngh))
+      allocate(rk(nr + ngh))
       do r = 1, nr + ngh
         if (r <= nr) then
           call node_of(r, I, J, m)
         else
-          J = gJ(r - nr)
+          I = gI(r - nr); J = gJ(r - nr)
         endif
-        rkey(r) = ring_key(J, nc)
+        rk(r) = rkey(g, I, J, nc)
       enddo
       do bb = 1, B%nb
         if (nsz(bb) == B%sz(bb)) cycle
-        call sort_rows_by_key(nrows(noff(bb) + 1 : noff(bb) + nsz(bb)), rkey)
+        call sort_rows_by_key(nrows(noff(bb) + 1 : noff(bb) + nsz(bb)), rk)
       enddo
       ! every ring block must now span its ring (a cut ring leaves the
       ! poloidal Alfven coupling across the cut outside the block)
       ninc = 0
       block
         logical :: seen(0:nc - 1)
+        integer :: nring
         do bb = 1, B%nb
           if (B%axblk(bb) .or. Ia(bb) < 0) cycle
           seen = .false.
+          nring = nc
           do q = 1, nsz(bb)
             r = nrows(noff(bb) + q) + 1
             if (r <= nr) then
               call node_of(r, I, J, m)
             else
-              J = gJ(r - nr)
+              I = gI(r - nr); J = gJ(r - nr)
             endif
+            if (xgrid) nring = xrg(g)%nn(I)               ! an X-point grid's ring: its own length
             seen(J) = .true.
           enddo
-          if (.not. all(seen)) ninc = ninc + 1
+          if (.not. all(seen(0:nring - 1))) ninc = ninc + 1
         enddo
       end block
       call MPI_Allreduce(MPI_IN_PLACE, ninc, 1, MPI_INTEGER, MPI_SUM, gcomm, mpierr)
       if (gme == 0 .and. ninc > 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   GMG WARNING: ", ninc, &
         " ring block(s) on level ", g, " still cut by a rank boundary"
-      deallocate(rkey)
+      deallocate(rk)
     endif
     call move_alloc(nrows, B%rows)
     B%sz = nsz; B%off = noff
@@ -3750,6 +3861,7 @@ contains
       else
         I_ = glv(g)%rnode(r_) / nc; J_ = mod(glv(g)%rnode(r_), nc); m_ = glv(g)%rharm(r_)
       endif
+      if (xgrid .and. .not. rings) J_ = row_col(g, r_, J_)
     end subroutine node_of
 
     !> position of x in the sorted list l (1-based), or 0
