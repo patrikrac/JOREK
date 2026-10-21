@@ -253,8 +253,10 @@ module mod_petsc_pc_gmg
   ! column (every private and SOL ring at one poloidal position), so a rank
   ! there holds short pieces of all leg rings and the ring overlap completes
   ! each of them (xg65 at 64 ranks: 572% ghost rows, closed grid 152%). The
-  ! hierarchy then works in its own layout: the same rows per rank, the DOFs
-  ! in ring-major order. xp_is: old global row of every new local row;
+  ! hierarchy then works in its own layout: the DOFs in ring-major order,
+  ! cut after the same rows per rank (xsplit 0, the default) or on ring
+  ! boundaries (xsplit 1, ring_split: no ring shared, so no ring ghosts).
+  ! xp_is: old global row of every new local row;
   ! xp_A = A(xp_is, xp_is); xp_sc scatters the PC's vectors in and out.
   logical, save :: xperm = .false.
   IS, save :: xp_is
@@ -960,6 +962,37 @@ contains
           enddo
         enddo
       enddo
+      ! crebal 1: whole rings (ci) per rank, as on the X-point grids (off by
+      ! default, see the X-point builder)
+      block
+        integer, allocatable :: wr(:), pr(:), own_o(:), rng(:)
+        integer :: q_
+        q_ = 0
+        call opt_int("crebal", q_)
+        if (q_ > 0 .and. np > 1) then
+          allocate(wr(lv(g)%ni), pr(lv(g)%ni), rng(0:lv(g)%n - 1))
+          rng = -1
+          do ci = 0, lv(g)%ni - 1
+            do cj = 0, lv(g)%nj - 1
+              do k = 0, 3
+                dd = lv(g)%d(ci, cj, k)
+                if (dd < 0) cycle
+                if (rng(dd) < 0) rng(dd) = ci
+              enddo
+            enddo
+          enddo
+          wr = 0
+          do dd = 0, lv(g)%n - 1
+            wr(rng(dd) + 1) = wr(rng(dd) + 1) + 1
+          enddo
+          call ring_parts(wr, np, pr)
+          own_o = ly(g)%own
+          do dd = 0, lv(g)%n - 1
+            ly(g)%own(dd) = pr(rng(dd) + 1)
+          enddo
+          call crebal_pick(g, np, rng, own_o, ly(g)%own)
+        endif
+      end block
       ly(g)%nl = 0
       do dd = 0, lv(g)%n - 1
         ly(g)%lpos(dd) = ly(g)%nl(ly(g)%own(dd))
@@ -1446,7 +1479,7 @@ contains
     call opt_int("xperm", q)
     if (q > 0 .and. np > 1) then
       block
-        integer, allocatable :: ord(:), okey(:), own0(:), lpos0(:)
+        integer, allocatable :: ord(:), okey(:), own0(:), lpos0(:), nl0(:), ps0(:)
         PetscInt, allocatable :: ix(:)
         integer :: nj1, rk_, fill_
         own0 = ly(0)%own; lpos0 = ly(0)%lpos
@@ -1459,6 +1492,15 @@ contains
           if (k > 0) okey(idx + 1) = xl(0)%rI(k) * nj1 + xl(0)%rJ(k)
         enddo
         call sort_rows_by_key(ord, okey)          ! stable: a node's DOFs stay together
+        nl0 = ly(0)%nl; ps0 = ly(0)%ps
+        ! xsplit 1: the rank boundaries on ring boundaries, so that no ring
+        ! block is cut and none is solved twice (no ring ghosts). Off by
+        ! default: on tok (xg65 / xg129, 16-64 ranks) the V-cycle gained only
+        ! at xg65 64 ranks (-20%), lost 12% at xg129 64x4, and PtAP rose
+        ! 1.1-1.6x from the busiest rank's 1.15-1.39x rows
+        q = 0
+        call opt_int("xsplit", q)
+        if (q > 0) call ring_split(ord, okey / nj1)
         rk_ = 0; fill_ = 0
         do k = 1, n_idx
           do while (fill_ >= ly(0)%nl(rk_))
@@ -1474,7 +1516,7 @@ contains
           do ff = 0, n_fields - 1
             do mm = 0, pc_ntor - 1
               lr = (ff * ly(0)%nl(me) + ly(0)%lpos(idx)) * pc_ntor + mm + 1
-              ix(lr) = ly(0)%ps(own0(idx)) + (ff * ly(0)%nl(own0(idx)) + lpos0(idx)) * pc_ntor + mm
+              ix(lr) = ps0(own0(idx)) + (ff * nl0(own0(idx)) + lpos0(idx)) * pc_ntor + mm
             enddo
           enddo
         enddo
@@ -1508,6 +1550,33 @@ contains
       ly(g)%nl = 0
       do k = 1, xl(g)%n
         ly(g)%own(k - 1) = ly(0)%own(xl(g)%dof(k) - 1)
+        ly(g)%nl(ly(g)%own(k - 1)) = ly(g)%nl(ly(g)%own(k - 1)) + 1
+      enddo
+      ! crebal 1: whole rings per rank on this level, the busiest rank's
+      ! share balanced (the inherited owners leave the ranks whose rings a
+      ! radial level drops idle and the others with their full rings). Off
+      ! by default: no V-cycle gain on tok, PtAP up to 1.3x (P across ranks)
+      q = 0
+      call opt_int("crebal", q)
+      if (q > 0 .and. np > 1) then
+        block
+          integer, allocatable :: wr(:), pr(:), own_o(:)
+          allocate(wr(maxval(xl(g)%rI(1:xl(g)%n)) + 1))
+          allocate(pr(size(wr)))
+          wr = 0
+          do k = 1, xl(g)%n
+            wr(xl(g)%rI(k) + 1) = wr(xl(g)%rI(k) + 1) + 1
+          enddo
+          call ring_parts(wr, np, pr)
+          own_o = ly(g)%own
+          do k = 1, xl(g)%n
+            ly(g)%own(k - 1) = pr(xl(g)%rI(k) + 1)
+          enddo
+          call crebal_pick(g, np, xl(g)%rI(1:xl(g)%n), own_o, ly(g)%own)
+        end block
+      endif
+      ly(g)%nl = 0
+      do k = 1, xl(g)%n
         ly(g)%lpos(k - 1) = ly(g)%nl(ly(g)%own(k - 1))
         ly(g)%nl(ly(g)%own(k - 1)) = ly(g)%nl(ly(g)%own(k - 1)) + 1
       enddo
@@ -1606,6 +1675,50 @@ contains
       any_rank = bad
       call MPI_Allreduce(MPI_IN_PLACE, any_rank, 1, MPI_LOGICAL, MPI_LOR, comm, mpierr)
     end function any_rank
+
+    !> xsplit: new ly(0)%nl / ps, the ring-major order ord cut on ring
+    !! boundaries (ring of DOF idx: rid(idx + 1)) into np contiguous parts
+    !! with the least possible maximum, every rank at least one ring. Too
+    !! few rings or a part above 1.5 x the even split: nl kept (equal counts).
+    subroutine ring_split(ord, rid)
+      integer, intent(in) :: ord(:), rid(:)
+      integer, allocatable :: w(:), pr(:), nl_(:)
+      integer :: nr, k, r_
+      allocate(w(n_idx))
+      w = 0; nr = 0
+      do k = 1, n_idx
+        if (k == 1) then
+          nr = 1
+        else if (rid(ord(k) + 1) /= rid(ord(k - 1) + 1)) then
+          nr = nr + 1
+        endif
+        w(nr) = w(nr) + 1
+      enddo
+      if (nr < np) then
+        if (me == 0) write(*,'(A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, ": xsplit off (", nr, &
+          " rings on ", np, " ranks), equal counts"
+        return
+      endif
+      allocate(pr(nr), nl_(0:np - 1))
+      call ring_parts(w(1:nr), np, pr)
+      nl_ = 0
+      do k = 1, nr
+        nl_(pr(k)) = nl_(pr(k)) + w(k)
+      enddo
+      if (maxval(nl_) > 1.5d0 * n_idx / np) then
+        if (me == 0) write(*,'(A,I0,A,F5.2,A)') "[Physics PC]   GMG", cur_inst, &
+          ": xsplit off (whole rings: max rank ", maxval(nl_) * np / dble(n_idx), " x even), equal counts"
+        return
+      endif
+      ly(0)%nl = nl_
+      ly(0)%ps(0) = 0
+      do r_ = 0, np - 1
+        ly(0)%ps(r_ + 1) = ly(0)%ps(r_) + n_fields * pc_ntor * nl_(r_)
+      enddo
+      if (me == 0) write(*,'(A,I0,A,I0,A,I0,A,F5.2,A)') "[Physics PC]   GMG", cur_inst, &
+        ": xsplit, whole rings per rank (", nr, " rings on ", np, " ranks, max rank ", &
+        maxval(nl_) * np / dble(n_idx), " x even)"
+    end subroutine ring_split
 
     !> Median cell aspect along / across (|x(A+1) - x(A)| / |x(B+1) - x(B)|)
     !! of the fine core row b (b >= 1), or (b = -1) of every patch's cells
@@ -4091,6 +4204,105 @@ contains
     enddo
     B%axdon = pass
   end subroutine axd_gate
+
+  !> Whole rings per rank: ring i of w(i) DOFs (rings in radial order, empty
+  !! ones skipped) -> rank part(i). At least np rings: np contiguous parts
+  !! with the least possible maximum, every rank at least one ring (binary
+  !! search on the cap, then greedy). Fewer rings: one per rank, spread
+  !! evenly over the ranks (and so over the nodes' memory bandwidth).
+  subroutine ring_parts(w, np, part)
+    integer, intent(in)  :: w(:), np
+    integer, intent(out) :: part(:)
+    integer, allocatable :: wc(:), ic(:)
+    integer :: nr, k, lo, hi, cap, r, s, first, nparts
+    nr = count(w > 0)
+    allocate(wc(nr), ic(nr))
+    nr = 0
+    do k = 1, size(w)
+      if (w(k) <= 0) cycle
+      nr = nr + 1; wc(nr) = w(k); ic(nr) = k
+    enddo
+    part = 0
+    if (nr == 0) return
+    if (nr < np) then
+      do k = 1, nr
+        part(ic(k)) = int((int(k - 1, 8) * np) / nr)
+      enddo
+    else
+      lo = maxval(wc); hi = sum(wc)
+      do while (lo < hi)
+        cap = (lo + hi) / 2
+        nparts = 1; s = 0
+        do k = 1, nr
+          if (s + wc(k) > cap) then
+            nparts = nparts + 1; s = wc(k)
+          else
+            s = s + wc(k)
+          endif
+        enddo
+        if (nparts <= np) then
+          hi = cap
+        else
+          lo = cap + 1
+        endif
+      enddo
+      cap = lo
+      k = 1
+      do r = 0, np - 1
+        s = 0; first = k
+        do while (k <= nr)
+          if (r < np - 1) then
+            if (k > first .and. s + wc(k) > cap) exit
+            if (k > first .and. nr - k < np - 1 - r) exit   ! one ring left for each later rank
+          endif
+          part(ic(k)) = r
+          s = s + wc(k); k = k + 1
+        enddo
+      enddo
+    endif
+    do k = 2, size(w)                    ! empty rings: no rows, any rank
+      if (w(k) <= 0) part(k) = part(k - 1)
+    enddo
+  end subroutine ring_parts
+
+  !> Coarse layout rebalancing (crebal): keep the whole-ring owners own_new
+  !! (else back to own_old, the owners inherited from the fine nodes) only if
+  !! they lower the busiest rank's ring-solve load: the DOFs of every ring
+  !! it holds a part of, since each rank sharing a ring solves all of it;
+  !! on a tie, if they lower its row count (the matvec). DOF d's ring: rid(d).
+  subroutine crebal_pick(g, np, rid, own_old, own_new)
+    integer, intent(in) :: g, np, rid(0:), own_old(0:)
+    integer, intent(inout) :: own_new(0:)
+    integer :: lo, ln, ro, rn
+    logical :: take
+    call ring_load(own_old, lo, ro)
+    call ring_load(own_new, ln, rn)
+    take = (ln < lo) .or. (ln == lo .and. rn < ro)
+    if (.not. take) own_new = own_old
+    if (gme == 0) write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,A)') "[Physics PC]   GMG", cur_inst, &
+      ": level ", g, " whole rings per rank: busiest ring-solve load ", lo, " -> ", ln, &
+      " DOFs, busiest rows ", ro, " -> ", rn, merge(" (applied)", " (kept)   ", take)
+  contains
+    subroutine ring_load(own, ld, rows)
+      integer, intent(in) :: own(0:)
+      integer, intent(out) :: ld, rows
+      integer, allocatable :: w(:), cnt(:)
+      logical, allocatable :: hit(:,:)
+      integer :: d, r
+      allocate(w(0:maxval(rid)), cnt(0:np - 1), hit(0:maxval(rid), 0:np - 1))
+      w = 0; cnt = 0; hit = .false.
+      do d = 0, size(rid) - 1
+        w(rid(d)) = w(rid(d)) + 1
+        cnt(own(d)) = cnt(own(d)) + 1
+        hit(rid(d), own(d)) = .true.
+      enddo
+      ld = 0
+      do r = 0, np - 1
+        ld = max(ld, sum(w, mask=hit(:, r)))
+      enddo
+      rows = maxval(cnt)
+    end subroutine ring_load
+  end subroutine crebal_pick
 
   !> In-place ascending heapsort, O(n log n) (the setup's medians; an
   !! insertion sort there was O(n^2) in the cell count).
