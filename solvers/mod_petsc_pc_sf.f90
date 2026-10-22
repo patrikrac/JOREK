@@ -17,6 +17,7 @@ module mod_petsc_pc_sf
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
   use mod_petsc_pc_sf_fam, only: fam_op_t, sff_comm, sff_decompose, sff_op_build, &
        sff_op_fill, sff_vec_setup, sff_scatter_in, sff_scatter_out
+  use mod_petsc_pc_sf_peel, only: peel_build, peel_solve, peel_report
   implicit none
   private
 
@@ -132,6 +133,8 @@ contains
     bk_w   = backend_of(physics_pc_sf_pair_w,   "physics_pc_sf_pair_w")
     bk_rho = backend_of(physics_pc_sf_rho,      "physics_pc_sf_rho")
     bk_T   = backend_of(physics_pc_sf_T,        "physics_pc_sf_T")
+    if (bk_pj == SF_PEEL .or. bk_rho == SF_PEEL .or. bk_T == SF_PEEL) &
+      call fatal("peel is a backend of physics_pc_sf_pair_w only")
 
     ! the variables (psi, u, zj, w, rho, T) in model199's slots, v_par as var 7;
     ! n_tor odd: n = 0 plus cos/sin pairs
@@ -146,6 +149,10 @@ contains
     harm_all    = physics_pc_sf_harm_couple
     sf_gmg_harm = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
     famode      = physics_pc_sf_mode_split .and. .not. harm_all
+    if (bk_w == SF_PEEL .and. famode) &
+      call fatal("physics_pc_sf_pair_w = peel runs on the global path (harm_couple .t. or mode_split .f.)")
+    if (bk_w == SF_PEEL .and. jorek_model /= 199) &
+      call fatal("physics_pc_sf_pair_w = peel supports model199 only")
 
     corr = physics_pc_sf_corrector
     if (corr == -1) corr = 4
@@ -225,9 +232,10 @@ contains
       select case (trim(adjustl(s)))
       case ("lu");  backend_of = SF_LU
       case ("gmg"); backend_of = SF_GMG
+      case ("peel"); backend_of = SF_PEEL
       case default
         backend_of = SF_LU
-        call fatal(trim(nm)//" must be lu | gmg, got '"//trim(s)//"'")
+        call fatal(trim(nm)//" must be lu | gmg (pair_w also peel), got '"//trim(s)//"'")
       end select
     end function backend_of
 
@@ -295,7 +303,8 @@ contains
     !--- stored operator, undone in sf_solver_apply
     call MatGetLocalSize(a_rho, n1_loc, PETSC_NULL_INTEGER, ierr)
     call block_scale(slv_pj, a_pj, 2, "pair_psi")
-    call block_scale(slv_w, a_w, nf_w, "pair_w")
+    ! the peel arm iterates on pair_w itself, unscaled
+    if (bk_w /= SF_PEEL) call block_scale(slv_w, a_w, nf_w, "pair_w")
 
     call PetscLogEventBegin(pcev_fact_pj, ierr)
     call sf_solver_setup(slv_pj, a_pj, bk_pj, "pair_psi KSP ([B_11,B_13;B_31,B_33])", &
@@ -306,11 +315,15 @@ contains
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
     call PetscLogEventBegin(pcev_fact_w, ierr)
-    call sf_solver_setup(slv_w, a_w, bk_w, "pair_w KSP (mixed)", &
-                         comm_s, my_id, rtol, gmg_inst=1, nfields=nf_w, &
-                         smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
-                         pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC, &
-                         axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    if (bk_w == SF_PEEL) then
+      call peel_build(a_w, comm_s, my_id, rtol)
+    else
+      call sf_solver_setup(slv_w, a_w, bk_w, "pair_w KSP (mixed)", &
+                           comm_s, my_id, rtol, gmg_inst=1, nfields=nf_w, &
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    endif
     call PetscLogEventEnd(pcev_fact_w, ierr)
 
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
@@ -729,7 +742,13 @@ contains
     else
       call sf_split_parts(rhs_W, [w5, x_w, w4, zv], .true.)
     endif
-    call solve(slv_w, rhs_W, sol_W, pcev_solve_w)
+    if (bk_w == SF_PEEL) then
+      call PetscLogEventBegin(pcev_solve_w, ierr)
+      call peel_solve(rhs_W, sol_W)
+      call PetscLogEventEnd(pcev_solve_w, ierr)
+    else
+      call solve(slv_w, rhs_W, sol_W, pcev_solve_w)
+    endif
     ! w3, w4 = psi_w, j_w (discarded by corrector 0); b1: y_v = V
     if (vb1) then
       call sf_split_parts(sol_W, [y_u, y_w, w3, w4, y_v], .false.)
@@ -872,7 +891,11 @@ contains
       call family_report(my_id)
     else
       call sf_solver_report(slv_pj,  my_id)
-      call sf_solver_report(slv_w,   my_id)
+      if (bk_w == SF_PEEL) then
+        call peel_report(my_id)
+      else
+        call sf_solver_report(slv_w, my_id)
+      endif
       call sf_solver_report(slv_rho, my_id)
       call sf_solver_report(slv_T,   my_id)
       if (with_v) call sf_solver_report(slv_v, my_id)

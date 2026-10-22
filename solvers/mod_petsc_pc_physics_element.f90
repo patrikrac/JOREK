@@ -68,7 +68,8 @@ contains
   !! terms). It needs mhd_sim, the linearisation state, so it is assembled
   !! here rather than in the PC build.
   subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
-    use construct_pc_matrix_mod, only: construct_force_operator_matrix
+    use construct_pc_matrix_mod, only: construct_force_operator_matrix, construct_peel_matrices
+    use phys_module,     only: physics_pc_sf_pair_w
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
     use mod_petsc_pc_sf_solver, only: sf_vpar_w_assembled, sf_vpar_gamma_w, sf_vpar_wvu_full
@@ -117,6 +118,22 @@ contains
                                            mhd_sim, g_ctx%W_force)
     endif
     g_ctx%w_force_ready = .true.
+
+    ! the peel arm's scalar operators (mod_petsc_pc_sf_peel)
+    if (trim(adjustl(physics_pc_sf_pair_w)) == "peel") then
+      block
+        integer :: k
+        do k = 1, size(g_ctx%P_peel)
+          if (g_ctx%peel_ready) then
+            PetscCallA(MatZeroEntries(g_ctx%P_peel(k), ierr))
+          else
+            call petsc_create_pc_matrix(g_ctx%P_peel(k), a_mat, 1)
+          endif
+        enddo
+      end block
+      call construct_peel_matrices(local_elms, n_local_elms, a_mat, g_ctx%P_peel)
+      g_ctx%peel_ready = .true.
+    endif
     call PetscLogEventEnd(pcev_elem_asm, ierr)
 
     if (my_id .eq. 0) then

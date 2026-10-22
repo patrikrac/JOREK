@@ -32,6 +32,12 @@ module mod_petsc_pc_physics_ctx
     !! on B_72, W_uv (u row, v_par column) on B_27.
     Mat :: W_vv, W_vu, W_uv
     logical :: w_v_ready = .false.
+
+    !> The peeled-Schur arm of pair_w (physics_pc_sf_pair_w = "peel"), from the
+    !! same element pass: opz K_rho, W_comp, M_rho, K_nu, K_eta, K_w on u
+    !! (pc_elt_matrix_peel_fft's PEEL_NOP, mod_petsc_pc_sf_peel).
+    Mat :: P_peel(6)
+    logical :: peel_ready = .false.
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx

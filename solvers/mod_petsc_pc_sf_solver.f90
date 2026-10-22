@@ -21,6 +21,9 @@ module mod_petsc_pc_sf_solver
 
   integer, parameter, public :: SF_LU  = 1
   integer, parameter, public :: SF_GMG = 2
+  !> pair_w only: FGMRES on pair_w around the peeled Schur block
+  !! preconditioner (mod_petsc_pc_sf_peel), whose scalar blocks use the two above
+  integer, parameter, public :: SF_PEEL = 3
 
   !--- GMG smoothers (codes of mod_petsc_pc_gmg) ----------------------------
   !> Radial-line block Jacobi: rho.
@@ -166,28 +169,34 @@ contains
   !! SF_GMG_AXIS_RINGS_RHOT.
   !--------------------------------------------------------------------
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, nfields, &
-                             smoother, maxits, pre0, post0, nsmooth_c, axis_rings)
+                             smoother, maxits, pre0, post0, nsmooth_c, axis_rings, ncyc)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
-                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
+                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, &
+                                gmg_pc_apply_6, gmg_pc_apply_7, gmg_pc_apply_8, gmg_opts_t
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
     integer, intent(in)          :: backend, comm, my_id
     character(len=*), intent(in) :: label
     real*8, intent(in)           :: rtol
-    integer, intent(in)          :: gmg_inst   !< hierarchy instance (1..5)
+    integer, intent(in)          :: gmg_inst   !< hierarchy instance (1..8)
     integer, intent(in)          :: nfields    !< fields packed per node in A
     integer, intent(in)          :: smoother   !< SF_GMG_SMOOTHER_*
     integer, intent(in)          :: maxits     !< FGMRES budget
     integer, intent(in), optional :: pre0, post0, nsmooth_c, axis_rings
+    !> GMG: > 0 = exactly ncyc V-cycles (Richardson, no norms: a fixed linear
+    !! operator) instead of FGMRES to rtol
+    integer, intent(in), optional :: ncyc
 
     PC :: pc
     PetscErrorCode :: ierr
-    logical :: ok, fresh
+    logical :: ok, fresh, fixed
     character(len=24) :: tstr
     type(gmg_opts_t) :: o
 
     fresh        = .not. slv%created
+    fixed        = .false.
+    if (present(ncyc)) fixed = (ncyc > 0)
     slv%backend  = backend
     slv%label    = label
     slv%gmg_inst = gmg_inst
@@ -241,6 +250,10 @@ contains
       if (fresh) then
         call KSPCreate(comm, slv%ksp, ierr)
         call KSPSetType(slv%ksp, KSPFGMRES, ierr)
+        if (fixed) then
+          call KSPSetType(slv%ksp, KSPRICHARDSON, ierr)
+          call KSPSetNormType(slv%ksp, KSP_NORM_NONE, ierr)
+        endif
         block
           ! -sf_gmg<k>_maxits, and -sf_gmg<k>_ksp_* through the prefix
           PetscInt :: mx
@@ -249,6 +262,7 @@ contains
           mx = maxits
           write(nm, '(A,I0,A)') "-sf_gmg", slv%gmg_inst, "_maxits"
           call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), mx, set, ierr)
+          if (fixed) mx = ncyc
           call KSPGMRESSetRestart(slv%ksp, max(int(mx), 2), ierr)
           call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, mx, ierr)
           write(nm, '(A,I0,A)') "sf_gmg", slv%gmg_inst, "_"
@@ -263,13 +277,21 @@ contains
         case (3); call PCShellSetApply(pc, gmg_pc_apply_3, ierr)
         case (4); call PCShellSetApply(pc, gmg_pc_apply_4, ierr)
         case (5); call PCShellSetApply(pc, gmg_pc_apply_5, ierr)
+        case (6); call PCShellSetApply(pc, gmg_pc_apply_6, ierr)
+        case (7); call PCShellSetApply(pc, gmg_pc_apply_7, ierr)
+        case (8); call PCShellSetApply(pc, gmg_pc_apply_8, ierr)
         end select
         call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       endif
       call KSPSetOperators(slv%ksp, A, A, ierr)
       call KSPSetUp(slv%ksp, ierr)
-      write(tstr,'(ES9.2)') rtol
-      call pc_print_block_setup(comm, label, "FGMRES + SHELL[C1 GMG V-cycle], rtol "//trim(adjustl(tstr)))
+      if (fixed) then
+        write(tstr,'(I0)') ncyc
+        call pc_print_block_setup(comm, label, "RICHARDSON + SHELL[C1 GMG V-cycle], "//trim(tstr)//" cycle(s)")
+      else
+        write(tstr,'(ES9.2)') rtol
+        call pc_print_block_setup(comm, label, "FGMRES + SHELL[C1 GMG V-cycle], rtol "//trim(adjustl(tstr)))
+      endif
 
     case default
       if (my_id == 0) write(*,'(A,I0)') "[Physics PC]   FATAL: sf_solver_setup got an unknown backend ", backend

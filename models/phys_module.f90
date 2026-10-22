@@ -155,7 +155,7 @@ module phys_module
   !--- the defaults are its production configuration.
   logical :: use_physics_pc       !< Use the SF preconditioner instead of JOREK's per-harmonic PCFIELDSPLIT (PETSc only)
   character(len=16) :: physics_pc_sf_pair_psi !< pair_psi = [[B_11,B_13],[B_31,B_33]] solver: "gmg" (default, FGMRES + one C1 GMG V-cycle) | "lu" (MUMPS, exact)
-  character(len=16) :: physics_pc_sf_pair_w   !< pair_w (u, omega, psi, j) solver: "gmg" (default) | "lu"
+  character(len=16) :: physics_pc_sf_pair_w   !< pair_w (u, omega, psi, j) solver: "gmg" (default) | "lu" | "peel" (FGMRES on pair_w around the peeled Schur block preconditioner, model199, mod_petsc_pc_sf_peel)
   character(len=16) :: physics_pc_sf_rho      !< rho block B_55 solver: "gmg" (default) | "lu"
   character(len=16) :: physics_pc_sf_T        !< T block B_66 solver: "gmg" (default) | "lu"
   integer :: physics_pc_sf_corrector !< Step 3 of the sweep. 4 (default; -1 = 4) = consistent: (psi, j) from pair_w, -B_16 T* on its psi row, B_51 psi_w and B_61 psi_w + B_63 j_w in the rho / T corrections. 0 = Chacon JCP 526 (2025) Eq. (16), a second pair_psi solve. 1 = Eq. (17), as 4 without pair_w's (psi, j) in rho / T. 2 = as 1 without B_16 T*. 3 = as 2 with rho / T by their mass inverse (model199 only).

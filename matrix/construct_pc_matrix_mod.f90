@@ -10,7 +10,7 @@ use petsc
 #endif
 implicit none
 private
-public :: construct_force_operator_matrix
+public :: construct_force_operator_matrix, construct_peel_matrices
 
 contains
 
@@ -281,25 +281,118 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   endif
 #endif
 
-contains
-
-  !> buf = the rows rsel(1:nr) of the element matrix E, row-major by scalar
-  !! row (MatSetValuesBlocked's default orientation). Everything by argument:
-  !! the caller's copies are OpenMP-private, host association would not see them.
-  subroutine pack_rows(E, rsel, nr, buf)
-    real*8, intent(in)  :: E(DFV_CM, DFV_CM)
-    integer, intent(in) :: rsel(:), nr
-    real*8, intent(out) :: buf(:)
-    integer :: r, j, o
-    o = 0
-    do r = 1, nr
-      do j = 1, n_tor
-        buf(o + 1 : o + DFV_CM) = E(n_tor * (rsel(r) - 1) + j, :)
-        o = o + DFV_CM
-      enddo
-    enddo
-  end subroutine pack_rows
-
 end subroutine construct_force_operator_matrix
+
+!> buf = the rows rsel(1:nr) of the element matrix E, row-major by scalar
+!! row (MatSetValuesBlocked's default orientation). Everything by argument:
+!! the caller's copies are OpenMP-private, host association would not see them.
+subroutine pack_rows(E, rsel, nr, buf)
+  use mod_parameters, only: n_tor, n_degrees, n_vertex_max
+  real*8, intent(in)  :: E(n_tor*n_vertex_max*n_degrees, n_tor*n_vertex_max*n_degrees)
+  integer, intent(in) :: rsel(:), nr
+  real*8, intent(out) :: buf(:)
+  integer :: r, j, o, nd
+  nd = n_tor * n_vertex_max * n_degrees
+  o = 0
+  do r = 1, nr
+    do j = 1, n_tor
+      buf(o + 1 : o + nd) = E(n_tor * (rsel(r) - 1) + j, :)
+      o = o + nd
+    enddo
+  enddo
+end subroutine pack_rows
+
+!--------------------------------------------------------------------
+!> Assemble the peeled-Schur operators of pair_w (mod_petsc_pc_sf_peel), one
+!! variable (u) each, block size n_tor: Pm(k) = the element routine's
+!! ELM(:,:,k) (opz K_rho, W_comp, M_rho, K_nu). Boundary rows are left as
+!! assembled; the peel arm fixes its Dirichlet DOFs itself.
+!--------------------------------------------------------------------
+subroutine construct_peel_matrices(local_elms, n_local_elms, a_mat, Pm)
+
+  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_peel_fft, PEEL_NOP
+  use mod_parameters,  only: n_tor, n_degrees, n_vertex_max
+  use data_structure,  only: type_SP_MATRIX, type_element, type_node
+  use nodes_elements
+  use omp_lib
+
+  implicit none
+
+  integer, pointer,     intent(in) :: local_elms(:)
+  integer,              intent(in) :: n_local_elms
+  type(type_SP_MATRIX), intent(in) :: a_mat
+#ifdef USE_PETSC
+  Mat, intent(inout) :: Pm(PEEL_NOP)
+#endif
+
+  integer :: my_ind_min, my_ind_max
+  type(type_element), allocatable :: element_thr(:)
+  type(type_node),    allocatable :: nodes_thr(:,:)
+  real*8, allocatable :: ELM(:,:,:), buf(:)
+  integer :: idx(NBV), rsel(NBV), nr
+  integer :: ife, ielm, iv, q, b, t, nthreads
+#ifdef USE_PETSC
+  PetscErrorCode :: ierr
+  PetscInt :: idxm(NBV), idxn(NBV)
+#endif
+
+  my_ind_min = a_mat%my_ind_min
+  my_ind_max = a_mat%my_ind_max
+
+  nthreads = 1
+  !$ nthreads = omp_get_max_threads()
+  allocate(element_thr(nthreads), nodes_thr(n_vertex_max, nthreads))
+
+  !$omp parallel default(shared) &
+  !$omp   private(ife, ielm, iv, q, b, t, ELM, buf, idx, rsel, nr &
+#ifdef USE_PETSC
+  !$omp           , ierr, idxm, idxn &
+#endif
+  !$omp          )
+  allocate(ELM(DFV_CM, DFV_CM, PEEL_NOP), buf(DFV_CM * DFV_CM))
+  t = 1
+  !$ t = omp_get_thread_num() + 1
+
+  !$omp do schedule(runtime)
+  do ife = 1, n_local_elms
+    ielm = local_elms(ife)
+    element_thr(t) = element_list%element(ielm)
+    do iv = 1, n_vertex_max
+      nodes_thr(iv, t) = node_list%node(element_thr(t)%vertex(iv))
+    enddo
+    call pc_elt_matrix_peel_fft(element_thr(t), nodes_thr(:, t), ELM)
+#ifdef USE_PETSC
+    nr = 0
+    do q = 1, NBV
+      idx(q) = nodes_thr((q - 1) / n_degrees + 1, t)%index(mod(q - 1, n_degrees) + 1)
+      idxn(q) = idx(q) - 1
+      if (idx(q) < my_ind_min .or. idx(q) > my_ind_max) cycle
+      nr = nr + 1
+      rsel(nr) = q
+      idxm(nr) = idx(q) - 1
+    enddo
+    if (nr > 0) then
+      !$omp critical (pc_peel_insert)
+      do b = 1, PEEL_NOP
+        call pack_rows(ELM(:,:,b), rsel, nr, buf)
+        PetscCallA(MatSetValuesBlocked(Pm(b), nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
+      enddo
+      !$omp end critical (pc_peel_insert)
+    endif
+#endif
+  enddo
+  !$omp end do
+  deallocate(ELM, buf)
+  !$omp end parallel
+  deallocate(element_thr, nodes_thr)
+
+#ifdef USE_PETSC
+  do b = 1, PEEL_NOP
+    PetscCallA(MatAssemblyBegin(Pm(b), MAT_FINAL_ASSEMBLY, ierr))
+    PetscCallA(MatAssemblyEnd  (Pm(b), MAT_FINAL_ASSEMBLY, ierr))
+  enddo
+#endif
+
+end subroutine construct_peel_matrices
 
 end module construct_pc_matrix_mod

@@ -646,7 +646,7 @@ subroutine preset_parameters
   ! the physics-based (SF) preconditioner; the defaults are its production configuration
   use_physics_pc              = .false.     ! Use the physics-based (SF) preconditioner (PETSc)
   physics_pc_sf_pair_psi      = "gmg"       ! pair_psi backend: gmg | lu
-  physics_pc_sf_pair_w        = "gmg"       ! pair_w backend: gmg | lu
+  physics_pc_sf_pair_w        = "gmg"       ! pair_w backend: gmg | lu | peel
   physics_pc_sf_rho           = "gmg"       ! rho block backend: gmg | lu
   physics_pc_sf_T             = "gmg"       ! T block backend: gmg | lu
   physics_pc_sf_rtol          = 1.d-1       ! shared inner rtol for the iterative backends
