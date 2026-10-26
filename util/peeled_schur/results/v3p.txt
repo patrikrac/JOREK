@@ -1,0 +1,1 @@
+v3p | -sf_peel_v 3 -sf_peel_patch 1 | its 9 8 8 | pw 5.44 5.38 5.88 | pw_s 14.849 | setup 2.121; N (T) nonzeros nnz 619.0 | N_vc 139 x 30.5 ms | real 31.67

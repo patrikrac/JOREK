@@ -1,0 +1,1 @@
+qv_tex | -sf_peel_v 3 -sf_peel_qv 1 -sf_peel_texact 1 -sf_peel_q lu -sf_peel_t lu -sf_peel_spec 40 | its 8 7 7 | pw 2.75 2.86 3.14 | pw_s 37.854 | setup 1.299; N (T) nonzeros nnz 619.0 | N_vc  | real 64.19

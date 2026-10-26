@@ -249,3 +249,66 @@ PETSC_OPTIONS="-sf_peel_check 1 -sf_peel_spec 100 -sf_peel_q lu -sf_peel_t lu -s
   mpirun -n 1 ./jorek_model199 < in      # in: physics_pc_sf_pair_w = "peel", tstep_n = 1.d1
 python lfa_review.py                     # (1) compression, (2) resistive X, (3) X_1 positivity
 ```
+
+## Follow-up 2026-10-23 to 2026-10-26: v3, commutation, the W surrogate
+
+**v3** (`-sf_peel_v 3`, design `numerics/v3`, LFA `lfa_peeling_v3.py`): cheaper N
+(nnz 619 vs 1470, setup 2.0 vs 6.4 s) but the same verdict as v2. At tstep 10,
+41x32 it takes 9 8 8 outer and 5.4-5.9 pair_w its, against production's 6 6 6
+and 2.0 (`results/seq.txt`, `v3*.txt`, `b1.txt`, `b2.txt`, `sweep_cyc.txt`).
+
+**Distributive smoother** (pair_w GMG; two-grid model in `model/`): rejected.
+- The commutation itself is exact in the model (spectrum [0.99, 1.01]).
+- The local Hermite mass inverses are not accurate enough: nodal-block Jacobi
+  gives eig(X M) in [0.06, 3.1], and both it and element additive Schwarz
+  diverge.
+- The only variant that converges eliminates omega/j with a near-exact X. Even
+  that is only mixed against the collective smoother.
+
+**Commutation as an outer preconditioner** (`model/t2.py`, `outer.py`;
+`-sf_peel_qv 1`):
+- In the model it is robust only when it commutes through the unweighted
+  vorticity Laplacian, z_u = B_44 B_42^-1 r. Under a 10:1 density pedestal,
+  the rho-weighted version gives |E| 100-2000, against 0.5-4.6 unweighted.
+- In JOREK, even the exact limit gives ratio 2.80 (v3 3.05) and 4 GMRES its
+  (`results/qv.txt`). Not competitive.
+
+**pair_w is not what limits the outer count; the W surrogate is.**
+- Production outer its at tstep 10 stay 6 6 6 with pair_w at rtol 1e-1 to 1e-6.
+- Option `-sf_w_scale s` (`mod_petsc_pc_sf_mixed`) weights W in pair_w's u block.
+- Env `JOREK_W_RHO` / `JOREK_W_T` (model199) weight W's density and temperature
+  halves.
+- Low beta (this case; `results/wdef.txt`, `ablate.txt`, `wsign.txt`,
+  `wsplit.txt`):
+
+  | tstep | W 1 (production) | W 0 | W 0.5 | W 2 | W -1 |
+  |---|---|---|---|---|---|
+  | 1 | 3 3 4 | 3 3 4 | 3 3 4 | 3 3 4 | |
+  | 10 | 6 6 6 (KSPSolve 2.84 s) | 5 5 5 (2.33 s) | 6 5 5 | 8 8 8 | 7 7 6 |
+  | 30 | 21 21 25 (51.8 s) | 7 7 8 (3.4 s) | 10 9 11 | 24 22 25 | 64 52 60 |
+
+  Both halves of W hurt at tstep 30: rho only gives 11 10 12, T only 11 10 11.
+  Neither W setting converges at tstep 100.
+
+- High beta (tok, m600_balloon t045, 65x96 n_tor 9, PC rebuilt every step;
+  mean outer its for W 1 / 0.5 / 0):
+
+  | snapshot | tstep 1 | tstep 3 | tstep 5 |
+  |---|---|---|---|
+  | s1000 | 4 / 4 / 4 | 6.4 / 6.0 / 6.7 | 9.1 / 8.2 / 9.4 |
+  | s1410 (nonlinear) | 4 / 4 / 4 | 8.7 / 8.3 / 8.6 | 17.0 / 14.8 / 15.9 |
+
+  With the PC built once and reused, W 0 matches W 1, including the stale-PC
+  climb at s1410 (14 -> 138 its at tstep 5).
+
+**Conclusion.** Keep W. At low beta it carries little physics, and its error,
+~(theta dt)^2 because it is the continuum form of the pressure Schur term
+without the discrete projections, dominates. At high beta the physics it
+carries matters about as much as its error. W 0.5 never did worse than W 1,
+but it is only a tuning knob. The next step would be explicit pressure rows in
+pair_w, the discrete counterpart of the explicit psi rows.
+
+Tools: `model/` (two-grid model: `tg.py` smoothers, `rho.py` dense rho(S^k C),
+`t2.py` P_T2, `outer.py`, `run.py`); `harness/` (41x32 local runs: `run.sh`
+<dir> <np> key=val, `one.sh`, `wsplit.sh`, `sweep_cyc.sh`, `base_stripped.in`;
+tok `*.slurm`); `results/`.

@@ -30,7 +30,7 @@ module mod_petsc_pc_mass_cheb
     real*8  :: lo = 0.d0, hi = 0.d0, err = 0.d0
   end type mass_cheb_t
 
-  public :: mass_cheb_setup, mass_cheb_solve
+  public :: mass_cheb_setup, mass_cheb_refresh, mass_cheb_solve
 
 contains
 
@@ -43,12 +43,9 @@ contains
     integer, intent(in)          :: comm
     character(len=*), intent(in) :: label
     integer, intent(in), optional :: nharm   !< B's harmonics per node block (default n_tor)
-    KSP :: est
     PC  :: pc
     PetscErrorCode :: ierr
-    PetscInt :: its
-    real*8 :: emax, emin, bound
-    integer :: rank, k
+    integer :: rank
     logical :: okb
 
     call MPI_Comm_rank(comm, rank, ierr)
@@ -62,6 +59,60 @@ contains
     call KSPSetOperators(MC%ksp, B, B, ierr)
     call KSPGetPC(MC%ksp, pc, ierr)
     call set_schwarz(pc)
+    call fit(MC, B, comm, label, okb)
+
+  contains
+
+    subroutine set_schwarz(pc_)
+      PC :: pc_
+      KSP, pointer :: sub(:)
+      PC :: spc
+      PetscInt :: nsub, first, i
+      call PCSetType(pc_, PCASM, ierr)
+      call PCASMSetOverlap(pc_, int(1, kind(nsub)), ierr)
+      call PCASMSetType(pc_, PC_ASM_BASIC, ierr)   ! symmetric, as CG and Chebyshev need
+      call PCSetUp(pc_, ierr)
+      call PCASMGetSubKSP(pc_, nsub, first, sub, ierr)
+      do i = 1, nsub
+        call KSPSetType(sub(i), KSPPREONLY, ierr)
+        call KSPGetPC(sub(i), spc, ierr)
+        call PCSetType(spc, PCICC, ierr)
+        call PCFactorSetMatOrderingType(spc, MATORDERINGND, ierr)
+      enddo
+      call PCASMRestoreSubKSP(pc_, nsub, first, sub, ierr)
+    end subroutine set_schwarz
+
+  end subroutine mass_cheb_setup
+
+  !> Refit MC to B's new values (same pattern): the Schwarz factors, the
+  !! bounds and the degree, as mass_cheb_setup. Collective on comm.
+  subroutine mass_cheb_refresh(MC, B, comm, label)
+    type(mass_cheb_t), intent(inout) :: MC
+    Mat, intent(in)              :: B
+    integer, intent(in)          :: comm
+    character(len=*), intent(in) :: label
+    PetscErrorCode :: ierr
+    call KSPSetType(MC%ksp, KSPPREONLY, ierr)    ! fit sets Chebyshev again
+    call KSPSetOperators(MC%ksp, B, B, ierr)
+    call fit(MC, B, comm, label, .false.)
+  end subroutine mass_cheb_refresh
+
+  !> MC's bounds of P^-1 B, then the degree, gated on the measured error
+  subroutine fit(MC, B, comm, label, okb)
+    type(mass_cheb_t), intent(inout) :: MC
+    Mat, intent(in)              :: B
+    integer, intent(in)          :: comm
+    character(len=*), intent(in) :: label
+    logical, intent(in)          :: okb
+    KSP :: est
+    PC  :: pc
+    PetscErrorCode :: ierr
+    PetscInt :: its
+    real*8 :: emax, emin, bound
+    integer :: rank, k
+
+    call MPI_Comm_rank(comm, rank, ierr)
+    call KSPGetPC(MC%ksp, pc, ierr)
 
     !--- bounds of P^-1 B from one preconditioned CG (Lanczos)
     call KSPCreate(comm, est, ierr)
@@ -106,25 +157,6 @@ contains
 
   contains
 
-    subroutine set_schwarz(pc_)
-      PC :: pc_
-      KSP, pointer :: sub(:)
-      PC :: spc
-      PetscInt :: nsub, first, i
-      call PCSetType(pc_, PCASM, ierr)
-      call PCASMSetOverlap(pc_, int(1, kind(its)), ierr)
-      call PCASMSetType(pc_, PC_ASM_BASIC, ierr)   ! symmetric, as CG and Chebyshev need
-      call PCSetUp(pc_, ierr)
-      call PCASMGetSubKSP(pc_, nsub, first, sub, ierr)
-      do i = 1, nsub
-        call KSPSetType(sub(i), KSPPREONLY, ierr)
-        call KSPGetPC(sub(i), spc, ierr)
-        call PCSetType(spc, PCICC, ierr)
-        call PCFactorSetMatOrderingType(spc, MATORDERINGND, ierr)
-      enddo
-      call PCASMRestoreSubKSP(pc_, nsub, first, sub, ierr)
-    end subroutine set_schwarz
-
     real*8 function rho(kk)
       real*8, intent(in) :: kk
       rho = (sqrt(kk) - 1.d0) / (sqrt(kk) + 1.d0)
@@ -135,7 +167,7 @@ contains
       cheb_degree = max(DEG_MIN, ceiling(log(2.d0 / TARGET) / log(1.d0 / max(rho(kk), 1.d-12))))
     end function cheb_degree
 
-  end subroutine mass_cheb_setup
+  end subroutine fit
 
 
   !> y = B^-1 x, to the chosen degree

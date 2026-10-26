@@ -173,13 +173,14 @@ contains
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, &
-                                gmg_pc_apply_6, gmg_pc_apply_7, gmg_pc_apply_8, gmg_opts_t
+                                gmg_pc_apply_6, gmg_pc_apply_7, gmg_pc_apply_8, gmg_pc_apply_9, &
+                                gmg_pc_apply_10, gmg_opts_t
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
     integer, intent(in)          :: backend, comm, my_id
     character(len=*), intent(in) :: label
     real*8, intent(in)           :: rtol
-    integer, intent(in)          :: gmg_inst   !< hierarchy instance (1..8)
+    integer, intent(in)          :: gmg_inst   !< hierarchy instance (1..10)
     integer, intent(in)          :: nfields    !< fields packed per node in A
     integer, intent(in)          :: smoother   !< SF_GMG_SMOOTHER_*
     integer, intent(in)          :: maxits     !< FGMRES budget
@@ -280,6 +281,8 @@ contains
         case (6); call PCShellSetApply(pc, gmg_pc_apply_6, ierr)
         case (7); call PCShellSetApply(pc, gmg_pc_apply_7, ierr)
         case (8); call PCShellSetApply(pc, gmg_pc_apply_8, ierr)
+        case (9); call PCShellSetApply(pc, gmg_pc_apply_9, ierr)
+        case (10); call PCShellSetApply(pc, gmg_pc_apply_10, ierr)
         end select
         call PCShellSetName(pc, trim(label)//" C1 GMG V-cycle", ierr)
       endif

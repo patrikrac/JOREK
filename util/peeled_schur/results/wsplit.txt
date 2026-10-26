@@ -1,0 +1,12 @@
+dt=1.d1 rho1_T0: ws_rho1_T0_1.d1: exit=0  its: 5 5 5  pair_w: 2.00 2.00 2.00  real 10.26
+   KSPSolve 2.3718e+00 s
+dt=1.d1 rho0_T1: ws_rho0_T1_1.d1: exit=0  its: 6 5 5  pair_w: 2.00 2.00 2.00  real 10.31
+   KSPSolve 2.5336e+00 s
+dt=1.d1 rho1_T1: ws_rho1_T1_1.d1: exit=0  its: 6 6 6  pair_w: 2.00 2.00 2.00  real 10.62
+   KSPSolve 2.8320e+00 s
+dt=3.d1 rho1_T0: ws_rho1_T0_3.d1: exit=0  its: 11 10 12  pair_w: 14.55 14.40 14.92  real 32.30
+   KSPSolve 2.4489e+01 s
+dt=3.d1 rho0_T1: ws_rho0_T1_3.d1: exit=0  its: 11 10 11  pair_w: 3.18 3.40 3.82  real 14.99
+   KSPSolve 7.1756e+00 s
+dt=3.d1 rho1_T1: ws_rho1_T1_3.d1: exit=0  its: 23 17 23  pair_w: 14.78 16.88 16.35  real 58.87
+   KSPSolve 5.0318e+01 s

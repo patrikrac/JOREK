@@ -310,7 +310,7 @@ end subroutine pack_rows
 !--------------------------------------------------------------------
 subroutine construct_peel_matrices(local_elms, n_local_elms, a_mat, Pm)
 
-  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_peel_fft, PEEL_NOP
+  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_peel_fft, PEEL_NOP, peel_ebe_axis_mask
   use mod_parameters,  only: n_tor, n_degrees, n_vertex_max
   use data_structure,  only: type_SP_MATRIX, type_element, type_node
   use nodes_elements
@@ -338,6 +338,15 @@ subroutine construct_peel_matrices(local_elms, n_local_elms, a_mat, Pm)
 
   my_ind_min = a_mat%my_ind_min
   my_ind_max = a_mat%my_ind_max
+#ifdef USE_PETSC
+  block
+    PetscInt :: v
+    PetscBool :: set
+    v = 0
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_peel_ebe_axis", v, set, ierr)
+    peel_ebe_axis_mask = (v /= 0)
+  end block
+#endif
 
   nthreads = 1
   !$ nthreads = omp_get_max_threads()

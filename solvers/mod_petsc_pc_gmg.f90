@@ -45,7 +45,7 @@ module mod_petsc_pc_gmg
 
   public :: gmg_build_prolongations, gmg_setup_operator, gmg_is_ready, gmg_select
   public :: gmg_pc_apply_1, gmg_pc_apply_2, gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5
-  public :: gmg_pc_apply_6, gmg_pc_apply_7, gmg_pc_apply_8
+  public :: gmg_pc_apply_6, gmg_pc_apply_7, gmg_pc_apply_8, gmg_pc_apply_9, gmg_pc_apply_10
   public :: gmg_opts_t
 
   !> Everything that configures a hierarchy, passed EXPLICITLY by the caller
@@ -300,8 +300,9 @@ module mod_petsc_pc_gmg
   ! state, and gmg_select(k) parks the active instance's state in
   ! inst(cur_inst) and loads instance k (handles copied, arrays moved, O(1)).
   ! Instance 1 = pair_w, 2 = pair_psi, 3 = rho, 4 = T, 5 = v_par; the peel
-  ! arm of pair_w (mod_petsc_pc_sf_peel): 6 = Q, 7 = T_X, 8 = its (psi, j).
-  integer, parameter :: MAX_INST = 8
+  ! arm of pair_w (mod_petsc_pc_sf_peel): 6 = Q, 7 = T_X, 8 = its (psi, j),
+  ! 9, 10 = the factorised (psi, j)'s two Helmholtz operators.
+  integer, parameter :: MAX_INST = 10
   type :: gmg_inst_t
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
     integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 1, rovl = 0
@@ -750,6 +751,20 @@ contains
     PetscErrorCode :: ierr
     call vcycle_of(8, b, x, ierr)
   end subroutine gmg_pc_apply_8
+
+  subroutine gmg_pc_apply_9(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call vcycle_of(9, b, x, ierr)
+  end subroutine gmg_pc_apply_9
+
+  subroutine gmg_pc_apply_10(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call vcycle_of(10, b, x, ierr)
+  end subroutine gmg_pc_apply_10
 
   subroutine vcycle_of(k, b, x, ierr)
     integer, intent(in) :: k

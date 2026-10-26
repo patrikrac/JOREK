@@ -34,9 +34,11 @@ module mod_petsc_pc_physics_ctx
     logical :: w_v_ready = .false.
 
     !> The peeled-Schur arm of pair_w (physics_pc_sf_pair_w = "peel"), from the
-    !! same element pass: opz K_rho, W_comp, M_rho, K_nu, K_eta, K_w on u
+    !! same element pass: opz K_rho, W_comp, M_rho, K_nu, K_eta, K_w on u,
+    !! B_12 and B_33's element sums, the element-local R_hat and N, v3's K_nu
+    !! in psi weights and the factorised (psi, j)'s K_alpha, K_gamma
     !! (pc_elt_matrix_peel_fft's PEEL_NOP, mod_petsc_pc_sf_peel).
-    Mat :: P_peel(6)
+    Mat :: P_peel(15)
     logical :: peel_ready = .false.
   end type type_physics_pc_ctx
 

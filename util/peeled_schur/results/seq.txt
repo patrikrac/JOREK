@@ -1,0 +1,10 @@
+s_v2 |  | its 9 8 8 | pw 4.56 4.50 4.88 | pw_s 14.087 | setup 6.370; N (T) nonzeros nnz 1469.6 | N_vc 116 x 53.1 ms | real 39.73
+s_v3 | -sf_peel_v 3 | its 9 8 8 | pw 5.44 5.38 5.88 | pw_s 14.146 | setup 1.914; N (T) nonzeros nnz 619.0 | N_vc 139 x 29.7 ms | real 25.20
+s_v3t | -sf_peel_v 3 -sf_peel_tri 1 | its 9 8 8 | pw 5.67 5.25 6.00 | pw_s 10.667 | setup 1.889; N (T) nonzeros nnz 619.0 | N_vc 141 x 29.6 ms | real 21.73
+s_v3f | -sf_peel_v 3 -sf_peel_pjfac 1 | its 9 9 8 | pw 6.00 5.89 6.75 | pw_s 11.921 | setup 1.943; N (T) nonzeros nnz 619.0 | N_vc 161 x 28.6 ms | real 22.81
+s_v3ft | -sf_peel_v 3 -sf_peel_pjfac 1 -sf_peel_tri 1 | its 9 9 9 | pw 7.33 7.56 8.22 | pw_s 13.853 | setup 1.948; N (T) nonzeros nnz 619.0 | N_vc 208 x 30.4 ms | real 25.02
+s_v3f2 | -sf_peel_v 3 -sf_peel_pjfac 1 -sf_peel_hcyc 2 | its 9 8 8 | pw 5.56 5.12 5.62 | pw_s 12.225 | setup 1.969; N (T) nonzeros nnz 619.0 | N_vc 136 x 29.1 ms | real 23.19
+s_v3f2t | -sf_peel_v 3 -sf_peel_pjfac 1 -sf_peel_hcyc 2 -sf_peel_tri 1 | its 9 9 8 | pw 5.67 5.56 6.12 | pw_s 10.088 | setup 1.927; N (T) nonzeros nnz 619.0 | N_vc 150 x 28.4 ms | real 21.02
+prod | its 6 6 6 | pw 2.00 2.00 2.00  | [Physics PC]   inner pair_w KSP (mixed): mean    2.00 its, max 2 (6 solves)
+[Physics PC]   inner pair_w KSP (mixed): mean    2.00 its, max 2 (6 solves)
+[Physics PC]   inner pair_w KSP (mixed): mean    2.00 its, max 2 (6 solves) | real 7.57

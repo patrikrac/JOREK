@@ -36,17 +36,33 @@ module mod_petsc_pc_sf_mixed
 
   Mat, save :: suu                           !< B_22 + W
   Mat, save :: mpsi                          !< opz M_psi (model183: B_11)
-  logical, parameter :: psi_mass_b11 = (jorek_model == 183)
+  logical, save :: psi_mass_b11 = (jorek_model == 183)
   logical, save :: packed = .false.
+  real*8,  save :: w_scale = 1.d0             !< -sf_w_scale: W's weight (diagnostic)
+  logical, save :: opts_read = .false.
 
   public :: sfm_build, sfm_refill
 
 contains
 
+  !> diagnostics: -sf_psi_b11 1 (the psi row's B_11 in place of opz M_psi),
+  !! -sf_w_scale s (W's weight)
+  subroutine read_opts()
+    PetscErrorCode :: ierr
+    PetscBool :: set
+    PetscInt :: iv
+    if (opts_read) return
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_psi_b11", iv, set, ierr)
+    if (set) psi_mass_b11 = (iv /= 0)
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_w_scale", w_scale, set, ierr)
+    opts_read = .true.
+  end subroutine read_opts
+
   subroutine sfm_build()
     PetscErrorCode :: ierr
+    call read_opts()
     call MatDuplicate(g_ctx%B_22, MAT_COPY_VALUES, suu, ierr)
-    call MatAXPY(suu, 1.0d0, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
+    call MatAXPY(suu, w_scale, g_ctx%W_force, DIFFERENT_NONZERO_PATTERN, ierr)
     if (psi_mass_b11) then
       call MatDuplicate(g_ctx%B_11, MAT_COPY_VALUES, mpsi, ierr)
     else
@@ -60,7 +76,7 @@ contains
     PetscErrorCode :: ierr
     call MatZeroEntries(suu, ierr)
     call MatAXPY(suu, 1.0d0, g_ctx%B_22, SUBSET_NONZERO_PATTERN, ierr)
-    call MatAXPY(suu, 1.0d0, g_ctx%W_force, SUBSET_NONZERO_PATTERN, ierr)
+    call MatAXPY(suu, w_scale, g_ctx%W_force, SUBSET_NONZERO_PATTERN, ierr)
     if (psi_mass_b11) then
       call MatCopy(g_ctx%B_11, mpsi, SAME_NONZERO_PATTERN, ierr)
     else

@@ -1,0 +1,1 @@
+v3 | -sf_peel_v 3 | its 9 8 8 | pw 5.44 5.38 5.88 | pw_s 14.698 | setup 1.995; N (T) nonzeros nnz 619.0 | N_vc 139 x 30.2 ms | real 27.21

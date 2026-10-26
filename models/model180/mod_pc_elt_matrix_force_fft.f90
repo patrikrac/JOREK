@@ -9,7 +9,8 @@ module mod_pc_elt_matrix_force_fft
 
   !> The peeled-Schur arm of pair_w (mod_petsc_pc_sf_peel) is model199's only
   logical, parameter, public :: pc_peel_supported = .false.
-  integer, parameter, public :: PEEL_NOP = 6
+  integer, parameter, public :: PEEL_NOP = 15
+  logical, public :: peel_ebe_axis_mask = .false.
 
 contains
 

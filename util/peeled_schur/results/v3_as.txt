@@ -1,0 +1,1 @@
+v3_as | -sf_peel_v 3 -sf_peel_q lu -sf_peel_t lu -sf_peel_spec 40 -sf_peel_check 1 | its 9 8 8 | pw 5.56 5.25 5.88 | pw_s 14.035 | setup 2.578; N (T) nonzeros nnz 619.0 | N_vc  | real 35.88

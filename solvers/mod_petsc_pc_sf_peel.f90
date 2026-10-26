@@ -6,7 +6,7 @@ module mod_petsc_pc_sf_peel
   use mod_petsc_pc_physics_ctx, only: g_ctx
   use mod_petsc_pc_blocks,      only: pack_pair_aij, make_field_block_scale, pc_print_block_setup
   use mod_petsc_pc_sf_solver
-  use mod_petsc_pc_mass_cheb,   only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
+  use mod_petsc_pc_mass_cheb,   only: mass_cheb_t, mass_cheb_setup, mass_cheb_refresh, mass_cheb_solve
   implicit none
   private
 
@@ -32,6 +32,18 @@ module mod_petsc_pc_sf_peel
   !! approximates a mass inverse. The viscous term carries R_hat's resistive
   !! factor too: the design's opz theta dt K_nu is divided by it in P and
   !! fell short of S by up to ~600x on viscosity-dominated modes (tstep 10).
+  !! v3 (-sf_peel_v 3; v3/peeled_schur_preconditioner_v3.md): viscosity moved
+  !! out of N into the factor with the inertia,
+  !!   P = Q M_rho^-1 H_nu (opz R_hat)^-1 N,
+  !!   P^-1 = N^-1 (opz R_hat) H_nu^-1 M_rho Q^-1,
+  !!   H_nu = M_rho + theta dt / opz K_nu,  N = opz R_hat + B_12^T Y B_12,
+  !!   Y = X_AS(B_33 + theta dt / opz K_nu^psi),
+  !! K_nu^psi = K_nu's symbol over M_rho's times B_33's (slot 13), so Q M_rho^-1
+  !! H_nu carries S's theta dt K_rho M_rho^-1 K_nu exactly and the bending's
+  !! viscous factor cancels in Y. N has reach 3 and is SPD by construction.
+  !! (The note writes the same with R_psi in B_33's weights and Y = H_nu^-1;
+  !! here R_hat keeps v2's M_rho weights, which moves B_33 / M_rho into Y.)
+  !! H_nu^-1 by Chebyshev + ASM(ICC) (mod_petsc_pc_mass_cheb), refitted per build.
   !! v1 (-sf_peel_v 1): P = Q M^-1 T, T = M_rho + opz^-2 B_12^T X B_12 +
   !! theta dt / opz K_nu, X ~ B_33^-1 diagonal (optionally resistive) or
   !! Chebyshev.
@@ -81,6 +93,34 @@ module mod_petsc_pc_sf_peel
   !!                 the commutation error from X's
   !!   check 1, v2   also M1: the spectrum of X_AS B_33 against the colouring
   !!                 bound, and where its extreme eigenvectors sit
+  !!   ebe bits      v2: terms as sums of element-local products instead of the
+  !!                 global X_AS ones (pc_elt_matrix_peel_fft's slots 9..11, the
+  !!                 X_AS patch of one element as X and as M_rho^-1), keeping
+  !!                 the element stencil: bit 0 the bending B_12^T X B_12, bit 1
+  !!                 R_hat's hyper-resistive sandwich, bit 2 the viscous term
+  !!                 (7: N without a matrix product); bit 3 the sandwich in
+  !!                 strong form, int R div(w grad v) div(w grad u) (slot 12).
+  !!                 Measured (41x32, tstep 10): the element-local bending
+  !!                 breaks B_12's kernel (S P^-1 down to 1e-3), the
+  !!                 element-local sandwich overweights smooth modes (up to 5e3)
+  !!   ninner k      v2: P^-1's N^-1 by k inner iterations on the matrix-free
+  !!                 N with the global X_AS products (R_hat too), preconditioned
+  !!                 by N's solver (with ebe the element-local N's V-cycle); 0 off
+  !!   ninner_type   0 Richardson (defect correction, default), 1 GMRES
+  !!   tvisc 0..3    ninner: the viscous term of the assembled N that N's
+  !!                 solver is built on (default: visc); the matrix-free N keeps visc
+  !!   patch 0|1     v2 / v3: the triple products B_12^T X B_12 and K_w X K_w
+  !!                 assembled patch by patch, sum_p (R_p C)^T (R_p H R_p^T)^-1
+  !!                 (R_p C) with R_p C C's assembled rows, exactly the global
+  !!                 X_AS product without MatMatMult or intermediates
+  !!   pjfac 0|1     A_aa's (psi, j) by elimination with the factorised psi-Schur,
+  !!                 R_psi ~ opz (B_33 + K_alpha) B_33^-1 (B_33 + K_gamma) (slots
+  !!                 14, 15): B_33^-1 by Chebyshev + ASM(ICC), the two Helmholtz
+  !!                 operators by scalar GMG V-cycles (instances 9, 10, default
+  !!                 V(1,1), -sf_gmg9_* / -sf_gmg10_*), no constraint rows
+  !!   pjcheck 1     first build: the (psi, j) solve's error against MUMPS on
+  !!                 random right-hand sides, the GMG V-cycle and pjfac, and their
+  !!                 times
   !--------------------------------------------------------------------
 
   public :: peel_build, peel_solve, peel_report
@@ -89,12 +129,16 @@ module mod_petsc_pc_sf_peel
   integer, save :: o_x = 0, o_xres = 1, o_visc = 1, o_tri = 0, o_check = 0, o_spec = 0, o_spec_every = 0
   integer, save :: o_spec_drop = 0, o_texact = 0
   integer, save :: o_v = 2, o_xas = 1, o_hyper = 1, o_as_axis = 1, o_loc_its = 3000
+  integer, save :: o_ebe = 0, o_ninner = 0, o_ninner_type = 0
+  integer, save :: o_patch = 0, o_pjfac = 0, o_pjcheck = 0, o_hcyc = 1
+  integer, save :: o_tvisc = -1                !< ninner: the viscous term of N's assembled stand-in (-1 = visc)
   integer, save :: o_visc_set = -1             !< -sf_peel_visc as given (v2 default 2)
   real*8,  save :: o_eta_w = 1.d0              !< v2: K_eta's weight in R_hat (diagnostic)
   integer, save :: o_restart = 10, o_maxits = 30
   integer, save :: bk_q = SF_GMG, bk_t = SF_GMG, bk_aa = SF_GMG
   integer, save :: ncyc_q = 1, ncyc_t = 1, ncyc_pj = 1
   real*8,  save :: o_wcomp = 1.d0, o_x1_kappa = 50.d0
+  integer, save :: o_qv = 0
 
   logical, save :: ready = .false.
   integer, save :: comm_p = MPI_COMM_NULL, me_p = 0
@@ -102,8 +146,9 @@ module mod_petsc_pc_sf_peel
 
   !--- operators
   Mat, save :: Wop                         !< the packed pair_w (unscaled)
-  Mat, save :: Pc(6)                       !< AIJ copies of g_ctx%P_peel
+  Mat, save :: Pc(15)                      !< AIJ copies of g_ctx%P_peel
   Mat, save :: Qm, Mm, Tm, TB              !< Q, M_rho, T, B_12^T X B_12
+  Mat, save :: Mv                          !< qv: B_44 / opz, in M_rho's place in P^-1
   Mat, save :: B12s, XmB12, Xm             !< X_0: diag(sqrt x) B_12; X_1: X, X B_12
   Mat, save :: RB31, Cres                  !< xres: D^-1 B_31, B_13 D^-1 B_31
   Mat, save :: mpsi, PJm                   !< opz B_33, [[opz B_33, B_13], [B_31, B_33]]
@@ -115,6 +160,19 @@ module mod_petsc_pc_sf_peel
   !! theta dt K_eta
   Mat, save :: Xmr, XmK, Vc, Vt, Rv
   logical, save :: vis_built = .false.
+  !> v3: H_nu = M_rho + theta dt / opz K_nu (u), HY = B_33 + theta dt / opz
+  !! K_nu^psi and Y = X_AS(HY) (both per build)
+  Mat, save :: Hn, HY, Yas, YasB12
+  Mat, save :: B33a                           !< B_33 as AIJ (v3, pjfac)
+  logical, save :: b33a_built = .false.
+  logical, save :: yas_built = .false.
+  type(mass_cheb_t), save :: mhn              !< v3: H_nu^-1
+  type(block_solver_t), save :: luHn, luY     !< texact v3: H_nu, HY by MUMPS
+  !> pjfac: B_33 + K_alpha, B_33 + K_gamma, B_33^-1, the psi rows without B_13
+  Mat, save :: Ha, Hg
+  type(mass_cheb_t), save :: m33
+  type(block_solver_t), save :: sha, shg
+  PetscInt, allocatable, save :: pbrows(:)
   integer, save :: as_ncol = 0, as_npatch = 0
   type(block_solver_t), save :: lu33          !< texact v2: B_33 by MUMPS
   type(block_solver_t), save :: luM           !< texact v2, visc >= 2: M_rho by MUMPS
@@ -129,11 +187,14 @@ module mod_petsc_pc_sf_peel
   logical, save :: exact_aa = .false.
   KSP, save :: ktex                         !< texact: GMRES on T with the exact X
   Mat, save :: Tex
+  KSP, save :: kin                          !< ninner: inner iterations on the matrix-free N
+  Mat, save :: Nmf
+  logical, save :: xmr_built = .false.
   type(mass_cheb_t), save :: mw
   KSP, save :: kout
 
   !--- work vectors (u layout; the (psi, j) pair packed)
-  Vec, save :: ru, rw, rp, rj, yu, yw, yp, yj, sv, t1, t2, rpj, ypj
+  Vec, save :: ru, rw, rp, rj, yu, yw, yp, yj, sv, t1, t2, rpj, ypj, p1, p2, p3
 
   !--- outer counters since the last report
   integer, save :: n_solve = 0, its_sum = 0, its_max = 0, n_fail = 0
@@ -184,7 +245,13 @@ contains
       call build_t(first)
       tw(3:4) = MPI_Wtime()
     else
-      if (first .and. o_xas /= 0) call build_xas(g_ctx%B_33, Xas, "B_33", .true.)
+      ! X_AS(B_33) as a matrix: the global products (not patch), the checks, ninner
+      if (first .and. (iand(o_ebe, 7) /= 7 .or. o_ninner > 0) .and. o_xas /= 0 .and. &
+          (o_patch == 0 .or. o_check /= 0 .or. o_ninner > 0)) &
+        call build_xas(g_ctx%B_33, Xas, "B_33", .true.)
+      if (o_ninner > 0) call build_xmr()
+      if (first .and. o_ebe /= 0) call ebe_checks()
+      if (o_v == 3) call build_v3(first)
       tw(3) = MPI_Wtime()
       call build_rhat(first)
       call build_n(first)
@@ -206,10 +273,12 @@ contains
                          comm, my_id, rtol, &
                          gmg_inst=7, nfields=1, smoother=SF_GMG_SMOOTHER_RINGS, &
                          maxits=SF_GMG_MAXITS, ncyc=ncyc_t)
-    call sf_solver_setup(spj, PJm, bk_aa, "peel A_aa (psi, j)", comm, my_id, rtol, &
-                         gmg_inst=8, nfields=2, smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, &
-                         maxits=SF_GMG_MAXITS, pre0=SF_PJ_PRE0, post0=SF_PJ_POST0, &
-                         nsmooth_c=SF_PJ_NSC, axis_rings=SF_GMG_AXIS_RINGS_PAIRS, ncyc=ncyc_pj)
+    if (o_pjfac == 0 .or. o_pjcheck /= 0) &
+      call sf_solver_setup(spj, PJm, bk_aa, "peel A_aa (psi, j)", comm, my_id, rtol, &
+                           gmg_inst=8, nfields=2, smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, &
+                           maxits=SF_GMG_MAXITS, pre0=SF_PJ_PRE0, post0=SF_PJ_POST0, &
+                           nsmooth_c=SF_PJ_NSC, axis_rings=SF_GMG_AXIS_RINGS_PAIRS, ncyc=ncyc_pj)
+    if (o_pjfac /= 0) call build_pjfac(first)
     if (bk_aa == SF_LU) then
       call sf_solver_setup(sw, g_ctx%B_44, SF_LU, "peel A_aa omega (B_44)", comm, my_id, rtol, &
                            gmg_inst=0, nfields=1, smoother=0, maxits=1)
@@ -219,6 +288,7 @@ contains
 
     tw(6) = MPI_Wtime()
     if (o_texact /= 0) call setup_texact(first)
+    if (o_ninner > 0 .and. first) call setup_ninner()
     block
       PetscInt :: rs_, re_, i_, nc_
       real*8 :: nz(2)
@@ -261,6 +331,7 @@ contains
     ready = .true.
 
     if (o_check /= 0 .and. first) call stage0_check()
+    if (o_pjcheck /= 0 .and. first .and. o_pjfac /= 0) call pj_check()
     if (o_spec > 0 .and. (first .or. o_spec_every /= 0)) call spectrum()
 
   contains
@@ -274,11 +345,23 @@ contains
       call opt_i("-sf_peel_v", o_v);         call opt_i("-sf_peel_xas", o_xas)
       call opt_i("-sf_peel_hyper", o_hyper); call opt_i("-sf_peel_as_axis", o_as_axis)
       call opt_i("-sf_peel_loc_its", o_loc_its); call opt_r("-sf_peel_eta_w", o_eta_w)
-      if (o_v /= 1 .and. o_v /= 2) call fatal("-sf_peel_v must be 1 or 2")
+      call opt_i("-sf_peel_ebe", o_ebe);     call opt_i("-sf_peel_ninner", o_ninner)
+      call opt_i("-sf_peel_ninner_type", o_ninner_type); call opt_i("-sf_peel_tvisc", o_tvisc)
+      call opt_i("-sf_peel_patch", o_patch); call opt_i("-sf_peel_pjfac", o_pjfac)
+      call opt_i("-sf_peel_pjcheck", o_pjcheck); call opt_i("-sf_peel_hcyc", o_hcyc)
+      call opt_i("-sf_peel_qv", o_qv)
+      if (o_qv /= 0 .and. o_v /= 3) call fatal("-sf_peel_qv needs v3")
+      if ((o_ebe /= 0 .or. o_ninner > 0) .and. o_v /= 2) call fatal("-sf_peel_ebe / ninner need v2")
+      if (o_ninner > 0 .and. o_xas == 0) call fatal("-sf_peel_ninner needs X_AS (xas 1)")
+      if (o_v < 1 .or. o_v > 3) call fatal("-sf_peel_v must be 1, 2 or 3")
+      if (o_patch /= 0 .and. (o_v == 1 .or. o_xas == 0 .or. o_ebe /= 0)) &
+        call fatal("-sf_peel_patch needs v2 / v3 with X_AS and no ebe")
       if (o_v == 2) then                         ! v2 default: the resistive factor on K_nu
         o_visc_set = 2
         call opt_i("-sf_peel_visc", o_visc_set)
         o_visc = o_visc_set
+      else if (o_v == 3) then                    ! v3: viscosity in H_nu and Y, none in N
+        o_visc = 0
       endif
       if (o_visc < 0 .or. o_visc > 3 .or. (o_v == 1 .and. o_visc > 1)) &
         call fatal("-sf_peel_visc must be 0 | 1 (v1, v2), 2 | 3 (v2)")
@@ -287,15 +370,19 @@ contains
       call opt_i("-sf_peel_pjcyc", ncyc_pj)
       call opt_r("-sf_peel_wcomp", o_wcomp); call opt_r("-sf_peel_x1_kappa", o_x1_kappa)
       call opt_b("-sf_peel_q", bk_q); call opt_b("-sf_peel_t", bk_t); call opt_b("-sf_peel_aa", bk_aa)
+      if (o_pjfac /= 0 .and. bk_aa == SF_LU) call fatal("-sf_peel_pjfac replaces the GMG A_aa (aa gmg)")
       if (o_x /= 0 .and. o_x /= 1) call fatal("-sf_peel_x must be 0 or 1")
       if (o_x == 1 .and. o_xres /= 0) then
         if (my_id == 0) write(*,'(A)') PP//"-sf_peel_x 1 takes diag(B_33) alone: xres ignored"
         o_xres = 0
       endif
-      if (my_id == 0 .and. o_v == 2) then
-        write(*,'(A,A,A,I0,A,I0,A,F6.3,A,I0,A,I0)') PP//"v2, X = ", merge("X_AS     ", "diag B_33", o_xas /= 0), &
+      if (my_id == 0 .and. o_v >= 2) then
+        write(*,'(A,I0,A,A,A,I0,A,I0,A,F6.3,A,I0,A,I0)') PP//"v", o_v, ", X = ", merge("X_AS     ", "diag B_33", o_xas /= 0), &
           ", hyper-resistive sandwich ", o_hyper, ", axis patch ", o_as_axis, ", W_comp weight ", o_wcomp, &
           ", K_nu ", o_visc, ", lower-triangular ", o_tri
+        write(*,'(A,I0,A,I0,A,A)') PP//"element-local R_hat, N ", o_ebe, ", inner iterations on N ", o_ninner, &
+          ", ", merge("Richardson", "GMRES     ", o_ninner_type == 0)
+        write(*,'(A,I0,A,I0)') PP//"patch-wise triple products ", o_patch, ", factorised (psi, j) ", o_pjfac
       else if (my_id == 0) then
         write(*,'(A,I0,A,I0,A,F6.3,A,I0,A,I0)') PP//"v1, X_", o_x, ", xres ", o_xres, ", W_comp weight ", &
           o_wcomp, ", K_nu ", o_visc, ", lower-triangular ", o_tri
@@ -336,7 +423,12 @@ contains
         write(*,*)
       endif
     endif
-    call sf_solver_report(sq, my_id); call sf_solver_report(st, my_id); call sf_solver_report(spj, my_id)
+    call sf_solver_report(sq, my_id); call sf_solver_report(st, my_id)
+    if (o_pjfac == 0) call sf_solver_report(spj, my_id)
+    if (o_pjfac /= 0) then
+      call sf_solver_report(sha, my_id); call sf_solver_report(shg, my_id)
+      call sf_solver_reset_counters(sha); call sf_solver_reset_counters(shg)
+    endif
     call sf_solver_reset_counters(sq); call sf_solver_reset_counters(st)
     call sf_solver_reset_counters(spj); call sf_solver_reset_counters(sw)
     n_solve = 0; its_sum = 0; its_max = 0; n_fail = 0; t_sum = 0.d0
@@ -369,17 +461,32 @@ contains
     ierr = 0
   end subroutine peel_pc_apply
 
-  !> y = -P^-1 s = -T^-1 M_rho Q^-1 s (v1), -N^-1 opz R_hat Q^-1 s (v2), with
-  !! the Dirichlet u rows exact.
+  !> y = -P^-1 s = -T^-1 M_rho Q^-1 s (v1), -N^-1 opz R_hat Q^-1 s (v2),
+  !! -N^-1 opz R_hat H_nu^-1 M_rho Q^-1 s (v3), with the Dirichlet u rows exact.
   subroutine apply_pinv(s, y)
     Vec :: s, y
     PetscErrorCode :: ierr
     call VecCopy(s, t1, ierr)
     call sf_solver_apply(sq, t1, t2, ierr)
+    if (o_v == 3) then                          ! t2 = H_nu^-1 M_rho t2 (qv: B_44 / opz)
+      if (o_qv /= 0) then
+        call MatMult(Mv, t2, t1, ierr)
+      else
+        call MatMult(Mm, t2, t1, ierr)
+      endif
+      if (o_texact /= 0) then
+        call sf_solver_apply(luHn, t1, t2, ierr)
+      else
+        call mass_cheb_solve(mhn, t1, t2)
+      endif
+    endif
     if (o_v == 1) then
       call MatMult(Mm, t2, t1, ierr)
     else if (o_texact /= 0) then                ! v2: opz R_hat, R_hat exact with texact
       call rhat_exact(t2, t1)
+      call VecScale(t1, opz, ierr)
+    else if (o_ninner > 0) then                 ! v2: R_hat by the global X_AS products
+      call rhat_as(t2, t1)
       call VecScale(t1, opz, ierr)
     else
       call MatMult(Rh, t2, t1, ierr)
@@ -387,6 +494,8 @@ contains
     endif
     if (o_texact /= 0) then
       call KSPSolve(ktex, t1, y, ierr)
+    else if (o_ninner > 0) then
+      call KSPSolve(kin, t1, y, ierr)
     else
       call sf_solver_apply(st, t1, y, ierr)
     endif
@@ -404,6 +513,10 @@ contains
       call sf_solver_apply(sw, aw, ow, ierr)
     else
       call mass_cheb_solve(mw, aw, ow)
+    endif
+    if (o_pjfac /= 0) then
+      call pj_fac_solve(ap, aj, op, oj)
+      return
     endif
     call sf_split_parts(rpj, [ap, aj], .true.)
     call sf_solver_apply(spj, rpj, ypj, ierr)
@@ -499,10 +612,23 @@ contains
     call VecDestroy(dW, ierr)
   end subroutine set_dirichlet_diag
 
-  !> Q = opz K_rho + w W_comp, the Dirichlet rows the identity
+  !> Q = opz K_rho + w W_comp, the Dirichlet rows the identity. qv: Q = L, the
+  !! vorticity row's Laplacian B_42 on the u rows' test functions (B_42^T, sign
+  !! as K_rho), so P^-1's B_44 L^-1 / opz commutes the Lorentz term through the
+  !! operator that defines omega and the density stays in H_nu (no W_comp)
   subroutine build_q(first)
     logical, intent(in) :: first
     PetscErrorCode :: ierr
+    if (o_qv /= 0) then
+      if (first) then
+        call MatTranspose(g_ctx%B_42, MAT_INITIAL_MATRIX, Qm, ierr)
+      else
+        call MatTranspose(g_ctx%B_42, MAT_REUSE_MATRIX, Qm, ierr)
+      endif
+      call MatScale(Qm, same_sign(Qm, Pc(1)), ierr)
+      call dirichlet(Qm)
+      return
+    endif
     if (first) then
       call MatDuplicate(Pc(1), MAT_COPY_VALUES, Qm, ierr)
       call MatSetOption(Qm, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr)
@@ -523,7 +649,29 @@ contains
       call MatCopy(Pc(3), Mm, SAME_NONZERO_PATTERN, ierr)
     endif
     call dirichlet(Mm)
+    if (o_qv /= 0) then
+      if (first) then
+        call MatDuplicate(g_ctx%B_44, MAT_COPY_VALUES, Mv, ierr)
+      else
+        call MatCopy(g_ctx%B_44, Mv, SAME_NONZERO_PATTERN, ierr)
+      endif
+      call MatScale(Mv, same_sign(Mv, Pc(3)) / opz, ierr)
+      call dirichlet(Mv)
+    endif
   end subroutine build_m
+
+  !> +-1: the sign that gives A's diagonal the sign of B's (summed)
+  real*8 function same_sign(A, B)
+    Mat :: A, B
+    PetscErrorCode :: ierr
+    Vec :: d
+    PetscScalar :: sa, sb
+    call MatCreateVecs(A, d, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, d, ierr); call VecSum(d, sa, ierr)
+    call MatGetDiagonal(B, d, ierr); call VecSum(d, sb, ierr)
+    call VecDestroy(d, ierr)
+    same_sign = merge(1.d0, -1.d0, sa * sb > 0.d0)
+  end function same_sign
 
   !> TB = B_12^T X B_12. X_0 = diag(x), x = 1 / (diag B_33 - diag(B_13
   !! D^-1 B_31) / opz) with xres (the psi row's resistive Schur diagonal),
@@ -666,13 +814,20 @@ contains
   !! submatrix over the rank's patch rows and is inverted by Cholesky.
   !! Also N_c, the greedy colouring of the patch graph (patches adjacent
   !! where B couples any of their DOFs): lambda_max(X_AS B) <= N_c.
+  !! With Cm (patch): X = Cm^T X_AS Cm instead, assembled patch by patch as
+  !! sum_p (R_p C)^T (R_p B R_p^T)^-1 (R_p C) (+ the decoupled rows' c_i^T c_i
+  !! / b_ii), R_p C the assembled rows of C = Cm: the global product exactly, by
+  !! one Cholesky solve and one rank update per patch, without MatMatMult or
+  !! intermediates; X's pattern on firstc (MATPREALLOCATOR), refilled after.
   !--------------------------------------------------------------------
-  subroutine build_xas(B, X, label, verbose)
+  subroutine build_xas(B, X, label, verbose, Cm, firstc)
     use mod_parameters, only: n_tor, n_degrees, n_vertex_max
     use nodes_elements, only: node_list, element_list
     Mat :: B, X
     character(len=*), intent(in) :: label
     logical, intent(in) :: verbose
+    Mat, optional :: Cm
+    logical, intent(in), optional :: firstc
     PetscErrorCode :: ierr
     PetscInt :: rs, re, nloc, ng, i, nc, k, n, nu
     PetscInt, parameter :: one = 1
@@ -685,7 +840,7 @@ contains
     integer :: ne, nn, e, e2, v, w, kd, m, np, me, mpierr, p, q, axp, info, a, j, npat, nfail, r, c, naxd
     IS :: isu
     Mat, pointer :: sub(:)
-    external :: dpotrf, dpotri
+    external :: dpotrf, dpotri, dtrsm, dsyrk
 
     call MPI_Comm_size(comm_p, np, mpierr); call MPI_Comm_rank(comm_p, me, mpierr)
     call MatGetOwnershipRange(B, rs, re, ierr)
@@ -761,6 +916,7 @@ contains
     if (axp == 1) naxd = plen(1)
 
     !--- X: preallocation from the patch sums (an upper bound)
+    if (.not. present(Cm)) then
     allocate(dnz(nloc), onz(nloc))
     dnz = 1; onz = 0
     do p = 1, npat
@@ -782,6 +938,7 @@ contains
     call MatSetType(X, MATMPIAIJ, ierr)
     call MatMPIAIJSetPreallocation(X, PETSC_DEFAULT_INTEGER, dnz, PETSC_DEFAULT_INTEGER, onz, ierr)
     call MatSetOption(X, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    endif
 
     !--- this rank's patches (owner of the first row): their rows, one submatrix
     allocate(mark(npat))
@@ -807,6 +964,15 @@ contains
     call ISCreateGeneral(PETSC_COMM_SELF, nu, urows, PETSC_COPY_VALUES, isu, ierr)
     call MatCreateSubMatrices(B, one, [isu], [isu], MAT_INITIAL_MATRIX, sub, ierr)
     nfail = 0
+    if (present(Cm)) then
+      call c_products(sub(1))
+      call MatDestroySubMatrices(one, sub, ierr)
+      call ISDestroy(isu, ierr)
+      call MPI_Allreduce(MPI_IN_PLACE, nfail, 1, MPI_INTEGER, MPI_SUM, comm_p, mpierr)
+      if (me_p == 0 .and. firstc) write(*,'(A,A,A,I0,A,I0,A,I0,A)') "[Physics PC]   peel: ", label, ", ", npat, &
+        " patches (axis patch ", naxd, " DOFs), ", nfail, " Cholesky failures"
+      return
+    endif
     do p = 1, npat
       if (mark(p) == 0) cycle
       n = plen(p)
@@ -901,6 +1067,134 @@ contains
 
   contains
 
+    !> X = sum_p (R_p C)^T (R_p B R_p^T)^-1 (R_p C) + the decoupled rows'
+    !! outer products, sb = B on this rank's patch rows
+    subroutine c_products(sb)
+      Mat :: sb
+      Mat :: Cc, pre, tgt
+      Mat, pointer :: subc(:)
+      IS :: isall
+      PetscInt :: ngc, nlc, ncol, nr
+      PetscInt, allocatable :: cl(:)
+      integer, allocatable :: cpos(:)
+      real*8, allocatable :: cp(:, :), g(:, :)
+      MatType :: mt
+      logical :: conv, vals_pass
+      integer :: pass, npass, jj, ic
+      call MatGetType(Cm, mt, ierr)
+      conv = (mt /= MATMPIAIJ .and. mt /= MATSEQAIJ)
+      if (conv) then
+        call MatConvert(Cm, MATMPIAIJ, MAT_INITIAL_MATRIX, Cc, ierr)
+      else
+        Cc = Cm
+      endif
+      call MatGetSize(Cc, PETSC_NULL_INTEGER, ngc, ierr)
+      call MatGetLocalSize(Cc, PETSC_NULL_INTEGER, nlc, ierr)
+      call ISCreateStride(PETSC_COMM_SELF, ngc, 0, one, isall, ierr)
+      call MatCreateSubMatrices(Cc, one, [isu], [isall], MAT_INITIAL_MATRIX, subc, ierr)
+      allocate(cpos(0:ngc - 1), cl(ngc))
+      cpos = 0
+      if (firstc) then
+        call MatCreate(comm_p, pre, ierr)
+        call MatSetSizes(pre, nlc, nlc, ngc, ngc, ierr)
+        call MatSetType(pre, MATPREALLOCATOR, ierr)
+        call MatSetUp(pre, ierr)
+        npass = 2
+      else
+        call MatZeroEntries(X, ierr)
+        npass = 1
+      endif
+      do pass = 1, npass
+        vals_pass = (pass == npass)
+        if (vals_pass) then
+          tgt = X
+        else
+          tgt = pre
+        endif
+        do p = 1, npat
+          if (mark(p) == 0) cycle
+          n = plen(p)
+          allocate(prow(n), lp(n))
+          prow = pdof(pst(p):pst(p) + n - 1)
+          do j = 1, int(n)
+            lp(j) = findpos(urows(1:nu), prow(j))
+          enddo
+          ! the columns of C's patch rows
+          ncol = 0
+          do j = 1, int(n)
+            call MatGetRow(subc(1), lp(j), nc, cols, vals, ierr)
+            do k = 1, nc
+              if (cpos(cols(k)) == 0) then
+                ncol = ncol + 1; cl(ncol) = cols(k); cpos(cols(k)) = int(ncol)
+              endif
+            enddo
+            call MatRestoreRow(subc(1), lp(j), nc, cols, vals, ierr)
+          enddo
+          allocate(g(ncol, ncol))
+          g = 0.d0
+          if (vals_pass) then
+            allocate(cp(n, ncol), blk(n, n))
+            cp = 0.d0
+            do j = 1, int(n)
+              call MatGetRow(subc(1), lp(j), nc, cols, vals, ierr)
+              do k = 1, nc
+                cp(j, cpos(cols(k))) = vals(k)
+              enddo
+              call MatRestoreRow(subc(1), lp(j), nc, cols, vals, ierr)
+            enddo
+            call MatGetValues(sb, n, lp, n, lp, blk, ierr)
+            call dpotrf('U', int(n), blk, int(n), info)
+            if (info == 0) then
+              ! U^-T R_p C, then its Gram matrix: (R_p C)^T (U^T U)^-1 (R_p C)
+              call dtrsm('L', 'U', 'T', 'N', int(n), int(ncol), 1.d0, blk, int(n), cp, int(n))
+              call dsyrk('U', 'T', int(ncol), int(n), 1.d0, cp, int(n), 0.d0, g, int(ncol))
+              do ic = 1, int(ncol)
+                do jj = ic + 1, int(ncol)
+                  g(jj, ic) = g(ic, jj)
+                enddo
+              enddo
+            else
+              nfail = nfail + 1
+            endif
+            deallocate(cp, blk)
+          endif
+          call MatSetValues(tgt, ncol, cl, ncol, cl, g, ADD_VALUES, ierr)
+          cpos(cl(1:ncol)) = 0
+          deallocate(g, prow, lp)
+        enddo
+        ! B's decoupled rows (owned here): c_i^T c_i / b_ii
+        do i = rs, re - 1
+          if (flag(i) /= 1) cycle
+          call MatGetRow(Cc, i, nc, cols, vals, ierr)
+          nr = nc
+          allocate(g(nr, nr))
+          g = 0.d0
+          if (vals_pass) then
+            do ic = 1, int(nr)
+              g(:, ic) = vals(1:nr) * vals(ic) / dg(i)
+            enddo
+          endif
+          cl(1:nr) = cols(1:nr)
+          call MatRestoreRow(Cc, i, nc, cols, vals, ierr)
+          call MatSetValues(tgt, nr, cl, nr, cl, g, ADD_VALUES, ierr)
+          deallocate(g)
+        enddo
+        call MatAssemblyBegin(tgt, MAT_FINAL_ASSEMBLY, ierr)
+        call MatAssemblyEnd(tgt, MAT_FINAL_ASSEMBLY, ierr)
+        if (.not. vals_pass) then
+          call MatCreate(comm_p, X, ierr)
+          call MatSetSizes(X, nlc, nlc, ngc, ngc, ierr)
+          call MatSetType(X, MATMPIAIJ, ierr)
+          call MatPreallocatorPreallocate(pre, PETSC_TRUE, X, ierr)
+          call MatDestroy(pre, ierr)
+          call MatSetOption(X, MAT_NEW_NONZERO_LOCATION_ERR, PETSC_TRUE, ierr)
+        endif
+      enddo
+      call MatDestroySubMatrices(one, subc, ierr)
+      call ISDestroy(isall, ierr)
+      if (conv) call MatDestroy(Cc, ierr)
+    end subroutine c_products
+
     integer function owner_of(row)
       integer, intent(in) :: row
       integer :: lo, hi, mid
@@ -963,7 +1257,13 @@ contains
   subroutine build_rhat(first)
     logical, intent(in) :: first
     PetscErrorCode :: ierr
-    if (o_hyper /= 0) then
+    if (o_hyper /= 0 .and. btest(o_ebe, 3)) then
+      Hm = Pc(12)
+    else if (o_hyper /= 0 .and. btest(o_ebe, 1)) then
+      Hm = Pc(9)
+    else if (o_hyper /= 0 .and. o_patch /= 0) then
+      call build_xas(g_ctx%B_33, Hm, "B_33 (K_w X K_w by patches)", .false., Pc(6), first)
+    else if (o_hyper /= 0) then
       if (first) then
         call MatMatMult(Pc(6), xmat(), MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, KwX, ierr)
         call MatMatMult(KwX, Pc(6), MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, Hm, ierr)
@@ -991,7 +1291,22 @@ contains
   subroutine build_n(first)
     logical, intent(in) :: first
     PetscErrorCode :: ierr
-    if (o_xas /= 0) then
+    integer :: vs
+    vs = o_visc
+    if (o_tvisc >= 0) vs = o_tvisc
+    if (btest(o_ebe, 0)) then
+      TB = Pc(10)
+    else if (o_v == 3 .and. o_patch /= 0) then     ! v3: Y = X_AS(HY)
+      call build_xas(HY, TB, "HY (B_12^T Y B_12 by patches)", .false., g_ctx%B_12, first)
+    else if (o_v == 3) then                          ! Yas is a new matrix per build
+      if (.not. first) then
+        call MatDestroy(YasB12, ierr); call MatDestroy(TB, ierr)
+      endif
+      call MatMatMult(Yas, g_ctx%B_12, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, YasB12, ierr)
+      call MatTransposeMatMult(g_ctx%B_12, YasB12, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, TB, ierr)
+    else if (o_xas /= 0 .and. o_patch /= 0) then
+      call build_xas(g_ctx%B_33, TB, "B_33 (B_12^T X B_12 by patches)", .false., g_ctx%B_12, first)
+    else if (o_xas /= 0) then
       if (first) then
         call MatMatMult(Xas, g_ctx%B_12, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, XasB12, ierr)
         call MatTransposeMatMult(g_ctx%B_12, XasB12, MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, TB, ierr)
@@ -1003,12 +1318,14 @@ contains
       o_xres = 0
       call build_x(first)                       ! X_0, TB = B_12^T X_0 B_12
     endif
-    if (o_visc >= 2) call build_visc()
+    if (vs >= 2 .and. .not. btest(o_ebe, 2)) call build_visc(vs)
     if (first) then
       call MatDuplicate(TB, MAT_COPY_VALUES, Tm, ierr)
       call MatAXPY(Tm, opz, Rh, DIFFERENT_NONZERO_PATTERN, ierr)
-      if (o_visc == 1) call MatAXPY(Tm, opz * thdt, Pc(4), DIFFERENT_NONZERO_PATTERN, ierr)
-      if (o_visc >= 2) then
+      if (vs == 1) call MatAXPY(Tm, opz * thdt, Pc(4), DIFFERENT_NONZERO_PATTERN, ierr)
+      if (vs >= 2 .and. btest(o_ebe, 2)) then
+        call MatAXPY(Tm, 1.d0, Pc(11), DIFFERENT_NONZERO_PATTERN, ierr)
+      else if (vs >= 2) then
         call MatAXPY(Tm, 0.5d0 * thdt, Vc, DIFFERENT_NONZERO_PATTERN, ierr)
         call MatAXPY(Tm, 0.5d0 * thdt, Vt, DIFFERENT_NONZERO_PATTERN, ierr)
       endif
@@ -1017,8 +1334,10 @@ contains
       call MatZeroEntries(Tm, ierr)
       call MatAXPY(Tm, 1.d0, TB, SUBSET_NONZERO_PATTERN, ierr)
       call MatAXPY(Tm, opz, Rh, SUBSET_NONZERO_PATTERN, ierr)
-      if (o_visc == 1) call MatAXPY(Tm, opz * thdt, Pc(4), SUBSET_NONZERO_PATTERN, ierr)
-      if (o_visc >= 2) then
+      if (vs == 1) call MatAXPY(Tm, opz * thdt, Pc(4), SUBSET_NONZERO_PATTERN, ierr)
+      if (vs >= 2 .and. btest(o_ebe, 2)) then
+        call MatAXPY(Tm, 1.d0, Pc(11), SUBSET_NONZERO_PATTERN, ierr)
+      else if (vs >= 2) then
         call MatAXPY(Tm, 0.5d0 * thdt, Vc, SUBSET_NONZERO_PATTERN, ierr)
         call MatAXPY(Tm, 0.5d0 * thdt, Vt, SUBSET_NONZERO_PATTERN, ierr)
       endif
@@ -1032,7 +1351,8 @@ contains
   !! Q (opz R_hat)^-1 N carries theta dt K_rho M_rho^-1 K_nu as S does. The
   !! design's opz theta dt K_nu (visc 1) is divided by R_hat's resistive
   !! factor, up to ~600x on viscosity-dominated modes here.
-  subroutine build_visc()
+  subroutine build_visc(vs)
+    integer, intent(in) :: vs
     PetscErrorCode :: ierr
     if (vis_built) then
       call MatDestroy(Xmr, ierr); call MatDestroy(XmK, ierr)
@@ -1040,7 +1360,7 @@ contains
     endif
     call build_xas(Mm, Xmr, "M_rho", .not. vis_built)
     call MatMatMult(Xmr, Pc(4), MAT_INITIAL_MATRIX, PETSC_DETERMINE_REAL, XmK, ierr)
-    if (o_visc == 3) then
+    if (vs == 3) then
       if (vis_built) then
         call MatZeroEntries(Rv, ierr)
         call MatAXPY(Rv, opz, Pc(3), SAME_NONZERO_PATTERN, ierr)
@@ -1058,6 +1378,205 @@ contains
     call MatTranspose(Vc, MAT_INITIAL_MATRIX, Vt, ierr)
     vis_built = .true.
   end subroutine build_visc
+
+  !> B_33 as AIJ, once (geometry-only)
+  subroutine ensure_b33a()
+    PetscErrorCode :: ierr
+    if (b33a_built) return
+    call MatConvert(g_ctx%B_33, MATMPIAIJ, MAT_INITIAL_MATRIX, B33a, ierr)
+    b33a_built = .true.
+  end subroutine ensure_b33a
+
+  !> v3: H_nu = M_rho + theta dt / opz K_nu (u; the Dirichlet rows the
+  !! identity) and its Chebyshev; HY = B_33 + theta dt / opz K_nu^psi and,
+  !! for the global products, Y = X_AS(HY). Per build (nu(T), rho0). Prints
+  !! the grid viscous numbers diag(theta dt / opz K_nu) / diag(M_rho) (and
+  !! HY's): the element / rank Schwarz of H_nu degrades once they are >> 1
+  !! (v3 note: kappa(X_AS H) 91 at 30).
+  subroutine build_v3(first)
+    logical, intent(in) :: first
+    PetscErrorCode :: ierr
+    call ensure_b33a()
+    if (first) then
+      call MatDuplicate(Pc(3), MAT_COPY_VALUES, Hn, ierr)
+      call MatAXPY(Hn, thdt / opz, Pc(4), DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatSetOption(Hn, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr)
+      call MatDuplicate(Pc(13), MAT_COPY_VALUES, HY, ierr)
+      call MatScale(HY, thdt / opz, ierr)
+      call MatAXPY(HY, 1.d0, B33a, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatSetOption(HY, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr)
+    else
+      call MatZeroEntries(Hn, ierr)
+      call MatAXPY(Hn, 1.d0, Pc(3), SUBSET_NONZERO_PATTERN, ierr)
+      call MatAXPY(Hn, thdt / opz, Pc(4), SUBSET_NONZERO_PATTERN, ierr)
+      call MatZeroEntries(HY, ierr)
+      call MatAXPY(HY, thdt / opz, Pc(13), SUBSET_NONZERO_PATTERN, ierr)
+      call MatAXPY(HY, 1.d0, B33a, SUBSET_NONZERO_PATTERN, ierr)
+    endif
+    call dirichlet(Hn)
+    call diag_ratio(Pc(4), Pc(3), thdt / opz, "v3 grid viscous number, theta dt / opz diag K_nu / diag M_rho")
+    call diag_ratio(Pc(13), B33a, thdt / opz, "v3 Y's, theta dt / opz diag K_nu^psi / diag B_33")
+    if (o_patch == 0) then
+      if (yas_built) call MatDestroy(Yas, ierr)
+      call build_xas(HY, Yas, "Y = B_33 + theta dt / opz K_nu^psi", .not. yas_built)
+      yas_built = .true.
+    endif
+    if (first) then
+      call mass_cheb_setup(mhn, Hn, comm_p, "peel v3 H_nu = M_rho + theta dt / opz K_nu")
+    else
+      call mass_cheb_refresh(mhn, Hn, comm_p, "peel v3 H_nu")
+    endif
+  end subroutine build_v3
+
+  !> max and mean of sc diag(A) / diag(B) over B's nonzero diagonal
+  subroutine diag_ratio(A, B, sc, label)
+    Mat :: A, B
+    real*8, intent(in) :: sc
+    character(len=*), intent(in) :: label
+    PetscErrorCode :: ierr
+    Vec :: d1, d2
+    PetscScalar, pointer :: p1(:), p2(:)
+    real*8 :: w(3)
+    integer :: k, mpierr
+    call MatCreateVecs(B, d1, PETSC_NULL_VEC, ierr)
+    call VecDuplicate(d1, d2, ierr)
+    call MatGetDiagonal(A, d1, ierr); call MatGetDiagonal(B, d2, ierr)
+    call VecGetArrayRead(d1, p1, ierr); call VecGetArrayRead(d2, p2, ierr)
+    w = 0.d0
+    do k = 1, size(p1)
+      if (abs(p2(k)) > 0.d0) then
+        w(1) = max(w(1), sc * p1(k) / p2(k)); w(2) = w(2) + sc * p1(k) / p2(k); w(3) = w(3) + 1.d0
+      endif
+    enddo
+    call VecRestoreArrayRead(d1, p1, ierr); call VecRestoreArrayRead(d2, p2, ierr)
+    call MPI_Allreduce(MPI_IN_PLACE, w(1), 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm_p, mpierr)
+    call MPI_Allreduce(MPI_IN_PLACE, w(2:3), 2, MPI_DOUBLE_PRECISION, MPI_SUM, comm_p, mpierr)
+    if (me_p == 0) write(*,'(A,A,A,ES10.3,A,ES10.3)') "[Physics PC]   peel: ", label, ": max ", w(1), &
+      ", mean ", w(2) / max(w(3), 1.d0)
+    call VecDestroy(d1, ierr); call VecDestroy(d2, ierr)
+  end subroutine diag_ratio
+
+  !> pjfac: H_alpha = B_33 + K_alpha, H_gamma = B_33 + K_gamma, with K's rows
+  !! and columns of the psi rows without B_13 zeroed (R_psi = opz B_33 there),
+  !! their GMG V-cycles (instances 9, 10), and B_33^-1's Chebyshev once
+  subroutine build_pjfac(first)
+    logical, intent(in) :: first
+    PetscErrorCode :: ierr
+    call ensure_b33a()
+    if (first) then
+      call find_pb_rows()
+      call MatDuplicate(Pc(14), MAT_COPY_VALUES, Ha, ierr)
+      call MatDuplicate(Pc(15), MAT_COPY_VALUES, Hg, ierr)
+    else
+      call MatCopy(Pc(14), Ha, SUBSET_NONZERO_PATTERN, ierr)
+      call MatCopy(Pc(15), Hg, SUBSET_NONZERO_PATTERN, ierr)
+    endif
+    call MatZeroRowsColumns(Ha, size(pbrows, kind=kind(pbrows)), pbrows, 0.d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    call MatZeroRowsColumns(Hg, size(pbrows, kind=kind(pbrows)), pbrows, 0.d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    if (first) then
+      call MatAXPY(Ha, 1.d0, B33a, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatAXPY(Hg, 1.d0, B33a, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatSetOption(Ha, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr)
+      call MatSetOption(Hg, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr)
+    else
+      call MatAXPY(Ha, 1.d0, B33a, SUBSET_NONZERO_PATTERN, ierr)
+      call MatAXPY(Hg, 1.d0, B33a, SUBSET_NONZERO_PATTERN, ierr)
+    endif
+    call diag_ratio(Pc(14), B33a, 1.d0, "pjfac diag K_alpha / diag B_33")
+    call diag_ratio(Pc(15), B33a, 1.d0, "pjfac diag K_gamma / diag B_33")
+    call sf_solver_setup(sha, Ha, SF_GMG, "peel (psi, j) H_alpha = B_33 + K_alpha", comm_p, me_p, 1.d-2, &
+                         gmg_inst=9, nfields=1, smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, &
+                         maxits=SF_GMG_MAXITS, pre0=1, post0=1, nsmooth_c=1, ncyc=o_hcyc)
+    call sf_solver_setup(shg, Hg, SF_GMG, "peel (psi, j) H_gamma = B_33 + K_gamma", comm_p, me_p, 1.d-2, &
+                         gmg_inst=10, nfields=1, smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, &
+                         maxits=SF_GMG_MAXITS, pre0=1, post0=1, nsmooth_c=1, ncyc=o_hcyc)
+    if (first) call mass_cheb_setup(m33, B33a, comm_p, "peel (psi, j) B_33")
+  end subroutine build_pjfac
+
+  !> pjfac: the psi rows with nothing in B_13 (the eliminated psi DOFs)
+  subroutine find_pb_rows()
+    PetscErrorCode :: ierr
+    PetscInt :: rs, re, i, nc, k, nb
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    logical, allocatable :: em(:)
+    integer :: ntot, mpierr
+    call MatGetOwnershipRange(g_ctx%B_13, rs, re, ierr)
+    allocate(em(rs:re - 1))
+    do i = rs, re - 1
+      em(i) = .true.
+      call MatGetRow(g_ctx%B_13, i, nc, cols, vals, ierr)
+      do k = 1, nc
+        if (vals(k) /= 0.d0) em(i) = .false.
+      enddo
+      call MatRestoreRow(g_ctx%B_13, i, nc, cols, vals, ierr)
+    enddo
+    nb = count(em)
+    allocate(pbrows(nb))
+    nb = 0
+    do i = rs, re - 1
+      if (em(i)) then
+        nb = nb + 1; pbrows(nb) = i
+      endif
+    enddo
+    call MPI_Allreduce(int(nb), ntot, 1, MPI_INTEGER, MPI_SUM, comm_p, mpierr)
+    if (me_p == 0) write(*,'(A,I0,A)') "[Physics PC]   peel pjfac: ", ntot, " psi rows without B_13"
+  end subroutine find_pb_rows
+
+  !> (psi, j) = [[opz B_33, B_13], [B_31, B_33]]^-1 (a_p, a_j) by elimination,
+  !! R_psi^-1 ~ opz^-1 H_gamma^-1 B_33 H_alpha^-1 (pjfac)
+  subroutine pj_fac_solve(ap, aj, op, oj)
+    Vec :: ap, aj, op, oj
+    PetscErrorCode :: ierr
+    call mass_cheb_solve(m33, aj, p1)              ! z = B_33^-1 a_j
+    call MatMult(g_ctx%B_13, p1, p2, ierr)
+    call VecAYPX(p2, -1.d0, ap, ierr)              ! a_p - B_13 z
+    call sf_solver_apply(sha, p2, p3, ierr)
+    call MatMult(B33a, p3, p2, ierr)
+    call sf_solver_apply(shg, p2, op, ierr)
+    call VecScale(op, 1.d0 / opz, ierr)
+    call MatMult(g_ctx%B_31, op, p2, ierr)
+    call VecAYPX(p2, -1.d0, aj, ierr)              ! a_j - B_31 psi
+    call mass_cheb_solve(m33, p2, oj)
+  end subroutine pj_fac_solve
+
+  !> pjcheck: the (psi, j) solve against MUMPS on 3 random right-hand sides,
+  !! the GMG V-cycle (spj) and pjfac: relative 2-norm errors of psi and j, ms
+  subroutine pj_check()
+    PetscErrorCode :: ierr
+    Vec :: ap, aj, ep, ej, xp, xj
+    real*8 :: e(4), t(2), nn(2), d, t0
+    integer :: k
+    call ensure_exact_aa()
+    call VecDuplicate(ru, ap, ierr); call VecDuplicate(ru, aj, ierr)
+    call VecDuplicate(ru, ep, ierr); call VecDuplicate(ru, ej, ierr)
+    call VecDuplicate(ru, xp, ierr); call VecDuplicate(ru, xj, ierr)
+    e = 0.d0; t = 0.d0
+    do k = 1, 3
+      call VecSetRandom(ap, PETSC_NULL_RANDOM, ierr); call VecSetRandom(aj, PETSC_NULL_RANDOM, ierr)
+      call sf_split_parts(rpj, [ap, aj], .true.)
+      call sf_solver_apply(lpj, rpj, ypj, ierr)
+      call sf_split_parts(ypj, [ep, ej], .false.)
+      call VecNorm(ep, NORM_2, nn(1), ierr); call VecNorm(ej, NORM_2, nn(2), ierr)
+      call sf_split_parts(rpj, [ap, aj], .true.)
+      t0 = MPI_Wtime()
+      call sf_solver_apply(spj, rpj, ypj, ierr)
+      t(1) = t(1) + MPI_Wtime() - t0
+      call sf_split_parts(ypj, [xp, xj], .false.)
+      call VecAXPY(xp, -1.d0, ep, ierr); call VecNorm(xp, NORM_2, d, ierr); e(1) = max(e(1), d / nn(1))
+      call VecAXPY(xj, -1.d0, ej, ierr); call VecNorm(xj, NORM_2, d, ierr); e(2) = max(e(2), d / nn(2))
+      t0 = MPI_Wtime()
+      call pj_fac_solve(ap, aj, xp, xj)
+      t(2) = t(2) + MPI_Wtime() - t0
+      call VecAXPY(xp, -1.d0, ep, ierr); call VecNorm(xp, NORM_2, d, ierr); e(3) = max(e(3), d / nn(1))
+      call VecAXPY(xj, -1.d0, ej, ierr); call VecNorm(xj, NORM_2, d, ierr); e(4) = max(e(4), d / nn(2))
+    enddo
+    if (me_p == 0) write(*,'(A,2ES10.2,A,F8.2,A,2ES10.2,A,F8.2,A)') &
+      "[Physics PC]   peel pjcheck: (psi, j) error vs MUMPS, GMG V-cycle psi / j", e(1:2), " (", &
+      1.d3 * t(1) / 3.d0, " ms); pjfac", e(3:4), " (", 1.d3 * t(2) / 3.d0, " ms)"
+    call VecDestroy(ap, ierr); call VecDestroy(aj, ierr); call VecDestroy(ep, ierr)
+    call VecDestroy(ej, ierr); call VecDestroy(xp, ierr); call VecDestroy(xj, ierr)
+  end subroutine pj_check
 
   !> The X of the hyper-resistive sandwich: X_AS, or diag(B_33)^-1 as a matrix
   function xmat() result(A)
@@ -1148,7 +1667,126 @@ contains
     call VecDuplicate(ru, yj, ierr); call VecDuplicate(ru, sv, ierr)
     call VecDuplicate(ru, t1, ierr); call VecDuplicate(ru, t2, ierr)
     call MatCreateVecs(PJm, rpj, ypj, ierr)
+    call VecDuplicate(ru, p1, ierr); call VecDuplicate(ru, p2, ierr); call VecDuplicate(ru, p3, ierr)
   end subroutine create_work_vectors
+
+  !> ebe, first build: B_12, B_33's element sums against pair_w's blocks
+  !! (the element products' inputs)
+  subroutine ebe_checks()
+    call ebe_check(Pc(7), g_ctx%B_12, "B_12")
+    call ebe_check(Pc(8), g_ctx%B_33, "B_33")
+  end subroutine ebe_checks
+
+  !> |E - B|_F / |B|_F with the Dirichlet rows and columns of both removed
+  subroutine ebe_check(E, B, label)
+    Mat :: E, B
+    character(len=*), intent(in) :: label
+    PetscErrorCode :: ierr
+    Mat :: D, Bc
+    real*8 :: nd, nb
+    call MatDuplicate(E, MAT_COPY_VALUES, D, ierr)
+    call MatConvert(B, MATMPIAIJ, MAT_INITIAL_MATRIX, Bc, ierr)
+    call MatAXPY(D, -1.d0, Bc, DIFFERENT_NONZERO_PATTERN, ierr)
+    call MatZeroRowsColumns(D, size(brows, kind=kind(brows)), brows, 0.d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    call MatZeroRowsColumns(Bc, size(brows, kind=kind(brows)), brows, 0.d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    call MatNorm(D, NORM_FROBENIUS, nd, ierr)
+    call MatNorm(Bc, NORM_FROBENIUS, nb, ierr)
+    if (me_p == 0) write(*,'(A,A,A,ES10.3)') "[Physics PC]   peel: element sum of ", label, &
+      " vs pair_w's block off the Dirichlet rows, relative difference ", nd / max(nb, tiny(1.d0))
+    call MatDestroy(D, ierr); call MatDestroy(Bc, ierr)
+  end subroutine ebe_check
+
+  !> ninner: X_AS(M_rho) for the viscous term, per rebuild (rho0 changes)
+  subroutine build_xmr()
+    PetscErrorCode :: ierr
+    if (xmr_built) call MatDestroy(Xmr, ierr)
+    call build_xas(Mm, Xmr, "M_rho", .not. xmr_built)
+    xmr_built = .true.
+  end subroutine build_xmr
+
+  !> y = R_hat x with the global X_AS sandwich, on the interior u DOFs (x is
+  !! masked, y masked)
+  subroutine rhat_as(x, y)
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    Vec :: xm, va, vb
+    call VecDuplicate(x, xm, ierr); call VecDuplicate(x, va, ierr); call VecDuplicate(x, vb, ierr)
+    call VecPointwiseMult(xm, x, imask, ierr)
+    call MatMult(Pc(3), xm, y, ierr)
+    call VecScale(y, opz, ierr)
+    call MatMult(Pc(5), xm, va, ierr)
+    call VecAXPY(y, o_eta_w * thdt, va, ierr)
+    if (o_hyper /= 0) then
+      call MatMult(Pc(6), xm, va, ierr)
+      call MatMult(Xas, va, vb, ierr)
+      call MatMult(Pc(6), vb, va, ierr)
+      call VecAXPY(y, thdt, va, ierr)
+    endif
+    call VecPointwiseMult(y, y, imask, ierr)
+    call VecDestroy(xm, ierr); call VecDestroy(va, ierr); call VecDestroy(vb, ierr)
+  end subroutine rhat_as
+
+  !> ninner: N x = opz R_hat x + B_12^T X_AS B_12 x + theta dt sym(R_hat
+  !! X_AS(M_rho) K_nu) x, all by products of the element-assembled operators
+  !! (v2's assembled N without forming it), the identity on the Dirichlet rows
+  subroutine nmf_mult(A, x, y, ierr)
+    Mat :: A
+    Vec :: x, y
+    PetscErrorCode :: ierr
+    Vec :: xm, va, vb
+    call VecDuplicate(x, xm, ierr); call VecDuplicate(x, va, ierr); call VecDuplicate(x, vb, ierr)
+    call VecPointwiseMult(xm, x, imask, ierr)
+    call rhat_as(xm, y)
+    call VecScale(y, opz, ierr)
+    call MatMult(g_ctx%B_12, xm, va, ierr)
+    call MatMult(Xas, va, vb, ierr)
+    call MatMultTranspose(g_ctx%B_12, vb, va, ierr)
+    call VecAXPY(y, 1.d0, va, ierr)
+    if (o_visc == 1) then
+      call MatMult(Pc(4), xm, va, ierr)
+      call VecAXPY(y, opz * thdt, va, ierr)
+    else if (o_visc >= 2) then
+      call MatMult(Pc(4), xm, va, ierr)
+      call MatMult(Xmr, va, vb, ierr)
+      call rhat_as(vb, va)
+      call VecAXPY(y, 0.5d0 * thdt, va, ierr)
+      call rhat_as(xm, va)
+      call MatMult(Xmr, va, vb, ierr)
+      call MatMult(Pc(4), vb, va, ierr)
+      call VecAXPY(y, 0.5d0 * thdt, va, ierr)
+    endif
+    call VecPointwiseMult(y, y, imask, ierr)
+    call VecAXPY(y, 1.d0, x, ierr)                ! Dirichlet rows: the identity
+    call VecPointwiseMult(va, x, imask, ierr)
+    call VecAXPY(y, -1.d0, va, ierr)
+    call VecDestroy(xm, ierr); call VecDestroy(va, ierr); call VecDestroy(vb, ierr)
+    ierr = 0
+  end subroutine nmf_mult
+
+  !> ninner: k Richardson or GMRES steps on Nmf around N's solver (st)
+  subroutine setup_ninner()
+    PetscErrorCode :: ierr
+    PetscInt :: nl, ng
+    PC :: pc
+    call MatGetLocalSize(g_ctx%B_22, nl, PETSC_NULL_INTEGER, ierr)
+    call MatGetSize(g_ctx%B_22, ng, PETSC_NULL_INTEGER, ierr)
+    call MatCreateShell(comm_p, nl, nl, ng, ng, PETSC_NULL_INTEGER, Nmf, ierr)
+    call MatShellSetOperation(Nmf, MATOP_MULT, nmf_mult, ierr)
+    call KSPCreate(comm_p, kin, ierr)
+    if (o_ninner_type == 0) then
+      call KSPSetType(kin, KSPRICHARDSON, ierr)
+      call KSPSetNormType(kin, KSP_NORM_NONE, ierr)
+    else
+      call KSPSetType(kin, KSPGMRES, ierr)
+      call KSPGMRESSetRestart(kin, o_ninner, ierr)
+      call KSPSetPCSide(kin, PC_RIGHT, ierr)
+    endif
+    call KSPSetTolerances(kin, 0.d0, 0.d0, 1.d10, o_ninner, ierr)
+    call KSPSetOperators(kin, Nmf, Nmf, ierr)
+    call KSPGetPC(kin, pc, ierr)
+    call PCSetType(pc, PCSHELL, ierr)
+    call PCShellSetApply(pc, tex_pc, ierr)
+  end subroutine setup_ninner
 
   !> MUMPS on A_aa's blocks (once per build): B_44 and the scaled (psi, j)
   subroutine ensure_exact_aa()
@@ -1170,8 +1808,14 @@ contains
     PetscInt :: nl, ng
     PC :: pc
     call ensure_exact_aa()
-    if (o_v == 2) call sf_solver_setup(lu33, g_ctx%B_33, SF_LU, "peel exact X = B_33^-1", comm_p, me_p, &
+    if (o_v >= 2) call sf_solver_setup(lu33, g_ctx%B_33, SF_LU, "peel exact X = B_33^-1", comm_p, me_p, &
                                        1.d-12, gmg_inst=0, nfields=1, smoother=0, maxits=1)
+    if (o_v == 3) then
+      call sf_solver_setup(luY, HY, SF_LU, "peel exact Y = HY^-1", comm_p, me_p, &
+                           1.d-12, gmg_inst=0, nfields=1, smoother=0, maxits=1)
+      call sf_solver_setup(luHn, Hn, SF_LU, "peel exact H_nu", comm_p, me_p, &
+                           1.d-12, gmg_inst=0, nfields=1, smoother=0, maxits=1)
+    endif
     if (o_v == 2 .and. o_visc >= 2) call sf_solver_setup(luM, Mm, SF_LU, "peel exact M_rho^-1", comm_p, me_p, &
                                                         1.d-12, gmg_inst=0, nfields=1, smoother=0, maxits=1)
     if (.not. first) return
@@ -1199,12 +1843,17 @@ contains
     Vec :: xm, va, vb
     call VecDuplicate(x, xm, ierr); call VecDuplicate(x, va, ierr); call VecDuplicate(x, vb, ierr)
     call VecPointwiseMult(xm, x, imask, ierr)
-    if (o_v == 2) then
-      ! N_ex xm = opz R_hat_ex xm + B_12^T B_33^-1 B_12 xm + opz theta dt K_nu xm
+    if (o_v >= 2) then
+      ! N_ex xm = opz R_hat_ex xm + B_12^T X_ex B_12 xm + the viscous term (v2),
+      ! X_ex = B_33^-1 (v2), HY^-1 (v3)
       call rhat_exact(xm, y)
       call VecScale(y, opz, ierr)
       call MatMult(g_ctx%B_12, xm, va, ierr)
-      call sf_solver_apply(lu33, va, vb, ierr)
+      if (o_v == 3) then
+        call sf_solver_apply(luY, va, vb, ierr)
+      else
+        call sf_solver_apply(lu33, va, vb, ierr)
+      endif
       call MatMultTranspose(g_ctx%B_12, vb, va, ierr)
       call VecAXPY(y, 1.d0, va, ierr)
       if (o_visc == 1) then
@@ -1338,12 +1987,13 @@ contains
 
     ! v2: the resistive terms of R_hat against its mass (~ 6.5 E, 6.5 E_4 in
     ! the LFA's grid numbers), and M1, the spectrum of X_AS B_33
-    if (o_v == 2) then
+    if (o_v >= 2) then
       call VecDuplicate(ru, d1, ierr); call VecDuplicate(ru, d2, ierr)
       call ratio_report(Pc(5), Pc(3), thdt / opz, "theta dt diag K_eta / (opz diag M_rho)")
       if (o_hyper /= 0) call ratio_report(Hm, Pc(3), thdt / opz, "theta dt diag(K_w X K_w) / (opz diag M_rho)")
       call VecDestroy(d1, ierr); call VecDestroy(d2, ierr)
       if (o_xas /= 0) call m1_report()
+      call n_lanczos()
     endif
 
     ! the resistive change of X: 1 - x_res / x_0 (xres only)
@@ -1385,6 +2035,31 @@ contains
     end subroutine ratio_report
 
   end subroutine stage0_check
+
+  !> v2 / v3: is N SPD? Lanczos (CG, Jacobi) on N: its Ritz values of D^-1 N
+  subroutine n_lanczos()
+    PetscErrorCode :: ierr
+    KSP :: kc
+    PC  :: pcj
+    Vec :: bb, xx
+    PetscInt :: ne
+    real*8 :: er(200), ei(200)
+    call KSPCreate(comm_p, kc, ierr)
+    call KSPSetType(kc, KSPCG, ierr)
+    call KSPSetOperators(kc, Tm, Tm, ierr)
+    call KSPGetPC(kc, pcj, ierr)
+    call PCSetType(pcj, PCJACOBI, ierr)
+    call KSPSetComputeEigenvalues(kc, PETSC_TRUE, ierr)
+    call KSPSetTolerances(kc, 1.d-30, 1.d-50, 1.d10, 200, ierr)
+    call KSPSetNormType(kc, KSP_NORM_UNPRECONDITIONED, ierr)
+    call MatCreateVecs(Tm, xx, bb, ierr)
+    call VecSetRandom(bb, PETSC_NULL_RANDOM, ierr)
+    call KSPSolve(kc, bb, xx, ierr)
+    call KSPComputeEigenvalues(kc, 200, er, ei, ne, ierr)
+    if (me_p == 0 .and. ne > 0) write(*,'(A,2ES11.3,A,I0,A)') "[Physics PC]   peel check: Lanczos on D^-1 N, Ritz in [", &
+      minval(er(1:ne)), maxval(er(1:ne)), "] (", ne, " values; negative = N indefinite)"
+    call KSPDestroy(kc, ierr); call VecDestroy(bb, ierr); call VecDestroy(xx, ierr)
+  end subroutine n_lanczos
 
   !> M1 of the v2 decision gate: the Lanczos extremes of X_AS B_33 (CG on
   !! B_33 with X_AS as the preconditioning matrix) against the colouring

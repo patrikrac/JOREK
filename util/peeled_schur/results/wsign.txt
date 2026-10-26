@@ -1,0 +1,8 @@
+dt=1.d1 wm05: sg_wm05_1.d1: exit=0  its: 6 6 5  pair_w: 2.00 2.00 2.00  real 10.71
+   KSPSolve 2.6852e+00 s
+dt=1.d1 wm1: sg_wm1_1.d1: exit=0  its: 7 7 6  pair_w: 2.00 2.00 2.00  real 11.20
+   KSPSolve 3.2298e+00 s
+dt=3.d1 wm05: sg_wm05_3.d1: exit=0  its: 12 11 12  pair_w: 2.25 2.18 2.17  real 13.59
+   KSPSolve 5.7815e+00 s
+dt=3.d1 wm1: sg_wm1_3.d1: exit=0  its: 64 52 60  pair_w: 15.81 18.67 22.52  real 174.97
+   KSPSolve 1.6568e+02 s

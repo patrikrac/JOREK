@@ -1,0 +1,13 @@
+dt=1.d1 base: df_base_1.d1: exit=0  its: 6 6 6  pair_w: 2.00 2.00 2.00  real 11.00
+   KSPSolve 2.8373e+00 s
+dt=1.d1 w0: df_w0_1.d1: exit=0  its: 5 5 5  pair_w: 2.00 2.00 2.00  real 9.80
+   KSPSolve 2.3297e+00 s
+dt=3.d1 base: df_base_3.d1: exit=0  its: 21 21 25  pair_w: 15.76 15.86 14.64  real 59.65
+   KSPSolve 5.1834e+01 s
+dt=3.d1 w0: df_w0_3.d1: exit=0  its: 7 7 8  pair_w: 2.00 2.00 2.00  real 11.08
+   KSPSolve 3.3824e+00 s
+dt=1.d2 base: df_base_1.d2: exit=1  its:  pair_w:  real 537.61
+ugrep: warning: r/df_base_1.d2/lv.txt: No such file or directory
+   KSPSolve  s
+dt=1.d2 w0: df_w0_1.d2: exit=0  its: 400  pair_w: 1.00  real 50.37
+   KSPSolve 4.3434e+01 s

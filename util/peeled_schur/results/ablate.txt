@@ -1,0 +1,15 @@
+dt=1.d0 base: ab_base_1.d0: exit=0  its: 3 3 4  pair_w: 5.00 5.00 5.00  real 11.07
+dt=1.d0 b11: ab_b11_1.d0: exit=0  its: 3 3 4  pair_w: 5.00 5.00 5.00  real 10.74
+dt=1.d0 w0: ab_w0_1.d0: exit=0  its: 3 3 4  pair_w: 5.00 5.00 5.00  real 10.30
+dt=1.d0 w05: ab_w05_1.d0: exit=0  its: 3 3 4  pair_w: 5.00 5.00 5.00  real 10.68
+dt=1.d0 w2: ab_w2_1.d0: exit=0  its: 3 3 4  pair_w: 5.00 5.00 5.00  real 10.76
+dt=1.d1 base: ab_base_1.d1: exit=0  its: 6 6 6  pair_w: 5.33 5.00 5.17  real 13.19
+dt=1.d1 b11: ab_b11_1.d1: exit=0  its: 6 6 6  pair_w: 5.33 5.00 5.17  real 13.27
+dt=1.d1 w0: ab_w0_1.d1: exit=0  its: 5 5 5  pair_w: 5.00 5.00 5.00  real 11.71
+dt=1.d1 w05: ab_w05_1.d1: exit=0  its: 6 5 5  pair_w: 5.33 5.00 5.00  real 12.55
+dt=1.d1 w2: ab_w2_1.d1: exit=0  its: 8 8 8  pair_w: 5.00 5.00 5.00  real 14.86
+dt=3.d1 base: ab_base_3.d1: exit=0  its: 16 15 16  pair_w: 24.94 25.13 25.25  real 65.25
+dt=3.d1 b11: ab_b11_3.d1: exit=0  its: 16 15 17  pair_w: 25.62 24.80 25.76  real 67.46
+dt=3.d1 w0: ab_w0_3.d1: exit=0  its: 7 7 8  pair_w: 5.00 5.00 5.00  real 14.00
+dt=3.d1 w05: ab_w05_3.d1: exit=0  its: 10 9 11  pair_w: 14.00 13.33 13.82  real 28.69
+dt=3.d1 w2: ab_w2_3.d1: exit=0  its: 24 22 25  pair_w: 54.71 162.05 172.44  real 448.70
