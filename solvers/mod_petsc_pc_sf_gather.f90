@@ -66,32 +66,31 @@ module mod_petsc_pc_sf_gather
     integer(c_int8_t), allocatable  :: zd(:), zo(:)
   end type tgt_t
 
-  integer, parameter :: MAXT = 40      !< the mixed pair_w arms keep all 22 blocks (29 with v_par) + 2 pairs
+  integer, parameter :: MAXT = 40      !< 22 blocks (29 with v_par) + the two pairs
   type(tgt_t), save :: tg(MAXT)
   integer, save     :: ntg = 0
   integer(8), save  :: a_nzst = -1, w_nzst = -1, a_id = -1, w_id = -1
   integer(8), save  :: na_d = 0, na_o = 0, nw_d = 0, nw_o = 0   !< value-array lengths
   logical, save     :: dev_on = .false.     !< the targets are gathered on the device
 
-  public :: sfg_build, sfg_gather, sfg_drop, sfg_cross_weights, sfg_dev_setup
+  public :: sfg_build, sfg_gather, sfg_drop, sfg_dev_setup
 
 contains
 
   !--------------------------------------------------------------------
   !> Build the maps (first build only). blocks(k) = A(eqs(k), vrs(k)) in the
-  !! sub-block layout; Kpj / Sw the packed pairs (pair_psi, pair_w = B_22 + W)
-  !! and Pw(:) further operators in pair_w's layout without W. All of them
+  !! sub-block layout; Kpj the packed pair_psi on the fields pj. All of them
   !! already hold the conventionally extracted values.
+  !! Mix (optional): the mixed pair_w (mod_petsc_pc_sf_mixed), a packed
+  !! operator with W in block (1, 1) and its blocks by mix_se / mix_sv /
+  !! mix_zs; its map is gated against the values it holds (mix_ok, opz the
+  !! current one). A failed gate drops it: the caller re-assembles it then.
   !--------------------------------------------------------------------
-  !! Mix (optional): a packed operator with W in block (1, 1) -- the mixed
-  !! pair_w -- in place of Sw, its blocks by mix_se / mix_sv / mix_zs; its map
-  !! is gated against the values it holds (mix_ok, opz the current one).
-  !--------------------------------------------------------------------
-  subroutine sfg_build(A, W, blocks, eqs, vrs, Kpj, pj_e, pj_v, Sw, Pw, w_e, w_v, comm, my_id, &
+  subroutine sfg_build(A, W, blocks, eqs, vrs, Kpj, pj, comm, my_id, &
                        Mix, mix_se, mix_sv, mix_zs, opz, mix_ok)
     Mat, intent(in)     :: A, W
-    Mat, intent(in)     :: blocks(:), Kpj, Sw, Pw(:)
-    integer, intent(in) :: eqs(:), vrs(:), pj_e(2), pj_v(2), w_e(2), w_v(2)
+    Mat, intent(in)     :: blocks(:), Kpj
+    integer, intent(in) :: eqs(:), vrs(:), pj(2)
     integer, intent(in) :: comm, my_id
     Mat, intent(in), optional :: Mix
     integer, intent(in), optional :: mix_se(:, :), mix_sv(:, :)
@@ -102,36 +101,31 @@ contains
     real*8 :: dmax
     PetscErrorCode :: ierr
 
-    call require_baij(A, "A"); call require_baij(W, "W")
-    if (size(blocks) + 2 + size(Pw) > MAXT) then
-      if (my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   FATAL: the SF value maps hold at most ", &
+    call require_baij(A, "A")
+    if (present(Mix)) call require_baij(W, "W")
+    if (size(blocks) + 2 > MAXT) then
+      if (my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   FATAL: sfg_build: more than ", &
         MAXT, " operators (MAXT)."
       call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     endif
-    if (present(Mix) .and. size(Pw) > 0) stop "sfg_build: Mix replaces Sw, without further Pw operators"
     ntg = 0
     do k = 1, size(blocks)
       call add_target(blocks(k), 1, reshape([eqs(k)], [1, 1]), reshape([vrs(k)], [1, 1]))
     enddo
-    call add_target(Kpj, 2, spread(pj_e, 2, 2), spread(pj_v, 1, 2))
+    call add_target(Kpj, 2, spread(pj, 2, 2), spread(pj, 1, 2))
     if (present(Mix)) then
       nf = size(mix_se, 1)
       call add_target(Mix, nf, mix_se, mix_sv)
       tg(ntg)%zs(1:nf, 1:nf) = mix_zs
       tg(ntg)%with_z = any(mix_zs)
-    else
-      call add_target(Sw, 2, spread(w_e, 2, 2), spread(w_v, 1, 2))
+      tg(ntg)%with_w = .true.
     endif
-    tg(ntg)%with_w = .true.
-    do k = 1, size(Pw)
-      call add_target(Pw(k), 2, spread(w_e, 2, 2), spread(w_v, 1, 2))
-    enddo
 
     do k = 1, ntg
       call build_map(tg(k), A, W, comm)
     enddo
     call source_state(A, a_id, a_nzst)
-    call source_state(W, w_id, w_nzst)
+    if (present(Mix)) call source_state(W, w_id, w_nzst)
     if (present(Mix)) then
       ! the map against the conventionally built values (MatAXPY + pack): the
       ! same sums in the same order, so they must agree to the bit
@@ -140,12 +134,7 @@ contains
       mix_ok = (dmax == 0.d0)
       if (my_id == 0) write(*,'(A,ES9.2,A)') "[Physics PC]   pair_w mixed: value map vs assembled, max |diff| ", &
         dmax, merge(" -> gathered on rebuilds  ", " -> FALLBACK: re-assembled", mix_ok)
-      if (.not. mix_ok) then
-        ntg = ntg - 1                                   ! drop it: Sw instead
-        call add_target(Sw, 2, spread(w_e, 2, 2), spread(w_v, 1, 2))
-        tg(ntg)%with_w = .true.
-        call build_map(tg(ntg), A, W, comm)
-      endif
+      if (.not. mix_ok) call sfg_drop([Mix])
     endif
 
   contains
@@ -295,8 +284,10 @@ contains
 
     call source_state(A, id, nz)
     if (id /= a_id .or. nz /= a_nzst) call frozen_fail("A")
-    call source_state(W, id, nz)
-    if (id /= w_id .or. nz /= w_nzst) call frozen_fail("W")
+    if (any(tg(1:ntg)%with_w)) then
+      call source_state(W, id, nz)
+      if (id /= w_id .or. nz /= w_nzst) call frozen_fail("W")
+    endif
     if (dev_on) then
       ! A's values are on the device for the outer solve already (an upload
       ! only if not), W's go up here; each gather bumps its target's state
@@ -322,134 +313,6 @@ contains
     end subroutine frozen_fail
   end subroutine sfg_gather
 
-  !--------------------------------------------------------------------
-  !> How much cross-|n| coupling A carries (diagnostic only; every build when
-  !! physics_pc_sf_cross_weights is set).
-  !! One pass over A's BAIJ values: for every (equation, variable) block B_ev
-  !! and |n|-group distance d, r_ev(d) = ||A_ev,d||_F / ||A_ev,0||_F, with
-  !! A_ev,d the entries between slots whose groups (m+1)/2 are d apart. The
-  !! ratio is per block, so it is free of the equations' units. Rank 0 prints
-  !! the band in use and, per d, the median over the blocks with a same-|n|
-  !! part and every block above CW_SHOW, largest first. Collective on comm.
-  !--------------------------------------------------------------------
-  subroutine sfg_cross_weights(A, comm, my_id)
-    use mod_parameters, only: n_tor, n_var
-    use mod_petsc_pc_blocks, only: harm_band
-    Mat, intent(in)     :: A
-    integer, intent(in) :: comm, my_id
-    real*8, parameter :: CW_SHOW = 0.1d0       !< blocks listed individually above this
-    integer, parameter :: CW_MAXLIST = 12      !< at most this many per d
-    Mat :: Ad, Ao
-    PetscInt, pointer :: ga(:), aia(:), aja(:), oia(:), oja(:)
-    PetscInt :: nad, nao
-    type(c_ptr) :: pad, pao
-    real(c_double), pointer :: va(:)
-    integer(c_int) :: rc
-    integer :: bs, ngrp, part, nblk, k, rw, cw, e, v, d, nr, mpierr, j, nshow
-    integer(8) :: off
-    integer, allocatable :: fe(:), gp(:), ie(:), iv(:), ord(:)
-    real*8, allocatable :: sl(:,:,:), sg(:,:,:), r(:), rs_(:)
-    real*8 :: x
-    character(len=1200) :: line
-    character(len=40) :: item
-
-    bs = n_var * n_tor
-    ngrp = (n_tor + 1) / 2
-    if (ngrp < 2) return
-    allocate(fe(0:bs - 1), gp(0:bs - 1))
-    do k = 0, bs - 1                                  ! in-block index -> (field, |n| group)
-      fe(k) = k / n_tor + 1; gp(k) = (mod(k, n_tor) + 1) / 2
-    enddo
-    allocate(sl(n_var, n_var, 0:ngrp - 1), sg(n_var, n_var, 0:ngrp - 1))
-    sl = 0.d0
-
-    call split_parts(A, .true., Ad, Ao, ga)
-    call get_ij(Ad, .true., nad, aia, aja)
-    call get_ij(Ao, .true., nao, oia, oja)
-    do part = 1, 2
-      if (part == 1) then
-        nblk = int(aia(nad + 1))
-        rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pad)
-        call c_f_pointer(pad, va, [max(int(nblk, 8) * bs * bs, 1_8)])
-      else
-        nblk = int(oia(nao + 1))
-        rc = c_baij_get(transfer(Ao%v, 0_c_intptr_t), pao)
-        call c_f_pointer(pao, va, [max(int(nblk, 8) * bs * bs, 1_8)])
-      endif
-      !$omp parallel do private(off, cw, rw, x) reduction(+:sl) schedule(static)
-      do k = 1, nblk                                  ! blocks are column-major
-        off = int(k - 1, 8) * bs * bs
-        do cw = 0, bs - 1
-          do rw = 0, bs - 1
-            x = va(off + cw * bs + rw + 1)
-            sl(fe(rw), fe(cw), abs(gp(rw) - gp(cw))) = sl(fe(rw), fe(cw), abs(gp(rw) - gp(cw))) + x * x
-          enddo
-        enddo
-      enddo
-      !$omp end parallel do
-      if (part == 1) then
-        rc = c_baij_restore(transfer(Ad%v, 0_c_intptr_t), pad)
-      else
-        rc = c_baij_restore(transfer(Ao%v, 0_c_intptr_t), pao)
-      endif
-    enddo
-    call put_ij(Ad, .true., nad, aia, aja); call put_ij(Ao, .true., nao, oia, oja)
-    call MPI_Allreduce(sl, sg, size(sl), MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
-
-    if (my_id == 0) then
-      write(*,'(A,I0,A)') "[Physics PC]   SF: cross-|n| weight ||A_d||/||A_0|| per block (band ", &
-        harm_band, " kept):"
-      allocate(r(n_var * n_var), rs_(n_var * n_var), ie(n_var * n_var), iv(n_var * n_var), &
-               ord(n_var * n_var))
-      do d = 1, ngrp - 1
-        nr = 0
-        do v = 1, n_var
-          do e = 1, n_var
-            if (sg(e, v, 0) <= 0.d0) cycle
-            nr = nr + 1
-            r(nr) = sqrt(sg(e, v, d) / sg(e, v, 0)); ie(nr) = e; iv(nr) = v
-          enddo
-        enddo
-        if (nr == 0) cycle
-        ord(1:nr) = [(j, j = 1, nr)]
-        call sort_desc(r(1:nr), ord(1:nr))
-        rs_(1:nr) = r(ord(1:nr))
-        write(line, '(A,I0,A,ES8.1,A)') "[Physics PC]     d=", d, ": median ", rs_((nr + 1) / 2), ";"
-        nshow = 0
-        do j = 1, nr
-          if (rs_(j) < CW_SHOW .or. nshow == CW_MAXLIST) exit
-          nshow = nshow + 1
-          write(item, '(A,I0,I0,A,ES8.1)') " B_", ie(ord(j)), iv(ord(j)), " ", rs_(j)
-          line = trim(line)//trim(item)
-        enddo
-        if (nshow == 0) then
-          write(item, '(A,ES8.1)') " none above ", CW_SHOW
-          line = trim(line)//trim(item)
-        endif
-        write(*,'(A)') trim(line)
-      enddo
-      deallocate(r, rs_, ie, iv, ord)
-    endif
-    deallocate(fe, gp, sl, sg)
-
-  contains
-
-    !> ord := the permutation sorting a descending (insertion sort, <= n_var**2)
-    subroutine sort_desc(a, ord)
-      real*8, intent(in)     :: a(:)
-      integer, intent(inout) :: ord(:)
-      integer :: p, q, t
-      do p = 2, size(ord)
-        t = ord(p); q = p - 1
-        do while (q >= 1)
-          if (a(ord(q)) >= a(t)) exit
-          ord(q + 1) = ord(q); q = q - 1
-        enddo
-        ord(q + 1) = t
-      enddo
-    end subroutine sort_desc
-
-  end subroutine sfg_cross_weights
 
   !====================================================================
   ! internals
@@ -621,10 +484,9 @@ contains
       m = int(mod(sr_, int(n_tor, 8))); q = int(mod(sc_, int(n_tor, 8)))
       arow = (sr_ / n_tor) * bsa + (e - 1) * n_tor + m
       acol = (sc_ / n_tor) * bsa + (v - 1) * n_tor + q
-      ! A contributes only between the slots the extraction's harm_split filter
-      ! keeps (harm_kept: |n| groups at most harm_band apart; band 0 = cos and
-      ! sin of one n). W is NOT filtered, so pair_w's S_uu holds cross-|n|
-      ! entries from W at any band.
+      ! A contributes only between the slots the extraction keeps (harm_kept:
+      ! every pair with harm_all, else cos and sin of one n). W is NOT
+      ! filtered, so pair_w's S_uu holds W's cross-|n| entries either way.
       mk = 0
       if (e > 0 .and. harm_kept(m, q)) mk = find_baij(arow, acol, bsa, rs_node(), aia, aja, oia, oja, ga)
       if (t%with_w .and. fr == 1 .and. fc == 1) &

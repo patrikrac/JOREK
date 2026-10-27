@@ -75,6 +75,7 @@ module mod_gmg_ring_btd
   end type btd_ring
 
   public :: btd_plan, btd_index, btd_factor, btd_solve, btd_matvec, btd_to_sp, btd_solve_sp
+  public :: btd_equil
   public :: hyb_end, hyb_fac_seg, hyb_fac_sep, hyb_sol_fwd, hyb_sol_sep, hyb_sol_bwd
   public :: hyb_sol_fwd_sp, hyb_sol_sep_sp, hyb_sol_bwd_sp
   public :: bcr_ok, btd_dev_pack
@@ -586,6 +587,51 @@ contains
   end subroutine btd_dev_pack
 
   !> a4 = a, rounded to single: the factors of one ring for the *_sp solves
+  !> Symmetric equilibration S A S of an unfactored ring, S = |diag A|^-1/2
+  !! (1 where the diagonal is zero), before ring_single's factorisation. The
+  !! C1 DOFs of one node differ in scale by the element sizes (d^2/ds dt by
+  !! their product: 1e-11..1e-16 of the value DOF on fine X-point grids), so
+  !! an unscaled block's single-precision factor is cond * 6e-8 wrong; the
+  !! scaled one only by its physical condition. The solves then take
+  !! x = S (S A S)^-1 S b.
+  subroutine btd_equil(rg, a, sc)
+    type(btd_ring), intent(in) :: rg
+    real*8, intent(inout) :: a(*)
+    real*8, intent(out)   :: sc(*)
+    integer :: J, Jn, Jp, i, k, nb, nn
+    real*8 :: d
+    nn = rg%nn
+    do J = 0, nn - 1
+      nb = rg%bs(J)
+      do i = 1, nb
+        d = abs(a(rg%od(J) + int(i - 1, 8) * nb + i))
+        sc(rg%rp(J) + i) = 1.d0
+        if (d > 0.d0) sc(rg%rp(J) + i) = 1.d0 / sqrt(d)
+      enddo
+    enddo
+    do J = 0, nn - 1
+      nb = rg%bs(J); Jn = modulo(J + 1, nn); Jp = modulo(J - 1, nn)
+      do k = 1, nb
+        do i = 1, nb
+          a(rg%od(J) + int(k - 1, 8) * nb + i) = a(rg%od(J) + int(k - 1, 8) * nb + i) &
+            * sc(rg%rp(J) + i) * sc(rg%rp(J) + k)
+        enddo
+      enddo
+      do k = 1, rg%bs(Jn)
+        do i = 1, nb
+          a(rg%ou(J) + int(k - 1, 8) * nb + i) = a(rg%ou(J) + int(k - 1, 8) * nb + i) &
+            * sc(rg%rp(J) + i) * sc(rg%rp(Jn) + k)
+        enddo
+      enddo
+      do k = 1, rg%bs(Jp)
+        do i = 1, nb
+          a(rg%ol(J) + int(k - 1, 8) * nb + i) = a(rg%ol(J) + int(k - 1, 8) * nb + i) &
+            * sc(rg%rp(J) + i) * sc(rg%rp(Jp) + k)
+        enddo
+      enddo
+    enddo
+  end subroutine btd_equil
+
   subroutine btd_to_sp(rg, a, a4)
     type(btd_ring), intent(in) :: rg
     real*8, intent(in)  :: a(*)

@@ -1,15 +1,8 @@
 module construct_pc_matrix_mod
 !----------------------------------------------------------------
-! Element assembly of the physics PC's operators: the composed force
-! operator W of the SF path (construct_force_operator_matrix).
-!
-! Reuses the mesh traversal of construct_matrix_mod but calls the
-! model's pc_elt_matrix_force_fft and inserts into a 1-variable
-! PETSc BAIJ matrix.
-!
-! Assumptions:
-!   - No mesh refinement (PC is an approximation).
-!   - n_tor_local = n_tor  (all toroidal modes on every process).
+! Element assembly of the SF preconditioner's force operator W into a
+! 1-variable PETSc BAIJ matrix (no mesh refinement, all toroidal modes
+! on every process).
 !----------------------------------------------------------------
 #ifdef USE_PETSC
 #include "petsc/finclude/petsc.h"
@@ -20,9 +13,6 @@ private
 public :: construct_force_operator_matrix
 
 contains
-
-
-
 
 !--------------------------------------------------------------------
 !> Zero out the rows of a 1-variable PC matrix that correspond to
@@ -140,25 +130,16 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
 
 end subroutine zero_bc_rows_pc_matrix
 
-
-
 !--------------------------------------------------------------------
-!> Assemble the momentum-Schur FORCE OPERATOR W.
+!> Assemble the force operator W, the matrix ADDED to B_22 (one variable,
+!! block size n_tor), with its constrained boundary rows zeroed. It is built
+!! on the linearisation state (mhd_sim), not on the Jacobian.
 !!
-!! One variable (u), so block size is n_tor. The element matrix is
-!! (theta*dt)^2/opz * a(du,v) -- exactly the matrix to be ADDED to B_22 to form
-!! the composed S_uu (see mod_pc_elt_matrix_force_fft for the operator and the
-!! self-adjointness statement).
-!!
-!! It needs mhd_sim: the operator is built on the linearisation state, not on
-!! the Jacobian.
-!!
-!! With W_vv, W_vu, W_uv present (model600 with_vpar, the SF path's "b0"
-!! stage) the same element pass also assembles v_par's sound-wave Schur terms
-!! into them (one variable each, like W): v_par row / column as the element
-!! routine's ELM_v blocks 1 (v_par, v_par), 2 (v_par, u), 3 (u, v_par).
+!! With W_vv, W_vu, W_uv present (model600 with_vpar, stages b0 / b1) the
+!! same pass assembles v_par's sound-wave Schur terms (the element routine's
+!! ELM_v blocks 1 (v_par, v_par), 2 (v_par, u), 3 (u, v_par)).
 !--------------------------------------------------------------------
-subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, mhd_sim, W_force, terms, &
+subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, mhd_sim, W_force, &
                                            W_vv, W_vu, W_uv, gamma_w, vu_full)
 
   use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_force_fft
@@ -178,74 +159,30 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   type(type_MHD_SIM),   intent(in) :: mhd_sim
 #ifdef USE_PETSC
   Mat, intent(inout) :: W_force
-#endif
-  !> term selection of pc_elt_matrix_force_fft (sf_force_terms)
-  integer, intent(in) :: terms
-#ifdef USE_PETSC
   Mat, intent(inout), optional :: W_vv, W_vu, W_uv
 #endif
-  real*8, intent(in), optional :: gamma_w
-  logical, intent(in), optional :: vu_full   !< W_vu with its R [p0,u] half (element routine)
+  real*8, intent(in), optional :: gamma_w    !< v_par's W terms: their adiabatic index
+  logical, intent(in), optional :: vu_full   !< ... W_vu with its R [p0,u] half
+
+#define NBV (n_vertex_max*n_degrees)
+#define DFV_CM (n_tor*NBV)
 
   integer :: my_ind_min, my_ind_max
-
-  integer :: xcase2
-  real*8  :: R_axis, Z_axis, psi_axis, psi_bnd
-  real*8  :: R_xpoint(2), Z_xpoint(2)
-  logical :: xpoint2
-
-#define DFV_CM (n_tor*n_vertex_max*n_degrees)
-
+  ! per thread (large derived types stay off the thread stacks)
   type(type_element), allocatable :: element_thr(:)
   type(type_node),    allocatable :: nodes_thr(:,:)
-  integer,            allocatable :: node_out_thr(:,:)
-  real*8,             allocatable :: ELM_thr(:,:,:)
-  real*8,             allocatable :: buf_thr(:,:)
-  real*8,             allocatable :: ELMv_thr(:,:,:,:)
-  logical :: do_v, v_full
-  real*8  :: g_v
-  integer :: b
-
-  integer :: nthreads, omp_tid
-  integer :: ife, ielm, iv, inode
-  integer :: i, i_order, k, k_order
-  integer :: index_node1, index_node2
-  integer :: j, l, idx_ij, idx_kl
-  integer :: bs1
+  real*8, allocatable :: ELM(:,:), ELMv(:,:,:), buf(:)
+  integer :: idx(NBV), rsel(NBV), nr
+  logical :: do_v
+  integer :: ife, ielm, iv, q, b, t, nthreads
 #ifdef USE_PETSC
   PetscErrorCode :: ierr
-  PetscInt :: idxm(1), idxn(1)
+  PetscInt :: idxm(NBV), idxn(NBV)
   Mat :: Wv(3)
 #endif
 
   my_ind_min = a_mat%index_min(my_id+1)
   my_ind_max = a_mat%index_max(my_id+1)
-  bs1        = n_tor
-
-  xpoint2       = mhd_sim%es%xpoint
-  xcase2        = mhd_sim%es%xcase
-  R_axis        = mhd_sim%es%R_axis
-  Z_axis        = mhd_sim%es%Z_axis
-  psi_axis      = mhd_sim%es%psi_axis
-  psi_bnd       = mhd_sim%es%psi_bnd
-  R_xpoint(1:2) = mhd_sim%es%R_xpoint(1:2)
-  Z_xpoint(1:2) = mhd_sim%es%Z_xpoint(1:2)
-
-  !$omp parallel
-  !$omp master
-#ifdef _OPENMP
-  nthreads = omp_get_num_threads()
-#else
-  nthreads = 1
-#endif
-  !$omp end master
-  !$omp end parallel
-
-  allocate(element_thr (nthreads))
-  allocate(nodes_thr   (n_vertex_max, nthreads))
-  allocate(node_out_thr(n_vertex_max, nthreads))
-  allocate(ELM_thr     (DFV_CM, DFV_CM, nthreads))
-  allocate(buf_thr     (bs1*bs1, nthreads))
 
   do_v = .false.
 #ifdef USE_PETSC
@@ -254,156 +191,86 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
     Wv(1) = W_vv; Wv(2) = W_vu; Wv(3) = W_uv
   endif
 #endif
-  g_v = -1.d0
-  if (present(gamma_w)) g_v = gamma_w
-  v_full = .false.
-  if (present(vu_full)) v_full = vu_full
-  if (do_v) then
-    allocate(ELMv_thr(DFV_CM, DFV_CM, 3, nthreads))
-  else
-    allocate(ELMv_thr(1, 1, 1, 1))
-  endif
 
-  !$omp parallel &
-  !$omp   default(shared) &
-  !$omp   shared(n_local_elms, local_elms, element_list, node_list, a_mat, &
-  !$omp          my_ind_min, my_ind_max, bs1, &
-  !$omp          xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, R_xpoint, Z_xpoint, &
-  !$omp          element_thr, nodes_thr, node_out_thr, ELM_thr, buf_thr, &
-  !$omp          do_v, g_v, v_full, ELMv_thr &
+  nthreads = 1
+  !$ nthreads = omp_get_max_threads()
+  allocate(element_thr(nthreads), nodes_thr(n_vertex_max, nthreads))
+
+  !$omp parallel default(shared) &
+  !$omp   private(ife, ielm, iv, q, b, t, ELM, ELMv, buf, idx, rsel, nr &
 #ifdef USE_PETSC
-  !$omp          , W_force, Wv &
-#endif
-  !$omp         ) &
-  !$omp   private(ife, ielm, iv, inode, omp_tid, &
-  !$omp           i, i_order, k, k_order, &
-  !$omp           index_node1, index_node2, &
-  !$omp           j, l, idx_ij, idx_kl, b &
-#ifdef USE_PETSC
-  !$omp           ,ierr, idxm, idxn &
+  !$omp           , ierr, idxm, idxn &
 #endif
   !$omp          )
+  allocate(ELM(DFV_CM, DFV_CM), buf(DFV_CM * DFV_CM))
+  if (do_v) then
+    allocate(ELMv(DFV_CM, DFV_CM, 3))
+  else
+    allocate(ELMv(1, 1, 1))
+  endif
 
-#ifdef _OPENMP
-  omp_tid = 1 + omp_get_thread_num()
-#else
-  omp_tid = 1
-#endif
+  t = 1
+  !$ t = omp_get_thread_num() + 1
 
   !$omp do schedule(runtime)
   do ife = 1, n_local_elms
     ielm = local_elms(ife)
-
-    element_thr(omp_tid) = element_list%element(ielm)
+    element_thr(t) = element_list%element(ielm)
     do iv = 1, n_vertex_max
-      inode = element_thr(omp_tid)%vertex(iv)
-      nodes_thr(iv, omp_tid)    = node_list%node(inode)
-      node_out_thr(iv, omp_tid) = inode
+      nodes_thr(iv, t) = node_list%node(element_thr(t)%vertex(iv))
     enddo
 
     if (do_v) then
-      if (g_v > 0.d0) then
-        call pc_elt_matrix_force_fft(element_thr(omp_tid), nodes_thr(:,omp_tid), &
-                                     xpoint2, xcase2, R_axis, Z_axis,           &
-                                     psi_axis, psi_bnd, R_xpoint, Z_xpoint,     &
-                                     ELM_thr(:,:,omp_tid), terms,               &
-                                     ELM_v=ELMv_thr(:,:,:,omp_tid), gamma_w=g_v, vu_full=v_full)
-      else
-        call pc_elt_matrix_force_fft(element_thr(omp_tid), nodes_thr(:,omp_tid), &
-                                     xpoint2, xcase2, R_axis, Z_axis,           &
-                                     psi_axis, psi_bnd, R_xpoint, Z_xpoint,     &
-                                     ELM_thr(:,:,omp_tid), terms,               &
-                                     ELM_v=ELMv_thr(:,:,:,omp_tid), vu_full=v_full)
-      endif
+      call pc_elt_matrix_force_fft(element_thr(t), nodes_thr(:, t), ELM, &
+                                   ELM_v=ELMv, gamma_w=gamma_w, vu_full=vu_full)
     else
-      call pc_elt_matrix_force_fft(element_thr(omp_tid), nodes_thr(:,omp_tid), &
-                                   xpoint2, xcase2, R_axis, Z_axis,           &
-                                   psi_axis, psi_bnd, R_xpoint, Z_xpoint,     &
-                                   ELM_thr(:,:,omp_tid), terms)
+      call pc_elt_matrix_force_fft(element_thr(t), nodes_thr(:, t), ELM)
     endif
 
 #ifdef USE_PETSC
-    do i = 1, n_vertex_max
-      do i_order = 1, n_degrees
-
-        index_node1 = node_list%node(node_out_thr(i,omp_tid))%index(i_order)
-        if ((index_node1 .lt. my_ind_min) .or. (index_node1 .gt. my_ind_max)) cycle
-        idxm(1) = index_node1 - 1
-
-        do k = 1, n_vertex_max
-          do k_order = 1, n_degrees
-
-            index_node2 = node_list%node(node_out_thr(k,omp_tid))%index(k_order)
-            idxn(1) = index_node2 - 1
-
-            buf_thr(:,omp_tid) = 0.d0
-            do j = 1, bs1
-              idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
-              do l = 1, bs1
-                idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
-                buf_thr((j-1)*bs1+l, omp_tid) = ELM_thr(idx_ij, idx_kl, omp_tid)
-              enddo
-            enddo
-            !$omp critical
-            PetscCallA(MatSetValuesBlocked(W_force, 1, idxm, 1, idxn, buf_thr(:,omp_tid), ADD_VALUES, ierr))
-            !$omp end critical
-
-            ! v_par's blocks: the same node-index layout, one matrix each
-            if (do_v) then
-              do b = 1, 3
-                do j = 1, bs1
-                  idx_ij = bs1*n_degrees*(i-1) + bs1*(i_order-1) + j
-                  do l = 1, bs1
-                    idx_kl = bs1*n_degrees*(k-1) + bs1*(k_order-1) + l
-                    buf_thr((j-1)*bs1+l, omp_tid) = ELMv_thr(idx_ij, idx_kl, b, omp_tid)
-                  enddo
-                enddo
-                !$omp critical
-                PetscCallA(MatSetValuesBlocked(Wv(b), 1, idxm, 1, idxn, buf_thr(:,omp_tid), ADD_VALUES, ierr))
-                !$omp end critical
-              enddo
-            endif
-
-          enddo  ! k_order
-        enddo    ! k
-
-      enddo  ! i_order
-    enddo    ! i
+    ! the element's (vertex, degree) block rows this rank owns, all columns
+    nr = 0
+    do q = 1, NBV
+      idx(q) = nodes_thr((q - 1) / n_degrees + 1, t)%index(mod(q - 1, n_degrees) + 1)
+      idxn(q) = idx(q) - 1
+      if (idx(q) < my_ind_min .or. idx(q) > my_ind_max) cycle
+      nr = nr + 1
+      rsel(nr) = q
+      idxm(nr) = idx(q) - 1
+    enddo
+    if (nr > 0) then
+      call pack_rows(ELM, rsel, nr, buf)
+      !$omp critical (pc_force_insert)
+      PetscCallA(MatSetValuesBlocked(W_force, nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
+      do b = 1, merge(3, 0, do_v)
+        call pack_rows(ELMv(:,:,b), rsel, nr, buf)
+        PetscCallA(MatSetValuesBlocked(Wv(b), nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
+      enddo
+      !$omp end critical (pc_force_insert)
+    endif
 #endif
-
-  enddo  ! ife
+  enddo
   !$omp end do
+  deallocate(ELM, ELMv, buf)
   !$omp end parallel
-
-  deallocate(element_thr, nodes_thr, node_out_thr, ELM_thr, buf_thr, ELMv_thr)
+  deallocate(element_thr, nodes_thr)
 
 #ifdef USE_PETSC
   PetscCallA(MatAssemblyBegin(W_force, MAT_FINAL_ASSEMBLY, ierr))
   PetscCallA(MatAssemblyEnd  (W_force, MAT_FINAL_ASSEMBLY, ierr))
-
-  ! Zero the constrained boundary rows.
-  !
-  ! An earlier version deliberately skipped this, arguing that W is a CORRECTION
-  ! to B_22 and would inherit B_22's Dirichlet treatment. That is wrong: B_22's
-  ! boundary row is [ZBIG on the diagonal, zeros elsewhere], so adding W's raw
-  ! element entries there DESTROYS the constraint rather than inheriting it.
-  ! Measured at tstep 10 (51x16), B_22 + W as a preconditioner for S_uu:
-  ! 1295 iterations with the raw rows, 221 with them zeroed -- a 5.9x error
-  ! that is only 0.4% of ||W||, so no Frobenius-norm check can see it.
-  ! Zeroing the columns as well makes no further difference (221 either way).
+  ! W is ADDED to blocks whose boundary rows are [ZBIG, 0, ...]: its own
+  ! entries there would destroy the constraint (5.9x the iterations at
+  ! tstep 10 although only 0.4% of ||W||), so they are zeroed.
   if (eliminate_boundary_dofs) then
     call zero_bc_rows_pc_matrix(W_force, var_u, local_elms, n_local_elms, &
                                 a_mat%my_ind_min, a_mat%my_ind_max)
   endif
-
-  ! v_par's blocks: assembled and their constrained rows zeroed the same way,
-  ! by their row variable (they are ADDED to B_77 / B_72, rows with BCs)
   if (do_v) then
     do b = 1, 3
       PetscCallA(MatAssemblyBegin(Wv(b), MAT_FINAL_ASSEMBLY, ierr))
       PetscCallA(MatAssemblyEnd  (Wv(b), MAT_FINAL_ASSEMBLY, ierr))
     enddo
-    if (eliminate_boundary_dofs) then
+    if (eliminate_boundary_dofs) then         ! by each block's row variable
       call zero_bc_rows_pc_matrix(Wv(1), var_Vpar, local_elms, n_local_elms, &
                                   a_mat%my_ind_min, a_mat%my_ind_max)
       call zero_bc_rows_pc_matrix(Wv(2), var_Vpar, local_elms, n_local_elms, &
@@ -413,6 +280,25 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
     endif
   endif
 #endif
+
+contains
+
+  !> buf = the rows rsel(1:nr) of the element matrix E, row-major by scalar
+  !! row (MatSetValuesBlocked's default orientation). Everything by argument:
+  !! the caller's copies are OpenMP-private, host association would not see them.
+  subroutine pack_rows(E, rsel, nr, buf)
+    real*8, intent(in)  :: E(DFV_CM, DFV_CM)
+    integer, intent(in) :: rsel(:), nr
+    real*8, intent(out) :: buf(:)
+    integer :: r, j, o
+    o = 0
+    do r = 1, nr
+      do j = 1, n_tor
+        buf(o + 1 : o + DFV_CM) = E(n_tor * (rsel(r) - 1) + j, :)
+        o = o + DFV_CM
+      enddo
+    enddo
+  end subroutine pack_rows
 
 end subroutine construct_force_operator_matrix
 

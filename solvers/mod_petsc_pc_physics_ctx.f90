@@ -6,22 +6,13 @@ module mod_petsc_pc_physics_ctx
   implicit none
   public
 
-  ! This module holds the shared context type (type_physics_pc_ctx) and the
-  ! module-level singleton instance (g_ctx) used by the physics PC family of
-  ! modules.  All other modules in the family `use` this one to access the
-  ! type definition and the singleton without circular dependencies.
+  ! The physics PC's shared state (g_ctx), its log events and memory audit.
 
   type :: type_physics_pc_ctx
-    logical :: initialized    = .false.
     logical :: reduced_ready  = .false.
 
-    !> Index sets for each variable in the full system vector (1=psi..6=T)
-    IS :: is_var(6)
-    logical :: is_created = .false.
-
-    !> Sub-blocks extracted from the full system matrix (the global SF path).
-    !! Naming: B_ij = block at (equation i, variable j), variables
-    !! 1..6 = (psi, u, j, w, rho, T).
+    !> Blocks of the Jacobian on the global SF path: B_ij = (equation i,
+    !! variable j), variables 1..6 = (psi, u, j, w, rho, T).
     Mat :: B_11, B_12, B_13, B_16
     Mat :: B_21, B_22, B_23, B_24, B_25, B_26
     Mat :: B_31, B_33
@@ -29,21 +20,16 @@ module mod_petsc_pc_physics_ctx
     Mat :: B_51, B_52, B_55
     Mat :: B_61, B_62, B_63, B_66
 
-    !> The assembled pairs of the global SF path (MPIAIJ, rebuilt every PC rebuild)
-    Mat :: K_pj_aij          !< pair_psi = [[B_11, B_13], [B_31, B_33]]
-    Mat :: S_W_aij           !< pair_w
+    Mat :: K_pj_aij          !< pair_psi = [[B_11, B_13], [B_31, B_33]], packed
 
-    !> The momentum-Schur force operator W, assembled directly from the
-    !! analytic composition of the two off-diagonal couplings (Chacon JCP 526
-    !! (2025) Eqs. 17-19), so that S_uu = B_22 + W. One variable (u), block
-    !! size n_tor. See models/model199/mod_pc_elt_matrix_force_fft.f90.
+    !> The composed force operator W (curvature part), one variable (u),
+    !! block size n_tor: models/model*/mod_pc_elt_matrix_force_fft.f90.
     Mat :: W_force
     logical :: w_force_ready = .false.
 
-    !> v_par's sound-wave Schur terms (model600 with_vpar, the "b0" stage):
-    !! the same element pass as W, one variable each, block size n_tor.
-    !! W_vv is added to B_77, W_vu (v_par row, u column) to B_72; W_uv (u row,
-    !! v_par column) only feeds the (u, v_par) symmetry diagnostic.
+    !> v_par's sound-wave Schur terms (model600 with_vpar, stages b0 / b1),
+    !! from the same element pass: W_vv on B_77, W_vu (v_par row, u column)
+    !! on B_72, W_uv (u row, v_par column) on B_27.
     Mat :: W_vv, W_vu, W_uv
     logical :: w_v_ready = .false.
   end type type_physics_pc_ctx
@@ -55,7 +41,7 @@ module mod_petsc_pc_physics_ctx
   PetscLogEvent, save :: pcev_elem_asm   = -1  !< the force-operator element assembly
   PetscLogEvent, save :: pcev_extract    = -1  !< block extraction / family operator fill
   PetscLogEvent, save :: pcev_build_suu  = -1  !< pair_w assembly
-  PetscLogEvent, save :: pcev_convert    = -1  !< MatConvert to the solvers' format
+  PetscLogEvent, save :: pcev_convert    = -1  !< pair_psi packing
   PetscLogEvent, save :: pcev_fact_pj    = -1  !< pair_psi solver setup
   PetscLogEvent, save :: pcev_fact_w     = -1  !< pair_w solver setup
   PetscLogEvent, save :: pcev_fact_rhot  = -1  !< rho and T solver setup
@@ -63,20 +49,13 @@ module mod_petsc_pc_physics_ctx
   PetscLogEvent, save :: pcev_solve_pj   = -1  !< pair_psi solves
   PetscLogEvent, save :: pcev_solve_w    = -1  !< pair_w solves
   PetscLogEvent, save :: pcev_solve_rhot = -1  !< rho/T solves
-  PetscLogEvent, save :: pcev_shellmult  = -1  !< one matrix-free pair_w matvec (suu = schur)
-  PetscLogEvent, save :: pcev_mjsolve    = -1  !< the B_33^-1 solve inside it
 
   logical, save, private :: pcev_registered = .false.
 
 contains
 
-  !--------------------------------------------------------------------
-  !> Register the physics-PC log events. Idempotent: safe to call from any
-  !! entry point without the caller having to know whether it ran already.
-  !! Registering twice would give two distinct events with the same name and
-  !! split the timings between them, which is why the guard is here rather
-  !! than at the call site.
-  !--------------------------------------------------------------------
+  !> Register the physics-PC log events, once (a second registration would
+  !! split the timings between two events of the same name).
   subroutine physics_pc_log_events_register()
     PetscErrorCode :: ierr
 
@@ -93,8 +72,6 @@ contains
     call PetscLogEventRegister("PhysPC_SolvePJ",   0, pcev_solve_pj,   ierr)
     call PetscLogEventRegister("PhysPC_SolveW",    0, pcev_solve_w,    ierr)
     call PetscLogEventRegister("PhysPC_SolveRhoT", 0, pcev_solve_rhot, ierr)
-    call PetscLogEventRegister("PhysPC_ShellMult", 0, pcev_shellmult,  ierr)
-    call PetscLogEventRegister("PhysPC_MjSolve",   0, pcev_mjsolve,    ierr)
 
     pcev_registered = .true.
   end subroutine physics_pc_log_events_register

@@ -3,30 +3,26 @@ module mod_petsc_pc_blocks
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: g_ctx
   implicit none
   private
 
   !--------------------------------------------------------------------
-  !> Leaf primitives shared by the physics preconditioner paths.
-  !!
-  !! Nothing here decides anything: every routine is a pure operation on
-  !! PETSc objects plus g_ctx%is_var. The block extraction keeps the |n|
-  !! groups at most harm_band apart (harm_kept); mod_petsc_pc_sf sets
-  !! harm_band from physics_pc_sf_harm_couple.
+  !> Block primitives of the SF preconditioner: extraction, packing, scaling
+  !! and the variable split of vectors. The extraction keeps every slot pair
+  !! with harm_all, else only those of one |n| group (harm_kept).
   !--------------------------------------------------------------------
 
   public :: pc_print_block_setup
-  public :: create_variable_index_sets
   public :: extract_sub_blocks_h
   public :: pack_pair_aij, pack_blocks_aij
-  public :: make_pair_block_scale, make_field_block_scale
+  public :: make_field_block_scale
+  public :: decouple_penalty_rows
   public :: split_vars, merge_vars
-  public :: harm_band, harm_kept
+  public :: harm_all, harm_kept
 
-  !> Cross-|n| band of the block extraction: 0 = same |n| group only (cos and
-  !! sin of one n together), k > 0 = groups at most k apart, < 0 = all.
-  integer, save :: harm_band = 0
+  !> Cross-|n| coupling of the block extraction: .true. = every slot pair,
+  !! .false. = one |n| group only (cos and sin of one n together).
+  logical, save :: harm_all = .false.
 
 contains
 
@@ -34,7 +30,7 @@ contains
   !! Slot m belongs to |n| group (m+1)/2 (slot 0 = n = 0, then cos/sin pairs).
   pure logical function harm_kept(m, q)
     integer, intent(in) :: m, q
-    harm_kept = (harm_band < 0) .or. (abs((m + 1) / 2 - (q + 1) / 2) <= harm_band)
+    harm_kept = harm_all .or. ((m + 1) / 2 == (q + 1) / 2)
   end function harm_kept
 
   !--------------------------------------------------------------------
@@ -53,69 +49,11 @@ contains
   end subroutine pc_print_block_setup
 
   !--------------------------------------------------------------------
-  !> Create variable index sets for extracting sub-vectors from the
-  !! full 6-variable system vector.
-  !!
-  !! DOF ordering within each BAIJ block (block_size = n_var*n_tor):
-  !!   var v (0-based) at node block i: i*block_size + v*n_tor + m
-  !!   for m = 0..n_tor-1
-  !--------------------------------------------------------------------
-  subroutine create_variable_index_sets(A_full, comm)
-    use mod_parameters, only: n_var, n_tor
-
-    Mat, intent(in) :: A_full
-    integer, intent(in) :: comm
-
-    PetscInt :: n_local, n_global, rstart, rend
-    PetscInt :: block_size, n_block_local, n_var_dofs, n_block_global
-    !PetscInt :: out_local, out_global, out_start, out_end
-    PetscInt, allocatable :: indices(:)
-    PetscErrorCode :: ierr
-    integer :: v, i, m, k
-
-    ! Get parallel layout from the full system matrix
-    PetscCallA(MatGetLocalSize(A_full, n_local, PETSC_NULL_INTEGER, ierr))
-    PetscCallA(MatGetSize(A_full, n_global, PETSC_NULL_INTEGER, ierr))
-    PetscCallA(MatGetOwnershipRange(A_full, rstart, rend, ierr))
-
-    !write(*,'(A,I8,A,I8)') "[Physics PC]   Creating variable index sets: local DOFs ", n_local, " [", rstart, "-", rend-1, "]"
-
-    block_size    = n_var * n_tor
-    n_block_local = n_local / block_size
-    n_block_global = n_global / block_size
-    n_var_dofs    = n_block_local * n_tor
-
-    allocate(indices(n_var_dofs))
-
-    do v = 1, 6
-      k = 0
-      do i = 0, n_block_local - 1
-        do m = 0, n_tor - 1
-          k = k + 1
-          !k = i*(n_tor-1) + m + 1
-          indices(k) = rstart + i * block_size + (v-1) * n_tor + m
-        enddo
-      enddo
-      PetscCallA(ISCreateGeneral(comm, n_var_dofs, indices, PETSC_COPY_VALUES, g_ctx%is_var(v), ierr))
-
-      ! Print information about the created IS for debugging
-      !PetscCallA(ISGetSize(g_ctx%is_var(v), out_global, ierr))
-      !PetscCallA(ISGetLocalSize(g_ctx%is_var(v), out_local, ierr))
-      !PetscCallA(ISGetMinMax(g_ctx%is_var(v), out_start, out_end, ierr))
-      !write(*,*) "[Physics PC]     Variable ", v, ": local DOFs : ", out_local," global DOFs ", out_global, " [", out_start, "-", out_end, "]"
-    enddo
-
-    deallocate(indices)
-    g_ctx%is_created = .true.
-  end subroutine create_variable_index_sets
-
-
-  !--------------------------------------------------------------------
   !> Extract the blocks Mb(k) = A(eqs(k), vrs(k)) of the full system matrix in
   !! ONE pass over A_full's rows: each equation row is read once (MatGetRow on
   !! JOREK's BAIJ matrix expands the whole n_var*n_tor-wide block row) and its
-  !! entries are dispatched to every requested block of that equation. Only
-  !! the entries between |n| groups at most harm_band apart are kept
+  !! entries are dispatched to every requested block of that equation. Every
+  !! entry is kept with harm_all, else only those of one |n| group
   !! (harm_kept; slot m is in group (m+1)/2, cos and sin of one n together).
   !!
   !! The blocks are read straight out of A_full's rows (MatGetRow), so no
@@ -384,63 +322,12 @@ contains
   end subroutine pack_blocks_aij
 
   !--------------------------------------------------------------------
-  !> Workstream B, Step 2: symmetric BLOCK scaling of a packed 2-field pair.
-  !!
-  !!   A <- D A D,   D = diag(I, s I)
-  !!
-  !! The caller then solves (D A D) z = D b and recovers x = D z, so this is an
-  !! exact similarity: it changes the conditioning the inner solver sees and
-  !! NOTHING else.
-  !!
-  !! WHY. Both packed pairs pit an operator block against a mass block, and in
-  !! both the two carry very different scale. Measured over the full ramp (the
-  !! former inner-solver probe, meas_B/pr_ramp_m8), the two behave DIFFERENTLY
-  !! and it matters:
-  !!
-  !!   pair_w   |diag| spread 5.3e9 -> 2.2e10 -> 1.2e12 -> 3.1e13 at tstep
-  !!            1 / 10 / 100 / 1000. min is pinned at 1.858e-5 (the dt-independent
-  !!            B_44 mass rows) while max tracks dt. Genuinely dt-driven.
-  !!   pair_psi |diag| spread CONSTANT at 1.78e10 across the whole ramp. Its
-  !!            mismatch is static, not dt-driven.
-  !!
-  !! So the dt story holds for pair_w only. It is NOT the ZBIG penalty rows in
-  !! either case -- eliminate_boundary_dofs has already removed those, and no
-  !! measured diagonal reaches 1e12 until pair_w does so on its own at tstep=100.
-  !!
-  !! Note also that spread alone does NOT predict solvability: pair_psi holds a
-  !! constant 1.78e10 spread while GMRES+ILU(0) on it improves from err 7.3e+1 at
-  !! tstep=1 to 3.5e-5 at tstep=1000. Scaling is therefore expected to pay on
-  !! pair_w, where the spread grows four decades and every candidate (INCLUDING
-  !! the MUMPS LU, err 1.7e-6 at tstep=1000) degrades with it. It is applied to
-  !! both because it is an exact similarity and costs one MatDiagonalScale.
-  !!
-  !! s is MEASURED from the two block diagonals, not assumed from a power of dt.
-  !! pair_w's max does not follow a clean power of dt (ratios 1.9 / 37 / 26 across
-  !! the ramp's decades) because S_uu carries both a mass part and the dt^2
-  !! channel correction, so an assumed exponent would be wrong; and pair_psi has
-  !! no dt dependence to assume in the first place.
-  !!
-  !! One scalar per block, deliberately: the block structure that a PCFIELDSPLIT
-  !! or a point-block smoother needs is preserved exactly. Per-row equilibration
-  !! would flatten the diagonal further but destroy that structure.
-  !--------------------------------------------------------------------
-  subroutine make_pair_block_scale(A, n1_loc, dvec, comm, my_id, label)
-    Mat, intent(inout)           :: A
-    PetscInt, intent(in)         :: n1_loc   !< LOCAL rows in the FIRST field: the
-                                             !< Nest->AIJ pack is [f1 local | f2 local] per rank
-    Vec, intent(inout)           :: dvec     !< out: D, kept for the apply
-    integer, intent(in)          :: comm
-    integer, intent(in)          :: my_id
-    character(len=*), intent(in) :: label
-    PetscInt :: rstart, rend
-    PetscErrorCode :: ierr
-    call MatGetOwnershipRange(A, rstart, rend, ierr)
-    call make_field_block_scale(A, [n1_loc, rend - rstart - n1_loc], dvec, comm, my_id, label)
-  end subroutine make_pair_block_scale
-
-  !--------------------------------------------------------------------
-  !> make_pair_block_scale for nf packed fields: D = diag(I, s_2 I, ..., s_nf I),
-  !! s_f = sqrt(mean|diag| of field 1 / mean|diag| of field f).
+  !> Symmetric block scaling of a packed operator, A <- D A D with
+  !! D = diag(I, s_2 I, ..., s_nf I), s_f = sqrt(mean|diag| of field 1 /
+  !! mean|diag| of field f). The caller solves (D A D) z = D b and takes
+  !! x = D z: an exact similarity that only evens out the scales of the
+  !! operator and mass blocks (pair_w's spread grows with dt). One scalar per
+  !! field keeps the block structure the smoothers rely on.
   !--------------------------------------------------------------------
   subroutine make_field_block_scale(A, nloc, dvec, comm, my_id, label)
     Mat, intent(inout)           :: A
@@ -482,9 +369,7 @@ contains
     call MPI_Allreduce(MPI_IN_PLACE, acc, 2 * nf, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
     m = acc(1:nf) / max(acc(nf + 1:2 * nf), 1.d0)
 
-    ! Fall back to the identity rather than guessing. A zero mean means the block
-    ! is not the shape this routine assumes, and a silently wrong scaling would be
-    ! indistinguishable from a bad preconditioner in every downstream number.
+    ! a field with zero mean |diag| is not the shape assumed here: identity
     if (all(m > 0.d0)) then
       sc = sqrt(m(1) / m)
     else
@@ -502,9 +387,9 @@ contains
     call VecRestoreArray(dvec, dptr, ierr)
 
     call MatDiagonalScale(A, dvec, dvec, ierr)
+    call report_tiny_diag(A, nf, m, comm, my_id, label)
 
-    !--- The spread actually achieved. This is the number the scaling exists to
-    !--- move, so it belongs in the log next to the unscaled one.
+    !--- the |diag| spread achieved
     call MatCreateVecs(A, chk, PETSC_NULL_VEC, ierr)
     call MatGetDiagonal(A, chk, ierr)
     call VecAbs(chk, ierr)
@@ -529,6 +414,177 @@ contains
 
   end subroutine make_field_block_scale
 
+  !--------------------------------------------------------------------
+  !> -sf_diag_report: the rows of a packed block whose |diag| is below
+  !! 1e-10 of their field's mean (m, unscaled), with their node, DOF order
+  !! and toroidal slot, up to 20 per rank. A is the scaled operator, so its
+  !! diagonal is divided back by D before the test.
+  !--------------------------------------------------------------------
+  subroutine report_tiny_diag(A, nf, m, comm, my_id, label)
+    use mod_parameters, only: n_tor, n_degrees
+    use nodes_elements, only: node_list
+    Mat, intent(in)              :: A
+    integer, intent(in)          :: nf
+    real*8, intent(in)           :: m(:)
+    integer, intent(in)          :: comm, my_id
+    character(len=*), intent(in) :: label
+
+    PetscErrorCode :: ierr
+    PetscInt :: rs, re, iv
+    PetscBool :: set
+    PetscScalar, pointer :: dptr(:)
+    Vec :: d
+    integer :: nloc, kk, f, lf, g, idx, slot, n, k, nfound, ntot, mpierr
+
+    iv = 0
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_diag_report", iv, set, ierr)
+    if (iv == 0) return
+
+    call MatGetOwnershipRange(A, rs, re, ierr)
+    nloc = int(re - rs) / nf
+    call MatCreateVecs(A, d, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, d, ierr)
+    call VecGetArrayRead(d, dptr, ierr)
+    nfound = 0
+    do kk = 1, int(re - rs)
+      f  = (kk - 1) / nloc + 1
+      lf = mod(kk - 1, nloc)
+      ! the scaling multiplied the diagonal by s_f^2 = m(1) / m(f)
+      if (abs(dptr(kk)) * m(f) / m(1) >= 1.d-10 * m(f)) cycle
+      nfound = nfound + 1
+      if (nfound > 20) cycle
+      g = int(rs) / nf + lf
+      idx = g / n_tor + 1; slot = mod(g, n_tor)
+      do n = 1, node_list%n_nodes
+        do k = 1, n_degrees
+          if (node_list%node(n)%index(k) == idx) then
+            write(*,'(A,A,A,I0,A,I0,A,I0,A,I0,A,I0,A,ES10.3,A,2F9.4,A,I0,A,L1)') "[Physics PC]   ", &
+              trim(label), " tiny diag: rank ", my_id, " field ", f, " slot ", slot, " node ", n, &
+              " dof ", k, " |d|/mean ", abs(dptr(kk)) / m(1), " RZ", node_list%node(n)%x(1,1,1), &
+              node_list%node(n)%x(1,1,2), " bnd ", node_list%node(n)%boundary, " axis ", &
+              node_list%node(n)%axis_node
+          endif
+        enddo
+      enddo
+    enddo
+    call VecRestoreArrayRead(d, dptr, ierr)
+    call VecDestroy(d, ierr)
+    call MPI_Allreduce(nfound, ntot, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
+    if (my_id == 0) write(*,'(A,A,A,I0)') "[Physics PC]   ", trim(label), " tiny-diag rows: ", ntot
+  end subroutine report_tiny_diag
+
+  !--------------------------------------------------------------------
+  !> The penalty rows of a diagonal block, made the Dirichlet rows
+  !! eliminate_boundary_dofs builds. With eliminate_boundary_dofs = .f.,
+  !! model600's boundary conditions (and fix_axis_nodes) add zbig = 1e12
+  !! (1e15 with keep_n0_const) to the diagonal of the whole FEM row, so on
+  !! that row x_b = r_b / a_bb up to O(max|a_bj| / zbig). Left in, those
+  !! rows set every field's mean |diag| (make_field_block_scale), dominate
+  !! the inner FGMRES norms, and stay in the GMG coarse spaces, which drop
+  !! only diagonal-only rows. A row with |a_ii| > PEN_TAU max_j |a_ij| has
+  !! its row and column zeroed and its field's bulk mean |diag| put on the
+  !! diagonal; pfac = bulk / a_ii there (1 elsewhere), so a caller scaling
+  !! the right-hand side by pfac still gets x_b = r_b / a_ii. The pattern
+  !! is kept (frozen-pattern refills, MUMPS / GMG symbolic reuse).
+  !--------------------------------------------------------------------
+  subroutine decouple_penalty_rows(A, nloc, pfac, made, comm, my_id, label)
+    Mat, intent(inout)           :: A
+    PetscInt, intent(in)         :: nloc(:)  !< LOCAL rows of each field, in pack order
+    Vec, intent(inout)           :: pfac     !< out: the right-hand-side factor
+    logical, intent(inout)       :: made     !< pfac exists (refilled in place)
+    integer, intent(in)          :: comm
+    integer, intent(in)          :: my_id
+    character(len=*), intent(in) :: label
+
+    real*8, parameter :: PEN_TAU = 1.d6
+    PetscErrorCode :: ierr
+    PetscInt :: rs, re, row, ncols, npen
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:), dptr(:), pptr(:)
+    PetscInt, allocatable :: prow(:)
+    logical, allocatable :: pen(:)
+    integer, allocatable :: fld(:)
+    real*8, allocatable :: acc(:), m(:)
+    integer :: nf, f, kk, jc, mpierr
+    real*8 :: dg, off
+    Vec :: dv
+    character(len=256) :: sn, sm
+    character(len=16)  :: t1
+
+    nf = size(nloc)
+    call MatGetOwnershipRange(A, rs, re, ierr)
+    allocate(pen(re - rs), fld(re - rs), prow(re - rs), acc(3 * nf), m(nf))
+    kk = 0
+    do f = 1, nf
+      fld(kk + 1:kk + nloc(f)) = f
+      kk = kk + int(nloc(f))
+    enddo
+
+    !--- detect, and the bulk mean |diag| of each field (owned rows, reduced)
+    acc = 0.d0
+    do row = rs, re - 1
+      kk = int(row - rs) + 1
+      call MatGetRow(A, row, ncols, cols, vals, ierr)
+      dg = 0.d0; off = 0.d0
+      do jc = 1, int(ncols)
+        if (cols(jc) == row) then
+          dg = abs(vals(jc))
+        else
+          off = max(off, abs(vals(jc)))
+        endif
+      enddo
+      call MatRestoreRow(A, row, ncols, cols, vals, ierr)
+      pen(kk) = (dg > 0.d0) .and. (dg > PEN_TAU * off)
+      if (pen(kk)) then
+        acc(2 * nf + fld(kk)) = acc(2 * nf + fld(kk)) + 1.d0
+      else
+        acc(fld(kk))      = acc(fld(kk)) + dg
+        acc(nf + fld(kk)) = acc(nf + fld(kk)) + 1.d0
+      endif
+    enddo
+    call MPI_Allreduce(MPI_IN_PLACE, acc, 3 * nf, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+    m = acc(1:nf) / max(acc(nf + 1:2 * nf), 1.d0)
+    where (.not. (m > 0.d0)) m = 1.d0
+
+    !--- pfac, and the diagonal the decoupled rows get
+    if (.not. made) call MatCreateVecs(A, pfac, PETSC_NULL_VEC, ierr)
+    made = .true.
+    call MatCreateVecs(A, dv, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, dv, ierr)
+    call VecGetArray(dv, dptr, ierr)
+    call VecGetArray(pfac, pptr, ierr)
+    npen = 0
+    do kk = 1, size(pen)
+      if (pen(kk)) then
+        npen = npen + 1
+        prow(npen) = rs + kk - 1
+        pptr(kk) = m(fld(kk)) / dptr(kk)
+        dptr(kk) = m(fld(kk))
+      else
+        pptr(kk) = 1.d0
+      endif
+    enddo
+    call VecRestoreArray(pfac, pptr, ierr)
+    call VecRestoreArray(dv, dptr, ierr)
+
+    call MatSetOption(A, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr)
+    call MatZeroRowsColumns(A, npen, prow(1:npen), 1.d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    call MatDiagonalSet(A, dv, INSERT_VALUES, ierr)
+    call VecDestroy(dv, ierr)
+
+    if (my_id == 0) then
+      sn = ""; sm = ""
+      do f = 1, nf
+        write(t1, '(I0)') nint(acc(2 * nf + f))
+        sn = trim(sn)//merge(" ", "/", f == 1)//trim(t1)
+        write(t1, '(ES10.3)') m(f)
+        sm = trim(sm)//merge("  ", " /", f == 1)//t1
+      enddo
+      write(*,'(A,A,A,A,A,A)') "[Physics PC]   ", trim(label), " penalty rows decoupled:", &
+        trim(sn), ", bulk mean|diag|", trim(sm)
+    endif
+  end subroutine decouple_penalty_rows
+
   !> v(k) = variable k of the full-system vector x (k = 1..size(v)): local rows
   !! node*bs + (k-1)*n_tor + m -> node*n_tor + m, bs = n_var*n_tor, exactly the
   !! map of create_variable_index_sets. Rank-local, no communication.
@@ -536,7 +592,7 @@ contains
     use mod_parameters, only: n_var, n_tor
     use mod_petsc_blk_dev, only: vec_copy_strided
     Vec :: x
-    Vec :: v(:)
+    Vec :: v(:)                         !< variables 1..size(v)
     PetscErrorCode :: ierr
     PetscInt :: nl
     integer :: k, bs, nn

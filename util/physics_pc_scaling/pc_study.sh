@@ -19,7 +19,7 @@
 #    PCS_DRYRUN=1 pc_study.sh strong   # only print the cases that would run
 #
 #  Environment (defaults in brackets):
-#    PCS_ARMS    arms to run, in order          [jorek sf_gmg_wpj_ms sf_lu_wpj;
+#    PCS_ARMS    arms to run, in order          [jorek sf_gmg_wpj_hcall sf_lu_wpj;
 #                                                 nonlinear: jorek jorek_fresh]
 #                (the _ms arms need np >= (n_tor+1)/2; smaller np fails the case)
 #    PCS_MESH    strong: the fixed mesh         [161x64]
@@ -55,7 +55,7 @@ if [ "$MODE" = nonlinear ]; then
   ARMS=${PCS_ARMS:-"jorek jorek_fresh"}
 else
   # jorek first: it is the cheapest, so a timed-out job still has the baseline.
-  ARMS=${PCS_ARMS:-"jorek sf_gmg_wpj_ms sf_lu_wpj"}
+  ARMS=${PCS_ARMS:-"jorek sf_gmg_wpj_hcall sf_lu_wpj"}
 fi
 MAXNP=${PCS_MAXNP:-${SLURM_NTASKS:-8}}
 export PCS_ROOT=${PCS_ROOT:-$PWD/pc_scaling}

@@ -541,6 +541,22 @@ contains
         PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_restart", rs, set, ierr))
         if (set) PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, rs, ierr))
       end block
+      ! -jorek_outer_rtol r, -jorek_outer_maxit k: the outer FGMRES relative tolerance
+      ! and iteration cap (defaults 1e-8, 400; the input's gmres_tol/gmres_max_iter
+      ! are not used on this path)
+      block
+        PetscReal :: rt
+        PetscInt :: mi
+        PetscBool :: set_rt, set_mi
+        rt = 1.d-8
+        mi = 400
+        PetscCallA(PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_rtol", rt, set_rt, ierr))
+        PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_maxit", mi, set_mi, ierr))
+        if (set_rt .or. set_mi) then
+          PetscCallA(KSPSetTolerances(petsc_sys%ksp, rt, 1.d-36, PETSC_CURRENT_REAL, mi, ierr))
+          if (my_id .eq. 0) write(*,'(A,ES10.3,A,I0)') " [PETSc] outer FGMRES rtol ", rt, ", maxit ", mi
+        endif
+      end block
 
       if (use_physics_pc) then
         if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + Physics PCSHELL"
@@ -600,6 +616,21 @@ contains
     PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
     PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for FGMRES
 
+    ! -jorek_dump_outer <file>: the outer operator in PETSc binary, once
+    ! (diagnostics of the outer matvec's cost)
+    block
+      character(len=256) :: dfile
+      PetscBool :: dset
+      PetscViewer :: dv
+      logical, save :: dumped = .false.
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_dump_outer", dfile, dset, ierr)
+      if (dset .and. .not. dumped) then
+        call PetscViewerBinaryOpen(comm, trim(dfile), FILE_MODE_WRITE, dv, ierr)
+        call MatView(petsc_sys%A_aij, dv, ierr)
+        call PetscViewerDestroy(dv, ierr)
+        dumped = .true.
+      endif
+    end block
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
