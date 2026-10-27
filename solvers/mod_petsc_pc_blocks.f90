@@ -16,6 +16,7 @@ module mod_petsc_pc_blocks
   public :: extract_sub_blocks_h
   public :: pack_pair_aij, pack_blocks_aij
   public :: make_field_block_scale
+  public :: decouple_penalty_rows
   public :: split_vars, merge_vars
   public :: harm_all, harm_kept
 
@@ -386,6 +387,7 @@ contains
     call VecRestoreArray(dvec, dptr, ierr)
 
     call MatDiagonalScale(A, dvec, dvec, ierr)
+    call report_tiny_diag(A, nf, m, comm, my_id, label)
 
     !--- the |diag| spread achieved
     call MatCreateVecs(A, chk, PETSC_NULL_VEC, ierr)
@@ -411,6 +413,177 @@ contains
     endif
 
   end subroutine make_field_block_scale
+
+  !--------------------------------------------------------------------
+  !> -sf_diag_report: the rows of a packed block whose |diag| is below
+  !! 1e-10 of their field's mean (m, unscaled), with their node, DOF order
+  !! and toroidal slot, up to 20 per rank. A is the scaled operator, so its
+  !! diagonal is divided back by D before the test.
+  !--------------------------------------------------------------------
+  subroutine report_tiny_diag(A, nf, m, comm, my_id, label)
+    use mod_parameters, only: n_tor, n_degrees
+    use nodes_elements, only: node_list
+    Mat, intent(in)              :: A
+    integer, intent(in)          :: nf
+    real*8, intent(in)           :: m(:)
+    integer, intent(in)          :: comm, my_id
+    character(len=*), intent(in) :: label
+
+    PetscErrorCode :: ierr
+    PetscInt :: rs, re, iv
+    PetscBool :: set
+    PetscScalar, pointer :: dptr(:)
+    Vec :: d
+    integer :: nloc, kk, f, lf, g, idx, slot, n, k, nfound, ntot, mpierr
+
+    iv = 0
+    call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_diag_report", iv, set, ierr)
+    if (iv == 0) return
+
+    call MatGetOwnershipRange(A, rs, re, ierr)
+    nloc = int(re - rs) / nf
+    call MatCreateVecs(A, d, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, d, ierr)
+    call VecGetArrayRead(d, dptr, ierr)
+    nfound = 0
+    do kk = 1, int(re - rs)
+      f  = (kk - 1) / nloc + 1
+      lf = mod(kk - 1, nloc)
+      ! the scaling multiplied the diagonal by s_f^2 = m(1) / m(f)
+      if (abs(dptr(kk)) * m(f) / m(1) >= 1.d-10 * m(f)) cycle
+      nfound = nfound + 1
+      if (nfound > 20) cycle
+      g = int(rs) / nf + lf
+      idx = g / n_tor + 1; slot = mod(g, n_tor)
+      do n = 1, node_list%n_nodes
+        do k = 1, n_degrees
+          if (node_list%node(n)%index(k) == idx) then
+            write(*,'(A,A,A,I0,A,I0,A,I0,A,I0,A,I0,A,ES10.3,A,2F9.4,A,I0,A,L1)') "[Physics PC]   ", &
+              trim(label), " tiny diag: rank ", my_id, " field ", f, " slot ", slot, " node ", n, &
+              " dof ", k, " |d|/mean ", abs(dptr(kk)) / m(1), " RZ", node_list%node(n)%x(1,1,1), &
+              node_list%node(n)%x(1,1,2), " bnd ", node_list%node(n)%boundary, " axis ", &
+              node_list%node(n)%axis_node
+          endif
+        enddo
+      enddo
+    enddo
+    call VecRestoreArrayRead(d, dptr, ierr)
+    call VecDestroy(d, ierr)
+    call MPI_Allreduce(nfound, ntot, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
+    if (my_id == 0) write(*,'(A,A,A,I0)') "[Physics PC]   ", trim(label), " tiny-diag rows: ", ntot
+  end subroutine report_tiny_diag
+
+  !--------------------------------------------------------------------
+  !> The penalty rows of a diagonal block, made the Dirichlet rows
+  !! eliminate_boundary_dofs builds. With eliminate_boundary_dofs = .f.,
+  !! model600's boundary conditions (and fix_axis_nodes) add zbig = 1e12
+  !! (1e15 with keep_n0_const) to the diagonal of the whole FEM row, so on
+  !! that row x_b = r_b / a_bb up to O(max|a_bj| / zbig). Left in, those
+  !! rows set every field's mean |diag| (make_field_block_scale), dominate
+  !! the inner FGMRES norms, and stay in the GMG coarse spaces, which drop
+  !! only diagonal-only rows. A row with |a_ii| > PEN_TAU max_j |a_ij| has
+  !! its row and column zeroed and its field's bulk mean |diag| put on the
+  !! diagonal; pfac = bulk / a_ii there (1 elsewhere), so a caller scaling
+  !! the right-hand side by pfac still gets x_b = r_b / a_ii. The pattern
+  !! is kept (frozen-pattern refills, MUMPS / GMG symbolic reuse).
+  !--------------------------------------------------------------------
+  subroutine decouple_penalty_rows(A, nloc, pfac, made, comm, my_id, label)
+    Mat, intent(inout)           :: A
+    PetscInt, intent(in)         :: nloc(:)  !< LOCAL rows of each field, in pack order
+    Vec, intent(inout)           :: pfac     !< out: the right-hand-side factor
+    logical, intent(inout)       :: made     !< pfac exists (refilled in place)
+    integer, intent(in)          :: comm
+    integer, intent(in)          :: my_id
+    character(len=*), intent(in) :: label
+
+    real*8, parameter :: PEN_TAU = 1.d6
+    PetscErrorCode :: ierr
+    PetscInt :: rs, re, row, ncols, npen
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:), dptr(:), pptr(:)
+    PetscInt, allocatable :: prow(:)
+    logical, allocatable :: pen(:)
+    integer, allocatable :: fld(:)
+    real*8, allocatable :: acc(:), m(:)
+    integer :: nf, f, kk, jc, mpierr
+    real*8 :: dg, off
+    Vec :: dv
+    character(len=256) :: sn, sm
+    character(len=16)  :: t1
+
+    nf = size(nloc)
+    call MatGetOwnershipRange(A, rs, re, ierr)
+    allocate(pen(re - rs), fld(re - rs), prow(re - rs), acc(3 * nf), m(nf))
+    kk = 0
+    do f = 1, nf
+      fld(kk + 1:kk + nloc(f)) = f
+      kk = kk + int(nloc(f))
+    enddo
+
+    !--- detect, and the bulk mean |diag| of each field (owned rows, reduced)
+    acc = 0.d0
+    do row = rs, re - 1
+      kk = int(row - rs) + 1
+      call MatGetRow(A, row, ncols, cols, vals, ierr)
+      dg = 0.d0; off = 0.d0
+      do jc = 1, int(ncols)
+        if (cols(jc) == row) then
+          dg = abs(vals(jc))
+        else
+          off = max(off, abs(vals(jc)))
+        endif
+      enddo
+      call MatRestoreRow(A, row, ncols, cols, vals, ierr)
+      pen(kk) = (dg > 0.d0) .and. (dg > PEN_TAU * off)
+      if (pen(kk)) then
+        acc(2 * nf + fld(kk)) = acc(2 * nf + fld(kk)) + 1.d0
+      else
+        acc(fld(kk))      = acc(fld(kk)) + dg
+        acc(nf + fld(kk)) = acc(nf + fld(kk)) + 1.d0
+      endif
+    enddo
+    call MPI_Allreduce(MPI_IN_PLACE, acc, 3 * nf, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+    m = acc(1:nf) / max(acc(nf + 1:2 * nf), 1.d0)
+    where (.not. (m > 0.d0)) m = 1.d0
+
+    !--- pfac, and the diagonal the decoupled rows get
+    if (.not. made) call MatCreateVecs(A, pfac, PETSC_NULL_VEC, ierr)
+    made = .true.
+    call MatCreateVecs(A, dv, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, dv, ierr)
+    call VecGetArray(dv, dptr, ierr)
+    call VecGetArray(pfac, pptr, ierr)
+    npen = 0
+    do kk = 1, size(pen)
+      if (pen(kk)) then
+        npen = npen + 1
+        prow(npen) = rs + kk - 1
+        pptr(kk) = m(fld(kk)) / dptr(kk)
+        dptr(kk) = m(fld(kk))
+      else
+        pptr(kk) = 1.d0
+      endif
+    enddo
+    call VecRestoreArray(pfac, pptr, ierr)
+    call VecRestoreArray(dv, dptr, ierr)
+
+    call MatSetOption(A, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr)
+    call MatZeroRowsColumns(A, npen, prow(1:npen), 1.d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    call MatDiagonalSet(A, dv, INSERT_VALUES, ierr)
+    call VecDestroy(dv, ierr)
+
+    if (my_id == 0) then
+      sn = ""; sm = ""
+      do f = 1, nf
+        write(t1, '(I0)') nint(acc(2 * nf + f))
+        sn = trim(sn)//merge(" ", "/", f == 1)//trim(t1)
+        write(t1, '(ES10.3)') m(f)
+        sm = trim(sm)//merge("  ", " /", f == 1)//t1
+      enddo
+      write(*,'(A,A,A,A,A,A)') "[Physics PC]   ", trim(label), " penalty rows decoupled:", &
+        trim(sn), ", bulk mean|diag|", trim(sm)
+    endif
+  end subroutine decouple_penalty_rows
 
   !> v(k) = variable k of the full-system vector x (k = 1..size(v)): local rows
   !! node*bs + (k-1)*n_tor + m -> node*n_tor + m, bs = n_var*n_tor, exactly the

@@ -239,6 +239,9 @@ module mod_petsc_pc_gmg
     ! ring_single: the ring blocks' factors rounded to single (lu4, block b at
     ! loff4(b)), which the solves read instead of lu; wk4 = wk's single copy
     real*4, allocatable :: lu4(:), wk4(:)
+    ! ring_single: the rings' equilibration S (btd_equil), block order as wk;
+    ! 1 on every other block
+    real*8, allocatable :: eqs(:)
     integer(8), allocatable :: loff4(:)
   end type blk_t
   type(blk_t), save, target :: gBk(0:MAX_LEV-1)
@@ -461,6 +464,7 @@ contains
     if (allocated(a%lu4))  call move_alloc(a%lu4,  b%lu4)
     if (allocated(a%wk4))  call move_alloc(a%wk4,  b%wk4)
     if (allocated(a%loff4)) call move_alloc(a%loff4, b%loff4)
+    if (allocated(a%eqs))  call move_alloc(a%eqs,  b%eqs)
   end subroutine move_blk
 
   subroutine move_rds(a, b)
@@ -3101,12 +3105,20 @@ contains
     allocate(binfo(B%nb))
     binfo = 0
     if (rchk > 0) a0chk = B%lu
+    if (rsp) then
+      if (allocated(B%eqs)) then
+        if (size(B%eqs) /= size(B%rows)) deallocate(B%eqs)
+      endif
+      if (.not. allocated(B%eqs)) allocate(B%eqs(size(B%rows)))
+      B%eqs = 1.d0
+    endif
     !$omp parallel do schedule(dynamic, 1) private(bb, n, ldab)
     do bb = 1, B%nb
       if (B%axblk(bb)) cycle
       n = B%sz(bb)
       if (B%btd(bb)) then
         B%jac(bb) = .false.
+        if (rsp) call btd_equil(B%rg(bb), B%lu(B%loff(bb) + 1), B%eqs(B%off(bb) + 1))
         if (.not. allocated(B%wk)) call btd_factor(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), binfo(bb))
       else if (B%band(bb)) then
         ldab = 2 * B%kl(bb) + B%ku(bb) + 1
@@ -3128,6 +3140,7 @@ contains
         ! a ring solver's block: a singular node block (the block
         ! elimination pivots inside the nodes only)
         if (B%btd(bb)) B%jac(bb) = .true.
+        if (rsp) B%eqs(B%off(bb) + 1 : B%off(bb) + n) = 1.d0
         B%lu(B%loff(bb) + 1 : B%loff(bb) + blk_size(B, bb)) = 0.0d0
         do q = 1, n
           r = B%rows(B%off(bb) + q)
@@ -3364,9 +3377,9 @@ contains
       if (rsp) then                                ! the solve the smoother uses
         block
           real*4 :: x4(n)
-          x4 = real(x, 4)
+          x4 = real(x * B%eqs(B%off(bb) + 1 : B%off(bb) + n), 4)
           call btd_solve_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), x4)
-          x = x4
+          x = x4 * B%eqs(B%off(bb) + 1 : B%off(bb) + n)
         end block
       else
         call btd_solve(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), x)
@@ -4578,9 +4591,9 @@ contains
         else if (rsp) then
           block
             real*4 :: w4(n)
-            w4 = real(w(1:n), 4)
+            w4 = real(w(1:n) * B%eqs(B%off(bb) + 1 : B%off(bb) + n), 4)
             call btd_solve_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), w4)
-            w(1:n) = w4
+            w(1:n) = w4 * B%eqs(B%off(bb) + 1 : B%off(bb) + n)
           end block
         else
           call btd_solve(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), w)
@@ -4678,7 +4691,7 @@ contains
           v = gp(r - B%nrow + 1)
         endif
         if (sp) then
-          B%wk4(B%off(bb) + q) = real(v, 4)
+          B%wk4(B%off(bb) + q) = real(v * B%eqs(B%off(bb) + q), 4)
         else
           B%wk(B%off(bb) + q) = v
         endif
@@ -4696,7 +4709,7 @@ contains
         r = B%rows(B%off(bb) + q)
         if (r >= B%nrow) cycle
         if (sp) then
-          yp(r + 1) = B%wk4(B%off(bb) + q)
+          yp(r + 1) = B%wk4(B%off(bb) + q) * B%eqs(B%off(bb) + q)
         else
           yp(r + 1) = B%wk(B%off(bb) + q)
         endif

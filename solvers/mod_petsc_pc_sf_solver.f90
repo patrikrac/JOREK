@@ -90,6 +90,8 @@ module mod_petsc_pc_sf_solver
     integer :: backend  = SF_LU
     Vec     :: dscale                      !< symmetric block scaling D, if scaled
     logical :: scaled   = .false.
+    Vec     :: pfac                        !< rhs factor of the decoupled penalty rows, if penal
+    logical :: penal    = .false.
     logical :: created  = .false.
     integer :: gmg_inst = 0
     integer :: its_sum  = 0, its_max = 0, nsolve = 0
@@ -290,6 +292,7 @@ contains
     real*8 :: t0
 
     t0 = MPI_Wtime()
+    if (slv%penal)  call VecPointwiseMult(rhs, rhs, slv%pfac, ierr)
     if (slv%scaled) call VecPointwiseMult(rhs, rhs, slv%dscale, ierr)
     call KSPSolve(slv%ksp, rhs, sol, ierr)
     if (slv%scaled) call VecPointwiseMult(sol, sol, slv%dscale, ierr)

@@ -9,7 +9,7 @@ module mod_petsc_pc_sf
        pcev_extract, pcev_convert, pcev_build_suu, pcev_fact_pj, pcev_fact_w, &
        pcev_fact_rhot, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, pcev_apply
   use mod_petsc_pc_blocks, only: extract_sub_blocks_h, pack_pair_aij, make_field_block_scale, &
-       split_vars, merge_vars, harm_all
+       decouple_penalty_rows, split_vars, merge_vars, harm_all
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_gather, only: sfg_build, sfg_gather
   use mod_petsc_pc_sf_mixed, only: sfm_build, sfm_refill, sfm_op, SFM_NF
@@ -110,6 +110,15 @@ module mod_petsc_pc_sf
   type(fam_op_t), save :: o_m
   Mat, save :: a_m
   type(mass_cheb_t), save :: mcm
+
+  !--- penalty rows of the full Jacobian (eliminate_boundary_dofs = .f.):
+  !--- local offsets and diagonals, refreshed on every build
+  Mat, save :: a_full_s
+  integer, save :: npen_full = 0             !< global count; 0 = no back-substitution
+  integer, allocatable, save :: pen_loc(:)
+  real*8, allocatable, save  :: pen_d(:)
+  Vec, save :: pen_w
+  logical, save :: pen_w_made = .false.
 
   public :: sf_build, sf_apply, sf_report
 
@@ -291,9 +300,21 @@ contains
     endif
     call physics_pc_mem("SF build: operators filled", my_id)
 
+    call MatGetLocalSize(a_rho, n1_loc, PETSC_NULL_INTEGER, ierr)
+
+    !--- penalty BC rows (eliminate_boundary_dofs = .f.) as Dirichlet rows
+    !--- of the diagonal blocks, before their scaling; -sf_penalty_rows 0: off
+    if (penalty_rows_on()) then
+      call full_penalty_rows(A_full)
+      call penalty_rows(slv_pj, a_pj, 2, "pair_psi")
+      call penalty_rows(slv_w, a_w, nf_w, "pair_w")
+      call penalty_rows(slv_rho, a_rho, 1, "rho-block")
+      call penalty_rows(slv_T, a_T, 1, "T-block")
+      if (with_v .and. vstage /= SF_VPAR_B1) call penalty_rows(slv_v, a_v, 1, "v_par-block")
+    endif
+
     !--- symmetric block scaling of both pairs: an exact similarity on the
     !--- stored operator, undone in sf_solver_apply
-    call MatGetLocalSize(a_rho, n1_loc, PETSC_NULL_INTEGER, ierr)
     call block_scale(slv_pj, a_pj, 2, "pair_psi")
     call block_scale(slv_w, a_w, nf_w, "pair_w")
 
@@ -360,6 +381,66 @@ contains
       call make_field_block_scale(A, spread(n1_loc, 1, nf), slv%dscale, comm_s, my_id, label)
       slv%scaled = .true.
     end subroutine block_scale
+
+    subroutine penalty_rows(slv, A, nf, label)
+      type(block_solver_t), intent(inout) :: slv
+      Mat :: A
+      integer, intent(in) :: nf
+      character(len=*), intent(in) :: label
+      call decouple_penalty_rows(A, spread(n1_loc, 1, nf), slv%pfac, slv%penal, comm_s, my_id, label)
+    end subroutine penalty_rows
+
+    !> The full Jacobian's penalty rows, for the back-substitution closing
+    !! sf_apply: |a_ii| > 1e6 max |a_ij| over the row's own variable (the
+    !! Mach-1 rows also hold zbig couplings to T and u).
+    subroutine full_penalty_rows(A)
+      use mod_parameters, only: n_tor
+      Mat :: A
+      PetscInt :: rs, re, row, ncols, bs
+      PetscInt, pointer :: cols(:)
+      PetscScalar, pointer :: vals(:)
+      integer :: jc, n, iv, mpierr
+      real*8 :: dg, off
+      integer, allocatable :: tl(:)
+      real*8, allocatable :: td(:)
+      a_full_s = A
+      call MatGetBlockSize(A, bs, ierr)
+      call MatGetOwnershipRange(A, rs, re, ierr)
+      allocate(tl(re - rs), td(re - rs))
+      n = 0
+      do row = rs, re - 1
+        iv = int(mod(row, bs)) / n_tor
+        call MatGetRow(A, row, ncols, cols, vals, ierr)
+        dg = 0.d0; off = 0.d0
+        do jc = 1, int(ncols)
+          if (cols(jc) == row) then
+            dg = vals(jc)
+          else if (int(mod(cols(jc), bs)) / n_tor == iv) then
+            off = max(off, abs(vals(jc)))
+          endif
+        enddo
+        call MatRestoreRow(A, row, ncols, cols, vals, ierr)
+        if (abs(dg) > 0.d0 .and. abs(dg) > 1.d6 * off) then
+          n = n + 1; tl(n) = int(row - rs) + 1; td(n) = dg
+        endif
+      enddo
+      if (allocated(pen_loc)) deallocate(pen_loc, pen_d)
+      pen_loc = tl(1:n); pen_d = td(1:n)
+      call MPI_Allreduce(n, npen_full, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
+      if (.not. pen_w_made) call MatCreateVecs(A, pen_w, PETSC_NULL_VEC, ierr)
+      pen_w_made = .true.
+      if (my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   full Jacobian: ", npen_full, &
+        " penalty rows, back-substituted after every sweep"
+    end subroutine full_penalty_rows
+
+    logical function penalty_rows_on()
+      use phys_module, only: eliminate_boundary_dofs
+      PetscInt :: iv
+      PetscBool :: set
+      iv = merge(0, 1, eliminate_boundary_dofs)
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_penalty_rows", iv, set, ierr)
+      penalty_rows_on = (iv /= 0)
+    end function penalty_rows_on
 
     subroutine create_work_vectors()
       integer :: k
@@ -820,6 +901,7 @@ contains
     else
       call merge_vars(sv_y, y)
     endif
+    if (npen_full > 0) call penalty_backsub(x, y)
     call PetscLogEventEnd(pcev_apply, ierr)
     ierr = 0
 
@@ -848,6 +930,26 @@ contains
       call MatMult(A, v, scratch(r), ierr)
       call VecAXPY(r, 1.0d0, scratch(r), ierr)
     end subroutine add_mult
+
+    !> The penalty rows' x_b = (r_b - sum_j a_bj y_j) / a_bb with the
+    !! sweep's y: a penalty row's residual is zbig times x_b's error, so the
+    !! sweep's x_b = r_b / a_bb (decoupled rows) leaves it at the size of the
+    !! whole outer residual. Changes the rest of y's residual by O(1 / zbig).
+    subroutine penalty_backsub(r, z)
+      Vec :: r, z
+      PetscScalar, pointer :: zp(:), rp(:), wp(:)
+      integer :: q
+      call MatMult(a_full_s, z, pen_w, ierr)
+      call VecGetArray(z, zp, ierr)
+      call VecGetArrayRead(r, rp, ierr)
+      call VecGetArrayRead(pen_w, wp, ierr)
+      do q = 1, size(pen_loc)
+        zp(pen_loc(q)) = zp(pen_loc(q)) + (rp(pen_loc(q)) - wp(pen_loc(q))) / pen_d(q)
+      enddo
+      call VecRestoreArrayRead(pen_w, wp, ierr)
+      call VecRestoreArrayRead(r, rp, ierr)
+      call VecRestoreArray(z, zp, ierr)
+    end subroutine penalty_backsub
 
     !> a work vector distinct from r and from every operand still live
     function scratch(r) result(s)
