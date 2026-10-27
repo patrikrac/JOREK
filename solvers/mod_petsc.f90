@@ -419,6 +419,7 @@ contains
       PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
       PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
+      call MPI_Barrier(comm, mpierr)
       PetscCallA(PetscTime(ts1, ierr))
 
       call physics_pc_mem("solver: before AIJ copy (JOREK assembled)", my_id)
@@ -505,6 +506,7 @@ contains
       petsc_sys%ksp_ready = .true.
       call physics_pc_mem("solver: setup done", my_id)
 
+      call MPI_Barrier(comm, mpierr)
       PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
       if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
@@ -512,6 +514,7 @@ contains
     else if (.not. solve_only) then
       if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: refactorizing"
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
+      call MPI_Barrier(comm, mpierr)
       PetscCallA(PetscTime(ts1, ierr))
 
       if (.not. no_aij) then
@@ -523,6 +526,7 @@ contains
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
       call physics_pc_mem("solver: rebuild done", my_id)
 
+      call MPI_Barrier(comm, mpierr)
       PetscCallA(PetscTime(ts2, ierr))
       PetscCallA(PetscLogStagePop(ierr))
       if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
@@ -556,10 +560,12 @@ contains
         dumped = .true.
       endif
     end block
+    call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
     PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
     PetscCallA(PetscLogStagePop(ierr))
+    call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t2, ierr))
 
     PetscCallA(VecCopy(petsc_sys%x_aij, petsc_sys%x, ierr))
