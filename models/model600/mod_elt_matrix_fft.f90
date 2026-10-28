@@ -414,6 +414,16 @@ do ms=1, n_gauss
                    particle_source(ms,mt),heat_source(ms,mt))
     end if
 
+    ! --- fixed_aux_source: the axisymmetric particle source of an earlier kinetic run (aux field 1,
+    !     n = 0), added to particle_source as model307 adds aux_rho0
+    if (fixed_aux_source .and. present(aux_nodes)) then
+      do i = 1, n_vertex_max
+        do j = 1, n_degrees
+          particle_source(ms,mt) = particle_source(ms,mt) + aux_nodes(i)%values(1,j,1) * element%size(i,j) * H(i,j,ms,mt)
+        enddo
+      enddo
+    endif
+
     ! Source of parallel velocity
     if ( ( abs(V_0) .ge. 1.e-12 ) .or. ( num_rot ) ) then
       call velocity(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, eq_g(1,var_psi,ms,mt), psi_axis, psi_bnd, V_source(ms,mt), &

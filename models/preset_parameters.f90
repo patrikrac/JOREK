@@ -601,6 +601,7 @@ subroutine preset_parameters
   
   export_for_nemec   = .false.
   export_aux_node_list = .true.
+  fixed_aux_source     = .false.
   
   ! Use iterative solver by default if n_tor>1.
   if ( n_tor == 1) then

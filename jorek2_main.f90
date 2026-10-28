@@ -687,6 +687,23 @@ write(*,*) "n elements:", element_list%n_elements
   if (.not. associated(aux_node_list)) allocate(aux_node_list) ! information of particle moments is stored in aux_list
   call init_node_list(aux_node_list, n_nodes_max, aux_node_list%n_dof, n_aux_var)
 
+  ! --- fixed_aux_source: particle moments of an earlier (kinetic) run, read once from jorek_aux.h5
+  !     (a restart of this grid whose values are the moments) and kept for the whole run
+  if (fixed_aux_source) then
+    if (my_id == 0) then
+      call import_hdf5_restart_aux(aux_node_list, 'jorek_aux.h5', rst_format, ierr)
+      if (ierr /= 0) then
+        write(*,*) 'fixed_aux_source: could not read jorek_aux.h5'
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+      if (aux_node_list%n_nodes /= node_list%n_nodes) then
+        write(*,*) 'fixed_aux_source: jorek_aux.h5 has ', aux_node_list%n_nodes, ' nodes, the grid ', node_list%n_nodes
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+    endif
+    call broadcast_nodes(my_id, aux_node_list)
+  endif
+
   index_now = index_start  ! index_now: Index of current timestep
 
 #if defined(SEMIANALYTICAL)
@@ -717,12 +734,14 @@ write(*,*) "n elements:", element_list%n_elements
     
     if (freeboundary) call update_response(my_id,tstep, resistive_wall)
 
-    ! ---- For now running the jorek2_main should not include aux inputs
-    aux_node_list%n_nodes = 0
-    do i = 1, size(aux_node_list%node, 1)
-      aux_node_list%node(i)%values = 0.d0
-      aux_node_list%node(i)%deltas = 0.d0
-    enddo
+    ! ---- For now running the jorek2_main should not include aux inputs (but a fixed_aux_source)
+    if (.not. fixed_aux_source) then
+      aux_node_list%n_nodes = 0
+      do i = 1, size(aux_node_list%node, 1)
+        aux_node_list%node(i)%values = 0.d0
+        aux_node_list%node(i)%deltas = 0.d0
+      enddo
+    endif
 
     call update_equil_state(my_id,mhd_sim%node_list, mhd_sim%element_list, bnd_elm_list, xpoint, xcase)
     if ( my_id == 0 ) call print_equil_state(.false.)
