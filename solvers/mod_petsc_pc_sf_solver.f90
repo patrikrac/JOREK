@@ -41,9 +41,11 @@ module mod_petsc_pc_sf_solver
   !! (-1 = that level count from the grid): ring blocks leave the radial
   !! couplings to the coarse grid, which a 2:1 full coarsening cannot take.
   integer, parameter, public :: SF_GMG_SEMI_R = -1
-  !> Axis block rings: 0 on the pairs (the shared axis value only), 0..1 on
-  !! the scalar blocks. Larger axis blocks were the strong-scaling floor.
-  integer, parameter, public :: SF_GMG_AXIS_RINGS_PAIRS = 0
+  !> Axis block rings: on the pairs -2 = automatic (gmg_setup_operator: 0, the
+  !! shared axis value only, unless the axis is not collapsed and the I = 0
+  !! ring would be a large dense block), 0..1 on the scalar blocks. Larger
+  !! axis blocks were the strong-scaling floor.
+  integer, parameter, public :: SF_GMG_AXIS_RINGS_PAIRS = -2
   integer, parameter, public :: SF_GMG_AXIS_RINGS_RHOT  = 1
   !> Radial lines extended by one node into the neighbouring ranks (RAS, Cai
   !! & Sarkis SISC 21 (1999)): JOREK partitions ring by ring, so every rank

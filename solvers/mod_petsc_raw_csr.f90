@@ -71,11 +71,20 @@ module mod_petsc_raw_csr
       integer(c_int), value      :: bs
       integer(c_int)             :: ok
     end function jorek_blockmv_attach
+    ! the Galerkin product on dense slot blocks of jorek_galerkin_blk.c
+    function jorek_galerkin_blk(A, Ps, bs, reuse, C, ok) bind(C)
+      use, intrinsic :: iso_c_binding, only: c_int, c_intptr_t
+      integer(c_int)             :: jorek_galerkin_blk
+      integer(c_intptr_t), value :: A, Ps
+      integer(c_int), value      :: bs, reuse
+      integer(c_intptr_t)        :: C
+      integer(c_int)             :: ok
+    end function jorek_galerkin_blk
   end interface
 
   public :: c_baij_get, c_baij_restore, c_aij_get, c_aij_restore
   public :: split_parts, get_ij, put_ij, aij_parts, aij_vals_read, aij_vals_done
-  public :: blockmv_attach
+  public :: blockmv_attach, galerkin_blk
 
 contains
 
@@ -92,6 +101,26 @@ contains
       stop "blockmv_attach: PETSc error"
     blockmv_attach = (ok /= 0)
   end function blockmv_attach
+
+  !> C = P^T A P for the packed harmonic layout through jorek_galerkin_blk.c:
+  !! A MPIAIJ, Ps the scalar prolongation (MPIAIJ, one row per bs slots); C with
+  !! dense bs x bs slot blocks. reuse refills a C made here. .false. (C
+  !! untouched, the same on all ranks) when A / Ps do not fit. Collective.
+  logical function galerkin_blk(A, Ps, bs, reuse, C)
+    Mat, intent(in)     :: A, Ps
+    integer, intent(in) :: bs
+    logical, intent(in) :: reuse
+    Mat, intent(inout)  :: C
+    integer(c_int) :: ok
+    integer(c_intptr_t) :: cv
+    cv = 0
+    if (reuse) cv = transfer(C%v, 0_c_intptr_t)
+    ok = 0
+    if (jorek_galerkin_blk(transfer(A%v, 0_c_intptr_t), transfer(Ps%v, 0_c_intptr_t), int(bs, c_int), &
+                           merge(1_c_int, 0_c_int, reuse), cv, ok) /= 0) stop "galerkin_blk: PETSc error"
+    galerkin_blk = (ok /= 0)
+    if (galerkin_blk .and. .not. reuse) C%v = transfer(cv, C%v)
+  end function galerkin_blk
 
   !> Diagonal/off-diagonal sequential parts of an MPI(B)AIJ matrix, and the
   !! off-diagonal part's global (block) column of each local column.

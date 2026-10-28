@@ -23,6 +23,24 @@
     enddo
   end subroutine BTD_SOLVE
 
+  !> x_J = D~_J^-1 x_J: LU solve, or (btd_invert) one gemv with the inverse
+  subroutine NODE_SOLVE(rg, a, piv, J, x)
+    type(btd_ring), intent(in) :: rg
+    real(RK), intent(in)    :: a(*)
+    integer, intent(in)     :: piv(*), J
+    real(RK), intent(inout) :: x(*)
+    real(RK), parameter :: one = 1, zero = 0
+    real(RK) :: t(rg%bs(J))
+    integer :: bj, info
+    bj = rg%bs(J)
+    if (rg%inv) then
+      t = x(rg%rp(J) + 1 : rg%rp(J) + bj)
+      call GEMV('N', bj, bj, one, a(rg%od(J) + 1), bj, t, 1, zero, x(rg%rp(J) + 1), 1)
+    else
+      call GETRS('N', bj, 1, a(rg%od(J) + 1), bj, piv(rg%rp(J) + 1), x(rg%rp(J) + 1), bj, info)
+    endif
+  end subroutine NODE_SOLVE
+
   !> bordered block LU: forward over nodes 0..c-1 (the corner gathers R z),
   !> the corner, then backward
   subroutine THOMAS_SOLVE(rg, a, piv, x)
@@ -37,10 +55,10 @@
       bj = rg%bs(J)
       if (J > 0) call GEMV('N', bj, rg%bs(J - 1), mone, a(rg%ol(J) + 1), bj, x(rg%rp(J - 1) + 1), 1, &
                            one, x(rg%rp(J) + 1), 1)
-      call GETRS('N', bj, 1, a(rg%od(J) + 1), bj, piv(rg%rp(J) + 1), x(rg%rp(J) + 1), bj, info)
+      call NODE_SOLVE(rg, a, piv, J, x)
       call GEMV('N', bc, bj, mone, a(rg%orr(J) + 1), bc, x(rg%rp(J) + 1), 1, one, x(rg%rp(c) + 1), 1)
     enddo
-    call GETRS('N', bc, 1, a(rg%od(c) + 1), bc, piv(rg%rp(c) + 1), x(rg%rp(c) + 1), bc, info)
+    call NODE_SOLVE(rg, a, piv, c, x)
     do J = c - 1, 0, -1
       bj = rg%bs(J)
       call GEMV('N', bj, bc, mone, a(rg%oc(J) + 1), bj, x(rg%rp(c) + 1), 1, one, x(rg%rp(J) + 1), 1)
@@ -64,7 +82,7 @@
       bj = rg%bs(J)
       if (J > s + 1) call GEMV('N', bj, rg%bs(J - 1), mone, a(rg%ol(J) + 1), bj, x(rg%rp(J - 1) + 1), 1, &
                                one, x(rg%rp(J) + 1), 1)
-      call GETRS('N', bj, 1, a(rg%od(J) + 1), bj, piv(rg%rp(J) + 1), x(rg%rp(J) + 1), bj, info)
+      call NODE_SOLVE(rg, a, piv, J, x)
       call GEMV('N', ba, bj, mone, a(rg%orr(J) + 1), ba, x(rg%rp(J) + 1), 1, one, x(rg%rp(s) + 1), 1)
     enddo
   end subroutine HYB_SOL_FWD

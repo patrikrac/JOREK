@@ -37,7 +37,8 @@ module mod_petsc_pc_gmg
 #include "petsc/finclude/petsc.h"
   use petsc
   use iso_c_binding, only: c_ptr, c_double
-  use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach
+  use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach, &
+                               galerkin_blk
   use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_refill, axd_factor, axd_solve
   use mod_gmg_ring_btd
   implicit none
@@ -56,7 +57,8 @@ module mod_petsc_pc_gmg
     integer :: pre0         = -1     !< level-0 pre-smoothing steps; < 0 = nsmooth (0 = none)
     integer :: post0        = -1     !< level-0 post-smoothing steps; < 0 = nsmooth (0 = none)
     integer :: nsmooth_c    = -1     !< pre and post steps on the coarse levels; <= 0 = nsmooth
-    integer :: axis_rings   = 0      !< axis block extent: rings 0..k; -1 = by physical radius
+    integer :: axis_rings   = 0      !< axis block extent: rings 0..k; -1 = by physical radius;
+                                     !< -2 = automatic (0, or 1 where I = 0 is a large ring)
     integer :: bnd_drop     = 0      !< drop Dirichlet DOFs from the coarse spaces
     integer :: ring_overlap = 0      !< smoother 4 (and 9's rings): a ring cut by a rank
                                      !< boundary is extended by up to this many nodes along
@@ -66,10 +68,11 @@ module mod_petsc_pc_gmg
                                      !< map cos <-> sin, then lie inside the blocks);
                                      !< 2 = every slot in one block (cross-|n| coupling).
                                      !< Set by the caller only (physics_pc_sf_harm_couple)
-    integer :: ring_solver  = -1     !< ring blocks (smoothers 4, 8): 0 LAPACK band / dense LU,
-                                     !< 1 periodic block Thomas, 2 Thomas / reduction hybrid
+    integer :: ring_solver  = -1     !< ring blocks (smoothers 4, 8) and radial lines: 0 LAPACK band /
+                                     !< dense LU, 1 periodic block Thomas, 2 Thomas / reduction hybrid
                                      !< threaded across the rank's rings and their segments
-                                     !< (mod_gmg_ring_btd); -1 = 2 with harm_pair 2, else 0
+                                     !< (mod_gmg_ring_btd); -1 = 2 (tok DTM harm_couple .f.: -21..-33 %
+                                     !< per step against the band LU at equal its)
     integer :: ring_segs    = 0      !< hybrid: segments per ring; 0 = ceil(threads / rings)
                                      !< when a rank has fewer rings than threads, else 1
     integer :: ring_btd_min = 0      !< ring blocks with fewer rows keep the LAPACK LU
@@ -77,7 +80,12 @@ module mod_petsc_pc_gmg
                                      !< 2 = and the Thomas fill's decay along the ring
     integer :: ring_single  = -1     !< 1 = ring solver factors kept and applied in single precision
                                      !< (factored in double; the smoothing solves are bandwidth-bound);
-                                     !< -1 = 1 with a ring solver and harm_pair 2, else 0
+                                     !< -1 = 1 with a ring solver
+    integer :: ring_inv     = 1      !< 1 = ring solver pivot blocks applied as explicit inverses
+                                     !< (btd_invert: one gemv per node); 0 = their LU
+    integer :: ring_chains  = 1      !< 1 = the ring solver also takes rings cut by a rank boundary
+                                     !< (one contiguous arc) and radial lines (closed grids), as open
+                                     !< block-tridiagonal chains; 0 = those keep the LAPACK LU
     integer :: line_overlap = 0      !< smoothers 5/7: radial lines extended by this many
                                      !< nodes into the ranks owning their continuation
                                      !< (restricted additive Schwarz); 0 = local segments
@@ -102,6 +110,11 @@ module mod_petsc_pc_gmg
   !! semi-coarsened ones keep more rows per level and may use MAX_LEV
   integer, parameter :: MAX_LEV_FULL = 6
   integer, parameter :: CRS_MUMPS_MIN = 2000  !< coarsest LU rows from which MUMPS (SCOTCH) factors
+  !> coarsest-level rows above which its LU is one distributed MUMPS
+  !! factorisation instead of a redundant one per owning rank: W7-X n_tor 31
+  !! (6x12 coarsest grid, all 31 slots coupled, ~36k rows) ran out of node
+  !! memory with 9 redundant sequential copies; n_tor 11 (10.6k) keeps them
+  integer, parameter :: CRS_DIST_ROWS = 20000
   integer, parameter :: SM_STEPS  = 4      !< default smoothing steps
   integer, parameter :: MAX_ENT   = 16     !< max nonzeros per scalar row of P (2x2 sources x 4 DOFs)
   !> semi_r < 0: levels coarsen radially only while the median r dtheta/dr of
@@ -137,6 +150,13 @@ module mod_petsc_pc_gmg
   ! Fine level is 0. gP(g) maps level g -> level g-1 (g = 1..nlev-1).
   integer, save     :: nlev = 0
   Mat, save         :: gP(1:MAX_LEV-1)
+  ! The same prolongation as I_fields x P_s x I_slots (the slot index is the
+  ! fastest in the packed layout), for the Galerkin products only: gPs = P_s
+  ! for the block product (jorek_galerkin_blk.c, dense slot blocks), gPm its
+  ! MATMAIJ for PETSc's MatPtAP (-sf_gmg_ptap_blk 0; W7-X n_tor 31: PtAP
+  ! 273 s scalar, 143 s MAIJ, 13.7 s block)
+  Mat, save         :: gPm(1:MAX_LEV-1), gPs(1:MAX_LEV-1)
+  logical, save     :: pmaij = .false.
   Mat, save         :: gA(0:MAX_LEV-1)      !< gA(0) borrowed (the fine operator), gA(g>0) owned
   KSP, save         :: gSm(0:MAX_LEV-1)
   Vec, save         :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1)
@@ -160,6 +180,10 @@ module mod_petsc_pc_gmg
     Mat, pointer :: sub(:) => null()
     KSP :: ksp
     Vec :: b, x
+    ! the coarsest level above CRS_DIST_ROWS rows: one MUMPS factorisation
+    ! distributed over the hierarchy's communicator instead (dksp)
+    logical :: dist = .false.
+    KSP :: dksp
   end type rds_t
 
   ! The block smoothers (Chacon 2025 S4.1, extended along rings and radial
@@ -232,17 +256,21 @@ module mod_petsc_pc_gmg
     ! (block lb, segment lk) work items of all the rank's rings, and the work
     ! vector wk (block order) the threaded solve runs on.
     logical, allocatable :: btd(:), jac(:)
-    integer, allocatable :: qn(:), ghJ(:)
+    integer, allocatable :: qn(:), ghJ(:), ghI(:)   !< ghI: I of each ghost row
     type(btd_ring), allocatable :: rg(:)
     integer, allocatable :: lb(:), lk(:)
     real*8, allocatable :: wk(:)
-    ! ring_single: the ring blocks' factors rounded to single (lu4, block b at
-    ! loff4(b)), which the solves read instead of lu; wk4 = wk's single copy
+    ! ring_single: the ring blocks live in single only (lu4, block b at
+    ! loff4(b); loff(b) < 0), filled there and factored per ring in a double
+    ! scratch; wk4 = wk's single copy
     real*4, allocatable :: lu4(:), wk4(:)
     ! ring_single: the rings' equilibration S (btd_equil), block order as wk;
     ! 1 on every other block
     real*8, allocatable :: eqs(:)
     integer(8), allocatable :: loff4(:)
+    ! ring_single: the ring blocks have no double storage (loff < 0); their
+    ! entries live in lu4 only, at lu_index codes nlu + loff4 + ...
+    integer(8) :: nlu = 0
   end type blk_t
   type(blk_t), save, target :: gBk(0:MAX_LEV-1)
   type(rds_t), save :: gcrs                  !< the coarsest level's direct solve
@@ -271,6 +299,7 @@ module mod_petsc_pc_gmg
   integer, save :: sm_type = 0, sm_nstep = 4
   real*8, allocatable, save :: blk_t_work(:,:)   !< (max block size, 0:threads-1)
   integer, parameter :: LINES_OMP_MIN = 4000     !< rows below which lines_solve stays serial
+  integer, parameter :: AXIS_DENSE_ROWS = 4096   !< axis_rings -2: a larger dense I = 0 ring joins the axis block
   ! Axis treatment (Bourne et al., JCP 488 (2023) 112249 S2-S3). Fine rings
   ! I < ring_is have median r*dtheta/dr below gmg_opts_t%ring_aspect: the
   ! circle couplings dominate there, so smoother 8 uses ring blocks inside and
@@ -282,6 +311,8 @@ module mod_petsc_pc_gmg
   integer, save :: rsolv = 0, rbmin = 0, rchk = 0   !< gmg_opts_t%ring_solver / ring_btd_min / ring_check
   integer, save :: rseg = 0                         !< gmg_opts_t%ring_segs
   logical, save :: rsp = .false.                    !< gmg_opts_t%ring_single
+  logical, save :: rinv = .false.                   !< gmg_opts_t%ring_inv
+  logical, save :: rchn = .true.                    !< gmg_opts_t%ring_chains
   integer, save :: semi_r = 0               !< gmg_opts_t%semi_r, of the hierarchy being built
   integer, save :: axsec = 0                !< axis J-sectors (gmg_opts_t%axis_sectors)
   integer, save :: gcomm = 0, gme = 0       !< communicator and rank of the hierarchy
@@ -307,10 +338,11 @@ module mod_petsc_pc_gmg
     integer :: nlev = 0, nth0 = 0, nf_s = 0, sm_type = 0, sm_nstep = 4
     integer :: ring_is = 1, axis_k = 0, lovl = 0, axsec = 0, hpair = 1, rovl = 0
     integer :: rsolv = 0, rbmin = 0, rchk = 0, rseg = 0
-    logical :: rsp = .false.
+    logical :: rsp = .false., rinv = .false., rchn = .true.
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false.
-    Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1)
+    Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gPm(1:MAX_LEV-1), gPs(1:MAX_LEV-1)
+    logical :: pmaij = .false.
     KSP :: gSm(0:MAX_LEV-1)
     type(rds_t) :: gcrs
     Vec :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1)
@@ -369,10 +401,10 @@ contains
       S%nlev = nlev; S%nth0 = nth0; S%nf_s = nf_s; S%sm_type = sm_type; S%sm_nstep = sm_nstep
       S%ring_is = ring_is; S%axis_k = axis_k
       S%lovl = lovl; S%axsec = axsec; S%hpair = hpair; S%rovl = rovl
-      S%rsolv = rsolv; S%rbmin = rbmin; S%rchk = rchk; S%rsp = rsp; S%rseg = rseg
+      S%rsolv = rsolv; S%rbmin = rbmin; S%rchk = rchk; S%rsp = rsp; S%rseg = rseg; S%rinv = rinv; S%rchn = rchn
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready
-      S%gP = gP; S%gA = gA; S%gSm = gSm
+      S%gP = gP; S%gA = gA; S%gSm = gSm; S%gPm = gPm; S%gPs = gPs; S%pmaij = pmaij
       S%gx = gx; S%gb = gb; S%gr = gr
       do g = 0, MAX_LEV - 1
         call move_blk(gBk(g), S%gBk(g))
@@ -394,10 +426,10 @@ contains
       nlev = S%nlev; nth0 = S%nth0; nf_s = S%nf_s; sm_type = S%sm_type; sm_nstep = S%sm_nstep
       ring_is = S%ring_is; axis_k = S%axis_k
       lovl = S%lovl; axsec = S%axsec; hpair = S%hpair; rovl = S%rovl
-      rsolv = S%rsolv; rbmin = S%rbmin; rchk = S%rchk; rsp = S%rsp; rseg = S%rseg
+      rsolv = S%rsolv; rbmin = S%rbmin; rchk = S%rchk; rsp = S%rsp; rseg = S%rseg; rinv = S%rinv; rchn = S%rchn
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready
-      gP = S%gP; gA = S%gA; gSm = S%gSm
+      gP = S%gP; gA = S%gA; gSm = S%gSm; gPm = S%gPm; gPs = S%gPs; pmaij = S%pmaij
       gx = S%gx; gb = S%gb; gr = S%gr
       do g = 0, MAX_LEV - 1
         call move_blk(S%gBk(g), gBk(g))
@@ -453,10 +485,12 @@ contains
     b%axdon = a%axdon; a%axdon = .false.
     if (allocated(a%axd))  call move_alloc(a%axd,  b%axd)
     b%pat_id = a%pat_id; b%pat_nz = a%pat_nz; a%pat_id = -1; a%pat_nz = -1
+    b%nlu = a%nlu; a%nlu = 0
     if (allocated(a%btd))  call move_alloc(a%btd,  b%btd)
     if (allocated(a%jac))  call move_alloc(a%jac,  b%jac)
     if (allocated(a%qn))   call move_alloc(a%qn,   b%qn)
     if (allocated(a%ghJ))  call move_alloc(a%ghJ,  b%ghJ)
+    if (allocated(a%ghI))  call move_alloc(a%ghI,  b%ghI)
     if (allocated(a%rg))   call move_alloc(a%rg,   b%rg)
     if (allocated(a%lb))   call move_alloc(a%lb,   b%lb)
     if (allocated(a%lk))   call move_alloc(a%lk,   b%lk)
@@ -472,6 +506,7 @@ contains
     b%ready = a%ready; b%member = a%member
     b%comm = a%comm; b%np = a%np; b%me = a%me
     b%isq = a%isq; b%ksp = a%ksp; b%b = a%b; b%x = a%x
+    b%dist = a%dist; b%dksp = a%dksp; a%dist = .false.
     b%sub => a%sub; a%sub => null()
     a%ready = .false.; a%member = .false.; a%comm = MPI_COMM_NULL; a%np = 0; a%me = 0
     if (allocated(a%loc))  call move_alloc(a%loc,  b%loc)
@@ -1249,6 +1284,11 @@ contains
       enddo
       call MatAssemblyBegin(P, MAT_FINAL_ASSEMBLY, ierr_)
       call MatAssemblyEnd(P, MAT_FINAL_ASSEMBLY, ierr_)
+      call make_maij(gPm(lc_), gPs(lc_), comm, nrl, ncl, nrg, ncg, size(r_), &
+                     [(ly(lr_)%own(r_(q)) == me, q = 1, size(r_))], &
+                     [(prow(lr_, 0, r_(q), 0), q = 1, size(r_))], [(prow(lc_, 0, c(q), 0), q = 1, size(r_))], &
+                     [(prow(lr_, 1, r_(q), 0) - prow(lr_, 0, r_(q), 0), q = 1, size(r_))], &
+                     [(prow(lc_, 1, c(q), 0) - prow(lc_, 0, c(q), 0), q = 1, size(r_))], v, n_fields)
     end subroutine make_expanded
 
   end subroutine gmg_build_prolongations
@@ -2223,6 +2263,11 @@ contains
       enddo
       call MatAssemblyBegin(P, MAT_FINAL_ASSEMBLY, ierr_)
       call MatAssemblyEnd(P, MAT_FINAL_ASSEMBLY, ierr_)
+      call make_maij(gPm(lc_), gPs(lc_), comm, nrl, ncl, nrg, ncg, ntrip, &
+                     [(ly(lr_)%own(rr(t)) == me, t = 1, ntrip)], &
+                     [(prow(lr_, 0, rr(t), 0), t = 1, ntrip)], [(prow(lc_, 0, cc(t), 0), t = 1, ntrip)], &
+                     [(prow(lr_, 1, rr(t), 0) - prow(lr_, 0, rr(t), 0), t = 1, ntrip)], &
+                     [(prow(lc_, 1, cc(t), 0) - prow(lc_, 0, cc(t), 0), t = 1, ntrip)], ww(1:ntrip), n_fields)
     end subroutine make_expanded
 
   end subroutine gmg_build_xpoint_prolongations
@@ -2465,15 +2510,48 @@ contains
       endif
       gA(0) = xp_A
     endif
-    call PetscLogEventBegin(gev_ptap, ierr)
-    do g = 1, nlev - 1
-      if (reuse) then
-        call MatPtAP(gA(g - 1), gP(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
-      else
-        call MatPtAP(gA(g - 1), gP(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
-      endif
-    enddo
-    call PetscLogEventEnd(gev_ptap, ierr)
+    ! Galerkin products through the MAIJ prolongation (gPm) whenever there are
+    ! several slots (-sf_gmg[<k>]_ptap_maij 0 / 1 overrides), on dense slot
+    ! blocks (jorek_galerkin_blk.c; -sf_gmg[<k>]_ptap_blk 0 = PETSc's MatPtAP)
+    block
+      use mod_petsc_pc_harm, only: pc_ntor
+      integer :: im, ib, ic
+      logical :: done
+      character(len=32) :: tm
+      im = merge(1, 0, pc_ntor > 1)
+      call opt_int("ptap_maij", im)
+      pmaij = (im > 0 .and. pc_ntor > 1)
+      ! one rank: MatCreateMAIJ makes a SEQMAIJ, which PETSc's PtAP does not
+      ! take with the MPIAIJ levels (the block product does)
+      tm = ""
+      if (pmaij) call MatGetType(gPm(1), tm, ierr)
+      ib = 1
+      call opt_int("ptap_blk", ib)
+      ic = 0
+      call opt_int("ptap_check", ic)
+      call PetscLogEventBegin(gev_ptap, ierr)
+      do g = 1, nlev - 1
+        done = .false.
+        if (pmaij .and. ib > 0) done = galerkin_blk(gA(g - 1), gPs(g), int(pc_ntor), reuse, gA(g))
+        if (done) then
+          if (ic > 0) call ptap_check(g)
+        else if (reuse) then
+          if (pmaij .and. tm == MATMPIMAIJ) then
+            call MatPtAP(gA(g - 1), gPm(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
+          else
+            call MatPtAP(gA(g - 1), gP(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
+          endif
+        else
+          if (pmaij .and. tm == MATMPIMAIJ) then
+            call MatPtAP(gA(g - 1), gPm(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
+          else
+            call MatPtAP(gA(g - 1), gP(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
+          endif
+        endif
+      enddo
+      call PetscLogEventEnd(gev_ptap, ierr)
+    end block
+    call gmg_mem("Galerkin levels")
     ! the multiply kernel each level's matvecs actually run: MatPtAP decides
     ! the coarse types, whatever the fine operator was converted to
     if (.not. op_ready .and. my_id == 0) then
@@ -2528,7 +2606,7 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: GMG level 0 needs pre0 + post0 > 0"
       call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     endif
-    axis_k = max(o%axis_rings, -1)
+    axis_k = max(o%axis_rings, -2)
     call opt_int("axis_rings", axis_k)
     lovl = 0
     if (sm_type /= 4) lovl = max(o%line_overlap, 0)
@@ -2538,12 +2616,27 @@ contains
       if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: GMG harm_pair must be 1 or 2"
       call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     endif
+    if (axis_k == -2) then
+      ! automatic: without a collapsed axis I = 0 is a ring of n_tht nodes that
+      ! couples beyond J +- 1 (the axis), so it would be factored dense on the
+      ! rank holding it; above AXIS_DENSE_ROWS rows it joins the sparse axis
+      ! block (rings 0..1). DTT (421 nodes, 15k rows): PC setup 150 -> 0.3 s,
+      ! step time -62 %; DTM 65x32 (3.6k rows) is faster dense.
+      block
+        use phys_module, only: treat_axis, n_tht
+        use mod_petsc_pc_harm, only: pc_ntor
+        integer :: nrow0
+        nrow0 = n_tht * nf_s * 4 * merge(pc_ntor, min(2, pc_ntor), hpair == 2)
+        axis_k = 0
+        if (.not. treat_axis .and. nrow0 > AXIS_DENSE_ROWS) axis_k = 1
+      end block
+    endif
     rovl = 0
     if (sm_type == 4) rovl = max(o%ring_overlap, 0)
     if (sm_type == 4) call opt_int("ring_overlap", rovl)
     rsolv = o%ring_solver
     call opt_int("ring_solver", rsolv)
-    if (rsolv < 0) rsolv = merge(RS_HYB, RS_LAPACK, hpair == 2)
+    if (rsolv < 0) rsolv = RS_HYB
     rseg = max(o%ring_segs, 0)
     call opt_int("ring_segs", rseg)
     rbmin = max(o%ring_btd_min, 0)
@@ -2554,8 +2647,14 @@ contains
       integer :: isp
       isp = o%ring_single
       call opt_int("ring_single", isp)
-      if (isp < 0) isp = merge(1, 0, hpair == 2)
+      if (isp < 0) isp = 1
       rsp = (isp > 0 .and. rsolv > 0)
+      isp = o%ring_inv
+      call opt_int("ring_inv", isp)
+      rinv = (isp > 0 .and. rsolv > 0)
+      isp = o%ring_chains
+      call opt_int("ring_chains", isp)
+      rchn = (isp > 0)
     end block
     if (rsolv > RS_HYB) then
       if (my_id == 0) write(*,'(A)') "[Physics PC]   FATAL: GMG ring_solver must be -1..2"
@@ -2621,6 +2720,7 @@ contains
     enddo
     call axd_factor_pending()
     call PetscLogEventEnd(gev_smsetup, ierr)
+    call gmg_mem("smoothers")
     block
       integer :: ib(3), ibg(3), mpierr, nbtd, nseg, bb
       real*8 :: st(2)
@@ -2655,17 +2755,18 @@ contains
         write(*,'(A,I0,A,I0,A,I0,A,I0,A)', advance="no") ", blocks ", ibg(1), " on level 0 (", &
           ibg(2), " banded, max kl ", ib(1), "; ", ibg(3), " singular -> point)"
         if (hpair == 2) write(*,'(A)', advance="no") ", all slots per block"
-        ! the ring solver's line only where it has blocks (not on line smoothers)
+        ! the ring solver's line only where it has blocks (radial lines and
+        ! cut-ring arcs as open chains: block Thomas, no segments)
         if (nbtd > 0) then
-          select case (rsolv)
-          case (RS_THOMAS)
-            write(*,'(A)', advance="no") ", ring blocks by block Thomas"
-          case (RS_HYB)
+          if (rsolv == RS_HYB .and. nseg > 0) then
             write(*,'(A,I0,A)', advance="no") ", ring blocks by the Thomas / reduction hybrid (", nseg, &
               " segments on level 0)"
-          end select
+          else
+            write(*,'(A)', advance="no") ", ring / line blocks by block Thomas"
+          endif
           write(*,'(A,I0,A)', advance="no") " (", nbtd, " over all levels)"
           if (rsp) write(*,'(A)', advance="no") ", single precision"
+          if (rinv) write(*,'(A)', advance="no") ", explicit pivot inverses"
         endif
         write(*,'(A,F9.2,A,F9.2,A)') "; factors ", st(1) * 8.d-6, " MB (max rank ", st(2) * 8.d-6, " MB)"
         if (sm_type == 8) write(*,'(A,I0,A)', advance="no") &
@@ -2693,8 +2794,21 @@ contains
       do g = 1, int(nr)
         gcrs%loc(g) = g - 1
       enddo
+      block
+        PetscInt :: nglob
+        integer :: idist
+        call MatGetSize(gA(nlev - 1), nglob, PETSC_NULL_INTEGER, ierr)
+        idist = -1
+        call opt_int("coarse_dist", idist)       ! 1 / 0 force, -1 automatic
+        gcrs%dist = (idist > 0 .or. (idist < 0 .and. nglob > CRS_DIST_ROWS))
+      end block
     endif
-    call rds_setup(gcrs, gA(nlev - 1), "coarse", "coarse level")
+    call gmg_mem("before the coarse LU")
+    if (gcrs%dist) then
+      call crs_dist_setup()
+    else
+      call rds_setup(gcrs, gA(nlev - 1), "coarse", "coarse level")
+    endif
     call PetscLogEventEnd(gev_coarselu, ierr)
     if (.not. vec_ready) then
       do g = 0, nlev - 1
@@ -2721,7 +2835,115 @@ contains
       if (my_id == 0) write(*,'(A,I0,A,F7.1,A)', advance="no") " ", nr, " (", nzg / max(dble(nr), 1.d0), ")"
     enddo
     if (my_id == 0) write(*,'(A,F6.3)') "   C_op = ", nzt / max(nz0, 1.d0)
+
+  contains
+
+    !> -sf_gmg[<k>]_ptap_check 1: level g's block product against PETSc's
+    !! MatPtAP (scalar prolongation), relative Frobenius difference and stored
+    !! entries of both
+    subroutine ptap_check(g_)
+      integer, intent(in) :: g_
+      Mat :: Cr
+      PetscReal :: nr, nd
+      MatInfo :: mi
+      real*8 :: nzb, nzr
+      call MatPtAP(gA(g_ - 1), gP(g_), MAT_INITIAL_MATRIX, 2.0d0, Cr, ierr)
+      call MatGetInfo(gA(g_), MAT_GLOBAL_SUM, mi, ierr); nzb = mi%nz_used
+      call MatGetInfo(Cr, MAT_GLOBAL_SUM, mi, ierr);     nzr = mi%nz_used
+      call MatNorm(Cr, NORM_FROBENIUS, nr, ierr)
+      call MatAXPY(Cr, -1.0d0, gA(g_), DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatNorm(Cr, NORM_FROBENIUS, nd, ierr)
+      if (my_id == 0) write(*,'(A,I0,A,I0,A,ES10.3,A,ES10.3,A,ES10.3)') "[Physics PC]   GMG", cur_inst, &
+        " ptap_check level ", g_, ": |C_blk - C_petsc|/|C_petsc| ", nd / max(nr, tiny(1.0d0)), &
+        ", entries blk ", nzb, " petsc ", nzr
+      call MatDestroy(Cr, ierr)
+    end subroutine ptap_check
+
+    !> coarse_dist: the coarsest level's LU as one MUMPS factorisation over the
+    !! hierarchy's communicator (gA(nlev-1) as it is distributed); rebuilds
+    !! refactor numerically (same operator object, new values)
+    subroutine crs_dist_setup()
+      PC :: cpc
+      character(len=64) :: pre
+      if (.not. gcrs%ready) then
+        call KSPCreate(gcomm, gcrs%dksp, ierr)
+        call KSPSetType(gcrs%dksp, KSPPREONLY, ierr)
+        call KSPGetPC(gcrs%dksp, cpc, ierr)
+        call PCSetType(cpc, PCLU, ierr)
+        call PCFactorSetMatSolverType(cpc, MATSOLVERMUMPS, ierr)
+        write(pre, '(A,I0,A)') "gmg", cur_inst, "_coarse_"
+        call KSPSetOptionsPrefix(gcrs%dksp, trim(pre), ierr)
+        call KSPSetFromOptions(gcrs%dksp, ierr)
+      endif
+      call KSPSetOperators(gcrs%dksp, gA(nlev - 1), gA(nlev - 1), ierr)
+      call KSPSetUp(gcrs%dksp, ierr)
+      if (.not. gcrs%ready) then
+        block
+          PetscInt :: nglob
+          integer :: np, mpierr
+          call MatGetSize(gA(nlev - 1), nglob, PETSC_NULL_INTEGER, ierr)
+          call MPI_Comm_size(gcomm, np, mpierr)
+          if (my_id == 0) write(*,'(A,I0,A,I0,A,I0,A,I0,A)') "[Mem] GMG", cur_inst, " coarse level LU: ", nglob, &
+            " rows, one MUMPS factorisation over ", np, " ranks (> ", CRS_DIST_ROWS, " rows)"
+          call gmg_mem("coarse LU")
+        end block
+      endif
+      gcrs%ready = .true.
+    end subroutine crs_dist_setup
   end subroutine gmg_setup_operator
+
+  !> gPm: the prolongation's slot-free part I_fields x P_s (scalar entries
+  !! at packed row / slot-count, kept as Ps) wrapped as MATMAIJ with pc_ntor dofs. Triplet
+  !! t (owned when own(t)): field-0 packed row r0 / column c0 at slot 0, and
+  !! the packed offsets dr / dc from one field to the next (nl * pc_ntor of
+  !! the owning rank, the same for all fields).
+  subroutine make_maij(Pm, Ps, comm, nrl, ncl, nrg, ncg, n, own, r0, c0, dr, dc, v, nf)
+    use mod_petsc_pc_harm, only: pc_ntor
+    Mat, intent(out) :: Pm, Ps
+    integer, intent(in) :: comm, n, nf
+    PetscInt, intent(in) :: nrl, ncl, nrg, ncg
+    logical, intent(in) :: own(n)
+    integer, intent(in) :: r0(n), c0(n), dr(n), dc(n)
+    real*8, intent(in) :: v(n)
+    PetscErrorCode :: ierr
+    PetscInt :: row, col
+    integer :: t, f
+    call MatCreate(comm, Ps, ierr)
+    call MatSetSizes(Ps, nrl / pc_ntor, ncl / pc_ntor, nrg / pc_ntor, ncg / pc_ntor, ierr)
+    call MatSetType(Ps, MATMPIAIJ, ierr)
+    call MatSeqAIJSetPreallocation(Ps, 2 * MAX_ENT, PETSC_NULL_INTEGER_ARRAY, ierr)
+    call MatMPIAIJSetPreallocation(Ps, 2 * MAX_ENT, PETSC_NULL_INTEGER_ARRAY, &
+                                   2 * MAX_ENT, PETSC_NULL_INTEGER_ARRAY, ierr)
+    call MatSetOption(Ps, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+    do t = 1, n
+      if (.not. own(t)) cycle
+      do f = 0, nf - 1
+        row = (r0(t) + f * dr(t)) / pc_ntor
+        col = (c0(t) + f * dc(t)) / pc_ntor
+        call MatSetValue(Ps, row, col, v(t), ADD_VALUES, ierr)
+      enddo
+    enddo
+    call MatAssemblyBegin(Ps, MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(Ps, MAT_FINAL_ASSEMBLY, ierr)
+    call MatCreateMAIJ(Ps, int(pc_ntor, kind(row)), Pm, ierr)
+  end subroutine make_maij
+
+  !> [Mem] checkpoint of the GMG setup (RSS peak: rank 0, max and sum over the
+  !! hierarchy's ranks; first build only)
+  subroutine gmg_mem(what)
+    use mod_petsc_pc_physics_ctx, only: physics_pc_peak_rss
+    character(len=*), intent(in) :: what
+    real*8 :: r, rmax, rsum
+    integer :: mpierr, imax, loc
+    if (op_ready) return
+    r = physics_pc_peak_rss() / 1.d9
+    call MPI_Allreduce(r, rmax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, gcomm, mpierr)
+    call MPI_Allreduce(r, rsum, 1, MPI_DOUBLE_PRECISION, MPI_SUM, gcomm, mpierr)
+    imax = merge(gme, -1, r >= rmax)
+    call MPI_Allreduce(imax, loc, 1, MPI_INTEGER, MPI_MAX, gcomm, mpierr)
+    if (gme == 0) write(*,'(A,I0,A,A,T52,A,F7.3,A,F7.3,A,I0,A,F8.1,A)') "[Mem] GMG", cur_inst, ": ", what, &
+      "RSS peak rank 0 ", r, " GB, max ", rmax, " GB (rank ", loc, "), sum ", rsum, " GB"
+  end subroutine gmg_mem
 
   !> Entries of the active hierarchy's smoother factors on this rank, all
   !! smoothing levels.
@@ -2854,7 +3076,11 @@ contains
 
     if (g == nlev - 1) then
       call PetscLogEventBegin(gev_coarse(cur_inst), ierr)
-      call rds_solve(gcrs, b, x)
+      if (gcrs%dist) then
+        call KSPSolve(gcrs%dksp, b, x, ierr)
+      else
+        call rds_solve(gcrs, b, x)
+      endif
       call PetscLogEventEnd(gev_coarse(cur_inst), ierr)
       return
     endif
@@ -2933,7 +3159,8 @@ contains
     integer(8) :: ix
     PetscInt, allocatable :: axr(:)
     integer, allocatable :: binfo(:)
-    real*8, allocatable :: a0chk(:)
+    real*8, allocatable :: a0chk(:), a04chk(:), wsc(:)
+    real*8 :: dv
     external :: dgetrf, dgbtrf
 
     B => gBk(g)
@@ -3104,7 +3331,10 @@ contains
     ! fallback reads A (MatGetRow is not thread-safe), so it runs afterwards.
     allocate(binfo(B%nb))
     binfo = 0
-    if (rchk > 0) a0chk = B%lu
+    if (rchk > 0) then
+      a0chk = B%lu
+      a04chk = real(B%lu4, 8)
+    endif
     if (rsp) then
       if (allocated(B%eqs)) then
         if (size(B%eqs) /= size(B%rows)) deallocate(B%eqs)
@@ -3112,12 +3342,26 @@ contains
       if (.not. allocated(B%eqs)) allocate(B%eqs(size(B%rows)))
       B%eqs = 1.d0
     endif
-    !$omp parallel do schedule(dynamic, 1) private(bb, n, ldab)
+    ! ring blocks in single (loff < 0): each factored in a double scratch wsc,
+    ! equilibrated, inverted, rounded back into lu4. Few rings (B%wk, hybrid
+    ! segments threaded): one ring after another below; else one scratch
+    ! per thread here
+    !$omp parallel do schedule(dynamic, 1) private(bb, n, ldab, wsc)
     do bb = 1, B%nb
       if (B%axblk(bb)) cycle
       n = B%sz(bb)
       if (B%btd(bb)) then
         B%jac(bb) = .false.
+        B%rg(bb)%inv = .false.
+        if (B%loff(bb) < 0) then
+          if (allocated(B%wk)) cycle
+          call scratch_in(bb, wsc)
+          call btd_equil(B%rg(bb), wsc, B%eqs(B%off(bb) + 1))
+          call btd_factor(B%rg(bb), wsc, B%piv(B%off(bb) + 1), binfo(bb))
+          if (rinv .and. binfo(bb) == 0) call btd_invert(B%rg(bb), wsc, B%piv(B%off(bb) + 1))
+          if (binfo(bb) == 0) B%lu4(B%loff4(bb) + 1 : B%loff4(bb) + B%rg(bb)%tot) = real(wsc(1:B%rg(bb)%tot), 4)
+          cycle
+        endif
         if (rsp) call btd_equil(B%rg(bb), B%lu(B%loff(bb) + 1), B%eqs(B%off(bb) + 1))
         if (.not. allocated(B%wk)) call btd_factor(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), binfo(bb))
       else if (B%band(bb)) then
@@ -3128,7 +3372,29 @@ contains
       endif
     enddo
     !$omp end parallel do
-    if (allocated(B%wk)) call hyb_par_factor(B, binfo)
+    if (allocated(B%wk)) then
+      if (rsp) then
+        ! few rings: one at a time, its segments on the threads
+        do bb = 1, B%nb
+          if (B%axblk(bb) .or. .not. B%btd(bb)) cycle
+          call scratch_in(bb, wsc)
+          call btd_equil(B%rg(bb), wsc, B%eqs(B%off(bb) + 1))
+          call seg_factor(bb, wsc)
+          if (rinv .and. binfo(bb) == 0) call btd_invert(B%rg(bb), wsc, B%piv(B%off(bb) + 1))
+          if (binfo(bb) == 0) B%lu4(B%loff4(bb) + 1 : B%loff4(bb) + B%rg(bb)%tot) = real(wsc(1:B%rg(bb)%tot), 4)
+        enddo
+      else
+        call hyb_par_factor(B, binfo)
+      endif
+    endif
+    if (rinv) then
+      !$omp parallel do schedule(dynamic, 1)
+      do bb = 1, B%nb
+        if (B%btd(bb) .and. .not. B%axblk(bb) .and. binfo(bb) == 0 .and. B%loff(bb) >= 0) &
+          call btd_invert(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1))
+      enddo
+      !$omp end parallel do
+    endif
     B%nsing = 0
     do bb = 1, B%nb
       n = B%sz(bb)
@@ -3141,30 +3407,45 @@ contains
         ! elimination pivots inside the nodes only)
         if (B%btd(bb)) B%jac(bb) = .true.
         if (rsp) B%eqs(B%off(bb) + 1 : B%off(bb) + n) = 1.d0
-        B%lu(B%loff(bb) + 1 : B%loff(bb) + blk_size(B, bb)) = 0.0d0
+        if (B%loff(bb) < 0) then
+          B%lu4(B%loff4(bb) + 1 : B%loff4(bb) + blk_size(B, bb)) = 0.0
+        else
+          B%lu(B%loff(bb) + 1 : B%loff(bb) + blk_size(B, bb)) = 0.0d0
+        endif
         do q = 1, n
           r = B%rows(B%off(bb) + q)
           ix = lu_index(B, bb, q, q)
+          dv = 0.d0
           if (r < B%nrow) then
             call MatGetRow(A, rst + r, ncols, cols, vals, ierr)
             do pcn = 1, int(ncols)
-              if (cols(pcn) == rst + r) B%lu(ix) = vals(pcn)
+              if (cols(pcn) == rst + r) dv = vals(pcn)
             enddo
             call MatRestoreRow(A, rst + r, ncols, cols, vals, ierr)
           else                                          ! ghost row: from sg(1), global columns
             call MatGetRow(B%sg(1), r - B%nrow, ncols, cols, vals, ierr)
             do pcn = 1, int(ncols)
-              if (cols(pcn) == B%gidx(r - B%nrow + 1)) B%lu(ix) = vals(pcn)
+              if (cols(pcn) == B%gidx(r - B%nrow + 1)) dv = vals(pcn)
             enddo
             call MatRestoreRow(B%sg(1), r - B%nrow, ncols, cols, vals, ierr)
           endif
-          if (abs(B%lu(ix)) < tiny(1.0d0)) B%lu(ix) = 1.0d0
+          if (abs(dv) < tiny(1.0d0)) dv = 1.0d0
+          if (ix > B%nlu) then
+            B%lu4(ix - B%nlu) = real(dv, 4)
+          else
+            B%lu(ix) = dv
+          endif
           B%piv(B%off(bb) + q) = q
         enddo
       endif
     enddo
-    if (rsp) call btd_single(B)
-    if (rchk > 0) call btd_check(g, B, a0chk)
+    if (allocated(B%wk) .and. rsp) then
+      if (allocated(B%wk4)) then
+        if (size(B%wk4) /= size(B%wk)) deallocate(B%wk4)
+      endif
+      if (.not. allocated(B%wk4)) allocate(B%wk4(size(B%wk)))
+    endif
+    if (rchk > 0) call btd_check(g, B, a0chk, a04chk)
     if (rchk > 1) call btd_decay(g, B)
 
     call PetscLogEventEnd(gev_blknum, ierr)
@@ -3195,6 +3476,42 @@ contains
       endif
     endif
     if (B%axsparse .and. .not. B%axdon .and. .not. B%axnew) call ax_lu(g, A, B)
+
+  contains
+
+    !> ring block bb's single entries (lu4) into the double scratch w
+    subroutine scratch_in(bb_, w)
+      integer, intent(in) :: bb_
+      real*8, allocatable, intent(inout) :: w(:)
+      integer(8) :: t
+      t = B%rg(bb_)%tot
+      if (allocated(w)) then
+        if (size(w, kind=8) < t) deallocate(w)
+      endif
+      if (.not. allocated(w)) allocate(w(t))
+      w(1:t) = real(B%lu4(B%loff4(bb_) + 1 : B%loff4(bb_) + t), 8)
+    end subroutine scratch_in
+
+    !> hybrid ring bb in w: its segments on the threads, then the separators
+    subroutine seg_factor(bb_, w)
+      integer, intent(in) :: bb_
+      real*8, intent(inout) :: w(:)
+      integer :: k, inf
+      if (B%rg(bb_)%meth /= RS_HYB) then
+        call btd_factor(B%rg(bb_), w, B%piv(B%off(bb_) + 1), binfo(bb_))
+        return
+      endif
+      !$omp parallel do schedule(dynamic, 1) private(inf)
+      do k = 0, B%rg(bb_)%ns - 1
+        call hyb_fac_seg(B%rg(bb_), w, B%piv(B%off(bb_) + 1), k, inf)
+        if (inf /= 0) then
+          !$omp atomic write
+          binfo(bb_) = inf
+        endif
+      enddo
+      !$omp end parallel do
+      if (binfo(bb_) == 0) call hyb_fac_sep(B%rg(bb_), w, B%piv(B%off(bb_) + 1), binfo(bb_))
+    end subroutine seg_factor
   end subroutine build_blocks
 
   !> ring_solver > 0, mesh part: the ring blocks solved as periodic
@@ -3210,21 +3527,29 @@ contains
   subroutine btd_mark(g, B)
     integer, intent(in) :: g
     type(blk_t), intent(inout) :: B
-    integer :: nc, nall, r, bb, q, I, ns, nthr, n, k
-    integer, allocatable :: key(:), cnt(:,:), nnb(:)
+    integer :: nc, nall, r, bb, q, I, ns, nthr, n, k, nimax
+    integer, allocatable :: key(:), cnt(:,:), nnb(:), lcn(:,:)
+    logical, allocatable :: lchain(:)
     nall = B%nrow + B%ngh
     if (allocated(B%btd)) deallocate(B%btd, B%jac, B%rg, B%qn)
     allocate(B%btd(B%nb), B%jac(B%nb), B%rg(B%nb), B%qn(nall))
     B%btd = .false.; B%jac = .false.; B%qn = 0
-    if (rsolv == RS_LAPACK .or. (sm_type /= 4 .and. sm_type /= 8)) return
+    if (rsolv == RS_LAPACK .or. sm_type < 4 .or. sm_type > 8 .or. sm_type == 6) return
     if (g == 0) then
       nc = nth0
     else
       nc = glv(g)%nj
     endif
     if (nc < 4) return
-    allocate(key(nall), cnt(0:nc - 1, B%nb), nnb(B%nb))
-    nnb = nc
+    allocate(key(nall), cnt(0:nc - 1, B%nb), nnb(B%nb), lchain(B%nb))
+    nnb = nc; lchain = .false.
+    nimax = 1
+    if (sm_type /= 4) then                        ! the radial lines' node counts
+      do r = 1, nall
+        nimax = max(nimax, row_I(r) + 1)
+      enddo
+      allocate(lcn(0:nimax - 1, B%nb))
+    endif
     do r = 1, nall
       if (r <= B%nrow) then
         if (g == 0) then
@@ -3250,9 +3575,16 @@ contains
         endif
         exit
       enddo
-      if (I <= 0) cycle
-      if (sm_type == 8) then
-        if (I >= ring_lim(g)) cycle
+      ! I = 0 is a ring of its own only on grids without a collapsed axis
+      ! (one shared node there: fewer than 4 nodes below, so it stays LU)
+      if (I < 0 .or. (I == 0 .and. .not. rchn)) cycle
+      ! a radial line (smoothers 5 / 7, and 8 outside ring_lim): an open
+      ! block-tridiagonal chain in I, planned as a ring of its length with
+      ! zero wrap couplings (closed grids only)
+      if (I > 0 .and. (sm_type == 5 .or. sm_type == 7 .or. (sm_type == 8 .and. I >= ring_lim(g)))) then
+        if (xgrid .or. .not. rchn) cycle
+        call line_chain(bb)
+        cycle
       endif
       ! an X-point grid's ring: its own length (an open line is a ring
       ! without the wrap couplings)
@@ -3263,7 +3595,28 @@ contains
         r = B%rows(B%off(bb) + q) + 1
         cnt(key(r), bb) = cnt(key(r), bb) + 1
       enddo
-      if (any(cnt(0:nnb(bb) - 1, bb) == 0)) cycle   ! still cut by a rank boundary
+      if (any(cnt(0:nnb(bb) - 1, bb) == 0)) then
+        ! cut by a rank boundary (X-point grids run without ring overlaps): a
+        ! single contiguous arc of the ring's nodes is an open block-
+        ! tridiagonal chain, solved as a ring of the arc's length whose wrap
+        ! couplings are zero, instead of a dense / banded LU of the whole block
+        block
+          integer :: j0, m, p, nst
+          nst = 0; j0 = -1; m = count(cnt(0:nnb(bb) - 1, bb) > 0)
+          do p = 0, nnb(bb) - 1
+            if (cnt(p, bb) > 0 .and. cnt(modulo(p - 1, nnb(bb)), bb) == 0) then
+              nst = nst + 1; j0 = p
+            endif
+          enddo
+          if (nst /= 1 .or. m < 4 .or. .not. rchn) cycle
+          do q = 1, B%sz(bb)
+            r = B%rows(B%off(bb) + q) + 1
+            key(r) = modulo(key(r) - j0, nnb(bb))
+          enddo
+          cnt(0:nnb(bb) - 1, bb) = cshift(cnt(0:nnb(bb) - 1, bb), j0)
+          nnb(bb) = m
+        end block
+      endif
       call sort_rows_by_key(B%rows(B%off(bb) + 1:B%off(bb) + B%sz(bb)), key)
       do q = 1, B%sz(bb)
         r = B%rows(B%off(bb) + q)
@@ -3276,12 +3629,16 @@ contains
     if (ns == 0) then
       nthr = 1
       !$ nthr = omp_get_max_threads()
-      n = max(count(B%btd), 1)
+      n = max(count(B%btd .and. .not. lchain), 1)
       ns = 1
       if (n < nthr) ns = (nthr + n - 1) / n
     endif
     do bb = 1, B%nb
-      if (B%btd(bb)) call btd_plan(B%rg(bb), rsolv, nnb(bb), cnt(0:nnb(bb) - 1, bb), ns)
+      if (B%btd(bb) .and. .not. lchain(bb)) call btd_plan(B%rg(bb), rsolv, nnb(bb), cnt(0:nnb(bb) - 1, bb), ns)
+    enddo
+    ! radial lines: block Thomas (short chains, several per thread)
+    do bb = 1, B%nb
+      if (lchain(bb)) call btd_plan(B%rg(bb), RS_THOMAS, nnb(bb), lcn(0:nnb(bb) - 1, bb), 1)
     enddo
     ! smoother 4 with segmented rings: the hybrid threaded over (block,
     ! segment) work items, one item for every other non-axis block
@@ -3302,6 +3659,53 @@ contains
         if (q == 1) allocate(B%lb(n), B%lk(n))
       enddo
     endif
+
+  contains
+
+    !> I of local row r (ghost rows: ghI)
+    integer function row_I(r_)
+      integer, intent(in) :: r_
+      if (r_ <= B%nrow) then
+        if (g == 0) then
+          row_I = fine_node(r_) / nth0
+        else
+          row_I = glv(g)%rnode(r_) / nc
+        endif
+      else if (allocated(B%ghI)) then
+        row_I = B%ghI(r_ - B%nrow)
+      else
+        row_I = -1
+      endif
+    end function row_I
+
+    !> block bb as a radial line: its rows' I must cover one contiguous range
+    !! of >= 4 nodes; key = I - I_min, rows sorted by it
+    subroutine line_chain(bb_)
+      integer, intent(in) :: bb_
+      integer :: q_, r_, i0, i1, m
+      i0 = huge(1); i1 = -1
+      do q_ = 1, B%sz(bb_)
+        r_ = row_I(B%rows(B%off(bb_) + q_) + 1)
+        if (r_ < 0) return
+        i0 = min(i0, r_); i1 = max(i1, r_)
+      enddo
+      m = i1 - i0 + 1
+      if (m < 4) return
+      lcn(0:m - 1, bb_) = 0
+      do q_ = 1, B%sz(bb_)
+        r_ = B%rows(B%off(bb_) + q_) + 1
+        key(r_) = row_I(r_) - i0
+        lcn(key(r_), bb_) = lcn(key(r_), bb_) + 1
+      enddo
+      if (any(lcn(0:m - 1, bb_) == 0)) return
+      call sort_rows_by_key(B%rows(B%off(bb_) + 1:B%off(bb_) + B%sz(bb_)), key)
+      do q_ = 1, B%sz(bb_)
+        r_ = B%rows(B%off(bb_) + q_)
+        B%pos(r_ + 1) = q_
+        B%qn(B%off(bb_) + q_) = key(r_ + 1)
+      enddo
+      nnb(bb_) = m; lchain(bb_) = .true.; B%btd(bb_) = .true.
+    end subroutine line_chain
   end subroutine btd_mark
 
   !> hybrid on smoother 4: the segments of all the rank's rings on the
@@ -3332,37 +3736,12 @@ contains
     !$omp end parallel
   end subroutine hyb_par_factor
 
-  !> ring_single: the ring blocks' factors rounded to single, into lu4 (its
-  !! layout is set again on every build; the pattern rarely changes)
-  subroutine btd_single(B)
-    type(blk_t), intent(inout) :: B
-    integer :: bb
-    integer(8) :: t
-    if (allocated(B%loff4)) deallocate(B%loff4)
-    allocate(B%loff4(B%nb))
-    t = 0
-    do bb = 1, B%nb
-      B%loff4(bb) = t
-      if (B%btd(bb)) t = t + B%rg(bb)%tot
-    enddo
-    if (allocated(B%lu4)) then
-      if (size(B%lu4, kind=8) /= t) deallocate(B%lu4)
-    endif
-    if (.not. allocated(B%lu4)) allocate(B%lu4(t))
-    if (allocated(B%wk) .and. .not. allocated(B%wk4)) allocate(B%wk4(size(B%wk)))
-    !$omp parallel do schedule(dynamic, 1)
-    do bb = 1, B%nb
-      if (B%btd(bb)) call btd_to_sp(B%rg(bb), B%lu(B%loff(bb) + 1), B%lu4(B%loff4(bb) + 1))
-    enddo
-    !$omp end parallel do
-  end subroutine btd_single
-
   !> ring_check: the relative residual |b - A x| / |b| of every ring solve
   !! (random b), A from the unfactored values a0; the largest per level
-  subroutine btd_check(g, B, a0)
+  subroutine btd_check(g, B, a0, a04)
     integer, intent(in) :: g
     type(blk_t), intent(in) :: B
-    real*8, intent(in) :: a0(*)
+    real*8, intent(in) :: a0(*), a04(*)   !< unfactored lu, and lu4 (ring_single) in double
     integer :: bb, n, mpierr, nchk
     real*8 :: res
     real*8, allocatable :: rhs(:), x(:), y(:)
@@ -3384,7 +3763,11 @@ contains
       else
         call btd_solve(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), x)
       endif
-      call btd_matvec(B%rg(bb), a0(B%loff(bb) + 1), x, y)
+      if (B%loff(bb) < 0) then
+        call btd_matvec(B%rg(bb), a04(B%loff4(bb) + 1), x, y)
+      else
+        call btd_matvec(B%rg(bb), a0(B%loff(bb) + 1), x, y)
+      endif
       res = max(res, maxval(abs(rhs - y)) / maxval(abs(rhs)))
       nchk = nchk + 1
       deallocate(rhs, x, y)
@@ -3410,7 +3793,7 @@ contains
     hd = 0.d0; rd = 0.d0; sm = 0.d0
     do bb = 1, B%nb
       if (.not. B%btd(bb) .or. B%jac(bb)) cycle
-      if (B%rg(bb)%meth /= RS_THOMAS) cycle
+      if (B%rg(bb)%meth /= RS_THOMAS .or. B%loff(bb) < 0) cycle
       associate (rg => B%rg(bb))
         c = rg%nn - 1
         allocate(hn(0:c - 1), rn(0:c - 1))
@@ -3465,7 +3848,7 @@ contains
     logical :: has_o
     integer :: pass, R, nall, bb, n, kz, nva, nvg, nbad
     PetscInt :: k
-    integer(8) :: tot
+    integer(8) :: tot, tot4
     PetscErrorCode :: ierr
 
     if (B%ovl) then
@@ -3517,16 +3900,29 @@ contains
       if (nbad > 0) write(*,'(A,I0,A)') "[Physics PC]   GMG WARNING: ", nbad, &
         " ring block(s) couple beyond J +- 1: dense LU instead of the ring solver"
       ! storage: banded where the band is narrow, dense otherwise
-      tot = 0
+      ! ring_single: the ring solver's blocks in lu4 only (factored per ring
+      ! in a double scratch, build_blocks), 4 instead of 12 bytes per entry
+      tot = 0; tot4 = 0
+      if (allocated(B%loff4)) deallocate(B%loff4)
+      allocate(B%loff4(B%nb))
+      B%loff4 = 0
       do bb = 1, B%nb
         n = B%sz(bb)
         B%band(bb) = (2 * (2 * B%kl(bb) + B%ku(bb) + 1) < n)
-        B%loff(bb) = tot
         if (B%axblk(bb) .or. B%btd(bb)) B%band(bb) = .false.
-        tot = tot + blk_size(B, bb)
+        if (B%btd(bb) .and. rsp) then
+          B%loff(bb) = -1; B%loff4(bb) = tot4
+          tot4 = tot4 + blk_size(B, bb)
+        else
+          B%loff(bb) = tot
+          tot = tot + blk_size(B, bb)
+        endif
       enddo
       if (allocated(B%lu)) deallocate(B%lu)
       allocate(B%lu(tot))
+      B%nlu = tot
+      if (allocated(B%lu4)) deallocate(B%lu4)
+      allocate(B%lu4(tot4))
       B%zp(1) = 1
       do R = 1, nall
         B%zp(R + 1) = B%zp(R + 1) + B%zp(R)
@@ -3651,7 +4047,11 @@ contains
     ! the pages' first touch then spreads over the threads' memory
     !$omp parallel do schedule(static)
     do k = 1, B%nb
-      B%lu(B%loff(k) + 1 : B%loff(k) + blk_size(B, k)) = 0.0d0
+      if (B%loff(k) < 0) then
+        B%lu4(B%loff4(k) + 1 : B%loff4(k) + blk_size(B, k)) = 0.0
+      else
+        B%lu(B%loff(k) + 1 : B%loff(k) + blk_size(B, k)) = 0.0d0
+      endif
     enddo
     !$omp end parallel do
     !$omp parallel do private(v, d) schedule(static)
@@ -3662,7 +4062,9 @@ contains
         v = vo_(-B%vs(k))
       endif
       d = B%vd(k)
-      if (d > 0) then
+      if (d > B%nlu) then
+        B%lu4(d - B%nlu) = real(v, 4)
+      else if (d > 0) then
         B%lu(d) = v
       else
         B%zv(-d) = v
@@ -3673,7 +4075,9 @@ contains
     do k = 1, size(B%gs)
       v = vg_(B%gs(k))
       d = B%gd(k)
-      if (d > 0) then
+      if (d > B%nlu) then
+        B%lu4(d - B%nlu) = real(v, 4)
+      else if (d > 0) then
         B%lu(d) = v
       else
         B%zv(-d) = v
@@ -3963,6 +4367,9 @@ contains
     if (allocated(B%ghJ)) deallocate(B%ghJ)
     allocate(B%ghJ(ngh))
     B%ghJ = gJ
+    if (allocated(B%ghI)) deallocate(B%ghI)
+    allocate(B%ghI(ngh))
+    B%ghI = gI
     call ISCreateGeneral(PETSC_COMM_SELF, int(ngh, kind(nn)), gl, PETSC_COPY_VALUES, B%isg, ierr)
     call VecCreateSeq(PETSC_COMM_SELF, int(ngh, kind(nn)), B%xg, ierr)
     call VecScatterCreate(kv, B%isg, B%xg, PETSC_NULL_IS, B%sct, ierr)
@@ -4451,7 +4858,12 @@ contains
     integer :: jr, jc
     if (B%btd(bb)) then
       jr = B%qn(B%off(bb) + i); jc = B%qn(B%off(bb) + j)
-      lu_index = B%loff(bb) + btd_index(B%rg(bb), jr, i - B%rg(bb)%rp(jr), jc, j - B%rg(bb)%rp(jc))
+      lu_index = btd_index(B%rg(bb), jr, i - B%rg(bb)%rp(jr), jc, j - B%rg(bb)%rp(jc))
+      if (B%loff(bb) < 0) then
+        lu_index = B%nlu + B%loff4(bb) + lu_index
+      else
+        lu_index = B%loff(bb) + lu_index
+      endif
     else if (B%band(bb)) then
       lu_index = B%loff(bb) + int(j - 1, 8) * (2 * B%kl(bb) + B%ku(bb) + 1) &
                  + (B%kl(bb) + B%ku(bb) + 1 + i - j)
@@ -4586,7 +4998,11 @@ contains
       if (B%btd(bb)) then
         if (B%jac(bb)) then
           do q = 1, n
-            w(q) = w(q) / B%lu(lu_index(B, bb, q, q))
+            if (B%loff(bb) < 0) then
+              w(q) = w(q) / B%lu4(lu_index(B, bb, q, q) - B%nlu)
+            else
+              w(q) = w(q) / B%lu(lu_index(B, bb, q, q))
+            endif
           enddo
         else if (rsp) then
           block

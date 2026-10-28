@@ -32,8 +32,8 @@
 !! piv(rp(J)+1 : rp(J+1)). Vectors are in block order: node J's rows at
 !! x(rp(J)+1 : rp(J+1)). No PETSc here.
 !!
-!! Mixed precision (gmg ring_single): the factorisation runs in double; its
-!! result, rounded to single (btd_to_sp), serves the *_sp solves, which read
+!! Mixed precision (gmg ring_single): the factorisation runs in double (the
+!! caller's scratch); its result, rounded to single, serves the *_sp solves, which read
 !! half the bytes. The smoothing solves are bandwidth-bound (~46 GB/s per
 !! 12-thread rank on tok), and a smoother needs no more than single accuracy.
 !! The solves exist once, in mod_gmg_ring_btd_solve.inc, included for both
@@ -46,6 +46,7 @@ module mod_gmg_ring_btd
 
   type, public :: btd_ring
     integer :: meth = 0, nn = 0
+    logical :: inv = .false.                        !< pivot blocks hold D~_J^-1 (btd_invert)
     integer, allocatable :: bs(:), rp(:)            !< (0:nn-1) node rows, (0:nn) row offsets
     integer(8), allocatable :: od(:), ou(:), ol(:)  !< (0:nn-1) offsets of D, U, L (0-based)
     integer(8), allocatable :: oc(:), orr(:)        !< Thomas, hybrid: border column C_J, row R_J
@@ -62,12 +63,12 @@ module mod_gmg_ring_btd
     integer(8) :: tot = 0                           !< storage (doubles)
   end type btd_ring
 
-  public :: btd_plan, btd_index, btd_factor, btd_solve, btd_matvec, btd_to_sp, btd_solve_sp
-  public :: btd_equil
+  public :: btd_plan, btd_index, btd_factor, btd_solve, btd_matvec, btd_solve_sp
+  public :: btd_equil, btd_invert
   public :: hyb_end, hyb_fac_seg, hyb_fac_sep, hyb_sol_fwd, hyb_sol_sep, hyb_sol_bwd
   public :: hyb_sol_fwd_sp, hyb_sol_sep_sp, hyb_sol_bwd_sp
 
-  external :: dgetrf, dgetrs, dgemm, dgemv, sgetrs, sgemv
+  external :: dgetrf, dgetrs, dgetri, dgemm, dgemv, sgetrs, sgemv
 
 contains
 
@@ -431,14 +432,42 @@ contains
     enddo
   end subroutine btd_equil
 
-  subroutine btd_to_sp(rg, a, a4)
-    type(btd_ring), intent(in) :: rg
-    real*8, intent(in)  :: a(*)
-    real*4, intent(out) :: a4(*)
-    a4(1:rg%tot) = real(a(1:rg%tot), 4)
-  end subroutine btd_to_sp
+  !> After btd_factor: the LU-factored pivot blocks (Thomas: every node;
+  !! hybrid: the segments' interiors) replaced by their inverses (dgetri),
+  !! so a solve applies D~_J^-1 by one gemv. In single precision this is the
+  !! more accurate form on the ill-conditioned pair_w rings (ringlab, real
+  !! dumps: forward error 1e-6 vs 1e-4 with the LU); the separators' system
+  !! keeps its LU.
+  subroutine btd_invert(rg, a, piv)
+    type(btd_ring), intent(inout) :: rg
+    real*8, intent(inout) :: a(*)
+    integer, intent(in)   :: piv(*)
+    integer :: J, k, bj, info
+    real*8, allocatable :: w(:)
+    allocate(w(64 * maxval(rg%bs)))
+    if (rg%meth == RS_THOMAS) then
+      do J = 0, rg%nn - 1
+        call inv1(J)
+      enddo
+    else
+      do k = 0, rg%ns - 1
+        do J = rg%sep(k) + 1, hyb_end(rg, k)
+          call inv1(J)
+        enddo
+      enddo
+    endif
+    rg%inv = .true.
 
-  ! ---- the solves, double (as factored) and single (btd_to_sp)
+  contains
+
+    subroutine inv1(J_)
+      integer, intent(in) :: J_
+      bj = rg%bs(J_)
+      call dgetri(bj, a(rg%od(J_) + 1), bj, piv(rg%rp(J_) + 1), w, size(w), info)
+    end subroutine inv1
+  end subroutine btd_invert
+
+  ! ---- the solves, double (as factored) and single (rounded factors)
 #define RK 8
 #define GEMV dgemv
 #define GETRS dgetrs
@@ -447,6 +476,7 @@ contains
 #define HYB_SOL_FWD hyb_sol_fwd
 #define HYB_SOL_SEP hyb_sol_sep
 #define HYB_SOL_BWD hyb_sol_bwd
+#define NODE_SOLVE node_solve
 #include "mod_gmg_ring_btd_solve.inc"
 #undef RK
 #undef GEMV
@@ -456,6 +486,7 @@ contains
 #undef HYB_SOL_FWD
 #undef HYB_SOL_SEP
 #undef HYB_SOL_BWD
+#undef NODE_SOLVE
 #define RK 4
 #define GEMV sgemv
 #define GETRS sgetrs
@@ -464,6 +495,7 @@ contains
 #define HYB_SOL_FWD hyb_sol_fwd_sp
 #define HYB_SOL_SEP hyb_sol_sep_sp
 #define HYB_SOL_BWD hyb_sol_bwd_sp
+#define NODE_SOLVE node_solve_sp
 #include "mod_gmg_ring_btd_solve.inc"
 
 end module mod_gmg_ring_btd
