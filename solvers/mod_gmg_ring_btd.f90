@@ -43,6 +43,8 @@ module mod_gmg_ring_btd
   private
 
   integer, parameter, public :: RS_LAPACK = 0, RS_THOMAS = 1, RS_HYB = 2
+  !> node-block products up to this many entries skip the BLAS (*gemv_s)
+  integer, parameter :: GEMV_SMALL = 1024
 
   type, public :: btd_ring
     integer :: meth = 0, nn = 0
@@ -470,6 +472,7 @@ contains
   ! ---- the solves, double (as factored) and single (rounded factors)
 #define RK 8
 #define GEMV dgemv
+#define GEMV_S dgemv_s
 #define GETRS dgetrs
 #define BTD_SOLVE btd_solve
 #define THOMAS_SOLVE thomas_solve
@@ -480,6 +483,7 @@ contains
 #include "mod_gmg_ring_btd_solve.inc"
 #undef RK
 #undef GEMV
+#undef GEMV_S
 #undef GETRS
 #undef BTD_SOLVE
 #undef THOMAS_SOLVE
@@ -489,6 +493,7 @@ contains
 #undef NODE_SOLVE
 #define RK 4
 #define GEMV sgemv
+#define GEMV_S sgemv_s
 #define GETRS sgetrs
 #define BTD_SOLVE btd_solve_sp
 #define THOMAS_SOLVE thomas_solve_sp

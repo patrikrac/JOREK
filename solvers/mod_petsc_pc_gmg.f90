@@ -369,6 +369,7 @@ module mod_petsc_pc_gmg
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1
   PetscLogEvent, save :: gev_prolong = -1
   PetscLogEvent, save :: gev_blkmesh = -1, gev_blkpat = -1, gev_blknum = -1, gev_axnum = -1, gev_axtry = -1
+  PetscLogEvent, save :: gev_ovl = -1
   PetscLogEvent, save :: gev_lines(MAX_INST) = -1, gev_axsolve(MAX_INST) = -1   !< the block smoother's two halves
   PetscLogEvent, save :: gev_vcycle(MAX_INST) = -1, gev_smooth0(MAX_INST) = -1, gev_smooth(MAX_INST) = -1
   PetscLogEvent, save :: gev_coarse(MAX_INST) = -1
@@ -2663,14 +2664,9 @@ contains
     axsec = 0
     if (axis_k /= 0) axsec = o%axis_sectors
     if (axis_k /= 0) call opt_int("axis_sectors", axsec)
-    ! X-point grids: the axis J-sectors split the axis block by the polar J,
-    ! not yet on the virtual lattice (its LU instead); the line and ring
+    ! X-point grids: the axis rings are closed core rings of the virtual
+    ! lattice, J the position along them (ax_ring_len); the line and ring
     ! overlaps walk the virtual lattice (rings, columns)
-    if (xgrid .and. axsec /= 0) then
-      if (my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   GMG", cur_inst, &
-        ": X-point grid, axis J-sectors off"
-      axsec = 0
-    endif
     ! Levels g >= rich_from smooth with Richardson on the same blocks instead
     ! of GMRES: no norm, no inner product, so no global reduction below that
     ! level. GMRES costs two allreduces over the whole communicator per step,
@@ -3032,6 +3028,7 @@ contains
     call PetscLogEventRegister("GMG_BlkNum",   cid, gev_blknum,   ierr)
     call PetscLogEventRegister("GMG_AxNum",    cid, gev_axnum,    ierr)
     call PetscLogEventRegister("GMG_AxTry",    cid, gev_axtry,    ierr)
+    call PetscLogEventRegister("GMG_Ovl",      cid, gev_ovl,      ierr)
     call PetscLogEventRegister("GMG_VCycle",   cid, gev_vcycle(1),  ierr)
     call PetscLogEventRegister("GMG_Smooth0",  cid, gev_smooth0(1), ierr)
     call PetscLogEventRegister("GMG_SmoothC",  cid, gev_smooth(1),  ierr)
@@ -3289,8 +3286,10 @@ contains
         enddo
         deallocate(axr, key)
       endif
+      call PetscLogEventBegin(gev_ovl, ierr)
       if (lovl > 0 .and. sm_type /= 4) call ovl_extend(g, A, B, rst, ren, lovl, .false.)
       if (rovl > 0 .and. sm_type == 4) call ovl_extend(g, A, B, rst, ren, rovl, .true.)
+      call PetscLogEventEnd(gev_ovl, ierr)
       call btd_mark(g, B)
       nthr = 1
       !$ nthr = omp_get_max_threads()
@@ -3846,7 +3845,12 @@ contains
     PetscInt, pointer :: garr(:), dia(:), dja(:), oia(:), oja(:), sia(:), sja(:)
     PetscInt :: nd, no, ns
     logical :: has_o
-    integer :: pass, R, nall, bb, n, kz, nva, nvg, nbad
+    integer :: pass, R, nall, bb, n, nva, nvg, nbad
+    integer, allocatable :: cva(:), cvg(:)
+    logical, allocatable :: bad(:)
+    ! a row's scan state (scan_row): its block, zebra count, ghost search
+    ! hint, map positions (own, ghost), band below / above the diagonal
+    integer, parameter :: S_BB = 1, S_KZ = 2, S_CH = 3, S_NVA = 4, S_NVG = 5, S_KL = 6, S_KU = 7, NST = 7
     PetscInt :: k
     integer(8) :: tot, tot4
     PetscErrorCode :: ierr
@@ -3876,27 +3880,28 @@ contains
     if (allocated(B%zp)) deallocate(B%zp)
     allocate(B%zp(nall + 1))
     B%zp = 0
+    ! Both passes threaded over the rows (W7-X n_tor 51: ~1e9 entries on
+    ! the rank with the most ring ghosts, 30 s serially, which every other
+    ! rank waited for in the next collective): pass 1 counts each row's
+    ! entries (cva / cvg, then their offsets) and gathers the per-block
+    ! band, the ring check (bad) and the zebra counts, pass 2 writes the maps
+    ! at the row's offsets.
+    allocate(cva(0:nall), cvg(0:nall), bad(B%nb))
+    bad = .false.
     do pass = 1, 2
+      !$omp parallel do schedule(dynamic, 16)
+      do R = 0, nall - 1
+        call scan_row(R, pass)
+      enddo
+      !$omp end parallel do
+      if (pass == 2) exit
+      nbad = count(bad .and. B%btd)
+      where (bad) B%btd = .false.
       nva = 0; nvg = 0
       do R = 0, nall - 1
-        bb = B%bid(R + 1)
-        kz = 0
-        if (R < B%nrow) then
-          do k = dia(R + 1), dia(R + 2) - 1
-            call visit(int(dja(k + 1)), int(k) + 1, .false.)
-          enddo
-          if (has_o) then
-            do k = oia(R + 1), oia(R + 2) - 1
-              call visit(comb(garr(oja(k + 1) + 1)), -(int(k) + 1), .false.)
-            enddo
-          endif
-        else
-          do k = sia(R - B%nrow + 1), sia(R - B%nrow + 2) - 1
-            call visit(comb(sja(k + 1)), int(k) + 1, .true.)
-          enddo
-        endif
+        n = cva(R); cva(R) = nva; nva = nva + n
+        n = cvg(R); cvg(R) = nvg; nvg = nvg + n
       enddo
-      if (pass == 2) exit
       if (nbad > 0) write(*,'(A,I0,A)') "[Physics PC]   GMG WARNING: ", nbad, &
         " ring block(s) couple beyond J +- 1: dense LU instead of the ring solver"
       ! storage: banded where the band is narrow, dense otherwise
@@ -3938,75 +3943,131 @@ contains
 
   contains
 
-    !> entry (R, C) with source src: into the zebra CSR, into the block, or nowhere
-    subroutine visit(C, src, ghost)
-      integer, intent(in) :: C, src
-      logical, intent(in) :: ghost
-      integer :: cb, pr, pc
-      if (C < 0) return                           ! outside the rank's rows and ghosts
-      cb = B%bid(C + 1)
-      if ((sm_type == 7 .or. sm_type == 8) .and. B%bcol(bb) == 1 .and. B%bcol(cb) == 0) then
-        if (pass == 1) then
-          B%zp(R + 2) = B%zp(R + 2) + 1
-        else
-          B%zc(B%zp(R + 1) + kz) = C
+    !> Row R's entries, pass 1 (count, band, ring check, zebra count) or 2
+    !! (the maps, from the row's offsets). Thread-safe: row-private state
+    !! (st), per-block results by atomic updates.
+    subroutine scan_row(R_, pass_)
+      integer, intent(in) :: R_, pass_
+      integer :: st(NST)
+      logical :: badr
+      PetscInt :: k_
+      st = 0
+      st(S_BB) = B%bid(R_ + 1)
+      badr = .false.
+      if (pass_ == 2) then
+        st(S_NVA) = cva(R_); st(S_NVG) = cvg(R_)
+      endif
+      if (R_ < B%nrow) then
+        do k_ = dia(R_ + 1), dia(R_ + 2) - 1
+          call visit(R_, pass_, st, badr, int(dja(k_ + 1)), int(k_) + 1, .false.)
+        enddo
+        if (has_o) then
+          do k_ = oia(R_ + 1), oia(R_ + 2) - 1
+            call visit(R_, pass_, st, badr, comb(garr(oja(k_ + 1) + 1), st(S_CH)), -(int(k_) + 1), .false.)
+          enddo
         endif
-        call put(src, -int(B%zp(R + 1) + kz, 8), ghost)
-        kz = kz + 1
-      else if (cb == bb) then
-        pr = B%pos(R + 1); pc = B%pos(C + 1)
-        if (pass == 1) then
-          B%kl(bb) = max(B%kl(bb), pr - pc)
-          B%ku(bb) = max(B%ku(bb), pc - pr)
-          if (B%btd(bb)) then
+      else
+        do k_ = sia(R_ - B%nrow + 1), sia(R_ - B%nrow + 2) - 1
+          call visit(R_, pass_, st, badr, comb(sja(k_ + 1), st(S_CH)), int(k_) + 1, .true.)
+        enddo
+      endif
+      if (pass_ == 1) then
+        cva(R_) = st(S_NVA); cvg(R_) = st(S_NVG)
+        B%zp(R_ + 2) = st(S_KZ)
+        if (st(S_KL) > 0) then
+          !$omp atomic
+          B%kl(st(S_BB)) = max(B%kl(st(S_BB)), st(S_KL))
+        endif
+        if (st(S_KU) > 0) then
+          !$omp atomic
+          B%ku(st(S_BB)) = max(B%ku(st(S_BB)), st(S_KU))
+        endif
+        if (badr) then
+          !$omp atomic write
+          bad(st(S_BB)) = .true.
+        endif
+      endif
+    end subroutine scan_row
+
+    !> entry (R, C) with source src: into the zebra CSR, into the block, or
+    !! nowhere (st as scan_row's)
+    subroutine visit(R_, pass_, st, badr, C, src, ghost)
+      integer, intent(in) :: R_, pass_, C, src
+      integer, intent(inout) :: st(NST)
+      logical, intent(inout) :: badr
+      logical, intent(in) :: ghost
+      integer :: cb, pr, pc, bb_
+      if (C < 0) return                           ! outside the rank's rows and ghosts
+      bb_ = st(S_BB)
+      cb = B%bid(C + 1)
+      if ((sm_type == 7 .or. sm_type == 8) .and. B%bcol(bb_) == 1 .and. B%bcol(cb) == 0) then
+        if (pass_ == 2) B%zc(B%zp(R_ + 1) + st(S_KZ)) = C
+        call put(pass_, st, src, -int(B%zp(R_ + 1) + st(S_KZ), 8), ghost)
+        st(S_KZ) = st(S_KZ) + 1
+      else if (cb == bb_) then
+        pr = B%pos(R_ + 1); pc = B%pos(C + 1)
+        if (pass_ == 1) then
+          st(S_KL) = max(st(S_KL), pr - pc)
+          st(S_KU) = max(st(S_KU), pc - pr)
+          if (B%btd(bb_) .and. .not. badr) then
             ! a ring solved as a block-tridiagonal chain: J +- 1 couplings only
-            if (btd_index(B%rg(bb), B%qn(B%off(bb) + pr), 1, B%qn(B%off(bb) + pc), 1) == 0) then
-              B%btd(bb) = .false.
-              nbad = nbad + 1
-            endif
+            if (btd_index(B%rg(bb_), B%qn(B%off(bb_) + pr), 1, B%qn(B%off(bb_) + pc), 1) == 0) badr = .true.
           endif
         endif
-        if (.not. B%axblk(bb)) then
-          if (pass == 1) then
-            call put(src, 0_8, ghost)
+        if (.not. B%axblk(bb_)) then
+          if (pass_ == 1) then
+            call put(pass_, st, src, 0_8, ghost)
           else
-            call put(src, lu_index(B, bb, pr, pc), ghost)
+            call put(pass_, st, src, lu_index(B, bb_, pr, pc), ghost)
           endif
         endif
       endif
     end subroutine visit
 
-    subroutine put(src, dst, ghost)
-      integer, intent(in)    :: src
+    subroutine put(pass_, st, src, dst, ghost)
+      integer, intent(in)    :: pass_, src
+      integer, intent(inout) :: st(NST)
       integer(8), intent(in) :: dst
       logical, intent(in)    :: ghost
       if (ghost) then
-        nvg = nvg + 1
-        if (pass == 2) then
-          B%gs(nvg) = src; B%gd(nvg) = dst
+        st(S_NVG) = st(S_NVG) + 1
+        if (pass_ == 2) then
+          B%gs(st(S_NVG)) = src; B%gd(st(S_NVG)) = dst
         endif
       else
-        nva = nva + 1
-        if (pass == 2) then
-          B%vs(nva) = src; B%vd(nva) = dst
+        st(S_NVA) = st(S_NVA) + 1
+        if (pass_ == 2) then
+          B%vs(st(S_NVA)) = src; B%vd(st(S_NVA)) = dst
         endif
       endif
     end subroutine put
 
-    !> combined row index of global column gc, or -1
-    integer function comb(gc)
+    !> combined row index of global column gc, or -1. A row's ghost columns
+    !! ascend in runs of consecutive indices (the slots and C1 DOFs of a
+    !! node), so the ghost after the last one found (chint, the row's) is
+    !! tried first.
+    integer function comb(gc, chint)
       PetscInt, intent(in) :: gc
+      integer, intent(inout) :: chint
       integer :: lo, hi, mid
       comb = -1
       if (gc >= rst .and. gc < ren) then
         comb = int(gc - rst)
         return
       endif
+      if (chint > 0 .and. chint < B%ngh) then
+        if (B%gidx(chint + 1) == gc) then
+          chint = chint + 1
+          comb = B%nrow + chint - 1
+          return
+        endif
+      endif
       lo = 1; hi = B%ngh
       do while (lo <= hi)
         mid = (lo + hi) / 2
         if (B%gidx(mid) == gc) then
           comb = B%nrow + mid - 1
+          chint = mid
           return
         else if (B%gidx(mid) < gc) then
           lo = mid + 1
@@ -4120,7 +4181,7 @@ contains
     integer :: nc, nr, r, bb, I, J, m, ilim, d, q, t, ngh, nlo, mpierr, code, nkey, qtot
     integer :: gtot(2), gloc(2), dmax, ninc, ncd
     integer, allocatable :: Ia(:), Ib(:), blkof(:), gb(:), gI(:), nsz(:), noff(:), nrows(:), fill(:)
-    integer, allocatable :: tb(:), tI(:), tJ(:), gJ(:), lst(:), rk(:)
+    integer, allocatable :: tb(:), tI(:), tJ(:), gJ(:), lst(:), rk(:), gst(:)
     PetscInt, allocatable :: cand(:), gl(:), tl(:), perm(:)
 
     nr = B%nrow
@@ -4193,6 +4254,15 @@ contains
     ! or < 2 rings per rank) reaches the rest only along J, one node per step.
     dmax = depth
     if (rings) dmax = max(depth, nc)
+    ! Rings: the ghosts are known without the walk, every row of a local
+    ! ring block's ring and slots that another rank owns. One gather of all
+    ! ranks' (I, J, m) codes and rows finds them (W7-X n_tor 51: the walk
+    ! took ~24 collective steps, 20 s), unless the level is too large to
+    ! gather on every rank.
+    if (rings) then
+      call ring_ghosts(dmax)
+      if (dmax == 0) deallocate(cand)
+    endif
     do d = 1, dmax
       ! drop the candidates already accepted
       allocate(tl(nn))
@@ -4271,16 +4341,26 @@ contains
     do bb = 2, B%nb
       noff(bb) = noff(bb - 1) + nsz(bb - 1)
     enddo
-    allocate(lst(ngh))
-    fill = 0
+    ! the ghosts bucketed by block, ascending k within each (gst(bb)+1 ..)
+    allocate(lst(ngh), gst(B%nb + 1))
+    gst = 0
+    do k = 1, ngh
+      gst(gb(k) + 1) = gst(gb(k) + 1) + 1
+    enddo
+    gst(1) = 0
+    do bb = 2, B%nb + 1
+      gst(bb) = gst(bb) + gst(bb - 1)
+    enddo
+    fill = gst(1:B%nb)
+    do k = 1, ngh
+      fill(gb(k)) = fill(gb(k)) + 1
+      lst(fill(gb(k))) = int(k)
+    enddo
     do bb = 1, B%nb                                     ! ghosts of block bb, ascending k
       if (nsz(bb) == B%sz(bb)) cycle
       nlo = 0
-      q = 0
-      do k = 1, ngh
-        if (gb(k) /= bb) cycle
-        q = q + 1; lst(q) = int(k)
-      enddo
+      q = gst(bb + 1) - gst(bb)
+      lst(1:q) = lst(gst(bb) + 1:gst(bb + 1))
       do t = 2, q                                       ! stable by ring
         r = lst(t); m = t - 1
         do while (m >= 1)
@@ -4416,6 +4496,60 @@ contains
       enddo
     end function find
 
+    !> The ring ghosts from a gather of every rank's row codes (see above);
+    !! dmax = 0 when done, unchanged (the walk follows) above RING_GATHER_MAX
+    !! rows.
+    subroutine ring_ghosts(dmax_)
+      integer, intent(inout) :: dmax_
+      integer, parameter :: RING_GATHER_MAX = 16000000
+      integer :: np_, kk, ntot_
+      integer, allocatable :: cnt_(:), dsp_(:), code_(:), grow_(:), myc(:), myg(:)
+      integer :: iv
+      iv = 1
+      call opt_int("ring_gather", iv)           ! 0: the walk
+      if (iv == 0) return
+      call MPI_Comm_size(gcomm, np_, mpierr)
+      allocate(cnt_(0:np_ - 1), dsp_(0:np_))
+      call MPI_Allgather(nr, 1, MPI_INTEGER, cnt_, 1, MPI_INTEGER, gcomm, mpierr)
+      dsp_(0) = 0
+      do kk = 0, np_ - 1
+        dsp_(kk + 1) = dsp_(kk) + cnt_(kk)
+      enddo
+      ntot_ = dsp_(np_)
+      if (ntot_ > RING_GATHER_MAX) return
+      allocate(myc(nr), myg(nr), code_(ntot_), grow_(ntot_))
+      do r = 1, nr
+        call node_of(r, I, J, m)
+        myc(r) = (I * ncd + J) * pc_ntor + m
+        myg(r) = int(rst) + r - 1
+      enddo
+      call MPI_Allgatherv(myc, nr, MPI_INTEGER, code_, cnt_, dsp_(0:np_ - 1), MPI_INTEGER, gcomm, mpierr)
+      call MPI_Allgatherv(myg, nr, MPI_INTEGER, grow_, cnt_, dsp_(0:np_ - 1), MPI_INTEGER, gcomm, mpierr)
+      q = 0
+      do kk = 1, ntot_
+        if (grow_(kk) >= rst .and. grow_(kk) < ren) cycle
+        code = code_(kk)
+        m = mod(code, pc_ntor); J = mod(code / pc_ntor, ncd); I = code / pc_ntor / ncd
+        if (I <= ilim .or. I >= nkey) cycle
+        if (blkof(I * pc_ntor + m) == 0) cycle
+        q = q + 1
+      enddo
+      deallocate(gl, gb, gI, gJ)
+      allocate(gl(q), gb(q), gI(q), gJ(q))
+      q = 0
+      do kk = 1, ntot_
+        if (grow_(kk) >= rst .and. grow_(kk) < ren) cycle
+        code = code_(kk)
+        m = mod(code, pc_ntor); J = mod(code / pc_ntor, ncd); I = code / pc_ntor / ncd
+        if (I <= ilim .or. I >= nkey) cycle
+        if (blkof(I * pc_ntor + m) == 0) cycle
+        q = q + 1
+        gl(q) = grow_(kk); gb(q) = blkof(I * pc_ntor + m); gI(q) = I; gJ(q) = J
+      enddo
+      call sort_ghosts()
+      dmax_ = 0
+    end subroutine ring_ghosts
+
     !> gl ascending, gb/gI permuted along
     subroutine sort_ghosts()
       integer :: n_
@@ -4502,11 +4636,7 @@ contains
     integer :: h, nc, ns
     axd_offset = 0
     do h = 0, g - 1
-      if (h == 0) then
-        nc = nth0
-      else
-        nc = glv(h)%nj
-      endif
+      nc = ax_ring_len(h)
       ns = axsec
       if (ns < 0) ns = axd_nsec(nc, gnp)
       ns = min(ns, gnp, nc / 4)
@@ -4528,11 +4658,7 @@ contains
     character(len=64) :: axtag
 
     call MPI_Comm_size(gcomm, gnp, mpierr)
-    if (g == 0) then
-      nc = nth0
-    else
-      nc = glv(g)%nj
-    endif
+    nc = ax_ring_len(g)
     nsec = axsec
     if (nsec < 0) nsec = axd_nsec(nc, gnp)
     nsec = min(nsec, gnp, nc / 4)
@@ -4545,7 +4671,7 @@ contains
         if (g == 0) then
           jl(q) = mod(fine_node(r), nth0)
         else
-          jl(q) = mod(glv(g)%rnode(r), nc)
+          jl(q) = mod(glv(g)%rnode(r), glv(g)%nj)
         endif
       enddo
       write(axtag, '(A,I0,A,I0,A,I0)') "GMG", cur_inst, " axis block level ", g, " group ", kk - 1
@@ -4962,6 +5088,32 @@ contains
       axis_lim = max(ring_lim(g) - 1, 1)
     endif
   end function axis_lim
+
+  !> Length of level g's axis rings, the J period of its J-sectors: n_tht
+  !! of the level; on an X-point grid the rings' own length on the virtual
+  !! lattice, if rings 1..axis_lim are closed core rings of one length and
+  !! ring 0 (never marked closed) has it too or is a single position (a
+  !! collapsed axis, whose rows the sector setup finds as border rows); 0
+  !! otherwise (no sectors).
+  integer function ax_ring_len(g)
+    integer, intent(in) :: g
+    integer :: I
+    if (.not. xgrid) then
+      if (g == 0) then
+        ax_ring_len = nth0
+      else
+        ax_ring_len = glv(g)%nj
+      endif
+      return
+    endif
+    ax_ring_len = 0
+    if (size(xrg(g)%nn) < 2 .or. axis_lim(g) < 1) return
+    ax_ring_len = xrg(g)%nn(1)
+    do I = 1, min(axis_lim(g), size(xrg(g)%nn) - 1)
+      if (.not. xrg(g)%per(I) .or. xrg(g)%nn(I) /= ax_ring_len) ax_ring_len = 0
+    enddo
+    if (xrg(g)%nn(0) /= ax_ring_len .and. xrg(g)%nn(0) /= 1) ax_ring_len = 0
+  end function ax_ring_len
 
   subroutine blk_apply(pc, x, y, ierr)
     PC  :: pc

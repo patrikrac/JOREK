@@ -14,8 +14,12 @@
  * by this rank's fine rows (one thread per row, no races),
  *   R = sum_i P_s(i,I) A(i,:)      dense strip over the fine block columns
  *   C(I,:) = R P_s                  bs x bs block axpys
- * writing owned rows straight into C's CSR arrays; rows owned by another
- * rank (partial sums) go through MatSetValues(ADD_VALUES) and the assembly.
+ * writing owned rows straight into C's CSR arrays. Rows owned by another
+ * rank (partial sums) are sent to their owner as raw dense blocks, which it
+ * adds at offsets into its CSR arrays worked out once in the symbolic phase
+ * (exchange of the rows' block lists), in rank order: MatSetValues and the
+ * stash, with indices per entry and a search per row, took 47 of the 48 s
+ * of the W7-X n_tor 51 numeric phase, and summed in arrival order.
  *
  * jorek_galerkin_blk(A, Ps, bs, reuse, &C, &ok): A MPIAIJ in the packed
  * layout, Ps = P_s (MPIAIJ, one row per bs rows of A). reuse = 0
@@ -31,6 +35,8 @@
 
 #define GBLK_KEY "jorek_galerkin_blk"
 
+static PetscLogEvent gblk_ev_sym = -1, gblk_ev_num = -1, gblk_ev_asm = -1;
+
 typedef struct {
   PetscInt  bs, nlb, ngb, ncb, cstart, Ncb; /* fine local / ghost blocks, coarse local / first / global blocks */
   PetscInt *dcb, *dcn;      /* A's diagonal part: local column -> local fine block, slot */
@@ -44,8 +50,14 @@ typedef struct {
   PetscInt *jp, *jl;        /* fine block columns of R per touched row */
   PetscInt *Jp, *Jl;        /* coarse block columns of the partial row */
   PetscInt *Jo;             /* owned rows: offset of block Jl[k] in its row, diagonal part >= 0, off-diagonal part -1 - offset */
-  PetscInt *rb;             /* remote rows: offset into rv (-1 for owned) */
+  PetscInt *rb;             /* remote rows: offset into rv (-1 for owned), grouped by owner */
   PetscScalar *rv;
+  /* the exchange: sends of rv to nsd owners (sdr ranks, sdo offsets into
+     rv), receives from nrc ranks (rcr, rco offsets into rcv); every received
+     row: its local coarse block row inI, block list inp / inJo (as Jo) */
+  PetscMPIInt nsd, nrc, *sdr, *rcr, tag;
+  PetscInt *sdo, *rco, nin, *inI, *inp, *inJo;
+  PetscScalar *rcv;
   PetscInt  mxj, mxJ;       /* largest R / out strip, in blocks */
 } gblk_ctx;
 
@@ -61,6 +73,10 @@ static PetscErrorCode ctx_destroy(void *pctx)
   PetscCall(PetscFree3(c->jl, c->Jl, c->Jo));
   PetscCall(PetscFree(c->rb));
   PetscCall(PetscFree(c->rv));
+  PetscCall(PetscFree2(c->sdr, c->sdo));
+  PetscCall(PetscFree2(c->rcr, c->rco));
+  PetscCall(PetscFree3(c->inI, c->inp, c->inJo));
+  PetscCall(PetscFree(c->rcv));
   PetscCall(PetscFree(c));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -71,6 +87,120 @@ static int cmp_int(const void *a, const void *b)
   return (x > y) - (x < y);
 }
 
+/* Remote rows (coarse block rows touched here, owned elsewhere): rv offsets
+ * grouped by owner (rb), and the exchange with the owners. Every rank sends
+ * each owner its rows' (Ib, nJ, J list); the owner turns each received block
+ * J into its offset in its CSR row (as Jo), so the numeric phase only moves
+ * values. Jpos: work array of Ncb entries, all PETSC_MIN_INT (restored). */
+/* Rank owning global coarse block row Ib (rng: C's row ownership ranges). */
+static PetscMPIInt gblk_owner(const PetscInt *rng, PetscMPIInt np, PetscInt Ib, PetscInt bs)
+{
+  PetscMPIInt lo = 0, hi = np - 1;
+  while (lo < hi) {
+    PetscMPIInt mid = (lo + hi + 1) / 2;
+    if (rng[mid] <= Ib * bs) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+static PetscErrorCode gblk_exchange_setup(Mat C, gblk_ctx *c, const PetscInt *cia, const PetscInt *cja,
+                                          const PetscInt *coia, const PetscInt *coja, const PetscInt *cgarr,
+                                          PetscInt *Jpos, PetscInt *nrv)
+{
+  MPI_Comm        comm = PetscObjectComm((PetscObject)C);
+  const PetscInt  bs = c->bs;
+  const PetscInt *rng;
+  PetscMPIInt     np, *own, *sc, *rc, *sd, *rd, p;
+  PetscInt        t, k, q, rem = 0, *sh, *rh, nsh, nrh, *hcnt, *tcnt, *ord, nrem = 0;
+
+  PetscFunctionBegin;
+  PetscCallMPI(MPI_Comm_size(comm, &np));
+  PetscCall(PetscObjectGetNewTag((PetscObject)C, &c->tag));
+  PetscCall(MatGetOwnershipRanges(C, &rng));
+  PetscCall(PetscMalloc1(c->nt + 1, &own));
+  PetscCall(PetscCalloc4(np, &sc, np, &rc, np + 1, &sd, np + 1, &rd));
+  PetscCall(PetscCalloc2(np, &hcnt, np + 1, &tcnt));
+  /* owners, header ints and rows per owner */
+  for (t = 0; t < c->nt; t++) {
+    own[t] = -1;
+    if (c->tI[t] >= c->cstart && c->tI[t] < c->cstart + c->ncb) continue;
+    own[t] = gblk_owner(rng, np, c->tI[t], bs);
+    hcnt[own[t]] += 2 + (c->Jp[t + 1] - c->Jp[t]);
+    tcnt[own[t] + 1]++;
+    nrem++;
+  }
+  for (p = 0; p < np; p++) PetscCall(PetscMPIIntCast(hcnt[p], &sc[p]));
+  PetscCallMPI(MPI_Alltoall(sc, 1, MPI_INT, rc, 1, MPI_INT, comm));
+  for (p = 0; p < np; p++) {
+    PetscCall(PetscMPIIntCast((PetscInt)sd[p] + sc[p], &sd[p + 1]));
+    PetscCall(PetscMPIIntCast((PetscInt)rd[p] + rc[p], &rd[p + 1]));
+  }
+  nsh = sd[np]; nrh = rd[np];
+  PetscCall(PetscMalloc2(nsh + 1, &sh, nrh + 1, &rh));
+  /* remote rows ordered by owner (counting sort, ascending t within) */
+  for (p = 0; p < np; p++) tcnt[p + 1] += tcnt[p];
+  PetscCall(PetscMalloc1(nrem + 1, &ord));
+  for (t = 0; t < c->nt; t++)
+    if (own[t] >= 0) ord[tcnt[own[t]]++] = t;
+  /* rv offsets and headers in that order, one send per owner */
+  c->nsd = 0;
+  for (p = 0; p < np; p++) if (sc[p]) c->nsd++;
+  PetscCall(PetscMalloc2(c->nsd, &c->sdr, c->nsd + 1, &c->sdo));
+  c->nsd = 0; q = 0;
+  for (k = 0; k < nrem; k++) {
+    PetscInt nJ, J;
+    t = ord[k];
+    if (k == 0 || own[t] != own[ord[k - 1]]) { c->sdr[c->nsd] = own[t]; c->sdo[c->nsd] = rem; c->nsd++; }
+    nJ = c->Jp[t + 1] - c->Jp[t];
+    c->rb[t] = rem; rem += nJ * bs * bs;
+    sh[q++] = c->tI[t]; sh[q++] = nJ;
+    for (J = c->Jp[t]; J < c->Jp[t + 1]; J++) sh[q++] = c->Jl[J];
+  }
+  c->sdo[c->nsd] = rem;
+  PetscCallMPI(MPI_Alltoallv(sh, sc, sd, MPIU_INT, rh, rc, rd, MPIU_INT, comm));
+  /* received rows: local block row, block offsets; value counts per source */
+  c->nrc = 0;
+  for (p = 0; p < np; p++) if (rc[p]) c->nrc++;
+  PetscCall(PetscMalloc2(c->nrc, &c->rcr, c->nrc + 1, &c->rco));
+  c->nin = 0;
+  for (k = 0; k < nrh; k += 2 + rh[k + 1]) c->nin++;
+  PetscCall(PetscMalloc3(c->nin, &c->inI, c->nin + 1, &c->inp, nrh + 1, &c->inJo));
+  c->nin = 0; c->inp[0] = 0; c->nrc = 0;
+  {
+    PetscInt nv = 0;
+    for (p = 0; p < np; p++) {
+      if (!rc[p]) continue;
+      c->rcr[c->nrc] = p; c->rco[c->nrc] = nv; c->nrc++;
+      for (k = rd[p]; k < rd[p + 1]; k += 2 + rh[k + 1]) {
+        PetscInt Ib = rh[k], nJ = rh[k + 1], r = (Ib - c->cstart) * bs, kk;
+        PetscCheck(Ib >= c->cstart && Ib < c->cstart + c->ncb, PETSC_COMM_SELF, PETSC_ERR_PLIB, "galerkin_blk: received a row not owned here");
+        for (kk = cia[r]; kk < cia[r + 1]; kk += bs) Jpos[c->cstart + cja[kk] / bs] = kk - cia[r];
+        for (kk = coia[r]; kk < coia[r + 1]; kk += bs) Jpos[cgarr[coja[kk]] / bs] = -1 - (kk - coia[r]);
+        c->inI[c->nin] = Ib - c->cstart;
+        for (q = 0; q < nJ; q++) {
+          PetscCheck(Jpos[rh[k + 2 + q]] != PETSC_MIN_INT, PETSC_COMM_SELF, PETSC_ERR_PLIB, "galerkin_blk: received block not in C's row");
+          c->inJo[c->inp[c->nin] + q] = Jpos[rh[k + 2 + q]];
+        }
+        for (kk = cia[r]; kk < cia[r + 1]; kk += bs) Jpos[c->cstart + cja[kk] / bs] = PETSC_MIN_INT;
+        for (kk = coia[r]; kk < coia[r + 1]; kk += bs) Jpos[cgarr[coja[kk]] / bs] = PETSC_MIN_INT;
+        c->inp[c->nin + 1] = c->inp[c->nin] + nJ;
+        c->nin++;
+        nv += nJ * bs * bs;
+      }
+    }
+    c->rco[c->nrc] = nv;
+    PetscCall(PetscMalloc1(nv + 1, &c->rcv));
+  }
+  PetscCall(PetscFree2(sh, rh));
+  PetscCall(PetscFree(ord));
+  PetscCall(PetscFree2(hcnt, tcnt));
+  PetscCall(PetscFree(own));
+  PetscCall(PetscFree4(sc, rc, sd, rd));
+  *nrv = rem;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 /* Symbolic phase: the context and C (dense slot blocks, all zero). */
 static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_ctx **cout)
 {
@@ -78,7 +208,7 @@ static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_
   gblk_ctx       *c;
   Mat             Ad, Ao, Ablk, Acb, C, *Psub;
   const PetscInt *cmap, *ia, *ja, *oia, *oja;
-  PetscInt        nA, rstart, nAo, n, i, k, m, t, rbs, *gblk, *mark;
+  PetscInt        nA, rstart, nAo, n, i, k, m, t, rbs, *gblk, *mark, *bgp, *bgj;
   PetscBool       done;
   IS              isr, isc;
 
@@ -144,7 +274,9 @@ static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_
   PetscCall(MatGetRowIJ(Ad, 0, PETSC_FALSE, PETSC_FALSE, &n, &ia, &ja, &done));
   PetscCall(MatGetRowIJ(Ao, 0, PETSC_FALSE, PETSC_FALSE, &n, &oia, &oja, &done));
 
-  /* the block graph of A (value 1) and its PtAP: C's block pattern and layout */
+  /* the block graph of A (value 1) and its PtAP: C's block pattern and
+     layout; the graph is kept (bgp / bgj: local fine block -> its fine
+     block columns, local ids as dcb / ocb) for the touched rows' lists */
   {
     PetscInt *dnz, *onz, *cols, nc, gcol;
     PetscCall(PetscMalloc4(c->nlb, &dnz, c->nlb, &onz, c->nlb + c->ngb, &mark, c->nlb + c->ngb, &cols));
@@ -157,6 +289,10 @@ static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_
         for (k = oia[r]; k < oia[r + 1]; k++) if (mark[c->ocb[oja[k]]] != i) { mark[c->ocb[oja[k]]] = i; onz[i]++; }
       }
     }
+    PetscCall(PetscMalloc1(c->nlb + 1, &bgp));
+    bgp[0] = 0;
+    for (i = 0; i < c->nlb; i++) bgp[i + 1] = bgp[i] + dnz[i] + onz[i];
+    PetscCall(PetscMalloc1(bgp[c->nlb] + 1, &bgj));
     PetscCall(MatCreate(comm, &Ablk));
     PetscCall(MatSetSizes(Ablk, c->nlb, c->nlb, PETSC_DETERMINE, PETSC_DETERMINE));
     PetscCall(MatSetType(Ablk, MATMPIAIJ));
@@ -170,6 +306,7 @@ static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_
         for (k = ia[r]; k < ia[r + 1]; k++) if (mark[c->dcb[ja[k]]] != i) { mark[c->dcb[ja[k]]] = i; cols[nc++] = c->dcb[ja[k]]; }
         for (k = oia[r]; k < oia[r + 1]; k++) if (mark[c->ocb[oja[k]]] != i) { mark[c->ocb[oja[k]]] = i; cols[nc++] = c->ocb[oja[k]]; }
       }
+      PetscCall(PetscArraycpy(bgj + bgp[i], cols, nc));
       for (k = 0; k < nc; k++) {
         gcol = cols[k] < c->nlb ? rbs + cols[k] : gblk[cols[k] - c->nlb];
         PetscCall(MatSetValues(Ablk, 1, (PetscInt[]){rbs + i}, 1, &gcol, &one, INSERT_VALUES));
@@ -254,16 +391,9 @@ static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_
       PetscInt j0 = nj, J0 = nJ, q, kk;
       for (q = c->cp[t]; q < c->cp[t + 1]; q++) {
         i = c->ci[q];
-        for (m = 0; m < bs; m++) {
-          PetscInt r = i * bs + m;
-          for (kk = ia[r]; kk < ia[r + 1]; kk++) {
-            PetscInt b = c->dcb[ja[kk]];
-            if (jmark[b] != t) { jmark[b] = t; GBLK_PUSH(jbuf, cap_j, nj, b); }
-          }
-          for (kk = oia[r]; kk < oia[r + 1]; kk++) {
-            PetscInt b = c->ocb[oja[kk]];
-            if (jmark[b] != t) { jmark[b] = t; GBLK_PUSH(jbuf, cap_j, nj, b); }
-          }
+        for (kk = bgp[i]; kk < bgp[i + 1]; kk++) {
+          PetscInt b = bgj[kk];
+          if (jmark[b] != t) { jmark[b] = t; GBLK_PUSH(jbuf, cap_j, nj, b); }
         }
       }
       for (q = j0; q < nj; q++)
@@ -296,10 +426,7 @@ static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_
       for (k = 0; k < c->Ncb; k++) Jpos[k] = PETSC_MIN_INT;
       for (t = 0; t < c->nt; t++) {
         PetscInt Ib = c->tI[t], q;
-        if (Ib < c->cstart || Ib >= c->cstart + c->ncb) {
-          c->rb[t] = rem; rem += (c->Jp[t + 1] - c->Jp[t]) * bs * bs;
-          continue;
-        }
+        if (Ib < c->cstart || Ib >= c->cstart + c->ncb) continue;   /* remote: gblk_exchange_setup */
         c->rb[t] = -1;
         {
           PetscInt r = (Ib - c->cstart) * bs;
@@ -313,6 +440,7 @@ static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_
           for (k = coia[r]; k < coia[r + 1]; k += bs) Jpos[cgarr[coja[k]] / bs] = PETSC_MIN_INT;
         }
       }
+      PetscCall(gblk_exchange_setup(C, c, cia, cja, coia, coja, cgarr, Jpos, &rem));
       PetscCall(PetscMalloc1(rem + 1, &c->rv));
       PetscCall(MatRestoreRowIJ(Cd, 0, PETSC_FALSE, PETSC_FALSE, &n, &cia, &cja, &done));
       PetscCall(MatRestoreRowIJ(Co, 0, PETSC_FALSE, PETSC_FALSE, &n, &coia, &coja, &done));
@@ -323,6 +451,8 @@ static PetscErrorCode gblk_symbolic(Mat A, Mat Ps, PetscInt bs, Mat *Cout, gblk_
   PetscCall(MatRestoreRowIJ(Ad, 0, PETSC_FALSE, PETSC_FALSE, &n, &ia, &ja, &done));
   PetscCall(MatRestoreRowIJ(Ao, 0, PETSC_FALSE, PETSC_FALSE, &n, &oia, &oja, &done));
   PetscCall(PetscFree(gblk));
+  PetscCall(PetscFree(bgp));
+  PetscCall(PetscFree(bgj));
   *Cout = C;
   *cout = c;
   PetscFunctionReturn(PETSC_SUCCESS);
@@ -377,15 +507,49 @@ static PetscErrorCode gblk_numeric(Mat A, Mat C, gblk_ctx *c)
       for (q = 0; q < nJ; q++) Jmark[c->Jl[J0 + q]] = q * bs;
       memset(R, 0, sizeof(PetscScalar) * (size_t)(ldR * bs));
       memset(O, 0, sizeof(PetscScalar) * (size_t)(ldO * bs));
-      /* R = sum_i P_s(i, I) A(i, :) */
+      /* R = sum_i P_s(i, I) A(i, :); a row's columns come as whole slot
+         blocks (bs consecutive columns of one fine block) wherever all slots
+         couple: one lookup and a vector axpy per block, entry by entry
+         elsewhere */
       for (q = c->cp[t]; q < c->cp[t + 1]; q++) {
         const PetscInt    i = c->ci[q];
         const PetscScalar p = c->cv[q];
         for (m = 0; m < bs; m++) {
           const PetscInt r  = i * bs + m;
           PetscScalar   *Rm = R + m * ldR;
-          for (kk = ia[r]; kk < ia[r + 1]; kk++) Rm[jmark[c->dcb[ja[kk]]] + c->dcn[ja[kk]]] += p * ad[kk];
-          for (kk = oia[r]; kk < oia[r + 1]; kk++) Rm[jmark[c->ocb[oja[kk]]] + c->ocn[oja[kk]]] += p * ao[kk];
+          for (kk = ia[r]; kk < ia[r + 1];) {
+            const PetscInt col = ja[kk];
+            if (c->dcn[col] == 0 && kk + bs <= ia[r + 1] && ja[kk + bs - 1] == col + bs - 1) {
+              PetscScalar       *dst = Rm + jmark[c->dcb[col]];
+              const PetscScalar *src = ad + kk;
+              PetscInt           x;
+#if defined(_OPENMP)
+              #pragma omp simd
+#endif
+              for (x = 0; x < bs; x++) dst[x] += p * src[x];
+              kk += bs;
+            } else {
+              Rm[jmark[c->dcb[col]] + c->dcn[col]] += p * ad[kk];
+              kk++;
+            }
+          }
+          for (kk = oia[r]; kk < oia[r + 1];) {
+            const PetscInt col = oja[kk];
+            if (c->ocn[col] == 0 && kk + bs <= oia[r + 1] && oja[kk + bs - 1] == col + bs - 1 &&
+                c->ocb[col + bs - 1] == c->ocb[col]) {
+              PetscScalar       *dst = Rm + jmark[c->ocb[col]];
+              const PetscScalar *src = ao + kk;
+              PetscInt           x;
+#if defined(_OPENMP)
+              #pragma omp simd
+#endif
+              for (x = 0; x < bs; x++) dst[x] += p * src[x];
+              kk += bs;
+            } else {
+              Rm[jmark[c->ocb[col]] + c->ocn[col]] += p * ao[kk];
+              kk++;
+            }
+          }
         }
       }
       /* O = R P_s, block by block */
@@ -423,6 +587,42 @@ static PetscErrorCode gblk_numeric(Mat A, Mat C, gblk_ctx *c)
     free(R); free(O); free(jmark); free(Jmark);
   }
 
+  /* partial rows owned elsewhere: raw blocks to their owners, added there
+     in rank order at the offsets of the symbolic phase */
+  PetscCall(PetscLogEventBegin(gblk_ev_asm, A, 0, 0, 0));
+  {
+    MPI_Comm     comm = PetscObjectComm((PetscObject)C);
+    MPI_Request *req;
+    PetscMPIInt  i;
+    PetscInt     k, q, m, x;
+    PetscCall(PetscMalloc1(c->nsd + c->nrc + 1, &req));
+    for (i = 0; i < c->nrc; i++) {
+      PetscMPIInt cnt;
+      PetscCall(PetscMPIIntCast(c->rco[i + 1] - c->rco[i], &cnt));
+      PetscCallMPI(MPI_Irecv(c->rcv + c->rco[i], cnt, MPIU_SCALAR, c->rcr[i], c->tag, comm, &req[i]));
+    }
+    for (i = 0; i < c->nsd; i++) {
+      PetscMPIInt cnt;
+      PetscCall(PetscMPIIntCast(c->sdo[i + 1] - c->sdo[i], &cnt));
+      PetscCallMPI(MPI_Isend(c->rv + c->sdo[i], cnt, MPIU_SCALAR, c->sdr[i], c->tag, comm, &req[c->nrc + i]));
+    }
+    PetscCallMPI(MPI_Waitall(c->nsd + c->nrc, req, MPI_STATUSES_IGNORE));
+    PetscCall(PetscFree(req));
+    {
+      const PetscScalar *src = c->rcv;
+      for (k = 0; k < c->nin; k++) {
+        const PetscInt r0 = c->inI[k] * bs, nJ = c->inp[k + 1] - c->inp[k], ldO = nJ * bs;
+        for (m = 0; m < bs; m++)
+          for (q = 0; q < nJ; q++) {
+            const PetscInt     off = c->inJo[c->inp[k] + q];
+            PetscScalar       *dst = off >= 0 ? cd + cia[r0 + m] + off : co + coia[r0 + m] + (-1 - off);
+            const PetscScalar *s_  = src + m * ldO + q * bs;
+            for (x = 0; x < bs; x++) dst[x] += s_[x];
+          }
+        src += ldO * bs;
+      }
+    }
+  }
   PetscCall(MatSeqAIJRestoreArray(Cd, &cd));
   PetscCall(MatSeqAIJRestoreArray(Co, &co));
   PetscCall(MatSeqAIJRestoreArrayRead(Ad, &ad));
@@ -431,22 +631,9 @@ static PetscErrorCode gblk_numeric(Mat A, Mat C, gblk_ctx *c)
   PetscCall(MatRestoreRowIJ(Ao, 0, PETSC_FALSE, PETSC_FALSE, &n, &oia, &oja, &done));
   PetscCall(MatRestoreRowIJ(Cd, 0, PETSC_FALSE, PETSC_FALSE, &n, &cia, NULL, &done));
   PetscCall(MatRestoreRowIJ(Co, 0, PETSC_FALSE, PETSC_FALSE, &n, &coia, NULL, &done));
-
-  /* partial rows owned elsewhere */
-  {
-    PetscInt *rows, *cols, mxc = c->mxJ * bs;
-    PetscCall(PetscMalloc2(bs, &rows, mxc + 1, &cols));
-    for (t = 0; t < c->nt; t++) {
-      PetscInt m, q, x, nJ = c->Jp[t + 1] - c->Jp[t];
-      if (c->rb[t] < 0) continue;
-      for (m = 0; m < bs; m++) rows[m] = c->tI[t] * bs + m;
-      for (q = 0; q < nJ; q++) for (x = 0; x < bs; x++) cols[q * bs + x] = c->Jl[c->Jp[t] + q] * bs + x;
-      PetscCall(MatSetValues(C, bs, rows, nJ * bs, cols, c->rv + c->rb[t], ADD_VALUES));
-    }
-    PetscCall(PetscFree2(rows, cols));
-  }
   PetscCall(MatAssemblyBegin(C, MAT_FINAL_ASSEMBLY));
   PetscCall(MatAssemblyEnd(C, MAT_FINAL_ASSEMBLY));
+  PetscCall(PetscLogEventEnd(gblk_ev_asm, A, 0, 0, 0));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -459,6 +646,13 @@ PetscErrorCode jorek_galerkin_blk(Mat A, Mat Ps, int bs, int reuse, Mat *C, int 
 
   PetscFunctionBegin;
   *ok = 0;
+  if (gblk_ev_sym < 0) {
+    PetscClassId cid;
+    PetscCall(PetscClassIdRegister("JOREK galerkin", &cid));
+    PetscCall(PetscLogEventRegister("GMG_GalSym", cid, &gblk_ev_sym));
+    PetscCall(PetscLogEventRegister("GMG_GalNum", cid, &gblk_ev_num));
+    PetscCall(PetscLogEventRegister("GMG_GalAsm", cid, &gblk_ev_asm));
+  }
   if (reuse) {
     PetscContainer cont;
     PetscCall(PetscObjectQuery((PetscObject)*C, GBLK_KEY, (PetscObject *)&cont));
@@ -466,7 +660,9 @@ PetscErrorCode jorek_galerkin_blk(Mat A, Mat Ps, int bs, int reuse, Mat *C, int 
     PetscCallMPI(MPI_Allreduce(MPI_IN_PLACE, &good, 1, MPI_INT, MPI_LAND, comm));
     if (!good) PetscFunctionReturn(PETSC_SUCCESS);
     PetscCall(PetscContainerGetPointer(cont, (void **)&c));
+    PetscCall(PetscLogEventBegin(gblk_ev_num, A, 0, 0, 0));
     PetscCall(gblk_numeric(A, *C, c));
+    PetscCall(PetscLogEventEnd(gblk_ev_num, A, 0, 0, 0));
     *ok = 1;
     PetscFunctionReturn(PETSC_SUCCESS);
   }
@@ -482,9 +678,13 @@ PetscErrorCode jorek_galerkin_blk(Mat A, Mat Ps, int bs, int reuse, Mat *C, int 
   }
   PetscCallMPI(MPI_Allreduce(MPI_IN_PLACE, &good, 1, MPI_INT, MPI_LAND, comm));
   if (!good) PetscFunctionReturn(PETSC_SUCCESS);
+  PetscCall(PetscLogEventBegin(gblk_ev_sym, A, 0, 0, 0));
   PetscCall(gblk_symbolic(A, Ps, bs, C, &c));
+  PetscCall(PetscLogEventEnd(gblk_ev_sym, A, 0, 0, 0));
   PetscCall(PetscObjectContainerCompose((PetscObject)*C, GBLK_KEY, c, (PetscCtxDestroyFn *)ctx_destroy));
+  PetscCall(PetscLogEventBegin(gblk_ev_num, A, 0, 0, 0));
   PetscCall(gblk_numeric(A, *C, c));
+  PetscCall(PetscLogEventEnd(gblk_ev_num, A, 0, 0, 0));
   *ok = 1;
   PetscFunctionReturn(PETSC_SUCCESS);
 }

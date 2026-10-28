@@ -7,10 +7,13 @@
  * the CSR arrays (so value-map refills and MatPtAP(MAT_REUSE_MATRIX) keep
  * working), MatCreateSubMatrices, MatGetDiagonal, MatMultTranspose.
  *
- * Structure used: the packed GMG layout keeps the n_tor harmonics of one
- * (field, scalar DOF) in consecutive rows with one column pattern, so each
- * block of bs such rows reads its column indices once. Rows that do not form
- * such a block (boundary rows) are done one by one.
+ * Structure used: the packed GMG layout keeps the slots of one (field, scalar
+ * DOF) in consecutive rows, and the four C1 DOFs (u, a, b, c) of a node next
+ * to each other, all 4 bs rows of a (field, node) with one column pattern.
+ * Runs of consecutive rows with one pattern (up to 4 bs: a node's, shorter
+ * at Dirichlet rows or with fewer slots coupled) read their column indices
+ * once, and the kernel takes them four rows at a time, so each gathered x
+ * serves four rows.
  *
  * For an MPIAIJ matrix the kernel does the ghost update itself, with its own
  * scatter built from the off-diagonal part's column map, and overlaps it with
@@ -80,16 +83,13 @@ static PetscErrorCode part_build(Mat M, PetscInt bs, bmv_part *p)
   p->n = n;
   p->nb = 0;
   for (i = 0; i < n;) {
-    PetscInt len = ia[i + 1] - ia[i], w = 1;
-    if (bs > 1 && i + bs <= n) {
-      for (r = 1; r < bs; r++) {
-        if (ia[i + r + 1] - ia[i + r] != len) break;
-        if (memcmp(ja + ia[i], ja + ia[i + r], (size_t)len * sizeof(PetscInt))) break;
-      }
-      if (r == bs) w = bs;
+    PetscInt len = ia[i + 1] - ia[i], wmax = PetscMin(4 * bs, n - i);
+    for (r = 1; r < wmax; r++) {
+      if (ia[i + r + 1] - ia[i + r] != len) break;
+      if (memcmp(ja + ia[i], ja + ia[i + r], (size_t)len * sizeof(PetscInt))) break;
     }
     p->bst[p->nb++] = i;
-    i += w;
+    i += r;
   }
   p->bst[p->nb] = n;
   nnz = ia[n];
@@ -135,9 +135,25 @@ static PetscErrorCode part_apply(Mat M, const bmv_part *p, const PetscScalar *x,
       const PetscInt i0 = p->bst[b], w = p->bst[b + 1] - i0;
       const PetscInt k0 = ia[i0], len = ia[i0 + 1] - k0;
       const PetscInt *c = ja + k0;
-      if (w == 3) {
-        const PetscScalar *a0 = a + k0, *a1 = a + ia[i0 + 1], *a2 = a + ia[i0 + 2];
-        PetscScalar s0 = 0, s1 = 0, s2 = 0;
+      PetscInt r = 0;
+      for (; r + 4 <= w; r += 4) {
+        const PetscInt     i = i0 + r;
+        const PetscScalar *a0 = a + ia[i], *a1 = a + ia[i + 1], *a2 = a + ia[i + 2], *a3 = a + ia[i + 3];
+        PetscScalar        s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+#if defined(_OPENMP)
+        #pragma omp simd reduction(+:s0, s1, s2, s3)
+#endif
+        for (PetscInt k = 0; k < len; k++) {
+          const PetscScalar xv = x[c[k]];
+          s0 += a0[k] * xv; s1 += a1[k] * xv; s2 += a2[k] * xv; s3 += a3[k] * xv;
+        }
+        if (add) { y[i] += s0; y[i + 1] += s1; y[i + 2] += s2; y[i + 3] += s3; }
+        else     { y[i]  = s0; y[i + 1]  = s1; y[i + 2]  = s2; y[i + 3]  = s3; }
+      }
+      if (w - r == 3) {
+        const PetscInt     i = i0 + r;
+        const PetscScalar *a0 = a + ia[i], *a1 = a + ia[i + 1], *a2 = a + ia[i + 2];
+        PetscScalar        s0 = 0, s1 = 0, s2 = 0;
 #if defined(_OPENMP)
         #pragma omp simd reduction(+:s0, s1, s2)
 #endif
@@ -145,18 +161,18 @@ static PetscErrorCode part_apply(Mat M, const bmv_part *p, const PetscScalar *x,
           const PetscScalar xv = x[c[k]];
           s0 += a0[k] * xv; s1 += a1[k] * xv; s2 += a2[k] * xv;
         }
-        if (add) { y[i0] += s0; y[i0 + 1] += s1; y[i0 + 2] += s2; }
-        else     { y[i0]  = s0; y[i0 + 1]  = s1; y[i0 + 2]  = s2; }
-      } else {
-        for (PetscInt r = 0; r < w; r++) {
-          const PetscScalar *ar = a + ia[i0 + r];
-          PetscScalar        s  = 0;
+        if (add) { y[i] += s0; y[i + 1] += s1; y[i + 2] += s2; }
+        else     { y[i]  = s0; y[i + 1]  = s1; y[i + 2]  = s2; }
+        r = w;
+      }
+      for (; r < w; r++) {
+        const PetscScalar *ar = a + ia[i0 + r];
+        PetscScalar        s  = 0;
 #if defined(_OPENMP)
-          #pragma omp simd reduction(+:s)
+        #pragma omp simd reduction(+:s)
 #endif
-          for (PetscInt k = 0; k < len; k++) s += ar[k] * x[c[k]];
-          if (add) y[i0 + r] += s; else y[i0 + r] = s;
-        }
+        for (PetscInt k = 0; k < len; k++) s += ar[k] * x[c[k]];
+        if (add) y[i0 + r] += s; else y[i0 + r] = s;
       }
     }
   }
