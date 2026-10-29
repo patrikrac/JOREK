@@ -16,15 +16,14 @@
  *   C(I,:) = R P_s                  bs x bs block axpys
  * writing owned rows straight into C's CSR arrays. Rows owned by another
  * rank (partial sums) are sent to their owner as raw dense blocks, which it
- * adds at offsets into its CSR arrays worked out once in the symbolic phase
- * (exchange of the rows' block lists), in rank order: MatSetValues and the
- * stash, with indices per entry and a search per row, took 47 of the 48 s
- * of the W7-X n_tor 51 numeric phase, and summed in arrival order.
+ * adds in rank order at CSR offsets worked out once in the symbolic phase:
+ * no per-entry indices or searches (MatSetValues and the stash took 47 of
+ * the 48 s of the W7-X n_tor 51 numeric phase), and a deterministic sum.
  *
  * jorek_galerkin_blk(A, Ps, bs, reuse, &C, &ok): A MPIAIJ in the packed
- * layout, Ps = P_s (MPIAIJ, one row per bs rows of A). reuse = 0
- * creates C, 1 refills a C this routine created (same A pattern). *ok = 0 (nothing done, same on
- * all ranks) if A, Ps or the layout do not fit. Collective.
+ * layout, Ps = P_s (MPIAIJ, one row per bs rows of A). reuse = 0 creates C,
+ * 1 refills a C this routine created (same A pattern). *ok = 0 (nothing
+ * done, the same on all ranks) if A, Ps or the layout do not fit. Collective.
  */
 #if defined(USE_PETSC)
 #include <string.h>
@@ -87,11 +86,6 @@ static int cmp_int(const void *a, const void *b)
   return (x > y) - (x < y);
 }
 
-/* Remote rows (coarse block rows touched here, owned elsewhere): rv offsets
- * grouped by owner (rb), and the exchange with the owners. Every rank sends
- * each owner its rows' (Ib, nJ, J list); the owner turns each received block
- * J into its offset in its CSR row (as Jo), so the numeric phase only moves
- * values. Jpos: work array of Ncb entries, all PETSC_MIN_INT (restored). */
 /* Rank owning global coarse block row Ib (rng: C's row ownership ranges). */
 static PetscMPIInt gblk_owner(const PetscInt *rng, PetscMPIInt np, PetscInt Ib, PetscInt bs)
 {
@@ -104,6 +98,11 @@ static PetscMPIInt gblk_owner(const PetscInt *rng, PetscMPIInt np, PetscInt Ib, 
   return lo;
 }
 
+/* Remote rows (coarse block rows touched here, owned elsewhere): rv offsets
+ * grouped by owner (rb), and the exchange with the owners. Every rank sends
+ * each owner its rows' (Ib, nJ, J list); the owner turns each received block
+ * J into its offset in its CSR row (as Jo), so the numeric phase only moves
+ * values. Jpos: work array of Ncb entries, all PETSC_MIN_INT (restored). */
 static PetscErrorCode gblk_exchange_setup(Mat C, gblk_ctx *c, const PetscInt *cia, const PetscInt *cja,
                                           const PetscInt *coia, const PetscInt *coja, const PetscInt *cgarr,
                                           PetscInt *Jpos, PetscInt *nrv)

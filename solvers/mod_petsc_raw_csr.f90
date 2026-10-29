@@ -90,9 +90,9 @@ contains
 
   !> Replace M's MatMult / MatMultAdd by the OpenMP kernel of jorek_blockmv_attach.c
   !! (runs of up to 4 bs consecutive rows sharing one column pattern, a node's
-  !! C1 DOFs x bs slots, read it once). Only for
-  !! (MPI/Seq)AIJ; returns .false. and leaves M alone otherwise. Collective;
-  !! idempotent, so it can follow every refill of M.
+  !! C1 DOFs x bs slots, read it once). Only for (MPI/Seq)AIJ; returns .false.
+  !! and leaves M alone otherwise. Collective; idempotent, so it can follow
+  !! every refill of M.
   logical function blockmv_attach(M, bs)
     Mat, intent(in)     :: M
     integer, intent(in) :: bs

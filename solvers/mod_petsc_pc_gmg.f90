@@ -150,13 +150,10 @@ module mod_petsc_pc_gmg
   ! Fine level is 0. gP(g) maps level g -> level g-1 (g = 1..nlev-1).
   integer, save     :: nlev = 0
   Mat, save         :: gP(1:MAX_LEV-1)
-  ! The same prolongation as I_fields x P_s x I_slots (the slot index is the
-  ! fastest in the packed layout), for the Galerkin products only: gPs = P_s
-  ! for the block product (jorek_galerkin_blk.c, dense slot blocks), gPm its
-  ! MATMAIJ for PETSc's MatPtAP (-sf_gmg_ptap_blk 0; W7-X n_tor 31: PtAP
-  ! 273 s scalar, 143 s MAIJ, 13.7 s block)
-  Mat, save         :: gPm(1:MAX_LEV-1), gPs(1:MAX_LEV-1)
-  logical, save     :: pmaij = .false.
+  ! gP = I_fields x P_s x I_slots (the slot index is the fastest in the
+  ! packed layout); gPs = P_s for the Galerkin product on dense slot blocks
+  ! (jorek_galerkin_blk.c)
+  Mat, save         :: gPs(1:MAX_LEV-1)
   Mat, save         :: gA(0:MAX_LEV-1)      !< gA(0) borrowed (the fine operator), gA(g>0) owned
   KSP, save         :: gSm(0:MAX_LEV-1)
   Vec, save         :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1)
@@ -341,8 +338,7 @@ module mod_petsc_pc_gmg
     logical :: rsp = .false., rinv = .false., rchn = .true.
     integer(8) :: a0_sig(2) = 0, a0_id = 0, a0_nzst = -1
     logical :: p_ready = .false., op_ready = .false., vec_ready = .false.
-    Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gPm(1:MAX_LEV-1), gPs(1:MAX_LEV-1)
-    logical :: pmaij = .false.
+    Mat :: gP(1:MAX_LEV-1), gA(0:MAX_LEV-1), gPs(1:MAX_LEV-1)
     KSP :: gSm(0:MAX_LEV-1)
     type(rds_t) :: gcrs
     Vec :: gx(0:MAX_LEV-1), gb(0:MAX_LEV-1), gr(0:MAX_LEV-1)
@@ -405,7 +401,7 @@ contains
       S%rsolv = rsolv; S%rbmin = rbmin; S%rchk = rchk; S%rsp = rsp; S%rseg = rseg; S%rinv = rinv; S%rchn = rchn
       S%a0_sig = a0_sig; S%a0_id = a0_id; S%a0_nzst = a0_nzst
       S%p_ready = p_ready; S%op_ready = op_ready; S%vec_ready = vec_ready
-      S%gP = gP; S%gA = gA; S%gSm = gSm; S%gPm = gPm; S%gPs = gPs; S%pmaij = pmaij
+      S%gP = gP; S%gA = gA; S%gSm = gSm; S%gPs = gPs
       S%gx = gx; S%gb = gb; S%gr = gr
       do g = 0, MAX_LEV - 1
         call move_blk(gBk(g), S%gBk(g))
@@ -430,7 +426,7 @@ contains
       rsolv = S%rsolv; rbmin = S%rbmin; rchk = S%rchk; rsp = S%rsp; rseg = S%rseg; rinv = S%rinv; rchn = S%rchn
       a0_sig = S%a0_sig; a0_id = S%a0_id; a0_nzst = S%a0_nzst
       p_ready = S%p_ready; op_ready = S%op_ready; vec_ready = S%vec_ready
-      gP = S%gP; gA = S%gA; gSm = S%gSm; gPm = S%gPm; gPs = S%gPs; pmaij = S%pmaij
+      gP = S%gP; gA = S%gA; gSm = S%gSm; gPs = S%gPs
       gx = S%gx; gb = S%gb; gr = S%gr
       do g = 0, MAX_LEV - 1
         call move_blk(S%gBk(g), gBk(g))
@@ -1285,11 +1281,11 @@ contains
       enddo
       call MatAssemblyBegin(P, MAT_FINAL_ASSEMBLY, ierr_)
       call MatAssemblyEnd(P, MAT_FINAL_ASSEMBLY, ierr_)
-      call make_maij(gPm(lc_), gPs(lc_), comm, nrl, ncl, nrg, ncg, size(r_), &
-                     [(ly(lr_)%own(r_(q)) == me, q = 1, size(r_))], &
-                     [(prow(lr_, 0, r_(q), 0), q = 1, size(r_))], [(prow(lc_, 0, c(q), 0), q = 1, size(r_))], &
-                     [(prow(lr_, 1, r_(q), 0) - prow(lr_, 0, r_(q), 0), q = 1, size(r_))], &
-                     [(prow(lc_, 1, c(q), 0) - prow(lc_, 0, c(q), 0), q = 1, size(r_))], v, n_fields)
+      call make_slot_free(gPs(lc_), comm, nrl, ncl, nrg, ncg, size(r_), &
+                          [(ly(lr_)%own(r_(q)) == me, q = 1, size(r_))], &
+                          [(prow(lr_, 0, r_(q), 0), q = 1, size(r_))], [(prow(lc_, 0, c(q), 0), q = 1, size(r_))], &
+                          [(prow(lr_, 1, r_(q), 0) - prow(lr_, 0, r_(q), 0), q = 1, size(r_))], &
+                          [(prow(lc_, 1, c(q), 0) - prow(lc_, 0, c(q), 0), q = 1, size(r_))], v, n_fields)
     end subroutine make_expanded
 
   end subroutine gmg_build_prolongations
@@ -2264,11 +2260,11 @@ contains
       enddo
       call MatAssemblyBegin(P, MAT_FINAL_ASSEMBLY, ierr_)
       call MatAssemblyEnd(P, MAT_FINAL_ASSEMBLY, ierr_)
-      call make_maij(gPm(lc_), gPs(lc_), comm, nrl, ncl, nrg, ncg, ntrip, &
-                     [(ly(lr_)%own(rr(t)) == me, t = 1, ntrip)], &
-                     [(prow(lr_, 0, rr(t), 0), t = 1, ntrip)], [(prow(lc_, 0, cc(t), 0), t = 1, ntrip)], &
-                     [(prow(lr_, 1, rr(t), 0) - prow(lr_, 0, rr(t), 0), t = 1, ntrip)], &
-                     [(prow(lc_, 1, cc(t), 0) - prow(lc_, 0, cc(t), 0), t = 1, ntrip)], ww(1:ntrip), n_fields)
+      call make_slot_free(gPs(lc_), comm, nrl, ncl, nrg, ncg, ntrip, &
+                          [(ly(lr_)%own(rr(t)) == me, t = 1, ntrip)], &
+                          [(prow(lr_, 0, rr(t), 0), t = 1, ntrip)], [(prow(lc_, 0, cc(t), 0), t = 1, ntrip)], &
+                          [(prow(lr_, 1, rr(t), 0) - prow(lr_, 0, rr(t), 0), t = 1, ntrip)], &
+                          [(prow(lc_, 1, cc(t), 0) - prow(lc_, 0, cc(t), 0), t = 1, ntrip)], ww(1:ntrip), n_fields)
     end subroutine make_expanded
 
   end subroutine gmg_build_xpoint_prolongations
@@ -2511,43 +2507,26 @@ contains
       endif
       gA(0) = xp_A
     endif
-    ! Galerkin products through the MAIJ prolongation (gPm) whenever there are
-    ! several slots (-sf_gmg[<k>]_ptap_maij 0 / 1 overrides), on dense slot
-    ! blocks (jorek_galerkin_blk.c; -sf_gmg[<k>]_ptap_blk 0 = PETSc's MatPtAP)
+    ! Galerkin products on dense slot blocks (jorek_galerkin_blk.c) when
+    ! there are several slots; -sf_gmg[<k>]_ptap_blk 0 = PETSc's MatPtAP
     block
       use mod_petsc_pc_harm, only: pc_ntor
-      integer :: im, ib, ic
+      integer :: ib, ic
       logical :: done
-      character(len=32) :: tm
-      im = merge(1, 0, pc_ntor > 1)
-      call opt_int("ptap_maij", im)
-      pmaij = (im > 0 .and. pc_ntor > 1)
-      ! one rank: MatCreateMAIJ makes a SEQMAIJ, which PETSc's PtAP does not
-      ! take with the MPIAIJ levels (the block product does)
-      tm = ""
-      if (pmaij) call MatGetType(gPm(1), tm, ierr)
-      ib = 1
+      ib = merge(1, 0, pc_ntor > 1)
       call opt_int("ptap_blk", ib)
       ic = 0
       call opt_int("ptap_check", ic)
       call PetscLogEventBegin(gev_ptap, ierr)
       do g = 1, nlev - 1
         done = .false.
-        if (pmaij .and. ib > 0) done = galerkin_blk(gA(g - 1), gPs(g), int(pc_ntor), reuse, gA(g))
+        if (ib > 0) done = galerkin_blk(gA(g - 1), gPs(g), int(pc_ntor), reuse, gA(g))
         if (done) then
           if (ic > 0) call ptap_check(g)
         else if (reuse) then
-          if (pmaij .and. tm == MATMPIMAIJ) then
-            call MatPtAP(gA(g - 1), gPm(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
-          else
-            call MatPtAP(gA(g - 1), gP(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
-          endif
+          call MatPtAP(gA(g - 1), gP(g), MAT_REUSE_MATRIX, 2.0d0, gA(g), ierr)
         else
-          if (pmaij .and. tm == MATMPIMAIJ) then
-            call MatPtAP(gA(g - 1), gPm(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
-          else
-            call MatPtAP(gA(g - 1), gP(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
-          endif
+          call MatPtAP(gA(g - 1), gP(g), MAT_INITIAL_MATRIX, 2.0d0, gA(g), ierr)
         endif
       enddo
       call PetscLogEventEnd(gev_ptap, ierr)
@@ -2888,14 +2867,13 @@ contains
     end subroutine crs_dist_setup
   end subroutine gmg_setup_operator
 
-  !> gPm: the prolongation's slot-free part I_fields x P_s (scalar entries
-  !! at packed row / slot-count, kept as Ps) wrapped as MATMAIJ with pc_ntor dofs. Triplet
-  !! t (owned when own(t)): field-0 packed row r0 / column c0 at slot 0, and
-  !! the packed offsets dr / dc from one field to the next (nl * pc_ntor of
-  !! the owning rank, the same for all fields).
-  subroutine make_maij(Pm, Ps, comm, nrl, ncl, nrg, ncg, n, own, r0, c0, dr, dc, v, nf)
+  !> Ps: the prolongation's slot-free part I_fields x P_s (one row per
+  !! pc_ntor packed rows). Triplet t (owned when own(t)): field-0 packed row
+  !! r0 / column c0 at slot 0, and the packed offsets dr / dc from one field
+  !! to the next.
+  subroutine make_slot_free(Ps, comm, nrl, ncl, nrg, ncg, n, own, r0, c0, dr, dc, v, nf)
     use mod_petsc_pc_harm, only: pc_ntor
-    Mat, intent(out) :: Pm, Ps
+    Mat, intent(out) :: Ps
     integer, intent(in) :: comm, n, nf
     PetscInt, intent(in) :: nrl, ncl, nrg, ncg
     logical, intent(in) :: own(n)
@@ -2921,8 +2899,7 @@ contains
     enddo
     call MatAssemblyBegin(Ps, MAT_FINAL_ASSEMBLY, ierr)
     call MatAssemblyEnd(Ps, MAT_FINAL_ASSEMBLY, ierr)
-    call MatCreateMAIJ(Ps, int(pc_ntor, kind(row)), Pm, ierr)
-  end subroutine make_maij
+  end subroutine make_slot_free
 
   !> [Mem] checkpoint of the GMG setup (RSS peak: rank 0, max and sum over the
   !! hierarchy's ranks; first build only)
@@ -3361,7 +3338,6 @@ contains
           if (binfo(bb) == 0) B%lu4(B%loff4(bb) + 1 : B%loff4(bb) + B%rg(bb)%tot) = real(wsc(1:B%rg(bb)%tot), 4)
           cycle
         endif
-        if (rsp) call btd_equil(B%rg(bb), B%lu(B%loff(bb) + 1), B%eqs(B%off(bb) + 1))
         if (.not. allocated(B%wk)) call btd_factor(B%rg(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), binfo(bb))
       else if (B%band(bb)) then
         ldab = 2 * B%kl(bb) + B%ku(bb) + 1
@@ -3848,9 +3824,13 @@ contains
     integer :: pass, R, nall, bb, n, nva, nvg, nbad
     integer, allocatable :: cva(:), cvg(:)
     logical, allocatable :: bad(:)
-    ! a row's scan state (scan_row): its block, zebra count, ghost search
-    ! hint, map positions (own, ghost), band below / above the diagonal
-    integer, parameter :: S_BB = 1, S_KZ = 2, S_CH = 3, S_NVA = 4, S_NVG = 5, S_KL = 6, S_KU = 7, NST = 7
+    !> one row's scan (scan_row): its block, zebra entries, ghost search
+    !! hint (comb), map positions (own, ghost), band below / above the
+    !! diagonal, a coupling the ring solver cannot take
+    type :: row_scan_t
+      integer :: bb = 0, kz = 0, chint = 0, nva = 0, nvg = 0, kl = 0, ku = 0
+      logical :: bad = .false.
+    end type row_scan_t
     PetscInt :: k
     integer(8) :: tot, tot4
     PetscErrorCode :: ierr
@@ -3880,12 +3860,10 @@ contains
     if (allocated(B%zp)) deallocate(B%zp)
     allocate(B%zp(nall + 1))
     B%zp = 0
-    ! Both passes threaded over the rows (W7-X n_tor 51: ~1e9 entries on
-    ! the rank with the most ring ghosts, 30 s serially, which every other
-    ! rank waited for in the next collective): pass 1 counts each row's
-    ! entries (cva / cvg, then their offsets) and gathers the per-block
-    ! band, the ring check (bad) and the zebra counts, pass 2 writes the maps
-    ! at the row's offsets.
+    ! Both passes threaded over the rows: pass 1 counts each row's entries
+    ! (cva / cvg, then their offsets) and gathers the per-block band, the
+    ! ring check (bad) and the zebra counts, pass 2 writes the maps at the
+    ! rows' offsets.
     allocate(cva(0:nall), cvg(0:nall), bad(B%nb))
     bad = .false.
     do pass = 1, 2
@@ -3944,81 +3922,76 @@ contains
   contains
 
     !> Row R's entries, pass 1 (count, band, ring check, zebra count) or 2
-    !! (the maps, from the row's offsets). Thread-safe: row-private state
-    !! (st), per-block results by atomic updates.
+    !! (the maps, from the row's offsets). Thread-safe: row-private state,
+    !! per-block results by atomic updates.
     subroutine scan_row(R_, pass_)
       integer, intent(in) :: R_, pass_
-      integer :: st(NST)
-      logical :: badr
+      type(row_scan_t) :: st
       PetscInt :: k_
-      st = 0
-      st(S_BB) = B%bid(R_ + 1)
-      badr = .false.
+      st = row_scan_t(bb = B%bid(R_ + 1))
       if (pass_ == 2) then
-        st(S_NVA) = cva(R_); st(S_NVG) = cvg(R_)
+        st%nva = cva(R_); st%nvg = cvg(R_)
       endif
       if (R_ < B%nrow) then
         do k_ = dia(R_ + 1), dia(R_ + 2) - 1
-          call visit(R_, pass_, st, badr, int(dja(k_ + 1)), int(k_) + 1, .false.)
+          call visit(R_, pass_, st, int(dja(k_ + 1)), int(k_) + 1, .false.)
         enddo
         if (has_o) then
           do k_ = oia(R_ + 1), oia(R_ + 2) - 1
-            call visit(R_, pass_, st, badr, comb(garr(oja(k_ + 1) + 1), st(S_CH)), -(int(k_) + 1), .false.)
+            call visit(R_, pass_, st, comb(garr(oja(k_ + 1) + 1), st%chint), -(int(k_) + 1), .false.)
           enddo
         endif
       else
         do k_ = sia(R_ - B%nrow + 1), sia(R_ - B%nrow + 2) - 1
-          call visit(R_, pass_, st, badr, comb(sja(k_ + 1), st(S_CH)), int(k_) + 1, .true.)
+          call visit(R_, pass_, st, comb(sja(k_ + 1), st%chint), int(k_) + 1, .true.)
         enddo
       endif
       if (pass_ == 1) then
-        cva(R_) = st(S_NVA); cvg(R_) = st(S_NVG)
-        B%zp(R_ + 2) = st(S_KZ)
-        if (st(S_KL) > 0) then
+        cva(R_) = st%nva; cvg(R_) = st%nvg
+        B%zp(R_ + 2) = st%kz
+        if (st%kl > 0) then
           !$omp atomic
-          B%kl(st(S_BB)) = max(B%kl(st(S_BB)), st(S_KL))
+          B%kl(st%bb) = max(B%kl(st%bb), st%kl)
         endif
-        if (st(S_KU) > 0) then
+        if (st%ku > 0) then
           !$omp atomic
-          B%ku(st(S_BB)) = max(B%ku(st(S_BB)), st(S_KU))
+          B%ku(st%bb) = max(B%ku(st%bb), st%ku)
         endif
-        if (badr) then
+        if (st%bad) then
           !$omp atomic write
-          bad(st(S_BB)) = .true.
+          bad(st%bb) = .true.
         endif
       endif
     end subroutine scan_row
 
     !> entry (R, C) with source src: into the zebra CSR, into the block, or
-    !! nowhere (st as scan_row's)
-    subroutine visit(R_, pass_, st, badr, C, src, ghost)
+    !! nowhere
+    subroutine visit(R_, pass_, st, C, src, ghost)
       integer, intent(in) :: R_, pass_, C, src
-      integer, intent(inout) :: st(NST)
-      logical, intent(inout) :: badr
+      type(row_scan_t), intent(inout) :: st
       logical, intent(in) :: ghost
-      integer :: cb, pr, pc, bb_
+      integer :: cb, pr, pc
       if (C < 0) return                           ! outside the rank's rows and ghosts
-      bb_ = st(S_BB)
       cb = B%bid(C + 1)
-      if ((sm_type == 7 .or. sm_type == 8) .and. B%bcol(bb_) == 1 .and. B%bcol(cb) == 0) then
-        if (pass_ == 2) B%zc(B%zp(R_ + 1) + st(S_KZ)) = C
-        call put(pass_, st, src, -int(B%zp(R_ + 1) + st(S_KZ), 8), ghost)
-        st(S_KZ) = st(S_KZ) + 1
-      else if (cb == bb_) then
+      if ((sm_type == 7 .or. sm_type == 8) .and. B%bcol(st%bb) == 1 .and. B%bcol(cb) == 0) then
+        if (pass_ == 2) B%zc(B%zp(R_ + 1) + st%kz) = C
+        call put(pass_, st, src, -int(B%zp(R_ + 1) + st%kz, 8), ghost)
+        st%kz = st%kz + 1
+      else if (cb == st%bb) then
         pr = B%pos(R_ + 1); pc = B%pos(C + 1)
         if (pass_ == 1) then
-          st(S_KL) = max(st(S_KL), pr - pc)
-          st(S_KU) = max(st(S_KU), pc - pr)
-          if (B%btd(bb_) .and. .not. badr) then
+          st%kl = max(st%kl, pr - pc)
+          st%ku = max(st%ku, pc - pr)
+          if (B%btd(st%bb) .and. .not. st%bad) then
             ! a ring solved as a block-tridiagonal chain: J +- 1 couplings only
-            if (btd_index(B%rg(bb_), B%qn(B%off(bb_) + pr), 1, B%qn(B%off(bb_) + pc), 1) == 0) badr = .true.
+            st%bad = btd_index(B%rg(st%bb), B%qn(B%off(st%bb) + pr), 1, B%qn(B%off(st%bb) + pc), 1) == 0
           endif
         endif
-        if (.not. B%axblk(bb_)) then
+        if (.not. B%axblk(st%bb)) then
           if (pass_ == 1) then
             call put(pass_, st, src, 0_8, ghost)
           else
-            call put(pass_, st, src, lu_index(B, bb_, pr, pc), ghost)
+            call put(pass_, st, src, lu_index(B, st%bb, pr, pc), ghost)
           endif
         endif
       endif
@@ -4026,26 +3999,25 @@ contains
 
     subroutine put(pass_, st, src, dst, ghost)
       integer, intent(in)    :: pass_, src
-      integer, intent(inout) :: st(NST)
+      type(row_scan_t), intent(inout) :: st
       integer(8), intent(in) :: dst
       logical, intent(in)    :: ghost
       if (ghost) then
-        st(S_NVG) = st(S_NVG) + 1
+        st%nvg = st%nvg + 1
         if (pass_ == 2) then
-          B%gs(st(S_NVG)) = src; B%gd(st(S_NVG)) = dst
+          B%gs(st%nvg) = src; B%gd(st%nvg) = dst
         endif
       else
-        st(S_NVA) = st(S_NVA) + 1
+        st%nva = st%nva + 1
         if (pass_ == 2) then
-          B%vs(st(S_NVA)) = src; B%vd(st(S_NVA)) = dst
+          B%vs(st%nva) = src; B%vd(st%nva) = dst
         endif
       endif
     end subroutine put
 
     !> combined row index of global column gc, or -1. A row's ghost columns
-    !! ascend in runs of consecutive indices (the slots and C1 DOFs of a
-    !! node), so the ghost after the last one found (chint, the row's) is
-    !! tried first.
+    !! ascend in runs (a node's slots and C1 DOFs): the ghost after the last
+    !! one found (chint) is tried first.
     integer function comb(gc, chint)
       PetscInt, intent(in) :: gc
       integer, intent(inout) :: chint
@@ -4254,11 +4226,9 @@ contains
     ! or < 2 rings per rank) reaches the rest only along J, one node per step.
     dmax = depth
     if (rings) dmax = max(depth, nc)
-    ! Rings: the ghosts are known without the walk, every row of a local
-    ! ring block's ring and slots that another rank owns. One gather of all
-    ! ranks' (I, J, m) codes and rows finds them (W7-X n_tor 51: the walk
-    ! took ~24 collective steps, 20 s), unless the level is too large to
-    ! gather on every rank.
+    ! Rings: the ghosts are known without the walk (up to nc collective
+    ! steps): every row of a local ring block's ring and slot that another
+    ! rank owns, found from one gather of all ranks' (I, J, m) codes.
     if (rings) then
       call ring_ghosts(dmax)
       if (dmax == 0) deallocate(cand)
@@ -4498,15 +4468,14 @@ contains
 
     !> The ring ghosts from a gather of every rank's row codes (see above);
     !! dmax = 0 when done, unchanged (the walk follows) above RING_GATHER_MAX
-    !! rows.
+    !! rows or with -sf_gmg_ring_gather 0.
     subroutine ring_ghosts(dmax_)
       integer, intent(inout) :: dmax_
       integer, parameter :: RING_GATHER_MAX = 16000000
-      integer :: np_, kk, ntot_
-      integer, allocatable :: cnt_(:), dsp_(:), code_(:), grow_(:), myc(:), myg(:)
-      integer :: iv
+      integer :: np_, kk, ntot_, iv
+      integer, allocatable :: cnt_(:), dsp_(:), code_(:), grow_(:), myc(:), myg(:), bk(:)
       iv = 1
-      call opt_int("ring_gather", iv)           ! 0: the walk
+      call opt_int("ring_gather", iv)
       if (iv == 0) return
       call MPI_Comm_size(gcomm, np_, mpierr)
       allocate(cnt_(0:np_ - 1), dsp_(0:np_))
@@ -4517,7 +4486,7 @@ contains
       enddo
       ntot_ = dsp_(np_)
       if (ntot_ > RING_GATHER_MAX) return
-      allocate(myc(nr), myg(nr), code_(ntot_), grow_(ntot_))
+      allocate(myc(nr), myg(nr), code_(ntot_), grow_(ntot_), bk(ntot_))
       do r = 1, nr
         call node_of(r, I, J, m)
         myc(r) = (I * ncd + J) * pc_ntor + m
@@ -4525,32 +4494,23 @@ contains
       enddo
       call MPI_Allgatherv(myc, nr, MPI_INTEGER, code_, cnt_, dsp_(0:np_ - 1), MPI_INTEGER, gcomm, mpierr)
       call MPI_Allgatherv(myg, nr, MPI_INTEGER, grow_, cnt_, dsp_(0:np_ - 1), MPI_INTEGER, gcomm, mpierr)
-      q = 0
+      ! bk: the local ring block (same ring and slot) of each off-rank row, or 0
+      bk = 0
       do kk = 1, ntot_
         if (grow_(kk) >= rst .and. grow_(kk) < ren) cycle
-        code = code_(kk)
-        m = mod(code, pc_ntor); J = mod(code / pc_ntor, ncd); I = code / pc_ntor / ncd
-        if (I <= ilim .or. I >= nkey) cycle
-        if (blkof(I * pc_ntor + m) == 0) cycle
-        q = q + 1
+        m = mod(code_(kk), pc_ntor); I = code_(kk) / pc_ntor / ncd
+        if (I > ilim .and. I < nkey) bk(kk) = blkof(I * pc_ntor + m)
       enddo
-      deallocate(gl, gb, gI, gJ)
-      allocate(gl(q), gb(q), gI(q), gJ(q))
-      q = 0
-      do kk = 1, ntot_
-        if (grow_(kk) >= rst .and. grow_(kk) < ren) cycle
-        code = code_(kk)
-        m = mod(code, pc_ntor); J = mod(code / pc_ntor, ncd); I = code / pc_ntor / ncd
-        if (I <= ilim .or. I >= nkey) cycle
-        if (blkof(I * pc_ntor + m) == 0) cycle
-        q = q + 1
-        gl(q) = grow_(kk); gb(q) = blkof(I * pc_ntor + m); gI(q) = I; gJ(q) = J
-      enddo
+      code_ = pack(code_, bk > 0)
+      gl = int(pack(grow_, bk > 0), kind(nn))
+      gb = pack(bk, bk > 0)
+      gI = code_ / pc_ntor / ncd
+      gJ = mod(code_ / pc_ntor, ncd)
       call sort_ghosts()
       dmax_ = 0
     end subroutine ring_ghosts
 
-    !> gl ascending, gb/gI permuted along
+    !> gl ascending, gb / gI / gJ permuted along
     subroutine sort_ghosts()
       integer :: n_
       PetscCount :: nn_
@@ -4653,7 +4613,7 @@ contains
     integer, intent(in) :: g
     Mat, intent(in) :: A
     type(blk_t), intent(inout) :: B
-    integer :: kk, q, r, nsec, gnp, mpierr, nc
+    integer :: kk, q, r, nsec, gnp, mpierr, nc, ichain, idense
     integer, allocatable :: jl(:)
     character(len=64) :: axtag
 
@@ -4663,6 +4623,10 @@ contains
     if (nsec < 0) nsec = axd_nsec(nc, gnp)
     nsec = min(nsec, gnp, nc / 4)
     if (nsec < 2) return
+    ! 0: PETSc's sparse LU for the sector interiors / the reduced system
+    ichain = 1; idense = 1
+    call opt_int("axis_chain", ichain)
+    call opt_int("axis_dense", idense)
     allocate(B%axd(size(B%axg)))
     do kk = 1, size(B%axg)
       allocate(jl(size(B%axg(kk)%loc)))
@@ -4675,7 +4639,8 @@ contains
         endif
       enddo
       write(axtag, '(A,I0,A,I0,A,I0)') "GMG", cur_inst, " axis block level ", g, " group ", kk - 1
-      call axd_setup(B%axd(kk), A, B%axg(kk)%loc, jl, nc, nsec, gcomm, trim(axtag), axd_offset(g, gnp))
+      call axd_setup(B%axd(kk), A, B%axg(kk)%loc, jl, nc, nsec, gcomm, trim(axtag), ichain /= 0, idense /= 0, &
+                     axd_offset(g, gnp))
       deallocate(jl)
       if (.not. B%axd(kk)%on) return
     enddo

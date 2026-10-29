@@ -33,11 +33,10 @@
 !! x(rp(J)+1 : rp(J+1)). No PETSc here.
 !!
 !! Mixed precision (gmg ring_single): the factorisation runs in double (the
-!! caller's scratch); its result, rounded to single, serves the *_sp solves, which read
-!! half the bytes. The smoothing solves are bandwidth-bound (~46 GB/s per
-!! 12-thread rank on tok), and a smoother needs no more than single accuracy.
-!! The solves exist once, in mod_gmg_ring_btd_solve.inc, included for both
-!! kinds.
+!! caller's scratch); its result, rounded to single, serves the *_sp solves,
+!! which read half the bytes. The smoothing solves are bandwidth-bound, and
+!! a smoother needs no more than single accuracy. The solves exist once, in
+!! mod_gmg_ring_btd_solve.inc, included for both kinds.
 module mod_gmg_ring_btd
   implicit none
   private
@@ -437,9 +436,8 @@ contains
   !> After btd_factor: the LU-factored pivot blocks (Thomas: every node;
   !! hybrid: the segments' interiors) replaced by their inverses (dgetri),
   !! so a solve applies D~_J^-1 by one gemv. In single precision this is the
-  !! more accurate form on the ill-conditioned pair_w rings (ringlab, real
-  !! dumps: forward error 1e-6 vs 1e-4 with the LU); the separators' system
-  !! keeps its LU.
+  !! more accurate form on the ill-conditioned pair_w rings (forward error
+  !! 1e-6 vs 1e-4 with the LU); the separators' system keeps its LU.
   subroutine btd_invert(rg, a, piv)
     type(btd_ring), intent(inout) :: rg
     real*8, intent(inout) :: a(*)
