@@ -263,6 +263,7 @@ module phys_module
   logical :: freeze_psi_dynamics  !< Freeze evolution of Psi in mod_equations for model 183
   real*8  :: core_freeze_s0, core_freeze_sig
   logical :: use_core_freeze      !< Freeze rho/T for s < core_freeze_s0 (fake, unmodeled core)
+  logical :: assemble_rhoT_only   !< model183 with freeze_psi_dynamics: keep only the (rho,T)x(rho,T) blocks and the frozen variables' diagonal blocks in the element matrix
   logical :: zkpar_picard ! for Picard linearisation of the zk_par
   logical ::   decay_bc_enable  ! Robinson BC for decay length condition, like EMC3
   real*8  :: decay_lambda_T

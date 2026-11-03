@@ -64,6 +64,8 @@ real*8     :: T0_e, T0_e_s, T0_e_ss
 real*8     :: BigR_x, vv2, eta_T, visco_T, deta_dT, d2eta_d2T, dvisco_dT
 real*8     :: theta, zeta, reta
 logical    :: xpoint2, use_fft
+logical    :: keep_blk(n_var,n_var)   !< (test, trial) variable blocks assembled; see assemble_rhoT_only
+integer    :: iv_e, jv_e
 
 real*8     :: T0_i_corr, T0_e_corr                      !> temperature for T^(-1.5)
 real*8     :: T0_e_corr_eV, dT0_e_corr_eV_dT            !> corrected T0_e in eV and derivative
@@ -117,6 +119,18 @@ RHS_p = 0.d0; RHS_k = 0.d0
 ELM   = 0.d0; RHS   = 0.d0
 rhs_ij  = 0.d0
 amat_ij = 0.d0
+
+! --- assemble_rhoT_only: with psi/u frozen only (rho,T)x(rho,T) and the frozen
+! --- variables' own diagonal blocks are kept; their couplings act on zero increments
+keep_blk = .true.
+if (assemble_rhoT_only) then
+  keep_blk = .false.
+  do iv_e = 1, n_var
+    keep_blk(iv_e, iv_e) = .true.
+  enddo
+  keep_blk(var_rho, var_T) = .true.
+  keep_blk(var_T, var_rho) = .true.
+endif
 
 ! --- Take time evolution parameters from phys_module
 theta = time_evol_theta
@@ -741,6 +755,7 @@ do ms=1, n_gauss
                   do i_var = 1, n_var
                     ij = index_ij + (i_var - 1)*n_tor_local
                     do j_var = 1, n_var 
+                      if (.not. keep_blk(i_var, j_var)) cycle
                       kl = index_kl + (j_var - 1)*n_tor_local
                   
                       if (use_fft) then
@@ -768,6 +783,7 @@ end do ! mt loop
 if (use_fft) then
   do i=1,n_vertex_max*n_var*(n_order+1)
     do j=1, n_vertex_max*n_var*(n_order+1)
+      if (.not. keep_blk(mod(i-1,n_var)+1, mod(j-1,n_var)+1)) cycle
       in_fft =  ELM_p(1:n_plane,i,j)
 
 #ifdef USE_FFTW
@@ -815,6 +831,7 @@ if (use_fft) then
 
   do i=1,n_vertex_max*n_var*(n_order+1)
     do j=1, n_vertex_max*n_var*(n_order+1)
+      if (.not. keep_blk(mod(i-1,n_var)+1, mod(j-1,n_var)+1)) cycle
       if (maxval(abs(ELM_n(1:n_plane,i,j))) .ne. 0.d0) then
         in_fft =  ELM_n(1:n_plane,i,j)
 
@@ -865,6 +882,7 @@ if (use_fft) then
 
   do i=1,n_vertex_max*n_var*(n_order+1)
     do j=1, n_vertex_max*n_var*(n_order+1)
+      if (.not. keep_blk(mod(i-1,n_var)+1, mod(j-1,n_var)+1)) cycle
       if (maxval(abs(ELM_k(1:n_plane,i,j))) .ne. 0.d0) then
         in_fft =  ELM_k(1:n_plane,i,j)
 
@@ -915,6 +933,7 @@ if (use_fft) then
 
   do i=1,n_vertex_max*n_var*(n_order+1)
     do j=1, n_vertex_max*n_var*(n_order+1)
+      if (.not. keep_blk(mod(i-1,n_var)+1, mod(j-1,n_var)+1)) cycle
       if (maxval(abs(ELM_kn(1:n_plane,i,j))) .ne. 0.d0) then
         in_fft =  ELM_kn(1:n_plane,i,j)
 
