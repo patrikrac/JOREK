@@ -412,7 +412,9 @@ contains
     PetscBool :: full_lu, central_rhs
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
-    if (rhoT_only) then
+    ! rhoT_only with use_physics_pc: the SF's rho/T stages (GMG) on the full system;
+    ! without it: the reduced (rho,T) system with a MUMPS LU (reference)
+    if (rhoT_only .and. .not. use_physics_pc) then
       call petsc_solve_rhot_only(petsc_sys, solve_only, n_iter, converged)
       return
     endif
@@ -611,10 +613,10 @@ contains
   !! variables' increments are set to zero. Inside a node block the unknowns are
   !! variable-major, (var-1)*n_tor + i_tor (as in mod_petsc_pc_toroidal). The
   !! default PC is one MUMPS LU of the (rho,T) system; -rhot_* options override.
+  !! The LU reference: with use_physics_pc the SF's rho/T GMG runs instead.
   subroutine petsc_solve_rhot_only(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
     use mod_parameters, only: n_tor, n_var, var_rho, var_T
-    use phys_module, only: use_physics_pc
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in)  :: solve_only
     integer, intent(out) :: n_iter
@@ -639,10 +641,6 @@ contains
     call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(ts1, ierr))
     if (.not. rt_sys%ready) then
-      if (use_physics_pc) then
-        if (my_id == 0) write(*,'(A)') "[PETSc] FATAL: rhoT_only replaces the solver; set use_physics_pc = .f."
-        call MPI_Abort(comm, 1, mpierr)
-      endif
       PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
       PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))

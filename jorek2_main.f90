@@ -786,7 +786,7 @@ write(*,*) "n elements:", element_list%n_elements
     ! rebuilds, so a step that keeps the preconditioner skips its assembly. The
     ! test is solve_sparse_system's own (keep_pc), made before the solve; if
     ! the solve still rebuilds, it refills from the last assembly.
-    if (use_physics_pc) then
+    if (use_physics_pc .and. .not. rhoT_only) then   ! rhoT_only: the SF uses no W
       if (.not. (solver%petsc_sys%ksp_ready .and. solver%keep_pc(istep))) &
         call petsc_assemble_pc_matrices(my_id, mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat, mhd_sim)
     endif

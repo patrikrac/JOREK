@@ -56,6 +56,7 @@ module mod_petsc_pc_sf
   type(block_solver_t), save :: slv_pj, slv_w, slv_rho, slv_T
   integer, save :: bk_pj = SF_GMG, bk_w = SF_GMG, bk_rho = SF_GMG, bk_T = SF_GMG
   integer, save :: corr = 4                    !< step-3 corrector (physics_pc_sf_corrector)
+  logical, save :: rtm = .false.               !< rhoT_only: psi, u, zj, omega frozen, only the rho -> T stages
 
   !--- v_par
   logical, parameter :: with_v = (var_Vpar > 0)
@@ -129,7 +130,8 @@ contains
     use phys_module, only: physics_pc_sf_pair_psi, physics_pc_sf_pair_w, &
                            physics_pc_sf_rho, physics_pc_sf_T, physics_pc_sf_rtol, &
                            physics_pc_sf_harm_couple, physics_pc_sf_corrector, &
-                           physics_pc_sf_mode_split, physics_pc_sf_vpar, physics_pc_sf_vpar_stage
+                           physics_pc_sf_mode_split, physics_pc_sf_vpar, physics_pc_sf_vpar_stage, &
+                           rhoT_only
     use mod_parameters, only: n_tor, var_T
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
@@ -156,6 +158,9 @@ contains
     sf_gmg_harm = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
     famode      = physics_pc_sf_mode_split .and. .not. harm_all
 
+    rtm = rhoT_only
+    if (rtm .and. famode) call fatal("rhoT_only runs on the global operators: set physics_pc_sf_mode_split = .f.")
+    if (rtm .and. with_v) call fatal("rhoT_only supports the 6-variable model (no v_par)")
     corr = physics_pc_sf_corrector
     if (corr == -1) corr = 4
     if (corr < 0 .or. corr > 4) call fatal("physics_pc_sf_corrector must be -1 (= 4), 0, 1, 2, 3 or 4")
@@ -216,6 +221,7 @@ contains
             " (W_vv W_vu W_uv), gamma_w ", sf_vpar_gamma_w(), ", wvu_full ", vfull
         end select
       endif
+      if (rtm) write(*,'(A)') P//"rhoT_only: pairs and W skipped; y_rho = B_55^-1 x_rho, y_T = B_66^-1 (x_T - B_65 y_rho), rest 0"
       select case (corr)
       case (0); write(*,'(A)') P//"corrector: 0, Eq. (16), second pair_psi solve"
       case (1); write(*,'(A)') P//"corrector: 1, Eq. (17), (psi, j) from pair_w, B_16 T* on its psi row"
@@ -281,9 +287,11 @@ contains
         call sfg_gather(A_full, my_id)
         if (with_v) call vpar_global_sums(.false.)
         call PetscLogEventEnd(pcev_extract, ierr)
-        call PetscLogEventBegin(pcev_build_suu, ierr)
-        call sfm_refill()
-        call PetscLogEventEnd(pcev_build_suu, ierr)
+        if (.not. rtm) then
+          call PetscLogEventBegin(pcev_build_suu, ierr)
+          call sfm_refill()
+          call PetscLogEventEnd(pcev_build_suu, ierr)
+        endif
       endif
       a_pj = g_ctx%K_pj_aij;  a_w = sfm_op;  a_rho = g_ctx%B_55;  a_T = g_ctx%B_66
       if (corr == 3) a_m = g_ctx%B_44
@@ -306,8 +314,10 @@ contains
     !--- of the diagonal blocks, before their scaling; -sf_penalty_rows 0: off
     if (penalty_rows_on()) then
       call full_penalty_rows(A_full)
-      call penalty_rows(slv_pj, a_pj, 2, "pair_psi")
-      call penalty_rows(slv_w, a_w, nf_w, "pair_w")
+      if (.not. rtm) then
+        call penalty_rows(slv_pj, a_pj, 2, "pair_psi")
+        call penalty_rows(slv_w, a_w, nf_w, "pair_w")
+      endif
       call penalty_rows(slv_rho, a_rho, 1, "rho-block")
       call penalty_rows(slv_T, a_T, 1, "T-block")
       if (with_v .and. vstage /= SF_VPAR_B1) call penalty_rows(slv_v, a_v, 1, "v_par-block")
@@ -315,6 +325,7 @@ contains
 
     !--- symmetric block scaling of both pairs: an exact similarity on the
     !--- stored operator, undone in sf_solver_apply
+    if (.not. rtm) then
     call block_scale(slv_pj, a_pj, 2, "pair_psi")
     call block_scale(slv_w, a_w, nf_w, "pair_w")
 
@@ -333,6 +344,7 @@ contains
                          pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC, &
                          axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
     call PetscLogEventEnd(pcev_fact_w, ierr)
+    endif
 
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
     call sf_solver_setup(slv_rho, a_rho, bk_rho, "rho-block KSP", &
@@ -444,8 +456,10 @@ contains
 
     subroutine create_work_vectors()
       integer :: k
-      call MatCreateVecs(a_pj, rhs_PJ, sol_PJ, ierr)
-      call MatCreateVecs(a_w, rhs_W, sol_W, ierr)
+      if (.not. rtm) then
+        call MatCreateVecs(a_pj, rhs_PJ, sol_PJ, ierr)
+        call MatCreateVecs(a_w, rhs_W, sol_W, ierr)
+      endif
       call MatCreateVecs(a_rho, sv_x(1), PETSC_NULL_VEC, ierr)
       do k = 2, NSV
         call VecDuplicate(sv_x(1), sv_x(k), ierr)
@@ -615,7 +629,7 @@ contains
       Mat :: M(NBLK)
       Mat, allocatable :: cb(:)
 
-      call require_w()
+      if (.not. rtm) call require_w()
       call PetscLogEventBegin(pcev_extract, ierr)
       ! the sweep's (1-14), v_par's (B_71 B_72 B_75 B_76 B_77 B_57 B_67), and
       ! the blocks only the pairs are packed from
@@ -649,9 +663,11 @@ contains
       call pack_pair_aij(g_ctx%B_11, g_ctx%B_13, g_ctx%B_31, g_ctx%B_33, &
                          g_ctx%K_pj_aij, kpj_packed, comm)
       call PetscLogEventEnd(pcev_convert, ierr)
-      call PetscLogEventBegin(pcev_build_suu, ierr)
-      call sfm_build()
-      call PetscLogEventEnd(pcev_build_suu, ierr)
+      if (.not. rtm) then
+        call PetscLogEventBegin(pcev_build_suu, ierr)
+        call sfm_build()
+        call PetscLogEventEnd(pcev_build_suu, ierr)
+      endif
 
       call sfg_build(A_full, M, eqs, vrs, g_ctx%K_pj_aij, [var_psi, var_zj], comm, my_id)
       if (with_v) call vpar_global_sums(.true.)
@@ -768,6 +784,16 @@ contains
       vb1 = (vstage == SF_VPAR_B1)
     endif
     vcor = vb0 .or. vb1                                  ! v_par in the rho / T correctors
+
+    if (rtm) then
+      ! rhoT_only: the frozen variables stay zero; rho, then T with B_65 rho
+      call VecZeroEntries(y_psi, ierr); call VecZeroEntries(y_u, ierr)
+      call VecZeroEntries(y_j, ierr);   call VecZeroEntries(y_w, ierr)
+      call solve(slv_rho, x_rho, y_rho, pcev_solve_rhot)
+      call VecCopy(x_T, w4, ierr)
+      if (use_b65) call sub_mult(a_65, y_rho, w4)
+      call solve(slv_T, w4, y_T, pcev_solve_rhot)
+    else
 
     !--- 1. predictor: (psi*, j*) = pair_psi^-1 (x_psi, x_j). x_j, not 0: it
     !--- makes j* the mass back-substitution M_j^-1 (x_j - B_31 psi*).
@@ -892,6 +918,7 @@ contains
       call sub_mult(a_vc(VC76), y_T, wv2)
       call solve(slv_v, wv2, y_v, pcev_solve_rhot)
     endif
+    endif   ! rtm
 
     if (famode) then
       t1 = MPI_Wtime()
