@@ -64,6 +64,7 @@ program RST_convert_hdf52bin
   visco     = visco_rst
   visco_par = visco_par_rst
   eta       = eta_rst
+  tstep     = tstep_rst
 
   call boundary_from_grid(node_list, element_list, bnd_node_list, bnd_elm_list, .false.)
   

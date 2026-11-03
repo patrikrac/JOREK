@@ -13,7 +13,7 @@ use mod_eqdsk_tools
 use mod_element_rtree
 
 ! --- Input parameters
-use phys_module, only:     n_wall_blocks, xpoint, n_flux, n_tht, n_radial, freeboundary
+use phys_module, only:     n_wall_blocks, xpoint, n_flux, n_tht, freeboundary
 
 implicit none
 
@@ -61,6 +61,16 @@ write(*,*) ' '
 
 n_grids(1) = n_flux
 n_grids(2) = n_tht
+if (n_flux .eq. 0) then
+! A pre-existing non-X-point grid does not use n_tht to describe its
+! central ring.  Recover the actual number from the grid instead.  In
+! particular, a polar grid is built with n_pol, which may differ from
+! the otherwise unrelated input value n_tht.
+  n_grids(2) = 0
+  do i=1,node_list%n_nodes
+    if (node_list%node(i)%axis_node) n_grids(2) = n_grids(2) + 1
+  enddo
+endif
 
 freeb_save = freeboundary    ! Disable freeboundary for this routine
 freeboundary = .false.       ! This allows to export restart files for diagnosing the grid patches
@@ -104,7 +114,7 @@ do i_ext = 1,n_wall_blocks
   ! --- create restart file for vtk plots END
   call join_grid_patches(node_list_new,  element_list_new, &
                          node_list_tmp,  element_list_tmp, &
-                         node_list_tmp2, element_list_tmp2, .false.)
+                         node_list_tmp2, element_list_tmp2, 0)
   call copy_node_structure(node_list_new, element_list_new, node_list_tmp2, element_list_tmp2)
   call update_neighbours_basic(element_list_new,node_list_new)
   call update_boundary_types  (element_list_new,node_list_new, 0)
@@ -116,7 +126,7 @@ enddo
 include_axis   = .true.
 include_xpoint = .true.
 include_psi    = .true.
-if ( (n_flux .eq. 0) .and. (n_radial .eq. 0) ) include_axis   = .false.
+if (n_flux .eq. 0) include_axis = (n_grids(2) .gt. 0)
 if (n_flux .eq. 0) include_xpoint = .false.
 call get_eqdsk_style(normal_eqdsk, normal_eqdsk_wall, ier)
 if ( (ier .ne. 0) .and. (n_flux .eq. 0) ) include_psi = .false.

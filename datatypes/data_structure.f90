@@ -22,7 +22,11 @@ module data_structure
   real*8     :: b_field(n_coord_tor,n_degrees,n_dim+1)  !< magnetic field  R, Z, phi components from GVEC
 #endif
 #ifndef USE_DOMM
-  real*8     :: chi_correction(n_coord_tor,n_degrees)   !< correction to the vacuum magnetic field
+#ifdef USE_EXT_FIELD
+  real*8     :: b_vac_field(n_coord_tor,n_degrees,n_dim+1)  !< vacuum magnetic field  R, Z, phi components from gvec2jorek file
+#else
+  real*8     :: chi_correction(n_coord_tor,n_degrees)       !< correction to the vacuum magnetic field
+#endif
 #endif 
   real*8     :: j_source(n_tor,n_degrees)               !< Current source in a stellarator
 #elif fullmhd
@@ -187,8 +191,8 @@ end type type_node
     integer, dimension(:,:), pointer             :: mode_families_modes => Null() !< Toroidal modes which belong to each mode family
     
     integer, dimension(:), pointer               :: rank_range => Null()          !< range of MPI ranks which belong to mode families
-    integer                                      :: my_id, n_cpu, comm    
-    integer                                      :: my_id_n, n_cpu_n, MPI_COMM_N
+    integer                                      :: my_id, n_mpi, comm    
+    integer                                      :: my_id_n, n_mpi_n, MPI_COMM_N
     integer                                      :: my_id_master, n_masters, MPI_COMM_MASTER, MPI_COMM_TRANS, MPI_GROUP_WORLD, MPI_GROUP_MASTER
 ! the following variables are used in PC distribution (they are set only once to save computation time)
     integer, dimension(:,:), pointer             :: send_counts => Null()         !< number of entries sent to each other MPI ranks (PC distribution)
@@ -225,8 +229,8 @@ contains
     if (allocated(node%values)) deallocate(node%values)
     if (allocated(node%deltas)) deallocate(node%deltas)
 
-    allocate(node%values(n_tor, n_degrees, n_values))
-    allocate(node%deltas(n_tor, n_degrees, n_values))
+    allocate(node%values(n_tor, n_degrees, n_values), source=0.d0)
+    allocate(node%deltas(n_tor, n_degrees, n_values), source=0.d0)
 
   end subroutine init_node
 
@@ -414,6 +418,7 @@ contains
     end do
     call tr_unregister_mem(sizeof(thread_struct),"thread_struct",CAT_MATELEM)
     deallocate(thread_struct)
+    nullify(thread_struct)      ! for kinetic_main stellarator model
   end subroutine del_thread_buffers
 
 end module data_structure

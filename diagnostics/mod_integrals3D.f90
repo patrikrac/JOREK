@@ -11,6 +11,8 @@ module mod_integrals3D
   use basis_at_gaussian
   use tr_module
   use phys_module
+  use mod_coupling_settings
+  use coupling_variables
   use mod_interp
   use convert_character
   use mpi_mod
@@ -77,7 +79,7 @@ real*8  :: eq_g(n_plane,0:n_var,n_gauss,n_gauss), eq_s(n_plane,0:n_var,n_gauss,n
 real*8  :: eq_t(n_plane,0:n_var,n_gauss,n_gauss), eq_p(n_plane,0:n_var,n_gauss,n_gauss)
 real*8  :: eq_ss(n_plane,0:n_var,n_gauss,n_gauss), eq_tt(n_plane,0:n_var,n_gauss,n_gauss), eq_st(n_plane,0:n_var,n_gauss,n_gauss)
 real*8  :: eq_sp(n_plane,0:n_var,n_gauss,n_gauss), eq_tp(n_plane,0:n_var,n_gauss,n_gauss)
-real*8, dimension(n_plane,n_var,n_gauss,n_gauss) :: eq_aux_g, eq_aux_s, eq_aux_t, eq_aux_p 
+real*8, dimension(n_plane,n_aux_var,n_gauss,n_gauss) :: eq_aux_g, eq_aux_s, eq_aux_t, eq_aux_p 
 real*8  :: eq_spp(n_plane,0:n_var,n_gauss,n_gauss), eq_tpp(n_plane,0:n_var,n_gauss,n_gauss)
 real*8  :: eq_s_3d(n_plane,0:n_var,n_gauss,n_gauss), eq_t_3d(n_plane,0:n_var,n_gauss,n_gauss)
 real*8  :: wgauss_copy(n_gauss)
@@ -98,7 +100,7 @@ real*8  :: dn_dpsi,dn_dz,dn_dpsi2,dn_dz2,dn_dpsi_dz,dn_dpsi3,dn_dpsi_dz2, dn_dps
 real*8  :: dT_dpsi,dT_dz,dT_dpsi2,dT_dz2,dT_dpsi_dz,dT_dpsi3,dT_dpsi_dz2, dT_dpsi2_dz
 
 integer :: i, j, k, in, ms, mt, mp, iv, inode, ife, n_elements, i_elm_axis, i_elm_xpoint(2), ifail
-integer :: ierr, n_cpu, my_id, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
+integer :: ierr, n_mpi, my_id, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
 integer :: k_vertex, k_dof, k_node, k_dir, k_dir_perp, m_bndelem, dir_perp(2), mv1, m_elm
 integer :: iexpr
 real*8  :: R_c, Z_c, vec_inside(2), grad_t(2)
@@ -110,16 +112,18 @@ real*8, allocatable :: qval(:), radav(:)
 
 real*8  :: R_axis,Z_axis,s_axis,t_axis
 real*8  :: current_tot, beta_p, beta_n, beta_t, aminor, current_MA, current_R_tot
-real*8  :: xjac, xjac_R, xjac_Z, BigR, wst, P_int, P_e_int, P_i_int, C_intern, zj0, ps0, r0, T0, Te0, Ti0
-real*8  :: Vol, Volume, Area, Bgeo, area1, surface_area 
+real*8  :: xjac, xjac_R, xjac_Z, BigR, wst, P_int, P_e_int, P_i_int, mag_pres_int, C_intern, zj0, ps0, r0, T0, Te0, Ti0
+real*8  :: Vol_in, Volume_in, Vol_ext, Volume_ext, Volume, Area, Bgeo, area1, surface_area
 real*8  :: psi_as_coord
 real*8  :: AR0, AR0_p, AR0_s, AR0_t, AR0_sp, AR0_tp, AR0_Rp, AZ0, AZ0_p, AZ0_s, AZ0_t, AZ0_sp, AZ0_tp, AZ0_Zp, A30
 real*8  :: A30_p, A30_s, A30_t, A30_ss, A30_tt, A30_st, A30_R, A30_RR, A30_ZZ
 real*8  :: BR_Z, BZ_R
-real*8  :: r0_corr, T0_corr, Te0_corr, Ti0_corr, dTe0_corr_dT, T_or_Te, T_or_Te_corr, T_or_Te_0  
-real*8  :: density_tot, density_in, density_out,  pressure, pressure_in, pressure_out
+real*8  :: r0_corr, T0_corr, Te0_corr, Ti0_corr, dTe0_corr_dT, T_or_Te, T_or_Te_corr, T_or_Te_0, r0_s, r0_t, r0_p  
+real*8  :: density_tot, density_in, density_out,  pressure, pressure_in, pressure_out, mag_pressure, mag_pressure_in, mag_pressure_out
 real*8  :: pressure_e, pressure_e_in, pressure_e_out, pressure_i, pressure_i_in, pressure_i_out
-real*8  :: current_in, current_out, D_int, D_ext, P_ext, C_ext, delta_phi, phi, P_tot, D_tot
+real*8  :: current_in, current_out, D_int, D_ext, P_ext, mag_pres_ext, C_ext, delta_phi, phi, P_tot, mag_pres_tot, D_tot
+real*8  :: beta_tot, beta_in, beta_out, vmec_beta_tot, vmec_beta_in, vmec_beta_out
+real*8  :: VB_int, VB_ext, VB_tot
 real*8  :: C_intern_3d, C_ext_3d, current_R_in, current_R_out, current_R, P_e_ext, P_i_ext, P_e_tot, P_i_tot
 real*8  :: VP_int, VP_ext, VK_int, VK_ext, vpar0, Bv2, BB2, VP_tot, VK_tot
 real*8  :: kin_par_in, kin_par_out, kin_par_tot, kin_perp_in, kin_perp_out, kin_perp_tot
@@ -165,11 +169,13 @@ real*8  :: viscopar_flux, viscopar_f, vpar_s, vpar_t, vpar_x, vpar_y, li3_tot, l
 real*8  :: varmin(n_var), varmax(n_var), V_min(n_var), V_max(n_var)
 
 !> for use_ncs
-real*8  :: aux_rho0, aux_T0, aux_Vpar0
+real*8  :: aux_rho0, aux_E0, aux_mom_par0
+real*8  :: aux_E0_Ti, aux_E0_Te
 real*8  :: aux_P0, aux_P0_s,  aux_P0_t, aux_P0_p, aux_q0, aux_jx0, aux_jy0, aux_jz0, aux_jz0_pcs 
 !Ionisation recombination for aux/use_ncs purposes. 
-real*8  :: Nion, Nrec, plasmaneutral, Prec, Prb, Prb_cooling !Also needed for use_ncs
-real*8  :: local_Nion, local_Nrec, local_pn, local_Prec, local_Prb, local_Prb_cooling  !Also needed for use_ncs
+real*8  :: Nion, Nrec, Prec, Prb, Prb_cooling !Also needed for use_ncs
+real*8  :: plasmaneutral, plasmaneutral_e, plasmaneutral_i, local_pn, local_pn_e, local_pn_i ! ncs/ics energy coupling terms (single T, Te, Ti)
+real*8  :: local_Nion, local_Nrec, local_Prec, local_Prb, local_Prb_cooling  !Also needed for use_ncs
 real*8  :: local_aux_mom_par_int ,local_aux_mom_par_ext, local_aux_mom_par_tot  ! coupled parallel momentum
 real*8  :: aux_mom_par_int ,aux_mom_par_ext, aux_mom_par_tot  ! coupled parallel momentum
 !> For model500 + use_ncs
@@ -271,10 +277,18 @@ real*8     :: frad_bg, Lrad_imp                               ! Retain hard-code
 real*8     :: SAW_tot, saw_energy_tot, saw_ene_dens, BB2_zero
 
 #ifndef NOMPIVERSION
-call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr) ! number of MPI procs
-n_cpu = max(n_cpu,1)
+call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr) ! number of MPI procs
+n_mpi = max(n_mpi,1)
 #else
-n_cpu = 1
+n_mpi = 1
+#endif
+
+#if STELLARATOR_MODEL
+if (n_coord_tor .le. 1) then
+  if (my_id .eq. 0) write(*,*) &
+    "INFO: int3d_new skipped: n_coord_tor=1 incompatible with stellarator integral path"
+  return
+end if
 #endif
 
 if (my_id .eq. 0) then
@@ -282,7 +296,7 @@ if (my_id .eq. 0) then
   write(*,*) '* Integrals  (3D)                     *'
   write(*,*) '***************************************'
   !write(*,*) ' n_plane : ',n_plane
-  !write(*,*) ' n_cpu   : ',n_cpu
+  !write(*,*) ' n_mpi   : ',n_mpi
 endif
 
 
@@ -291,6 +305,9 @@ density_tot  = 0.d0
 pressure = 0.d0
 pressure_i = 0.d0
 pressure_e = 0.d0
+mag_pres_tot = 0.d0
+mag_pres_int = 0.d0
+mag_pres_ext = 0.d0
 D_int    = 0.d0
 P_int    = 0.d0
 P_e_int  = 0.d0
@@ -304,6 +321,7 @@ VP_int   = 0.d0
 local_mom_par_int = 0.d0 
 VK_int   = 0.d0
 VM_int   = 0.d0
+VB_int   = 0.d0
 J2_int   = 0.d0
 D_ext    = 0.d0
 P_ext    = 0.d0
@@ -318,8 +336,10 @@ VP_ext   = 0.d0
 local_mom_par_ext = 0.d0
 VK_ext   = 0.d0
 VM_ext   = 0.d0
+VB_ext   = 0.d0
 J2_ext   = 0.d0
-Vol      = 0.d0
+Vol_in   = 0.d0
+Vol_ext  = 0.d0
 surface_area = 0.d0
 area1    = 0.d0
 P_tot    = 0.d0
@@ -331,6 +351,7 @@ VP_tot   = 0.d0
 local_mom_par_tot = 0.d0
 VK_tot   = 0.d0
 VM_tot   = 0.d0
+VB_tot   = 0.d0
 J2_tot   = 0.d0
 hel1     = 0.d0
 heli_tot = 0.d0
@@ -374,7 +395,7 @@ local_n_particles     = 0.d0
 
 local_Nion = 0.d0
 local_Nrec = 0.d0
-local_pn   = 0.d0
+local_pn   = 0.d0; local_pn_e   = 0.d0; local_pn_i   = 0.d0
 local_Prec = 0.d0
 local_Prb  = 0.d0        ! Radiation power (as would be measured by a bolometer, i.e. uses LradDCont_T)
 local_Prb_cooling = 0.d0 ! Radiative cooling power (radiative energy lost from the plasma, i.e. uses LradDcont_corr)
@@ -420,7 +441,7 @@ psi_axis   = ES%psi_axis;        R_axis = ES%R_axis;        Z_axis = ES%Z_axis
 psi_xpoint = ES%psi_xpoint;    R_xpoint = ES%R_xpoint;    Z_xpoint = ES%Z_xpoint 
 psi_bnd    = ES%psi_bnd
 
-ife_delta = ceiling(float(element_list%n_elements) / n_cpu)
+ife_delta = ceiling(float(element_list%n_elements) / n_mpi)
 ife_min   =      my_id     * ife_delta + 1
 ife_max   = min((my_id +1) * ife_delta, element_list%n_elements)
 
@@ -432,8 +453,9 @@ Tie_min_neg = 0.5*T_min_neg
 !$omp   shared(element_list,node_list, aux_node_list, H, H_s, H_t, HZ, HZ_p, ife_min, ife_max, xpoint, xcase, &
 !$omp          H_ss, H_tt, H_st, HZ_pp, HZ_coord, HZ_coord_p,                                                 &
 !$omp          R_xpoint, Z_xpoint, my_id, use_pellet, delta_phi, R_axis, Z_axis, psi_axis, psi_bnd,           &
-!$omp          D_tot, D_int, D_Ext, P_tot, P_int, P_ext, Vol, surface_area, C_intern, C_ext, VP_ext, VP_int,  &
-!$omp          VK_ext, VK_int, VK_tot, VM_ext, VM_int, VM_tot, J2_tot, J2_ext, J2_int,                        &
+!$omp          D_tot, D_int, D_Ext, P_tot, P_int, P_ext, mag_pres_tot, mag_pres_int, mag_pres_ext,            &
+!$omp          Vol_in, Vol_ext, surface_area, C_intern, C_ext, VP_ext, VP_int, VK_ext, VK_int, VK_tot,        &
+!$omp          VM_ext, VM_int, VM_tot, VB_ext, VB_int, VB_tot, J2_tot, J2_ext, J2_int,                        &
 !$omp          H_int, H_ext, S_int, S_ext,psi_xpoint,  F0, VP_tot,eta, T_0, Te_0, T_min,                      &
 !$omp          ne_SI_min, Te_eV_min, rn0_min, P_e_tot, P_i_tot, P_e_int, P_i_int, P_e_ext, P_i_ext,           &
 !$omp          C_intern_3d,C_ext_3d,pellet_amplitude,pellet_R,pellet_Z,pellet_psi,pellet_phi,                 &
@@ -446,8 +468,15 @@ Tie_min_neg = 0.5*T_min_neg
 !$omp          vpar_disp_tot, vprp_disp_tot, fric_disp_tot, area1, mag_src_tot, momentum_x, momentum_y,       &
 !$omp          eta_ohmic, central_mass, R2curr_tmp, Zcurr_tmp, ksi_ion,                                       &
 !$omp          local_mom_par_int, local_mom_par_ext, local_mom_par_tot,                                       &
-!$omp          use_ncs, local_Nion, local_Nrec, local_pn, local_Prec, local_Prb, local_Prb_cooling,           &
-!$omp          local_aux_mom_par_int,local_aux_mom_par_ext,local_aux_mom_par_tot,                             &
+!$omp          use_ncs, use_ics, local_Nion, local_Nrec, local_Prec, local_Prb, local_Prb_cooling,            &
+!$omp          local_aux_mom_par_int,local_aux_mom_par_ext,local_aux_mom_par_tot, n_aux_var, bloating_factor, &
+!$omp          rho_idx_kin, mom_par_idx_kin,                                                                  &
+!$omp          local_pn_e, local_pn_i, local_pn,                                                              &
+#ifdef WITH_TiTe
+!$omp           E_Te_idx_kin, E_Ti_idx_kin,                                                                   &
+#else
+!$omp           E_idx_kin,                                                                                    &
+#endif
 #if (defined WITH_Neutrals) || (defined WITH_Impurities)
 !$omp          spi_num_vol, local_source_volume, local_source_volume_drift, drift_distance,                   &
 !$omp          using_spi, n_spi_tot, n_inj, n_spi,                                                            &
@@ -469,9 +498,9 @@ Tie_min_neg = 0.5*T_min_neg
 !$omp   private(ife,iv,inode,element,i,j, k,in, mp, ms, mt,                                             &
 !$omp           x_g, y_g, x_s, y_s, x_t, y_t, x_p, y_p, xjac, xjac_R, xjac_Z, eq_g, eq_s, eq_t, eq_p,         &
 !$omp           x_ss, x_tt, x_st, y_ss, y_tt, y_st, eq_ss, eq_tt, eq_st, eq_sp, eq_tp,                        &
-!$omp           eq_spp, eq_tpp, psi_axisym,s_norm, stel_current_source,eq_s_3d, eq_t_3d, wst, BigR,           &
-!$omp           r0, T0, Te0, zj0, ps0, dTdx, dTdy, drhodx, drhody, dpsidx, dpsidy, dpsidp, dudx, dudy,dudp,   &
-!$omp           dpsidx_3d, dpsidy_3d, saw_ene_dens, BB2_zero,                                                 &
+!$omp           eq_spp, eq_tpp, psi_axisym,s_norm, stel_current_source,eq_s_3d, eq_t_3d,                      &
+!$omp           wst, BigR, r0, T0, Te0, zj0, ps0, dTdx, dTdy, drhodx, drhody, dpsidx, dpsidy, dpsidp, dudx, dudy,dudp,  &
+!$omp           dpsidx_3d, dpsidy_3d, saw_ene_dens, BB2_zero, r0_s, r0_t, r0_p,                               &
 !$omp           w0, dwdx, dwdy, u0_xpp, u0_ypp, visco_T, visco_fact_old, visco_fact_new,                      &
 !$omp           dpdx, dpdy, phi, Ti0, psi_as_coord, vprp_disp,                                                &
 !$omp           source_pellet, source_volume, eq_zne, eq_zTe, vpar0, BB2, chi, Bv2,                           &
@@ -485,9 +514,10 @@ Tie_min_neg = 0.5*T_min_neg
 !$omp           AZ0_Zp, A30, A30_p, A30_s, A30_t, A30_ss, A30_tt, A30_st, A30_R, A30_RR, A30_ZZ, BR_Z, BZ_R,  &
 !$omp           Srec_T_ncs, dSrec_dT_ncs, ksi_ion_norm, LradDcont_T_ncs, dLradDcont_dT_ncs, Sion_T_ncs,       &
 !$omp           LradDcont_corr_ncs, dLradDcont_dT_corr_ncs,                                                   &
-!$omp           dSion_dT_ncs, eq_aux_g, eq_aux_s, eq_aux_t, eq_aux_p, aux_rho0, aux_T0, aux_Vpar0, &
+!$omp           dSion_dT_ncs, eq_aux_g, eq_aux_s, eq_aux_t, eq_aux_p, aux_rho0, aux_mom_par0,                 &
 !$omp           aux_P0, aux_P0_s, aux_P0_t, aux_P0_p, aux_q0, aux_jx0, aux_jy0, aux_jz0, aux_jz0_pcs,         &
 !$omp           eta_T_ohm, rn0, rn0_corr, rimp0, rimp0_corr, Z_eff, lnA, alpha_e,                             &
+!$omp           aux_E0_Ti, aux_E0_Te, aux_E0,                                                                 &
 #if (defined WITH_Neutrals) || (defined WITH_Impurities)
 !$omp           i_imp, frad_bg, Lrad_imp, Te_corr_eV, Te_eV, ne_SI, Ti_eV,                                    &
 !$omp           spi_R_tmp, spi_Z_tmp, spi_phi_tmp, ns_radius_tmp,                                             &
@@ -516,7 +546,7 @@ Tie_min_neg = 0.5*T_min_neg
 !$omp           Arad_bg, Brad_bg, Crad_bg,                                                                    &
 !$omp           coef_prad_si,                                                                                 &
 #endif
-!$omp           omp_nthreads,omp_tid)                                                          &
+!$omp           omp_nthreads,omp_tid)                                                                         &
 !$omp   firstprivate(nodes, aux_nodes) !< so that these nodes are unallocated at the start of the omp region and can be explicitly allocated/deallocated 
 
 
@@ -537,13 +567,15 @@ omp_tid      = 0
 #endif
 !$omp                D_int, D_ext, P_int, H_int, S_int, H_ext, S_ext, P_ext, C_intern, C_ext, &
 !$omp                P_e_int, P_i_int, P_e_ext, P_i_ext, P_e_tot, P_i_tot,                    &
+!$omp                mag_pres_tot, mag_pres_int, mag_pres_ext,                                &
 !$omp                VP_int, VP_ext, VP_tot, VK_tot, VK_int, VK_ext, VM_ext,                  &
-!$omp                VM_int, VM_tot, Vol, surface_area, P_tot, D_tot,J2_tot, J2_int, J2_ext,                &
+!$omp                VM_int, VM_tot, VB_ext, VB_int, VB_tot, Vol_in, Vol_ext,                 &
+!$omp                surface_area, P_tot, D_tot,J2_tot, J2_int, J2_ext,                       &
 !$omp                local_Nion, local_Nrec, local_pn, local_Prec, local_Prb ,                &
 !$omp                local_aux_mom_par_int,local_aux_mom_par_ext,local_aux_mom_par_tot,       &
 !$omp                local_mom_par_int, local_mom_par_ext, local_mom_par_tot,                        &
 !$omp                heli_tot, mag_wk_tot, vpar_disp_tot, thm_wk_tot, area1, mag_src_tot,H_impl_int,H_impl_ext, &
-!$omp                fric_disp_tot, R2curr_tmp, Zcurr_tmp, C_intern_3d, C_ext_3d, vprp_disp_tot)
+!$omp                fric_disp_tot, R2curr_tmp, Zcurr_tmp, C_intern_3d, C_ext_3d, vprp_disp_tot, bloating_factor)
 
 do ife = ife_min, ife_max
   element = element_list%element(ife)
@@ -556,7 +588,8 @@ do ife = ife_min, ife_max
   enddo
 
 eq_aux_g = 0.d0; eq_aux_s = 0.d0; eq_aux_t = 0.d0; eq_aux_p = 0.d0;  
-aux_rho0  = 0.d0; aux_T0    = 0.d0; aux_Vpar0 = 0.d0
+aux_rho0  = 0.d0; aux_E0    = 0.d0; aux_mom_par0 = 0.d0
+aux_E0_Ti = 0.d0; aux_E0_Te = 0.d0
 aux_P0    = 0.d0; aux_P0_s  = 0.d0; aux_P0_t  = 0.d0; aux_P0_p  = 0.d0
 aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_pcs = 0.d0
   
@@ -633,13 +666,6 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
                 eq_st(mp,k,ms,mt) = eq_st(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_st(i,j,ms,mt)* HZ(in,mp)
                 eq_spp(mp,k,ms,mt) = eq_spp(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_s(i,j,ms,mt)*HZ_pp(in,mp)
                 eq_tpp(mp,k,ms,mt) = eq_tpp(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_t(i,j,ms,mt)*HZ_pp(in,mp)
-
-                if (present(aux_node_list)) then
-                  eq_aux_g(mp,k,ms,mt) =  eq_aux_g(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) * element%size(i,j) * H(i,j,ms,mt)   * HZ(in,mp)
-                  eq_aux_s(mp,k,ms,mt) =  eq_aux_s(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) * element%size(i,j) * H_s(i,j,ms,mt) * HZ(in,mp)
-                  eq_aux_t(mp,k,ms,mt) =  eq_aux_t(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) * element%size(i,j) * H_t(i,j,ms,mt) * HZ(in,mp)
-                  eq_aux_p(mp,k,ms,mt) =  eq_aux_p(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) * element%size(i,j) * H(i,j,ms,mt)   * HZ_p(in,mp)
-                endif ! present(aux_node_list)
                 
                 if ( in == 1 ) cycle ! Record only the non-axisymmetric components
                 eq_s_3d(mp,k,ms,mt) = eq_s_3d(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_s(i,j,ms,mt)* HZ(in,mp)
@@ -647,6 +673,18 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
              
               enddo !n_tor
             enddo !n_var
+
+            if (present(aux_node_list)) then
+              do k=1,n_aux_var
+                do in=1,n_tor
+                  eq_aux_g(mp,k,ms,mt) =  eq_aux_g(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) * element%size(i,j) * H(i,j,ms,mt)   * HZ(in,mp)
+                  eq_aux_s(mp,k,ms,mt) =  eq_aux_s(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) * element%size(i,j) * H_s(i,j,ms,mt) * HZ(in,mp)
+                  eq_aux_t(mp,k,ms,mt) =  eq_aux_t(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) * element%size(i,j) * H_t(i,j,ms,mt) * HZ(in,mp)
+                  eq_aux_p(mp,k,ms,mt) =  eq_aux_p(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) * element%size(i,j) * H(i,j,ms,mt)   * HZ_p(in,mp)
+                enddo
+              enddo
+            endif ! present(aux_node_list)
+
 	        enddo !mt n_gauss
         enddo !ms n_gauss
       enddo !mp nplane
@@ -702,8 +740,19 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         Bv2 = chi(1,0,0)**2 + chi(0,1,0)**2 + chi(0,0,1)**2/BigR**2
 #endif
 
-        r0     = eq_g(mp,var_rho,ms,mt)
-        r0_corr = corr_neg_dens(r0)
+        if (with_rho) then
+          r0      = eq_g(mp,var_rho,ms,mt)
+          r0_corr = corr_neg_dens(r0)
+          r0_s    = eq_s(mp,var_rho,ms,mt)
+          r0_t    = eq_t(mp,var_rho,ms,mt)
+          r0_p    = eq_p(mp,var_rho,ms,mt)
+        else
+          r0      = 1.d0
+          r0_corr = 1.d0
+          r0_s    = 0.d0
+          r0_t    = 0.d0
+          r0_p    = 0.d0
+        endif
 #ifdef WITH_TiTe
         Ti0    = eq_g(mp,var_Ti,ms,mt)
         Te0    = eq_g(mp,var_Te,ms,mt)
@@ -737,10 +786,15 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         vpar_s  = eq_s(mp,var_Vpar,ms,mt)
         vpar_t  = eq_t(mp,var_Vpar,ms,mt)
 
-        if (use_ncs) then
-                aux_rho0  = eq_aux_g(mp,1,ms,mt)
-                aux_T0    = eq_aux_g(mp,2,ms,mt)
-                aux_Vpar0 = eq_aux_g(mp,3,ms,mt)
+        if (use_ncs .or. use_ics) then
+                if (use_ncs) aux_rho0     = eq_aux_g(mp,rho_idx_kin,ms,mt)
+#ifdef WITH_TiTe
+                aux_E0_Te = eq_aux_g(mp,E_Te_idx_kin,ms,mt)
+                aux_E0_Ti = eq_aux_g(mp,E_Ti_idx_kin,ms,mt)
+#else
+                aux_E0       = eq_aux_g(mp,E_idx_kin,ms,mt)
+#endif
+                aux_mom_par0 = eq_aux_g(mp,mom_par_idx_kin,ms,mt)
         end if
 
 #if (defined WITH_Neutrals)
@@ -802,8 +856,8 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         ! Some of these do not seem to be doing anything so I'm commenting them off !
         !dTdx   = (   y_t(mp,ms,mt) * eq_s(mp,var_T,ms,mt) - y_s(mp,ms,mt) * eq_t(mp,var_T,ms,mt) ) / xjac
         !dTdy   = ( - x_t(mp,ms,mt) * eq_s(mp,var_T,ms,mt) + x_s(mp,ms,mt) * eq_t(mp,var_T,ms,mt) ) / xjac
-        !drhodx = (   y_t(mp,ms,mt) * eq_s(mp,var_rho,ms,mt) - y_s(mp,ms,mt) * eq_t(mp,var_rho,ms,mt) ) / xjac
-        !drhody = ( - x_t(mp,ms,mt) * eq_s(mp,var_rho,ms,mt) + x_s(mp,ms,mt) * eq_t(mp,var_rho,ms,mt) ) / xjac
+        !drhodx = (   y_t(mp,ms,mt) * r0_s - y_s(mp,ms,mt) * r0_t ) / xjac
+        !drhody = ( - x_t(mp,ms,mt) * r0_s + x_s(mp,ms,mt) * r0_t ) / xjac
 
         dpsidx = (   y_t(mp,ms,mt) * eq_s(mp,var_psi,ms,mt) - y_s(mp,ms,mt) * eq_t(mp,var_psi,ms,mt) ) / xjac
         dpsidy = ( - x_t(mp,ms,mt) * eq_s(mp,var_psi,ms,mt) + x_s(mp,ms,mt) * eq_t(mp,var_psi,ms,mt) ) / xjac
@@ -853,7 +907,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 !-------------------------------------------
 ! --- USE NCS, PARTICLE NEUTRAL AND IMPURITY COUPLE SCHEME
 ! ------------------------------------------
-        if(use_ncs) then 
+        if(use_ncs .or. use_ics) then 
           ksi_ion_norm = central_density * 1.d20 * ksi_ion
           call rec_rate_to_kinetic(r0, 0.5d0*T0, Sion_T_ncs, dSion_dT_ncs, Srec_T_ncs, dSrec_dT_ncs, &
                                    LradDcont_T_ncs, dLradDcont_dT_ncs, LradDcont_corr_ncs, dLradDcont_dT_corr_ncs)
@@ -865,10 +919,15 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
           local_Nrec = local_Nrec + (Srec_T_ncs * r0_corr * r0_corr)*BigR *xjac * delta_phi *wst ! rho_rec
           
           !> coupled energies
-          !>aux_T0 (plasma neutral interaction)
-          local_pn = local_pn + aux_T0 *BigR * xjac* delta_phi * wst !& !aux_T0
+          !>aux_E0 (plasma neutral interaction)
+#ifdef WITH_TiTe
+          local_pn_e = local_pn_e + aux_E0_Te *BigR * xjac* delta_phi * wst
+          local_pn_i = local_pn_i + aux_E0_Ti *BigR * xjac* delta_phi * wst
+#else
+          local_pn = local_pn + aux_E0 *BigR * xjac* delta_phi * wst !& !aux_E0
                       !+ (gamma-1.d0)* 0.5d0 *aux_rho0 *vpar0**2 * BB2 * BigR*xjac* delta_phi *wst &
-                      !- (gamma-1.d0)* aux_Vpar0 * vpar0 * BigR *xjac* delta_phi *wst
+                      !- (gamma-1.d0)* aux_mom_par0 * vpar0 * BigR *xjac* delta_phi *wst
+#endif
           !>Lost to recombination (no Brehmstralung)
           local_Prec = local_Prec + r0_corr*r0_corr*(T0_corr*Srec_T_ncs)*BigR *xjac* delta_phi *wst
           ! Radiation power of recombination and bremsstrahlung combined
@@ -876,7 +935,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
           ! Radiative cooling power of recombination and bremsstrahlung combined
           local_Prb_cooling = local_Prb_cooling + r0_corr*r0_corr *LradDcont_corr_ncs *BigR *xjac* delta_phi *wst
           !> aux_vpar = dot_product(SI momentum source,B). so we  divide by |B| to obtain the integral of the SI momentum
-          local_aux_mom_par_tot=local_aux_mom_par_tot+ aux_vpar0 /sqrt(BB2) * xjac * BigR * wst * delta_phi !< * sqrt(BB2)
+          local_aux_mom_par_tot=local_aux_mom_par_tot+ aux_mom_par0 /sqrt(BB2) * xjac * BigR * wst * delta_phi !< * sqrt(BB2)
 
         endif ! use_ncs  
  
@@ -1163,28 +1222,28 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         P_tot   = P_e_tot + P_i_tot
 
         p0_s   = (r0+alpha_i*rimp0)*eq_s(mp,var_Ti,ms,mt) &
-                 + Ti0 * (eq_s(mp,var_rho,ms,mt)+alpha_i*eq_s(mp,var_rhoimp,ms,mt))&
+                 + Ti0 * (r0_s+alpha_i*eq_s(mp,var_rhoimp,ms,mt))&
                  + (r0+alpha_e*rimp0+dalpha_e_dT*rimp0*Te0)*eq_s(mp,var_Te,ms,mt)&
-                 + Te0 * (eq_s(mp,var_rho,ms,mt)+alpha_e*eq_s(mp,var_rhoimp,ms,mt))
+                 + Te0 * (r0_s+alpha_e*eq_s(mp,var_rhoimp,ms,mt))
         p0_t   = (r0+alpha_i*rimp0)*eq_t(mp,var_Ti,ms,mt) &
-                 + Ti0 * (eq_t(mp,var_rho,ms,mt)+alpha_i*eq_t(mp,var_rhoimp,ms,mt))&
+                 + Ti0 * (r0_t+alpha_i*eq_t(mp,var_rhoimp,ms,mt))&
                  + (r0+alpha_e*rimp0+dalpha_e_dT*rimp0*Te0)*eq_t(mp,var_Te,ms,mt)&
-                 + Te0 * (eq_t(mp,var_rho,ms,mt)+alpha_e*eq_t(mp,var_rhoimp,ms,mt))
+                 + Te0 * (r0_t+alpha_e*eq_t(mp,var_rhoimp,ms,mt))
         p0_p   = (r0+alpha_i*rimp0)*eq_p(mp,var_Ti,ms,mt) &
-                 + Ti0 * (eq_p(mp,var_rho,ms,mt)+alpha_i*eq_p(mp,var_rhoimp,ms,mt))&
+                 + Ti0 * (r0_p+alpha_i*eq_p(mp,var_rhoimp,ms,mt))&
                  + (r0+alpha_e*rimp0+dalpha_e_dT*rimp0*Te0)*eq_p(mp,var_Te,ms,mt)&
-                 + Te0 * (eq_p(mp,var_rho,ms,mt)+alpha_e*eq_p(mp,var_rhoimp,ms,mt))
+                 + Te0 * (r0_p+alpha_e*eq_p(mp,var_rhoimp,ms,mt))
 #else /* WITH_TiTe */
         P_tot  = P_tot  + (r0+alpha_imp*rimp0) * T0 * xjac * BigR * wst * delta_phi
         P_e_tot = P_tot / 2.
         P_i_tot = P_e_tot
 
         p0_s   = (r0+alpha_imp*rimp0+dalpha_imp_dT*rimp0*T0)*eq_s(mp,var_T,ms,mt) &
-                 + T0 * (eq_s(mp,var_rho,ms,mt)+alpha_imp*eq_s(mp,var_rhoimp,ms,mt))
+                 + T0 * (r0_s+alpha_imp*eq_s(mp,var_rhoimp,ms,mt))
         p0_t   = (r0+alpha_imp*rimp0+dalpha_imp_dT*rimp0*T0)*eq_t(mp,var_T,ms,mt) &
-                 + T0 * (eq_t(mp,var_rho,ms,mt)+alpha_imp*eq_t(mp,var_rhoimp,ms,mt))
+                 + T0 * (r0_t+alpha_imp*eq_t(mp,var_rhoimp,ms,mt))
         p0_p   = (r0+alpha_imp*rimp0+dalpha_imp_dT*rimp0*T0)*eq_p(mp,var_T,ms,mt) &
-                 + T0 * (eq_p(mp,var_rho,ms,mt)+alpha_imp*eq_p(mp,var_rhoimp,ms,mt))
+                 + T0 * (r0_p+alpha_imp*eq_p(mp,var_rhoimp,ms,mt))
 #endif /* WITH_TiTe */
 #else /* WITH_Impurities */
         D_tot  = D_tot  + r0       * xjac * BigR * wst * delta_phi
@@ -1193,21 +1252,21 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         P_i_tot = P_i_tot + r0 * Ti0 * xjac * BigR * wst * delta_phi
         P_tot   = P_e_tot + P_i_tot
 
-        p0_s   = r0*eq_s(mp,var_Te,ms,mt) + Te0 * eq_s(mp,var_rho,ms,mt) &
-                 +r0*eq_s(mp,var_Ti,ms,mt) + Ti0 * eq_s(mp,var_rho,ms,mt)
-        p0_t   = r0*eq_t(mp,var_Te,ms,mt) + Te0 * eq_t(mp,var_rho,ms,mt) &
-                 +r0*eq_t(mp,var_Ti,ms,mt) + Ti0 * eq_t(mp,var_rho,ms,mt)
-        p0_p   = r0*eq_p(mp,var_Te,ms,mt) + Te0 * eq_p(mp,var_rho,ms,mt) &
-                 +r0*eq_p(mp,var_Ti,ms,mt) + Ti0 * eq_p(mp,var_rho,ms,mt)
+        p0_s   = r0*eq_s(mp,var_Te,ms,mt) + Te0 * r0_s &
+                 +r0*eq_s(mp,var_Ti,ms,mt) + Ti0 * r0_s
+        p0_t   = r0*eq_t(mp,var_Te,ms,mt) + Te0 * r0_t &
+                 +r0*eq_t(mp,var_Ti,ms,mt) + Ti0 * r0_t
+        p0_p   = r0*eq_p(mp,var_Te,ms,mt) + Te0 * r0_p &
+                 +r0*eq_p(mp,var_Ti,ms,mt) + Ti0 * r0_p
 #else /* WITH_TiTe */
 
         P_tot  = P_tot  + r0 * T0 * xjac * BigR * wst * delta_phi
         P_e_tot = P_tot / 2.
         P_i_tot = P_e_tot
 
-        p0_s   = r0*eq_s(mp,var_T,ms,mt) + T0 * eq_s(mp,var_rho,ms,mt) 
-        p0_t   = r0*eq_t(mp,var_T,ms,mt) + T0 * eq_t(mp,var_rho,ms,mt) 
-        p0_p   = r0*eq_p(mp,var_T,ms,mt) + T0 * eq_p(mp,var_rho,ms,mt) 
+        p0_s   = r0*eq_s(mp,var_T,ms,mt) + T0 * r0_s 
+        p0_t   = r0*eq_t(mp,var_T,ms,mt) + T0 * r0_t 
+        p0_p   = r0*eq_p(mp,var_T,ms,mt) + T0 * r0_p 
 #endif /* WITH_TiTe */
 #endif /* WITH_Impurities */
 
@@ -1228,9 +1287,15 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
                - (chi(1,0,0)*dudx + chi(0,1,0)*dudy + chi(0,0,1)*dudp/BigR**2)**2/Bv2**2)*xjac*BigR*wst*delta_phi
         VM_tot = VM_tot + (Bv2*(dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2) &
                - (chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)*xjac*BigR*wst*delta_phi/F0**2
+        VB_tot  = VB_tot + 2.0*r0*T0 / (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                   - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2) *xjac*BigR*wst*delta_phi
+        mag_pres_tot = mag_pres_tot + (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                    - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2)/2 *xjac*BigR*wst*delta_phi
 #else
         VK_tot = VK_tot + r0 * (dudx**2 + dudy**2) * BigR**2 * xjac * BigR * wst * delta_phi
         VM_tot = VM_tot + (dpsidx**2+dpsidy**2)/BigR**2 * xjac * BigR * wst * delta_phi
+        VB_tot = VB_tot + 2.0*r0*T0 / BB2 * xjac * BigR * wst * delta_phi
+        mag_pres_tot = mag_pres_tot + BB2/2 * xjac * BigR * wst * delta_phi
 #endif
         J2_tot = J2_tot + eta_T_ohm *(ZJ0/BigR)**2.d0 * xjac * BigR * wst * delta_phi
         
@@ -1432,7 +1497,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 #endif
 
 #if STELLARATOR_MODEL
-        if (s_norm(ms,mt) <= 1.d0) then
+        if (s_norm(ms,mt) <= 1.d0) then       ! Inside LCFS
 #else
         if ( get_psi_n(psi_as_coord, y_g(mp,ms,mt)) <= 1.d0 ) then   !inside LCFS
 #endif
@@ -1474,21 +1539,29 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
           C_intern = C_intern - zj0 /BigR * xjac *        wst * delta_phi    ! 2D integral
           C_intern_3d = C_intern_3d - zj0 * xjac * wst * delta_phi ! 3D integral
           area1    = area1    +  xjac * wst * delta_phi         
-          Vol   = Vol   +             xjac * BigR * wst * delta_phi
+          Vol_in   = Vol_in   +  xjac * BigR * wst * delta_phi
           H_int = H_int + heat_source     * xjac * BigR * wst * delta_phi
           S_int = S_int + particle_source * xjac * BigR * wst * delta_phi
           VP_int = VP_int + r0 * vpar0**2 * BB2 * xjac * BigR * wst * delta_phi
           local_mom_par_int = local_mom_par_int + r0 * vpar0 * sqrt(BB2) * xjac * BigR * wst * delta_phi
 #if STELLARATOR_MODEL
           VK_int = VK_int + r0*(dudx**2 + dudy**2)*BigR**2*xjac*BigR*wst*delta_phi/F0**2
+          VM_int = VM_int + (Bv2*(dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2) &
+                 - (chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)*xjac*BigR*wst*delta_phi/F0**2
+          VB_int  = VB_int  + 2.0*r0*T0 / (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                     - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2) *xjac*BigR*wst*delta_phi
+          mag_pres_int = mag_pres_int + (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                      - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2)/2 *xjac*BigR*wst*delta_phi
 #else
           VK_int = VK_int + r0 * (dudx**2 + dudy**2) * BigR**2 * xjac * BigR * wst * delta_phi
-#endif
           VM_int = VM_int + (dpsidx**2+dpsidy**2)/BigR**2 * xjac * BigR * wst * delta_phi
+          VB_int = VB_int + 2.0*r0*T0 / BB2 * xjac * BigR * wst * delta_phi
+          mag_pres_int = mag_pres_int + BB2/2 * xjac * BigR * wst * delta_phi
+#endif
           J2_int = J2_int + eta_T_ohm * (ZJ0/BigR)**2.d0 * xjac * BigR * wst * delta_phi
 
-          if (use_ncs) then 
-            local_aux_mom_par_int=local_aux_mom_par_int+ aux_vpar0 /sqrt(BB2)* xjac * BigR * wst * delta_phi !*sqrt(BB2)
+          if (use_ncs .or. use_ics) then 
+            local_aux_mom_par_int=local_aux_mom_par_int+ aux_mom_par0 /sqrt(BB2)* xjac * BigR * wst * delta_phi !*sqrt(BB2)
           endif 
 
           
@@ -1532,18 +1605,27 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
           C_ext_3d = C_ext_3d - zj0 * xjac * wst * delta_phi
           H_ext = H_ext + heat_source     * xjac * BigR * wst * delta_phi
           S_ext = S_ext + particle_source * xjac * BigR * wst * delta_phi
+          Vol_ext   = Vol_ext   +           xjac * BigR * wst * delta_phi
           VP_ext = VP_ext + r0 * vpar0**2 * BB2 * xjac * BigR * wst * delta_phi
           local_mom_par_ext = local_mom_par_ext + r0 * vpar0 * sqrt(BB2) * xjac * BigR * wst * delta_phi
 #if STELLARATOR_MODEL
           VK_ext = VK_ext + r0*(dudx**2 + dudy**2)*BigR**2*xjac*BigR*wst*delta_phi/F0**2
+          VM_ext = VM_ext + (Bv2*(dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2) &
+                 - (chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)*xjac*BigR*wst*delta_phi/F0**2
+          VB_ext  = VB_ext + 2.0*r0*T0 / (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                     - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2) *xjac*BigR*wst*delta_phi
+          mag_pres_ext = mag_pres_ext + (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                      - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2)/2 *xjac*BigR*wst*delta_phi
 #else
           VK_ext = VK_ext + r0 * (dudx**2 + dudy**2) * BigR**2 * xjac * BigR * wst * delta_phi
-#endif
           VM_ext = VM_ext + (dpsidx**2+dpsidy**2)/BigR**2 * xjac * BigR * wst * delta_phi
+          VB_ext = VB_ext + 2.0*r0*T0 / BB2 * xjac * BigR * wst * delta_phi
+          mag_pres_ext = mag_pres_ext + BB2/2 * xjac * BigR * wst * delta_phi
+#endif
           J2_ext = J2_ext + eta_T_ohm * (ZJ0/BigR)**2.d0 * xjac * BigR * wst * delta_phi
 
-          if (use_ncs) then 
-            local_aux_mom_par_ext=local_aux_mom_par_ext+ aux_vpar0 /sqrt(BB2)* xjac * BigR * wst * delta_phi !*sqrt(BB2)
+          if (use_ncs .or. use_ics) then 
+            local_aux_mom_par_ext=local_aux_mom_par_ext+ aux_mom_par0 /sqrt(BB2)* xjac * BigR * wst * delta_phi !*sqrt(BB2)
           endif  
          
 
@@ -1687,8 +1769,13 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
       ps0_sbnd = eq_s_1D(mp,var_psi ,ms)
       u0_sbnd  = eq_s_1D(mp,var_u   ,ms)
       zj0      = eq_g_1D(mp,var_Zj  ,ms) 
-      r0       = eq_g_1D(mp,var_rho ,ms) 
-      r0_corr  = corr_neg_dens(r0)
+      if (with_rho) then
+        r0       = eq_g_1D(mp,var_rho ,ms) 
+        r0_corr  = corr_neg_dens(r0)
+      else 
+        r0       = 1.d0
+        r0_corr  = 1.d0
+      endif
       T0       = eq_g_1D(mp,var_T   ,ms) 
 #ifdef WITH_TiTe
       Ti0      = eq_g_1D(mp,var_Ti,ms)
@@ -1769,9 +1856,14 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
           u_p = 0.d0
         end if
 
-        call interp(node_list,element_list,m_elm,var_rho,in,sg,tg,RH,RH_s,RH_t,RH_st,RH_ss,RH_tt)
-        rho_s = rho_s + RH_s * HZ(in,mp)
-        rho_t = rho_t + RH_t * HZ(in,mp)
+        if (with_rho) then
+          call interp(node_list,element_list,m_elm,var_rho,in,sg,tg,RH,RH_s,RH_t,RH_st,RH_ss,RH_tt)
+          rho_s = rho_s + RH_s * HZ(in,mp)
+          rho_t = rho_t + RH_t * HZ(in,mp)
+        else
+          rho_s = 0.d0
+          rho_t = 0.d0
+        endif
 
 #ifdef WITH_TiTe
         call interp(node_list,element_list,m_elm,var_Ti,in,sg,tg,TT,TT_s,TT_t,TT_st,TT_ss,TT_tt)
@@ -1852,8 +1944,13 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
 #endif
 
 #ifdef WITH_TiTe
-      ZK_e_prof     = get_zk_eperp(psi_n)
-      ZK_i_prof     = get_zk_iperp(psi_n)
+      if (use_zkperp_times_density) then 
+        ZK_e_prof     = get_zk_eperp(psi_n) * max(r0,zkperp_density_floor)
+        ZK_i_prof     = get_zk_iperp(psi_n) * max(r0,zkperp_density_floor)
+      else
+        ZK_e_prof     = get_zk_eperp(psi_n)
+        ZK_i_prof     = get_zk_iperp(psi_n)
+      end if
 
       ! --- Temperature dependent parallel heat conductivity
       call conductivity_parallel(ZK_i_par, ZK_par_max, Ti0, Ti0_corr, Ti_min_ZKpar, Ti_0,  & 
@@ -1862,7 +1959,11 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
                                  ZK_e_par_T, ZK_e_par_neg_thresh, ZK_e_par_neg)
 
 #else
-      ZK_prof = get_zkperp(psi_n)
+      if (use_zkperp_times_density) then
+        ZK_prof = get_zkperp(psi_n) * max(r0,zkperp_density_floor)
+      else
+        ZK_prof = get_zkperp(psi_n)
+      end if
 
       ! --- Temperature dependent parallel heat conductivity
       call conductivity_parallel(ZK_par, ZK_par_max, T0, T0_corr, T_min_ZKpar, T_0, &
@@ -1872,14 +1973,26 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
 
       if ( with_TiTe ) then ! (with_TiTe) ****************************************************
         if (Ti0 .lt. ZK_i_prof_neg_thresh) then
-          ZK_i_prof = ZK_i_prof_neg
+          if (use_zkperp_times_density) then
+            ZK_i_prof = ZK_i_prof_neg * max(r0,zkperp_density_floor)
+          else
+            ZK_i_prof = ZK_i_prof_neg
+          end if
         end if
         if (Te0 .lt. ZK_e_prof_neg_thresh) then
-          ZK_e_prof = ZK_e_prof_neg
+          if (use_zkperp_times_density) then
+            ZK_e_prof = ZK_e_prof_neg * max(r0,zkperp_density_floor)
+          else
+            ZK_e_prof = ZK_e_prof_neg
+          end if
         end if
       else ! (with_TiTe = .f.), i.e. with single temperature ***************************************
         if (T0 .lt. ZK_prof_neg_thresh) then
-          ZK_prof = ZK_prof_neg
+          if (use_zkperp_times_density) then
+            ZK_prof = ZK_prof_neg * max(r0,zkperp_density_floor)
+          else
+            ZK_prof = ZK_prof_neg
+          end if
         end if
       endif ! (with_TiTe) ********************************************************************
 
@@ -2032,13 +2145,17 @@ call MPI_AllReduce(P_e_int,pressure_e_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM
 call MPI_AllReduce(P_e_ext,pressure_e_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(P_i_int,pressure_i_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(P_i_ext,pressure_i_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(mag_pres_tot,mag_pressure,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(mag_pres_int,mag_pressure_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(mag_pres_ext,mag_pressure_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(C_intern,current_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(C_ext,current_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(C_intern_3d,current_R_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(C_ext_3d,current_R_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(R2curr_tmp,      R2curr,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(Zcurr_tmp , Z_curr_cent,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
-call MPI_AllReduce(Vol,Volume,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(Vol_in,Volume_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(Vol_ext,Volume_ext,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(area1,area,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(D_tot,density_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(P_tot,pressure,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
@@ -2059,6 +2176,9 @@ call MPI_AllReduce(VK_tot,kin_perp_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_W
 call MPI_AllReduce(VM_int,mag_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(VM_ext,mag_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(VM_tot,mag_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(VB_tot,beta_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(VB_int,beta_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(VB_ext,beta_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(SAW_tot,saw_energy_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(J2_int,ohm_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(J2_ext,ohm_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
@@ -2077,7 +2197,12 @@ call MPI_AllReduce(momentum_y,Py,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,i
 
 call MPI_AllReduce(local_Nion,Nion,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(local_Nrec,Nrec,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+#ifdef WITH_TiTe
+call MPI_AllReduce(local_pn_e,plasmaneutral_e,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(local_pn_i,plasmaneutral_i,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+#else
 call MPI_AllReduce(local_pn,plasmaneutral,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+#endif
 call MPI_AllReduce(local_Prec,Prec,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(local_Prb,Prb,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(local_Prb_cooling,Prb_cooling,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
@@ -2108,13 +2233,17 @@ pressure_e_in        = P_e_int
 pressure_e_out       = P_e_ext
 pressure_i_in        = P_i_int
 pressure_i_out       = P_i_ext
+mag_pressure         = mag_pres_tot
+mag_pressure_in      = mag_pres_int
+mag_pressure_out     = mag_pres_ext
 current_in           = C_intern
 current_out          = C_ext
 current_R_in         = C_intern_3d
 current_R_out        = C_ext_3d
 R2curr               = R2curr_tmp
 Z_curr_cent          = Zcurr_tmp
-Volume               = Vol
+Volume_in            = Vol_in
+Volume_ext           = Vol_ext
 area                 = area1
 density_tot          = D_tot
 pressure             = P_tot
@@ -2135,6 +2264,9 @@ kin_perp_tot         = VK_tot
 mag_in               = VM_int
 mag_out              = VM_ext
 mag_tot              = VM_tot
+beta_tot             = VB_tot
+beta_in              = VB_int
+beta_out             = VB_ext
 saw_energy_tot       = SAW_tot
 ohm_in               = J2_int
 ohm_out              = J2_ext
@@ -2156,7 +2288,12 @@ mom_par_ext = local_mom_par_ext
 mom_par_tot = local_mom_par_tot
 Nion                 = local_Nion
 Nrec                 = local_Nrec
+#ifdef WITH_TiTe
+plasmaneutral_e        = local_pn_e
+plasmaneutral_i        = local_pn_i
+#else
 plasmaneutral        = local_pn
+#endif
 Prec                 = local_Prec
 Prb                  = local_Prb
 Prb_cooling          = local_Prb_cooling
@@ -2256,6 +2393,9 @@ pressure_e_out       = n_period * pressure_e_out* fact_mu0  / (GAMMA-1.d0)
 pressure_i           = n_period * pressure_i    * fact_mu0  / (GAMMA-1.d0)
 pressure_i_in        = n_period * pressure_i_in * fact_mu0  / (GAMMA-1.d0)
 pressure_i_out       = n_period * pressure_i_out* fact_mu0  / (GAMMA-1.d0)
+mag_pressure         = n_period * mag_pressure    * fact_mu0 / (GAMMA-1.d0)
+mag_pressure_in      = n_period * mag_pressure_in * fact_mu0 / (GAMMA-1.d0)
+mag_pressure_out     = n_period * mag_pressure_out* fact_mu0 / (GAMMA-1.d0)
 kin_par_tot          = n_period * kin_par_tot * fact_mu0  * 0.5d0
 kin_par_in           = n_period * kin_par_in  * fact_mu0  * 0.5d0
 kin_par_out          = n_period * kin_par_out * fact_mu0  * 0.5d0
@@ -2286,16 +2426,29 @@ visco_dissip_tot     = n_period * visco_dissip_tot    * fact_flux
 viscopar_dissip_tot  = n_period * viscopar_dissip_tot * fact_flux
 friction_dissip_tot  = n_period * friction_dissip_tot * fact_flux
 mag_source_tot       = n_period * mag_source_tot      * fact_flux
-volume               = n_period * volume
+Volume_in            = n_period * Volume_in
+Volume_ext           = n_period * Volume_ext
 area                 = n_period * area / (2.d0 * PI)
 surface_area         = n_period * surface_area
+beta_tot             = n_period * beta_tot / (Volume_in + Volume_ext)
+beta_in              = n_period * beta_in  / Volume_in
+if (volume_ext .ne. 0) then
+  beta_out           = n_period * beta_out / Volume_ext
+else
+  beta_out           = 0.d0
+endif
 mom_par_int      = n_period * mom_par_int * rho_norm / t_norm
 mom_par_ext      = n_period * mom_par_ext * rho_norm / t_norm
 mom_par_tot      = n_period * mom_par_tot * rho_norm / t_norm
 
 Nion                 = n_period * Nion         * fact_part / t_norm2
 Nrec                 = n_period * Nrec         * fact_part / t_norm2
-plasmaneutral        = n_period * plasmaneutral* fact_flux / (GAMMA-1.d0) 
+#ifdef WITH_TiTe
+plasmaneutral_e        = n_period * plasmaneutral_e* fact_flux / (GAMMA-1.d0)
+plasmaneutral_i        = n_period * plasmaneutral_i* fact_flux / (GAMMA-1.d0)
+#else
+plasmaneutral        = n_period * plasmaneutral* fact_flux / (GAMMA-1.d0)
+#endif
 Prec                 = n_period * Prec         * fact_flux / (GAMMA-1.d0)
 Prb                  = n_period * Prb          * fact_flux / (GAMMA-1.d0)
 Prb_cooling          = n_period * Prb_cooling  * fact_flux / (GAMMA-1.d0)
@@ -2334,6 +2487,7 @@ else
 endif
 
 ! --- Derived quantities
+Volume       = Volume_in + Volume_ext
 E_tot        = mag_tot + pressure     + kin_par_tot + kin_perp_tot 
 E_in         = mag_in  + pressure_in  + kin_par_in  + kin_perp_in 
 E_out        = mag_out + pressure_out + kin_par_out + kin_perp_out 
@@ -2346,13 +2500,20 @@ Bgeo         = F0 / R_geo
 current_MA   = current_in * 1.d-6 * (1.d0/fact_mu0) * (1/mu_zero)
 current_R    = current_R_in * (1.d0/fact_mu0) * (1/mu_zero)
 beta_p       = 4.d0 * pressure_in/(R_geo * current_in**2 )     * (GAMMA-1)*fact_mu0
-beta_t       = 2.d0 * pressure_in / volume / Bgeo**2           * (GAMMA-1)/fact_mu0
+beta_t       = 2.d0 * pressure_in / volume_in / Bgeo**2           * (GAMMA-1)/fact_mu0
 beta_n       = 100.d0 * beta_t * Bgeo/current_MA * ES%LCFS_a
 li3          = 2.d0 * mag_in /0.5  /( current_in**2 * R_geo ) * fact_mu0
 li3_tot      = 2.d0 * mag_tot/0.5  /(current_tot**2 * R_geo ) * fact_mu0
 sheath_heatflux =  gamma_stangeby * (gamma-1)/(2.d0*gamma) * vn_p0 ! the factor comes to obtain n T_e v from vn_p0
 R_curr_cent  = sqrt(R2curr / current_tot) 
 Z_curr_cent  = Z_curr_cent / current_tot 
+vmec_beta_tot        = pressure/mag_pressure
+vmec_beta_in         = pressure_in/mag_pressure_in
+if (mag_pressure_out .ne. 0) then
+  vmec_beta_out      = pressure_out/mag_pressure_out
+else
+  vmec_beta_out      = 0.d0
+endif
 
 
 ! --- Externally calculated quantities
@@ -2373,9 +2534,14 @@ surface_list%psi_values(2) = ES%psi_axis + (ES%psi_bnd - ES%psi_axis) * 0.02d0
 surface_list%psi_values(3) = ES%psi_axis + (ES%psi_bnd - ES%psi_axis) * 0.95d0 
 surface_list%psi_values(4) = ES%psi_axis + (ES%psi_bnd - ES%psi_axis) * 0.99d0
 
-call find_flux_surfaces(my_id,xpoint, xcase, node_list, element_list, surface_list)
-call determine_q_profile(node_list, element_list, surface_list, ES%psi_axis, ES%psi_xpoint,    &
+if (.not. freeze_psi_dynamics) then
+  call find_flux_surfaces(my_id,xpoint, xcase, node_list, element_list, surface_list)
+  call determine_q_profile(node_list, element_list, surface_list, ES%psi_axis, ES%psi_xpoint,    &
      ES%Z_xpoint, qval, radav)
+else
+  qval  = 0.d0          ! Psi frozen (stellarator stage 1): no Psi flux surfaces, q not defined
+  radav = 0.d0
+endif
 
 q02 = qval(2)
 q95 = qval(3)
@@ -2633,7 +2799,7 @@ if (my_id .eq. 0) then
         res(iexpr) = area 
 
       case ( 'volume' )
-        res(iexpr) = volume
+        res(iexpr) = volume_in
 
       case ( 'q02' )
         res(iexpr) = q02 
@@ -2752,10 +2918,13 @@ if (my_id .eq. 0) then
     end do
   endif
 #endif
+  write(*,'(A,2es14.6,A)') ' Volume_in                       : ',xt,Volume_in,' [m^3]'
+  write(*,'(A,2es14.6,A)') ' Volume_ext                      : ',xt,Volume_ext,' [m^3]'
   write(*,'(A,2es14.6,A)') ' Volume                          : ',xt,volume,' [m^3]'
   write(*,'(A,2es14.6,A)') ' Surface area                    : ',xt,surface_area, '[m^2]'
   write(*,'(A,4es14.6,A)') ' density  (total/in/out)         : ',xt,density_tot,  density_in,  density_out,'[ 10^20/m^3]'
   write(*,'(A,4es14.6,A)') ' pressure (total/in/out)         : ',xt,pressure/1.d6, pressure_in/1.d6, pressure_out/1.d6,' [MJ]'
+  write(*,'(A,4es14.6,A)') ' magnetic pressure (total/in/out): ',xt,mag_pressure/1.d6, mag_pressure_in/1.d6, mag_pressure_out/1.d6, ' [MJ]'
   write(*,'(A,4es14.6,A)') ' kinetic parallel (total/in/out) : ',xt,kin_par_tot/1.d6, kin_par_in/1.d6, kin_par_out/1.d6,' [MJ]'
   write(*,'(A,4es14.6,A)') ' kinetic perp (total/in/out)     : ',xt,kin_perp_tot/1.d6, kin_perp_in/1.d6, kin_perp_out/1.d6,' [MJ]'
   write(*,'(A,4e14.6,A)')  ' parallel momentum (total/in/out): ',xt,mom_par_tot, mom_par_int, mom_par_ext,' [kg m/s]'
@@ -2769,6 +2938,10 @@ if (my_id .eq. 0) then
 
   write(*,'(A,2es14.6)')   ' li(3)                           : ',xt, li3 
   write(*,'(A,2es14.6)')   ' betap(1)                        : ',xt, beta_p
+  write(*,'(A,4es14.6)')   ' beta (total/in/out)             : ',xt,beta_tot,beta_in,beta_out
+  write(*,'(A,4es14.6)')   ' vmec_beta (total/in/out)        : ',xt,vmec_beta_tot,vmec_beta_in,vmec_beta_out
+  ! beta_tot/in/out is calculated via beta = 2 mu0 <p/B^2> and differs from vmec_beta_tot/in/out which is calculated via beta = 2 mu0 <p> / <B^2>
+  ! Also note that VMEC and other codes do not use the factor (GAMMA-1) in the definition of pressure.
 
   write(*,'(A)')           ' sum ,time ,density_tot, pressure, Wkin_par, Wkin_perp, Wmag, Ohm, heating, source'
 
@@ -2776,15 +2949,20 @@ if (my_id .eq. 0) then
                                  Ohm_tot/1.d6,heating_in/1d6+heating_out/1.d6 ,source_in+source_out
 
 
-  if (use_ncs) then
+  if (use_ncs .or. use_ics) then
     write(*,'(A)') '----------------------------------------'
     write(*,'(A)') ' Kinetic neutral integrals on fluid side                  '
     write(*,'(A,4es14.6,A)') ' Ion source (aux_rho0), Recomb loss                : ',xt,xt*t_norm, Nion, Nrec,' [#/m^3/s]'
-    write(*,'(A,5es14.6,A)') ' Parallel momentum source(aux_vpar0) (total/in/out): ',xt,xt*t_norm,aux_mom_par_tot, aux_mom_par_int, aux_mom_par_ext,' [kg m/s]'
-    write(*,'(A,3es14.6,A)') ' Heat source (aux_T0)         : ',xt,xt*t_norm, plasmaneutral/1.d6, ' [MW]'
-    write(*,'(A,4es14.6,A)') ' Prec, Prb, Prb_cooling       : ',xt,xt*t_norm,Prec/1.d6,Prb/1.d6,Prb_cooling/1.d6,' [MW]'
+    write(*,'(A,5es14.6,A)') ' Parallel momentum source(aux_mom_par0) (total/in/out): ',xt,xt*t_norm,aux_mom_par_tot, aux_mom_par_int, aux_mom_par_ext,' [kg m/s]'
+#ifdef WITH_TiTe
+    write(*,'(A,3es14.6,A)') ' Heat source electrons (aux_E0_Te)         : ',xt,xt*t_norm, plasmaneutral_e/1.d6, ' [MW]'
+    write(*,'(A,3es14.6,A)') ' Heat source ions (aux_E0_Ti)         : ',xt,xt*t_norm, plasmaneutral_i/1.d6, ' [MW]'
+#else
+    write(*,'(A,3es14.6,A)') ' Heat source (aux_E0)         : ',xt,xt*t_norm, plasmaneutral/1.d6, ' [MW]'
+#endif
+    write(*,'(A,5es14.6,A)') ' Prec, Prb, Prb_cooling       : ',xt,xt*t_norm,Prec/1.d6,Prb/1.d6,Prb_cooling/1.d6,' [MW]'
     write(*,'(A)') '----------------------------------------'
-  endif !use_ncs  
+  endif !use_ncs .or. use_ics 
 
 #if (defined WITH_Neutrals) || (defined WITH_Impurities)
   write(*,'(A,4es14.6)')   ' Integrals_3D, MGI              : ', total_n_particles_inj, total_n_particles
@@ -2878,7 +3056,7 @@ if (my_id .eq. 0) then
     part_src_in_t(index_now)         = source_in
     part_src_out_t(index_now)        = source_out
     area_t(index_now)                = area
-    volume_t(index_now)              = volume
+    volume_t(index_now)              = volume_in
     mag_ener_src_tot(index_now)      = mag_source_tot
     beta_n_t(index_now)              = beta_n
     beta_t_t(index_now)              = beta_t

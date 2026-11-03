@@ -27,9 +27,9 @@ program jorek2_poincare
   real*8,allocatable	:: T_turn(:,:), PSI_turn(:,:), ZN_turn(:,:)
   
   ! --- Extra data
-  integer		:: my_id, ikeep, n_cpu, ierr, nsend, nrecv, ikeep0, inode1, inode2, i_line0
+  integer		:: my_id, ikeep, n_mpi, ierr, nsend, nrecv, ikeep0, inode1, inode2, i_line0
   integer		:: elm_start, elm_end, elm_delta, local_elm_start, local_elm_end
-  integer		:: i_elm_half, cpu_fraction
+  integer		:: i_elm_half, mpi_fraction
   integer		:: nnos, n_scalars, ivtk, i_var, i_strike, i_strike0
   integer		:: i, j, iside_i, iside_j, ip, i_line, n_lines, i_tor, i_harm, i_var_psi, i_dir, k, m, ns, nt
   integer		:: i_elm, ifail, i_phi, n_phi, i_turn, n_turns, i_elm_out, i_elm_prev, i_elm_tmp,i_steps, n_turn_max(2)
@@ -85,7 +85,7 @@ program jorek2_poincare
   !required=MPI_THREAD_MULTIPLE
   !call MPI_Init_thread(required,provided,StatInfo)
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)      ! id of each MPI proc
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)      ! number of MPI procs
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)      ! number of MPI procs
   
   ! --- Initilise data
   call initialise_parameters(my_id, "__NO_FILENAME__")
@@ -179,17 +179,17 @@ program jorek2_poincare
   ! --- We divide the elements in two halves, and put 5/6 of the MPIs on the first half
   ! --- Because elements in the core take much longer to run...
   i_elm_half    = (elm_end - elm_start) / 2
-  cpu_fraction = real(5)/real(6) * n_cpu
-  if (my_id .lt. cpu_fraction) then
-    elm_delta       = (i_elm_half - elm_start) / cpu_fraction
+  mpi_fraction = real(5)/real(6) * n_mpi
+  if (my_id .lt. mpi_fraction) then
+    elm_delta       = (i_elm_half - elm_start) / mpi_fraction
     local_elm_start = elm_start + my_id*elm_delta + 1
     local_elm_end   = min(i_elm_half,elm_start+(my_id+1)*elm_delta)
   else
-    elm_delta       = (elm_end - i_elm_half+1) / (n_cpu-cpu_fraction)
-    local_elm_start = i_elm_half + (my_id-cpu_fraction)*elm_delta + 1
-    local_elm_end   = min(elm_end,i_elm_half+((my_id-cpu_fraction)+1)*elm_delta)
+    elm_delta       = (elm_end - i_elm_half+1) / (n_mpi-mpi_fraction)
+    local_elm_start = i_elm_half + (my_id-mpi_fraction)*elm_delta + 1
+    local_elm_end   = min(elm_end,i_elm_half+((my_id-mpi_fraction)+1)*elm_delta)
   endif
-  !elm_delta = (elm_end - elm_start) / n_cpu
+  !elm_delta = (elm_end - elm_start) / n_mpi
   !local_elm_start = elm_start + my_id*elm_delta + 1
   !local_elm_end   = min(elm_end,elm_start+(my_id+1)*elm_delta)
   
@@ -722,7 +722,7 @@ program jorek2_poincare
   ! --- Write points for all other MPIs
   if (my_id .eq. 0) then
     ! --- If this is mpi_0, we receive data from the other MPIs and print it
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (ikeep .gt. 0) then
   	nrecv = 2*ikeep
@@ -762,7 +762,7 @@ program jorek2_poincare
     ! --- Write data for all other MPIs
     if (my_id .eq. 0) then
       ! --- If this is mpi_0, we receive data from the other MPIs and print it
-      do j=1,n_cpu-1
+      do j=1,n_mpi-1
   	call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
   	if (ikeep .gt. 0) then
   	  nrecv = ikeep
@@ -850,7 +850,7 @@ program jorek2_poincare
   ! --- Write points for all other MPIs
   if (my_id .eq. 0) then
     ! --- If this is mpi_0, we receive data from the other MPIs and print it
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(i_strike,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (i_strike .gt. 0) then
   	nrecv = i_strike
@@ -896,7 +896,7 @@ program jorek2_poincare
     ! --- Write data for all other MPIs
     if (my_id .eq. 0) then
       ! --- If this is mpi_0, we receive data from the other MPIs and print it
-      do j=1,n_cpu-1
+      do j=1,n_mpi-1
   	call mpi_recv(i_strike,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
   	if (i_strike .gt. 0) then
   	  nrecv = i_strike

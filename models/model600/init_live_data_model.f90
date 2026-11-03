@@ -5,7 +5,7 @@ subroutine init_live_data_model(file_handle)
   
   use mod_parameters
   use phys_module,   only: xpoint, xcase
-  use diffusivities, only: get_dperp, get_zkperp, get_zk_iperp, get_zk_eperp
+  use diffusivities, only: get_dperp, get_zkperp, get_zk_iperp, get_zk_eperp, get_vpinch
   use mod_sources
   
   implicit none
@@ -14,10 +14,10 @@ subroutine init_live_data_model(file_handle)
   
   integer :: i
   real*8  :: psin, FFp, dFFp_dpsi, dens, dn_dpsi, T, dT_dpsi, Te, dTe_dpsi, Ti, dTi_dpsi
-  real*8  :: S_rho, S_T, S_Ti, S_Te, d_perp, zk_perp, zke_perp, zki_perp
+  real*8  :: S_rho, S_T, S_Ti, S_Te, d_perp, zk_perp, zke_perp, zki_perp, v_pinch
   real*8  :: d, d1, d2, d3, d4, d5, d6 ! dummies
   
-  write(file_handle,'(A,I5)') '@n_input_profiles: ', 13
+  write(file_handle,'(A,I5)') '@n_input_profiles: ', 14
   write(file_handle,'(A)') '@input_profiles_xlabel: Psi_{normalized}'
   write(file_handle,'(A)') '@input_profiles_xlabel_si: Psi_{normalized}'
   write(file_handle,'(A)') '@input_profiles_ylabel: input profiles'
@@ -28,11 +28,11 @@ subroutine init_live_data_model(file_handle)
   if ( with_TiTe ) then
     write(file_handle,'(A)') '@input_profiles: %"psin"       "FF''"    "dFF''/dpsin"'             // &
       '    "rho"    "drho/dpsin"   "Te"     "dTe/dpsin"   "Ti"     "dTi/dpsin"   "S_rho"'         // &
-      '     "S_Te"       "S_Ti"       "D_perp"    "ZKe_perp"   "ZKi_perp"'
+      '     "S_Te"       "S_Ti"       "D_perp"    "ZKe_perp"   "ZKi_perp"   "V_pinch"'
   else
     write(file_handle,'(A)') '@input_profiles: %"psin"       "FF''"    "dFF''/dpsin"'             // &
       '    "rho"    "drho/dpsin"   "T"     "dT/dpsin"   "S_rho"'                                  // &
-      '     "S_T"       "D_perp"    "ZK_perp"'
+      '     "S_T"       "D_perp"    "ZK_perp"   "V_pinch"'
   end if
   
   do i = 0, 200
@@ -53,13 +53,14 @@ subroutine init_live_data_model(file_handle)
     end if
     call FFprime      (xpoint,xcase,0.d0,(/-99.d0,+99.d0/),psin,0.d0,1.d0,FFp,dFFp_dpsi,d,d1,d2,d3)
     d_perp  = get_dperp (psin)
-    
+    v_pinch = get_vpinch(psin)
+
     if ( with_TiTe ) then
       write(file_handle,'(a,20es13.4e3)') '@input_profiles: ', psin, FFp, dFFp_dpsi, dens, dn_dpsi,    &
-        Te, dTe_dpsi, Ti, dTi_dpsi, S_rho, S_Te, S_Ti, d_perp, zke_perp, zki_perp
+        Te, dTe_dpsi, Ti, dTi_dpsi, S_rho, S_Te, S_Ti, d_perp, zke_perp, zki_perp, v_pinch
     else
       write(file_handle,'(a,20es13.4e3)') '@input_profiles: ', psin, FFp, dFFp_dpsi, dens, dn_dpsi,    &
-        T, dT_dpsi, S_rho, S_T, d_perp, zk_perp
+        T, dT_dpsi, S_rho, S_T, d_perp, zk_perp, v_pinch
     end if
       
   end do

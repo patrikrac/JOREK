@@ -3,8 +3,6 @@
 # Takes an element symbol (like W) and makes a POST request to the NIST
 # website to retrieve the data.
 #
-# Author: Daan van Vugt <the JOREK team>
-# Date: 2018-03-28
 
 set -o pipefail
 set -o errtrace

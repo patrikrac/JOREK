@@ -24,25 +24,26 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 eta, visco, visco_par, visco_par_par,               &
                 restart, rst_format, regrid, bootstrap, write_ps,   &
                 bootstrap_psin_cutoff,                              &
-                regrid_from_rz,                                     &
+                regrid_from_rz, force_horizontal_Xline,             &
                 n_R, n_Z, n_radial, n_pol, n_tht, n_flux,           &
                 n_open, n_private, n_leg, n_leg_out, n_ext,         &
                 n_outer, n_inner, n_up_priv, n_up_leg, n_up_leg_out,&
                 n_tht_equidistant,                                  &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
                 XR_z, SIG_z, bgf_r, bgf_z, bgf_rpolar, bgf_tht,     &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
                 SIG_outer, SIG_inner, SIG_theta_up,                 &
                 dPSI_outer, dPSI_inner, dPSI_up_priv,               &
-                nout, nout_projection, xr1, sig1, xr2, sig2,        &
+                nout, nout_projection, nout_particles,              &
+                xr1, sig1, xr2, sig2,                               &
                 R_begin, R_end, Z_begin, Z_end,                     &
                 rect_grid_vac_psi,                                  &
                 R_geo, Z_geo, amin, mf, fbnd, fpsi, mode,           &
                 R_boundary, Z_boundary, psi_boundary, n_boundary,   &
                 R_Z_psi_bnd_file,                                   &
-                force_horizontal_Xline,                             &
                 n_pfc, manipulate_psi_map,                          &
                 Rmin_pfc, Rmax_pfc, Zmin_pfc, Zmax_pfc, current_pfc,&
                 n_jropes,                                           &
@@ -74,6 +75,11 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 FF_0,  FF_1,  FF_coef,                              &
                 ZK_par, ZK_i_par, ZK_e_par, ZK_par_max,             &
                 ZK_perp, ZK_i_perp, ZK_e_perp, D_par, D_perp,       &
+                ZK_perp_pri, ZK_perp_pri_z0, ZK_perp_pri_width,     &
+                ZK_i_perp_pri, ZK_i_perp_pri_z0, ZK_i_perp_pri_width,&
+                ZK_e_perp_pri, ZK_e_perp_pri_z0, ZK_e_perp_pri_width,&
+                D_perp_pri, D_perp_pri_z0, D_perp_pri_width,        &
+                V_pinch_gauss, V_pinch_psin, V_pinch_sig, v_pinch_file, &
                 heatsource_e, heatsource_i, heatsource,             &
                 particlesource, tauIC, Wdia,                        &
                 eta_num, visco_num, visco_par_num,                  &
@@ -129,6 +135,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 particlesource_psin, particlesource_sig,            &
                 edgeparticlesource, edgeparticlesource_psin,        &
                 edgeparticlesource_sig,                             &
+                privparticlesource, privparticlesource_z0,          &
+                privparticlesource_width,                           &
                 particlesource_gauss,    heatsource_gauss,          &
                 heatsource_gauss_i,      heatsource_gauss_e,        &
                 heatsource_gauss_psin,   heatsource_gauss_sig,      &
@@ -147,7 +155,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 RMP_psi_cos_file, RMP_psi_sin_file,                 &
                 V_0,V_1,V_coef, output_bnd_elements,                &
                 n_limiter, R_limiter, Z_limiter,                    &
-                first_target_point, last_target_point,		    &
+                first_target_point, last_target_point,              &
                 R_Z_psi_bnd_file, wall_file,time_evol_scheme,       &
                 spi_tor_rot, tor_frequency, spi_num_vol,            &
                 NEO, neo_file, aki_neo_const, amu_neo_const,        &
@@ -170,6 +178,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 spi_Vel_RxZref, spi_quantity, spi_abl_model,        &
                 ns_radius_ratio, ns_radius_min, spi_angle,          &
                 spi_L_inj, spi_L_inj_diff, spi_abl_mag_reduction,   &
+                spi_abl_history_old,                                &
                 drift_distance, energy_teleported,                  &
                 K_Dmv, A_Dmv, L_tube, V_Dmv, P_Dmv,                 &
                 spi_Vel_diff, t_ns, JET_MGI, ASDEX_MGI,             &
@@ -202,13 +211,16 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 tgnum_psi, tgnum_u, tgnum_zj, tgnum_w, tgnum_rho,   &
                 tgnum_T, tgnum_Ti, tgnum_Te, tgnum_vpar, tgnum_rhon,&
                 tgnum_nre, tgnum_AR, tgnum_AZ, tgnum_A3,            &
-                n_particles, tstep_particles, nstep_particles,      &
+                tstep_particles, nstep_particles,                   &
                 nsubstep_particles,                                 &
                 filter_perp,    filter_hyper,    filter_par,        &
                 filter_perp_n0, filter_hyper_n0, filter_par_n0,     &
-                use_kn_cx, use_kn_sputtering, use_kn_ionisation,             &
-                use_ncs, use_pcs, use_ccs,                          &
-                min_sheath_angle, bcs,                              &
+                apply_dirichlet_proj, restart_particles,            &
+                proj_collection_period,                             &
+                part_group_configs, part_groups_in_use, valves,     &
+                fluid_configs, init_particles_only,                 &
+                find_RZ_nearby_iter, find_RZ_nearby_tol,            &
+                min_sheath_angle, bcs, part_kill_ratio,             &
                 use_sc, add_sources_in_sc, visco_sc_num,            &
                 D_perp_sc_num, D_par_sc_num, ZK_perp_sc_num,        &
                 ZK_par_sc_num, ZK_i_perp_sc_num, ZK_i_par_sc_num,   &
@@ -224,9 +236,11 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 visco_old_setup, visco_heating, eta_coul_log_dep,   &
                 export_polar_boundary, xpoint_search_tries,         &
                 use_manual_random_seed, manual_seed,                &
-                use_fixed_rng_value, fixed_rng_value,               &            
+                use_fixed_rng_value, fixed_rng_value,               &
                 loop_voltage, export_aux_node_list, fixed_aux_source, &
-                eps_noise, use_matrix_equilibration                       
+                use_zkperp_times_density, zkperp_density_floor,     &
+                fix_kinetic_Te, fixed_Te_eV,                        &
+                eps_noise, use_matrix_equilibration
 
 
 if (my_id .eq. 0) then

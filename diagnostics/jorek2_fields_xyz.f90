@@ -63,7 +63,7 @@ program jorek2_fields_xyz
   integer, parameter :: n_phi_int=64
 
   integer   :: my_id, my_id_n, my_id_master, ierr, ierr2
-  integer   :: i_rank(n_tor), n_cpu, n_cpu_n, n_cpu_master, m_cpu, n_masters, n_cpu_trans, my_id_trans
+  integer   :: i_rank(n_tor), n_mpi, n_mpi_n, n_mpi_master, m_mpi, n_masters, n_mpi_trans, my_id_trans
   integer   :: MPI_COMM_N, MPI_GROUP_MASTER, MPI_GROUP_WORLD, MPI_COMM_MASTER, MPI_COMM_TRANS
   integer   :: required,provided,StatInfo
   integer   :: istep, delta_step, istart, iend, np, i, i_fmt
@@ -96,7 +96,7 @@ program jorek2_fields_xyz
   
   ! --- Determine number of MPI procs
   call MPI_COMM_SIZE(MPI_COMM_WORLD, comm_size, ierr)
-  n_cpu = comm_size
+  n_mpi = comm_size
   
   ! --- Determine ID of each MPI proc
   call MPI_COMM_RANK(MPI_COMM_WORLD, rank, ierr)
@@ -111,7 +111,7 @@ program jorek2_fields_xyz
   call det_modes()
  
   ! --- Preset input parameters to reasonable defaults, then read the input file.
-  call initialise_and_broadcast_parameters(my_id, "__NO_FILENAME__")
+  call initialise_and_broadcast_parameters(my_id, "__NO_FILENAME__", .false.)
   
   ! --- Initialize the vacuum part.
   call vacuum_init(my_id, freeboundary_equil, freeboundary, resistive_wall)

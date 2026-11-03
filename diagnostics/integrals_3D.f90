@@ -21,6 +21,7 @@ use equil_info, only : get_psi_n, ES
   use mod_impurity
 #endif
 use mod_sources
+use mod_parameters, only: n_coord_tor
 
 implicit none
 
@@ -44,7 +45,7 @@ real*8  :: dn_dpsi,dn_dz,dn_dpsi2,dn_dz2,dn_dpsi_dz,dn_dpsi3,dn_dpsi_dz2, dn_dps
 real*8  :: dT_dpsi,dT_dz,dT_dpsi2,dT_dz2,dT_dpsi_dz,dT_dpsi3,dT_dpsi_dz2, dT_dpsi2_dz
 
 integer :: i, j, k, in, ms, mt, mp, iv, inode, ife, n_elements, ifail
-integer :: ierr, n_cpu, my_id, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
+integer :: ierr, n_mpi, my_id, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
 real*8  :: beta_p, beta_n, beta_t, aminor
 real*8  :: xjac, BigR, wst, P_int, C_intern, zj0, ps0, r0, T0, Te0, Vol, Volume, Area, Bgeo, psi_limit
 real*8  :: r0_corr, T0_corr
@@ -67,16 +68,29 @@ integer    :: spi_i, i_inj
 real*8,dimension(n_var),intent(out) :: varminout,varmaxout
 real*8,dimension(n_var) :: varmin,varmax
 
-call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr) ! number of MPI procs
+#if STELLARATOR_MODEL
+if (n_coord_tor .le. 1) then
+  if (my_id .eq. 0) write(*,*) "INFO: Integrals_3D skipped for stellarator model with n_coord_tor=1"
+  density_tot = 0.d0; density_in = 0.d0; density_out = 0.d0
+  pressure    = 0.d0; pressure_in = 0.d0; pressure_out = 0.d0
+  kin_par_tot = 0.d0; kin_par_in  = 0.d0; kin_par_out  = 0.d0
+  mom_par_tot = 0.d0; mom_par_in  = 0.d0; mom_par_out  = 0.d0
+  varminout   = 0.d0
+  varmaxout   = 0.d0
+  return
+end if
+#endif
 
-n_cpu = max(n_cpu,1)
+call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr) ! number of MPI procs
+
+n_mpi = max(n_mpi,1)
 
 if (my_id .eq. 0) then
   write(*,*) '***************************************'
   write(*,*) '* Integrals  (3D)                     *'
   write(*,*) '***************************************'
   write(*,*) ' n_plane : ',n_plane
-  write(*,*) ' n_cpu   : ',n_cpu
+  write(*,*) ' n_mpi   : ',n_mpi
 endif
 
 wgauss_copy = wgauss
@@ -133,7 +147,7 @@ gradP_psi_max = 0.d0
 
 psi_limit = ES%psi_bnd
 
-ife_delta = ceiling(float(element_list%n_elements) / n_cpu)
+ife_delta = ceiling(float(element_list%n_elements) / n_mpi)
 ife_min   =      my_id     * ife_delta + 1
 ife_max   = min((my_id +1) * ife_delta, element_list%n_elements)
 
@@ -292,8 +306,13 @@ do ife = ife_min, ife_max
         xjac = x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
         BigR = x_g(ms,mt)
 
-        r0      = eq_g(mp,var_rho,ms,mt)
-        r0_corr = corr_neg_dens1(r0)
+        if (with_rho) then
+          r0      = eq_g(mp,var_rho,ms,mt)
+          r0_corr = corr_neg_dens1(r0)
+        else
+          r0      = 1.d0
+          r0_corr = 1.d0
+        endif
 #ifdef WITH_TiTe
         T0      = eq_g(mp,var_Ti,ms,mt)
         T0_corr = corr_neg_temp1(T0)

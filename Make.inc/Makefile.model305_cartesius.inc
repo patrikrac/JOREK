@@ -50,29 +50,29 @@ USE_MUMPS = 0
 # Directory containing the user-compiled libraries (e.g., MUMPS, PASTIX, ...)
 
 #Scotch library
-SCOTCH_DIR := /home/pratt/jor/lib/scotchall/scotch_5.1/
-LIBSCOTCH =  /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libptscotch.a /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libscotch.a /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libscotcherr.a
-INC_SCOTCH = -I/home/pratt/jor/lib/scotchall/scotch_5.1/include/
+SCOTCH_DIR ?= /path/to/scotchall/scotch_5.1
+LIBSCOTCH =  $(SCOTCH_DIR)/lib/libptscotch.a $(SCOTCH_DIR)/lib/libscotch.a $(SCOTCH_DIR)/lib/libscotcherr.a
+INC_SCOTCH = -I$(SCOTCH_DIR)/include/
 
-#PASTIX_HOME     ?= /home/pratt/jor/lib/pastix_release_3999/install
+#PASTIX_HOME     ?= /path/to/pastix_release_3999/install
 #LIB_PASTIX       = `$(PASTIX_HOME)/pastix-conf --libs`
 #LIB_PASTIX_MURGE = `$(PASTIX_HOME)/pastix-conf --libs_murge`
 #LIB_PASTIX_BLAS  = `$(PASTIX_HOME)/pastix-conf --blas`
 #INC_PASTIX       = `$(PASTIX_HOME)/pastix-conf --incs`
 
 # PASTIX
-#PASTIX_HOME      = /home/pratt/jor/lib/pastix_release_3999/install
+#PASTIX_HOME      = /path/to/pastix_release_3999/install
 #LIB_PASTIX       = -L$(PASTIX_HOME) -lpastix_murge -lpastix $(LIBSCOTCH)
 #LIB_PASTIX_MURGE = -L$(PASTIX_HOME) -lpastix_murge -lpastix $(LIBSCOTCH)
 #LIB_PASTIX_BLAS  = 
 #INC_PASTIX       = -I$(PASTIX_HOME) $(INC_SCOTCH)
 
 # PASTIX
-PASTIX_HOME      = /home/pratt/jor/lib/pastix_release_3999/install
-LIB_PASTIX       = /home/pratt/jor/lib/pastix_release_3999/install/libpastix_murge.a /home/pratt/jor/lib/pastix_release_3999/install/libpastix.a /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libptscotch.a  /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libscotch.a /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libscotcherr.a
-LIB_PASTIX_MURGE = /home/pratt/jor/lib/pastix_release_3999/install/libpastix_murge.a /home/pratt/jor/lib/pastix_release_3999/install/libpastix.a /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libptscotch.a /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libscotch.a /home/pratt/jor/lib/scotchall/scotch_5.1/lib/libscotcherr.a
+PASTIX_HOME      ?= /path/to/pastix_release_3999/install
+LIB_PASTIX       = $(PASTIX_HOME)/libpastix_murge.a $(PASTIX_HOME)/libpastix.a $(SCOTCH_DIR)/lib/libptscotch.a  $(SCOTCH_DIR)/lib/libscotch.a $(SCOTCH_DIR)/lib/libscotcherr.a
+LIB_PASTIX_MURGE = $(PASTIX_HOME)/libpastix_murge.a $(PASTIX_HOME)/libpastix.a $(SCOTCH_DIR)/lib/libptscotch.a $(SCOTCH_DIR)/lib/libscotch.a $(SCOTCH_DIR)/lib/libscotcherr.a
 LIB_PASTIX_BLAS  =
-INC_PASTIX       = -I/home/pratt/jor/lib/pastix_release_3999/install -I/home/pratt/jor/lib/scotchall/scotch_5.1/include/
+INC_PASTIX       = -I$(PASTIX_HOME) -I$(SCOTCH_DIR)/include/
 
 #HIPS
 #LIBHIPS   = -L$(HOME)/hips_trunk/trunk/LIB -lhips -lio $(LIBSCOTCH)

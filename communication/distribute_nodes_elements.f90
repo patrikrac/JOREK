@@ -1,4 +1,4 @@
-subroutine distribute_nodes_elements(my_id, m_cpu, index_size, node_list, element_list, direct_construction, &
+subroutine distribute_nodes_elements(my_id, m_mpi, index_size, node_list, element_list, direct_construction, &
                                     local_elms, n_local_elms, restart, freeboundary, a_mat)
 !---------------------------------------------------------------------------------------------
 ! subroutine divides the nodes (not their individual dof) over index_size equal parts
@@ -20,7 +20,7 @@ logical, parameter :: DEBUG = .false.
 
 integer               :: local_elms(*)
 integer, dimension(:), pointer :: index_min, index_max
-integer               :: my_id, index_size, m_cpu, n_local_elms, inode
+integer               :: my_id, index_size, m_mpi, n_local_elms, inode
 integer               :: index_total
 integer               :: inext, i,j, k, iv,index1
 logical               :: restart, freeboundary
@@ -71,16 +71,16 @@ if (.not. direct_construction) then ! global matrix construction
   
 else ! PC matrix "direct" construction
   
-  if (mod(my_id,m_cpu) .eq. 0) index_min(my_id+1) = 1
+  if (mod(my_id,m_mpi) .eq. 0) index_min(my_id+1) = 1
   do i=1,index_size
-    index_max(i) = ((mod(i-1,m_cpu)+1) * index_total)/m_cpu
+    index_max(i) = ((mod(i-1,m_mpi)+1) * index_total)/m_mpi
   enddo
   do i=2,index_size
-    if (mod(i-1,m_cpu) .ne. 0) then
+    if (mod(i-1,m_mpi) .ne. 0) then
       index_min(i) = index_max(i-1) + 1
     endif
   enddo
-  if (mod(my_id+1,m_cpu) .eq. 0) index_max(my_id+1) = index_total
+  if (mod(my_id+1,m_mpi) .eq. 0) index_max(my_id+1) = index_total
   if (DEBUG) write(*,'(A,3i6)') ' index_min,index_max:',my_id,index_min(my_id+1),index_max(my_id+1)
   
 end if 

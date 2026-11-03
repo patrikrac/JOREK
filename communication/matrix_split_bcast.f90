@@ -9,13 +9,13 @@ subroutine matrix_split_bcast(ad_mat, ac_mat)
   type(type_SP_MATRIX), intent(inout)  :: ad_mat
   type(type_SP_MATRIX), intent(inout)  :: ac_mat
 
-  integer               :: my_id, n_cpu, comm, ierr
+  integer               :: my_id, n_mpi, comm, ierr
   integer(kind=int_all) :: is, ie, nnz
   integer               :: buff_max, nz_split_end, n_split, i
 
   comm = ad_mat%comm
   call MPI_COMM_RANK(comm, my_id, ierr)
-  call MPI_COMM_SIZE(comm, n_cpu, ierr)
+  call MPI_COMM_SIZE(comm, n_mpi, ierr)
 
   nnz = ad_mat%nnz
   call MPI_Bcast(nnz,1,MPI_INTEGER_ALL,0,comm,ierr)

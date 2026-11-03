@@ -18,7 +18,7 @@
 !!
 !! writer: Mark Verbeek
 !! data  : 11-02-2016
-subroutine jorek2help(n_cpu, nbthreads)
+subroutine jorek2help(n_mpi, nbthreads)
   use constants
   use mod_parameters
   use mod_log_params
@@ -27,7 +27,7 @@ subroutine jorek2help(n_cpu, nbthreads)
   
   implicit none
 
-  integer, intent(in) :: n_cpu, nbthreads
+  integer, intent(in) :: n_mpi, nbthreads
   
 #ifndef NO_HELP
 
@@ -112,7 +112,7 @@ contains
     write(*,'(A)') '*                 JOREK ' // trim(JOREK_VERSION) // '               *'
     write(*,*) '*                https://www.jorek.eu/          *'
     write(*,*) '*************************************************'
-    write(*,*) ' MPI processes       : ', n_cpu
+    write(*,*) ' MPI processes       : ', n_mpi
     write(*,*) ' OpenMP threads      : ', nbthreads
     write(*,*) ' GIT revision        : ', trim(adjustl(RCS_VERSION))
     write(*,*) ' GIT revision label  : ', trim(adjustl(RCS_LABEL))

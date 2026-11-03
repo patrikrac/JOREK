@@ -209,8 +209,12 @@ do m=1, n_toroidal
           if (n_coord_period .ne. 1 .and. without_n0_mode .and. mod(mode(i_tor),n_coord_period) .eq. 0) cycle
          
           if(density_only) then
-            call interp(node_list,element_list,i,var_rho,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
-            scalars(inode,1) = scalars(inode,1) + P * HZ(i_tor,m)
+            if (with_rho) then
+              call interp(node_list,element_list,i,var_rho,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
+              scalars(inode,1) = scalars(inode,1) + P * HZ(i_tor,m)
+            else
+              scalars(inode,1) = 1.d0
+            endif
           else
             call interp(node_list,element_list,i,var_psi,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
             scalars(inode,1) = scalars(inode,1) + P * HZ(i_tor,m)
@@ -234,8 +238,12 @@ do m=1, n_toroidal
             call interp(node_list,element_list,i,var_w,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
             scalars(inode,4) = scalars(inode,4) + P * HZ(i_tor,m)
 
-            call interp(node_list,element_list,i,var_rho,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
-            scalars(inode,5) = scalars(inode,5) + P * HZ(i_tor,m)
+            if (with_rho) then
+              call interp(node_list,element_list,i,var_rho,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
+              scalars(inode,5) = scalars(inode,5) + P * HZ(i_tor,m)
+            else
+              scalars(inode,5) = 1.d0 
+            endif
 
             call interp(node_list,element_list,i,var_T,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
             scalars(inode,6) = scalars(inode,6) + P * HZ(i_tor,m)

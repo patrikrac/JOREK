@@ -158,6 +158,13 @@ subroutine read_num_profiles(my_id)
       'zk_i_perp', check_positive=.true.)
   end if
 
+  num_v_pinch = ( v_pinch_file /= 'none' )
+  if ( num_v_pinch .and. ( my_id == 0 ) ) then
+    call readProf(num_v_pinch_x, num_v_pinch_y, num_v_pinch_len, v_pinch_file)
+    call check_num_prof(num_v_pinch, num_v_pinch_x, num_v_pinch_y, num_v_pinch_len,                  &
+      'v_pinch', check_positive=.false.)
+  end if
+
   num_neo_file= NEO .and. ( neo_file /= 'none')
   if ( num_neo_file .and. ( my_id == 0 ) ) then
     write(*,*) 'using ki and mui profiles from file "'//trim(neo_file)//'"'

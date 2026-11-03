@@ -21,19 +21,21 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 eta, visco, visco_par,                              &
                 restart, rst_format, regrid, bootstrap, write_ps,   &
                 bootstrap_psin_cutoff,                              &
-                regrid_from_rz,                                     &
-                force_horizontal_Xline, fix_axis_nodes,             &
+                regrid_from_rz, force_horizontal_Xline,             &
+                fix_axis_nodes,                                     &
                 n_R, n_Z, n_radial, n_pol, n_tht, n_flux,           &
                 n_open, n_private, n_leg, n_leg_out, n_ext,         &
                 n_outer, n_inner, n_up_priv, n_up_leg, n_up_leg_out,&
                 n_tht_equidistant,                                  &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
                 SIG_outer, SIG_inner, SIG_theta_up,                 &
                 dPSI_outer, dPSI_inner, dPSI_up_priv,               &
-                nout, nout_projection, xr1, sig1, xr2, sig2,        &
+                nout, nout_projection, nout_particles,              &
+                xr1, sig1, xr2, sig2,                               &
                 R_begin, R_end, Z_begin, Z_end,                     &
                 R_geo, Z_geo, amin, mf, fbnd, fpsi, mode,           &
                 R_boundary, Z_boundary, psi_boundary, n_boundary,   &
@@ -130,6 +132,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 spi_Vel_diff, t_ns, JET_MGI, ASDEX_MGI,             &
                 imp_type, delta_n_convection, nimp_bg,              &
                 index_main_imp, spi_abl_mag_reduction,              &
+                spi_abl_history_old,                                & 
                 adas_dir, output_prad_phi, n_adas,                  &
                 RMP_on, RMP_har_cos,RMP_har_sin, spi_shard_file,    &
                 spi_plume_file, spi_plume_hdf5,                     &

@@ -13,6 +13,7 @@ module mod_model_settings
   logical, parameter :: reduced_MHD     = .false.
   logical, parameter :: full_MHD        = .true.
   
+  logical, parameter :: with_rho        = .true.
   logical, parameter :: with_TiTe       = .false.
   logical, parameter :: with_neutrals   = .false.
   logical, parameter :: with_impurities = .false.

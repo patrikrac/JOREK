@@ -34,7 +34,7 @@ USE_MUMPS = 0
 USE_WSMP   = 0
 
 # PASTIX
-PASTIX_HOME     ?= /home/glatu/jorek_tools/gpastix_release_3184/install
+PASTIX_HOME     ?= /path/to/jorek_tools/gpastix_release_3184/install
 LIB_PASTIX       = `$(PASTIX_HOME)/pastix-conf --libs` 
 LIB_PASTIX_MURGE = `$(PASTIX_HOME)/pastix-conf --libs_murge`
 LIB_PASTIX_BLAS  = `$(PASTIX_HOME)/pastix-conf --blas`

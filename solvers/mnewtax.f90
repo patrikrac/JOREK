@@ -1,6 +1,6 @@
 subroutine mnewtax(node_list,element_list,i_elm, r, s, errx, errf, ifail)
 !-------------------------------------------------------------------------
-! solves two non-linear equations using Newtons method (from numerical recipes)
+! solves two non-linear equations using Newtons method
 ! LU decomposition replaced by explicit solution of 2x2 matrix.
 !-------------------------------------------------------------------------
 use data_structure

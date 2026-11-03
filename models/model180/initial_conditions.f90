@@ -35,7 +35,7 @@ if (my_id .eq. 0) then
 endif
 
 if (my_id .eq. 0) then
-  s_factor = 1.0 / (n_flux - 1)
+  s_factor = 1.0 * bloating_factor / (n_flux - 1)
 
   do i=1,node_list%n_nodes
 

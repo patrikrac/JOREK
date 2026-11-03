@@ -1,129 +1,126 @@
       SUBROUTINE RFT2(DATA,NR,KR)
       !*****************************************************************
-      !* REAL FOURIER TRANSFORM.                                       *
-      !* INPUT:  NR REAL COEFFICIENTS                                  *
-      !*            DATA(1),DATA(1+KR),....,DATA(1+(NR-1)*KR).         *
-      !* OUTPUT: NR/2+1 COMPLEX COEFFICIENTS                           *
-      !*           (DATA(1),      DATA(1+KR))                          *
-      !*           (DATA(1+2*KR), DATA(1+3*KR))                        *
-      !*            .............................                      *
-      !*           (DATA(1+NR*KR),DATA(1+(NR+1)*KR).                   *
-      !* THE CALLING PROGRAM SHOULD HAVE DATA DIMENSIONED WITH AT LEAST*
-      !* (NR+1)*KR+1 ELEMENTS. (I.E., NR+2 IF INCREMENT KR=1).         *
-      !* LASL ROUTINE MAY 75, CALLING FFT2 AND RTRAN2.                 *
+      !* REAL FOURIER TRANSFORM  (forward, real-to-complex).          *
+      !*                                                              *
+      !* Self-contained drop-in preserving the original RFT2 name,    *
+      !* argument list and coefficient layout.                        *
+      !*                                                              *
+      !* INPUT : NR real values                                       *
+      !*           DATA(1), DATA(1+KR), ..., DATA(1+(NR-1)*KR)        *
+      !* OUTPUT: NR/2+1 complex coefficients as consecutive (re,im)   *
+      !*         pairs                                                *
+      !*           ( DATA(1),       DATA(1+KR)        )   mode 0       *
+      !*           ( DATA(1+2*KR),  DATA(1+3*KR)      )   mode 1       *
+      !*            .........................................         *
+      !*           ( DATA(1+NR*KR), DATA(1+(NR+1)*KR) )   mode NR/2    *
+      !*                                                              *
+      !* Convention: unnormalised forward transform                   *
+      !*   X_k = sum_{n=0}^{NR-1} x_n * exp(-2*pi*i*k*n/NR),           *
+      !* identical to FFTW's dfftw_execute_dft_r2c, so the FFTW and    *
+      !* non-FFTW code paths yield the same coefficients.             *
+      !* DATA must be dimensioned with at least (NR+1)*KR+1 elements   *
+      !* (i.e. NR+2 when KR=1).                                        *
       !*****************************************************************
 
+      implicit none
       real*8  :: DATA(*)
-      integer :: nr, kr
+      integer :: NR, KR
 
-      CALL FFT2(DATA(1),DATA(KR+1),NR/2,-(KR+KR))
-      CALL RTRAN2(DATA,NR,KR,1)
+      complex*16, allocatable :: work(:)
+      integer :: n, k
 
+      n = NR
+      allocate(work(0:n-1))
+
+      do k = 0, n-1
+        work(k) = cmplx(DATA(1+k*KR), 0.d0, kind=8)
+      enddo
+
+      call RFT2_DFT(work, n)
+
+      do k = 0, n/2
+        DATA(1 + (2*k  )*KR) = real (work(k))
+        DATA(1 + (2*k+1)*KR) = aimag(work(k))
+      enddo
+
+      deallocate(work)
       RETURN
       END
 
-      SUBROUTINE RTRAN2(DATA,NR,KR,KTRAN)
+      SUBROUTINE RFT2_DFT(X,N)
       !*****************************************************************
-      !* INTERFACE BETWEEN RFT2, RFI2, AND FFT2.                       *
-      !* THE CALLING PROGRAM SHOULD HAVE DATA DIMENSIONED WITH AT LEAST*
-      !* (NR+1)*KR+1 ELEMENTS.                                         *
-      !* LASL ROUTINE MAY 75, CALLED FROM RFT2 AND RFI2.               *
+      !* In-place forward discrete Fourier transform,                 *
+      !*   X_k = sum_n X_n * exp(-2*pi*i*k*n/N).                       *
+      !* Iterative radix-2 Cooley-Tukey when N is a power of two,      *
+      !* otherwise a direct O(N^2) evaluation. Standard textbook       *
+      !* (public-domain) algorithm.                                   *
       !*****************************************************************
 
-      real*8 DATA(*)
+      implicit none
+      integer,    intent(in)    :: N
+      complex*16, intent(inout) :: X(0:N-1)
 
-      PI = 2.d0*asin(1.d0)
+      real*8, parameter :: TWOPI = 6.28318530717958647692528677d0
+      complex*16, allocatable :: Y(:)
+      complex*16 :: u, t, w, wm
+      integer :: i, j, k, m, mh
+      real*8  :: ang
 
-      KS=2*KR
-      N=NR/2
-      NMAX=N*KS+2
-      KMAX=NMAX/2
-      THETA=PI/FLOAT(2*N)
-      DC=2.D0*SIN(THETA)**2
-      DS=SIN(2.D0*THETA)
-      WS=0.D0
-      IF(KTRAN.LE.0) THEN
-         WC=-1.0D0
-         DS=-DS
-      ELSE
-         WC=1.D0
-         DATA(NMAX-1)=DATA(1)
-         DATA(NMAX-1+KR)=DATA(KR+1)
-      ENDIF
-      DO K=1,KMAX,KS
-         NK=NMAX-K
-         SUMR=.5D0*(DATA(K)+DATA(NK))
-         DIFR=.5D0*(DATA(K)-DATA(NK))
-         SUMI=.5D0*(DATA(K+KR)+DATA(NK+KR))
-         DIFI=.5D0*(DATA(K+KR)-DATA(NK+KR))
-         TR=WC*SUMI-WS*DIFR
-         TI=WS*SUMI+WC*DIFR
-         DATA(K)=SUMR+TR
-         DATA(K+KR)=DIFI-TI
-         DATA(NK)=SUMR-TR
-         DATA(NK+KR)=-DIFI-TI
-         WCA=WC-DC*WC-DS*WS
-         WS=WS+DS*WC-DC*WS
-         WC=WCA
-      ENDDO
+      if (N <= 1) return
+
+      if (iand(N, N-1) == 0) then
+
+        ! bit-reversal permutation
+        j = 0
+        do i = 1, N-1
+          k = N/2
+          do while (k <= j)
+            j = j - k
+            k = k/2
+          enddo
+          j = j + k
+          if (i < j) then
+            t = X(i)
+            X(i) = X(j)
+            X(j) = t
+          endif
+        enddo
+
+        ! Danielson-Lanczos butterflies
+        m = 1
+        do while (m < N)
+          mh = m
+          m  = m + m
+          ang = -TWOPI / dble(m)
+          wm  = cmplx(cos(ang), sin(ang), kind=8)
+          do k = 0, N-1, m
+            w = (1.d0, 0.d0)
+            do j = 0, mh-1
+              u = X(k+j)
+              t = w * X(k+j+mh)
+              X(k+j)    = u + t
+              X(k+j+mh) = u - t
+              w = w * wm
+            enddo
+          enddo
+        enddo
+
+      else
+
+        ! direct evaluation (any N)
+        allocate(Y(0:N-1))
+        do k = 0, N-1
+          u = (0.d0, 0.d0)
+          do j = 0, N-1
+            ang = -TWOPI * dble(mod(k*j, N)) / dble(N)
+            u = u + X(j) * cmplx(cos(ang), sin(ang), kind=8)
+          enddo
+          Y(k) = u
+        enddo
+        X = Y
+        deallocate(Y)
+
+      endif
+
       RETURN
-      END
-
-      SUBROUTINE FFT2 (DATAR,DATAI,N,INC)
-      !*****************************************************************
-      !* FFT2 FORTRAN VERSION CLAIR NIELSON MAY 75.                    *
-      !*****************************************************************
-
-      DIMENSION DATAR(*), DATAI(*)
-
-      PI = 2.d0*asin(1.d0)
-
-      KTRAN=ISIGN(-1,INC)
-      KS=IABS(INC)
-      IP0=KS
-      IP3=IP0*N
-      IREV=1
-      DO 20 I=1,IP3,IP0
-         IF(I.LT.IREV) THEN
-            TEMPR=DATAR(I)
-            TEMPI=DATAI(I)
-            DATAR(I)=DATAR(IREV)
-            DATAI(I)=DATAI(IREV)
-            DATAR(IREV)=TEMPR
-            DATAI(IREV)=TEMPI
-         ENDIF
-         IBIT=IP3/2
-   10    IF(IREV.GT.IBIT) THEN
-            IREV=IREV-IBIT
-            IBIT=IBIT/2
-            IF(IBIT.GE.IP0) GOTO 10
-         ENDIF
-   20    IREV=IREV+IBIT
-      IP1=IP0
-      THETA=REAL(KTRAN)*PI
-   30 IF(IP1.GE.IP3) GOTO 60
-      IP2=IP1+IP1
-      SINTH=SIN(.5D0*THETA)
-      WSTPR=-2.D0*SINTH*SINTH
-      WSTPI=SIN(THETA)
-      WR=1.D0
-      WI=0.D0
-      DO 50 I1=1,IP1,IP0
-         DO 40 I3=I1,IP3,IP2
-            J0=I3
-            J1=J0+IP1
-            TEMPR=WR*DATAR(J1)-WI*DATAI(J1)
-            TEMPI=WR*DATAI(J1)+WI*DATAR(J1)
-            DATAR(J1)=DATAR(J0)-TEMPR
-            DATAI(J1)=DATAI(J0)-TEMPI
-            DATAR(J0)=DATAR(J0)+TEMPR
-   40       DATAI(J0)=DATAI(J0)+TEMPI
-         TEMPR=WR
-         WR=WR*WSTPR-WI*WSTPI+WR
-   50    WI=WI*WSTPR+TEMPR*WSTPI+WI
-      IP1=IP2
-      THETA=.5D0*THETA
-      GOTO 30
-   60 RETURN
-
       END

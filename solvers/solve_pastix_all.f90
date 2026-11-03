@@ -26,14 +26,14 @@ subroutine solve_pastix_all(ptss, ad_mat, rhs_vec, solve_only, tag)
 ! --- Local variables
   type(clcktype)                    :: t_itstart, t0, t1, t2, t3
   real*8                            :: tsecond
-  integer                           :: n_cpu, my_id, ierr, comm
+  integer                           :: n_mpi, my_id, ierr, comm
   type(type_SP_MATRIX)              :: ac_mat
   logical                           :: verbose = .false.
 
   comm = ad_mat%comm
 
   call MPI_COMM_RANK(comm, my_id, ierr)
-  call MPI_COMM_SIZE(comm, n_cpu, ierr)
+  call MPI_COMM_SIZE(comm, n_mpi, ierr)
   
   if ((tag.ge.0).and.(my_id.eq.0)) verbose = .true.
 

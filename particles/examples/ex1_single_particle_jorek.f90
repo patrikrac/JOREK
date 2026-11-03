@@ -21,7 +21,7 @@ end interface
 ! 1. Set up the simulation variables containing
 !    sim: particles, time, and io.
 !    events: halting points for the pushers and actions to run.
-real*8 :: timesteps(1) = [1d-7]
+real*8 :: timesteps(1) = [1d-4]
 class(*), pointer :: p
 integer :: i, j, k, n_steps, n_lost
 real*8  :: target_time, time
@@ -37,7 +37,7 @@ integer, parameter :: n_particles = 1
 call sim%initialize(num_groups=1)
 
 ! 3. Set up the field reader
-fieldreader = read_jorek_fields_interp_linear(basename='jorek_restart', i=-1)
+fieldreader = read_jorek_fields_interp_linear(basename='jorek', i=-1)
 call with(sim, fieldreader)
 
 ! 4. Allocate a particle of type particle_kinetic_leapfrog
@@ -54,7 +54,7 @@ write(*,*) 'Initial particle position: ', R, Z, phi
 select type (p => sim%groups(1)%particles(1))
 type is (particle_kinetic_leapfrog)
   p%x = [R,Z,phi]
-  p%v = [1.d0,0.d0,1.0d0]
+  p%v = [1.55d6, 0.d0, 1.55d6]  ! He-4 at ~100 keV: gyroradius ~1.4 cm, fits in W7-A (a=9 cm)
   p%q = 2_1
   p%i_elm = i_elm
   p%st = [s, t]
@@ -73,7 +73,7 @@ select type (p => sim%groups(1)%particles(1))
 end select
 
 ! 7. Set an event to stop the simulation.
-events  = [event(stop_action(), start=1.0d0)]
+events  = [event(stop_action(), start=20.0d0)]
 
 ! 8. Check whether all events conform to the requested timestep
 call check_and_fix_timesteps(timesteps, events)
@@ -112,11 +112,12 @@ do while (.not. sim%stop_now)
           st_old    = p(j)%st
           i_elm_old = p(j)%i_elm
           
-          call boris_push_cylindrical(p(j), m=sim%groups(i)%mass, E=E, B=B, dt=timesteps(i))
+          call boris_push_cylindrical(p(j), m=sim%groups(i)%mass, E=E, B=B, dt=timesteps(i)*sim%t_norm)
           call find_RZ_nearby(sim%fields%node_list, sim%fields%element_list, rz_old(1), rz_old(2), st_old(1), st_old(2), i_elm_old, p(j)%x(1), p(j)%x(2), p(j)%st(1), p(j)%st(2), p(j)%i_elm, ifail, p(j)%x(3))
         
+          if (p(j)%i_elm .le. 0) exit  ! particle lost
           call interp_gvec(sim%fields%node_list, sim%fields%element_list, p(j)%i_elm, 4, 1, 1, p(j)%st(1), p(j)%st(2), s_norm, dummy, dummy, dummy, dummy, dummy)
-          if (mod(k, 1) .eq. 0) write(21, "(15e16.8)") p(j)%x, p(j)%v, B, E, p(j)%st(1), p(j)%st(2), s_norm
+          if (mod(k, 10) .eq. 0) write(21, "(15e16.8)") p(j)%x, p(j)%v, B, E, p(j)%st(1), p(j)%st(2), s_norm
         type is (particle_fieldline)
           call field_line_runge_kutta_fixed_dt_push_jorek(sim%fields, p(j), sim%time, t)
           call interp_gvec(sim%fields%node_list, sim%fields%element_list, p(j)%i_elm, 4, 1, 1, p(j)%st(1), p(j)%st(2), s_norm, dummy, dummy, dummy, dummy, dummy)

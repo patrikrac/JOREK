@@ -23,12 +23,13 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 visco, visco_par, visco_par_par,                    &
                 restart, rst_format, regrid, bootstrap, write_ps,   &
                 bootstrap_psin_cutoff,                              &
-                force_horizontal_Xline,                             &
+                regrid_from_rz, force_horizontal_Xline,             &
                 n_R, n_Z, n_radial, n_pol, n_tht, n_flux,           &
                 n_open, n_private, n_leg, n_ext, i_plane_rtree,     &
                 n_outer, n_inner, n_up_priv, n_up_leg,              &
                 SDN_threshold,                                      &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
@@ -41,7 +42,12 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 R_boundary, Z_boundary, psi_boundary, n_boundary,   &
                 n_pfc, n_tor_fft_thresh, manipulate_psi_map,        &
                 Rmin_pfc, Rmax_pfc, Zmin_pfc, Zmax_pfc, current_pfc,&
-                tokamak_device, gvec_grid_import,                   &
+                tokamak_device, gvec_grid_import,bloating_factor,   &
+                freeze_psi_dynamics,                                &
+                use_core_freeze, core_freeze_s0, core_freeze_sig,   &
+                zkpar_picard,                                       &
+                decay_bc_enable, decay_lambda_T, decay_lambda_n,    &
+                decay_R0, decay_rmin, decay_conv,                   &
                 F0, gamma_sheath, density_reflection,               &
                 zjz_0, zjz_1, zj_coef,                              &
                 rho_0, rho_1, rho_coef,                             &
@@ -55,6 +61,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 maintain_profiles,                                  &
                 particlesource, heatsource,                         &
                 heatsource_i, heatsource_e, tauIC,                  &
+                loop_voltage,                                       &
                 eta_num, visco_num, visco_par_num, D_perp_num,      &
                 ZK_perp_num,                                        &
                 pellet_amplitude, pellet_R, pellet_Z, pellet_phi,   &
@@ -74,6 +81,9 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 resistive_wall,                                     &
                 wall_resistivity, wall_resistivity_fact,            &
                 bc_natural_open,                                    &
+                vpar_sbc_enable, vpar_sbc_alpha0, vpar_sbc_T_floor, &
+                particle_flux_sbc_enable, heat_flux_sbc_enable,     &
+                min_sheath_angle,                                   &
                 use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
                 use_physics_pc,                                     &
                 physics_pc_sf_pair_psi, physics_pc_sf_pair_w,       &
@@ -85,7 +95,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 use_mumps, mumps_ordering,                          &
                 use_BLR_compression, epsilon_BLR, just_in_time_BLR, &
                 use_pastix, use_murge, use_murge_element, use_wsmp, &
-                refinement, force_central_node,    &
+                refinement, force_central_node,                     &
                 fix_axis_nodes, treat_axis,                         &
                 grid_to_wall, use_strumpack,                        &
                 adaptive_time, equil, bench_without_plot,           &
@@ -111,11 +121,12 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 V_0,V_1,V_coef, output_bnd_elements,                &
                 wall_file,                                          &
                 n_limiter, R_limiter, Z_limiter,                    &
-                first_target_point, last_target_point,		    &
+                first_target_point, last_target_point,              &
                 NEO, neo_file, aki_neo_const, amu_neo_const,        &
                 time_evol_scheme, corr_neg_temp_coef,               &
                 corr_neg_dens_coef, D_prof_neg, ZK_prof_neg,        &
                 D_prof_neg_thresh, ZK_prof_neg_thresh, T_min,       &
+                T_min_neg, rho_min_neg,                             &
                 amix, amix_freeb, equil_accuracy,                   &
                 equil_accuracy_freeb, current_ref, FB_Ip_position,  &
                 FB_Ip_integral, Z_axis_ref, FB_Zaxis_position,      &
@@ -134,9 +145,18 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 weights_per_family, autodistribute_ranks,           &
                 ranks_per_family,                                   &
                 use_manual_random_seed, manual_seed,                &
-                use_fixed_rng_value, fixed_rng_value                
+                use_fixed_rng_value, fixed_rng_value,                &
+                tstep_particles, nstep_particles,                   &
+                nsubstep_particles, nout_particles,                 &
+                restart_particles, init_particles_only,             &
+                filter_perp,    filter_hyper,    filter_par,        &
+                filter_perp_n0, filter_hyper_n0, filter_par_n0,     &
+                apply_dirichlet_proj,                               &
+                n_part_groups, part_group_configs,                  &
+                part_groups_in_use, valves, fluid_configs,          &
+                fix_kinetic_Te, fixed_Te_eV
 
-                
+
 namelist /dommcoef/  R_domm, dcoef
 
 if (my_id .eq. 0) then
@@ -246,6 +266,24 @@ if (domm .and. my_id .eq. 0 ) then
     stop
   end if
 end if
+
+#ifdef USE_DOMM
+! Runtime check: If compiled with USE_DOMM, vacuum field representation uses ONLY Dommaschk potentials (no FE correction)
+! This requires domm_file to provide dcoef array. Without it, dcoef=0 causes NaN in field calculations.
+if (.not. domm .and. my_id .eq. 0) then
+  write(*,*) '**************************************************************************'
+  write(*,*) 'WARNING: Compiled with USE_DOMM=1 (Dommaschk-only vacuum field)'
+  write(*,*) '         but domm_file="', trim(domm_file), '"'
+  write(*,*) '         Vacuum field will be ZERO (dcoef array uninitialized)!'
+  write(*,*) '         This will cause NaN in field line tracing and Poincare plots.'
+  write(*,*) ''
+  write(*,*) 'SOLUTION: Either:'
+  write(*,*) '  1. Provide domm_file with Dommaschk coefficients in namelist'
+  write(*,*) '  2. Recompile with USE_DOMM=0 to use GVEC import + FE correction'
+  write(*,*) '**************************************************************************'
+  stop
+end if
+#endif
   
 return
 end subroutine initialise_parameters

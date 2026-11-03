@@ -5,6 +5,7 @@ program generate_particle_restart_from_SOFT
 use constants,       only: PI,SPEED_OF_LIGHT,ATOMIC_MASS_UNIT,EL_CHG
 use mod_mpi_tools,   only: init_mpi_threads,finalize_mpi_threads
 use mod_particle_io, only: write_simulation_hdf5
+use phys_module
 use particle_tracer
 
 implicit none
@@ -21,7 +22,7 @@ type(pcg32_rng)      :: rng_type
 type(event)          :: field_reader
 type(type_soft_pdf),dimension(:),allocatable :: soft_pdf_list
 logical              :: do_write_particles_in_hdf5,compute_magnetic_field_error
-integer              :: my_id,n_cpus,ierr,n_vec,n_groups,n_phi
+integer              :: my_id,n_mpis,ierr,n_vec,n_groups,n_phi
 integer              :: n_r_pdf_mesh,n_accepted_orbit_labels
 integer,dimension(2) :: dims
 integer,dimension(:),allocatable :: accepted_orbit
@@ -62,10 +63,11 @@ filename_jorek_hdf5    = 'jorek_particles_from_soft'
 Bfield_error_filename  = 'soft_jorek_magnetic_field_error' 
 !> Initialisation --------------------------------------------------------------------------
 !> initialise the MPI communicator
-call init_mpi_threads(my_id,n_cpus,ierr)
+call init_mpi_threads(my_id,n_mpis,ierr)
 !> read mhd data
 write(*,*) "Reading MHD data ..."
-call sim%initialize(n_groups,.true.,my_id,n_cpus)
+n_part_groups = n_groups
+call sim%initialize(.true.,my_id,n_mpis)
 field_reader = event(read_jorek_fields_interp_linear(basename=trim(fields_filename),i=-1))
 call with(sim,field_reader)
 write(*,*) "Reading MHD data: completed!"
@@ -87,8 +89,8 @@ if(my_id.eq.0) then
   soft_RZ_axis,soft_R_mesh,soft_Z_mesh,soft_poloidal_flux,soft_pdf_r_mesh,soft_pdf_list,\
   soft_orbit_x,soft_orbit_ppar,soft_orbit_pperp,soft_orbit_weights)
   !> scatter the global arrays to each mpi process)
-  dims(2) = dims(1)/n_cpus;
-  if(dims(2)*n_cpus.lt.dims(1)) dims(2) = dims(2)+1
+  dims(2) = dims(1)/n_mpis;
+  if(dims(2)*n_mpis.lt.dims(1)) dims(2) = dims(2)+1
   if(allocated(soft_R_mesh))        deallocate(soft_R_mesh)
   if(allocated(soft_Z_mesh))        deallocate(soft_Z_mesh)
   if(allocated(soft_pdf_r_mesh))    deallocate(soft_pdf_r_mesh)
@@ -100,7 +102,7 @@ allocate(soft_orbit_x_local(n_vec,dims(2)));  soft_orbit_x_local     = 0d0;
 allocate(soft_orbit_ppar_local(dims(2)));     soft_orbit_ppar_local  = 0d0;
 allocate(soft_orbit_pperp_local(dims(2)));    soft_orbit_pperp_local = 0d0;
 allocate(soft_orbit_weights_local(dims(2)));  soft_orbit_weights_local = 0d0;
-call scatter_2D_arrays(my_id,n_cpus,n_vec,dims(2),dims(1),soft_orbit_x,soft_orbit_x_local)
+call scatter_2D_arrays(my_id,n_mpis,n_vec,dims(2),dims(1),soft_orbit_x,soft_orbit_x_local)
 call MPI_Scatter(soft_orbit_ppar,dims(2),MPI_REAL8,soft_orbit_ppar_local,dims(2),MPI_REAL8,0,MPI_COMM_WORLD,ierr)
 call MPI_Scatter(soft_orbit_pperp,dims(2),MPI_REAL8,soft_orbit_pperp_local,dims(2),MPI_REAL8,0,MPI_COMM_WORLD,ierr)
 call MPI_Scatter(soft_orbit_weights,dims(2),MPI_REAL8,soft_orbit_weights_local,dims(2),&
@@ -114,17 +116,17 @@ write(*,*) "Reading SOFT magnetic field, pdf and orbit files: completed!"
 write(*,*) 'Converting soft orbit to JOREK relativistic gc ...'
 if(trim(generator_type)=='random') then
   write(*,*) "use random the toroidal angle"
-  call convert_soft_orbits_in_jorek_relativistic_gcs_rnd_phi(sim,rng_type,my_id,n_cpus,\
+  call convert_soft_orbits_in_jorek_relativistic_gcs_rnd_phi(sim,rng_type,my_id,n_mpis,\
   time,mass,charge,n_vec,dims(2),n_phi,phi_interval,soft_orbit_x_local,soft_orbit_ppar_local,\
   soft_orbit_pperp_local,soft_orbit_weights_local)
 elseif(trim(generator_type)=='deterministic') then
   write(*,*) "use deterministic the toroidal angle"
-  call convert_soft_orbits_in_jorek_relativistic_gcs_det_phi(sim,my_id,n_cpus,time,\
+  call convert_soft_orbits_in_jorek_relativistic_gcs_det_phi(sim,my_id,n_mpis,time,\
   mass,charge,n_vec,dims(2),n_phi,phi_interval,soft_orbit_x_local,soft_orbit_ppar_local,\
   soft_orbit_pperp_local,soft_orbit_weights_local)
 else
   write(*,*) "use SOFT toroidal angle"
-  call convert_soft_orbits_in_jorek_relativistic_gcs(sim,my_id,n_cpus,time,mass,charge,n_vec,dims(2),\
+  call convert_soft_orbits_in_jorek_relativistic_gcs(sim,my_id,n_mpis,time,mass,charge,n_vec,dims(2),\
   soft_orbit_x_local,soft_orbit_ppar_local,soft_orbit_pperp_local,soft_orbit_weights_local)
 endif
 write(*,*) 'Converting soft orbit to JOREK relativistic gc: completed!'
@@ -134,7 +136,7 @@ write(*,*) 'Writing JOREK relativistic gc in ',trim(particle_filename),' complet
 !> Write data in HDF5 file -----------------------------------------------------------------
 if(do_write_particles_in_hdf5) then
   write(*,*) 'Writing JOREK particles in HDF5 file ...'
-  call write_particles_in_hdf5(my_id,filename_jorek_hdf5,n_cpus,n_vec,sim)
+  call write_particles_in_hdf5(my_id,filename_jorek_hdf5,n_mpis,n_vec,sim)
   write(*,*) 'Writing JOREK particles in HDF5 file: completed!'
 endif
 !> Finalisation ----------------------------------------------------------------------------
@@ -160,7 +162,7 @@ contains
 !> inputs:
 !>   sim:                (particle_sim) particle simulation type to be initialised
 !>   my_id:              (integer) MPI task rank
-!>   n_cpus:             (integer) number of MPI tasks
+!>   n_mpis:             (integer) number of MPI tasks
 !>   time:               (real8) simulation time
 !>   mass:               (real8) particle mass in AMU
 !>   charge:             (real8) particle charge (RE: -1)
@@ -176,7 +178,7 @@ contains
 !>   soft_orbit_weights: (real8)(n_points) soft orbit weight:
 !>                       jacobian*dpoloidal*dminor_radius*dmomentum*dcospitchangle*dtorangle
 subroutine convert_soft_orbits_in_jorek_relativistic_gcs(&
-sim,my_id,n_cpus,time,mass,charge,n_vec,n_points,soft_orbit_x,&
+sim,my_id,n_mpis,time,mass,charge,n_vec,n_points,soft_orbit_x,&
 soft_orbit_ppar,soft_orbit_pperp,soft_orbit_weights)
   use mpi
   use constants,                 only: TWOPI,SPEED_OF_LIGHT
@@ -186,7 +188,7 @@ soft_orbit_ppar,soft_orbit_pperp,soft_orbit_weights)
   type(particle_sim),intent(inout)         :: sim
   real*8,dimension(n_points),intent(inout) :: soft_orbit_weights
   !> inputs:
-  integer,intent(in)               :: my_id,n_cpus,n_vec,n_points
+  integer,intent(in)               :: my_id,n_mpis,n_vec,n_points
   real*8,intent(in)                :: time,mass,charge
   real*8,dimension(n_points),intent(in)       :: soft_orbit_ppar
   real*8,dimension(n_points),intent(in)       :: soft_orbit_pperp
@@ -236,7 +238,7 @@ end subroutine convert_soft_orbits_in_jorek_relativistic_gcs
 !>   sim:                (particle_sim) particle simulation type to be initialised
 !>   rng_base:           (type_rng) type of the random number generator
 !>   my_id:              (integer) MPI task rank
-!>   n_cpus:             (integer) number of MPI tasks
+!>   n_mpis:             (integer) number of MPI tasks
 !>   time:               (real8) simulation time
 !>   mass:               (real8) particle mass in AMU
 !>   charge:             (real8) particle charge (RE: -1)
@@ -254,7 +256,7 @@ end subroutine convert_soft_orbits_in_jorek_relativistic_gcs
 !>   soft_orbit_weights: (real8)(n_points) soft orbit weight:
 !>                       jacobian*dpoloidal*dminor_radius*dmomentum*dcospitchangle*dtorangle
 subroutine convert_soft_orbits_in_jorek_relativistic_gcs_rnd_phi(sim,rng_base,&
-my_id,n_cpus,time,mass,charge,n_vec,n_points,n_phi,phi_interval,&
+my_id,n_mpis,time,mass,charge,n_vec,n_points,n_phi,phi_interval,&
 soft_orbit_x,soft_orbit_ppar,soft_orbit_pperp,soft_orbit_weights)
   use mpi
   use constants,                 only: SPEED_OF_LIGHT
@@ -268,7 +270,7 @@ soft_orbit_x,soft_orbit_ppar,soft_orbit_pperp,soft_orbit_weights)
   real*8,dimension(n_points),intent(inout) :: soft_orbit_weights
   !> inputs:
   class(type_rng),intent(in)       :: rng_base
-  integer,intent(in)               :: my_id,n_cpus,n_vec
+  integer,intent(in)               :: my_id,n_mpis,n_vec
   integer,intent(in)               :: n_points,n_phi
   real*8,intent(in)                :: time,mass,charge
   real*8,dimension(2),intent(in)   :: phi_interval
@@ -288,7 +290,7 @@ soft_orbit_x,soft_orbit_ppar,soft_orbit_pperp,soft_orbit_weights)
 !$ n_threads = omp_get_max_threads()
   allocate(rngs(n_threads),source=rng_base) 
   do ii=1,n_threads
-    call rngs(ii)%initialize(n_phi,random_seed(),n_cpus*n_threads,my_id*n_threads+ii,ifail)
+    call rngs(ii)%initialize(n_phi,random_seed(),n_mpis*n_threads,my_id*n_threads+ii,ifail)
     if(ifail.ne.0) call MPI_Abort(MPI_COMM_WORLD,-1,ifail)
   enddo
   !> initialise and allocate particle simulation array
@@ -341,7 +343,7 @@ end subroutine convert_soft_orbits_in_jorek_relativistic_gcs_rnd_phi
 !> inputs:
 !>   sim:                (particle_sim) particle simulation type to be initialised
 !>   my_id:              (integer) MPI task rank
-!>   n_cpus:             (integer) number of MPI tasks
+!>   n_mpis:             (integer) number of MPI tasks
 !>   time:               (real8) simulation time
 !>   mass:               (real8) particle mass in AMU
 !>   charge:             (real8) particle charge (RE: -1)
@@ -359,7 +361,7 @@ end subroutine convert_soft_orbits_in_jorek_relativistic_gcs_rnd_phi
 !>   soft_orbit_weights: (real8)(n_points) soft orbit weight:
 !>                       jacobian*dpoloidal*dminor_radius*dmomentum*dcospitchangle*dtorangle
 subroutine convert_soft_orbits_in_jorek_relativistic_gcs_det_phi(sim,&
-my_id,n_cpus,time,mass,charge,n_vec,n_points,n_phi,phi_interval,&
+my_id,n_mpis,time,mass,charge,n_vec,n_points,n_phi,phi_interval,&
 soft_orbit_x,soft_orbit_ppar,soft_orbit_pperp,soft_orbit_weights)
   use mpi
   use constants,                 only: SPEED_OF_LIGHT
@@ -370,7 +372,7 @@ soft_orbit_x,soft_orbit_ppar,soft_orbit_pperp,soft_orbit_weights)
   type(particle_sim),intent(inout)         :: sim
   real*8,dimension(n_points),intent(inout) :: soft_orbit_weights
   !> inputs:
-  integer,intent(in)               :: my_id,n_cpus,n_vec
+  integer,intent(in)               :: my_id,n_mpis,n_vec
   integer,intent(in)               :: n_points,n_phi
   real*8,intent(in)                :: time,mass,charge
   real*8,dimension(2),intent(in)   :: phi_interval
@@ -427,18 +429,18 @@ end subroutine convert_soft_orbits_in_jorek_relativistic_gcs_det_phi
 !> along the second index
 !> inputs:
 !>   my_id:        (integer) MPI task rank
-!>   n_cpus:       (integer) size of the MPI communicator
+!>   n_mpis:       (integer) size of the MPI communicator
 !>   n1:           (integer) first index size
 !>   n2_loc:       (integer) local array second index size
 !>   n2_glob:      (integer) global array second index size
 !>   global_array: (n1,n2_glob) array to be scattered
 !> outputs:
 !>   local_array: (n1,n2_loc) array receiving the scattered global array
-subroutine scatter_2D_arrays(my_id,n_cpus,n1,n2_loc,n2_glob,global_array,local_array)
+subroutine scatter_2D_arrays(my_id,n_mpis,n1,n2_loc,n2_glob,global_array,local_array)
   use mpi
   implicit none
   !> inputs:
-  integer,intent(in) :: my_id,n_cpus,n1,n2_loc,n2_glob
+  integer,intent(in) :: my_id,n_mpis,n1,n2_loc,n2_glob
   !> inputs-outputs:
   real*8,dimension(:,:),allocatable,intent(inout) :: global_array
   !> outputs:
@@ -447,7 +449,7 @@ subroutine scatter_2D_arrays(my_id,n_cpus,n1,n2_loc,n2_glob,global_array,local_a
   logical :: did_allocate
   integer :: ii,doublesize,subarraytype,resizedsubarraytype,errorcode,ierr
   integer(kind=MPI_Address_kind) :: startresized,extent
-  integer,dimension(n_cpus)      :: disps,counts
+  integer,dimension(n_mpis)      :: disps,counts
   !> check consistency
   if(n2_loc.le.0) then
     write(*,*) 'Error: invalid size of the receiving array during scattering: abort!'
@@ -456,7 +458,7 @@ subroutine scatter_2D_arrays(my_id,n_cpus,n1,n2_loc,n2_glob,global_array,local_a
   !> create a vector for each subblock and scatter them
   did_allocate = .false.
   if(my_id.eq.0) then
-    counts = 1; disps = [(n2_loc*ii,ii=0,n_cpus-1)]; startresized = 0;
+    counts = 1; disps = [(n2_loc*ii,ii=0,n_mpis-1)]; startresized = 0;
     call MPI_Type_size(MPI_REAL8,doublesize,ierr); extent = n1*doublesize;
     call MPI_Type_create_subarray(2,[n1,n2_glob],[n1,n2_loc],[0,0],MPI_ORDER_FORTRAN,MPI_REAL8,subarraytype,ierr)
     call MPI_Type_create_resized(subarraytype,startresized,extent,resizedsubarraytype,ierr)
@@ -1025,11 +1027,11 @@ end subroutine find_point_segment
 !> inputs:
 !>   my_id:    (integer)
 !>   filename: (character) hdf5 filename
-!>   n_cpus:   (integer) total number of mpi tasks
+!>   n_mpis:   (integer) total number of mpi tasks
 !>   n_vec:    (integer) size of the x position vector
 !>   sim:      (particle_sim) jorek particle simulation
 !> outputs:
-subroutine write_particles_in_hdf5(my_id,filename,n_cpus,n_vec,sim)
+subroutine write_particles_in_hdf5(my_id,filename,n_mpis,n_vec,sim)
   use constants,      only: SPEED_OF_LIGHT
   use mpi
   use hdf5
@@ -1040,7 +1042,7 @@ subroutine write_particles_in_hdf5(my_id,filename,n_cpus,n_vec,sim)
   !> inputs:
   type(particle_sim),intent(in) :: sim
   character(len=*),intent(in)   :: filename
-  integer,intent(in)            :: my_id,n_cpus,n_vec
+  integer,intent(in)            :: my_id,n_mpis,n_vec
   !> variables:
   integer(HID_T) :: file_id
   integer        :: ii,n_particles,ierr
@@ -1054,9 +1056,9 @@ subroutine write_particles_in_hdf5(my_id,filename,n_cpus,n_vec,sim)
   allocate(x_pos(n_vec,n_particles)); x_pos = 0d0;
   allocate(ppar(n_particles));        ppar  = 0d0;
   allocate(pperp(n_particles));       pperp = 0d0;
-  allocate(x_pos_glob(n_vec,n_cpus*n_particles)); x_pos_glob = 0d0;
-  allocate(ppar_glob(n_cpus*n_particles));        ppar_glob  = 0d0;
-  allocate(pperp_glob(n_cpus*n_particles));       pperp_glob = 0d0; 
+  allocate(x_pos_glob(n_vec,n_mpis*n_particles)); x_pos_glob = 0d0;
+  allocate(ppar_glob(n_mpis*n_particles));        ppar_glob  = 0d0;
+  allocate(pperp_glob(n_mpis*n_particles));       pperp_glob = 0d0; 
   !$omp parallel do default(shared) firstprivate(n_particles) &
   !$omp private(ii,Evec,Bvec,psi,U)
   do ii=1,n_particles
@@ -1079,9 +1081,9 @@ subroutine write_particles_in_hdf5(my_id,filename,n_cpus,n_vec,sim)
   !> write data in hdf5
   if(my_id.eq.0) then
     call HDF5_open_or_create(trim(filename//'.h5'),file_id,ierr,file_access=H5F_ACC_TRUNC_F)
-    call HDF5_array2D_saving(file_id,x_pos_glob,n_vec,n_cpus*n_particles,'x')
-    call HDF5_array1D_saving(file_id,ppar_glob,n_cpus*n_particles,'ppar')
-    call HDF5_array1D_saving(file_id,pperp_glob,n_cpus*n_particles,'pperp')
+    call HDF5_array2D_saving(file_id,x_pos_glob,n_vec,n_mpis*n_particles,'x')
+    call HDF5_array1D_saving(file_id,ppar_glob,n_mpis*n_particles,'ppar')
+    call HDF5_array1D_saving(file_id,pperp_glob,n_mpis*n_particles,'pperp')
     call HDF5_close(file_id)
   endif
   !> cleanup

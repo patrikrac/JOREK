@@ -51,6 +51,7 @@ contains
     use mod_particle_sim, only: particle_sim
     use mod_parameters, only: n_tor, n_vertex_max, n_degrees
     use phys_module, only: n_aux_var
+    use data_structure, only: init_node
 
     use mpi_mod
     use mod_event
@@ -89,6 +90,11 @@ contains
       n_rhs_f = size(this%rhs_f,5)
     end if
 
+    ! reinitialise the storage node_list to ensure all projections fit
+    do i=1, this%node_list%n_nodes
+      call init_node(this%node_list%node(i), n_rhs_f+n_rhs)
+    enddo
+
     this%rhs_vec%nrhs = (n_rhs + n_rhs_f)
     this%rhs_vec%n = this%system_size
 
@@ -97,6 +103,9 @@ contains
       write(*,*) this%n_dof,  this%rhs_vec%n
     endif
 
+    if (associated(this%rhs_vec%val)) then
+      deallocate(this%rhs_vec%val); this%rhs_vec%val => Null()
+    endif
     allocate(this%rhs_vec%val(this%rhs_vec%n * this%rhs_vec%nrhs * n_tor))
     this%rhs_vec%val = 0.d0
 
@@ -152,7 +161,7 @@ contains
     ! Write the solution to the node_list
     if (this%my_id .eq. 0) then
 
-      do i_var=1,min(n_rhs+n_rhs_f, n_aux_var)
+      do i_var=1,n_rhs+n_rhs_f
     
         found_nan = .false.
         
@@ -163,13 +172,14 @@ contains
             index = this%node_list%node(i)%index(k)
             
             do i_tor=1,n_tor
+              this%node_list%node(i)%deltas(i_tor, k, i_var) = this%rhs_vec%val(n_tor*(index - 1) + i_tor + this%rhs_vec%n * (i_var - 1)) - this%node_list%node(i)%values(i_tor, k, i_var)
               this%node_list%node(i)%values(i_tor, k, i_var) = this%rhs_vec%val(n_tor*(index - 1) + i_tor + this%rhs_vec%n * (i_var - 1))
             end do
           
           enddo    ! order
           
           ! Check for NaNs in the projection
-          if (any(ieee_is_nan(this%node_list%node(i)%values(:,:,i_var)))) then
+          if (any(ieee_is_nan(this%node_list%node(i)%values(:,:,i_var))) .or. any(ieee_is_nan(this%node_list%node(i)%deltas(:,:,i_var)))) then
             found_nan = .true.
           end if
         

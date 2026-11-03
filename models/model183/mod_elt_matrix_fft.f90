@@ -23,6 +23,8 @@ use mod_semianalytical
 use mod_equations
 use mod_chi
 use mod_sources
+use coupling_variables
+use mod_coupling_settings
 
 implicit none
  
@@ -99,6 +101,7 @@ real*8, dimension(n_gauss, n_gauss)        :: s_norm
 
 real*8, dimension(n_plane,n_var,n_gauss,n_gauss) :: eq_g, eq_s, eq_t, eq_p, eq_ss, eq_st, eq_tt, eq_pp, eq_sp, eq_tp
 real*8, dimension(n_plane,n_var,n_gauss,n_gauss) :: delta_g, delta_s, delta_t, delta_p
+real*8, dimension(n_plane, n_aux_var, n_gauss, n_gauss) :: eq_aux_g
 
 real*8, dimension(:,:,:,:,:), pointer :: eq
 real*8, dimension(n_var)              :: eq_px, eq_py
@@ -143,14 +146,14 @@ n_tor_local = n_tor_end - n_tor_start + 1
 !---------------------------------------------------- value of (x,y) and derivatives on Gaussian points
 x_g  = 0.d0; x_s   = 0.d0; x_t   = 0.d0; x_p = 0.d0; x_st  = 0.d0; x_ss  = 0.d0; x_tt  = 0.d0; x_sp = 0.d0; x_tp = 0.d0; x_pp = 0.d0;
 y_g  = 0.d0; y_s   = 0.d0; y_t   = 0.d0; y_p = 0.d0; y_st  = 0.d0; y_ss  = 0.d0; y_tt  = 0.d0; y_sp = 0.d0; y_tp = 0.d0; y_pp = 0.d0;
-eq_g = 0.d0; eq_s  = 0.d0; eq_t  = 0.d0; eq_st = 0.d0; eq_ss = 0.d0; eq_tt = 0.d0;
+eq_g = 0.d0; eq_s  = 0.d0; eq_t  = 0.d0; eq_st = 0.d0; eq_ss = 0.d0; eq_tt = 0.d0;  eq_aux_g = 0.d0;
 eq_p = 0.d0; eq_pp = 0.d0; eq_sp = 0.d0; eq_tp = 0.d0
 
 delta_g = 0.d0; delta_s = 0.d0; delta_t = 0.d0; delta_p = 0.d0
 
 eq = 0.d0
 
-s_factor = 1.0 / (n_flux - 1)
+s_factor = 1.0 * bloating_factor / (n_flux - 1)
 s_norm          = 0.d0
 current_source  = 0.d0
 particle_source = 0.d0
@@ -209,6 +212,16 @@ do i=1,n_vertex_max
               delta_p(mp,k,ms,mt) = delta_p(mp,k,ms,mt) + nodes(i)%deltas(in,j,k) * element%size(i,j) * H(i,j,ms,mt)   * HZ_p(in,mp)
             enddo
           enddo
+
+          ! kinetics extension
+          if (use_ncs .or. use_ics) then
+            do k=1, n_aux_var
+              do in=1, n_tor
+                eq_aux_g(mp,k,ms,mt) = eq_aux_g(mp,k,ms,mt) + aux_nodes(i)%values(in,j,k) &
+                                       * element%size(i,j) * H(i,j,ms,mt) * HZ(in,mp)
+              enddo
+            enddo
+           endif
 
           if (keep_current_prof) then
             do in=1,n_tor
@@ -329,6 +342,17 @@ do ms=1, n_gauss
 
       eq(var_S_rho,0,0,0,:) = particle_source(mp,ms,mt)   ! S_rho
       eq(  var_S_j,0,0,0,:) = current_source(mp,ms,mt)/F0 ! S_j
+
+      ! ############ Kinetics Particle Coupling source terms ############
+      eq(var_aux_E0,0,0,0,:) = 0.d0
+      if (use_ncs .or. use_ics) eq(var_aux_E0,0,0,0,:) = eq_aux_g(mp, E_idx_kin, ms, mt)
+
+      eq(var_aux_mom_par0,0,0,0,:) = 0.d0
+      if (use_ncs .or. use_ics) eq(var_aux_mom_par0,0,0,0,:) = eq_aux_g(mp, mom_par_idx_kin, ms, mt)
+
+      eq(var_aux_rho0,0,0,0,:) = 0.d0
+      if (use_ncs) eq(var_aux_rho0,0,0,0,:) = eq_aux_g(mp, rho_idx_kin, ms, mt) ! only for neutral coupling scheme
+      ! ##################################################################
 
       ! Poloidal momentum source based on artificial ExB flow - note only first order derivatives are implemented
       call potential_source(xpoint2, xcase2, y_g(mp,ms,mt), Z_xpoint, psi_norm, 0.0, 1.0, phi_source, dPhi_source_dpsi,dummy1,dPhi_source_dpsi2,dummy2,dummy3,dummy4,dummy5,dummy6)
@@ -524,7 +548,7 @@ do ms=1, n_gauss
                                 + nu_e_bg * (T0_e_corr - T0_i_corr) * drho0_corr_dn
 
       else !>>> if not with_TiTe
-        eq(var_k_perp,0,0,0,:)        = get_zkperp(psi_norm)        ! Perpendicular thermal conductivity
+        eq(var_k_perp,0,0,0,:)        = get_zkperp(psi_norm) * corr_neg_dens(eq(var_rho,0,0,0,1))  ! Perpendicular thermal conductivity ! TEMP for EMC3: kappa_perp = (g-1) chi t_norm rho (local)    
         eq(   var_S_e,0,0,0,:)        = heat_source(mp,ms,mt)       ! S_e
         ! Resistivity
         if (eta_T_dependent) then
@@ -546,6 +570,7 @@ do ms=1, n_gauss
         if (zkpar_T_dependent) then
           eq(    var_k_par,0,0,0,:) = zk_par*(corr_neg_temp(eq(var_T,0,0,0,1))/T_0)**(2.5d0)               ! k_par 
           eq(var_dk_par_dT,0,0,0,:) = 2.5d0*zk_par*corr_neg_temp(eq(var_T,0,0,0,1))**(1.5d0)*T_0**(-2.5d0) ! dk_par_dT 
+          if (zkpar_picard) eq(var_dk_par_dT,0,0,0,:) = 0.d0     ! TEST: Picard linearization of Spitzer kappa_par
           if (eq(var_k_par,0,0,0,1) .gt. zk_par_max) then
             eq(    var_k_par,0,0,0,:) = zk_par_max
             eq(var_dk_par_dT,0,0,0,:) = 0.d0
@@ -620,8 +645,19 @@ do ms=1, n_gauss
                                   - x_p(mp,ms,mt)*eq(var_v,1,1,0,:)
             
             
-          call get_rhs(rhs_ij, eq)
+          call get_rhs(rhs_ij, eq, psi_norm)
            
+            ! kinetics extension - only impurities for now
+            ! if (use_ncs .or. use_ics) then
+              ! aux_E0 = eq_aux_g(mp, E_idx_kin, ms, mt)
+              ! aux_mom_par0 = eq_aux_g(mp, mom_par_idx_kin,  ms, mt) 
+              ! vpar0        = eq_g(mp, var_Vpar, ms, mt)
+
+              ! rhs_ij(var_T, 1) = rhs_ij(var_T, 1) &
+              !                   + eq(var_v,0,0,0,1) * aux_E0 * tstep ! &
+              !                     ! - (gamma-1.d0) * eq(var_v,0,0,0,1) * aux_mom_par0 * vpar0 * tstep 
+            ! endif
+
            ! Add Jacobian pre-factor to contributions
            do i_var=1,n_var
              rhs_ij(i_var,:) = rhs_ij(i_var,:)*wst*BigR*xjac
@@ -686,7 +722,7 @@ do ms=1, n_gauss
                   eq(var_varStar_pol,0,1,0,:) = (-x_t(mp,ms,mt)*h_s(k,l,ms,mt))*element%size(k,l)*dur/xjac
                   eq(var_varStar_pol,0,0,1,:) = H(k,l,ms,mt)*element%size(k,l)*dup - eq(var_varStar_pol,1,0,0,:)*x_p(mp,ms,mt) - eq(var_varStar_pol,0,1,0,:)*y_p(mp,ms,mt)      
 
-                  call get_amat(amat_ij, eq)                
+                  call get_amat(amat_ij, eq, psi_norm)                
                   
                   ! Include pre-factor to contribution
                   do i_var = 1, n_var
@@ -1012,7 +1048,7 @@ subroutine get_auxiliary(eq)
 #include "aux_automatic.h"
 end subroutine
 
-subroutine get_rhs(rhs_ij, eq)
+subroutine get_rhs(rhs_ij, eq, psi_norm)
   use data_structure
   use constants
   use mod_parameters
@@ -1023,7 +1059,8 @@ subroutine get_rhs(rhs_ij, eq)
 
   real*8, dimension(n_var,4), intent(inout)       :: rhs_ij
   real*8, dimension(:,:,:,:,:), pointer, intent(in) :: eq
-  real*8     :: theta, zeta, reta
+  real*8, intent(in) :: psi_norm
+  real*8     :: theta, zeta, reta, freeze_flag, core_freeze ! whether to freeze Psi (magnetic evolution)
   
   ! --- Take time evolution parameters from phys_module
   theta = time_evol_theta
@@ -1034,11 +1071,15 @@ subroutine get_rhs(rhs_ij, eq)
   else
     reta = 0.d0
   end if
+
+  freeze_flag = merge(1.d0, 0.d0, freeze_psi_dynamics)
+  core_freeze = merge(0.5d0 - 0.5d0*tanh((psi_norm - core_freeze_s0)/core_freeze_sig), &
+                       0.d0, use_core_freeze)
   
 #include "rhs_automatic.h"
 end subroutine
 
-subroutine get_amat(amat_ij, eq)
+subroutine get_amat(amat_ij, eq, psi_norm)
   use data_structure
   use constants
   use mod_parameters
@@ -1049,7 +1090,8 @@ subroutine get_amat(amat_ij, eq)
 
   real*8, dimension(n_var,n_var,4), intent(inout) :: amat_ij
   real*8, dimension(:,:,:,:,:), pointer, intent(in) :: eq
-  real*8     :: theta, zeta, reta
+  real*8, intent(in) :: psi_norm
+  real*8     :: theta, zeta, reta, freeze_flag, core_freeze
   
   ! --- Take time evolution parameters from phys_module
   theta = time_evol_theta
@@ -1060,6 +1102,10 @@ subroutine get_amat(amat_ij, eq)
   else
     reta = 0.d0
   end if
+
+  freeze_flag = merge(1.d0, 0.d0, freeze_psi_dynamics)
+  core_freeze = merge(0.5d0 - 0.5d0*tanh((psi_norm - core_freeze_s0)/core_freeze_sig), &
+                       0.d0, use_core_freeze)
   
 #include "amat_automatic.h"
 end subroutine

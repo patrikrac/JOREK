@@ -34,7 +34,7 @@ USE_HDF5   = 1
 
 #Scotch library
 SCOTCH_HOME ?= $(EBROOTSCOTCH)
-#SCOTCH_HOME  = /home/ITER/vanvugd/source/scotch_5.1.12
+#SCOTCH_HOME ?= /path/to/scotch_5.1.12
 #LIB_SCOTCH   = -L$(SCOTCH_HOME)/lib -lscotch -lscotcherr
 #INC_SCOTCH   = -I$(SCOTCH_HOME)/include
 
@@ -72,7 +72,7 @@ LIBFFTW   = -L$(FFTWDIR)/lib -lfftw3
 INC_FFTW  = -I$(FFTWDIR)/include
 
 # LIBDIERCKX
-DIERCKX_HOME ?= /home/ITER/vanvugd/source/Dierckx
+DIERCKX_HOME ?= /path/to/Dierckx
 LIBDIERCKX = -L$(DIERCKX_HOME) -ldierckx
 
 #LAPACK

@@ -1,0 +1,46 @@
+// Gruvbox Material — Dark (medium background), palette by sainnhe
+// https://github.com/sainnhe/gruvbox-material
+//
+// This scheme is imported *after* the theme's default `light` scheme, so every
+// variable set here (without !default) overrides the light values.
+
+// Palette --------------------------------------------------------------------
+$gm-bg-dim:        #1d2021;
+$gm-bg0:           #282828; // main background
+$gm-bg1:           #32302f;
+$gm-bg2:           #32302f;
+$gm-bg3:           #45403d;
+$gm-bg4:           #504945;
+$gm-fg0:           #d4be98; // main foreground
+$gm-fg1:           #ddc7a1;
+$gm-grey0:         #7c6f64;
+$gm-grey1:         #928374;
+$gm-grey2:         #a89984;
+$gm-red:           #ea6962;
+$gm-orange:        #e78a4e;
+$gm-yellow:        #d8a657;
+$gm-green:         #a9b665;
+$gm-aqua:          #89b482;
+$gm-blue:          #7daea3;
+$gm-purple:        #d3869b;
+
+// Just the Docs mappings -----------------------------------------------------
+$color-scheme:                dark;
+
+$body-background-color:       $gm-bg0;
+$sidebar-color:               $gm-bg-dim;
+$body-heading-color:          $gm-fg1;
+$body-text-color:             $gm-fg0;
+$link-color:                  $gm-blue;
+$nav-child-link-color:        $gm-grey2;
+$base-button-color:           $gm-bg1;
+$btn-primary-color:           $gm-bg3;
+$code-background-color:        $gm-bg-dim;
+$code-linenumber-color:       $gm-grey1;
+$feedback-color:              darken($sidebar-color, 3%);
+$table-background-color:      $gm-bg1;
+$search-background-color:     $gm-bg1;
+$search-result-preview-color: $gm-grey2;
+$border-color:                $gm-bg4;
+
+@import "./vendor/OneDarkJekyll/syntax"; // dark syntax highlighting theme

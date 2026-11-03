@@ -42,7 +42,7 @@ USE_MUMPS  = 0
 USE_WSMP   = 0
 
 #Library directory
-LIB_DIR = /afs/ipp/u/mhoelzl/mylib/amd64_sles11/
+LIB_DIR ?= /path/to/mylib/amd64_sles11
 
 #Scotch library
 SCOTCH_HOME ?= $(HOME)/scotch_5.1.11

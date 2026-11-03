@@ -65,7 +65,7 @@ program test_particle_io
   mpio_collective            = .true.
   remove_file                = .true.
   !> Initialise --------------------------------------------------
-  call sim_write%initialize(n_groups,.true.,do_jorek_init_in=.false.)
+  call sim_write%initialize(num_groups=n_groups,skip_jorek2help=.true.,do_jorek_init_in=.false.)
   if(do_write) then
     write_particle = write_action(filename,file_access_in=file_access_write,&
     use_native_hdf5_mpio_in=use_native_hdf5_mpio,&
@@ -96,8 +96,8 @@ program test_particle_io
     read_particle = read_action(filename=filename,mpi_comm_in=mpi_comm_io,&
     mpi_info_in=mpi_info_io,use_hdf5_access_properties_in=use_hdf5_access_properties)
     event_read = [event(read_particle)];
-    call sim_read%initialize(n_groups,.true.,my_id=sim_write%my_id,&
-    n_cpu=sim_write%n_cpu,do_jorek_init_in=.false.)
+    call sim_read%initialize(num_groups=n_groups,skip_jorek2help=.true.,my_id=sim_write%my_id,&
+    n_mpi=sim_write%n_mpi,do_jorek_init_in=.false.)
   endif
   !> Read - write operations -------------------------------------
   if(do_write) then
@@ -136,9 +136,9 @@ program test_particle_io
       sim_read%groups(ii)%mass,"List mass mismatch!")
       call assert_equal_particle(size(sim_write%groups(ii)%particles),&
       sim_write%groups(ii)%particles,sim_read%groups(ii)%particles)
-      call fruit_summary_mpi(sim_write%n_cpu,sim_write%my_id)
-      call fruit_summary_mpi_xml(sim_write%n_cpu,sim_write%my_id)
-      call fruit_finalize_mpi(sim_write%n_cpu,sim_write%my_id)
+      call fruit_summary_mpi(sim_write%n_mpi,sim_write%my_id)
+      call fruit_summary_mpi_xml(sim_write%n_mpi,sim_write%my_id)
+      call fruit_finalize_mpi(sim_write%n_mpi,sim_write%my_id)
     enddo
   endif
   !> Log data ---------------------------------------------------- 

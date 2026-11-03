@@ -124,6 +124,7 @@ subroutine fshape
 !-----------------------------------------------------------------------
 use tr_module
 use helena_boundary
+use mod_spline_routines
 use constants
 
 implicit none

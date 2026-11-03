@@ -35,8 +35,8 @@ contains
     type(type_SP_MATRIX)               :: a_mat
     type(type_MHD_SIM), optional       :: sim
 
-    integer                            :: my_id, n_cpu, j, k, l, n, ierr
-    integer                            :: nm, ji, nr, lmode, kmode, n_i, n_j, isplit, icpu, ie
+    integer                            :: my_id, n_mpi, j, k, l, n, ierr
+    integer                            :: nm, ji, nr, lmode, kmode, n_i, n_j, isplit, i_mpi, ie
     integer(kind=int_all)              :: i, i0, i1, nz_split, ibufsize, block_size
     integer(kind=int_all)              :: n_tor_int
 
@@ -52,7 +52,7 @@ contains
     real t0, t1
     
     my_id   = pc%my_id
-    n_cpu   = pc%n_cpu
+    n_mpi   = pc%n_mpi
 
     if (my_id .eq. 0) then
       write(*,*) my_id,'*********************************'
@@ -68,7 +68,7 @@ contains
     distribute_row = pc%mat%row_distributed.and.(.not.pc%mat%col_distributed)
     distribute_col = pc%mat%col_distributed.and.(.not.pc%mat%row_distributed)
 
-    allocate(indx(n_cpu))
+    allocate(indx(n_mpi))
 
     if (.not.pc%structured) call set_pc_structure(pc,a_mat)
 
@@ -80,7 +80,7 @@ contains
 ! --- Loop over communication splits
     do isplit = 1, pc%nsplit
 
-      ibufsize = sum(pc%send_counts(isplit,1:n_cpu))
+      ibufsize = sum(pc%send_counts(isplit,1:n_mpi))
 
       allocate(Asnd_buffer(ibufsize))
       allocate(isnd_buffer(ibufsize))
@@ -90,7 +90,7 @@ contains
 
     ! prepare data to be distributed from the current rank
       indx(1) = 0 ! starting index for a particular destination rank
-      do i = 2, n_cpu
+      do i = 2, n_mpi
         indx(i) = indx(i-1) + pc%send_counts(isplit,i-1)
       enddo
 
@@ -150,36 +150,36 @@ contains
 
       endif
 
-      allocate(Arcv_buffer(sum(pc%recv_counts(isplit,1:n_cpu))))
-      call mpi_alltoallv(Asnd_buffer, pc%send_counts(isplit,1:n_cpu), pc%send_disp(isplit,1:n_cpu), MPI_DOUBLE_PRECISION, &
-                         Arcv_buffer, pc%recv_counts(isplit,1:n_cpu), pc%splt_disp(isplit,1:n_cpu), MPI_DOUBLE_PRECISION,a_mat%comm,ierr)
-      do icpu = 1, n_cpu
-        i0 = pc%recv_disp(isplit,icpu) + int1
-        i1 = i0 + pc%recv_counts(isplit,icpu) - int1
-        pc%mat%val(i0:i1) = Arcv_buffer(pc%splt_disp(isplit,icpu) + 1:pc%splt_disp(isplit,icpu) + pc%recv_counts(isplit,icpu))
+      allocate(Arcv_buffer(sum(pc%recv_counts(isplit,1:n_mpi))))
+      call mpi_alltoallv(Asnd_buffer, pc%send_counts(isplit,1:n_mpi), pc%send_disp(isplit,1:n_mpi), MPI_DOUBLE_PRECISION, &
+                         Arcv_buffer, pc%recv_counts(isplit,1:n_mpi), pc%splt_disp(isplit,1:n_mpi), MPI_DOUBLE_PRECISION,a_mat%comm,ierr)
+      do i_mpi = 1, n_mpi
+        i0 = pc%recv_disp(isplit,i_mpi) + int1
+        i1 = i0 + pc%recv_counts(isplit,i_mpi) - int1
+        pc%mat%val(i0:i1) = Arcv_buffer(pc%splt_disp(isplit,i_mpi) + 1:pc%splt_disp(isplit,i_mpi) + pc%recv_counts(isplit,i_mpi))
       enddo
       deallocate(Arcv_buffer)
       deallocate(Asnd_buffer)
 
-      allocate(ircv_buffer(sum(pc%recv_counts(isplit,1:n_cpu))))
-      call mpi_alltoallv(isnd_buffer, pc%send_counts(isplit,1:n_cpu), pc%send_disp(isplit,1:n_cpu), MPI_INTEGER_ALL, &
-                         ircv_buffer, pc%recv_counts(isplit,1:n_cpu), pc%splt_disp(isplit,1:n_cpu), MPI_INTEGER_ALL,a_mat%comm,ierr)
+      allocate(ircv_buffer(sum(pc%recv_counts(isplit,1:n_mpi))))
+      call mpi_alltoallv(isnd_buffer, pc%send_counts(isplit,1:n_mpi), pc%send_disp(isplit,1:n_mpi), MPI_INTEGER_ALL, &
+                         ircv_buffer, pc%recv_counts(isplit,1:n_mpi), pc%splt_disp(isplit,1:n_mpi), MPI_INTEGER_ALL,a_mat%comm,ierr)
 
-      do icpu = 1, n_cpu
-        i0 = pc%recv_disp(isplit,icpu) + int1
-        i1 = i0 + pc%recv_counts(isplit,icpu) - int1
-        pc%mat%irn(i0:i1) = ircv_buffer(pc%splt_disp(isplit,icpu) + 1:pc%splt_disp(isplit,icpu) + pc%recv_counts(isplit,icpu))
+      do i_mpi = 1, n_mpi
+        i0 = pc%recv_disp(isplit,i_mpi) + int1
+        i1 = i0 + pc%recv_counts(isplit,i_mpi) - int1
+        pc%mat%irn(i0:i1) = ircv_buffer(pc%splt_disp(isplit,i_mpi) + 1:pc%splt_disp(isplit,i_mpi) + pc%recv_counts(isplit,i_mpi))
       enddo
       deallocate(ircv_buffer)
       deallocate(isnd_buffer)
 
-      allocate(jrcv_buffer(sum(pc%recv_counts(isplit,1:n_cpu))))
-      call mpi_alltoallv(jsnd_buffer, pc%send_counts(isplit,1:n_cpu), pc%send_disp(isplit,1:n_cpu), MPI_INTEGER_ALL, &
-                         jrcv_buffer, pc%recv_counts(isplit,1:n_cpu), pc%splt_disp(isplit,1:n_cpu), MPI_INTEGER_ALL,a_mat%comm,ierr)
-      do icpu = 1, n_cpu
-        i0 = pc%recv_disp(isplit,icpu) + int1
-        i1 = i0 + pc%recv_counts(isplit,icpu) - int1
-        pc%mat%jcn(i0:i1) = jrcv_buffer(pc%splt_disp(isplit,icpu) + 1:pc%splt_disp(isplit,icpu) + pc%recv_counts(isplit,icpu))
+      allocate(jrcv_buffer(sum(pc%recv_counts(isplit,1:n_mpi))))
+      call mpi_alltoallv(jsnd_buffer, pc%send_counts(isplit,1:n_mpi), pc%send_disp(isplit,1:n_mpi), MPI_INTEGER_ALL, &
+                         jrcv_buffer, pc%recv_counts(isplit,1:n_mpi), pc%splt_disp(isplit,1:n_mpi), MPI_INTEGER_ALL,a_mat%comm,ierr)
+      do i_mpi = 1, n_mpi
+        i0 = pc%recv_disp(isplit,i_mpi) + int1
+        i1 = i0 + pc%recv_counts(isplit,i_mpi) - int1
+        pc%mat%jcn(i0:i1) = jrcv_buffer(pc%splt_disp(isplit,i_mpi) + 1:pc%splt_disp(isplit,i_mpi) + pc%recv_counts(isplit,i_mpi))
       enddo
       deallocate(jrcv_buffer)
       deallocate(jsnd_buffer)
@@ -230,7 +230,7 @@ contains
     integer(kind=int_all)              :: nz_split, i0, i1, ind
     integer(kind=int_all)              :: nm
     integer(kind=8)                    :: nnz, nzg
-    integer                            :: isplit, i, j, ie, icpu
+    integer                            :: isplit, i, j, ie, i_mpi
     integer                            :: ierr
     integer                            :: nr
     
@@ -252,8 +252,8 @@ contains
  
     pc%mat%block_size = n_var*pc%mode_set_n ! set block size for current family
 
-    allocate(long_send_counts(pc%n_cpu))
-    allocate(long_recv_counts(pc%n_cpu))
+    allocate(long_send_counts(pc%n_mpi))
+    allocate(long_recv_counts(pc%n_mpi))
 
     nnz = a_mat%nnz
     call MPI_Allreduce(nnz,nzg,1,MPI_INTEGER8,MPI_SUM,a_mat%comm,ierr)
@@ -279,41 +279,41 @@ contains
     enddo
     pc%ifinish(pc%nsplit) = a_mat%nnz
 
-    allocate(pc%send_counts(pc%nsplit,pc%n_cpu))
-    allocate(pc%recv_counts(pc%nsplit,pc%n_cpu))
-    allocate(pc%send_disp(pc%nsplit,pc%n_cpu))
-    allocate(pc%recv_disp(pc%nsplit,pc%n_cpu))
-    allocate(pc%splt_disp(pc%nsplit,pc%n_cpu))
+    allocate(pc%send_counts(pc%nsplit,pc%n_mpi))
+    allocate(pc%recv_counts(pc%nsplit,pc%n_mpi))
+    allocate(pc%send_disp(pc%nsplit,pc%n_mpi))
+    allocate(pc%recv_disp(pc%nsplit,pc%n_mpi))
+    allocate(pc%splt_disp(pc%nsplit,pc%n_mpi))
 
     do isplit = 1, pc%nsplit
       i0 = pc%istart(isplit); i1 = pc%ifinish(isplit)
       call get_send_recv(i0,i1,long_send_counts,long_recv_counts,pc,a_mat)
-      pc%send_counts(isplit,1:pc%n_cpu) = long_send_counts(1:pc%n_cpu)
-      pc%recv_counts(isplit,1:pc%n_cpu) = long_recv_counts(1:pc%n_cpu)
+      pc%send_counts(isplit,1:pc%n_mpi) = long_send_counts(1:pc%n_mpi)
+      pc%recv_counts(isplit,1:pc%n_mpi) = long_recv_counts(1:pc%n_mpi)
     enddo
 
     nnz = 0
     do isplit = 1, pc%nsplit
-      nnz = nnz + sum(pc%recv_counts(isplit,1:pc%n_cpu))
+      nnz = nnz + sum(pc%recv_counts(isplit,1:pc%n_mpi))
     enddo
     pc%mat%nnz=nnz
 
     do isplit = 1, pc%nsplit
       pc%send_disp(isplit,1) = 0
-      do i = 2, pc%n_cpu
+      do i = 2, pc%n_mpi
           pc%send_disp(isplit,i) = pc%send_disp(isplit,i-1) + pc%send_counts(isplit,i-1)
       enddo
     enddo
 
-    !cpu:    |   cpu0    |   cpu1    |   cpu2    |
+    !mpi:    |   mpi0    |   mpi1    |   mpi2    |
     !split:  | 1 | 2 | 3 | 1 | 2 | 3 | 1 | 2 | 3 |
-    ! long displacements calculated cpu by cpu
+    ! long displacements calculated mpi by mpi
 
     pc%recv_disp(1,1) = 0
     do isplit = 2, pc%nsplit
       pc%recv_disp(isplit,1) = pc%recv_disp(isplit-1,1) + pc%recv_counts(isplit-1,1)
     enddo
-    do i = 2, pc%n_cpu
+    do i = 2, pc%n_mpi
       pc%recv_disp(1,i) = pc%recv_disp(pc%nsplit,i-1) + pc%recv_counts(pc%nsplit,i-1)
       do isplit = 2, pc%nsplit
         pc%recv_disp(isplit,i) = pc%recv_disp(isplit-1,i) + pc%recv_counts(isplit-1,i)
@@ -323,7 +323,7 @@ contains
     ! short int displacement for every isplit
     do isplit = 1, pc%nsplit
       pc%splt_disp(isplit,1) = 0
-      do i = 2, pc%n_cpu
+      do i = 2, pc%n_mpi
         pc%splt_disp(isplit,i) = pc%splt_disp(isplit,i-1) + pc%recv_counts(isplit,i-1)
       enddo
     enddo
@@ -332,12 +332,12 @@ contains
 
     pc%mat%comm = pc%MPI_COMM_N    
     ! centralized
-    allocate(pc%mat%index_min(pc%n_cpu_n)); pc%mat%index_min(1:pc%n_cpu_n) = 0
-    allocate(pc%mat%index_max(pc%n_cpu_n)); pc%mat%index_max(1:pc%n_cpu_n) = 0
+    allocate(pc%mat%index_min(pc%n_mpi_n)); pc%mat%index_min(1:pc%n_mpi_n) = 0
+    allocate(pc%mat%index_max(pc%n_mpi_n)); pc%mat%index_max(1:pc%n_mpi_n) = 0
     pc%mat%index_min(pc%my_id_n + 1) = 1
     pc%mat%index_max(pc%my_id_n + 1) = pc%mat%nnz/(pc%mat%block_size*pc%mat%block_size)
-    call MPI_Allreduce(MPI_IN_PLACE,pc%mat%index_min,pc%n_cpu_n,MPI_INTEGER,MPI_SUM,pc%MPI_COMM_N,ierr)
-    call MPI_Allreduce(MPI_IN_PLACE,pc%mat%index_max,pc%n_cpu_n,MPI_INTEGER,MPI_SUM,pc%MPI_COMM_N,ierr)
+    call MPI_Allreduce(MPI_IN_PLACE,pc%mat%index_min,pc%n_mpi_n,MPI_INTEGER,MPI_SUM,pc%MPI_COMM_N,ierr)
+    call MPI_Allreduce(MPI_IN_PLACE,pc%mat%index_max,pc%n_mpi_n,MPI_INTEGER,MPI_SUM,pc%MPI_COMM_N,ierr)
     
     allocate(pc%rhs%val(pc%mat%ng))
     pc%rhs%val(1:pc%mat%ng) = 0.d0
@@ -384,7 +384,7 @@ contains
 
     n_tor_int = n_tor
 
-    long_send_counts(1:pc%n_cpu) = 0 ! number of elements to be sent from current rank to others
+    long_send_counts(1:pc%n_mpi) = 0 ! number of elements to be sent from current rank to others
 
    ! calculate number of entries to be distributed from the current rank
     if (pc%autodistribute_modes) then
@@ -437,16 +437,16 @@ contains
 
     endif
 
-    allocate(sendrecv(pc%n_cpu*pc%n_cpu))
-    sendrecv(1:pc%n_cpu*pc%n_cpu) = 0
-    sendrecv(pc%my_id*pc%n_cpu + 1:(pc%my_id+1)*pc%n_cpu) = long_send_counts(1:pc%n_cpu)
-    j = pc%n_cpu*pc%n_cpu
+    allocate(sendrecv(pc%n_mpi*pc%n_mpi))
+    sendrecv(1:pc%n_mpi*pc%n_mpi) = 0
+    sendrecv(pc%my_id*pc%n_mpi + 1:(pc%my_id+1)*pc%n_mpi) = long_send_counts(1:pc%n_mpi)
+    j = pc%n_mpi*pc%n_mpi
     call MPI_Barrier(a_mat%comm,ierr)
     call MPI_Allreduce(MPI_IN_PLACE,sendrecv,j,MPI_INTEGER_ALL,MPI_SUM,a_mat%comm,ierr)
 
-    long_recv_counts(1:pc%n_cpu) = 0
-    do i = 1, pc%n_cpu
-      long_recv_counts(i) = sendrecv(pc%n_cpu*(i-1) + pc%my_id + 1)
+    long_recv_counts(1:pc%n_mpi) = 0
+    do i = 1, pc%n_mpi
+      long_recv_counts(i) = sendrecv(pc%n_mpi*(i-1) + pc%my_id + 1)
     enddo
 
     deallocate(sendrecv)

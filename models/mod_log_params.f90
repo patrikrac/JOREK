@@ -9,7 +9,9 @@ contains
 subroutine log_parameters(my_id, short)
 
 use phys_module
+use mod_coupling_settings
 use vacuum
+use particle_tracer, only: sim
 use gauss, only: n_gauss
 #ifdef USE_CATALYST
   use mod_catalyst_adaptor, only: catalyst_scripts
@@ -22,23 +24,28 @@ integer,           intent(in) :: my_id !< MPI proc id
 logical, optional             :: short !< commandline short version or run long version
 
 ! --- Constants
-character(len=512), parameter :: REAL_FMT = "(1X,A, ' = ', 99ES12.4)"
-character(len=512), parameter :: REAL_FMT2 = "(1X,A, ' = ', ES12.4, A)"
-character(len=512), parameter :: INTG_FMT = "(1X,A, ' = ', 100I12)"
-character(len=512), parameter :: INTG_FMT2 = "(1X,A, ' = ', I12, A)"
-character(len=512), parameter :: LOGI_FMT = "(1X,A, ' = ', 10L12)"
-character(len=512), parameter :: REA2_FMT = "(1X,A, ' = ', 4ES12.4, '     ...    ', 4ES12.4)"
-character(len=512), parameter :: REA3_FMT = "(1X,A, ' = ', 9ES12.4, '     ...')"
-character(len=512), parameter :: VARI_FMT = "(3x,I3,': ',A)"
-character(len=512), parameter :: MODE_FMT = "(3x,I3,': ',A,'(',A,'*phi)')"
-character(len=512), parameter :: CHAR_FMT = "(1X,A, ' = ""', A, '""')"
-character(len=512), parameter :: CHAR_FMT2 = "(1X,A,I2,A,' = ""',A,'""')"
+character(len=512), parameter :: REAL_FMT   = "(1X,A, ' = ', 99ES12.4)"
+character(len=512), parameter :: REAL_FMT2  = "(1X,A, ' = ', ES12.4, A)"
+character(len=512), parameter :: INTG_FMT   = "(1X,A, ' = ', 100I12)"
+character(len=512), parameter :: INTG_FMT2  = "(1X,A, ' = ', I12, A)"
+character(len=512), parameter :: LOGI_FMT   = "(1X,A, ' = ', 10L12)"
+character(len=512), parameter :: REA2_FMT   = "(1X,A, ' = ', 4ES12.4, '     ...    ', 4ES12.4)"
+character(len=512), parameter :: REA3_FMT   = "(1X,A, ' = ', 9ES12.4, '     ...')"
+character(len=512), parameter :: VARI_FMT   = "(3x,I3,': ',A)"
+character(len=512), parameter :: MODE_FMT   = "(3x,I3,': ',A,'(',A,'*phi)')"
+character(len=512), parameter :: CHAR_FMT   = "(1X,A, ' = ""', A, '""')"
+character(len=512), parameter :: CHAR_FMT2  = "(1X,A,I2,A,' = ""',A,'""')"
+character(len=512), parameter :: HEADER_FMT = "(A40)"
+
 
 ! --- Local variables
 integer           :: ivar, itor
-integer           :: i, j, n_rows !> do loop index 
+integer           :: i, j, n_rows, group_num !> do loop index 
+integer           :: used_segs !< used for write out of puff ctrls
+integer           :: n_wall_actions, n_poly
 character(len=10) :: mode_num
 logical           :: short2
+logical           :: from_file !< whether a file has been specified for this input (used in puff ctrls)
 
 ! --- Text out format
 200 format(' ',79('*'))
@@ -180,6 +187,13 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   write(*,*) 'off'
 #endif
 
+write(*,'(1x,a)',advance='no') ' USE_DOMM            : '
+#ifdef USE_DOMM
+  write(*,*) 'on  (Dommaschk-only vacuum field, no FE correction)'
+#else
+  write(*,*) 'off (GVEC import + FE correction for vacuum field)'
+#endif
+
   write(*,*)
   write(*,200)
   write(*,*) '* Hard-Coded Parameters:                                                      *'
@@ -292,6 +306,7 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
     write(*,INTG_FMT) 'n_up_priv             ', n_up_priv
     write(*,INTG_FMT) 'n_up_leg              ', n_up_leg
     write(*,INTG_FMT) 'n_up_leg_out          ', n_up_leg_out
+    write(*,REAL_FMT) 'xr_closed             ', xr_closed
     write(*,REAL_FMT) 'SIG_closed            ', SIG_closed
     write(*,REAL_FMT) 'SIG_open              ', SIG_open
     write(*,REAL_FMT) 'SIG_private           ', SIG_private
@@ -344,6 +359,7 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
 
   write(*,INTG_FMT) 'nout                  ', nout
   write(*,INTG_FMT) 'nout_projection       ', nout_projection
+  write(*,INTG_FMT) 'nout_particles        ', nout_particles
   write(*,REAL_FMT) 'xr1                   ', xr1
   write(*,REAL_FMT) 'sig1                  ', sig1
   write(*,REAL_FMT) 'xr2                   ', xr2
@@ -421,6 +437,7 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   write(*,LOGI_FMT) 'extended_boundary     ', extended_boundary
   write(*,REAL_FMT) 'j_cutoff_rcoord       ', j_cutoff_rcoord
   write(*,REAL_FMT) 'j_cutoff_sig          ', j_cutoff_sig
+  write(*,REAL_FMT) 'bloating_factor       ', bloating_factor
 
   if ( (abs(V_0) .ge. 1.d-19) .or. (num_rot) ) then
      write(*,LOGI_FMT) 'normalized_velocity_profile', normalized_velocity_profile
@@ -459,6 +476,12 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
     else
       write(*,CHAR_FMT) 'ZK_i_perp_file        ', trim(ZK_i_perp_file)
     end if
+    write(*,REAL_FMT) 'ZK_i_perp_pri          ', ZK_i_perp_pri(1:2)
+    write(*,REAL_FMT) 'ZK_i_perp_pri_z0       ', ZK_i_perp_pri_z0(1:2)
+    write(*,REAL_FMT) 'ZK_i_perp_pri_width    ', ZK_i_perp_pri_width(1:2)
+    write(*,REAL_FMT) 'ZK_e_perp_pri          ', ZK_e_perp_pri(1:2)
+    write(*,REAL_FMT) 'ZK_e_perp_pri_z0       ', ZK_e_perp_pri_z0(1:2)
+    write(*,REAL_FMT) 'ZK_e_perp_pri_width    ', ZK_e_perp_pri_width(1:2)
     write(*,REAL_FMT) 'heatsource_e           ', heatsource_e
     write(*,REAL_FMT) 'heatsource_e_psin      ', heatsource_e_psin
     write(*,REAL_FMT) 'heatsource_e_sig       ', heatsource_e_sig
@@ -495,6 +518,9 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
     else
       write(*,CHAR_FMT) 'ZK_perp_file          ', trim(ZK_perp_file)
     end if
+    write(*,REAL_FMT) 'ZK_perp_pri            ', ZK_perp_pri(1:2)
+    write(*,REAL_FMT) 'ZK_perp_pri_z0         ', ZK_perp_pri_z0(1:2)
+    write(*,REAL_FMT) 'ZK_perp_pri_width      ', ZK_perp_pri_width(1:2)
     write(*,REAL_FMT) 'ZK_par                ', ZK_par
     write(*,REAL_FMT) 'ZK_par_max            ', ZK_par_max
     write(*,REAL_FMT) 'ZK_par_SpitzerHaerm (not input parameter; printed for reference in JOREK units)', ZK_par_SpitzerHaerm
@@ -512,6 +538,9 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   else
     write(*,CHAR_FMT) 'D_perp_file           ', trim(D_perp_file)
   end if
+  write(*,REAL_FMT) 'D_perp_pri              ', D_perp_pri(1:2)
+  write(*,REAL_FMT) 'D_perp_pri_z0           ', D_perp_pri_z0(1:2)
+  write(*,REAL_FMT) 'D_perp_pri_width        ', D_perp_pri_width(1:2)
 #ifdef WITH_Impurities
   write(*,REAL_FMT) 'D_par_imp               ', D_par_imp
   if ( .not. num_d_perp_imp ) then
@@ -520,12 +549,22 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
     write(*,CHAR_FMT) 'D_perp_imp_file       ', trim(D_perp_imp_file)
   end if
 #endif
+  if ( num_v_pinch ) then
+    write(*,CHAR_FMT) 'v_pinch_file          ', trim(v_pinch_file)
+  else
+    write(*,REAL_FMT) 'V_pinch_gauss         ', V_pinch_gauss
+    write(*,REAL_FMT) 'V_pinch_psin          ', V_pinch_psin
+    write(*,REAL_FMT) 'V_pinch_sig           ', V_pinch_sig
+  end if
   write(*,REAL_FMT) 'particlesource        ', particlesource
   write(*,REAL_FMT) 'particlesource_psin   ', particlesource_psin
   write(*,REAL_FMT) 'particlesource_sig    ', particlesource_sig
   write(*,REAL_FMT) 'edgeparticlesource    ', edgeparticlesource
   write(*,REAL_FMT) 'edgeparticlesource_psin', edgeparticlesource_psin
   write(*,REAL_FMT) 'edgeparticlesource_sig', edgeparticlesource_sig
+  write(*,REAL_FMT) 'privparticlesource    ', privparticlesource
+  write(*,REAL_FMT) 'privparticlesource_z0 ', privparticlesource_z0
+  write(*,REAL_FMT) 'privparticlesource_width', privparticlesource_width
   write(*,REAL_FMT) 'particlesource_gauss  ', particlesource_gauss
   write(*,REAL_FMT) 'particlesource_gauss_psin', particlesource_gauss_psin
   write(*,REAL_FMT) 'particlesource_gauss_sig ', particlesource_gauss_sig
@@ -644,6 +683,8 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
     write(*,REAL_FMT) 'ZK_prof_neg_thresh    ', ZK_prof_neg_thresh
     write(*,REAL_FMT) 'ZK_par_neg_thresh     ', ZK_par_neg_thresh
   endif
+  write(*,LOGI_FMT) 'use_zkperp_times_density', use_zkperp_times_density
+  write(*,REAL_FMT) 'zkperp_density_floor    ', zkperp_density_floor
   write(*,REAL_FMT) 'D_imp_extra_R         ', D_imp_extra_R
   write(*,REAL_FMT) 'D_imp_extra_Z         ', D_imp_extra_Z
   write(*,REAL_FMT) 'D_imp_extra_p         ', D_imp_extra_p
@@ -995,41 +1036,243 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
      write(*,REAL_FMT) 'spi_Vel_diff        ',  spi_Vel_diff
    end if
 #endif
-  write(*,REAL_FMT) 'loop_voltage        ',loop_voltage
-  write(*,LOGI_FMT) 'restart_particles   ',restart_particles
-  write(*,REAL_FMT) 'n_particles         ',n_particles
-  write(*,INTG_FMT) 'nstep_particles     ',nstep_particles
-  write(*,INTG_FMT) 'nsubstep_particles  ',nsubstep_particles
-  write(*,REAL_FMT) 'tstep_particles     ',tstep_particles
-  write(*,REAL_FMT) 'filter_perp,        ',filter_perp
-  write(*,REAL_FMT) 'filter_hyper,       ',filter_hyper
-  write(*,REAL_FMT) 'filter_par,         ',filter_par
-  write(*,REAL_FMT) 'filter_perp_n0,     ',filter_perp_n0
-  write(*,REAL_FMT) 'filter_hyper_n0,    ',filter_hyper_n0   
-  write(*,REAL_FMT) 'filter_par_n0,      ',filter_par_n0     
-  write(*,LOGI_FMT) 'use_ncs,            ',use_ncs     
-  write(*,LOGI_FMT) 'use_ccs,            ',use_ccs    
-  write(*,LOGI_FMT) 'use_pcs,            ',use_pcs
-  write(*,LOGI_FMT) 'use_kn_ionisation,     ',use_kn_ionisation    
-  write(*,LOGI_FMT) 'use_kn_sputtering,     ',use_kn_sputtering    
-  write(*,LOGI_FMT) 'use_kn_cx,             ',use_kn_cx
-  write(*,LOGI_FMT) 'use_kn_recombination,  ',use_kn_recombination
-  write(*,LOGI_FMT) 'use_kn_puffing,        ',use_kn_puffing
-  write(*,LOGI_FMT) 'use_kn_line_radiation, ',use_kn_line_radiation
+  write(*,REAL_FMT) 'loop_voltage          ',loop_voltage
+  write(*,INTG_FMT) 'n_aux_var             ',n_aux_var
+  write(*,LOGI_FMT) 'restart_particles     ',restart_particles
+  write(*,INTG_FMT) 'nstep_particles       ',nstep_particles
+  write(*,INTG_FMT) 'nsubstep_particles    ',nsubstep_particles
+  write(*,REAL_FMT) 'tstep_particles       ',tstep_particles
+  write(*,REAL_FMT) 'filter_perp,          ',filter_perp
+  write(*,REAL_FMT) 'filter_hyper,         ',filter_hyper
+  write(*,REAL_FMT) 'filter_par,           ',filter_par
+  write(*,REAL_FMT) 'filter_perp_n0,       ',filter_perp_n0
+  write(*,REAL_FMT) 'filter_hyper_n0,      ',filter_hyper_n0   
+  write(*,REAL_FMT) 'filter_par_n0,        ',filter_par_n0   
+  write(*,LOGI_FMT) 'apply_dirichlet_proj, ',apply_dirichlet_proj     
+  write(*,LOGI_FMT) 'init_particles_only,  ',init_particles_only     
+  write(*,INTG_FMT) 'find_RZ_nearby_iter,  ',find_RZ_nearby_iter    
+  write(*,REAL_FMT) 'find_RZ_nearby_tol,   ',find_RZ_nearby_tol    
 
-  if (use_kn_puffing) then 
-    write(*,INTG_FMT) 'n_puff                ',  n_puff
-    write(*,REAL_FMT) 'puff_rate,            ',puff_rate
-    write(*,REAL_FMT) 'r_valve,              ',r_valve
-    write(*,REAL_FMT) 'R_valve_loc,          ',R_valve_loc
-    write(*,REAL_FMT) 'Z_valve,              ',Z_valve
-    write(*,REAL_FMT) 'R_valve_loc2,         ',R_valve_loc2
-    write(*,REAL_FMT) 'Z_valve2,             ',Z_valve2
-  endif
 
-  write(*,LOGI_FMT) 'use_manual_random_seed,  ',use_manual_random_seed
+  
+  if (n_part_groups > 0) then !< particles settings
+
+    write(*,HEADER_FMT) "=============== Valves ================="
+    do i=1, n_valves_max
+      if (trim(valves(i)%type) /= 'none') then
+        write(*,"(A, I2, A)") "--------------- Valve ", i ," ---------------" 
+        write(*,CHAR_FMT) 'type,               ', valves(i)%type
+        write(*,REAL_FMT) 'phi,                ', valves(i)%phi
+  
+        if (valves(i)%type == 'circ') then
+          write(*,REAL_FMT) 'r_valve             ', valves(i)%r_valve
+          write(*,REAL_FMT) 'R_valve_loc         ', valves(i)%R_valve_loc
+          write(*,REAL_FMT) 'Z_valve_loc         ', valves(i)%Z_valve_loc
+        endif
+  
+        if (valves(i)%type == 'poly') then
+          write(*,REAL_FMT) 'poly_R              ', valves(i)%poly_R
+          write(*,REAL_FMT) 'poly_Z              ', valves(i)%poly_Z
+        endif
+      endif
+    enddo
+
+    write(*,HEADER_FMT) "========== Coupling schemes ============"
+    write(*,*) "  use_ncs               = ", use_ncs
+    write(*,*) "  use_ics               = ", use_ics
+    write(*,*) "  use_rep               = ", use_rep
+    write(*,*) "  use_epf               = ", use_epf
+    write(*,*) "  use_kin_recomb_global = ", use_kin_recomb_global
+
+    write(*,HEADER_FMT) '=========== Particle Groups ============'
+    write(*,INTG_FMT) 'n_part_groups     ',n_part_groups
+    write(*, "(1X,A, ' = ')", advance="no") "part_groups_in_use"
+    do i = 1, n_part_groups
+       write(*, "(A, A)", advance="no") "'", trim(part_groups_in_use(i)) // "' "
+    end do
+    write(*,*)
+    do group_num=1, n_part_groups
+      write(*,*) "---- Particle group slot: ", group_num, " -----" 
+      write(*,CHAR_FMT) 'id,                     ',sim%groups(group_num)%id
+      write(*,INTG_FMT) 'Z,                      ',sim%groups(group_num)%Z
+      write(*,REAL_FMT) 'mass                    ',sim%groups(group_num)%mass
+      write(*,CHAR_FMT) 'coupling_scheme,        ',sim%groups(group_num)%coupling_scheme
+      write(*,REAL_FMT) 'n_particles,            ',sim%groups(group_num)%n_particles
+      write(*,CHAR_FMT) 'type,                   ',trim(part_group_configs(group_num)%type)
+      write(*,CHAR_FMT) 'init_function           ',trim(part_group_configs(group_num)%init_function)
+      if (trim(part_group_configs(group_num)%init_function) /= 'none') then
+        write(*,CHAR_FMT) 'init_pdf                ',trim(part_group_configs(group_num)%init_pdf)
+      endif
+      write(*,LOGI_FMT) 'do_conservation_checks  ',sim%groups(group_num)%do_conservation_checks
+      
+
+      ! ncs and ics -----
+      if (sim%groups(group_num)%coupling_scheme .eq. 'ncs' .or. sim%groups(group_num)%coupling_scheme .eq. 'ics') then     
+        write(*,LOGI_FMT) 'use_kin_ionisation,     ',sim%groups(group_num)%use_kin_ionisation    
+        write(*,LOGI_FMT) 'use_kin_puffing,        ',sim%groups(group_num)%use_kin_puffing
+        write(*,LOGI_FMT) 'use_kin_radiation,      ',sim%groups(group_num)%use_kin_radiation
+
+        ! ncs specific
+        if (sim%groups(group_num)%coupling_scheme .eq. 'ncs') then
+          write(*,LOGI_FMT) 'use_kin_cx,             ',sim%groups(group_num)%use_kin_cx
+          write(*,LOGI_FMT) 'use_kin_recombination,  ',sim%groups(group_num)%use_kin_recombination
+          write(*,LOGI_FMT) 'use_kin_neutral_coll,   ',sim%groups(group_num)%use_kin_neutral_coll
+          if(sim%groups(group_num)%use_kin_neutral_coll) then
+            write(*,REAL_FMT) 'neutral_coll_dTw,       ',part_group_configs(group_num)%neutral_coll_dTw
+            write(*,INTG_FMT) 'ncoll_each_nstep_part,  ',part_group_configs(group_num)%ncoll_each_nstep_part
+          endif
+        endif
+
+        ! ics specific
+        if (sim%groups(group_num)%coupling_scheme .eq. 'ics') then
+          write(*,LOGI_FMT) 'use_kin_bg_collisions,  ',sim%groups(group_num)%use_kin_bg_collisions
+          write(*,CHAR_FMT) 'kin_bg_coll_type,  ',sim%groups(group_num)%kin_bg_coll_type
+          write(*,REAL_FMT) 'homma2020_alpha,  ',sim%groups(group_num)%homma2020_alpha
+        endif
+
+        write(*,CHAR_FMT) 'atom_data_suffix,       ',trim(part_group_configs(group_num)%atom_data_suffix)
+
+        if (sim%groups(group_num)%use_kin_puffing) then
+          write(*,*) "Puff ctrls: "
+
+          do i=1, n_valves_max
+            used_segs = count(part_group_configs(group_num)%puff_ctrl(i)%rates /= -1)
+            from_file = trim(part_group_configs(group_num)%puff_ctrl(i)%from_file) /= "none"
+            if (used_segs > 0 .or. from_file) then
+              write(*,"(3X,A,' = ',100I12)")    'Puff valve            ', i
+
+              !> config of the number of supers to create per event
+              if (part_group_configs(group_num)%puff_ctrl(i)%supers_num_puff > 0) then
+                write(*,"(3X,A,' = ',100I12)")    'supers_num_puff       ', part_group_configs(group_num)%puff_ctrl(i)%supers_num_puff
+              else if (part_group_configs(group_num)%puff_ctrl(i)%supers_weight_puff > 0) then
+                write(*,"(3X,A,' = ',99ES12.4)")    'supers_weight_puff    ', part_group_configs(group_num)%puff_ctrl(i)%supers_weight_puff
+              else
+                write(*,"(3X,A,' = ',99ES12.4)")    'supers_ratio_puff     ', part_group_configs(group_num)%puff_ctrl(i)%supers_ratio_puff
+              endif
+              if(used_segs > 0) then
+                write(*,"(3X,A,' = ',99ES10.3)")  'rates                 ', part_group_configs(group_num)%puff_ctrl(i)%rates(1:used_segs)
+                write(*,"(3X,A,' = ',99ES10.3)")  'times                 ', part_group_configs(group_num)%puff_ctrl(i)%times(1:used_segs)
+              end if
+              if(from_file) then
+                write(*,"(3X,A,' = ',99A)")  'from_file             ', part_group_configs(group_num)%puff_ctrl(i)%from_file
+              end if
+            endif
+          enddo
+        endif ! puffing
+
+      endif ! 'ncs' or 'ics'
+
+      ! rep (runaway electrons, only pressure coupling for now) -----
+      if (sim%groups(group_num)%coupling_scheme .eq. 'rep') then
+        write(*,REAL_FMT) 'num_re,                 ',part_group_configs(group_num)%num_re
+        write(*,REAL_FMT) 're_energy,              ',part_group_configs(group_num)%re_energy
+        write(*,REAL_FMT) 're_std_energy,          ',part_group_configs(group_num)%re_std_energy
+        write(*,REAL_FMT) 're_pitch,               ',part_group_configs(group_num)%re_pitch
+      endif
+
+      ! epf (energetic particles, full pressure tensor coupling)
+      if (sim%groups(group_num)%coupling_scheme .eq. 'epf') then
+        write(*,REAL_FMT) 'T_maxwell,              ',part_group_configs(group_num)%T_maxwell
+        write(*,INTG_FMT) 'n_phi_planes,           ',part_group_configs(group_num)%n_phi_planes
+        write(*,REAL_FMT) 'n_particles_total,      ',part_group_configs(group_num)%n_particles_total
+        write(*,INTG_FMT) 'proj_collection_period, ',proj_collection_period
+      endif
+
+
+      ! wall interactions
+      n_wall_actions = 0
+      do i=1,n_part_groups_max
+        if(trim(part_group_configs(group_num)%wall_act_configs(i)%type) /= "none") n_wall_actions = n_wall_actions + 1
+      end do
+      write(*,INTG_FMT) "n_wall_actions          ",n_wall_actions
+      if(n_wall_actions > 0) then
+        write(*,INTG_FMT) "wall_act_each_nstep_part",part_group_configs(group_num)%wall_act_each_nstep_part
+        do i=1,n_part_groups_max
+          if (trim(part_group_configs(group_num)%wall_act_configs(i)%type) == "none") cycle
+          
+          write(*,*)    '--- wall action slot: ', i, ' ---'
+          
+          write(*,"(3X,A, ' = ""', A, '""')") 'type,                 ', trim(part_group_configs(group_num)%wall_act_configs(i)%type)
+          write(*,"(3X,A,' = ',A)") 'target_group_id,      ', part_group_configs(group_num)%wall_act_configs(i)%target_group_id
+          write(*,"(3X,A,' = ',ES12.4)") 'weight_factor,        ', part_group_configs(group_num)%wall_act_configs(i)%weight_factor
+          write(*,"(3X,A,' = ',L12)") 'only_in_polygon,      ', part_group_configs(group_num)%wall_act_configs(i)%only_in_polygon   
+          if (part_group_configs(group_num)%wall_act_configs(i)%only_in_polygon) then
+            write(*,"(3X,A,' = ',100ES12.4)") 'poly_R,               ', part_group_configs(group_num)%wall_act_configs(i)%poly_R
+            write(*,"(3X,A,' = ',100ES12.4)") 'poly_Z,               ', part_group_configs(group_num)%wall_act_configs(i)%poly_Z
+            write(*,"(3X,A, ' = ""', A, '""')") 'nametag,              ', trim(part_group_configs(group_num)%wall_act_configs(i)%nametag)
+          end if
+          
+          !> config of the number of supers to create per event
+          if (part_group_configs(group_num)%wall_act_configs(i)%supers_num_wall > 0) then
+            write(*,"(3X,A,' = ',100I12)")    'supers_num_wall       ', part_group_configs(group_num)%wall_act_configs(i)%supers_num_wall
+          else if (part_group_configs(group_num)%wall_act_configs(i)%supers_weight_wall > 0) then
+            write(*,"(3X,A,' = ',99ES12.4)")    'supers_weight_wall    ', part_group_configs(group_num)%wall_act_configs(i)%supers_weight_wall
+          else
+            write(*,"(3X,A,' = ',99ES12.4)")    'supers_ratio_wall     ', part_group_configs(group_num)%wall_act_configs(i)%supers_ratio_wall
+          endif
+        end do
+      end if !wall actions
+
+    enddo ! n_part_groups
+    write(*,HEADER_FMT) '======== End of particle groups ========'
+    write(*,*) ""
+  endif ! n_part_groups > 0
+
+  write(*,REAL_FMT) 'part_kill_ratio         ', part_kill_ratio
+
+  ! fluid groups
+  write(*,INTG_FMT) 'n_fluid_groups          ',n_fluid_groups
+  if(n_fluid_groups > 0) then
+    write(*,HEADER_FMT) "============= Fluid groups ============="
+    
+    do group_num=1,n_fluid_groups
+      write(*,*) "---- Fluid group slot: ", group_num, " -----" 
+      write(*,INTG_FMT) 'Z,                      ', fluid_configs(group_num)%Z
+      write(*,REAL_FMT) 'density_fraction,       ', fluid_configs(group_num)%density_fraction
+
+      ! wall interactions
+      n_wall_actions = 0
+      do i=1,n_part_groups_max
+        if(trim(fluid_configs(group_num)%wall_act_configs(i)%type) /= "none") n_wall_actions = n_wall_actions + 1
+      end do
+      if(n_wall_actions > 0) then
+        write(*,INTG_FMT) "n_wall_actions          ",n_wall_actions
+        
+        do i=1,n_part_groups_max
+          if (trim(fluid_configs(group_num)%wall_act_configs(i)%type) == "none") cycle
+          
+          write(*,*)    '--- wall action slot: ', i, ' ---'
+
+          write(*,"(3X,A, ' = ""', A, '""')") 'type,                 ', trim(fluid_configs(group_num)%wall_act_configs(i)%type)
+          write(*,"(3X,A,' = ',A)") 'target_group_id,      ', fluid_configs(group_num)%wall_act_configs(i)%target_group_id
+          write(*,"(3X,A,' = ',ES12.4)") 'weight_factor,        ', fluid_configs(group_num)%wall_act_configs(i)%weight_factor
+          write(*,"(3X,A,' = ',L12)") 'only_in_polygon,      ', fluid_configs(group_num)%wall_act_configs(i)%only_in_polygon   
+          if (fluid_configs(group_num)%wall_act_configs(i)%only_in_polygon) then
+            write(*,"(3X,A,' = ',100ES12.4)") 'poly_R,               ', fluid_configs(group_num)%wall_act_configs(i)%poly_R
+            write(*,"(3X,A,' = ',100ES12.4)") 'poly_Z,               ', fluid_configs(group_num)%wall_act_configs(i)%poly_Z
+            write(*,"(3X,A, ' = ""', A, '""')") 'nametag,              ', trim(fluid_configs(group_num)%wall_act_configs(i)%nametag)
+          end if
+          
+          !> config of the number of supers to create per event
+          if (fluid_configs(group_num)%wall_act_configs(i)%supers_num_wall > 0) then
+            write(*,"(3X,A,' = ',100I12)")    'supers_num_wall       ', fluid_configs(group_num)%wall_act_configs(i)%supers_num_wall
+          else if (fluid_configs(group_num)%wall_act_configs(i)%supers_weight_wall > 0) then
+            write(*,"(3X,A,' = ',99ES12.4)")    'supers_weight_wall    ', fluid_configs(group_num)%wall_act_configs(i)%supers_weight_wall
+          else
+            write(*,"(3X,A,' = ',99ES12.4)")    'supers_ratio_wall     ', fluid_configs(group_num)%wall_act_configs(i)%supers_ratio_wall
+          endif
+        end do
+      end if !wall actions
+
+    end do !n_fluid_groups
+
+    write(*,HEADER_FMT) "=========== End fluid groups ==========="
+  end if !n_fluid_groups > 0
+
+
+  write(*,LOGI_FMT) 'use_manual_random_seed, ',use_manual_random_seed
   if (use_manual_random_seed) then
-    write(*,INTG_FMT) 'manual_seed,             ',manual_seed
+    write(*,INTG_FMT) 'manual_seed,            ',manual_seed
   endif     
   write(*,LOGI_FMT) 'use_fixed_rng_value,    ',use_fixed_rng_value
   if (use_fixed_rng_value) then

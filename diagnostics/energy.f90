@@ -7,6 +7,7 @@ use gauss
 use basis_at_gaussian
 use phys_module
 use nodes_elements
+use mod_parameters, only: n_coord_tor
 
 implicit none
 
@@ -25,6 +26,14 @@ real*8     :: ps0_x, ps0_y, u0_x, u0_y
 
 W_mag = 0.d0
 W_kin = 0.d0
+
+! Some Gauss points may be zero Jacobian for n_coord_tor=1 geometry
+#if STELLARATOR_MODEL
+if (n_coord_tor .le. 1) then
+  write(*,*) "INFO: energy skipped: n_coord_tor=1"
+  return
+end if
+#endif
 
 do ife =1,  element_list%n_elements
 

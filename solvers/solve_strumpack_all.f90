@@ -23,7 +23,7 @@ subroutine solve_strumpack_all(spss, ad_mat, rhs_vec, solve_only, tag)
   type(type_SP_MATRIX)        :: ac_mat
   type(clcktype)              :: t_itstart, t0, t1, t2, t3
   real*8                      :: tsecond
-  integer                     :: my_id, n_cpu, comm, ierr
+  integer                     :: my_id, n_mpi, comm, ierr
   logical                     :: centralize = .true.
   logical                     :: verbose = .false.
 
@@ -32,14 +32,14 @@ subroutine solve_strumpack_all(spss, ad_mat, rhs_vec, solve_only, tag)
   comm = ad_mat%comm
 
   call MPI_COMM_RANK(comm, my_id, ierr)
-  call MPI_COMM_SIZE(comm, n_cpu, ierr)
+  call MPI_COMM_SIZE(comm, n_mpi, ierr)
 
   if ((tag.ge.0).and.(my_id.eq.0)) verbose = .true.
 
   if (.not. solve_only) then
 
     ! in projection the matrix is already centralized
-    centralize = (n_cpu.gt.1).and.(.not.ad_mat%row_distributed).and. .not. spss%projection
+    centralize = (n_mpi.gt.1).and.(.not.ad_mat%row_distributed).and. .not. spss%projection
 
     if (centralize) then
 

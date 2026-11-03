@@ -11,7 +11,7 @@ contains
 
 
 !< Create a grid from parameters n_R, n_Z, n_radial, n_pol
-subroutine initial_grid(node_list, element_list, bnd_node_list, bnd_elm_list, my_id, n_cpu)
+subroutine initial_grid(node_list, element_list, bnd_node_list, bnd_elm_list, my_id, n_mpi)
   use phys_module
   use data_structure
   use mpi_mod
@@ -32,7 +32,7 @@ subroutine initial_grid(node_list, element_list, bnd_node_list, bnd_elm_list, my
   type(type_bnd_node_list),     intent(inout) :: bnd_node_list
   type(type_bnd_element_list),  intent(inout) :: bnd_elm_list
   integer,                      intent(in)    :: my_id
-  integer,                      intent(in)    :: n_cpu
+  integer,                      intent(in)    :: n_mpi
 
   integer :: ierr
 
@@ -74,7 +74,7 @@ subroutine initial_grid(node_list, element_list, bnd_node_list, bnd_elm_list, my
     if ( extend_existing_grid .and. (n_flux .le. 0) ) &
         call grid_patches_on_existing_grid(node_list, element_list)
 
-    if ( freeboundary .and. (n_flux==0) .and. freeb_change_indices ) call exchange_indices(node_list, my_id, n_cpu, .false.)
+    if ( freeboundary .and. (n_flux==0) .and. freeb_change_indices ) call exchange_indices(node_list, my_id, n_mpi, .false.)
     
     ! --- Determine boundary information from the grid
     call boundary_from_grid(node_list, element_list, bnd_node_list, bnd_elm_list, .false.)

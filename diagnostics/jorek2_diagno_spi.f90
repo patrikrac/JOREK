@@ -32,7 +32,7 @@ real*8, allocatable          :: res(:)
 integer                      :: units
 
 
-integer :: i, in, i_tor, i_spi
+integer :: i, in, i_tor, i_spi, i_inj
 real*8  :: growth_kin, growth_mag,density,density_in,density_out,pressure,pressure_in,pressure_out
 real*8  :: Rplot(2), Zplot(2)
 real*8  :: psi_axis,R_axis,Z_axis,s_axis,t_axis
@@ -134,11 +134,11 @@ if (using_spi) then
     spi_abl_tot = 0.0
     spi_abl_bg_rate_tot = 0.0
     spi_abl_bg_tot = 0.0
-    do i_spi = 1, n_spi_tot
-      spi_abl_rate_tot = spi_abl_rate_tot + xtime_spi_ablation_rate(i_spi,i)
-      spi_abl_tot = spi_abl_tot + xtime_spi_ablation(i_spi,i)
-      spi_abl_bg_rate_tot = spi_abl_bg_rate_tot + xtime_spi_ablation_bg_rate(i_spi,i)
-      spi_abl_bg_tot = spi_abl_bg_tot + xtime_spi_ablation_bg(i_spi,i)
+    do i_inj = 1, n_inj
+      spi_abl_rate_tot = spi_abl_rate_tot + xtime_spi_ablation_rate(i_inj,i)
+      spi_abl_tot = spi_abl_tot + xtime_spi_ablation(i_inj,i)
+      spi_abl_bg_rate_tot = spi_abl_bg_rate_tot + xtime_spi_ablation_bg_rate(i_inj,i)
+      spi_abl_bg_tot = spi_abl_bg_tot + xtime_spi_ablation_bg(i_inj,i)
     end do
     write(20,'(i7,f12.3,4e14.6)') i,xtime(i), spi_abl_rate_tot, spi_abl_tot, spi_abl_bg_rate_tot, spi_abl_bg_tot
   enddo

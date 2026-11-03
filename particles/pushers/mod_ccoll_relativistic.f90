@@ -616,7 +616,7 @@ contains
        ! but neither is having |xiout| > 2 (one should decrease time step if this happens).
        if (abs(xiout) .gt. 2.D0) ierr = 1
 
-       xiout = modulo( xiout, 2.0 )
+       xiout = mod( xiout, 2.0 )
 
        ! Reflect (this part is ok physics-wise)
        if(abs(xiout) .gt. 1.D0) then
@@ -704,7 +704,7 @@ contains
     xiout = xiin - ( nuee_D + nuei_D ) * xiin * dt + sqrt( ( 1.d0 - xiin**2 ) * ( nuee_D + nuei_D ) * dt  ) * rnd(2)
     if(abs(xiout) .gt. 1.d0) then
        if (abs(xiout) .gt. 2.D0) ierr = 1
-       xiout = modulo( xiout, 2.d0 )
+       xiout = mod( xiout, 2.d0 )
        if(abs(xiout) .gt. 1.d0) then
           xiout = sign(2.d0-abs(xiout), xiout)
        end if

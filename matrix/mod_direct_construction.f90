@@ -60,7 +60,7 @@ contains
     
     call tr_allocatep(pc%local_elms,1,mhd_sim%element_list%n_elements,"local_elms_harm",CAT_FEM)
     
-    call distribute_nodes_elements(mhd_sim%my_id, pc%n_cpu_n, mhd_sim%n_cpu, mhd_sim%node_list, mhd_sim%element_list, .true., pc%local_elms, & 
+    call distribute_nodes_elements(mhd_sim%my_id, pc%n_mpi_n, mhd_sim%n_mpi, mhd_sim%node_list, mhd_sim%element_list, .true., pc%local_elms, & 
                                    pc%n_local_elms, mhd_sim%restart, mhd_sim%freeboundary, pc%mat)
                                    
     call global_matrix_structure(mhd_sim%node_list, mhd_sim%element_list, mhd_sim%bnd_elm_list, mhd_sim%freeboundary, &

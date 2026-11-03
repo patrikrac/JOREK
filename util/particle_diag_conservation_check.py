@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 """
 Plot particle timetraces from diag.h5, useful to check conservation laws.
-Daan van Vugt <the JOREK team>
 """
 from __future__ import print_function
 

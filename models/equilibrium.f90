@@ -47,7 +47,7 @@ real*8     :: zjz, dj_dpsi, dj_dR, dj_dZ, dj_dR_dZ, dj_dR_DR, dj_dZ_dZ, dj_dpsi2
 real*8     :: ps0_s, ps0_t, p_s, p_t, p_ss, p_st, p_tt 
 real*8     :: zj0_s, zj0_t, equil_error, equil_value, ps0_x, ps0_y, Z_s, Z_t, xjac, direction, Btot
 real*8     :: current_tot, current_int, diff, R_xpoint2(2), Z_xpoint2(2)
-real*8     :: sigmas(17), dZ_axis, dR_axis, Z_axis_int, Z_axis_old, R_axis_old, R_axis_int, area_ref
+real*8     :: sigmas(22), dZ_axis, dR_axis, Z_axis_int, Z_axis_old, R_axis_old, R_axis_int, area_ref
 integer    :: n_grids(12)
 logical    :: freeboundary_equil2
 real*8     :: T_prof, T_0_old, FF_0_old, T_1_old, FF_1_old
@@ -614,21 +614,21 @@ if (my_id == 0) then
     node_list%node(i)%values(1,1,3) = zjz
   
     node_list%node(i)%values(1,2,3) = dj_dpsi * node_list%node(i)%values(1,2,1) &
-                                    + dj_dR   * node_list%node(i)%x(1,2,1)        &
-                                    + dj_dZ   * node_list%node(i)%x(1,2,2)
+                                         + dj_dR   * node_list%node(i)%x(1,2,1)        &
+                                         + dj_dZ   * node_list%node(i)%x(1,2,2)
   
     node_list%node(i)%values(1,3,3) = dj_dpsi * node_list%node(i)%values(1,3,1) &
-                                    + dj_dR   * node_list%node(i)%x(1,3,1)        &
-                                    + dj_dZ   * node_list%node(i)%x(1,3,2)
+                                         + dj_dR   * node_list%node(i)%x(1,3,1)        &
+                                         + dj_dZ   * node_list%node(i)%x(1,3,2)
   
     node_list%node(i)%values(1,4,3) = dj_dpsi  * node_list%node(i)%values(1,4,1) &
-                                    + dj_dR    * node_list%node(i)%x(1,4,1)        &
-                                    + dj_dZ    * node_list%node(i)%x(1,4,2)        &
-                                    + dj_dR_dR * node_list%node(i)%x(1,2,1) * node_list%node(i)%x(1,3,1)  &
-                                    + dj_dZ_dZ * node_list%node(i)%x(1,2,2) * node_list%node(i)%x(1,3,2)  &
+                                         + dj_dR    * node_list%node(i)%x(1,4,1)        &
+                                         + dj_dZ    * node_list%node(i)%x(1,4,2)        &
+                                         + dj_dR_dR * node_list%node(i)%x(1,2,1) * node_list%node(i)%x(1,3,1)  &
+                                         + dj_dZ_dZ * node_list%node(i)%x(1,2,2) * node_list%node(i)%x(1,3,2)  &
                                     + dj_dpsi2 * node_list%node(i)%values(1,2,1) * node_list%node(i)%values(1,3,1)  &
-                                    + dj_dR_dZ * ( node_list%node(i)%x(1,2,1) * node_list%node(i)%x(1,3,2)          &
-                                                 + node_list%node(i)%x(1,3,1) * node_list%node(i)%x(1,2,2) )        &
+                                         + dj_dR_dZ * ( node_list%node(i)%x(1,2,1) * node_list%node(i)%x(1,3,2)          &
+                                                      + node_list%node(i)%x(1,3,1) * node_list%node(i)%x(1,2,2) )        &
                                     + dj_dR_dpsi*( node_list%node(i)%x(1,2,1) * node_list%node(i)%values(1,3,1)   &
                                                  + node_list%node(i)%x(1,3,1) * node_list%node(i)%values(1,2,1) ) &
                                     + dj_dZ_dpsi*( node_list%node(i)%x(1,2,2) * node_list%node(i)%values(1,3,1)   &
@@ -721,7 +721,7 @@ if (my_id == 0) then
     sigmas  = 0.d0
     
     ! Build up some arrays to send as routine parameters to define_flux_values
-    sigmas(1)  = SIG_closed  ; sigmas(2)  = SIG_theta
+    sigmas(1)  = SIG_closed(1); sigmas(2)  = SIG_theta
     sigmas(3)  = SIG_open    ; sigmas(4)  = SIG_outer   ; sigmas(5)  = SIG_inner
     sigmas(6)  = SIG_private ; sigmas(7)  = SIG_up_priv
     sigmas(8)  = SIG_leg_0   ; sigmas(9)  = SIG_leg_1
@@ -729,6 +729,9 @@ if (my_id == 0) then
     sigmas(12) = dPSI_open   ; sigmas(13) = dPSI_outer  ; sigmas(14) = dPSI_inner
     sigmas(15) = dPSI_private; sigmas(16) = dPSI_up_priv
     sigmas(17) = SIG_theta_up
+    sigmas(18) = SIG_closed(2); sigmas(19) = SIG_closed(3)
+    sigmas(20) = xr_closed(1) ; sigmas(21) = xr_closed(2)
+    sigmas(22) = xr_closed(3)
   
     n_grids(1) = 2*n_flux   ; n_grids(2) = n_tht
     n_grids(3) = 2*n_open   ; n_grids(4) = 2*n_outer  ; n_grids(5) = 2*n_inner

@@ -19,12 +19,12 @@ integer :: ierr, err, i
 namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 rst_hdf5, rst_hdf5_version, keep_current_prof,      &
                 eta, visco, restart, regrid, write_ps,              &
-                regrid_from_rz,                                     &
-                force_horizontal_Xline,                             &
+                regrid_from_rz, force_horizontal_Xline,             &
                 n_R, n_Z, n_radial, n_pol, n_tht, n_flux,           &
                 n_open, n_private, n_leg, n_ext,                    &
                 n_outer, n_inner, n_up_priv, n_up_leg,              &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
@@ -37,7 +37,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 R_boundary, Z_boundary, psi_boundary, n_boundary,   &
                 tokamak_device, manipulate_psi_map,                 &
                 F0, time_evol_scheme,                               &
-				T_min_neg,rho_min_neg,                              &
+                T_min_neg,rho_min_neg,                              &
                 zjz_0, zjz_1, zj_coef,                              &
                 rho_0, rho_1, rho_coef,                             &
                 T_0,   T_1,   T_coef,                               &
@@ -69,7 +69,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 produce_live_data, gmres, gmres_max_iter,           &
                 wall_file,                                          &
                 n_limiter, R_limiter, Z_limiter,                    &
-                first_target_point, last_target_point,		    &
+                first_target_point, last_target_point,              &
                 keep_n0_const, linear_run, export_for_nemec,        &
                 amix, amix_freeb, equil_accuracy,                   &
                 equil_accuracy_freeb, current_ref, FB_Ip_position,  &
@@ -91,7 +91,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 ranks_per_family, cte_current_FB_fact, treat_axis,  &
                 vacuum_min, export_aux_node_list,                   &
                 use_manual_random_seed, manual_seed,                &
-                use_fixed_rng_value, fixed_rng_value,               &
+                use_fixed_rng_value, fixed_rng_value,               & 
                 xpoint_search_tries, bgf_rpolar, bgf_tht
 
 

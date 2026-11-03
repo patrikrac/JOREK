@@ -23,12 +23,13 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 eta, visco, visco_par,                              &
                 restart, rst_format, regrid, bootstrap, write_ps,   &
                 bootstrap_psin_cutoff,                              &
-                regrid_from_rz,                                     &
+                regrid_from_rz, force_horizontal_Xline,             &
                 n_R, n_Z, n_radial, n_pol, n_tht, n_flux,           &
                 n_open, n_private, n_leg, n_leg_out, n_ext,         &
                 n_outer, n_inner, n_up_priv, n_up_leg, n_up_leg_out,&
                 n_tht_equidistant,                                  &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
@@ -39,7 +40,6 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 R_geo, Z_geo, amin, mf, fbnd, fpsi, mode,           &
                 R_boundary, Z_boundary, psi_boundary, n_boundary,   &
                 R_Z_psi_bnd_file,                                   &
-                force_horizontal_Xline,                            &
                 n_pfc, manipulate_psi_map,                          &
                 Rmin_pfc, Rmax_pfc, Zmin_pfc, Zmax_pfc, current_pfc,&
                 grid_to_wall, RZ_grid_inside_wall, eqdsk_psi_fact,  &
@@ -112,7 +112,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 D_prof_neg, ZK_prof_neg,                            &
                 D_prof_neg_thresh, ZK_prof_neg_thresh, T_min,       &
                 rho_min,                                            &
-				T_min_neg,rho_min_neg,                              &
+                T_min_neg,rho_min_neg,                              &
                 corr_neg_temp_coef,                                 &
                 corr_neg_dens_coef, D_prof_neg, ZK_prof_neg,        &  
                 ns_deltaphi, ksi_ion, spi_rnd_seed,                 &
@@ -149,7 +149,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 alpha_Newton, vacuum_min, strumpack_matching,       &
                 export_aux_node_list, xpoint_search_tries,          &
                 use_manual_random_seed, manual_seed,                &
-                use_fixed_rng_value, fixed_rng_value,               &            
+                use_fixed_rng_value, fixed_rng_value,               &
                 bgf_rpolar, bgf_tht
 
 if (my_id .eq. 0) then

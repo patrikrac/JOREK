@@ -35,7 +35,7 @@ real*8  :: Rmid,Zmid,Rmid_s,Rmid_t,Zmid_s,Zmid_t, dl2, total_length, length_max,
 real*8  :: value_out, psi_bnd
 real*8  :: element_start_percent
 integer :: elm_start, elm_end, elm_delta, local_elm_start, local_elm_end
-integer :: my_id, ikeep, n_cpu, ierr, nsend, nrecv, ikeep0, inode1, inode2, i_line0
+integer :: my_id, ikeep, n_mpi, ierr, nsend, nrecv, ikeep0, inode1, inode2, i_line0
 real*4,allocatable :: RZkeep(:,:),scalars(:,:)
 real*4             :: ZERO
 integer            :: status(MPI_STATUS_SIZE)
@@ -52,7 +52,7 @@ call MPI_INIT(IERR)
 !required=MPI_THREAD_MULTIPLE
 !call MPI_Init_thread(required,provided,StatInfo)
 call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)      ! id of each MPI proc
-call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)      ! number of MPI procs
+call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)      ! number of MPI procs
 write(*,*) 'my_id = ', my_id
 
 
@@ -203,7 +203,7 @@ elm_end   = element_list%n_elements
 
 write(*,*) ' elm start, end : ',elm_start, elm_end
 
-elm_delta = (elm_end - elm_start) / n_cpu
+elm_delta = (elm_end - elm_start) / n_mpi
 
 local_elm_start = elm_start + my_id*elm_delta + 1
 local_elm_end   = min(elm_end,elm_start+(my_id+1)*elm_delta)
@@ -747,7 +747,7 @@ if (my_id .eq. 0) then
 endif
 
 if (my_id .eq. 0) then
-  do j=1,n_cpu-1
+  do j=1,n_mpi-1
     call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
     if (ikeep .gt. 0) then
       nrecv = 2*ikeep
@@ -782,7 +782,7 @@ do i_var =1, n_scalars
   endif
 
   if (my_id .eq. 0) then
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (ikeep .gt. 0) then
         nrecv = ikeep
@@ -865,7 +865,7 @@ if (my_id .eq. 0) then
 endif
 
 if (my_id .eq. 0) then
-  do j=1,n_cpu-1
+  do j=1,n_mpi-1
     call mpi_recv(i_strike,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
     if (i_strike .gt. 0) then
       nrecv = i_strike
@@ -905,7 +905,7 @@ do i_var =1, n_scalars
   endif
 
   if (my_id .eq. 0) then
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(i_strike,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (i_strike .gt. 0) then
         nrecv = i_strike

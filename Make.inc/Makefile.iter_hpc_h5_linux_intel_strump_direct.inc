@@ -36,7 +36,7 @@ LIB_ZMUMPS  = -lzmumps
 INC_MUMPS   =  $(MUMPS_HOME)/include/
 
 #Strumpack library
-STRUMPACK_HOME=/u/iholod/bin/STRUMPACK-3.2.0/build
+STRUMPACK_HOME ?= /path/to/STRUMPACK-3.2.0/build
 STRUMPACKINC = -I$(METIS_HOME)/include -I$(STRUMPACK_HOME)/include 
 STRUMPACKLIB = -L$(STRUMPACK_HOME)/lib/ -lstrumpack $(METIS_HOME)/lib/libmetis.a -lmpifort -lmpi -lmpigi -ldl -lrt -lpthread -lifport -lifcoremt -limf -lsvml -lm -lipgo -lirc -lpthread -lsvml -lc -lirc_s -ldl -lc
 MKLINC= -I${MKLROOT}/include

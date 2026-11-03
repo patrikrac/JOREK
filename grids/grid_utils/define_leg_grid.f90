@@ -22,7 +22,7 @@ type (type_strategic_points), intent(inout) :: stpts
 type (type_new_points)      , intent(inout) :: nwpts
 integer,                      intent(inout) :: n_grids(12)
 integer,                      intent(in)    :: xcase
-real*8,                       intent(in)    :: sigmas(17)
+real*8,                       intent(in)    :: sigmas(22)
 integer,                      intent(in)    :: which_leg ! 1=LowerInner, 2=OuterInner, 3=LowerUpper, 4=OuterUpper
 
 ! --- local variables

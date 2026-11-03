@@ -361,7 +361,11 @@ do m=1, n_plane
           psi_norm = get_psi_n(psi, Z)
 
           D_prof   = get_dperp (psi_norm)
-          ZK_prof  = get_zkperp(psi_norm)
+          if (use_zkperp_times_density) then
+            ZK_prof = get_zkperp(psi_norm) * max(rho,zkperp_density_floor)
+          else
+            ZK_prof = get_zkperp(psi_norm)
+          endif
 
           call conductivity_parallel(ZK_par, ZK_par_max, T, corr_neg_temp(T), T_min_ZKpar, T_0, ZKpar_T)
 

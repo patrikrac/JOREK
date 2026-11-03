@@ -32,8 +32,11 @@ USE_HDF5          = 1
 USE_FFTW          = 1
 USE_MUMPS         = 1
 
+# --- Root of the pre-built JOREK tool-chain for this machine
+JOREK_TOOLS ?= /path/to/jorek_tools_irene_skl
+
 # --- PaStiX solver
-PASTIX_HOME ?= /ccc/cont003/home/jorek/jorek/jorek_tools_irene_skl/pastix_release_4492/install
+PASTIX_HOME ?= $(JOREK_TOOLS)/pastix_release_4492/install
 LIB_PASTIX        = `$(PASTIX_HOME)/pastix-conf --libs` 
 LIB_PASTIX_MURGE  = `$(PASTIX_HOME)/pastix-conf --libs_murge`
 LIB_PASTIX_BLAS   = `$(PASTIX_HOME)/pastix-conf --blas`
@@ -49,7 +52,7 @@ FFLAGS_NOBOUNDS  := $(FFLAGS)               $(FFLAGS_OMP)
 FFLAGS           := $(FFLAGS) $(DEBUGFLAGS) $(FFLAGS_OMP)
 FFLAGS_NO_OMP     = $(FFLAGS) $(DEBUGFLAGS)
 
-HDF5_HOME   = /ccc/cont003/home/jorek/jorek/jorek_tools_irene_skl/hdf5-1.8.10
+HDF5_HOME   = $(JOREK_TOOLS)/hdf5-1.8.10
 HDF5INCLUDE = $(HDF5_HOME)/include
 HDF5LIB     = $(HDF5_HOME)/lib/libhdf5hl_fortran.a \
               $(HDF5_HOME)/lib/libhdf5_hl.a \
@@ -58,9 +61,9 @@ HDF5LIB     = $(HDF5_HOME)/lib/libhdf5hl_fortran.a \
               -lz
 
 # --- MUMPS solver
-MUMPS_LIBDIR  = /ccc/cont003/home/jorek/jorek/jorek_tools_irene_skl/MUMPS_5.0.1/lib
-SCOTCH_LIBDIR = /ccc/cont003/home/jorek/jorek/jorek_tools_irene_skl/scotch_6.0.4//lib
+MUMPS_LIBDIR  = $(JOREK_TOOLS)/MUMPS_5.0.1/lib
+SCOTCH_LIBDIR = $(JOREK_TOOLS)/scotch_6.0.4//lib
 LIB_MUMPS     = -L$(MUMPS_LIBDIR) -ldmumps -lmumps_common -lptesmumps -L$(SCOTCH_LIBDIR) -lptscotch -lptscotcherr -lscotch -lpord
-MUMPS_INCDIR  = /ccc/cont003/home/jorek/jorek/jorek_tools_irene_skl/MUMPS_5.0.1/include
+MUMPS_INCDIR  = $(JOREK_TOOLS)/MUMPS_5.0.1/include
 INC_MUMPS     = $(MUMPS_INCDIR)
 SCALAP        = -L$(MKL_LIBDIR) -lmkl_scalapack_lp64 -lmkl_blacs_intelmpi_lp64

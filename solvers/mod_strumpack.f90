@@ -116,7 +116,7 @@ module mod_strumpack
       use phys_module, only: strumpack_matching
       implicit none
 
-      integer comm, ierr, n_cpu
+      integer comm, ierr, n_mpi
       type(type_STRUMPACK_SOLVER) spss
       type(c_ptr) iparm_c
       integer(kind=C_INT), target :: iparm(5)=0
@@ -138,8 +138,8 @@ module mod_strumpack
 
       call spk_init(spss%sscp, c_loc(iparm), spss%comm)
       
-      call MPI_COMM_SIZE(spss%comm, n_cpu, ierr)
-      allocate(spss%distr(n_cpu+1))
+      call MPI_COMM_SIZE(spss%comm, n_mpi, ierr)
+      allocate(spss%distr(n_mpi+1))
       
       call MPI_Barrier(spss%comm,ierr)
 
@@ -177,7 +177,7 @@ module mod_strumpack
 
       integer(kind=C_INT_ALL), allocatable, target :: distr(:)
       
-      integer :: rank, n_cpu
+      integer :: rank, n_mpi
       integer(kind=C_INT_ALL) :: nnz_d, tmp_nnz_d, n_d, i, j, imin, imax, ranks_i, request
 
 
@@ -190,7 +190,7 @@ module mod_strumpack
       eql = spss%equilibrium
 
       call MPI_COMM_RANK(spss%comm, rank, ierr)
-      call MPI_COMM_SIZE(spss%comm, n_cpu, ierr)
+      call MPI_COMM_SIZE(spss%comm, n_mpi, ierr)
       if (eql .or. spss%projection) then
         if (rank.eq.0) call remove_duplicates(a_mat%ng,a_mat%nnz,a_mat%irn,a_mat%jcn,a_mat%val)
         call MPI_Bcast(a_mat%ng,       1, MPI_INTEGER, 0, spss%comm, ierr)
@@ -200,20 +200,20 @@ module mod_strumpack
         call MPI_Bcast(a_mat%row_distributed, 1, MPI_INTEGER, 0, spss%comm, ierr)
       endif
       
-      allocate(distr(n_cpu+1))
+      allocate(distr(n_mpi+1))
 
-      if ((.not. dflag).and.(n_cpu.gt.1)) then
-        ! distribute rows between n_cpu
-        call distribute_rows(a_mat,n_cpu,distr)
+      if ((.not. dflag).and.(n_mpi.gt.1)) then
+        ! distribute rows between n_mpi
+        call distribute_rows(a_mat,n_mpi,distr)
         if (rank.eq.0) write(*,*) "Matrix is not row-distributed. Distributing now."
 
-        allocate(buff_irn_d(n_cpu), buff_jcn_d(n_cpu), buff_val_d(n_cpu))
+        allocate(buff_irn_d(n_mpi), buff_jcn_d(n_mpi), buff_val_d(n_mpi))
 
         n_d = distr(rank+2) - distr(rank+1) ! number of local rows
 
         allocate(myelm(a_mat%nnz))
         if (rank.eq.0) then
-          do ranks_i=0, n_cpu-1
+          do ranks_i=0, n_mpi-1
             myelm = 0
             j = 1
             do i=1, a_mat%nnz
@@ -270,24 +270,24 @@ module mod_strumpack
 
         deallocate(myelm)
 
-      elseif (dflag.and.(n_cpu.gt.1)) then
+      elseif (dflag.and.(n_mpi.gt.1)) then
         ! get row distribution from irn in case of pre-distributed matrix
         if (allocated(distr)) deallocate(distr)
-        allocate(distr(n_cpu+1))
+        allocate(distr(n_mpi+1))
         
-        distr(1:n_cpu+1) = 0
+        distr(1:n_mpi+1) = 0
         imin = minval(a_mat%irn(1:a_mat%nnz))
         imax = maxval(a_mat%irn(1:a_mat%nnz))
                 
         distr(rank+1) = imin
 
-        if (rank.eq.(n_cpu-1)) distr(rank+2) = imax + 1
-        call MPI_Allreduce(MPI_IN_PLACE,distr,n_cpu+1,MPI_INTEGER_ALL,MPI_SUM,spss%comm,ierr)
+        if (rank.eq.(n_mpi-1)) distr(rank+2) = imax + 1
+        call MPI_Allreduce(MPI_IN_PLACE,distr,n_mpi+1,MPI_INTEGER_ALL,MPI_SUM,spss%comm,ierr)
 
         ! check for consistency
         ierr = 0
         if ((distr(1).ne.1)) ierr = 1
-        do i = 2, n_cpu+1
+        do i = 2, n_mpi+1
           if (.not.(distr(i)>distr(i-1))) ierr = 1
         enddo
 
@@ -300,7 +300,7 @@ module mod_strumpack
         nnz_d = a_mat%nnz
         a_mat%irn(1:nnz_d) = a_mat%irn(1:nnz_d) - imin + a_mat%indexing ! irn starts with indx
         
-      elseif (n_cpu.eq.1) then
+      elseif (n_mpi.eq.1) then
         call distribute_rows(a_mat,1,distr)
         n_d = a_mat%ng
         nnz_d = a_mat%nnz
@@ -317,7 +317,7 @@ module mod_strumpack
       if (a_mat%indexing.eq.1) then
         a_mat%irn(1:nnz_d) = a_mat%irn(1:nnz_d) - a_mat%indexing;
         a_mat%jcn(1:nnz_d) = a_mat%jcn(1:nnz_d) - a_mat%indexing;
-        distr(1:n_cpu+1) = distr(1:n_cpu+1) - a_mat%indexing
+        distr(1:n_mpi+1) = distr(1:n_mpi+1) - a_mat%indexing
         a_mat%indexing = 0
       endif
       
@@ -333,7 +333,7 @@ module mod_strumpack
 
       !spss%distr = c_loc(distr)
       
-      spss%distr(1:n_cpu+1) = distr(1:n_cpu+1)
+      spss%distr(1:n_mpi+1) = distr(1:n_mpi+1)
       deallocate(distr)
       dist_c = c_loc(spss%distr)
       
@@ -387,13 +387,16 @@ module mod_strumpack
       type(c_ptr)                   :: dist_c
       integer :: ierr
       integer(kind=C_INT_ALL), allocatable, target :: dist(:)
-      integer :: i, n_cpu, rank
+      integer :: i, n_mpi, rank
       
-      call MPI_COMM_SIZE(spss%comm, n_cpu, ierr)
+      call MPI_COMM_SIZE(spss%comm, n_mpi, ierr)
       call MPI_COMM_RANK(spss%comm, rank, ierr)
 
       if (spss%projection) then
-        if (rank.ne.0) allocate (rhs_vec%val(rhs_vec%n*rhs_vec%nrhs))
+        if (rank.ne.0) then
+          if (associated(rhs_vec%val)) deallocate(rhs_vec%val)
+          allocate (rhs_vec%val(rhs_vec%n*rhs_vec%nrhs))
+        endif
         call MPI_Bcast(rhs_vec%val, rhs_vec%n*rhs_vec%nrhs, MPI_DOUBLE_PRECISION, 0, spss%comm, ierr)
       endif
 
@@ -432,7 +435,7 @@ module mod_strumpack
     end subroutine strumpack_finalize
    
 !> Distribute rows between members of MPI group   
-    subroutine distribute_rows(a_mat,n_cpu,distr)
+    subroutine distribute_rows(a_mat,n_mpi,distr)
       
       use, intrinsic :: iso_c_binding
       use data_structure, only: type_SP_MATRIX
@@ -440,20 +443,20 @@ module mod_strumpack
       implicit none
 
       type(type_SP_MATRIX)                 :: a_mat
-      integer, intent(in)                  :: n_cpu
+      integer, intent(in)                  :: n_mpi
       
       integer(kind=C_INT_ALL), allocatable :: nr(:)
       integer(kind=C_INT_ALL), allocatable :: distr(:)
       integer :: ierr, i
     
       
-      allocate(nr(n_cpu))
+      allocate(nr(n_mpi))
 
-      nr = a_mat%block_size*((a_mat%ng/a_mat%block_size)/n_cpu)
-      nr(n_cpu) = nr(n_cpu) + (a_mat%ng - sum(nr))
+      nr = a_mat%block_size*((a_mat%ng/a_mat%block_size)/n_mpi)
+      nr(n_mpi) = nr(n_mpi) + (a_mat%ng - sum(nr))
 
       distr(1) = 1
-      do i=1, n_cpu
+      do i=1, n_mpi
         distr(i+1)= distr(i) + nr(i)
       enddo
 

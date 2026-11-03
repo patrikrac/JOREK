@@ -7,7 +7,7 @@ use data_structure
 use grid_xpoint_data
 use phys_module, only: tokamak_device, n_ext_block, n_wall_blocks, n_wall_block_points_max, n_ext_equidistant, &
                        n_block_points_left, R_block_points_left, Z_block_points_left, corner_block, &
-                       n_block_points_right, R_block_points_right, Z_block_points_right, xcase, &
+                       n_block_points_right, R_block_points_right, Z_block_points_right, xcase, n_flux, &
                        n_limiter, R_limiter, Z_limiter
 use py_plots_grids
 
@@ -95,8 +95,9 @@ write(*,*) '                 Define extension patch',i_ext
 
 
 ! --- Avoid xpoint nodes
-n_start = 4
-if (xcase .eq. DOUBLE_NULL) n_start = 8
+n_start = 0
+if ((xcase .gt. 0) .and. (n_flux > 0)) n_start = 4
+if ((xcase .eq. DOUBLE_NULL) .and. (n_flux>0)) n_start = 8
 
 !-------------------------------- Allocate data structures for new nodes and initialize them
 newnode_list%n_nodes = 0

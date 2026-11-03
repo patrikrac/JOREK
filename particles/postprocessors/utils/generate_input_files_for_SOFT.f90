@@ -20,7 +20,7 @@ type(type_surface_list)     :: flux_surfaces
 type(type_bnd_node_list)    :: bnd_node_list
 type(type_bnd_element_list) :: bnd_elm_list
 logical                     :: write_wall,use_boundary_lcfs
-integer                     :: my_id,n_cpus,ierr,i_elm_axis,ii,n_points_lcfs
+integer                     :: my_id,n_mpis,ierr,i_elm_axis,ii,n_points_lcfs
 integer                     :: n_vec,n_R,n_Z,n_R_loc,n_momenta,n_pitch
 integer                     :: n_flux,n_flux_loc,errorcode,charge,n_LCFS
 real*8                      :: time,tor_angle,psi_axis,flux_axis_tol,mass
@@ -63,17 +63,17 @@ soft_mag_name = 'jorek_circular_equilibrium_hollow_current_profile_magnetic_data
 soft_desc     = 'pulse95135_press0_parabolicq_q95_6dot8_res1r5dot88m5_res2r4dot705m4_Ip612en1MA'
 !> Initialisation ---------------------------------------------------------------------------------------
 !> initialise the MPI communicator
-call init_mpi_threads(my_id,n_cpus,ierr)
+call init_mpi_threads(my_id,n_mpis,ierr)
 !> read MHD fields
 write(*,*) "Reading MHD data ..."
-call sim%initialize(0,.true.,my_id,n_cpus)
+call sim%initialize(.true.,my_id,n_mpis)
 field_reader = event(read_jorek_fields_interp_linear(basename=trim(fields_filename),i=-1))
 call with(sim,field_reader)
 write(*,*) "Reading MHD data: completed!"
 !> initialise magnetic field array
 write(*,*) "Initialise magnetic field computation ..."
 !> allocate R,Z mesh and magnetic field arrays
-n_R_loc = n_R/n_cpus; n_R_loc = max(n_R_loc,n_R - (n_cpus-1)*n_R_loc); n_R = n_R_loc*n_cpus;
+n_R_loc = n_R/n_mpis; n_R_loc = max(n_R_loc,n_R - (n_mpis-1)*n_R_loc); n_R = n_R_loc*n_mpis;
 allocate(R_mesh(n_R)); R_mesh = 0d0; allocate(Z_mesh(n_Z)); Z_mesh = 0d0;
 allocate(poloidal_flux(n_Z,n_R_loc)); poloidal_flux = 0d0;
 allocate(magnetic_field(n_vec,n_Z,n_R_loc)); magnetic_field = 0d0;
@@ -86,8 +86,8 @@ bnd_node_list,bnd_elm_list,.false.)
 call broadcast_boundary(my_id,bnd_elm_list,bnd_node_list)
 call update_equil_state(my_id,sim%fields%node_list,sim%fields%element_list,bnd_elm_list,xpoint,xcase)
 !> define flux surfaces
-n_flux_loc = n_flux/n_cpus; n_flux_loc = max(n_flux - (n_cpus-1)*n_flux_loc,n_flux_loc);
-n_flux = n_flux_loc*n_cpus; allocate(flux_minor_radii_Zmag_LFS(n_flux_loc));
+n_flux_loc = n_flux/n_mpis; n_flux_loc = max(n_flux - (n_mpis-1)*n_flux_loc,n_flux_loc);
+n_flux = n_flux_loc*n_mpis; allocate(flux_minor_radii_Zmag_LFS(n_flux_loc));
 flux_minor_radii_Zmag_LFS = 0d0; flux_surfaces%n_psi = n_flux_loc; 
 allocate(flux_surfaces%psi_values(flux_surfaces%n_psi));
 !> Find the separatrix coordinates
@@ -127,7 +127,7 @@ write(*,*) "Compute and write the magnetic field ..."
 call compute_magnetic_field_poloidal_flux(sim%fields,n_vec,n_R_loc,n_Z,time,tor_angle,&
 R_mesh(my_id*n_R_loc+1:(my_id+1)*n_R_loc),Z_mesh,ES%psi_bnd,magnetic_field,poloidal_flux)
 call write_SOFT_magnetic_field_file(magnetic_field_filename,sim%fields,write_wall,n_vec,&
-n_R_loc,n_Z,n_limiter,n_LCFS,n_cpus,my_id,RZ_axis,R_mesh,Z_mesh,R_limiter,Z_limiter,&
+n_R_loc,n_Z,n_limiter,n_LCFS,n_mpis,my_id,RZ_axis,R_mesh,Z_mesh,R_limiter,Z_limiter,&
 RZ_LCFS,magnetic_field,poloidal_flux,soft_mag_name,soft_desc)
 write(*,*) "Compute and write the magnetic field: completed!"
 
@@ -138,7 +138,7 @@ call soft_current_density_uniform_phase_pdf(sim%fields,flux_surfaces,n_momenta,&
 n_pitch,charge,mass,momentum_mesh,cospitch_mesh,pdf)
 !> write distribution in soft input file the momentum mesh and the pdf are
 !> normalised w.r.t. mass*SPEED_OF_LIGHT
-call write_soft_distribution_function(pdf_filename,my_id,n_cpus,flux_surfaces%n_psi,&
+call write_soft_distribution_function(pdf_filename,my_id,n_mpis,flux_surfaces%n_psi,&
 n_momenta,n_pitch,flux_minor_radii_Zmag_LFS,momentum_mesh/(mass*SPEED_OF_LIGHT),&
 cospitch_mesh,pdf*((mass*SPEED_OF_LIGHT)**3))
 write(*,*) "Compute and write distribution function: completed!"
@@ -312,10 +312,10 @@ end subroutine compute_magnetic_field_poloidal_flux
 !>   n_Z:            (integer) number of vertical positions
 !>   n_RZ_wall:      (integer) number of wall nodes
 !>   n_lcfs:         (integer) number of last close flux surface nodes
-!>   n_cpus:         (integer) number of mpi tasks
+!>   n_mpis:         (integer) number of mpi tasks
 !>   my_id:          (integer) mpi task identifier 
 !>   RZ_axis:        (real8)(2) magnetic field coordinates
-!>   R_mesh:         (real8)(n_cpus*n_R_loc) radial mesh
+!>   R_mesh:         (real8)(n_mpis*n_R_loc) radial mesh
 !>   Z_mesh:         (real8)(n_Z) vertical mesh
 !>   R_wall:         (real8)(n_RZ_wall) radial coordinates of the wall
 !>   Z_wall:         (real8)(n_RZ_wall) vertical coordinates of the wall
@@ -326,7 +326,7 @@ end subroutine compute_magnetic_field_poloidal_flux
 !>   mag_name:       (character) name of the input file (metadeta)
 !>   description:    (character) description of the input file (metadeta)
 subroutine write_SOFT_magnetic_field_file(filename,fields,write_wall,n_vec,n_R_loc,&
-n_Z,n_RZ_wall,n_lcfs,n_cpus,my_id,RZ_axis,R_mesh,Z_mesh,R_wall,Z_wall,RZ_lcfs,&
+n_Z,n_RZ_wall,n_lcfs,n_mpis,my_id,RZ_axis,R_mesh,Z_mesh,R_wall,Z_wall,RZ_lcfs,&
 magnetic_field,poloidal_flux,mag_name,description)
   use mpi
   use hdf5
@@ -339,9 +339,9 @@ magnetic_field,poloidal_flux,mag_name,description)
   character(len=*),intent(in)                        :: filename,mag_name,description
   logical,intent(in)                                 :: write_wall
   integer,intent(in)                                 :: n_vec,n_R_loc,n_Z,n_lcfs
-  integer,intent(in)                                 :: n_RZ_wall,n_cpus,my_id
+  integer,intent(in)                                 :: n_RZ_wall,n_mpis,my_id
   real*8,dimension(2),intent(in)                     :: RZ_axis
-  real*8,dimension(n_R_loc*n_cpus),intent(in)        :: R_mesh
+  real*8,dimension(n_R_loc*n_mpis),intent(in)        :: R_mesh
   real*8,dimension(n_Z),intent(in)                   :: Z_mesh
   real*8,dimension(n_RZ_wall),intent(in)             :: R_wall,Z_wall
   real*8,dimension(2,n_lcfs),intent(in)              :: RZ_lcfs
@@ -355,21 +355,21 @@ magnetic_field,poloidal_flux,mag_name,description)
   integer                       :: ii,desc_len
   integer(HID_T)                :: file_id
   real*8,dimension(2,n_RZ_wall) :: RZ_wall
-  real*8,dimension(n_Z,n_cpus*n_R_loc)       :: global_poloidal_flux
-  real*8,dimension(n_vec,n_Z,n_cpus*n_R_loc) :: global_magnetic_field
+  real*8,dimension(n_Z,n_mpis*n_R_loc)       :: global_poloidal_flux
+  real*8,dimension(n_vec,n_Z,n_mpis*n_R_loc) :: global_magnetic_field
 
   !> gather the poloidal flux
-  call gather_2d_array_equal_chunks(my_id,n_cpus,n_Z,n_R_loc,poloidal_flux,global_poloidal_flux) 
+  call gather_2d_array_equal_chunks(my_id,n_mpis,n_Z,n_R_loc,poloidal_flux,global_poloidal_flux) 
   !> gather the magnetic field components
   do ii = 1,n_vec
-    call gather_2d_array_equal_chunks(my_id,n_cpus,n_Z,n_R_loc,&
+    call gather_2d_array_equal_chunks(my_id,n_mpis,n_Z,n_R_loc,&
     magnetic_field(ii,:,:),global_magnetic_field(ii,:,:)) 
   enddo
   !> write SOFT magnetic input file
   if(my_id.eq.0) then
     call HDF5_open_or_create(trim(filename//'.h5'),file_id,ierr,file_access=H5F_ACC_TRUNC_F)
     call HDF5_array1D_saving(file_id,RZ_axis,2,'maxis')         !< write magnetic axis
-    call HDF5_array1D_saving(file_id,R_mesh,n_cpus*n_R_loc,'r') !< write radial mesh
+    call HDF5_array1D_saving(file_id,R_mesh,n_mpis*n_R_loc,'r') !< write radial mesh
     call HDF5_array1D_saving(file_id,Z_mesh,n_Z,'z')            !< write vertical mesh
     !> write the tokamak wall
     RZ_wall(1,:) = R_wall; RZ_wall(2,:) = Z_wall;
@@ -380,12 +380,12 @@ magnetic_field,poloidal_flux,mag_name,description)
     endif
     call HDF5_array2D_saving(file_id,RZ_lcfs,2,n_lcfs,'separatrix')
     !> write magnetic field - poloidal flux
-    call HDF5_array2D_saving(file_id,global_poloidal_flux,n_Z,n_R_loc*n_cpus,'Psi') !< poloidal flux
-    call HDF5_array2D_saving(file_id,global_magnetic_field(1,:,:),n_Z,n_R_loc*n_cpus,'Br')   !< radial B
-    call HDF5_array2D_saving(file_id,global_magnetic_field(2,:,:),n_Z,n_R_loc*n_cpus,'Bz')   !< vertical B
+    call HDF5_array2D_saving(file_id,global_poloidal_flux,n_Z,n_R_loc*n_mpis,'Psi') !< poloidal flux
+    call HDF5_array2D_saving(file_id,global_magnetic_field(1,:,:),n_Z,n_R_loc*n_mpis,'Br')   !< radial B
+    call HDF5_array2D_saving(file_id,global_magnetic_field(2,:,:),n_Z,n_R_loc*n_mpis,'Bz')   !< vertical B
     !> add a negative sign to the toroidal magnetic field because the toroidal angle in SOFT
     !> is positive clockwise
-    call HDF5_array2D_saving(file_id,-global_magnetic_field(3,:,:),n_Z,n_R_loc*n_cpus,'Bphi')
+    call HDF5_array2D_saving(file_id,-global_magnetic_field(3,:,:),n_Z,n_R_loc*n_mpis,'Bphi')
     !> write magnetic field name
     call HDF5_char_saving(file_id,trim(mag_name),'name')
     !> create and write magnetic field description
@@ -402,29 +402,29 @@ end subroutine write_SOFT_magnetic_field_file
 !> gather 2d equally chunked array to global 2d array
 !> inputs:
 !>   my_id:       (integer) mpi task identifier
-!>   n_cpus:      (integer) number of mpi tasks
+!>   n_mpis:      (integer) number of mpi tasks
 !>   n1:          (integer) size of the local array 1st dimension
 !>   n2:          (integer) size of the local array 2nd dimension
 !>   local_array: (real8)(n1,n2) local array to be gathered
 !> outputs:
-!>   global_array: (real8)(n_cpus*n1,n_cpus*n2) gathered global array
-subroutine gather_2d_array_equal_chunks(my_id,n_cpus,n1,n2,local_array,global_array)
+!>   global_array: (real8)(n_mpis*n1,n_mpis*n2) gathered global array
+subroutine gather_2d_array_equal_chunks(my_id,n_mpis,n1,n2,local_array,global_array)
   use mpi
   implicit none
   !> inputs:
-  integer,intent(in)                 :: my_id,n_cpus,n1,n2
+  integer,intent(in)                 :: my_id,n_mpis,n1,n2
   real*8,dimension(n1,n2),intent(in) :: local_array
   !> outputs:
-  real*8,dimension(n1,n_cpus*n2),intent(out) :: global_array
+  real*8,dimension(n1,n_mpis*n2),intent(out) :: global_array
   !> variables
   integer                        :: ii,doublesize,subarraytype,resizedsubarraytype,ierr
   integer(kind=MPI_Address_kind) :: startresized,extent
-  integer,dimension(n_cpus)      :: disps,counts
+  integer,dimension(n_mpis)      :: disps,counts
   !> create a vector for each subblock and gather them
   if(my_id.eq.0) then
-    global_array = 0d0; counts = 1; disps = [(n2*ii,ii=0,n_cpus-1)]; startresized = 0;
+    global_array = 0d0; counts = 1; disps = [(n2*ii,ii=0,n_mpis-1)]; startresized = 0;
     call MPI_Type_size(MPI_REAL8,doublesize,ierr); extent = n1*doublesize;
-    call MPI_Type_create_subarray(2,[n1,n_cpus*n2],[n1,n2],[0,0],MPI_ORDER_FORTRAN,MPI_REAL8,subarraytype,ierr)
+    call MPI_Type_create_subarray(2,[n1,n_mpis*n2],[n1,n2],[0,0],MPI_ORDER_FORTRAN,MPI_REAL8,subarraytype,ierr)
     call MPI_Type_create_resized(subarraytype,startresized,extent,resizedsubarraytype,ierr)
     call MPI_Type_commit(resizedsubarraytype,ierr)
   endif
@@ -700,7 +700,7 @@ end subroutine integrate_current_density_over_flux_surface
 !> inputs:
 !>   filename:           (character)(*) name of the hdf5 file
 !>   my_id:              (integer) mpi task number
-!>   n_cpus:             (integer) total number of mpi tasks
+!>   n_mpis:             (integer) total number of mpi tasks
 !>   n_radii_per_task:   (integer) number of radial points per task
 !>   n_momenta:          (integer) number of momentum mesh nodes
 !>   n_pitch:            (integer) number of pitch mesh nodes
@@ -709,7 +709,7 @@ end subroutine integrate_current_density_over_flux_surface
 !>   cospitch_mesh:      (real8)(n_pitch) cos pitch angle mesh in increasing order
 !>   pdf:                (real8)(n_momenta,n_pitch,n_radii_per_task) particle distribution function
 !> outputs
-subroutine write_soft_distribution_function(filename,my_id,n_cpus,n_radii_per_task,&
+subroutine write_soft_distribution_function(filename,my_id,n_mpis,n_radii_per_task,&
 n_momenta,n_pitch,minor_radii_task,momentum_mesh,cospitch_mesh,pdf)
   use mpi
   use hdf5
@@ -719,7 +719,7 @@ n_momenta,n_pitch,minor_radii_task,momentum_mesh,cospitch_mesh,pdf)
   implicit none
   !> inputs:
   character(len=*),intent(in) :: filename
-  integer,intent(in)          :: my_id,n_cpus,n_radii_per_task,n_momenta,n_pitch
+  integer,intent(in)          :: my_id,n_mpis,n_radii_per_task,n_momenta,n_pitch
   real*8,dimension(n_radii_per_task),intent(in) :: minor_radii_task
   real*8,dimension(n_momenta),intent(in)        :: momentum_mesh
   real*8,dimension(n_pitch),intent(in)          :: cospitch_mesh
@@ -730,7 +730,7 @@ n_momenta,n_pitch,minor_radii_task,momentum_mesh,cospitch_mesh,pdf)
   integer                      :: ii,jj,kk,r_id,n_r_id,ierr,group_name_len
   integer(HID_T)               :: file_id,group_id
   integer,dimension(MPI_STATUS_SIZE)        :: statuss
-  real*8,dimension(n_cpus*n_radii_per_task) :: minor_radii_global
+  real*8,dimension(n_mpis*n_radii_per_task) :: minor_radii_global
   real*8,dimension(:,:,:),allocatable       :: pdf_local
 
   !> open the hdf5 file 
@@ -740,7 +740,7 @@ n_momenta,n_pitch,minor_radii_task,momentum_mesh,cospitch_mesh,pdf)
   n_radii_per_task,MPI_REAL8,0,MPI_COMM_WORLD,ierr)
   if(my_id.eq.0) then
     !> write minor radius in HDF5 file
-    call HDF5_array1D_saving(file_id,minor_radii_global,n_cpus*n_radii_per_task,'r')
+    call HDF5_array1D_saving(file_id,minor_radii_global,n_mpis*n_radii_per_task,'r')
   endif
   !> send the pdf distribution to root
   if(my_id.ne.0) call MPI_send(pdf,n_radii_per_task*n_momenta*n_pitch,MPI_REAL8,0,my_id,MPI_COMM_WORLD,ierr);
@@ -748,8 +748,8 @@ n_momenta,n_pitch,minor_radii_task,momentum_mesh,cospitch_mesh,pdf)
   if(my_id.eq.0) then
     !> generate the xi mesh
     allocate(pdf_local(n_momenta,n_pitch,n_radii_per_task))
-    !> loop on the number of cpus
-    do ii=0,n_cpus-1
+    !> loop on the number of mpi's
+    do ii=0,n_mpis-1
       if(ii.eq.0) then
         pdf_local = pdf
       else

@@ -10,6 +10,7 @@ use mod_spectra_deterministic,                       only: spectrum_integrator_2
 use mod_pinhole_lens,                                only: pinhole_lens
 use mod_camera_perspective_static,                   only: camera_perspective_static
 use mod_gyroaverage_synchrotron_light_dist_vertices, only: gyroaverage_synchrotron_light_dist
+use phys_module
 
 implicit none
 
@@ -23,7 +24,7 @@ type(gyroaverage_synchrotron_light_dist)    :: synch_sources
 type(particle_sim),dimension(:),allocatable :: sims,sims_particle_reconstructed
 logical                                     :: do_jorek_init
 integer                                     :: ii,n_particles_tot
-integer                                     :: n_groups,my_id,n_cpus,n_x,ierr
+integer                                     :: n_groups,my_id,n_mpis,n_x,ierr
 integer                                     :: n_times,n_wavelengths,n_spectra
 integer                                     :: n_int_camera_param,n_real_camera_param
 integer                                     :: n_null_particles
@@ -90,7 +91,10 @@ real_camera_param = [5.23d-1,5.23d-1,5d-1*PI,9.998025d-1,1.5807985,2.09801,-8.86
 
 !> Initialisation ------------------------------------------------------------------------------------------
 !> initialise the MPI communicator
-call init_mpi_threads(my_id,n_cpus,ierr)
+call init_mpi_threads(my_id,n_mpis,ierr)
+
+!> set the number of particle groups
+n_part_groups = n_groups
 
 !> read particle, time and MHD fields
 write(*,*) "Reading particle and MHD data ..."
@@ -98,7 +102,7 @@ do_jorek_init = .true.;
 allocate(sim_times(n_times)); allocate(sims(n_times));
 field_reader = event(read_jorek_fields_interp_linear(basename=trim(fields_filename),i=-1))
 do ii=1,n_times
-  call sims(ii)%initialize(n_groups,.true.,my_id,n_cpus,do_jorek_init)
+  call sims(ii)%initialize(.true.,my_id,n_mpis,do_jorek_init)
   write(*,*) 'my_id: ',sims(ii)%my_id,'doing particle restart file: ',trim(particle_filenames(ii))
   particle_reader = event(read_action(filename=trim(particle_filenames(ii))//trim(hdf5ext)))
   call with(sims(ii),particle_reader); sim_times(ii) = sims(ii)%time;
@@ -153,7 +157,7 @@ if(size(signs_p_parallel_gc_ref).eq.camera%n_times) signs_p_gc_parallel = signs_
 signs_charge = signs_charge_ref(1)
 if(size(signs_charge_ref).eq.camera%n_times) signs_charge = signs_charge_ref
 call generate_particle_simulations_from_active_light_sources(synch_sources,&
-rng_pcg32,sims(1)%fields,my_id,n_cpus,camera%n_times,n_null_particles,n_particles_tot,&
+rng_pcg32,sims(1)%fields,my_id,n_mpis,camera%n_times,n_null_particles,n_particles_tot,&
 spectra%n_spectra,accept_dark_lights_threshold,masses,camera%times,active_light_source_intensities,&
 signs_charge,sims_particle_reconstructed,signs_p_parallel_in=signs_p_parallel_gc_ref)
 t1 = MPI_Wtime()
@@ -275,7 +279,7 @@ end subroutine compute_contribution_light_source_to_image_static
 !>   rng:                             (type_rng) random number generator
 !>   fields:                          (fields_base) JOREK MHD fields
 !>   my_id:                           (integer) id of the current mpi task
-!>   n_cpus:                          (integer) number of mpi tasks
+!>   n_mpis:                          (integer) number of mpi tasks
 !>   n_times:                         (integer) number of times to be treated
 !>   n_dead_particles:                (integer) number of required dead particles
 !>   n_particles:                     (integer) number of active lights
@@ -290,7 +294,7 @@ end subroutine compute_contribution_light_source_to_image_static
 !> outputs:
 !>   sims_particle_out:                (type_particle_sim)(n_times) initialised particle simulations
 subroutine generate_particle_simulations_from_active_light_sources(lights_inout,&
-rng,fields,my_id,n_cpus,n_times,n_dead_particles,n_particles,n_spectra,accept_threshold,&
+rng,fields,my_id,n_mpis,n_times,n_dead_particles,n_particles,n_spectra,accept_threshold,&
 masses,times,active_light_source_intensities,signs_charge,sims_particle_out,signs_p_parallel_in)
   use mod_rng
   use mod_fields,         only: fields_base
@@ -302,7 +306,7 @@ masses,times,active_light_source_intensities,signs_charge,sims_particle_out,sign
   class(type_rng),intent(inout)       :: rng
   !> inputs:
   class(fields_base),intent(in)                              :: fields
-  integer,intent(in)                                         :: n_dead_particles,n_particles,n_cpus,my_id
+  integer,intent(in)                                         :: n_dead_particles,n_particles,n_mpis,my_id
   integer,intent(in)                                         :: n_times,n_spectra
   integer,dimension(n_times),intent(in)                      :: signs_charge
   real*8,intent(in)                                          :: accept_threshold
@@ -320,7 +324,7 @@ masses,times,active_light_source_intensities,signs_charge,sims_particle_out,sign
   !> loop for initialising particles
   do ii=1,n_times
     call generate_particle_simulation_from_active_light_sources(lights_inout,&
-    rng,fields,my_id,n_cpus,n_dead_particles,n_particles,n_spectra,accept_threshold,&
+    rng,fields,my_id,n_mpis,n_dead_particles,n_particles,n_spectra,accept_threshold,&
     masses(ii),times(ii),active_light_source_intensities(:,:,ii),signs_charge(ii),&
     sims_particle_out(ii),sign_p_parallel_in=signs_p_parallel(ii))
   enddo
@@ -334,7 +338,7 @@ end subroutine generate_particle_simulations_from_active_light_sources
 !>   rng:                             (type_rng) random number generator
 !>   fields:                          (fields_base) JOREK MHD fields
 !>   my_id:                           (integer) id of the current mpi task
-!>   n_cpus:                          (integer) number of mpi tasks
+!>   n_mpis:                          (integer) number of mpi tasks
 !>   n_dead_particles:                (integer) number of required dead particles
 !>   n_particles:                     (integer) number of active lights
 !>   n_spectra:                       (integer) number of spectra
@@ -348,7 +352,7 @@ end subroutine generate_particle_simulations_from_active_light_sources
 !> outputs:
 !>   sim_particle_out:                (type_particle_sim) initialised particle simulation
 subroutine generate_particle_simulation_from_active_light_sources(lights_inout,&
-rng,fields,my_id,n_cpus,n_dead_particles,n_particles,n_spectra,accept_threshold,&
+rng,fields,my_id,n_mpis,n_dead_particles,n_particles,n_spectra,accept_threshold,&
 mass,time,active_light_source_intensities,sign_charge,sim_particle_out,sign_p_parallel_in)
   use mod_rng
   use mod_random_seed
@@ -366,7 +370,7 @@ mass,time,active_light_source_intensities,sign_charge,sim_particle_out,sign_p_pa
   class(type_rng),intent(inout)       :: rng
   !> inputs:
   class(fields_base),intent(in)                      :: fields
-  integer,intent(in)                                 :: n_dead_particles,n_particles,n_cpus,my_id
+  integer,intent(in)                                 :: n_dead_particles,n_particles,n_mpis,my_id
   integer,intent(in)                                 :: n_spectra,sign_charge
   real*8,intent(in)                                  :: time,mass,accept_threshold
   real*8,dimension(n_spectra,n_particles),intent(in) :: active_light_source_intensities
@@ -383,11 +387,12 @@ mass,time,active_light_source_intensities,sign_charge,sim_particle_out,sign_p_pa
   sign_p_parallel = 1; if(present(sign_p_parallel_in)) sign_p_parallel = sign_p_parallel_in;
   check_particle_to_copy = .false.; ifail = 0;
   !> generate random numbers
-  call rng%initialize(n_particles,random_seed(),n_cpus,my_id,ifail)
+  call rng%initialize(n_particles,random_seed(),n_mpis,my_id,ifail)
   if(ifail.ne.0) call MPI_ABORT(MPI_COMM_WORLD,-1,ifail)  
   call rng%next(random_numbers)
   !> initialise particle simulation
-  call sim_particle_out%initialize(1,.true.,my_id,n_cpus,.false.)
+  n_part_groups = 1
+  call sim_particle_out%initialize(.true.,my_id,n_mpis,.false.)
   sim_particle_out%time           = time
   sim_particle_out%fields         = fields
   sim_particle_out%groups(:)%mass = mass

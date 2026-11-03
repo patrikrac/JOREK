@@ -62,11 +62,13 @@ DIRS := diagnostics				\
 	refinement				\
 	matrix					\
 	modelPC					\
+	numerics				\
 	particles				\
 	particles/pushers			\
 	particles/examples			\
 	particles/diagnostics			\
 	particles/tests				\
+	particles/initialisers      \
 	particles/postprocessors		\
 	particles/postprocessors/spectra	\
 	particles/postprocessors/lights		\
@@ -148,6 +150,7 @@ all: $(basename $(notdir $(PROGRAM_SOURCES)))
 most: jorek2_connection2 \
       jorek2_connection_stan \
       jorek2_connection_flux_aligned \
+	  jorek2_connection_stellarator \
       jorek2_diagno \
       jorek2_diagno_spi \
       jorek2_fieldlines_vtk \

@@ -9,11 +9,11 @@ contains
 function mpi_stats(var)
   real*8, intent(in) :: var
   real*8, dimension(5) :: mpi_stats
-  integer :: n_cpu, ierr
+  integer :: n_mpi, ierr
   real*8, allocatable, dimension(:) :: vars
 
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)
-  allocate(vars(n_cpu))
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)
+  allocate(vars(n_mpi))
   vars = 0.d0
 
   call MPI_Gather(var, 1, MPI_REAL8, vars, 1, MPI_REAL8, 0, MPI_COMM_WORLD, ierr)

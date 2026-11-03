@@ -28,7 +28,7 @@ contains
                                   a_mat)
 
     use data_structure
-    use phys_module, only: F0, GAMMA, keep_n0_const
+    use phys_module, only: F0, GAMMA, keep_n0_const, freeze_except_T
     use vacuum, only: is_freebound
     use mpi_mod
     use mod_integer_types
@@ -73,6 +73,7 @@ contains
 
     n_tor_local = a_mat%i_tor_max - a_mat%i_tor_min + 1
     zbig = 1.d12
+    if (freeze_except_T) zbig = 1.d18   ! toy tests: tstep*ZK_par*K up to ~1e13 must not compete with the Dirichlet penalty
     zbig_backup = zbig
 
     do i=1, n_local_elms

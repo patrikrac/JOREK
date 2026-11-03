@@ -18,6 +18,7 @@ OK_COL="\x1b[32;02m"     # green
 
 startdir=`readlink -f $(dirname $0)`
 codedir=`readlink -f ${startdir}/..` # Assumption about source code location
+particlesdir=`readlink -f ${codedir}/particles/`
 cd $codedir || exit 1
 
 # --- Usage printing function
@@ -269,7 +270,7 @@ fi
 # --- Check if the particle example exists
 if [ "$isparticletest" == "yes" ]; then
   # --- Check if the particle example exists
-  if [ ! -f "${codedir}/${particle_example_dir}/${particle_example}.f90" ]; then
+  if [ ! -f "${codedir}/${particle_example_dir}/${particle_example}.f90" ] && [ ! -f "${particlesdir}/${particle_example}.f90" ]; then
     printf "\n$ERROR_COL ERROR: Testcase '$testcase', particle example '$particle_example' does not exist.$NO_COL\n"
     exit 1
   fi

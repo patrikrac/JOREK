@@ -1,0 +1,34 @@
+// JOREK light theme — warm amber/cream palette echoing the JOREK logo
+// (black wordmark over an orange/amber plasma swirl). Tuned to sit
+// comfortably alongside the gruvbox-material dark scheme.
+
+// Palette --------------------------------------------------------------------
+$jk-bg:            #fdf8f0; // warm near-white page background
+$jk-bg-sidebar:    #f6ecd9; // soft cream sidebar
+$jk-bg-alt:        #f2e6cf; // panels / buttons
+$jk-ink:           #3c3836; // body text (warm near-black)
+$jk-heading:       #2f271f; // headings, matches the logo's black wordmark
+$jk-muted:         #6b5d4f; // secondary text
+$jk-amber:         #e8912c; // logo amber highlight
+$jk-orange:        #c85e0c; // logo orange, readable as a link color on cream
+$jk-border:        #e6d5b8;
+
+// Just the Docs mappings -----------------------------------------------------
+$color-scheme:                light;
+
+$body-background-color:       $jk-bg;
+$sidebar-color:               $jk-bg-sidebar;
+$body-heading-color:          $jk-heading;
+$body-text-color:             $jk-ink;
+$link-color:                  $jk-orange;
+$nav-child-link-color:        $jk-muted;
+$base-button-color:           $jk-bg-alt;
+$btn-primary-color:           $jk-amber;
+$code-background-color:        $jk-bg-sidebar;
+$feedback-color:              darken($sidebar-color, 3%);
+$table-background-color:      $jk-bg;
+$search-background-color:     $jk-bg;
+$search-result-preview-color: $jk-muted;
+$border-color:                $jk-border;
+
+@import "./vendor/OneLightJekyll/syntax"; // light syntax highlighting theme

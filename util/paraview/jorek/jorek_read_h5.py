@@ -9,8 +9,6 @@ Before reading, set:
 Before interpolating, set:
     - Without_n0_mode (default false)
 
-Created by Daan van Vugt <the JOREK team>
-
 See https://www.jorek.eu/wiki/doku.php?id=jorek_read_h5
 
 prec controls the precision of the calculation. Values: np.float32 or np.float64

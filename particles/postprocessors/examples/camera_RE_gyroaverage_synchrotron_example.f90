@@ -24,6 +24,7 @@ use mod_camera_perspective_static,  only: camera_perspective_static
 use mod_gyroaverage_synchrotron_light_dist_vertices, only: gyroaverage_synchrotron_light_dist
 #ifdef USE_HDF5
 use mod_fast_camera_io,             only: write_pixel_intensity_hdf5
+use phys_module
 #endif
 
 implicit none
@@ -39,7 +40,7 @@ type(gyroaverage_synchrotron_light_dist) :: synch_sources
 type(particle_sim),dimension(:),allocatable :: sims,sims_gc
 logical                            :: write_gc_in_txt,do_jorek_init
 integer                            :: ii,n_1d,n_2d,t0,t1
-integer                            :: n_groups,my_id,n_cpus,n_x,ierr
+integer                            :: n_groups,my_id,n_mpis,n_x,ierr
 integer                            :: n_wavelengths,n_spectra
 integer                            :: n_int_camera_param,n_real_camera_param
 integer                            :: n_times,n_frames
@@ -95,7 +96,9 @@ real_camera_param = [5.23d-1,5.23d-1,5d-1*PI,9.998025d-1,1.5807965,2.09801,-8.86
 
 !> Initialisation  ------------------------------------------------------------------------
 !> Initialise MPI communicator
-call init_mpi_threads(my_id,n_cpus,ierr)
+call init_mpi_threads(my_id,n_mpis,ierr)
+!> set the number of particle groups
+n_part_groups = n_groups
 
 !> allocate structures, read particle, time, MHD fields data and transform to gc if needed
 write(*,*) 'Reading particle data ...'
@@ -106,7 +109,7 @@ allocate(sim_times(n_times)); allocate(sims(n_times));
 allocate(sims_gc(n_times)); do_jorek_init = .true.
 field_reader = event(read_jorek_fields_interp_linear(basename=trim(fields_filename),i=-1))
 do ii=1,n_times
-  call sims(ii)%initialize(n_groups,.true.,my_id,n_cpus,do_jorek_init)
+  call sims(ii)%initialize(.true.,my_id,n_mpis,do_jorek_init)
   write(*,*) 'my_id: ',sims(ii)%my_id,'doing particle restart file: ',trim(particle_filenames(ii))
   particle_reader = event(read_action(filename=trim(particle_filenames(ii))//trim(hdf5ext)))
   call with(sims(ii),particle_reader); sim_times(ii) = sims(ii)%time; 
@@ -208,7 +211,7 @@ subroutine relativistic_kinetic_sim_to_relativistic_gc_sim(sim_kin,sim_gc)
   !> copy base data from sim_kin to sim_gc
   sim_gc%time   = sim_kin%time; sim_gc%stop_now = sim_kin%stop_now;
   sim_gc%t_norm = sim_kin%t_norm; sim_gc%my_id  = sim_kin%my_id;
-  sim_gc%n_cpu  = sim_kin%n_cpu; sim_gc%wtime_start = sim_kin%wtime_start;
+  sim_gc%n_mpi  = sim_kin%n_mpi; sim_gc%wtime_start = sim_kin%wtime_start;
   if(.not.allocated(sim_gc%groups)) allocate(sim_gc%groups(n_groups))
   counter = 1
   do jj=1,size(sim_kin%groups)

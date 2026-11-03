@@ -278,7 +278,7 @@ function kinetic_to_gc(node_list, element_list, in, B, mass) result(out)
 
   ! Calculate new st and i_elm
   call find_RZ_nearby(node_list, element_list, in%x(1), in%x(2), in%st(1), in%st(2), in%i_elm, &
-      out%x(1), out%x(2), out%st(1), out%st(2), out%i_elm, ifail)
+      out%x(1), out%x(2), out%st(1), out%st(2), out%i_elm, ifail, phi=in%x(3))
 end function kinetic_to_gc
 
 !> Take a particle_gc and get the kinetic particle.
@@ -322,6 +322,6 @@ function gc_to_kinetic(node_list, element_list, in, chi, B, mass) result(out)
 
   ! Calculate new st and i_elm
   call find_RZ_nearby(node_list, element_list, in%x(1), in%x(2), in%st(1), in%st(2), in%i_elm, &
-      out%x(1), out%x(2), out%st(1), out%st(2), out%i_elm, ifail)
+      out%x(1), out%x(2), out%st(1), out%st(2), out%i_elm, ifail, phi=in%x(3))
 end function gc_to_kinetic
 end module mod_boris

@@ -1,0 +1,217 @@
+&in1
+
+  restart=.t.
+  regrid  = .f.
+  refinement=.false.
+
+  restart_particles=.f.
+
+  tstep_n=10.
+  nstep_n=2
+
+  nout = 1
+
+  use_manual_random_seed = .true.
+  manual_seed = 498932990
+
+  use_fixed_rng_value = .true.
+  fixed_rng_value = 0.5
+
+  deuterium_adas    = .true.
+
+  tstep_particles    = 5.d-7
+  filter_perp_n0     = 0.d0 
+  filter_hyper_n0    = 1.d-10
+  filter_par_n0      = 0.d0
+
+  time_evol_scheme= 'Gears'
+  use_strumpack = .false.
+  use_mumps     = .true.
+  use_mumps_eq  = .true.
+  use_mumps_prj = .true.
+  T_min_neg     = 4.d-4
+  rho_min_neg   =  1.d-3
+  T_min       = 4.d-6
+  rho_min     = 1.d-3
+  D_prof_neg_thresh  = 1.d-3
+  D_prof_neg         = 2.d-5
+  ZK_prof_neg_thresh = 4.d-6
+  ZK_prof_neg        = 7.d-5
+
+  bc_natural_open        = .true.
+  gamma_stangeby = 8.d0
+  gamma_sheath    = 1.44
+ 
+  fbnd(1)   = 2.
+  fbnd(2:4) = 0.
+  mf        = 0
+ 
+  ellip  = 1.7
+  tria_u = 0.
+  tria_l = 0.
+  quad_u = -0.
+  quad_l = -0.4
+ 
+  xampl  = +0.22
+  xsig   = 0.6
+  xwidth = 1.5
+  xtheta = 4.7
+  xleft  = -0.01
+  xshift = 0.02
+  xpoint = .t.
+ 
+  R_begin = 2.9
+  R_end   = 3.1
+  Z_begin = -0.1
+  Z_end   = 0.1
+ 
+  R_geo = 3.0
+  Z_geo = 0.
+ 
+  F0    = 3.0
+ 
+  amin     = 1.
+ 
+  n_R      = 0
+  n_Z      = 0
+  n_radial = 10
+  n_pol    = 15
+ 
+  n_flux   = 10
+  n_tht    = 15
+  n_open   = 3
+  n_leg    = 3
+  n_private = 1
+ 
+  eta   = 2.d-6
+  visco = 4.d-6
+  visco_par = 1.d-4
+ 
+  eta_num = 3.d-10
+ 
+  D_par     = 0.d0
+  D_perp(1) = 1.d-5
+  D_perp(2) = 0.85d0
+  D_perp(3) = 0.d0
+  D_perp(4) = 0.01d0
+  D_perp(5) = 0.92d0
+ 
+  ZK_par     = 10.d0
+  ZK_perp(1) = 1.d-5
+  ZK_perp(2) = 0.85d0
+  ZK_perp(3) = 0.d0
+  ZK_perp(4) = 0.01d0
+  ZK_perp(5) = 0.92d0
+ 
+  FF_0 = 1.6
+  FF_1 = 0.
+  FF_coef(1)  = -1.0
+  FF_coef(2)  = 0.d0
+  FF_coef(3)  = 0.d0
+  FF_coef(4)  = 0.03d0
+  FF_coef(5)  = 1.0d0
+  FF_coef(6)  = -0.06d0
+  FF_coef(7)  = 0.90d0
+  FF_coef(8)  = 0.07d0
+ 
+  heatsource     = 4.d-7
+  particlesource = 1.5d-5
+ 
+  T_0 = 1.5d-2
+  T_1 = 3.d-4
+  T_coef(1) = -0.66d0
+  T_coef(2) = +0.0d0
+  T_coef(3) = 0.d0
+  T_coef(4) = 0.08d0
+  T_coef(5) = 0.94d0
+ 
+  rho_0 = 1.
+  rho_1 = 0.01
+  rho_coef(1)  =  0.0
+  rho_coef(2)  =  0.0
+  rho_coef(3)  =  0.0
+  rho_coef(4)  =  0.08
+  rho_coef(5)  =  0.94d0
+ 
+  iter_precon = 22
+  gmres_m = 20
+  gmres_4 = 1.d0
+  gmres_max_iter = 200
+  gmres_tol = 1.d-8
+
+  ! --- valves
+  valves(1)%type = 'poly'
+  valves(1)%poly_R = 3.86d0, 3.9d0, 3.86d0, 3.9d0
+  valves(1)%poly_Z = 0.1d0,  0.1d0,  0.0d0, 0.0d0
+
+  ! ----  particle groups
+
+  ! Deuterium Neutrals (D01)
+  part_group_configs(1)%id              = 'D01'
+  part_group_configs(1)%Z = -2
+  part_group_configs(1)%mass = 2.01410174369812
+  part_group_configs(1)%coupling_scheme = 'ncs'
+  part_group_configs(1)%n_particles     = 1e4
+  part_group_configs(1)%type            = 'particle_kinetic_leapfrog'
+  part_group_configs(1)%do_conservation_checks = .t.
+
+  part_group_configs(1)%use_kin_puffing        = .t.
+  part_group_configs(1)%use_kin_cx             = .t.
+  part_group_configs(1)%use_kin_ionisation     = .t.
+  part_group_configs(1)%use_kin_recombination  = .t.
+  part_group_configs(1)%use_kin_radiation      = .t.
+  part_group_configs(1)%use_kin_neutral_coll   = .t.
+  part_group_configs(1)%neutral_coll_dTw = 2.d-10, 273, 0.66
+  part_group_configs(1)%atom_data_suffix = '12_h'
+  part_group_configs(1)%wall_act_configs(1)%type="reflection"
+  part_group_configs(1)%wall_act_configs(2)%type="pump"
+  part_group_configs(1)%wall_act_configs(2)%weight_factor=0.7d0
+  part_group_configs(1)%wall_act_configs(2)%only_in_polygon=.t.
+  part_group_configs(1)%wall_act_configs(2)%poly_R= 2.75,3.2,3.2,2.75
+  part_group_configs(1)%wall_act_configs(2)%poly_Z= -1.4,-1.4,-1.7,-1.7  
+  part_group_configs(1)%wall_act_configs(2)%nametag="PFR"
+
+  ! Nitrogen Impurities (N01)
+  part_group_configs(2)%id = 'N01'
+  part_group_configs(2)%Z = 7
+  part_group_configs(2)%mass = 14.0067396163940
+  part_group_configs(2)%coupling_scheme = 'ics'
+  part_group_configs(2)%n_particles     = 1e4
+  part_group_configs(2)%type            = 'particle_kinetic_leapfrog'
+  part_group_configs(2)%do_conservation_checks = .t.
+
+  part_group_configs(2)%use_kin_puffing        = .t. 
+  part_group_configs(2)%use_kin_ionisation     = .t.
+  part_group_configs(2)%use_kin_radiation      = .t.
+  part_group_configs(2)%use_kin_bg_collisions  = .t.
+  part_group_configs(2)%atom_data_suffix = '96_n'
+  part_group_configs(2)%wall_act_configs(1)%type="reflection"
+  part_group_configs(2)%wall_act_configs(2)%type="pump"
+  part_group_configs(2)%wall_act_configs(2)%weight_factor=0.7d0
+  part_group_configs(2)%wall_act_configs(2)%only_in_polygon=.t.
+  part_group_configs(2)%wall_act_configs(2)%poly_R= 2.75,3.2,3.2,2.75
+  part_group_configs(2)%wall_act_configs(2)%poly_Z= -1.4,-1.4,-1.7,-1.7  
+  part_group_configs(2)%wall_act_configs(2)%nametag="PFR"
+
+  ! ---- fluid groups
+
+  ! Deuterium plasma species
+  fluid_configs(1)%Z=-2
+  fluid_configs(1)%wall_act_configs(1)%type="wall recomb"
+  fluid_configs(1)%wall_act_configs(1)%target_group_id="D01"
+  fluid_configs(1)%wall_act_configs(1)%supers_num_wall=200
+
+  ! ------------- Puffing patterns:
+
+  ! D01
+  part_group_configs(1)%puff_ctrl(1)%times = 0     
+  part_group_configs(1)%puff_ctrl(1)%rates = 70.d21 !< constant puffing rate
+  part_group_configs(1)%puff_ctrl(1)%supers_num_puff = 40
+
+  ! N01
+  part_group_configs(2)%puff_ctrl(1)%times = 0     
+  part_group_configs(2)%puff_ctrl(1)%rates = 35.d21 !< constant puffing rate
+  part_group_configs(2)%puff_ctrl(1)%supers_num_puff = 20
+
+ /
+ 

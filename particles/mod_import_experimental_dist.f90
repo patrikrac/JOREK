@@ -40,7 +40,7 @@ subroutine import_particles(particles,fields,filename, rng_base,mass, n_phi_plan
   real*8,                intent(in)                 :: mass, fraction_phi_planes
   integer,               intent(in)                 :: n_phi_planes_in
 
-  integer                                           :: my_id, n_cpu, ierr, rank, n_particles,ifail
+  integer                                           :: my_id, n_mpi, ierr, rank, n_particles,ifail
   integer                                           :: hdferr
   integer, allocatable, dimension(:)                :: particles_per_proc
   integer*8                                         :: arraysize(4),maxdims(4)
@@ -68,7 +68,7 @@ subroutine import_particles(particles,fields,filename, rng_base,mass, n_phi_plan
   class(particle_base), dimension(:), allocatable   :: particles_tmp
 
   call MPI_COMM_RANK(MPI_COMM_WORLD,my_id,ierr)
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)
   if(my_id .eq. 0 )then
     write(*,*) "*************************************"
     write(*,*) "* Initialising from experimental    *"
@@ -215,7 +215,7 @@ subroutine import_particles(particles,fields,filename, rng_base,mass, n_phi_plan
     if (n_tries_now .lt. 64 .and. n_tries_now .gt. 0) n_tries_now = 64
 
     call MPI_AllReduce(n_tries_now, blocksize, 1, MPI_INTEGER, MPI_MAX, MPI_COMM_WORLD, ierr)
-    call rng%jump_ahead((n_cpu-my_id-1)*prev_blocksize + my_id*blocksize)
+    call rng%jump_ahead((n_mpi-my_id-1)*prev_blocksize + my_id*blocksize)
     prev_blocksize = blocksize
     allocate(rans(8,blocksize))
     do i=1,blocksize

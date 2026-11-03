@@ -29,10 +29,10 @@ USE_PASTIX_MURGE = 1
 USE_MUMPS = 1
 USE_WSMP   = 0
 
-LIBHOME = /home/jorekcp/jorek_tools
+LIBHOME ?= /path/to/jorek_tools
 
 #Scotch library
-#SCOTCH_HOME ?= /home/jorekcp/jorek_tools/scotch
+#SCOTCH_HOME ?= $(LIBHOME)/scotch
 #LIB_SCOTCH   = -L$(SCOTCH_HOME)/lib -lscotch -lscotcherr
 #INC_SCOTCH   = -I$(SCOTCH_HOME)/include
 

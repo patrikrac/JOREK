@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 """
 Plot particle trajectory from part*.h5.
-Daan van Vugt <the JOREK team>
 """
 from __future__ import print_function
 

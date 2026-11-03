@@ -53,6 +53,7 @@ module mod_position
     real*8             :: length     !< Length along a line (for line)
     ! --- Quantities related to boundary elements
     real*8             :: bnd_normal(2) = 0.d0 !< Normal vector to the computational boundary (pointing outside)
+    real*8             :: dl = 0.d0  !< Poloidal distance represented by this poloidal position (m)
   end type t_pol_pos
   
   !> Data structure for a list of poloidal positions
@@ -500,8 +501,10 @@ module mod_position
         ! --- Normal vector to the boundary
         if ( s_const ) then
           pos%bnd_normal = (/ -pos%Z_t, pos%R_t /) / sqrt(pos%R_t**2.d0 + pos%Z_t**2.d0)  
+          pos%dl         = sqrt(pos%R_t**2.d0 + pos%Z_t**2.d0)/float(n_elm_pts)  
         else
           pos%bnd_normal = (/ -pos%Z_s, pos%R_s /) / sqrt(pos%R_s**2.d0 + pos%Z_s**2.d0)
+          pos%dl         = sqrt(pos%R_s**2.d0 + pos%Z_s**2.d0)/float(n_elm_pts) 
         end if
 
         ! --- Correct normal direction to point outwards 

@@ -7,6 +7,8 @@ use petsc
 #endif
 implicit none
 
+logical, save :: sbc_check_done = .false.
+
 public :: construct_matrix
 
 contains
@@ -30,6 +32,9 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   use mod_fix_axis_nodes, only: fix_nodes_on_axis
   use vacuum_response, only: vacuum_boundary_integral
   use global_distributed_matrix, only: global_matrix_structure_vacuum
+#if JOREK_MODEL == 183
+  use mod_boundary_ndotB, only: init_boundary_ndotB, finalize_boundary_ndotB
+#endif
 #ifdef USE_PETSC
   use mod_petsc, only: petsc_create_matrix
 #endif
@@ -143,6 +148,22 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     call global_matrix_structure_vacuum(mhd_sim%node_list, mhd_sim%bnd_node_list, a_mat, i_tor_min=1, i_tor_max=n_tor)
   endif
 
+#if JOREK_MODEL == 183
+  ! One-time consistency check, if vpar_sbc_enable also needs bc_natural_open=.true.
+  if (my_id == 0) then
+    if (vpar_sbc_enable .and. (.not. bc_natural_open) .and. (.not. sbc_check_done)) then
+      write(*,'(A)') "FATAL: vpar_sbc_enable=.true. requires bc_natural_open=.true."
+      write(*,'(A)') "  Without it, n.B is never accumulated (boundary_matrix_open is not called),"
+      write(*,'(A)') "  and the v_par sheath BC silently reduces to driving v_par -> 0."
+      stop
+    endif
+    sbc_check_done = .true.
+  endif
+
+  ! Initialize n.B storage for stellarator BC (before OMP region)
+  call init_boundary_ndotB(node_list%n_nodes, n_plane, n_tor)   ! storage is indexed by GLOBAL node index
+#endif
+
   ! --- Matrix construction
   my_ind_min = a_mat%index_min(my_id+1)
   my_ind_max = a_mat%index_max(my_id+1)
@@ -196,6 +217,11 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
     enddo !< Element loop
     !$omp end do
     !$omp end parallel
+
+#if JOREK_MODEL == 183
+    ! Finalize n.B storage (average accumulated values, print stats)
+    call finalize_boundary_ndotB()
+#endif
 
 #ifdef USE_PETSC
     if (.not. harmonic_matrix) then

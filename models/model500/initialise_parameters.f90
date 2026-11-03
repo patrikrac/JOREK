@@ -23,13 +23,14 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 eta, visco, visco_par,                              &
                 restart, rst_format, regrid, bootstrap, write_ps,   &
                 bootstrap_psin_cutoff,                              &
-                regrid_from_rz,                                     &
-                force_horizontal_Xline, fix_axis_nodes,             &
+                regrid_from_rz, force_horizontal_Xline,             &
+                fix_axis_nodes,                                     &
                 n_R, n_Z, n_radial, n_pol, n_tht, n_flux,           &
                 n_open, n_private, n_leg, n_leg_out, n_ext,         &
                 n_outer, n_inner, n_up_priv, n_up_leg, n_up_leg_out,&
                 n_tht_equidistant,                                  &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
@@ -114,7 +115,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 corr_neg_temp_coef, corr_neg_dens_coef,             &
                 D_prof_neg, ZK_prof_neg, ZK_par_neg,                &
                 D_prof_neg_thresh, ZK_prof_neg_thresh, T_min,       &
-				T_min_neg,rho_min_neg,                              &
+                T_min_neg,rho_min_neg,                              &
                 ne_SI_min, Te_eV_min, rn0_min,                      &
                 D_neutral_x, D_neutral_y, D_neutral_p,              &
                 neutral_reflection, rho_min,                        &
@@ -124,6 +125,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 spi_Vel_RxZref, spi_quantity, spi_abl_model,        &
                 ns_radius_ratio, ns_radius_min, spi_angle,          &
                 spi_L_inj, spi_L_inj_diff, spi_abl_mag_reduction,   &
+                spi_abl_history_old,                                &
                 drift_distance, energy_teleported,                  &
                 K_Dmv, A_Dmv, L_tube, V_Dmv, P_Dmv,                 &
                 spi_Vel_diff, t_ns, JET_MGI, ASDEX_MGI,             &
@@ -156,7 +158,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 alpha_Newton, vacuum_min, strumpack_matching,       &
                 export_aux_node_list, xpoint_search_tries,          &
                 use_manual_random_seed, manual_seed,                &
-                use_fixed_rng_value, fixed_rng_value,               &            
+                use_fixed_rng_value, fixed_rng_value,               &
                 bgf_rpolar, bgf_tht
 
 if (my_id .eq. 0) then

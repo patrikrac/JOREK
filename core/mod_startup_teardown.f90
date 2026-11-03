@@ -5,7 +5,7 @@ implicit none
 contains
 
 !> Initialize solvers, parameters, MPI, threads etc.
-subroutine initialise(my_id, n_cpu, skip_help)
+subroutine initialise(my_id, n_mpi, skip_help)
   use tr_module, only: tr_meminit
   use mod_clock, only: clck_init
   use data_structure, only: init_threads
@@ -23,7 +23,7 @@ subroutine initialise(my_id, n_cpu, skip_help)
 
 #include "r3_info.h"
 ! Necessary for dependency reasons... should clean that up a bit and create a module
-  integer, intent(out) :: my_id, n_cpu
+  integer, intent(out) :: my_id, n_mpi
   logical, optional, intent(in) :: skip_help
   integer :: ierr
   integer :: required, provided
@@ -50,14 +50,14 @@ subroutine initialise(my_id, n_cpu, skip_help)
   call init_threads()
   
   ! --- Determine number of MPI procs, ID of this proc
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)
   
   ! --- Process command line arguments
   if (present(skip_help)) then
-    if ( my_id == 0 .and. .not. skip_help) call jorek2help(n_cpu, nbthreads)
+    if ( my_id == 0 .and. .not. skip_help) call jorek2help(n_mpi, nbthreads)
   else
-    if ( my_id == 0) call jorek2help(n_cpu, nbthreads)
+    if ( my_id == 0) call jorek2help(n_mpi, nbthreads)
   end if
   
   call MPI_Barrier(MPI_COMM_WORLD,ierr)
@@ -66,7 +66,7 @@ subroutine initialise(my_id, n_cpu, skip_help)
   call MPI_Barrier(MPI_COMM_WORLD,ierr)
 
   ! --- Initialise memory tracing
-  call tr_meminit(my_id, n_cpu)
+  call tr_meminit(my_id, n_mpi)
 
   ! --- Initialise timing
   call clck_init()
@@ -107,19 +107,62 @@ subroutine initialise(my_id, n_cpu, skip_help)
 end subroutine initialise
 
 
+!> Ensure that the prescribed density is compatible with a model that does not evolve density.
+subroutine check_flat_density_profile(my_id)
+  use phys_module, only: LOWER_XPOINT
+
+  integer, intent(in) :: my_id
+  integer, parameter :: n_profile_points = 201
+  real*8, parameter :: tolerance = 1.d-5
+
+  integer :: i, ierr
+  real*8 :: density_profile, derivatives(8), psi_n
+  real*8 :: max_deviation, psi_n_max_deviation
+
+  max_deviation = 0.d0
+  psi_n_max_deviation = 0.d0
+
+  do i = 1, n_profile_points
+    psi_n = 1.5d0 * dble(i-1) / dble(n_profile_points-1)
+    call density(.false., LOWER_XPOINT, 0.d0, (/0.d0, 0.d0/), psi_n, 0.d0, 1.d0, density_profile, &
+                 derivatives(1), derivatives(2), derivatives(3), derivatives(4), &
+                 derivatives(5), derivatives(6), derivatives(7), derivatives(8))
+
+    if (abs(density_profile - 1.d0) .gt. max_deviation) then
+      max_deviation = abs(density_profile - 1.d0)
+      psi_n_max_deviation = psi_n
+    endif
+  enddo
+
+  if (max_deviation .le. tolerance) return
+
+  if (my_id .eq. 0) then
+    write(*,*) 'ERROR:'
+    write(*,*) '  with_rho = .false. requires density() to return a flat profile of 1.'
+    write(*,*) '  Maximum deviation from 1: ', max_deviation
+    write(*,*) '  At normalized flux coordinate: ', psi_n_max_deviation
+  endif
+  call MPI_FINALIZE(ierr)
+  stop
+end subroutine check_flat_density_profile
+
+
 
 !> Verify that we are not doing stupid things. Run this after loading parameters
 !> from the input file.
-subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
+subroutine sanity_checks(my_id, n_mpi, mpi_required, mpi_provided)
   use mod_parameters, only: n_tor, n_plane
   use phys_module
   use gauss
 
   integer :: ierr, i
-  integer, intent(in) :: my_id, n_cpu
+  integer, intent(in) :: my_id, n_mpi
   integer :: nsolvers=0
   logical :: solvers(4), solvers_eq(4)
   integer :: mpi_required, mpi_provided
+
+  ! Check for a non-flat density profile when density is not evolved
+  if (.not. with_rho) call check_flat_density_profile(my_id)
 
   ! WARNING for axis treatment
   if(treat_axis .and. (fix_axis_nodes .or. force_central_node))then

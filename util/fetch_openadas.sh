@@ -3,7 +3,6 @@
 # Downloads all files in parallel, removes the ones which were
 # not found (the web service does not give a 404 but bad data)
 #
-# Author: Daan van Vugt <the JOREK team>
 # Date: 2018-03-28
 
 set -o pipefail

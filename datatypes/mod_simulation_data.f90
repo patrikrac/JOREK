@@ -26,7 +26,7 @@ module mod_simulation_data
 
     !< MPI settings
     integer                                       :: my_id = 0
-    integer                                       :: n_cpu = 1 ! if not initialized, act as if there is no mpi
+    integer                                       :: n_mpi = 1 ! if not initialized, act as if there is no mpi
     
     integer                                       :: n_tor = 1
     

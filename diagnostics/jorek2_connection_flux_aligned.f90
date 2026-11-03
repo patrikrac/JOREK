@@ -54,8 +54,8 @@ program jorek2_connection_flux_aligned
 
   ! --- Extra data
   integer   :: ntheta, n_rcoord
-  integer   :: my_id, ikeep, n_cpu, ierr, nsend, nrecv, ikeep0, i_line0
-  integer   :: thetas_per_cpu, local_theta_start, local_theta_end
+  integer   :: my_id, ikeep, n_mpi, ierr, nsend, nrecv, ikeep0, i_line0
+  integer   :: thetas_per_mpi, local_theta_start, local_theta_end
   integer   :: nnos, i_var, i_strike, i_strike0
   integer   :: i, j, iside_i, iside_j, ip, i_line, n_lines, i_tor, i_harm, i_var_psi, i_var_n, i_var_T, i_dir, k, m
   integer   :: i_elm, i_elm_start, ifail, i_phi, n_phi, i_turn, n_turns, i_elm_out, i_elm_prev, i_steps, n_turn_max(2)
@@ -108,7 +108,7 @@ program jorek2_connection_flux_aligned
   ! --- MPI initilisation
   call MPI_INIT(IERR)
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)             ! id of each MPI proc
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)             ! number of MPI procs
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)             ! number of MPI procs
   
   if (my_id .eq. 0) then
     write(*,*) '***************************************'
@@ -220,14 +220,14 @@ program jorek2_connection_flux_aligned
   ! --- The elements our local MPI is looking at
   ! --- Field lines are separated poloidally to ensure that the computational time
   ! --- should be evenly distributed among MPI tasks
-  if (mod(ntheta, n_cpu) .ne. 0) then
-    write(*,*) "ERROR: n_theta must be exactly divisible by n_cpu! Otherwise poloidal distribution of field lines is non-uniform.", ntheta, n_cpu
+  if (mod(ntheta, n_mpi) .ne. 0) then
+    write(*,*) "ERROR: n_theta must be exactly divisible by n_mpi! Otherwise poloidal distribution of field lines is non-uniform.", ntheta, n_mpi
     stop 
   endif 
-  thetas_per_cpu = ntheta / n_cpu
-  local_theta_start = my_id * thetas_per_cpu + 1
-  local_theta_end = min(ntheta, (my_id + 1) * thetas_per_cpu)
-  if (my_id .eq. 0) write(*, *) thetas_per_cpu
+  thetas_per_mpi = ntheta / n_mpi
+  local_theta_start = my_id * thetas_per_mpi + 1
+  local_theta_end = min(ntheta, (my_id + 1) * thetas_per_mpi)
+  if (my_id .eq. 0) write(*, *) thetas_per_mpi
   write(*, *) my_id, local_theta_start, local_theta_end
   
   ! --- Some info print outs
@@ -589,7 +589,7 @@ program jorek2_connection_flux_aligned
   ! --- Write points for all other MPIs
   if (my_id .eq. 0) then
     ! --- If this is mpi_0, we receive data from the other MPIs and print it
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (ikeep .gt. 0) then
         nrecv = 5*ikeep
@@ -638,7 +638,7 @@ program jorek2_connection_flux_aligned
   ! --- Write points for all other MPIs
   if (my_id .eq. 0) then
     ! --- If this is mpi_0, we receive data from the other MPIs and print it
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(i_line,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (i_line .gt. 0) then
         nrecv = i_line
@@ -694,7 +694,7 @@ program jorek2_connection_flux_aligned
   ! --- Write points for all other MPIs
   if (my_id .eq. 0) then
     ! --- If this is mpi_0, we receive data from the other MPIs and print it
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(i_strike,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (i_strike .gt. 0) then
         nrecv = i_strike

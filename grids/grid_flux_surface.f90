@@ -43,7 +43,7 @@ real*8             :: theta, drr1, dss1, drr2, dss2, t, t2, t3, ri, si, dri, dsi
 real*8             :: rad2, th_z, th_r, th_rr, th_zz, th_rz, dth_ds, dth_dr, dth_drs, dth_drr, dth_dss
 real*8             :: rzjac, ps_z, ps_r, ejac, ptjac, rt, st, dptjac_dr, dptjac_ds, rpt, spt, rtt, stt
 real*8             :: dr_dr, dr_dz, ds_dr, ds_dz, dps_drr, dps_dzz, crr_axis, czz_axis, cx, cy
-real*8             :: dr_dpt, dz_dpt, dr_dtt, dz_dtt, r_ax, s_ax, tn, tn2, cn
+real*8             :: dr_dpt, dz_dpt, dr_dtt, dz_dtt, r_ax, s_ax, tn, tn2, cn, sn
 real*8             :: delta_rp, delta_zp, delta_rm, delta_zm, dir_2, dir_3, B_axis, q_axis
 real*8             :: psi_bnd
 real*8, external   :: spwert
@@ -348,6 +348,11 @@ write(*,'(A,4f14.8)') ' magnetic axis, q : ',ES%R_axis,ES%Z_axis,ES%psi_axis,q_a
 CX = CRR_axis
 CY = CZZ_axis
 
+if (CX .le. 0.d0 .or. CY .le. 0.d0) then
+  write(*,*) ' ERROR in grid_flux_surface: negative curvature at the axis, cannot build grid'
+  stop
+endif
+
 do j=1,npnew
 
   inode = j
@@ -359,28 +364,17 @@ do j=1,npnew
   TN  = TAN(theta)
   TN2 = TN**2
   CN  = COS(theta)
+  SN  = SIN(theta)
 
-  if (theta .eq. PI/2.d0) then
-    RRnew(2,inode) = 0.d0
-    ZZnew(2,inode) = +1.d0/(sqrt(abs(CY))*2.d0*float(nrnew-1))
-    RRnew(4,inode) = -1.d0/(sqrt(abs(CY))*2.d0*float(nrnew-1)*float(npnew)/PI)
-    ZZnew(4,inode) = 0.d0
-  ELSEIF (theta .eq. (3.d0*PI/2.d0)) THEN
-    RRnew(2,inode) = 0.d0
-    ZZnew(2,inode) = +1.d0/(sqrt(abs(CY))*2.d0*float(nrnew-1))
-    RRnew(4,inode) = -1.d0/(sqrt(abs(CY))*2.d0*float(nrnew-1)*float(npnew)/PI)
-    ZZnew(4,inode) = 0.d0
-  ELSE
-    RRnew(2,inode) = + sign(1.d0,CN)/(sqrt(abs(CX+CY*TN2))*2.d0 *float(nrnew-1))
-    ZZnew(2,inode) = + abs(TN)/(sqrt(abs(CX+CY*TN2))*2.d0*float(nrnew-1))
-    RRnew(4,inode) = - abs(CX+CY*TN2)**(-1.5d0) * CY * abs(TN) / (CN**2 * 2.d0*float(nrnew-1)*float(npnew)/PI)
-    ZZnew(4,inode) = + CX * abs(CX + CY*TN2)**(-1.5d0) / (CN*abs(CN) * 2.d0*float(nrnew-1)*float(npnew-1)/PI)
-  ENDIF
+! derived from:
+! R = R_axis + s * cos(theta) / sqrt(CX * cos(theta)**2 + CY * sin(theta)**2)
+! Z = Z_axis + s * sin(theta) / sqrt(CX * cos(theta)**2 + CY * sin(theta)**2)
 
-  IF (theta .gt. PI) THEN
-    ZZnew(2,inode) = - ZZnew(2,inode)
-    RRnew(4,inode) = - RRnew(4,inode)
-  ENDIF
+  RRnew(2, inode) =   CN / (sqrt(CX * CN ** 2 + CY * SN ** 2) * 2.d0 * float(nrnew-1))
+  ZZnew(2, inode) =   SN / (sqrt(CX * CN ** 2 + CY * SN ** 2) * 2.d0 * float(nrnew-1))
+  RRnew(4, inode) = - CY * SN / ((CX * CN **2 + CY * SN **2) ** 1.5d0 * 2.d0 * float(nrnew-1) * float(npnew)/PI)
+  ZZnew(4, inode) =   CX * CN / ((CX * CN **2 + CY * SN **2) ** 1.5d0 * 2.d0 * float(nrnew-1) * float(npnew)/PI)
+
   RRnew(3,inode) = 0.d0
   ZZnew(3,inode) = 0.d0
   PSInew(1,inode) = ES%psi_axis
@@ -408,6 +402,7 @@ do i=1,n_nodes_max
   node_list%node(i)%values   = 0.d0
   node_list%node(i)%index    = 0
   node_list%node(i)%boundary = 0
+  node_list%node(i)%constrained = .false.
 enddo
 node_list%n_nodes = 0
 
@@ -505,6 +500,7 @@ do i=1,nrnew
 
     node_list%node(index)%axis_node = .false.
     node_list%node(index)%axis_dof  = 0    
+    node_list%node(index)%constrained = .false.
 
     if (i .eq. 1) node_list%node(index)%axis_node = .true.
 

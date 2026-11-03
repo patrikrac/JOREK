@@ -67,7 +67,7 @@ subroutine do_write_particle_diagnostics(this, sim, ev)
   integer(HSIZE_T), parameter :: n_time = 1_HSIZE_T
 
   integer(HSIZE_T)  :: data_dims(2), time_dims(1), data_maxdims(2), time_maxdims(1)
-  integer           :: i, j, n, my_id, n_cpu, ierr, dot_index, var_index
+  integer           :: i, j, n, my_id, n_mpi, ierr, dot_index, var_index
   integer(HID_T)    :: dspace, dset, mem_space
   integer(HID_T)    :: tspace, t_mem_space, tset, group_id, plist
   logical           :: link_exists, file_exists
@@ -86,7 +86,7 @@ subroutine do_write_particle_diagnostics(this, sim, ev)
   integer :: i_elm, ifail, xcase
 
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)      ! id of each MPI proc
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)      ! number of MPI procs
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)      ! number of MPI procs
   if (my_id .eq. 0) call h5open_f(ierr)
 
   ! Move an old file if this is the initialisation, we are id 0 and we are not appending
@@ -129,7 +129,7 @@ subroutine do_write_particle_diagnostics(this, sim, ev)
   if (.not. allocated(sim%groups)) return
 
   ! Preparation
-  allocate(particles_per_proc(0:n_cpu-1))
+  allocate(particles_per_proc(0:n_mpi-1))
   psi_axis = -1.d0
   psi_xpoint = 0.d0
 
@@ -207,17 +207,17 @@ subroutine do_write_particle_diagnostics(this, sim, ev)
     end if
     do j=1,n_real8_var
       call MPI_Gatherv(real8_var(:,j), size(real8_var,1), MPI_REAL8, &
-        real8_var_all(:,j), particles_per_proc, [(sum(particles_per_proc(0:i-1),1), i=0,n_cpu-1)], &
+        real8_var_all(:,j), particles_per_proc, [(sum(particles_per_proc(0:i-1),1), i=0,n_mpi-1)], &
         MPI_REAL8, 0, MPI_COMM_WORLD, ierr)
     end do
     do j=1,n_real4_var
       call MPI_Gatherv(real4_var(:,j), size(real4_var,1), MPI_REAL4, &
-        real4_var_all(:,j), particles_per_proc, [(sum(particles_per_proc(0:i-1),1), i=0,n_cpu-1)], &
+        real4_var_all(:,j), particles_per_proc, [(sum(particles_per_proc(0:i-1),1), i=0,n_mpi-1)], &
         MPI_REAL4, 0, MPI_COMM_WORLD, ierr)
     end do
     do j=1,n_int4_var
       call MPI_Gatherv(int4_var(:,j), size(int4_var,1), MPI_INTEGER, &
-        int4_var_all(:,j), particles_per_proc, [(sum(particles_per_proc(0:i-1),1), i=0,n_cpu-1)], &
+        int4_var_all(:,j), particles_per_proc, [(sum(particles_per_proc(0:i-1),1), i=0,n_mpi-1)], &
         MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
     end do
 

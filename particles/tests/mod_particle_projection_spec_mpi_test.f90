@@ -392,7 +392,7 @@ apply_dirichlet_in,write_particle_in,n_fields_write_in)
   project = new_projection(node_list,element_list,filter_n0=smoothing,&
   f=[proj_f(proj_f_proj,group=1)],do_dirichlet=apply_dirichlet)
   project%n_tor_local = n_tor_local; project%i_tor_local = i_tor_local;
-  sim%my_id=rank; sim%n_cpu=n_tasks; allocate(sim%groups(1));
+  sim%my_id=rank; sim%n_mpi=n_tasks; allocate(sim%groups(1));
   !> fill the particle structure
   do kk=1,size(n)
     write(number_particles,'(I8)') n(kk)
@@ -479,7 +479,7 @@ n_tor_local_in,i_tor_local_in,smoothing_in,apply_dirichlet_in)
   allocate(project%f(1)); project%f(1)%group=1; project%f(1)=proj_f(f_proj,group=1);
   project%n_tor_local = n_tor_local; project%i_tor_local = i_tor_local;
   !> initialise particles
-  sim%my_id=rank; sim%n_cpu=n_tasks; allocate(sim%groups(1)); 
+  sim%my_id=rank; sim%n_mpi=n_tasks; allocate(sim%groups(1)); 
   allocate(particle_fieldline::sim%groups(1)%particles(n_particles));
   !> to prevent omp trouble (!?)
   call find_RZ(node_list,element_list,R_particle_in,Z_particle_in,&

@@ -172,7 +172,11 @@ do ife =1, element_list%n_elements
       xjac = x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
       BigR = x_g(ms,mt)
 
-      rho_00 = eq_g(var_rho,ms,mt)
+      if (with_rho) then
+        rho_00 = eq_g(var_rho,ms,mt)
+      else
+        rho_00 = 1.d0
+      endif
       if (with_TiTe) then
         Ti_00 = eq_g(var_Ti,ms,mt)
         Te_00 = eq_g(var_Te,ms,mt)

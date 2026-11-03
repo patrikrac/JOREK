@@ -65,7 +65,7 @@ module mod_projection_type
     integer :: my_id_n           ! mpi id with comm_n
     integer :: mpi_group_world
     integer :: mpi_group_master
-    integer :: n_cpu, m_cpu      ! n_cpu : the total number of cores, m_cpu the number of cores per harmonic
+    integer :: n_mpi, m_mpi      ! n_mpi : the total number of cores, m_mpi the number of cores per harmonic
     integer :: n_tor_local       ! 1 or 2 : (1) or (cos,sin)
     integer :: i_tor_local       ! the starting index in the array of toroidal hamonics (as in HZ)
     integer :: n_dof             ! the number of unknowns for (n=0)

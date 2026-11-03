@@ -1,7 +1,7 @@
 subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, R_c,Z_c, &
                                           R_out,Z_out, r_flux,s_flux, t_tht,ifail, gofast)
   !-------------------------------------------------------------------------
-  ! solves two non-linear equations using Newtons method (from numerical recipes)
+  ! solves two non-linear equations using Newtons method
   ! LU decomposition replaced by explicit solution of 2x2 matrix.
   !
   ! finds the crossing of two coordinate lines given as a series of cubics

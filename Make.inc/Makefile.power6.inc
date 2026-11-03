@@ -33,7 +33,7 @@ USE_PASTIX_MURGE = 1
 USE_MUMPS = 0
 USE_WSMP   = 0
 
-LIBDIR = /afs/ipp/u/mhoelzl/mylib/rs_aix61/
+LIBDIR ?= /path/to/mylib/rs_aix61
 
 #Scotch library
 SCOTCH_HOME ?= $(LIBDIR)/scotch_5.1_esmumps
@@ -62,9 +62,11 @@ INCHIPS   = ###
 LIB_WSMP = -L$(WSMP_HOME) -lpwsmp64
 
 # LIBFFTW
-LIBFFTW   = -L/afs/rzg/@sys/lib -lfftw
+FFTW_LIBDIR ?= /path/to/fftw/lib
+LIBFFTW   = -L$(FFTW_LIBDIR) -lfftw
 
-LIBLAPACK = -lessl 
-SCALAP    = -lessl -L /afs/ipp/@sys/lib  /afs/ipp/@sys/lib/blacsF77init_MPI-POWER4-0.a /afs/ipp/@sys/lib/blacs_MPI-POWER4-0.a /afs/ipp/@sys/lib/libscalapack_old.a
+LIBLAPACK = -lessl
+SCALAPACK_LIBDIR ?= /path/to/scalapack/lib
+SCALAP    = -lessl -L $(SCALAPACK_LIBDIR)  $(SCALAPACK_LIBDIR)/blacsF77init_MPI-POWER4-0.a $(SCALAPACK_LIBDIR)/blacs_MPI-POWER4-0.a $(SCALAPACK_LIBDIR)/libscalapack_old.a
 BLACS_HOME = 
 BLACS      = 

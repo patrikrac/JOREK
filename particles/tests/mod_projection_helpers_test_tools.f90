@@ -68,7 +68,7 @@ nx,ny,Rbegin,Rend,Zbegin,Zend)
 end subroutine initialize_square_grid_parameters
 
 !> Create a simple square grid with n nodes in each dimension
-subroutine default_square_grid(my_id,n_cpu,nx,ny,node_list,&
+subroutine default_square_grid(my_id,n_mpi,nx,ny,node_list,&
 element_list,ifail,Rbegin_in,Rend_in,Zbegin_in,Zend_in,&
 bnd_node_list_out,bnd_element_list_out)
   use mpi_mod
@@ -83,7 +83,7 @@ bnd_node_list_out,bnd_element_list_out)
   type(type_element_list),intent(inout) :: element_list
   type(type_bnd_node_list),intent(out),optional    :: bnd_node_list_out
   type(type_bnd_element_list),intent(out),optional :: bnd_element_list_out
-  integer, intent(in)                   :: nx,ny,my_id,n_cpu
+  integer, intent(in)                   :: nx,ny,my_id,n_mpi
   real*8,intent(in),optional            :: Rbegin_in,Rend_in
   real*8,intent(in),optional            :: Zbegin_in,Zend_in
   type(type_bnd_node_list)              :: bnd_node_list
@@ -95,13 +95,13 @@ bnd_node_list_out,bnd_element_list_out)
   Zbegin = -5d-1; if(present(Zbegin_in)) Zbegin = Zbegin_in;
   Zend   = 5d-1;  if(present(Zend_in))   Zend   = Zend_in;
   !> compute gridi
-  call tr_meminit(my_id,n_cpu) !< initialise memory tracing
+  call tr_meminit(my_id,n_mpi) !< initialise memory tracing
   call preset_parameters()
   call initialize_square_grid_parameters(nx,ny,Rbegin,Rend,Zbegin,Zend)
   call det_modes(); call initialise_basis()
   call broadcast_phys(my_id)
   call tr_resetfile()
-  call initial_grid(node_list,element_list,bnd_node_list,bnd_elm_list,my_id,n_cpu)
+  call initial_grid(node_list,element_list,bnd_node_list,bnd_elm_list,my_id,n_mpi)
   call broadcast_boundary(my_id,bnd_elm_list,bnd_node_list)
   call broadcast_elements(my_id,element_list)
   call broadcast_nodes(my_id,node_list)
@@ -124,7 +124,7 @@ end subroutine initialize_polar_grid_parameters
 
 !> Create a simple polar grid with npol nodes in the poloidal direction, 30 radial
 !> volume = 2 pi^2 R a^2
-subroutine default_polar_grid(my_id,n_cpu,npol,nrad,node_list,element_list,ifail,&
+subroutine default_polar_grid(my_id,n_mpi,npol,nrad,node_list,element_list,ifail,&
  bnd_node_list_out,bnd_element_list_out)
   use mpi_mod
   use phys_module
@@ -136,18 +136,18 @@ subroutine default_polar_grid(my_id,n_cpu,npol,nrad,node_list,element_list,ifail
   integer,intent(inout)                  :: ifail
   type(type_node_list), intent(inout)    :: node_list
   type(type_element_list), intent(inout) :: element_list
-  integer,intent(in)                     :: my_id,n_cpu,npol,nrad
+  integer,intent(in)                     :: my_id,n_mpi,npol,nrad
   type(type_bnd_node_list),intent(out),optional    :: bnd_node_list_out
   type(type_bnd_element_list),intent(out),optional :: bnd_element_list_out
   type(type_bnd_node_list)               :: bnd_node_list
   type(type_bnd_element_list)            :: bnd_elm_list
-  call tr_meminit(my_id,n_cpu) !< initialise memory tracing
+  call tr_meminit(my_id,n_mpi) !< initialise memory tracing
   call preset_parameters()
   call initialize_polar_grid_parameters(npol,nrad)
   call det_modes(); call initialise_basis();
   call broadcast_phys(my_id)
   call tr_resetfile()
-  call initial_grid(node_list,element_list,bnd_node_list,bnd_elm_list,my_id,n_cpu)
+  call initial_grid(node_list,element_list,bnd_node_list,bnd_elm_list,my_id,n_mpi)
   call broadcast_boundary(my_id,bnd_elm_list,bnd_node_list)
   call broadcast_elements(my_id,element_list)
   call broadcast_nodes(my_id,node_list)
@@ -265,7 +265,7 @@ end subroutine set_test_equilibrium_parameters
 
 !> Create a simple flux aligned grid with npol nodes in the poloidal direction, 40 radial
 !> by calculating equilibrium and creating flux aligned grid (like in jorek2_main)
-subroutine default_flux_grid(my_id,n_cpu,npol,nrad,node_list,element_list,ifail,&
+subroutine default_flux_grid(my_id,n_mpi,npol,nrad,node_list,element_list,ifail,&
 bnd_node_list_out,bnd_element_list_out)
   use phys_module
   use mpi_mod
@@ -280,7 +280,7 @@ bnd_node_list_out,bnd_element_list_out)
   integer,intent(inout)                  :: ifail
   type(type_node_list), intent(inout)    :: node_list
   type(type_element_list), intent(inout) :: element_list
-  integer,intent(in)                     :: my_id,n_cpu
+  integer,intent(in)                     :: my_id,n_mpi
   integer, intent(in)                    :: npol,nrad !< Number of nodes (poloidal,radial)
   type(type_bnd_node_list),intent(out),optional    :: bnd_node_list_out
   type(type_bnd_element_list),intent(out),optional :: bnd_element_list_out
@@ -289,7 +289,7 @@ bnd_node_list_out,bnd_element_list_out)
   type(type_bnd_element_list)            :: bnd_elm_list
 
   !> initialisations 
-  call tr_meminit(my_id,n_cpu) !< initialise memory tracing
+  call tr_meminit(my_id,n_mpi) !< initialise memory tracing
   call clck_init(); call r3_info_init() !< initialise timing
   call det_modes() !< initialise mode and mode_type arrays
   call initialise_basis() !< initialise the basis functions
@@ -300,13 +300,13 @@ bnd_node_list_out,bnd_element_list_out)
   call broadcast_phys(my_id)
   !> compute th initial grid
   call tr_resetfile()
-  call initial_grid(node_list,element_list,bnd_node_list,bnd_elm_list,my_id,n_cpu)
+  call initial_grid(node_list,element_list,bnd_node_list,bnd_elm_list,my_id,n_mpi)
   call broadcast_boundary(my_id,bnd_elm_list,bnd_node_list)
   !> compute and update the plasma equilibrium
   call equilibrium(my_id,node_list,element_list,bnd_node_list,bnd_elm_list,xpoint,xcase,nice_q)
   if(my_id.eq.0) call update_equil_state(my_id,node_list,element_list,bnd_elm_list,xpoint,xcase) 
   !> compute the flux aligned grid and recompute the equilibrium
-  call flux_grid(node_list,element_list,bnd_node_list,bnd_elm_list,my_id,n_cpu)
+  call flux_grid(node_list,element_list,bnd_node_list,bnd_elm_list,my_id,n_mpi)
   call equilibrium(my_id,node_list,element_list,bnd_node_list,bnd_elm_list,xpoint,xcase,nice_q)
   if(my_id.eq.0) then 
     call update_equil_state(my_id,node_list,element_list,bnd_elm_list,xpoint,xcase)

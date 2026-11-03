@@ -48,7 +48,7 @@ do i_p=1,n_plane
       do k=1,n_gauss
         l = (i_p-1) * n_gauss_2*sim%fields%element_list%n_elements + (i-1)*n_gauss_2 + (j-1)*n_gauss + k
         associate(p => sim%groups(1)%particles(l))
-          p%x(3) = TWOPI*real(i_p,8)/real(n_plane,8)/real(n_period,8)
+          p%x(3) = TWOPI*real(i_p,8)/real(n_plane,8)/real(n_period,8) !note that these particles are only placed in the first out of n_period toroidal wedges, which is considered bad practice. See https://git.iter.org/projects/STAB/repos/jorek/pull-requests/1013/overview for details
           p%i_elm = i
           p%st = [Xgauss(j), Xgauss(k)]
           ! Every particle represents a sample in the integral in an element

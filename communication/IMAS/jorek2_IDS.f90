@@ -37,7 +37,7 @@ program jorek2_IDS
 
 
   integer   :: my_id, my_id_n, my_id_master, ierr2
-  integer   :: i_rank(n_tor), n_cpu, n_cpu_n, n_cpu_master, m_cpu, n_masters, n_cpu_trans, my_id_trans
+  integer   :: i_rank(n_tor), n_mpi, n_mpi_n, n_mpi_master, m_mpi, n_masters, n_mpi_trans, my_id_trans
   integer   :: MPI_COMM_N, MPI_GROUP_MASTER, MPI_GROUP_WORLD, MPI_COMM_MASTER, MPI_COMM_TRANS
   integer   :: required,provided,StatInfo, resultlength
   integer*4 :: rank, comm_size 
@@ -80,12 +80,12 @@ program jorek2_IDS
 
   ! --- Determine number of MPI procs
   call MPI_COMM_SIZE(MPI_COMM_WORLD, comm_size, ierr)
-  n_cpu = comm_size
+  n_mpi = comm_size
   
-  if (n_cpu > 1) then
+  if (n_mpi > 1) then
     write(*,*) '  jorek2_IDS needs to be adapated for several MPI processes'
     write(*,*) '  please run with 1 MPI process for the moment'
-    write(*,*) n_cpu
+    write(*,*) n_mpi
     stop
   endif
 
@@ -107,7 +107,7 @@ program jorek2_IDS
   call preset_parameters()
 
   ! --- Initialize and broadcast input parameters
-  call initialise_and_broadcast_parameters(my_id, "__NO_FILENAME__")
+  call initialise_and_broadcast_parameters(my_id, "__NO_FILENAME__", .false.)
 
   ! --- Ensure that aux_node_list is associated
   if (.not. associated(aux_node_list)) allocate(aux_node_list)

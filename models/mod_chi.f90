@@ -8,7 +8,7 @@ module mod_chi
   use phys_module, only: domm, dcoef, F0, R_domm, PI
   implicit none
   private 
-  public init_chi_basis, get_chi, get_chi_domm, get_chi_corr, compute_chi_on_gauss_points
+  public init_chi_basis, get_chi, get_chi_domm, get_chi_corr, get_chi_corr_ext, compute_chi_on_gauss_points
 
   integer, parameter :: m_tor = (n_coord_tor - 1)/2
   
@@ -243,7 +243,11 @@ module mod_chi
     
     get_chi = get_chi_domm(R,z,phi,max_ord)
 #ifndef USE_DOMM
+#ifndef USE_EXT_FIELD
     get_chi = get_chi + get_chi_corr(node_list, element_list, i_elm, s, t, phi)
+#else
+    get_chi = get_chi + get_chi_corr_ext(node_list, element_list, i_elm, s, t, phi)
+#endif
 #endif
   endfunction get_chi
 
@@ -329,6 +333,9 @@ module mod_chi
 
 #else
     get_chi_domm(0,0,0) = phi; get_chi_domm(0,0,1) = 1
+#endif
+#ifdef USE_EXT_FIELD
+    get_chi_domm(0,0,1) = 0.d0  ! If using an external vacuum field, this toroidal field term is already included in the external field.
 #endif
 
     get_chi_domm = F0*get_chi_domm
@@ -441,16 +448,89 @@ module mod_chi
     
     get_chi_corr        = 0.0
     get_chi_corr(0,0,0) = get_chi_corr(0,0,0) + chi_corr
-    get_chi_corr(1,0,0) = get_chi_corr(1,0,0) + chi_x
-    get_chi_corr(0,1,0) = get_chi_corr(0,1,0) + chi_y
-    get_chi_corr(0,0,1) = get_chi_corr(0,0,1) + chi_p
-    get_chi_corr(2,0,0) = get_chi_corr(2,0,0) + chi_xx
-    get_chi_corr(0,2,0) = get_chi_corr(0,2,0) + chi_yy
-    get_chi_corr(0,0,2) = get_chi_corr(0,0,2) + chi_pp
-    get_chi_corr(1,1,0) = get_chi_corr(1,1,0) + chi_xy
-    get_chi_corr(1,0,1) = get_chi_corr(1,0,1) + chi_xp
-    get_chi_corr(0,1,1) = get_chi_corr(0,1,1) + chi_yp
+    get_chi_corr(1,0,0) = get_chi_corr(1,0,0) + chi_x   ! BR
+    get_chi_corr(0,1,0) = get_chi_corr(0,1,0) + chi_y   ! BZ
+    get_chi_corr(0,0,1) = get_chi_corr(0,0,1) + chi_p   ! Bphi
+    get_chi_corr(2,0,0) = get_chi_corr(2,0,0) + chi_xx  ! BR_R
+    get_chi_corr(0,2,0) = get_chi_corr(0,2,0) + chi_yy  ! BZ_Z
+    get_chi_corr(0,0,2) = get_chi_corr(0,0,2) + chi_pp  ! Bphi_phi
+    get_chi_corr(1,1,0) = get_chi_corr(1,1,0) + chi_xy  ! BR_Z = BZ_R
+    get_chi_corr(1,0,1) = get_chi_corr(1,0,1) + chi_xp  ! BR_phi = Bphi_R
+    get_chi_corr(0,1,1) = get_chi_corr(0,1,1) + chi_yp  ! BZ_phi = Bphi_Z
   end function get_chi_corr
+
+  !>  This function returns the external vacuum magnetic field from the values provided in the gvec2jorek file.
+  pure function get_chi_corr_ext(node_list, element_list, i_elm, s, t, phi)
+    use phys_module,        only: mode_coord, n_tht
+    use data_structure,     only: type_node_list, type_element_list
+    use mod_interp,         only: interp_RZP, interp_gvec
+    implicit none
+    type (type_node_list),    intent(in)  :: node_list
+    type (type_element_list), intent(in)  :: element_list
+    integer, intent(in) :: i_elm
+    real*8,  intent(in) :: s, t, phi
+    real*8, dimension(0:n_order-1,0:n_order-1,0:n_order-1) :: get_chi_corr_ext
+    real*8, dimension(3) :: B, B_s, B_t, B_st, B_p_coord, B_x, B_y, B_p    ! Index represents the direction of the field:  1: R, 2: Z, 3: phi
+    integer :: i_harm, i_tor, i_var, i_dim
+    real*8  :: R, R_s, R_t, R_p, R_ss, R_tt, R_st, R_pp, R_sp, R_tp
+    real*8  :: Z, Z_s, Z_t, Z_p, Z_ss, Z_tt, Z_st, Z_pp, Z_sp, Z_tp
+    real*8  :: B_harm, B_harm_s, B_harm_t, B_harm_st,B_harm_ss,B_harm_tt  ! The second derivatives aren't used
+    real*8  :: xjac, xjac_s
+
+    ! Get R, Z, phi geometry of point.
+    call interp_RZP(node_list,element_list,i_elm,s,t,phi,R,R_s,R_t,R_p,R_st,R_ss,R_tt,R_sp,R_tp,R_pp, &
+                                                         Z,Z_s,Z_t,Z_p,Z_st,Z_ss,Z_tt,Z_sp,Z_tp,Z_pp)
+    i_var = 6 ! This decides which variable to retrieve. In this case, 6 is for the vacuum field
+    xjac =  R_s*Z_t - R_t*Z_s
+    do i_dim = 1,3  ! R, Z, phi components
+      call interp_gvec(node_list,element_list,i_elm,i_var,i_dim,1,s,t,B(i_dim),B_s(i_dim),B_t(i_dim), &
+                                                                      B_harm_st,B_harm_ss,B_harm_tt)
+      B_p(i_dim) = 0.0
+      do i_tor=1,(n_coord_tor-1)/2
+        i_harm = 2*i_tor
+        call interp_gvec(node_list,element_list,i_elm,i_var,i_dim,i_harm,s,t,B_harm, B_harm_s, B_harm_t, &
+                                                                             B_harm_st,B_harm_ss,B_harm_tt)
+        B(i_dim)   = B(i_dim)     + B_harm    * cos(mode_coord(i_harm)*phi)
+        B_s(i_dim) = B_s(i_dim)   + B_harm_s  * cos(mode_coord(i_harm)*phi)
+        B_t(i_dim) = B_t(i_dim)   + B_harm_t  * cos(mode_coord(i_harm)*phi)
+        B_st(i_dim) = B_st(i_dim) + B_harm_st * cos(mode_coord(i_harm)*phi) ! This is just needed on axis for L'Hopital's rule.
+        B_p(i_dim) = B_p(i_dim)   - B_harm    * mode_coord(i_harm) * sin(mode_coord(i_harm)*phi)
+
+        call interp_gvec(node_list,element_list,i_elm,i_var,i_dim,i_harm+1,s,t,B_harm, B_harm_s, B_harm_t, &
+                                                                               B_harm_st,B_harm_ss,B_harm_tt)
+        B(i_dim)   = B(i_dim)     - B_harm    * sin(mode_coord(i_harm)*phi)
+        B_s(i_dim) = B_s(i_dim)   - B_harm_s  * sin(mode_coord(i_harm)*phi)
+        B_t(i_dim) = B_t(i_dim)   - B_harm_t  * sin(mode_coord(i_harm)*phi)
+        B_st(i_dim) = B_st(i_dim) - B_harm_st * sin(mode_coord(i_harm)*phi) ! This is just needed on axis for L'Hopital's rule.
+        B_p(i_dim) = B_p(i_dim)   - B_harm    * mode_coord(i_harm) * cos(mode_coord(i_harm)*phi)
+      end do
+
+      ! Calculate the R,Z,phi derivatives.
+      ! Use L'Hopital's rule (differentiate numerator and denominator wrt s) if the derivatives are being evaluated on the axis
+      if (i_elm .le. n_tht .and. s .eq. 0.d0) then
+        xjac_s = R_s*Z_st - R_st*Z_s
+        B_x(i_dim) = ( Z_st * B_s(i_dim) - Z_s * B_st(i_dim)) / xjac_s
+        B_y(i_dim) = (-R_st * B_s(i_dim) + R_s * B_st(i_dim)) / xjac_s
+      else ! If not, then we use the standard expressions for B_x and B_y
+        B_x(i_dim) = ( Z_t * B_s(i_dim) - Z_s * B_t(i_dim)) / xjac
+        B_y(i_dim) = (-R_t * B_s(i_dim) + R_s * B_t(i_dim)) / xjac
+      end if
+      B_p(i_dim) = B_p(i_dim) - B_x(i_dim) * R_p - B_y(i_dim) * Z_p
+    end do
+
+    get_chi_corr_ext        = 0.0
+    get_chi_corr_ext(0,0,0) = 0.0
+    get_chi_corr_ext(1,0,0) = B(1)        ! chi_x = BR
+    get_chi_corr_ext(0,1,0) = B(2)        ! chi_y = BZ
+    get_chi_corr_ext(0,0,1) = B(3) * R    ! chi_p = R*Bp
+    get_chi_corr_ext(2,0,0) = B_x(1)      ! chi_xx = BR_R
+    get_chi_corr_ext(0,2,0) = B_y(2)      ! chi_yy = BZ_Z
+    get_chi_corr_ext(0,0,2) = B_p(3) * R  ! chi_pp = R*Bp_p
+    get_chi_corr_ext(1,1,0) = B_y(1)      ! chi_xy = BR_Z (?= BZ_R)
+    get_chi_corr_ext(1,0,1) = B_p(1)      ! chi_xp = BR_p (?= Bp + R*Bp_R)
+    get_chi_corr_ext(0,1,1) = B_p(3)      ! chi_zp = Bz_p (?= R*Bp_Z)
+
+  end function get_chi_corr_ext
 
   !>---------------------------
   !! Factorial of n
@@ -498,6 +578,11 @@ module mod_chi
       write (*,*) "Storing vacuum field on gaussian points..."
       write (*,*) 
     endif
+    
+    ! Pre-initialize to avoid Intel IFX 2025 firstprivate allocatable crash
+    do i_vertex = 1, n_vertex_max
+      call init_node(nodes(i_vertex), n_var)
+    end do
     
     ! --- Declare shared and private variables for omp
     !$omp parallel default(none) &

@@ -1,0 +1,81 @@
+// Custom styles for the JOREK Wiki: header logo + dark/light toggle.
+// Imported last by the theme, so scheme variables are available here.
+
+// Site title: "JOREK Wiki" text on the left, logo pushed to the right edge -----
+.site-title {
+  padding-top: 0.4rem;
+  padding-bottom: 0.4rem;
+}
+
+.jorek-site-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 0.75rem;
+  line-height: 1;
+}
+
+.jorek-title-text {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.jorek-logo {
+  height: 2.6rem;
+  width: auto;
+  flex: none;
+  display: block;
+}
+
+// Two logo variants swapped by theme: dark-text on the light theme, light-text
+// on the dark theme. Both have transparent backgrounds (no chip / white box).
+.jorek-logo-dark { display: none; }
+
+[data-theme="gruvbox_dark"] {
+  .jorek-logo-light { display: none; }
+  .jorek-logo-dark { display: block; }
+}
+
+// Dark/light toggle button ----------------------------------------------------
+.jorek-theme-toggle {
+  align-self: center; // .main-header doesn't center its children vertically
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 2.6rem;
+  height: 2.6rem;
+  padding: 0;
+  margin: 0 0.5rem;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: $link-color;
+  cursor: pointer;
+  transition: background-color 150ms ease, box-shadow 150ms ease, color 150ms ease;
+
+  &:hover {
+    background: $feedback-color;
+    // Larger, softer highlight: extend the filled area outward + a drop shadow.
+    box-shadow: 0 0 0 4px $feedback-color, 0 3px 10px rgba(0, 0, 0, 0.28);
+  }
+
+  &:focus-visible {
+    outline: 2px solid $link-color;
+    outline-offset: 2px;
+  }
+
+  svg {
+    display: block;
+  }
+}
+
+// Show the icon representing the theme you'd switch *to*.
+// Scoped under .jorek-theme-toggle so these beat the `.jorek-theme-toggle svg`
+// rule above on specificity.
+.jorek-theme-toggle .jorek-icon-sun { display: none; }
+.jorek-theme-toggle .jorek-icon-moon { display: block; }
+
+[data-theme="gruvbox_dark"] .jorek-theme-toggle .jorek-icon-sun { display: block; }
+[data-theme="gruvbox_dark"] .jorek-theme-toggle .jorek-icon-moon { display: none; }

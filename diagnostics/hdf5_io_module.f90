@@ -230,6 +230,8 @@ module hdf5_io_module
     allocate(dims(rank)); allocate(maxdims(rank));
     !*** get space size ***
     call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
+    !*** Closing ***
+    call H5Dclose_f(dataset_id,error)
   end subroutine HDF5_extract_dataset_rank_shape
 
   !----------------------------------------
@@ -727,7 +729,7 @@ module hdf5_io_module
 
   !---------------------------------------- 
   ! HDF5 saving for a 1D array of integer. if use_gatherv 
-  ! is true and dim1_all_tasks, displs, mpi_rank, n_cpu,
+  ! is true and dim1_all_tasks, displs, mpi_rank, n_mpi,
   ! and mpi_comm_loc are defined,  parallelization
   ! based on the MPI gather of all data by the master task
   ! the data are written by the master task in HDF5 file.
@@ -739,11 +741,11 @@ module hdf5_io_module
   !   dim1_tot:             (integer) total size of all arrays sum(dim1_all_tasks)
   !   dsetname:             (character)(*) name of the dataset in which the data are written
   !   use_gatherv:          (logical) if true use gatherv parallelization, HDF5-IO is used is false
-  !   dim1_all_tasks:       (integer)(n_cpu)(optional) size of the array of each task
-  !   displs:               (integer)(n_cpu)(optional) each element specifies the displacement relative to
+  !   dim1_all_tasks:       (integer)(n_mpi)(optional) size of the array of each task
+  !   displs:               (integer)(n_mpi)(optional) each element specifies the displacement relative to
   !                         the receive MPI buffer at which to place the incoming data from processes
   !   mpi_rank:             (integer)(optional) identifier of the current MPI task
-  !   n_cpu:                (integer)(optional) number of MPI tasks
+  !   n_mpi:                (integer)(optional) number of MPI tasks
   !   mpi_comm_loc:         (integer)(optional) MPI communicator identifier
   !   start:                (HSIZE_T)(1)(optional) starting index of the input data chunk 
   !                         in the global dataset
@@ -753,7 +755,7 @@ module hdf5_io_module
   !   mpio_collective_in:   (logical)(optional) toggle MPIO collective actions if true (default)
   !----------------------------------------
   subroutine HDF5_array1D_saving_int_native_or_gatherv(file_id,array1D,dim1_tot,dsetname,&
-    use_gatherv,dim1_all_tasks,displs,mpi_rank,n_cpu,mpi_comm_loc,start,compress_level,&
+    use_gatherv,dim1_all_tasks,displs,mpi_rank,n_mpi,mpi_comm_loc,start,compress_level,&
     use_hdf5_parallel_in,mpio_collective_in)
     use mpi
     implicit none
@@ -762,7 +764,7 @@ module hdf5_io_module
     integer, dimension(:)     , intent(in) :: array1D
     character(LEN=*)          , intent(in) :: dsetname  ! dataset name
     logical                   , intent(in) :: use_gatherv
-    integer                       , intent(in), optional :: mpi_rank,n_cpu,mpi_comm_loc
+    integer                       , intent(in), optional :: mpi_rank,n_mpi,mpi_comm_loc
     integer, dimension(:)         , intent(in), optional :: dim1_all_tasks,displs
     integer(HSIZE_T), dimension(1), intent(in), optional :: start !< Begin position of data
     integer                       , intent(in), optional :: compress_level !< if set and start is not provided compress with this level
@@ -774,7 +776,7 @@ module hdf5_io_module
     ! check preset
     mpio_collective=.true.; if(present(mpio_collective_in)) mpio_collective=mpio_collective_in;
     ! check whether gatherv can/should be used default false
-    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_cpu).and.&
+    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_mpi).and.&
     present(mpi_comm_loc).and.present(dim1_all_tasks).and.present(displs)
     use_hdf5_parallel=.false.
     if(present(use_hdf5_parallel_in)) use_hdf5_parallel=use_hdf5_parallel_in
@@ -909,7 +911,7 @@ module hdf5_io_module
 
   !---------------------------------------- 
   ! HDF5 saving for a 2D array of integer. if use_gatherv 
-  ! is true and dim3_all_tasks, displs, mpi_rank, n_cpu,
+  ! is true and dim3_all_tasks, displs, mpi_rank, n_mpi,
   ! and mpi_comm_loc are defined,  parallelization
   ! based on the MPI gather of all data by the master task
   ! the data are written by the master task in HDF5 file.
@@ -922,11 +924,11 @@ module hdf5_io_module
   !   dim2_tot              (integer) total size of second dimension of all arrays sum(dim1_all_tasks)
   !   dsetname:             (character)(*) name of the dataset in which the data are written
   !   use_gatherv:          (logical) if true use gatherv parallelization, HDF5-IO is used is false
-  !   dim2_all_tasks:       (integer)(n_cpu)(optional) size of the array of each task
-  !   displs:               (integer)(n_cpu)(optional) each element specifies the displacement relative to
+  !   dim2_all_tasks:       (integer)(n_mpi)(optional) size of the array of each task
+  !   displs:               (integer)(n_mpi)(optional) each element specifies the displacement relative to
   !                         the receive MPI buffer at which to place the incoming data from processes
   !   mpi_rank:             (integer)(optional) identifier of the current MPI task
-  !   n_cpu:                (integer)(optional) number of MPI tasks
+  !   n_mpi:                (integer)(optional) number of MPI tasks
   !   mpi_comm_loc:         (integer)(optional) MPI communicator identifier
   !   start:                (HSIZE_T)(2)(optional) starting index of the input data chunk 
   !                         in the global dataset
@@ -936,7 +938,7 @@ module hdf5_io_module
   !   mpio_collective_in:   (logical)(optional) toggle MPIO collective actions if true (default)
   !----------------------------------------
   subroutine HDF5_array2D_saving_int_native_or_gatherv(file_id,array2D,dim1_tot,dim2_tot,&
-    dsetname,use_gatherv,dim2_all_tasks,displs,mpi_rank,n_cpu,mpi_comm_loc,start,&
+    dsetname,use_gatherv,dim2_all_tasks,displs,mpi_rank,n_mpi,mpi_comm_loc,start,&
     compress_level,use_hdf5_parallel_in,mpio_collective_in)
     use mpi
     implicit none
@@ -945,7 +947,7 @@ module hdf5_io_module
     integer, dimension(:,:)   , intent(in) :: array2D
     character(LEN=*)          , intent(in) :: dsetname  ! dataset name
     logical                   , intent(in) :: use_gatherv
-    integer                       , intent(in), optional :: mpi_rank,n_cpu,mpi_comm_loc
+    integer                       , intent(in), optional :: mpi_rank,n_mpi,mpi_comm_loc
     integer, dimension(:)         , intent(in), optional :: dim2_all_tasks,displs
     integer(HSIZE_T), dimension(2), intent(in), optional :: start !< Begin position of data
     integer                       , intent(in), optional :: compress_level !< if set and start is not provided compress with this level
@@ -957,7 +959,7 @@ module hdf5_io_module
     ! check preset
     mpio_collective=.true.; if(present(mpio_collective_in)) mpio_collective=mpio_collective_in;
     ! check whether gatherv can/should be used default false
-    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_cpu).and.&
+    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_mpi).and.&
     present(mpi_comm_loc).and.present(dim2_all_tasks).and.present(displs)
     use_hdf5_parallel=.false.
     if(present(use_hdf5_parallel_in)) use_hdf5_parallel=use_hdf5_parallel_in
@@ -1180,7 +1182,7 @@ module hdf5_io_module
 
   !---------------------------------------- 
   ! HDF5 saving for a 1D array of real*4. if use_gatherv 
-  ! is true and dim1_all_tasks, displs, mpi_rank, n_cpu,
+  ! is true and dim1_all_tasks, displs, mpi_rank, n_mpi,
   ! and mpi_comm_loc are defined,  parallelization
   ! based on the MPI gather of all data by the master task
   ! the data are written by the master task in HDF5 file.
@@ -1192,11 +1194,11 @@ module hdf5_io_module
   !   dim1_tot:             (integer) total size of all arrays sum(dim1_all_tasks)
   !   dsetname:             (character)(*) name of the dataset in which the data are written
   !   use_gatherv:          (logical) if true use gatherv parallelization, HDF5-IO is used is false
-  !   dim1_all_tasks:       (integer)(n_cpu)(optional) size of the array of each task
-  !   displs:               (integer)(n_cpu)(optional) each element specifies the displacement relative to
+  !   dim1_all_tasks:       (integer)(n_mpi)(optional) size of the array of each task
+  !   displs:               (integer)(n_mpi)(optional) each element specifies the displacement relative to
   !                         the receive MPI buffer at which to place the incoming data from processes
   !   mpi_rank:             (integer)(optional) identifier of the current MPI task
-  !   n_cpu:                (integer)(optional) number of MPI tasks
+  !   n_mpi:                (integer)(optional) number of MPI tasks
   !   mpi_comm_loc:         (integer)(optional) MPI communicator identifier
   !   start:                (HSIZE_T)(1)(optional) starting index of the input data chunk 
   !                         in the global dataset
@@ -1206,7 +1208,7 @@ module hdf5_io_module
   !   mpio_collective_in:   (logical)(optional) toggle MPIO collective actions if true (default)
   !----------------------------------------
   subroutine HDF5_array1D_saving_r4_native_or_gatherv(file_id,array1D,dim1_tot,dsetname,&
-    use_gatherv,dim1_all_tasks,displs,mpi_rank,n_cpu,mpi_comm_loc,start,compress_level,&
+    use_gatherv,dim1_all_tasks,displs,mpi_rank,n_mpi,mpi_comm_loc,start,compress_level,&
     use_hdf5_parallel_in,mpio_collective_in)
     use mpi
     implicit none
@@ -1215,7 +1217,7 @@ module hdf5_io_module
     real*4, dimension(:)      , intent(in) :: array1D
     character(LEN=*)          , intent(in) :: dsetname  ! dataset name
     logical                   , intent(in) :: use_gatherv
-    integer                       , intent(in), optional :: mpi_rank,n_cpu,mpi_comm_loc
+    integer                       , intent(in), optional :: mpi_rank,n_mpi,mpi_comm_loc
     integer, dimension(:)         , intent(in), optional :: dim1_all_tasks,displs
     integer(HSIZE_T), dimension(1), intent(in), optional :: start !< Begin position of data
     integer                       , intent(in), optional :: compress_level !< if set and start is not provided compress with this level
@@ -1227,7 +1229,7 @@ module hdf5_io_module
     ! check preset
     mpio_collective=.true.; if(present(mpio_collective_in)) mpio_collective=mpio_collective_in;
     ! check whether gatherv can/should be used default false
-    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_cpu).and.&
+    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_mpi).and.&
     present(mpi_comm_loc).and.present(dim1_all_tasks).and.present(displs)
     use_hdf5_parallel=.false.
     if(present(use_hdf5_parallel_in)) use_hdf5_parallel=use_hdf5_parallel_in
@@ -1360,7 +1362,7 @@ module hdf5_io_module
 
   !---------------------------------------- 
   ! HDF5 saving for a 1D array of real*8. if use_gatherv 
-  ! is true and dim1_all_tasks, displs, mpi_rank, n_cpu,
+  ! is true and dim1_all_tasks, displs, mpi_rank, n_mpi,
   ! and mpi_comm_loc are defined,  parallelization
   ! based on the MPI gather of all data by the master task
   ! the data are written by the master task in HDF5 file.
@@ -1372,11 +1374,11 @@ module hdf5_io_module
   !   dim1_tot:             (integer) total size of all arrays sum(dim1_all_tasks)
   !   dsetname:             (character)(*) name of the dataset in which the data are written
   !   use_gatherv:          (logical) if true use gatherv parallelization, HDF5-IO is used is false
-  !   dim1_all_tasks:       (integer)(n_cpu)(optional) size of the array of each task
-  !   displs:               (integer)(n_cpu)(optional) each element specifies the displacement relative to
+  !   dim1_all_tasks:       (integer)(n_mpi)(optional) size of the array of each task
+  !   displs:               (integer)(n_mpi)(optional) each element specifies the displacement relative to
   !                         the receive MPI buffer at which to place the incoming data from processes
   !   mpi_rank:             (integer)(optional) identifier of the current MPI task
-  !   n_cpu:                (integer)(optional) number of MPI tasks
+  !   n_mpi:                (integer)(optional) number of MPI tasks
   !   mpi_comm_loc:         (integer)(optional) MPI communicator identifier
   !   start:                (HSIZE_T)(1)(optional) starting index of the input data chunk 
   !                         in the global dataset
@@ -1386,7 +1388,7 @@ module hdf5_io_module
   !   mpio_collective_in:   (logical)(optional) toggle MPIO collective actions if true (default)
   !----------------------------------------
   subroutine HDF5_array1D_saving_native_or_gatherv(file_id,array1D,dim1_tot,dsetname,&
-    use_gatherv,dim1_all_tasks,displs,mpi_rank,n_cpu,mpi_comm_loc,start,compress_level,&
+    use_gatherv,dim1_all_tasks,displs,mpi_rank,n_mpi,mpi_comm_loc,start,compress_level,&
     use_hdf5_parallel_in,mpio_collective_in)
     use mpi
     implicit none
@@ -1395,7 +1397,7 @@ module hdf5_io_module
     real*8, dimension(:)      , intent(in) :: array1D
     character(LEN=*)          , intent(in) :: dsetname  ! dataset name
     logical                   , intent(in) :: use_gatherv
-    integer                       , intent(in), optional :: mpi_rank,n_cpu,mpi_comm_loc
+    integer                       , intent(in), optional :: mpi_rank,n_mpi,mpi_comm_loc
     integer, dimension(:)         , intent(in), optional :: dim1_all_tasks,displs
     integer(HSIZE_T), dimension(1), intent(in), optional :: start !< Begin position of data
     integer                       , intent(in), optional :: compress_level !< if set and start is not provided compress with this level
@@ -1407,7 +1409,7 @@ module hdf5_io_module
     ! check preset
     mpio_collective=.true.; if(present(mpio_collective_in)) mpio_collective=mpio_collective_in;
     ! check whether gatherv can/should be used default false
-    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_cpu).and.&
+    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_mpi).and.&
     present(mpi_comm_loc).and.present(dim1_all_tasks).and.present(displs)
     use_hdf5_parallel=.false.
     if(present(use_hdf5_parallel_in)) use_hdf5_parallel=use_hdf5_parallel_in
@@ -1542,7 +1544,7 @@ module hdf5_io_module
 
   !---------------------------------------- 
   ! HDF5 saving for a 2D array of real8. if use_gatherv 
-  ! is true and dim2_all_tasks, displs, mpi_rank, n_cpu,
+  ! is true and dim2_all_tasks, displs, mpi_rank, n_mpi,
   ! and mpi_comm_loc are defined,  parallelization
   ! based on the MPI gather of all data by the master task
   ! the data are written by the master task in HDF5 file.
@@ -1555,11 +1557,11 @@ module hdf5_io_module
   !   dim2_tot              (integer) total size of second dimension of all arrays sum(dim2_all_tasks)
   !   dsetname:             (character)(*) name of the dataset in which the data are written
   !   use_gatherv:          (logical) if true use gatherv parallelization, HDF5-IO is used is false
-  !   dim2_all_tasks:       (integer)(n_cpu)(optional) size of the array of each task
-  !   displs:               (integer)(n_cpu)(optional) each element specifies the displacement relative to
+  !   dim2_all_tasks:       (integer)(n_mpi)(optional) size of the array of each task
+  !   displs:               (integer)(n_mpi)(optional) each element specifies the displacement relative to
   !                         the receive MPI buffer at which to place the incoming data from processes
   !   mpi_rank:             (integer)(optional) identifier of the current MPI task
-  !   n_cpu:                (integer)(optional) number of MPI tasks
+  !   n_mpi:                (integer)(optional) number of MPI tasks
   !   mpi_comm_loc:         (integer)(optional) MPI communicator identifier
   !   start:                (HSIZE_T)(2)(optional) starting index of the input data chunk 
   !                         in the global dataset
@@ -1569,7 +1571,7 @@ module hdf5_io_module
   !   mpio_collective_in:   (logical)(optional) toggle MPIO collective actions if true (default)
   !----------------------------------------
   subroutine HDF5_array2D_saving_native_or_gatherv(file_id,array2D,dim1_tot,dim2_tot,&
-    dsetname,use_gatherv,dim2_all_tasks,displs,mpi_rank,n_cpu,mpi_comm_loc,start,&
+    dsetname,use_gatherv,dim2_all_tasks,displs,mpi_rank,n_mpi,mpi_comm_loc,start,&
     compress_level,use_hdf5_parallel_in,mpio_collective_in)
     use mpi
     implicit none
@@ -1578,7 +1580,7 @@ module hdf5_io_module
     real*8, dimension(:,:)    , intent(in) :: array2D
     character(LEN=*)          , intent(in) :: dsetname  ! dataset name
     logical                   , intent(in) :: use_gatherv
-    integer                       , intent(in), optional :: mpi_rank,n_cpu,mpi_comm_loc
+    integer                       , intent(in), optional :: mpi_rank,n_mpi,mpi_comm_loc
     integer, dimension(:)         , intent(in), optional :: dim2_all_tasks,displs
     integer(HSIZE_T), dimension(2), intent(in), optional :: start !< Begin position of data
     integer                       , intent(in), optional :: compress_level !< if set and start is not provided compress with this level
@@ -1590,7 +1592,7 @@ module hdf5_io_module
     ! check preset
     mpio_collective=.true.; if(present(mpio_collective_in)) mpio_collective=mpio_collective_in;
     ! check whether gatherv can/should be used default false
-    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_cpu).and.&
+    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_mpi).and.&
     present(mpi_comm_loc).and.present(dim2_all_tasks).and.present(displs)
     use_hdf5_parallel=.false.
     if(present(use_hdf5_parallel_in)) use_hdf5_parallel=use_hdf5_parallel_in
@@ -1730,7 +1732,7 @@ module hdf5_io_module
 
   !---------------------------------------- 
   ! HDF5 saving for a 3D array of real8. if use_gatherv 
-  ! is true and dim3_all_tasks, displs, mpi_rank, n_cpu,
+  ! is true and dim3_all_tasks, displs, mpi_rank, n_mpi,
   ! and mpi_comm_loc are defined,  parallelization
   ! based on the MPI gather of all data by the master task
   ! the data are written by the master task in HDF5 file.
@@ -1744,11 +1746,11 @@ module hdf5_io_module
   !   dim3_tot            (integer) total size of third dimension of all arrays sum(dim3_all_tasks)
   !   dsetname:           (character)(*) name of the dataset in which the data are written
   !   use_gatherv:        (logical) if true use gatherv parallelization, HDF5-IO is used is false
-  !   dim3_all_tasks:     (integer)(n_cpu)(optional) size of the array of each task
-  !   displs:             (integer)(n_cpu)(optional) each element specifies the displacement relative to
+  !   dim3_all_tasks:     (integer)(n_mpi)(optional) size of the array of each task
+  !   displs:             (integer)(n_mpi)(optional) each element specifies the displacement relative to
   !                       the receive MPI buffer at which to place the incoming data from processes
   !   mpi_rank:           (integer)(optional) identifier of the current MPI task
-  !   n_cpu:              (integer)(optional) number of MPI tasks
+  !   n_mpi:              (integer)(optional) number of MPI tasks
   !   mpi_comm_loc:       (integer)(optional) MPI communicator identifier
   !   start:              (HSIZE_T)(1)(optional) starting index of the input data chunk 
   !                       in the global dataset
@@ -1758,7 +1760,7 @@ module hdf5_io_module
   !   mpio_collective_in:   (logical)(optional) toggle MPIO collective actions if true (default)
   !----------------------------------------
   subroutine HDF5_array3D_saving_native_or_gatherv(file_id,array3D,dim1_tot,dim2_tot,&
-    dim3_tot,dsetname,use_gatherv,dim3_all_tasks,displs,mpi_rank,n_cpu,mpi_comm_loc,start,&
+    dim3_tot,dsetname,use_gatherv,dim3_all_tasks,displs,mpi_rank,n_mpi,mpi_comm_loc,start,&
     compress_level,use_hdf5_parallel_in,mpio_collective_in)
     use mpi
     implicit none
@@ -1767,7 +1769,7 @@ module hdf5_io_module
     real*8, dimension(:,:,:)  , intent(in) :: array3D
     character(LEN=*)          , intent(in) :: dsetname  ! dataset name
     logical                   , intent(in) :: use_gatherv
-    integer                       , intent(in), optional :: mpi_rank,n_cpu,mpi_comm_loc
+    integer                       , intent(in), optional :: mpi_rank,n_mpi,mpi_comm_loc
     integer, dimension(:)         , intent(in), optional :: dim3_all_tasks,displs
     integer(HSIZE_T), dimension(3), intent(in), optional :: start !< Begin position of data
     integer                       , intent(in), optional :: compress_level !< if set and start is not provided compress with this level
@@ -1779,7 +1781,7 @@ module hdf5_io_module
     ! check preset
     mpio_collective=.true.; if(present(mpio_collective_in)) mpio_collective=mpio_collective_in;
     ! check whether gatherv can/should be used default false
-    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_cpu).and.&
+    use_gatherv_loc=use_gatherv.and.present(mpi_rank).and.present(n_mpi).and.&
     present(mpi_comm_loc).and.present(dim3_all_tasks).and.present(displs)
     use_hdf5_parallel=.false.
     if(present(use_hdf5_parallel_in)) use_hdf5_parallel=use_hdf5_parallel_in
@@ -2220,6 +2222,46 @@ module hdf5_io_module
     !*** Closing ***
     call H5Dclose_f(dataset,error)
   end subroutine HDF5_array1D_reading_char
+
+  subroutine HDF5_array1D_reading_char_len(file_id, array1D, char_len, dsetname)
+    use HDF5
+    implicit none
+
+    ! Arguments
+    integer(HID_T), intent(in)                    :: file_id       ! File identifier
+    character(LEN=*), dimension(:), intent(out)   :: array1D       ! Output character array
+    integer, intent(in)                           :: char_len      ! Length of array entries
+    character(LEN=*), intent(in)                  :: dsetname      ! Dataset name
+
+    ! Local variables
+    integer :: ierr_HDF5                          ! Error flag
+    integer(HID_T) :: dataset                     ! Dataset identifier
+    integer(HID_T) :: dataspace                   ! Dataspace identifier
+    integer(HID_T) :: string_type                 ! Custom string datatype
+    integer(HSIZE_T), dimension(1) :: dim        ! Dataset dimensions
+
+    ! Open the dataset
+    call H5Dopen_f(file_id, trim(dsetname), dataset, ierr_HDF5)
+
+    ! Get the dataspace
+    call H5Dget_space_f(dataset, dataspace, ierr_HDF5)
+
+    dim(1) = size(array1D,1)
+
+    ! Define a custom string datatype matching the length of each character
+    call H5Tcopy_f(H5T_NATIVE_CHARACTER, string_type, ierr_HDF5)
+    call H5Tset_size_f(string_type, int(char_len,kind=SIZE_T), ierr_HDF5)
+
+    ! Read the dataset into the Fortran array
+    call H5Dread_f(dataset, string_type, array1D, dim, ierr_HDF5)
+
+    ! Close resources
+    call H5Tclose_f(string_type, ierr_HDF5)
+    call H5Sclose_f(dataspace, ierr_HDF5)
+    call H5Dclose_f(dataset, ierr_HDF5)
+
+end subroutine HDF5_array1D_reading_char_len
+
 
   !---------------------------------------- 
   ! HDF5 reading for an integer. Parallel compatible

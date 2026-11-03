@@ -23,9 +23,9 @@ program jorek2_connection_fmhd
   real*8,allocatable    :: T_turn(:,:), PSI_turn(:,:), ZN_turn(:,:)
   
   ! --- Extra data
-  integer               :: my_id, ikeep, n_cpu, ierr, nsend, nrecv, ikeep0, inode1, inode2, i_line0
+  integer               :: my_id, ikeep, n_mpi, ierr, nsend, nrecv, ikeep0, inode1, inode2, i_line0
   integer               :: elm_start, elm_end, elm_delta, local_elm_start, local_elm_end
-  integer               :: i_elm_half, cpu_fraction
+  integer               :: i_elm_half, mpi_fraction
   integer               :: nnos, n_scalars, ivtk, i_var
   integer               :: i, j, iside_i, iside_j, i_line, n_lines, i_tor, i_harm, i_var_psi, i_dir, k, m
   integer               :: i_elm, ifail, i_phi, n_phi, i_turn, n_turns, i_elm_out, n_turn_max(2)
@@ -99,7 +99,7 @@ program jorek2_connection_fmhd
   !required=MPI_THREAD_MULTIPLE
   !call MPI_Init_thread(required,provided,StatInfo)
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)      ! id of each MPI proc
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)      ! number of MPI procs
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)      ! number of MPI procs
   
   ! --- Initilise data
   call initialise_parameters(my_id, "__NO_FILENAME__")
@@ -207,7 +207,7 @@ program jorek2_connection_fmhd
   elm_end   = n_points_start
   
   ! --- The elements our local MPI is looking at
-  elm_delta = (elm_end - elm_start) / n_cpu + 1
+  elm_delta = (elm_end - elm_start) / n_mpi + 1
   local_elm_start = elm_start + my_id*elm_delta
   local_elm_end   = min(elm_end,elm_start+(my_id+1)*elm_delta - 1)
   
@@ -547,7 +547,7 @@ program jorek2_connection_fmhd
   ! --- Write points for all other MPIs
   if (my_id .eq. 0) then
     ! --- If this is mpi_0, we receive data from the other MPIs and print it
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (ikeep .gt. 0) then
         nrecv = 2*ikeep
@@ -587,7 +587,7 @@ program jorek2_connection_fmhd
     ! --- Write data for all other MPIs
     if (my_id .eq. 0) then
       ! --- If this is mpi_0, we receive data from the other MPIs and print it
-      do j=1,n_cpu-1
+      do j=1,n_mpi-1
         call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
         if (ikeep .gt. 0) then
           nrecv = ikeep

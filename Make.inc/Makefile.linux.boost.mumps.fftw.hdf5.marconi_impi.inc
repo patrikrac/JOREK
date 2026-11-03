@@ -37,12 +37,12 @@ USE_STD_BESSELK   = 0
 USE_TASKLOOP      = 0
 
 #Scotch library
-SCOTCH_HOME  = /marconi/home/userexternal/glatu000/jorek_tools/scotch_5.1.12_impi_17
+SCOTCH_HOME ?= /path/to/jorek_tools/scotch_5.1.12_impi_17
 LIB_SCOTCH   = -L$(SCOTCH_HOME)/lib -lptesmumps -lptscotch -lesmumps -lscotch -lptscotcherrexit -lptscotcherr -lscotcherrexit -lscotcherr
 INC_SCOTCH   = -I$(SCOTCH_HOME)/include
 
 # --- PaStiX solver
-PASTIX_HOME ?= /marconi/home/userexternal/glatu000/jorek_tools/pastix_3184_impi_17/install
+PASTIX_HOME ?= /path/to/jorek_tools/pastix_3184_impi_17/install
 LIB_PASTIX        = `$(PASTIX_HOME)/install/pastix-conf --libs` 
 LIB_PASTIX_MURGE  = `$(PASTIX_HOME)/install/pastix-conf --libs_murge`
 LIB_PASTIX_BLAS   = `$(PASTIX_HOME)/install/pastix-conf --blas`
@@ -70,7 +70,7 @@ LIB_BOOST  = -L$(BOOST_LIB) -lboost_math_tr1
 INC_BOOST  = -I$(BOOST_INC)
 
 # --- MUMPS solver
-MUMPS_HOME = /marconi/home/userexternal/glatu000/jorek_tools/mumps-5.0.2_impi_17
+MUMPS_HOME ?= /path/to/jorek_tools/mumps-5.0.2_impi_17
 LIB_MUMPS  = -L$(MUMPS_HOME)/lib -ldmumps -lmumps_common $(LIB_SCOTCH)
 INC_MUMPS  = $(MUMPS_HOME)/include $(INC_SCOTCH)
 ORDLIB     = -L$(MUMPS_HOME)/PORD/lib -lpord

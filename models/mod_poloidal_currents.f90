@@ -72,18 +72,26 @@ module mod_poloidal_currents
 
       call interp(node_list,element_list,i_elm,var_psi,i_tor,s,t,Psi,Ps_s, Ps_t, Ps_st, Ps_ss, Ps_tt)
       call interp(node_list,element_list,i_elm,var_zj,i_tor,s,t,ZJ ,ZJ_s, ZJ_t, ZJ_st, ZJ_ss, ZJ_tt)
-      if (with_TiTe) then
+
+      if (with_rho) then
         call interp(node_list,element_list,i_elm,var_rho,i_tor,s,t,RHO,RHO_s,RHO_t,RHO_st,RHO_ss,RHO_tt)
-        call interp(node_list,element_list,i_elm,var_Ti,1,s,t,Ti0,Ti0_s,Ti0_t,Ti0_st,Ti0_ss,Ti0_tt)
-        call interp(node_list,element_list,i_elm,var_Te,1,s,t,Te0,Te0_s,Te0_t,Te0_st,Te0_ss,Te0_tt)
-        T0    = Ti0   + Te0
-        T0_s  = Ti0_s + Te0_s
-        T0_t  = Ti0_t + Te0_t
-      elseif (jorek_model < 200) then 
-        T0 = 0.d0;  T0_s = 0.d0; T0_t = 0.d0; rho = 1.d0; rho_t = 0.d0; rho_s = 0.d0
       else
-        call interp(node_list,element_list,i_elm,var_T,i_tor,s,t,T0,T0_s,T0_t,T0_st,T0_ss,T0_tt) 
-        call interp(node_list,element_list,i_elm,var_rho,i_tor,s,t,RHO,RHO_s,RHO_t,RHO_st,RHO_ss,RHO_tt)
+        rho = 0.d0; rho_t = 0.d0; rho_s = 0.d0
+        if (i_tor==1) rho = 1.d0
+      endif
+
+      if (jorek_model < 180) then 
+        T0 = 0.d0;  T0_s = 0.d0; T0_t = 0.d0; 
+      else
+        if (with_TiTe) then
+          call interp(node_list,element_list,i_elm,var_Ti,1,s,t,Ti0,Ti0_s,Ti0_t,Ti0_st,Ti0_ss,Ti0_tt)
+          call interp(node_list,element_list,i_elm,var_Te,1,s,t,Te0,Te0_s,Te0_t,Te0_st,Te0_ss,Te0_tt)
+          T0    = Ti0   + Te0
+          T0_s  = Ti0_s + Te0_s
+          T0_t  = Ti0_t + Te0_t
+        else
+          call interp(node_list,element_list,i_elm,var_T,i_tor,s,t,T0,T0_s,T0_t,T0_st,T0_ss,T0_tt)
+        endif 
       endif
 
       zj_sum  = zj_sum   +  ZJ * HZ(i_tor,i_plane)
@@ -200,13 +208,25 @@ module mod_poloidal_currents
         
           do mp=1,n_plane
             do in=1,n_tor
-              psi_s(:,mp) = psi_s(:,mp)  + node_k%values(in,k_dir,1) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
-              zj   (:,mp) = zj   (:,mp)  + node_k%values(in,k_dir,3) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
-              if (jorek_model > 190) then  
-                rho  (:,mp) = rho  (:,mp)  + node_k%values(in,k_dir,5) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
-                rho_s(:,mp) = rho_s(:,mp)  + node_k%values(in,k_dir,5) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
-                T0   (:,mp) = T0   (:,mp)  + node_k%values(in,k_dir,6) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
-                T0_s (:,mp) = T0_s (:,mp)  + node_k%values(in,k_dir,6) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
+              psi_s(:,mp) = psi_s(:,mp)  + node_k%values(in,k_dir,var_psi) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
+              zj   (:,mp) = zj   (:,mp)  + node_k%values(in,k_dir, var_zj) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
+              if (with_rho) then
+                rho  (:,mp) = rho  (:,mp)  + node_k%values(in,k_dir,var_rho) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
+                rho_s(:,mp) = rho_s(:,mp)  + node_k%values(in,k_dir,var_rho) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
+              else
+                rho   = 1.d0
+                rho_s = 0.d0
+              endif
+              if (jorek_model > 190) then 
+                if (with_TiTe) then 
+                  T0   (:,mp) = T0   (:,mp)  + node_k%values(in,k_dir,var_Ti) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
+                  T0   (:,mp) = T0   (:,mp)  + node_k%values(in,k_dir,var_Te) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
+                  T0_s (:,mp) = T0_s (:,mp)  + node_k%values(in,k_dir,var_Ti) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
+                  T0_s (:,mp) = T0_s (:,mp)  + node_k%values(in,k_dir,var_Te) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
+                else
+                  T0   (:,mp) = T0   (:,mp)  + node_k%values(in,k_dir,var_T) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
+                  T0_s (:,mp) = T0_s (:,mp)  + node_k%values(in,k_dir,var_T) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
+                endif
               else
                 rho = 1.d0; rho_s = 0.d0; T0 = 0.d0; T0_s = 0.d0 
               endif
@@ -327,15 +347,28 @@ module mod_poloidal_currents
           Z_s(:)   = Z_s(:)  + node_k%x(1,k_dir,2) * k_size * H1_s(k_vertex,k_dof,:)
         
           do in=1,n_tor
-            psi_s(:) = psi_s(:) + node_k%values(in,k_dir,1) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
-            zj   (:) = zj   (:) + node_k%values(in,k_dir,3) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
-            if (jorek_model > 200 ) then
-              rho  (:) = rho  (:) + node_k%values(in,k_dir,5) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
-              rho_s(:) = rho_s(:) + node_k%values(in,k_dir,5) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
-              T0   (:) = T0   (:) + node_k%values(in,k_dir,6) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
-              T0_s (:) = T0_s (:) + node_k%values(in,k_dir,6) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
+            psi_s(:) = psi_s(:) + node_k%values(in,k_dir,var_psi) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
+            zj   (:) = zj   (:) + node_k%values(in,k_dir, var_zj) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
+            if (with_rho) then
+              rho  (:) = rho  (:) + node_k%values(in,k_dir,var_rho) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
+              rho_s(:) = rho_s(:) + node_k%values(in,k_dir,var_rho) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
             else
-              rho = 1.d0; rho_s = 0.d0; T0 = 0.d0; T0_s = 0.d0 
+              rho   = 1.d0
+              rho_s = 0.d0
+            endif
+
+            if (jorek_model > 180 ) then
+              if (with_TiTe) then 
+                T0   (:) = T0   (:) + node_k%values(in,k_dir,var_Ti)  * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
+                T0   (:) = T0   (:) + node_k%values(in,k_dir,var_Te)  * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
+                T0_s (:) = T0_s (:) + node_k%values(in,k_dir,var_Ti)  * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
+                T0_s (:) = T0_s (:) + node_k%values(in,k_dir,var_Te)  * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
+              else
+                T0   (:) = T0   (:) + node_k%values(in,k_dir,var_T)   * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
+                T0_s (:) = T0_s (:) + node_k%values(in,k_dir,var_T)   * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
+              endif
+            else
+              T0 = 0.d0; T0_s = 0.d0 
             endif        
           enddo
         

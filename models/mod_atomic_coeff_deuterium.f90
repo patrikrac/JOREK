@@ -72,8 +72,7 @@ subroutine atomic_coeff_deuterium(Te0, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradD
 
   if ( (.not. old_deuterium_atomic) .and. (.not. deuterium_adas) ) then 
 
-    ! Fit of ADAS data calculated by Guido, see comparisons in 
-    ! see the public JOREK issue tracker
+    ! Fit of ADAS data calculated by Guido.
 
     Te_eV_lim = max(Te_eV,     0.2d0 )  ! ADAS fit valid between 0.2eV and 10 keV  
     Te_eV_lim = min(Te_eV_lim, 1.d4  )  

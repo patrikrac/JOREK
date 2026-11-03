@@ -43,11 +43,11 @@ USE_PASTIX_MURGE = 0
 USE_MUMPS = 0
 
 # Directory containing the user-compiled libraries (e.g., MUMPS, PASTIX, ...)
-#LIBDIR = /ccc/cont003/home/gen2197/huijsmag/lib
- LIBDIR=/ccc/cont003/home/dsm/fila/lib/pastix/install/
+#LIBDIR ?= /path/to/lib
+LIBDIR ?= /path/to/lib/pastix/install
 
 #Scotch library
-SCOTCH_HOME  = /ccc/cont003/home/dsm/fila/lib/scotch_5.1.12
+SCOTCH_HOME ?= /path/to/scotch_5.1.12
 SCOTCH_LIBDIR = ${SCOTCH_HOME}/lib
 LIB_SCOTCH   = -L$(SCOTCH_LIBDIR) -lptscotch -lptscotcherr
 INC_SCOTCH   = -I$(SCOTCH_INCDIR)
@@ -63,7 +63,7 @@ ORDLIB     = $(MUMPS_LIB_DIR)/libpord.a $(METIS_LIB_DIR)/libmetis.a
 # PASTIX
 #PASTIX_HOME      = $(LIBDIR)/pastix_release_4030/install/
 #PASTIX_HOME      = $(LIBDIR)/pastix/install/
- PASTIX_HOME = /ccc/cont003/home/dsm/fila/lib/pastix/install/
+PASTIX_HOME ?= /path/to/pastix/install
 LIB_PASTIX       = -L$(PASTIX_HOME) -lpastix_murge -lpastix $(LIB_SCOTCH)
 LIB_PASTIX_MURGE = -L$(PASTIX_HOME) -lpastix_murge -lpastix $(LIB_SCOTCH)
 LIB_PASTIX_BLAS  = 

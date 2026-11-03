@@ -145,14 +145,14 @@ function proj_f_ionization_energy(sim, i_group, particle) result(ion_energy)
   integer, intent(in)              :: i_group
   real*8                           :: ion_energy
 
-  real*8, parameter :: binding_energy = 2.18d-18 ! ionization energy of a hydrogen atom [J] (= 13.6 eV)
+  real*8, parameter :: H_binding_energy = 2.18d-18 ! ionization energy of a hydrogen atom [J] (= 13.6 eV)
   real*8            :: ion_source, kinetic_energy
   
   select type (pa => particle)
   type is (particle_kinetic_leapfrog)   
     ion_source     = proj_f_ion_source(sim, i_group, pa)
     kinetic_energy = sim%groups(i_group)%mass * ATOMIC_MASS_UNIT * dot_product(pa%v, pa%v)/2.0d0
-    ion_energy     = (kinetic_energy - binding_energy) * ion_source
+    ion_energy     = (kinetic_energy - H_binding_energy) * ion_source
   class default
     ion_energy = 0.d0
   end select

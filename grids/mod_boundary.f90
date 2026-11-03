@@ -535,7 +535,7 @@ module mod_boundary
   !> Get a normal vector from the wall on your element. It is your own responsibility to ensure
   !> that it is actually on the wall ;) We just find the closest edge of the element and calculate the gradient
   !> towards the inside of the element.
-  pure function wall_normal_vector(node_list, element_list, i_elm, s, t) result(n)
+  function wall_normal_vector(node_list, element_list, i_elm, s, t) result(n)
     use data_structure
     use mod_interp, only: interp_RZ
     type(type_node_list), intent(in)    :: node_list
@@ -543,7 +543,7 @@ module mod_boundary
     integer, intent(in)                 :: i_elm
     real*8, intent(in)                  :: s, t
     real*8                              :: n(3)
-    real*8 :: R, R_s, R_t, Z, Z_s, Z_t
+    real*8 :: R, R_s, R_t, Z, Z_s, Z_t, norm_n
     logical :: allowed(4)
     integer :: i_side
 
@@ -590,6 +590,16 @@ module mod_boundary
     case (4)
       n = [Z_t, -R_t, 0.d0]
     end select
-    n = n/norm2(n,1)
+    norm_n=(norm2(n,1))
+    !> WARNING: this is to avoid a NaN from ruining the simulation, but it is not correct!
+    if(norm_n <= 0.d0) then
+      !$omp critical
+      write(*,"(A,I8,6es15.5)") "ERROR: size of normal vector is 0 in grids/mod_boundary.f90 wall_normal_vector(). Returning n=(1,0,0) i_elm,s,t,norm_n,n = ",i_elm,s,t,norm_n,n
+      write(*,"(A)") "Please find out why this happened, and fix the underlying issue"
+      !$omp end critical
+      n=[1.d0,0.d0,0.d0]
+      return
+    endif
+    n = n/norm_n
   end function wall_normal_vector
 end module mod_boundary

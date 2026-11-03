@@ -99,14 +99,16 @@ if ( (my_id .eq. 0) .and. (n_order .le. 3) ) then
     dp_dz2     = zn * (dTi_dz2   + dTe_dz2)   + 2.d0 * dn_dz * (dTi_dz + dTe_dz) + dn_dz2 * (zTi + zTe)
     dp_dpsi_dz = zn * (dTi_dpsi_dz + dTe_dpsi_dz) + dn_dz * (dTi_dpsi + dTe_dpsi) + dn_dpsi * (dTi_dz + dTe_dz) + dn_dpsi_dz * (zTi + zTe)
 
-    node_list%node(i)%values(1,1,var_rho) = zn
-    node_list%node(i)%values(1,2,var_rho) = dn_dpsi    * node_list%node(i)%values(1,2,var_psi) + dn_dz * node_list%node(i)%x(1,2,2)
-    node_list%node(i)%values(1,3,var_rho) = dn_dpsi    * node_list%node(i)%values(1,3,var_psi) + dn_dz * node_list%node(i)%x(1,3,2)
-    node_list%node(i)%values(1,4,var_rho) = dn_dpsi    * node_list%node(i)%values(1,4,var_psi) + dn_dz * node_list%node(i)%x(1,4,2) &
-                                    + dn_dpsi2   * node_list%node(i)%values(1,2,var_psi) * node_list%node(i)%values(1,3,var_psi)  &
-                                    + dn_dz2     * node_list%node(i)%x(1,2,2)              * node_list%node(i)%x(1,3,2)         &
-                                    + dn_dpsi_dz * node_list%node(i)%values(1,3,var_psi) * node_list%node(i)%x(1,2,2)         &
-                                    + dn_dpsi_dz * node_list%node(i)%values(1,2,var_psi) * node_list%node(i)%x(1,3,2)
+    if (with_rho) then
+      node_list%node(i)%values(1,1,var_rho) = zn
+      node_list%node(i)%values(1,2,var_rho) = dn_dpsi    * node_list%node(i)%values(1,2,var_psi) + dn_dz * node_list%node(i)%x(1,2,2)
+      node_list%node(i)%values(1,3,var_rho) = dn_dpsi    * node_list%node(i)%values(1,3,var_psi) + dn_dz * node_list%node(i)%x(1,3,2)
+      node_list%node(i)%values(1,4,var_rho) = dn_dpsi    * node_list%node(i)%values(1,4,var_psi) + dn_dz * node_list%node(i)%x(1,4,2) &
+                                      + dn_dpsi2   * node_list%node(i)%values(1,2,var_psi) * node_list%node(i)%values(1,3,var_psi)  &
+                                      + dn_dz2     * node_list%node(i)%x(1,2,2)              * node_list%node(i)%x(1,3,2)         &
+                                      + dn_dpsi_dz * node_list%node(i)%values(1,3,var_psi) * node_list%node(i)%x(1,2,2)         &
+                                      + dn_dpsi_dz * node_list%node(i)%values(1,2,var_psi) * node_list%node(i)%x(1,3,2)
+    endif
 
     if (with_neutrals) then
 
@@ -224,8 +226,10 @@ endif ! if n_order<=3
 ! --- and remove all derivatives from profiles functions, which are not really needed, 
 ! --- except dn_dpsi and dT_dpsi for current profile...)
 if (n_order .ge. 5) then
-  call Poisson(my_id,0,node_list,element_list,bnd_node_list,bnd_elm_list, &
-               var_psi,var_rho,1, ES%psi_axis,ES%psi_bnd,xpoint2,xcase2,ES%Z_xpoint,freeboundary_equil,refinement,1)
+  if (with_rho) then
+    call Poisson(my_id,0,node_list,element_list,bnd_node_list,bnd_elm_list, &
+                 var_psi,var_rho,1, ES%psi_axis,ES%psi_bnd,xpoint2,xcase2,ES%Z_xpoint,freeboundary_equil,refinement,1)
+  endif
   if ( with_TiTe ) then
     call Poisson(my_id,0,node_list,element_list,bnd_node_list,bnd_elm_list, &
                  var_psi,var_Ti,1, ES%psi_axis,ES%psi_bnd,xpoint2,xcase2,ES%Z_xpoint,freeboundary_equil,refinement,1)

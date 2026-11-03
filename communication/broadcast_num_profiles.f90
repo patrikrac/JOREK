@@ -217,6 +217,16 @@ if (with_TiTe) then
   end if
 end if
 
+if ( num_v_pinch ) then
+  call MPI_BCAST(num_v_pinch_len,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+  if ( my_id /= 0 ) then
+     call tr_allocate(num_v_pinch_x,1,num_v_pinch_len,"num_v_pinch_x")
+     call tr_allocate(num_v_pinch_y,1,num_v_pinch_len,"num_v_pinch_y")
+  end if
+  call MPI_BCAST(num_v_pinch_x,num_v_pinch_len,MPI_DOUBLE_PRECISION,0,MPI_COMM_WORLD,ierr)
+  call MPI_BCAST(num_v_pinch_y,num_v_pinch_len,MPI_DOUBLE_PRECISION,0,MPI_COMM_WORLD,ierr)
+end if
+
 if (NEO) then
    if ( num_neo_file ) then
       call MPI_BCAST(num_neo_len,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)

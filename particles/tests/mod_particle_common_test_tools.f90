@@ -184,7 +184,7 @@ n_particles,p_types,ifail,rank_in,n_tasks_in,fill_particle_in)
   endif
   call MPI_Bcast(sims_real8,n_times*(n_groups+1),MPI_DOUBLE,0,MPI_COMM_WORLD,ifail)
   do ii=1,n_times
-    sims_particles(ii)%my_id = rank; sims_particles(ii)%n_cpu = n_tasks;
+    sims_particles(ii)%my_id = rank; sims_particles(ii)%n_mpi = n_tasks;
     sims_particles(ii)%wtime_start = MPI_Wtime()
     sims_particles(ii)%time = sims_real8(ii)
     call sims_particles(ii)%set_t_norm

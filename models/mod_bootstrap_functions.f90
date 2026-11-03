@@ -400,7 +400,7 @@ subroutine bootstrap_get_averaged_j_spline(my_id, node_list, element_list, psi_a
   type (type_surface_list) :: flux_list, sep_list
   integer                  :: i, k, ig, i_surf, i_piece, n_psi, i_elm
   real*8                   :: psi_bnd, psi_bnd2, psi_n_bnd_factor
-  real*8                   :: sigmas(17)
+  real*8                   :: sigmas(22)
   integer                  :: n_grids(12)
   real*8                   :: rr, s, t, ds, dt, xjac, dl, sum_dl
   real*8                   :: R, dR_ds, dR_dt, dR_dl
@@ -435,7 +435,7 @@ subroutine bootstrap_get_averaged_j_spline(my_id, node_list, element_list, psi_a
   
   ! --- Build up some arrays to send as routine parameters (avoid long lists...)
   ! --- Take 70% of dPSI_open and dPSI_outer to make sure we stay inside domain...
-  sigmas(1)  = SIG_closed   ; sigmas(2)  = SIG_theta
+  sigmas(1)  = SIG_closed(1); sigmas(2)  = SIG_theta
   sigmas(3)  = SIG_open     ; sigmas(4)  = SIG_outer     ; sigmas(5)  = SIG_inner
   sigmas(6)  = SIG_private  ; sigmas(7)  = SIG_up_priv
   sigmas(8)  = SIG_leg_0    ; sigmas(9)  = SIG_leg_1
@@ -443,6 +443,9 @@ subroutine bootstrap_get_averaged_j_spline(my_id, node_list, element_list, psi_a
   sigmas(12) = dPSI_open*0.7; sigmas(13) = dPSI_outer*0.7; sigmas(14) = dPSI_inner
   sigmas(15) = dPSI_private ; sigmas(16) = dPSI_up_priv
   sigmas(17) = SIG_theta_up
+  sigmas(18) = SIG_closed(2); sigmas(19) = SIG_closed(3)
+  sigmas(20) = xr_closed(1) ; sigmas(21) = xr_closed(2) 
+  sigmas(22) = xr_closed(3)
 
   n_grids(1) = n_flux   ; n_grids(2) = n_tht
   n_grids(3) = n_open   ; n_grids(4) = n_outer  ; n_grids(5) = n_inner
@@ -500,6 +503,7 @@ subroutine bootstrap_get_averaged_j_spline(my_id, node_list, element_list, psi_a
 
     call tr_allocate(sep_list%psi_values,1,1,"sep_list%psi_values",CAT_GRID)
     sep_list%psi_values(1) = psi_bnd
+    sep_list%n_psi = 1
     call find_flux_surfaces(my_id,xpoint,xcase,node_list,element_list,sep_list)
   endif
   
@@ -611,7 +615,7 @@ subroutine bootstrap_get_q_and_ft_splines(my_id, node_list, element_list, psi_ax
   real*8                   :: rad(n_spline), Bmax(n_spline)
   integer                  :: i, k, ig, i_surf, i_piece, n_psi, i_elm, i_ft
   real*8                   :: psi_bnd, psi_bnd2
-  real*8                   :: sigmas(17)
+  real*8                   :: sigmas(22)
   integer                  :: n_grids(12)
   real*8                   :: rr, s, t, ds, dt, xjac, dl, sum_dl
   real*8                   :: R,  dR_ds,  dR_dt, dR_dl
@@ -650,7 +654,7 @@ subroutine bootstrap_get_q_and_ft_splines(my_id, node_list, element_list, psi_ax
   
   ! --- Build up some arrays to send as routine parameters (avoid long lists...)
   ! --- Take 70% of dPSI_open and dPSI_outer to make sure we stay inside domain...
-  sigmas(1)  = SIG_closed   ; sigmas(2)  = SIG_theta
+  sigmas(1)  = SIG_closed(1); sigmas(2)  = SIG_theta
   sigmas(3)  = SIG_open     ; sigmas(4)  = SIG_outer     ; sigmas(5)  = SIG_inner
   sigmas(6)  = SIG_private  ; sigmas(7)  = SIG_up_priv
   sigmas(8)  = SIG_leg_0    ; sigmas(9)  = SIG_leg_1
@@ -658,7 +662,10 @@ subroutine bootstrap_get_q_and_ft_splines(my_id, node_list, element_list, psi_ax
   sigmas(12) = dPSI_open*0.7; sigmas(13) = dPSI_outer*0.7; sigmas(14) = dPSI_inner
   sigmas(15) = dPSI_private ; sigmas(16) = dPSI_up_priv
   sigmas(17) = SIG_theta_up
-
+  sigmas(18) = SIG_closed(2); sigmas(19) = SIG_closed(3)
+  sigmas(20) = xr_closed(1) ; sigmas(21) = xr_closed(2)
+  sigmas(22) = xr_closed(3)
+ 
   n_grids(1) = n_flux   ; n_grids(2) = n_tht
   n_grids(3) = n_open   ; n_grids(4) = n_outer  ; n_grids(5) = n_inner
   n_grids(6) = n_private; n_grids(7) = n_up_priv
@@ -715,6 +722,7 @@ subroutine bootstrap_get_q_and_ft_splines(my_id, node_list, element_list, psi_ax
 
     call tr_allocate(sep_list%psi_values,1,1,"sep_list%psi_values",CAT_GRID)
     sep_list%psi_values(1) = psi_bnd
+    sep_list%n_psi = 1
     call find_flux_surfaces(my_id,xpoint,xcase,node_list,element_list,sep_list)
   endif
   

@@ -404,7 +404,8 @@ end function inbetweenSegment
 
 ! --- Find intersection between horizontal segment (Rmin,Rmax)@height=Z and polygon
 subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, new_Rmax, new_Rmin2, new_Rmax2)
-
+  use mod_polygon
+  
   implicit none
   
   ! --- Input variables
@@ -414,7 +415,7 @@ subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, n
   
   ! --- Local variables
   integer, parameter :: n_iter = 1000
-  integer :: inside, i1, i2, i, insidePolygon
+  integer :: inside, i1, i2, i
   real*8  :: R_iter(n_iter), r_tmp, z_tmp
   real*8  :: Rleft, Rmid, Rright
   real*8  :: diff
@@ -434,13 +435,13 @@ subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, n
   i2 = -1
   do i=1,n_iter
     r_tmp = R_iter(i)
-    if (insidePolygon(N, rpol, zpol, r_tmp, z_tmp) .eq. 1) then
+    if (inside_polygon(N, rpol, zpol, r_tmp, z_tmp)) then
       if (inside .eq. 0) then
         i1 = i
         inside = 1
       endif
     endif
-    if (insidePolygon(N, rpol, zpol, r_tmp, z_tmp) .eq. 0) then
+    if (.not. inside_polygon(N, rpol, zpol, r_tmp, z_tmp)) then
       if (inside .eq. 1) then
         i2 = i
         exit
@@ -467,7 +468,7 @@ subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, n
       new_Rmin = Rmid
       exit
     endif
-    if (insidePolygon(N, rpol, zpol, Rmid, z_tmp) .eq. 1) then
+    if (inside_polygon(N, rpol, zpol, Rmid, z_tmp)) then
       Rright = Rmid
     else
       Rleft  = Rmid
@@ -488,7 +489,7 @@ subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, n
       new_Rmax = Rmid
       exit
     endif
-    if (insidePolygon(N, rpol, zpol, Rmid, z_tmp) .eq. 1) then
+    if (inside_polygon(N, rpol, zpol, Rmid, z_tmp)) then
       Rleft = Rmid
     else
       Rright  = Rmid
@@ -512,13 +513,13 @@ subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, n
   i2 = -1
   do i=1,n_iter
     r_tmp = R_iter(i)
-    if (insidePolygon(N, rpol, zpol, r_tmp, z_tmp) .eq. 1) then
+    if (inside_polygon(N, rpol, zpol, r_tmp, z_tmp)) then
       if (inside .eq. 0) then
         i1 = i
         inside = 1
       endif
     endif
-    if (insidePolygon(N, rpol, zpol, r_tmp, z_tmp) .eq. 0) then
+    if (.not. inside_polygon(N, rpol, zpol, r_tmp, z_tmp)) then
       if (inside .eq. 1) then
         i2 = i
         exit
@@ -550,7 +551,7 @@ subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, n
       new_Rmin2 = Rmid
       exit
     endif
-    if (insidePolygon(N, rpol, zpol, Rmid, z_tmp) .eq. 1) then
+    if (inside_polygon(N, rpol, zpol, Rmid, z_tmp)) then
       Rright = Rmid
     else
       Rleft  = Rmid
@@ -571,7 +572,7 @@ subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, n
       new_Rmax2 = Rmid
       exit
     endif
-    if (insidePolygon(N, rpol, zpol, Rmid, z_tmp) .eq. 1) then
+    if (inside_polygon(N, rpol, zpol, Rmid, z_tmp)) then
       Rleft = Rmid
     else
       Rright  = Rmid
@@ -588,67 +589,6 @@ subroutine RintersectPolygon(N, rpol, zpol, Rmin, Rmax, Z, accuracy, new_Rmin, n
   
   return
 end subroutine RintersectPolygon
-
-
-
-
-
-! --- Check if point is inside polygon
-integer function insidePolygon(N, rpol, zpol, r, z)
-
-  implicit none
-  
-  ! --- Input variables
-  integer, intent(in)  :: N
-  real*8,  intent(in)  :: rpol(N), zpol(N), r, z
-  
-  ! --- Local variables
-  integer :: counter, i
-  real*8  :: r1, z1, r2, z2, xinters
-  
-  insidePolygon = 0
-  
-  counter = 0
-  r1 = rpol(N)
-  z1 = zpol(N)
-  do i = 1,N
-    r2 = rpol(i)
-    z2 = zpol(i)
-    if ( (z .ge. min(z1,z2)) .and. (z .le. max(z1,z2)) .and. (r .lt. max(r1,r2)) ) then
-      if (z1 .ne. z2) then
-        xinters = (z-z1)*(r2-r1)/(z2-z1) + r1
-        if ((r .lt. xinters) .and. (z .ne. z2)) then
-          counter = counter + 1
-        endif
-      endif
-    endif
-    r1 = r2
-    z1 = z2
-  enddo
-
-  ! --- Outside
-  if (mod(counter,2) .eq. 0) then
-    insidePolygon = 0
-  ! --- Inside
-  else
-    insidePolygon = 1
-  endif
-  
-  return
-
-end function insidePolygon
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

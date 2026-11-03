@@ -1,4 +1,9 @@
+! SPDX-License-Identifier: LGPL-3.0-or-later AND LicenseRef-Zhang-Jin
 !> Contains functions to calculate the fields created by the plasma current alone and by external currents
+!!
+!! Note: the `comelp` routine below is copyright (C) Shanjie Zhang and
+!! Jianming Jin, used with permission (see the licensing note at the routine
+!! and THIRD_PARTY_LICENSES.md).
 !!
 !!  * The routines B_plasma and psi_plasma calculate the plasma field given a set of (R,Z) points
 !!  * Routines to predict the best coil currents for given fixed-bnd equilibrium are also avaialable
@@ -111,7 +116,7 @@ module mod_plasma_response
     
     ! --- local variables    
     integer    :: i, j, ms, mt, iv, inode, ife, mp, in
-    integer    :: ierr, n_cpu, my_id, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
+    integer    :: ierr, n_mpi, my_id, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
     real*8     :: zj0, R, Z, wst, xjac, delta_phi
     real*8     :: G_BR, G_BZ, G_psi
     integer    :: n_points
@@ -232,7 +237,7 @@ module mod_plasma_response
     real*8     :: eq_g(n_phi_int,n_gauss,n_gauss)
     
     integer    :: i, j, ms, mt, iv, inode, ife, mp, in
-    integer    :: ierr, n_cpu, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
+    integer    :: ierr, n_mpi, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
     real*8     :: zj0, R, xp,yp,zp, dd, wst, xjac, delta_phi, phi
     real*8     :: d_vec(3), J_vec(3), cross(3), dB(3), dA(3)
     real*8     :: wgauss_copy(n_gauss)
@@ -244,10 +249,10 @@ module mod_plasma_response
     real*8, allocatable :: Ax(:), Ay(:), Az(:)
 
     ! --- MPI initialization
-    call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr) ! number of MPI procs
-    n_cpu = max(n_cpu,1)
+    call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr) ! number of MPI procs
+    n_mpi = max(n_mpi,1)
 
-    ife_delta = ceiling(float(element_list%n_elements) / n_cpu)
+    ife_delta = ceiling(float(element_list%n_elements) / n_mpi)
     ife_min   =      my_id     * ife_delta + 1
     ife_max   = min((my_id +1) * ife_delta, element_list%n_elements)
 
@@ -653,7 +658,7 @@ module mod_plasma_response
     
     ! --- local variables    
     integer    :: i, j, ms, mt, iv, inode, ife, mp, in
-    integer    :: ierr, n_cpu, my_id, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
+    integer    :: ierr, n_mpi, my_id, ife_delta, ife_min, ife_max, omp_nthreads, omp_tid
     real*8     :: zj0, R, Z, wst, xjac, delta_phi
     real*8     :: G_BR, G_BZ, G_psi
     integer    :: n_points

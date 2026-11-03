@@ -321,7 +321,7 @@ subroutine test_HDF5_array1D_saving_int()
   if(rank_loc.eq.master_rank) call HDF5_open_or_create(trim(filename),file_id,ierr=ifail_loc) 
   call HDF5_array1D_saving_int_native_or_gatherv(file_id,result_array,sum(elements_all),&
   datasetname,.true.,dim1_all_tasks=elements_all,displs=displs,mpi_rank=rank_loc,&
-  n_cpu=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,use_hdf5_parallel_in=use_hdf5_mpio,&
+  n_mpi=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,use_hdf5_parallel_in=use_hdf5_mpio,&
   mpio_collective_in=mpio_collective)  
   if(rank_loc.eq.master_rank) call HDF5_close(file_id); call MPI_Barrier(mpi_comm_loc,ifail_loc);
   call HDF5_open(filename,file_id,ifail_loc,create_access_plist_in=access_hdf5_parallel,&
@@ -399,7 +399,7 @@ subroutine test_HDF5_array2D_saving_int()
   if(rank_loc.eq.master_rank) call HDF5_open_or_create(trim(filename),file_id,ierr=ifail_loc) 
   call HDF5_array2D_saving_int_native_or_gatherv(file_id,result_array,n_elements(1),&
   sum(elements_all),datasetname,.true.,dim2_all_tasks=elements_all,displs=displs,&
-  mpi_rank=rank_loc,n_cpu=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,use_hdf5_parallel_in=use_hdf5_mpio,&
+  mpi_rank=rank_loc,n_mpi=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,use_hdf5_parallel_in=use_hdf5_mpio,&
   mpio_collective_in=mpio_collective)
   if(rank_loc.eq.master_rank) call HDF5_close(file_id); call MPI_Barrier(mpi_comm_loc,ifail_loc);
   call HDF5_open(filename,file_id,ifail_loc,create_access_plist_in=access_hdf5_parallel,&
@@ -519,7 +519,7 @@ subroutine test_HDF5_array1D_saving_r4()
   if(rank_loc.eq.master_rank) call HDF5_open_or_create(trim(filename),file_id,ierr=ifail_loc) 
   call HDF5_array1D_saving_r4_native_or_gatherv(file_id,result_array,sum(elements_all),&
   datasetname,.true.,dim1_all_tasks=elements_all,displs=displs,mpi_rank=rank_loc,&
-  n_cpu=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,use_hdf5_parallel_in=use_hdf5_mpio,&
+  n_mpi=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,use_hdf5_parallel_in=use_hdf5_mpio,&
   mpio_collective_in=mpio_collective)  
   if(rank_loc.eq.master_rank) call HDF5_close(file_id); call MPI_Barrier(mpi_comm_loc,ifail_loc);
   call HDF5_open(filename,file_id,ifail_loc,create_access_plist_in=access_hdf5_parallel,&
@@ -626,7 +626,7 @@ subroutine test_HDF5_array1D_saving_r8()
   if(rank_loc.eq.master_rank) call HDF5_open_or_create(trim(filename),file_id,ierr=ifail_loc) 
   call HDF5_array1D_saving_native_or_gatherv(file_id,result_array,sum(elements_all),&
   datasetname,.true.,dim1_all_tasks=elements_all,displs=displs,mpi_rank=rank_loc,&
-  n_cpu=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,use_hdf5_parallel_in=use_hdf5_mpio,&
+  n_mpi=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,use_hdf5_parallel_in=use_hdf5_mpio,&
   mpio_collective_in=mpio_collective)  
   if(rank_loc.eq.master_rank) call HDF5_close(file_id); call MPI_Barrier(mpi_comm_loc,ifail_loc);
   call HDF5_open(filename,file_id,ifail_loc,create_access_plist_in=access_hdf5_parallel,&
@@ -704,7 +704,7 @@ subroutine test_HDF5_array2D_saving_r8()
   if(rank_loc.eq.master_rank) call HDF5_open_or_create(trim(filename),file_id,ierr=ifail_loc) 
   call HDF5_array2D_saving_native_or_gatherv(file_id,result_array,n_elements(1),&
   sum(elements_all),datasetname,.true.,dim2_all_tasks=elements_all,displs=displs,&
-  mpi_rank=rank_loc,n_cpu=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,&
+  mpi_rank=rank_loc,n_mpi=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,&
   use_hdf5_parallel_in=use_hdf5_mpio,mpio_collective_in=mpio_collective)
   if(rank_loc.eq.master_rank) call HDF5_close(file_id); call MPI_Barrier(mpi_comm_loc,ifail_loc);
   call HDF5_open(filename,file_id,ifail_loc,create_access_plist_in=access_hdf5_parallel,&
@@ -793,7 +793,7 @@ subroutine test_HDF5_array3D_saving_r8()
   if(rank_loc.eq.master_rank) call HDF5_open_or_create(trim(filename),file_id,ierr=ifail_loc) 
   call HDF5_array3D_saving_native_or_gatherv(file_id,result_array,n_elements(1),n_elements(2),&
   sum(elements_all),datasetname,.true.,dim3_all_tasks=elements_all,&
-  displs=displs,mpi_rank=rank_loc,n_cpu=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,&
+  displs=displs,mpi_rank=rank_loc,n_mpi=n_tasks_loc,mpi_comm_loc=mpi_comm_loc,&
   use_hdf5_parallel_in=use_hdf5_mpio,mpio_collective_in=mpio_collective)
   if(rank_loc.eq.master_rank) call HDF5_close(file_id); call MPI_Barrier(mpi_comm_loc,ifail_loc);
   call HDF5_open(filename,file_id,ifail_loc,create_access_plist_in=access_hdf5_parallel,&

@@ -1,0 +1,19 @@
+{%- comment -%}
+  Override of Just the Docs' title.html: site title text on the left, JOREK
+  logo pushed to the right edge of the sidebar header. Two logo variants are
+  provided (dark-text for the light theme, light-text for the dark theme) and
+  swapped via CSS on [data-theme]. See _sass/custom/custom.scss.
+{%- endcomment -%}
+<span class="jorek-site-title">
+  <span class="jorek-title-text">{{ site.title }}</span>
+  <img
+    class="jorek-logo jorek-logo-light"
+    src="{{ '/assets/images/jorek_logo.png' | relative_url }}"
+    alt="JOREK logo"
+    width="600" height="273">
+  <img
+    class="jorek-logo jorek-logo-dark"
+    src="{{ '/assets/images/jorek_logo_dark.png' | relative_url }}"
+    alt="JOREK logo"
+    width="600" height="273">
+</span>

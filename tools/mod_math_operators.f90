@@ -6,6 +6,7 @@ module mod_math_operators
   public :: cross_product
   public :: solve_2x2_linear_problem
   public :: solve_3x3_linear_problem
+  public :: gcd
 
 interface cross_product
   module procedure cross_product_r4
@@ -125,5 +126,25 @@ subroutine solve_3x3_linear_problem_r8(A,b,x)
       invA(3,1)*b(1)+invA(3,2)*b(2)+invA(3,3)*b(3)/)/det
   
 end subroutine solve_3x3_linear_problem_r8
+
+!> calculates the greatest common divisor (gcd) using the Euclidean algorithm
+pure integer function gcd(n1,n2)
+  implicit none
+  integer, intent(in) :: n1, n2
+  integer :: a,b,r !< remainder
+
+  ! the gcd does not change when the larger number is replaced by the difference (e.g. when a > b, gcd(a,b) = gcd(a-b,b))
+  ! so this is done iteratively until a divisor is found (which gives mod(a,b)=0)
+  a=n1
+  b=n2
+  do
+    r=mod(a,b)
+    a=b
+    b=r
+    ! if b > a, one cycle will effectively swap a and b since mod(a,b)=a for b>a, making if statements for a>b unnecessary
+    if(b==0) exit
+  end do
+  gcd = a
+end function gcd
 
 end module mod_math_operators

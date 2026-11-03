@@ -68,7 +68,7 @@ implicit none
 private
 public :: elm_coords
 public :: edge_elements
-public :: sample_edge_elements
+public :: sample_edge_elements, integrate_edge_elements, type_cdf_data
 public :: find_edge_element
 
 !> 1D Finite elements on the plasma boundary on a connected patch
@@ -92,9 +92,20 @@ type :: edge_elements
   type(edge_elements_patch), allocatable, dimension(:) :: patch !< n_domains different patches of edge elements
 contains
   procedure :: prepare !< this%prepare(node_list, element_list, edge_domains, nsub, nsub_toroidal)
-  procedure :: write !< this%write(filename)
-  procedure :: sample => sample_edge_elements !< this%sample(i_scalar, n_samples, u, integral, xyz, st, ielm)
+  procedure :: write_vtk_projection !< this%write_vtk_projection(filename)
+  procedure :: sample => sample_edge_elements !< this%sample(i_scalar, n_samples, u, integral, xyz, st, i_elm)
 end type edge_elements
+
+type :: type_arr  
+  real*8, allocatable :: a(:)
+end type type_arr
+type :: type_cdf_data
+  real*8, allocatable :: pdf_patch(:) !< per patch
+  real*8, allocatable :: cdf_patch(:) !< per patch
+  type(type_arr), allocatable :: pdf_pol(:) !< poloidal direction, per patch
+  real*8 :: dphi
+  integer :: nphi
+end type type_cdf_data
 
 contains
 
@@ -270,7 +281,7 @@ end function find_edge_element
 !> Assumptions: nsub_toroidal and n_plane are the same for each patch
 !>
 !> Writes only what is present on MPI ID 0! You need to reduce this yourself to a single set.
-subroutine write(this, filename)
+subroutine write_vtk_projection(this, filename)
   use mpi
   use mod_event
   use mod_coordinate_transforms
@@ -388,13 +399,10 @@ subroutine write(this, filename)
       vector_names,vectors)
       
   end if
-end subroutine write
+end subroutine write_vtk_projection
 
 !> Sample from the edge elements.
-!> We need to first integrate in the toroidal direction for every poloidal point.
-!> Then we integrate in the poloidal direction over every patch, to determine the
-!> distribution between patches (and normalize all CDFs).
-!> Finally we can sample with the following algorithm
+!> We can sample with the following algorithm
 !>
 !> do i=1,n_samples
 !>   select patch with u(1,i) in discrete array of CDFs
@@ -411,99 +419,45 @@ end subroutine write
 !>
 !> Note that the sampled positions are not exactly corresponding to the sampled
 !> element-local coordinates!
-subroutine sample_edge_elements(this, i_scalar, n_samples, u, integral, xyz, st, ielm)
+subroutine sample_edge_elements(this, res, i_scalar, n_samples, u, xyz, st, i_elm)
   use constants, only: TWOPI
   use mod_sampling, only: sample_piecewise_linear
   class(edge_elements), intent(in) :: this
+  type(type_cdf_data), intent(in) :: res
   integer, intent(in) :: i_scalar
   integer, intent(in) :: n_samples
-  real*8, intent(in)  :: u(2,n_samples)
-  real*8, intent(out) :: integral
+  real*8, intent(in)  :: u(3,n_samples)
   real*8, intent(out) :: xyz(3,n_samples)
   real*8, intent(out) :: st(2,n_samples)
-  integer, intent(out) :: ielm(n_samples)
+  integer, intent(out) :: i_elm(n_samples)
 
 
-  type :: arr1
-    real*8, allocatable :: a(:)
-  end type arr1
-
-  real*8, allocatable :: pdf_patch(:) !< per patch
-  real*8, allocatable :: cdf_patch(:) !< per patch
-  type(arr1), allocatable :: pdf_pol(:) !< poloidal direction, per patch
-
-  real*8 :: dphi
-  integer :: i, j, n, nphi, i_patch, n_patch, i_min, i_max
-  real*8 :: u_tmp(2), s0(2), S1(2)
+  integer :: i, j, n, i_patch, i_min, i_max
+  real*8 :: u_tmp(3), s0(2), S1(2)
   real*8, allocatable :: dl(:), r(:), p_phi(:)
-  real*8 :: i_r, f_min, f_max
+  real*8 :: i_r, f_min, f_max, integral
 
-  if (.not. allocated(this%patch)) then
-    write(*,*) 'No patches allocated for sample_edge_elements, exiting'
-    return
-  end if
-  n_patch = size(this%patch,1)
-  allocate(pdf_patch(n_patch))
-  allocate(cdf_patch(0:n_patch))
-  cdf_patch(0) = 0.d0
-  allocate(pdf_pol(n_patch))
-
-  ! Prepare PDFs
-  nphi = n_plane*this%patch(1)%nsub_toroidal
-  dphi = TWOPI / (n_period*nphi)
-  do i_patch=1,n_patch
-    n = size(this%patch(i_patch)%st,2)/nphi
-    allocate(pdf_pol(i_patch)%a(n))
-    allocate(r(n))
-
-    !$omp parallel do default(shared) private(j)
-    do j=1,n
-      ! The phi-integral is given by the sum over the elements (they are equal size)
-      ! pdf_pol(i_patch)%a(j) = sum(this%patch(i_patch)%scalars(i_scalar,(j-1)*nphi+1:j*nphi))*dphi
-      pdf_pol(i_patch)%a(j) = sum(this%patch(i_patch)%scalars((j-1)*nphi+1:j*nphi,i_scalar))*dphi
-    end do
-    !$omp end parallel do
-
-    dl = norm2(this%patch(i_patch)%xyz(1:2,     1:nphi*(n-1):nphi) - &
-               this%patch(i_patch)%xyz(1:2,nphi+1:nphi*n    :nphi), dim=1)
-    r = this%patch(i_patch)%xyz(1,1:nphi*n:nphi)
-
-    ! Adjust the pdf with the jacobian and length to turn it into an integral over 1-N
-    pdf_pol(i_patch)%a = pdf_pol(i_patch)%a(1:n) * r(1:n) * [dl(1), ((dl(j)+dl(j+1))/2, j=1,n-2), dl(n-1)]
-
-
-    ! Integrate this pdf over the patch
-    ! Two contributions: rising basis function and descending
-    ! integral for each element is given by 0.5*dl*a for both of these functions
-    !pdf_patch(i_patch) = 0.5d0*(sum(pdf_pol(i_patch)%a(1:n-1)*dl*r(1:n-1)) + &
-                                !sum(pdf_pol(i_patch)%a(2:n)  *dl*r(2:n)))
-    pdf_patch(i_patch) = sum(pdf_pol(i_patch)%a(2:n-1)) + 0.5d0*(pdf_pol(i_patch)%a(1) + pdf_pol(i_patch)%a(n))
-    cdf_patch(i_patch) = cdf_patch(i_patch-1) + pdf_patch(i_patch)
-    deallocate(r)
-  end do
-
-  integral = cdf_patch(n_patch)
+  integral = res%cdf_patch(size(this%patch,1))
   if (integral .le. 1d-30) then
     ! create only lost particles
-    ielm = 0
+    i_elm = 0
     xyz = 0
     st = 0
     return
   end if
 
-  !$omp parallel do default(none) shared(n_samples, u, cdf_patch, integral, pdf_pol, xyz, st, ielm, nphi, dphi, this, i_scalar, &
-  !$omp pdf_patch) &
+  !$omp parallel do default(none) shared(n_samples, u, integral, xyz, st, i_elm, this, i_scalar, res) &
   !$omp private(i, u_tmp, i_patch, i_r, i_min, i_max, f_min, f_max, p_phi, S0, S1)
   do i=1,n_samples
     u_tmp = u(:,i)
-    i_patch = minloc(cdf_patch, mask=(u_tmp(1)*integral .le. cdf_patch),dim=1)-1 ! -1 is due to cdf_patch starting at 0
+    i_patch = minloc(res%cdf_patch, mask=(u_tmp(1)*integral .le. res%cdf_patch),dim=1)-1 ! -1 is due to res%cdf_patch starting at 0
     
     ! We use a trick here. Instead of putting the `real` distance l, we use the node numbers
     ! instead. This way we can very easily interpolate later.
     ! rescale our random number to this range
-    i_r = sample_piecewise_linear(size(pdf_pol(i_patch)%a,1), &
-                                  [(real(j,8),j=1,size(pdf_pol(i_patch)%a,1))], &
-                                  pdf_pol(i_patch)%a, (u_tmp(1)*integral-cdf_patch(i_patch-1))/pdf_patch(i_patch))
+    i_r = sample_piecewise_linear(size(res%pdf_pol(i_patch)%a,1), &
+                                  [(real(j,8),j=1,size(res%pdf_pol(i_patch)%a,1))], &
+                                  res%pdf_pol(i_patch)%a, (u_tmp(1)*integral-res%cdf_patch(i_patch-1))/res%pdf_patch(i_patch))
 
     ! floor(i_r) is the lower node, ceil(i_r) is the upper, and if they are the same we're exactly on a node
     i_min = floor(i_r)
@@ -512,19 +466,19 @@ subroutine sample_edge_elements(this, i_scalar, n_samples, u, integral, xyz, st,
     f_max = 1-f_min
 
     ! Fill in the positions
-    ielm(i) = this%patch(i_patch)%i_elm_jorek_edge(i_min*nphi)
-    xyz(1:2,i) = this%patch(i_patch)%xyz(1:2,i_min*nphi)*f_min + &
-                 this%patch(i_patch)%xyz(1:2,i_max*nphi)*f_max
+    i_elm(i) = this%patch(i_patch)%i_elm_jorek_edge(i_min*res%nphi)
+    xyz(1:2,i) = this%patch(i_patch)%xyz(1:2,i_min*res%nphi)*f_min + &
+                 this%patch(i_patch)%xyz(1:2,i_max*res%nphi)*f_max
     ! We need to be careful here, since st is defined in the element with the
     ! same number as the node! (but then do some nodes not have it defined?)
     ! So if the i_elm_jorek_edge is different between the two, then
     ! we need to flip the latter one, to get it from 0 to 1 or vice versa.
     ! we don't know if this is the s or t coordinate though...
-    if (this%patch(i_patch)%i_elm_jorek_edge(i_min*nphi) .ne. &
-        this%patch(i_patch)%i_elm_jorek_edge(i_max*nphi)) then
+    if (this%patch(i_patch)%i_elm_jorek_edge(i_min*res%nphi) .ne. &
+        this%patch(i_patch)%i_elm_jorek_edge(i_max*res%nphi)) then
 
-      s0 = this%patch(i_patch)%st(:,i_min*nphi)
-      s1 = this%patch(i_patch)%st(:,i_max*nphi)
+      s0 = this%patch(i_patch)%st(:,i_min*res%nphi)
+      s1 = this%patch(i_patch)%st(:,i_max*res%nphi)
 
       if (s0(1) .ne. s1(1)) then
         st(:,i) = s0*f_min + [1.d0-s1(1), s1(2)]*f_max
@@ -541,20 +495,90 @@ subroutine sample_edge_elements(this, i_scalar, n_samples, u, integral, xyz, st,
         write(*,*) "ERROR: cannot determine side of element in sample_edge_elements. Use nsub > 1" ! or save i_elm_jorek_side in this%patch
       end if
     else
-      st(:,i) = this%patch(i_patch)%st(:,i_min*nphi)*f_min + &
-                this%patch(i_patch)%st(:,i_max*nphi)*f_max
+      st(:,i) = this%patch(i_patch)%st(:,i_min*res%nphi)*f_min + &
+                this%patch(i_patch)%st(:,i_max*res%nphi)*f_max
     end if
 
     ! Sample the toroidal position phi
-    allocate(p_phi(nphi+1))
-    p_phi(1:nphi) = this%patch(i_patch)%scalars((i_min-1)*nphi+1:i_min*nphi,i_scalar)*f_min + &
-                    this%patch(i_patch)%scalars((i_max-1)*nphi+1:i_max*nphi, i_scalar)*f_max
-    p_phi(nphi+1) = p_phi(1) ! make it circular
-    xyz(3,i) = sample_piecewise_linear(nphi+1, [(real(j-1,8)*dphi*n_period,j=1,nphi+1)], p_phi, u_tmp(2))
+    allocate(p_phi(res%nphi+1))
+    p_phi(1:res%nphi) = this%patch(i_patch)%scalars((i_min-1)*res%nphi+1:i_min*res%nphi,i_scalar)*f_min + &
+                    this%patch(i_patch)%scalars((i_max-1)*res%nphi+1:i_max*res%nphi, i_scalar)*f_max
+    p_phi(res%nphi+1) = p_phi(1) ! make it circular
+    xyz(3,i) = sample_piecewise_linear(res%nphi+1, [(real(j-1,8)*res%dphi,j=1,res%nphi+1)], p_phi, u_tmp(2))
+    xyz(3,i) = xyz(3,i) + int(u_tmp(3)*n_period) * TWOPI/real(n_period,8)  ! randomly add particle to one of n_period toroidal wedges
     deallocate(p_phi)
 
   end do
   !$omp end parallel do
 
 end subroutine sample_edge_elements
+
+!> Determines the total integral over all patches, while storing the cumulative
+!> distribution functions etc in res
+!> First we integrate in the toroidal direction for every poloidal point.
+!> Then we integrate in the poloidal direction over every patch, to determine the
+!> distribution between patches (and normalize all CDFs).
+subroutine integrate_edge_elements(this, i_scalar, integral, res)
+  use constants, only: TWOPI
+  use mod_sampling, only: sample_piecewise_linear
+  class(edge_elements), intent(in) :: this
+  integer, intent(in) :: i_scalar
+  real*8, intent(out) :: integral
+  type(type_cdf_data), intent(out) :: res
+ 
+  integer :: j, n, i_patch, n_patch
+  real*8, allocatable :: dl(:), r(:), p_phi(:)
+  
+  if (.not. allocated(this%patch)) then
+    write(*,*) 'No patches allocated for sample_edge_elements, exiting'
+    return
+  end if
+  n_patch = size(this%patch,1)
+  allocate(res%pdf_patch(n_patch))
+  allocate(res%cdf_patch(0:n_patch))
+  res%cdf_patch(0) = 0.d0
+  allocate(res%pdf_pol(n_patch))
+
+  ! Prepare PDFs
+  res%nphi = n_plane*this%patch(1)%nsub_toroidal
+  res%dphi = TWOPI / (n_period*res%nphi)
+  do i_patch=1,n_patch
+    n = size(this%patch(i_patch)%st,2)/res%nphi
+    allocate(res%pdf_pol(i_patch)%a(n))
+    allocate(r(n))
+
+    !$omp parallel do default(shared) private(j)
+    do j=1,n
+      ! The phi-integral is given by the sum over the elements (they are equal size)
+      ! res%pdf_pol(i_patch)%a(j) = sum(this%patch(i_patch)%scalars(i_scalar,(j-1)*res%nphi+1:j*res%nphi))*res%dphi
+      res%pdf_pol(i_patch)%a(j) = sum(this%patch(i_patch)%scalars((j-1)*res%nphi+1:j*res%nphi,i_scalar))*res%dphi
+    end do
+    !$omp end parallel do
+
+    dl = norm2(this%patch(i_patch)%xyz(1:2,     1:res%nphi*(n-1):res%nphi) - &
+               this%patch(i_patch)%xyz(1:2,res%nphi+1:res%nphi*n    :res%nphi), dim=1)
+    r = this%patch(i_patch)%xyz(1,1:res%nphi*n:res%nphi)
+
+    ! Adjust the pdf with the jacobian and length to turn it into an integral over 1-N
+    res%pdf_pol(i_patch)%a = res%pdf_pol(i_patch)%a(1:n) * r(1:n) * [dl(1), ((dl(j)+dl(j+1))/2, j=1,n-2), dl(n-1)]
+
+
+    ! Integrate this pdf over the patch
+    ! Two contributions: rising basis function and descending
+    ! integral for each element is given by 0.5*dl*a for both of these functions
+    !res%pdf_patch(i_patch) = 0.5d0*(sum(res%pdf_pol(i_patch)%a(1:n-1)*dl*r(1:n-1)) + &
+                                !sum(res%pdf_pol(i_patch)%a(2:n)  *dl*r(2:n)))
+    res%pdf_patch(i_patch) = sum(res%pdf_pol(i_patch)%a(2:n-1)) + 0.5d0*(res%pdf_pol(i_patch)%a(1) + res%pdf_pol(i_patch)%a(n))
+    res%cdf_patch(i_patch) = res%cdf_patch(i_patch-1) + res%pdf_patch(i_patch)
+    deallocate(r)
+  end do
+
+  ! --- Volume integral of the wedge from 0 to 2*PI/n_period
+  ! --- needs to be over the full torus.
+  integral = n_period * res%cdf_patch(n_patch)
+
+end subroutine integrate_edge_elements
+
+
+
 end module mod_edge_elements

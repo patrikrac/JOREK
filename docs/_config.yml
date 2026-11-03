@@ -1,0 +1,43 @@
+title: JOREK Wiki
+description: JOREK project documentation
+remote_theme: just-the-docs/just-the-docs@v0.10.0
+
+url: "https://iterorganization.github.io"
+baseurl: "/JOREK"
+
+search_enabled: true
+
+# Default color scheme (custom, defined in _sass/color_schemes/).
+# A runtime dark/light toggle switches between "jorek_light" and "gruvbox_dark"
+# (see _includes/header_custom.html and _includes/head_custom.html).
+color_scheme: jorek_light
+
+heading_anchors: true
+
+markdown: kramdown
+kramdown:
+  smart_quotes: ["apos", "apos", "quot", "quot"]
+  typographic_symbols:
+    mdash: "---"
+    ndash: "--"
+
+footer_content: "JOREK Documentation"
+
+aux_links:
+  "JOREK Website":
+    - "https://www.jorek.eu"
+aux_links_new_tab: true
+
+back_to_top: true
+back_to_top_text: "Back to top"
+
+plugins:
+  - jekyll-seo-tag
+  - jekyll-remote-theme
+  - jekyll-relative-links
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: "default"

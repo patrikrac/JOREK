@@ -201,7 +201,7 @@ end subroutine coord_in_neighbour
 
 
 
-subroutine update_neighbours(node_list, element_list, force_rtree_initialize)
+subroutine update_neighbours(node_list, element_list, force_rtree_initialize, use_3D_rtree)
 #ifdef USE_NO_TREE  
 use mod_no_tree
 #elif USE_QUADTREE
@@ -214,6 +214,7 @@ implicit none
 type (type_node_list), intent(in)       :: node_list
 type (type_element_list), intent(inout) :: element_list
 logical, intent(in), optional           :: force_rtree_initialize !< default false
+logical, optional, intent(in) :: use_3D_rtree
 
 type (type_element)      :: elm_i, elm_j
 integer                  :: inb_i, inb_j, i, j, k, iv1, iv2
@@ -241,9 +242,9 @@ end if
 ! Be careful here. If the grid changes the information will be incorrect and you
 ! need to manually call populate_element_rtree
 if (present(force_rtree_initialize)) then
-  if (force_rtree_initialize) call populate_element_rtree(node_list, element_list)
+  if (force_rtree_initialize) call populate_element_rtree(node_list, element_list, use_3D_rtree)
 else if (.not. rtree_initialized) then
-  call populate_element_rtree(node_list, element_list)
+  call populate_element_rtree(node_list, element_list, use_3D_rtree)
 end if
 #endif
 

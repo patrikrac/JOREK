@@ -25,7 +25,14 @@ real*8                :: Z_imp, dZ_imp_dT, d2Z_imp_dT2, Prad, dPrad_dT
 
 !call MPI_Init_thread(MPI_THREAD_MULTIPLE, provided, ierr)
 
-directory = '${JOREK_ADAS_DIR}'
+! ADAS data location: set JOREK_ADAS_DIR to the directory holding the ADAS files.
+directory = ''
+call get_environment_variable('JOREK_ADAS_DIR', directory)
+if (trim(directory) .eq. '') then
+  write(*,*) 'ERROR: JOREK_ADAS_DIR is not set - point it at your ADAS data directory.'
+  stop 1
+end if
+
 ad = read_adf11(0, '96_ne', directory)
 cor = coronal(ad)
 

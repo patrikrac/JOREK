@@ -15,7 +15,7 @@ module mod_bicgstab
   implicit none
 
   ! MPI related
-  integer                        :: my_id, my_id_n, n_cpu
+  integer                        :: my_id, my_id_n, n_mpi
   integer                        :: MPI_GLOB, MPI_COMM_N, MPI_COMM_MASTER
 
   ! Global-matrix related
@@ -57,7 +57,7 @@ module mod_bicgstab
     MPI_COMM_MASTER = solver%pc%MPI_COMM_MASTER
 
     call MPI_COMM_RANK(MPI_GLOB, my_id, ierr)
-    call MPI_COMM_SIZE(MPI_GLOB, n_cpu, ierr)
+    call MPI_COMM_SIZE(MPI_GLOB, n_mpi, ierr)
     call MPI_COMM_RANK(MPI_COMM_N, my_id_n, ierr)
 
     if (.not.bicgstab_initialized) then
@@ -297,14 +297,14 @@ module mod_bicgstab
     n_local   = (a_mat%index_max(my_id + 1) - a_mat%index_min(my_id + 1) + 1)*blocksize
 
     allocate(b_tmp(n_local))
-    allocate(rcv_c(n_cpu),rcv_d(n_cpu))
+    allocate(rcv_c(n_mpi),rcv_d(n_mpi))
 
-    do i = 1, n_cpu
+    do i = 1, n_mpi
       rcv_c(i) = (a_mat%index_max(i) - a_mat%index_min(i) + 1)*blocksize
     enddo
 
     rcv_d(1) = 0
-    do i = 2, n_cpu
+    do i = 2, n_mpi
       rcv_d(i) = rcv_d(i-1) + rcv_c(i-1)
     enddo
 

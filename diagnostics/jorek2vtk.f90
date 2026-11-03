@@ -22,7 +22,9 @@ use mod_impurity, only: init_imp_adas, radiation_function, radiation_function_li
 use mod_atomic_coeff_deuterium, only : atomic_coeff_deuterium
 use mod_openadas , only : read_adf11
 use mod_atomic_coeff_deuterium, only : ad_deuterium , atomic_coeff_deuterium
-
+use coupling_variables
+use mod_coupling_settings
+use mod_particle_group_id
 implicit none
 
 type (type_node_list)   ,     pointer :: node_list
@@ -114,7 +116,7 @@ real*8                :: Te_eV, ne_SI, Lrad_imp, r_imp_bg
 real*8                :: Te_corr_eV, coef_rad_1, Sion_T, eta_Sp, ksi_ion_norm, LradDcont_T
 real*8                :: LradDcont_corr, dLradDcont_dT_corr
 real*8                :: LradDrays_T, coef_ion_1, coef_ion_2, coef_ion_3, S_ion_puiss
-real*8                :: r0_real8, rn0_real8, lnA
+real*8                :: r0_real8, rn0_real8, lnA, r0_tmp
 real*8                :: T0_corr, r0_corr, rn0_corr, ne_JOREK, T_or_Te, T_or_Te_corr, T_or_Te_0 
 integer               :: i_imp, offset_bgimp, i_bg     ! Loop for more than one background impurity
 integer               :: i_proj
@@ -270,6 +272,19 @@ write(*,*) 'include_saw_ene =', include_saw_ene
 
 if (include_projections) then
   write(*,*) ' -proj_basename =', trim(proj_basename)
+
+
+  ! --- Initialize particle groups and determine coupling scheme + n_aux_var
+
+  !> generate the particle groups in use based on the defined groups in part_group_configs
+  if (part_groups_in_use(1) == 'non') then
+    call generate_part_groups_in_use()
+  endif
+  n_part_groups = count(part_groups_in_use /= 'non')
+
+  call match_part_groups_and_configs()                      !< find the matching part_group_config for each particle group
+  call check_compatibility_and_determine_coupling_schemes() !< determine coupling scheme
+  call determine_coupling_variables()                       !< determine n_aux_var
 end if
 
 write(*,*) '-----------'
@@ -296,7 +311,7 @@ if ( SI_units ) then
 #else
    variable_names_si(var_u)='u_m/s       '
    variable_names_si(var_zj)='j_MA/m2     '
-   variable_names_si(var_rho)='ne20_m-3    '
+   if (with_rho) variable_names_si(var_rho)='ne20_m-3    '
    if (with_TiTe) then
       variable_names_si(var_Ti)='Ti_keV      '
       variable_names_si(var_Te)='Te_keV      '
@@ -374,10 +389,10 @@ if (include_vacuum_field) then
 #endif
 endif
 
-allocate(iibg(n_adas),iproj(n_var))
+allocate(iibg(n_adas),iproj(n_aux_var))
 
 if (include_projections) then
-  do i = 1, n_var
+  do i = 1, n_aux_var
     write(proj_label, '(a4,i2.2)') 'aux_', i
     call add_vtk_entry(proj_label, proj_label, iproj(i), n_scalars, si_units, scalar_names) 
   end do
@@ -481,7 +496,7 @@ enddo
 
 call initialise_basis                              ! define the basis functions at the Gaussian points
 
-call import_restart(node_list,  element_list, 'jorek_restart', rst_format, ierr, .true., aux_node_list=aux_node_list)
+call import_restart(node_list,  element_list, 'jorek_restart', rst_format, ierr, .true., aux_node_list=aux_node_list, use_3D_rtree=.false.)
 
 call init_chi_basis
 
@@ -586,7 +601,12 @@ do i=1,element_list%n_elements
         call interp(node_list,element_list,i,var_u,  i_tor,s,t,U0, U0_s, U0_t, U0_st, U0_ss, U0_tt)
         call interp(node_list,element_list,i,var_zj, i_tor,s,t,ZJ0,ZJ0_s,ZJ0_t,ZJ0_st,ZJ0_ss,ZJ0_tt)
         call interp(node_list,element_list,i,var_w,  i_tor,s,t,W0, W0_s, W0_t, W0_st, W0_ss, W0_tt)
-        call interp(node_list,element_list,i,var_rho,i_tor,s,t,ZN0,ZN0_s,ZN0_t,ZN0_st,ZN0_ss,ZN0_tt)
+        if (with_rho) then
+          call interp(node_list,element_list,i,var_rho,i_tor,s,t,ZN0,ZN0_s,ZN0_t,ZN0_st,ZN0_ss,ZN0_tt)
+        else
+          ZN0=0.d0; ZN0_s=0.d0; ZN0_t=0.d0; ZN0_st=0.d0; ZN0_ss=0.d0; ZN0_tt=0.d0
+          if (i_tor==1) ZN0 = 1.d0
+        endif
 
         if (with_Vpar) then
           call interp(node_list,element_list,i,var_Vpar,i_tor,s,t,V0,V0_s,V0_t,V0_st,V0_ss,V0_tt)
@@ -721,7 +741,7 @@ do i=1,element_list%n_elements
         enddo
 
         if (include_projections) then
-          do i_proj=1,n_var
+          do i_proj=1,n_aux_var
             call interp(aux_node_list,element_list,i,i_proj,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
             scalars(inode,iproj(i_proj)) = P * HZ(i_tor,i_plane)
           end do
@@ -740,7 +760,12 @@ do i=1,element_list%n_elements
           call interp(node_list,element_list,i,var_u,  i_tor,s,t,U,U_s,U_t,U_st,U_ss,U_tt)
           call interp(node_list,element_list,i,var_zj, i_tor,s,t,ZJ,ZJ_s,ZJ_t,ZJ_st,ZJ_ss,ZJ_tt)
           call interp(node_list,element_list,i,var_w,  i_tor,s,t,W,W_s,W_t,W_st,W_ss,W_tt)
-          call interp(node_list,element_list,i,var_rho,i_tor,s,t,RHO,RHO_s,RHO_t,RHO_st,RHO_ss,RHO_tt)
+          if (with_rho) then
+            call interp(node_list,element_list,i,var_rho,i_tor,s,t,RHO,RHO_s,RHO_t,RHO_st,RHO_ss,RHO_tt)
+          else
+            RHO=0.d0; RHO_s=0.d0; RHO_t=0.d0; RHO_st=0.d0; RHO_ss=0.d0; RHO_tt=0.d0
+            if (i_tor==1) RHO = 1.d0
+          endif
           if (with_TiTe) then
              call interp(node_list,element_list,i,var_Ti,i_tor,s,t,Ti,Ti_s,Ti_t,Ti_st,Ti_ss,Ti_tt)
              call interp(node_list,element_list,i,var_Te,i_tor,s,t,Te,Te_s,Te_t,Te_st,Te_ss,Te_tt)
@@ -813,6 +838,13 @@ do i=1,element_list%n_elements
              call interp(node_list,element_list,i,m,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
              scalars(inode,m) = scalars(inode,m) + P * HZ(i_tor,i_plane)
           enddo
+
+          if (include_projections) then
+            do i_proj=1,n_aux_var
+              call interp(aux_node_list,element_list,i,i_proj,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
+              scalars(inode,iproj(i_proj)) = scalars(inode,iproj(i_proj)) + P * HZ(i_tor,i_plane)
+            end do
+          end if
           
           call interp(node_list,element_list,i,var_AR, i_tor,s,t,AR0,AR0_s,AR0_t,AR0_st,AR0_ss,AR0_tt)
           call interp(node_list,element_list,i,var_AZ, i_tor,s,t,AZ0,AZ0_s,AZ0_t,AZ0_st,AZ0_ss,AZ0_tt)
@@ -1076,7 +1108,7 @@ do i=1,element_list%n_elements
           enddo
 
           if (include_projections) then
-            do i_proj=1,n_var
+            do i_proj=1,n_aux_var
               call interp(aux_node_list,element_list,i,i_proj,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
               scalars(inode,iproj(i_proj)) = scalars(inode,iproj(i_proj)) + P * HZ(i_tor,i_plane)
             end do
@@ -1091,7 +1123,12 @@ do i=1,element_list%n_elements
           call interp(node_list,element_list,i,var_u,  i_tor,s,t,U  ,U_s,  U_t,  U_st,  U_ss,  U_tt)
           call interp(node_list,element_list,i,var_zj, i_tor,s,t,ZJ ,ZJ_s, ZJ_t, ZJ_st, ZJ_ss, ZJ_tt)
           call interp(node_list,element_list,i,var_w,  i_tor,s,t,W  ,W_s,  W_t,  W_st,  W_ss,  W_tt)
-          call interp(node_list,element_list,i,var_rho,i_tor,s,t,RHO,RHO_s,RHO_t,RHO_st,RHO_ss,RHO_tt)
+          if (with_rho) then
+            call interp(node_list,element_list,i,var_rho,i_tor,s,t,RHO,RHO_s,RHO_t,RHO_st,RHO_ss,RHO_tt)
+          else
+            RHO=0.d0; RHO_s=0.d0; RHO_t=0.d0; RHO_st=0.d0; RHO_ss=0.d0; RHO_tt=0.d0;
+            if (i_tor==1) RHO=1.d0
+          endif
           if (with_TiTe) then
              call interp(node_list,element_list,i,var_Ti,i_tor,s,t,Ti,Ti_s,Ti_t,Ti_st,Ti_ss,Ti_tt)
              call interp(node_list,element_list,i,var_Te,i_tor,s,t,Te,Te_s,Te_t,Te_st,Te_ss,Te_tt)
@@ -1248,7 +1285,12 @@ do i=1,element_list%n_elements
         v_perp  = R * sqrt(u_x*u_x + u_y * u_y)
         Btot    = sqrt(F0**2 + ps_x**2 + ps_y**2) / BigR
         D_prof  = get_dperp (psi_norm)
-        ZK_prof = get_zkperp(psi_norm)
+
+        if (use_zkperp_times_density) then
+          ZK_prof = get_zkperp(psi_norm) * max(scalars(inode,var_rho),zkperp_density_floor)
+        else
+          ZK_prof = get_zkperp(psi_norm)
+        endif
 
         ZKpar_T = ZK_par * ((max( scalars(inode,6), T_min ))/T_0)**2.5
 
@@ -1391,7 +1433,11 @@ enddo  ! n_elements
   if (deuterium_adas)  ad_deuterium =  read_adf11(0,'96_h',trim(adas_dir)) !< for both include_radiation and include_neutral_dens
   if (include_radiation) then
     do i=1,nnos
-      r0_real8  = scalars(i,var_rho)
+      if (with_rho) then
+        r0_real8  = scalars(i,var_rho)
+      else
+        r0_real8  = 1.d0
+      endif
       if ( with_TiTe ) then
         T_real8 = scalars(i,var_Te)
         Te_corr_eV = corr_neg_temp(T_real8*2.d0)/(2.d0*EL_CHG*MU_ZERO*central_density*1.d20)
@@ -1416,6 +1462,11 @@ enddo  ! n_elements
 
       ksi_ion_norm = ksi_ion * central_density * 1.d20
       rn0_real8 = scalars(i,var_rhon)
+      if (with_rho) then
+        r0_real8  = scalars(i,var_rho)
+      else 
+        r0_real8  = 1.d0
+      endif
 
       if ( with_TiTe ) then
         call atomic_coeff_deuterium(T_real8, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradDcont_T, dLradDcont_dT, &
@@ -1428,9 +1479,9 @@ enddo  ! n_elements
       call coulomb_log_ei(T_or_Te, T_or_Te_corr, rho, corr_neg_dens1(rho), 0.0, 0.0, 0.0, lnA)
       call resistivity(eta, T_or_Te, T_or_Te_corr, T_max_eta, T_or_Te_0, 1.d0, lnA, eta_Sp)           
 
-      scalars(i,ineu(1)) = ksi_ion_norm * scalars(i,var_rho) * scalars(i,var_rhon) * Sion_T
-      scalars(i,ineu(2)) = scalars(i,var_rho) * scalars(i,var_rhon) * LradDrays_T
-      scalars(i,ineu(3)) = LradDcont_T * scalars(i,var_rho)**2.d0                           !< outputs radiation power (i.e. what a bolometer would measure), rather than the radiative cooling
+      scalars(i,ineu(1)) = ksi_ion_norm * r0_real8 * scalars(i,var_rhon) * Sion_T
+      scalars(i,ineu(2)) = r0_real8 * scalars(i,var_rhon) * LradDrays_T
+      scalars(i,ineu(3)) = LradDcont_T * r0_real8**2.d0
 #ifdef fullmhd
       scalars(i,ineu(4)) = 0.d0   ! NEEDS BE CALCULATED FOR FULL MHD ELESEWHERE! 
 #else /* not fullmhd */ 
@@ -1458,7 +1509,7 @@ enddo  ! n_elements
             Lrad_imp = 0.
           end if
           frad_bg = frad_bg + r_imp_bg * Lrad_imp
-          scalars(i,iibg(i_imp)) = r_imp_bg * Lrad_imp * scalars(i,var_rho)
+          scalars(i,iibg(i_imp)) = r_imp_bg * Lrad_imp * r0_corr
         end do
       else
         if ( trim(imp_type(1)) == 'Ar') then ! Hard-coded fitting exists for argon
@@ -1475,7 +1526,7 @@ enddo  ! n_elements
       end if   
 
 
-      scalars(i,ibg_tot) = scalars(i,var_rho) * frad_bg
+      scalars(i,ibg_tot) = r0_corr * frad_bg
    
     enddo
   endif
@@ -1518,8 +1569,12 @@ enddo  ! n_elements
        T_or_Te_corr = corr_neg_temp(T_real8)
        T_or_Te_0    = T_0
      endif
-     
-     r0_real8 = scalars(i,var_rho)
+
+     if (with_rho) then
+       r0_real8 = scalars(i,var_rho)
+     else 
+       r0_real8 = 1.d0
+     endif
      rimp0_real8 = scalars(i,var_rhoimp)
 
      r0_corr = corr_neg_dens(r0_real8)
@@ -1637,7 +1692,11 @@ enddo  ! n_elements
 
     do i=1,nnos
 
-      r0_real8  = scalars(i,var_rho)
+      if (with_rho) then
+        r0_real8  = scalars(i,var_rho)
+      else 
+        r0_real8  = 1.d0
+      endif
       rn0_real8 = scalars(i,var_rhon) 
 
       if ( with_TiTe ) then
@@ -1732,7 +1791,12 @@ if (SI_units) then
       scalars(i,var_zj) = currdens(i) / MU_zero * 1.e-6
     endif
     !============================================density in 1e20m-3
-    scalars(i,var_rho) = scalars(i,var_rho) * central_density
+    if (with_rho) then
+      scalars(i,var_rho)  = scalars(i,var_rho) * central_density
+      r0_tmp = scalars(i,var_rho)
+    else
+      r0_tmp = central_density
+    endif
     if (with_impurities) then
       scalars(i,i_ne)    = scalars(i,i_ne) * central_density
     end if
@@ -1793,7 +1857,8 @@ if (SI_units) then
 
 #if (!defined WITH_Impurities)
     if (include_radiation) then
-      r0_real8  = scalars(i,var_rho)/central_density ! Back to JOREK unit for calling atomic_coeff_deuterium
+      
+      r0_real8  = r0_tmp/central_density ! Back to JOREK unit for calling atomic_coeff_deuterium
       if ( with_TiTe ) then
         T_real8 = scalars(i,var_Te)*1.e3*EL_CHG*MU_zero*(central_density * 1.d20) ! T_real8 back to JOREK units
         Te_corr_eV = corr_neg_temp(T_real8*2.d0)/(2.d0*EL_CHG*MU_ZERO*central_density*1.d20)
@@ -1809,7 +1874,7 @@ if (SI_units) then
       coef_rad_1 = (gamma-1.d0)*MU_ZERO**1.5d0*(central_mass*ATOMIC_MASS_UNIT)**0.5d0*(central_density*1.d20)**2.5d0
 
       ksi_ion_norm = ksi_ion * central_density * 1.d20
-      rn0_real8 = scalars(i,8)/central_density
+      rn0_real8 = scalars(i,var_rhon)/central_density
 
       if ( with_TiTe ) then
         call atomic_coeff_deuterium(T_real8, Sion_T, dSion_dT, Srec_T, dSrec_dT, LradDcont_T, dLradDcont_dT, &
@@ -1822,11 +1887,11 @@ if (SI_units) then
       eta_Sp = 1.65d-9*17*(1.d-3*Te_corr_eV)**(-1.5d0)
   
       scalars(i,ineu(1)) = ksi_ion_norm* (1.5d0)/(MU_zero*central_density*1.d20)      &
-                                          * scalars(i,var_rho) * 1.d20 * scalars(i,var_rhon) * 1.d20 * Sion_T / coef_ion_1
+                                          * r0_tmp * 1.d20 * scalars(i,var_rhon) * 1.d20 * Sion_T / coef_ion_1
 
-      scalars(i,ineu(2)) = scalars(i,var_rho)* 1.d20 * scalars(i,var_rhon) * 1.d20 * LradDrays_T/ coef_rad_1
+      scalars(i,ineu(2)) = r0_tmp* 1.d20 * scalars(i,var_rhon) * 1.d20 * LradDrays_T/ coef_rad_1
 
-      scalars(i,ineu(3)) = LradDcont_T * (scalars(i,var_rho)*1.d20)**2.d0 / coef_rad_1  !< outputs radiation power (i.e. what a bolometer would measure), rather than the radiative cooling
+      scalars(i,ineu(3)) = LradDcont_T * (r0_tmp*1.d20)**2.d0 / coef_rad_1  !< outputs radiation power (i.e. what a bolometer would measure), rather than the radiative cooling
 
       scalars(i,ineu(4)) = eta_Sp * (1.d6*scalars(i,var_zj))**2.d0
 #endif /* WITH_Neutrals but not WITH_Impurities */
@@ -1847,7 +1912,7 @@ if (SI_units) then
           else     
             Lrad_imp = 0.
           end if
-          scalars(i,iibg(i_imp)) = 1.d20 * scalars(i,var_rho) * nimp_bg(i_imp) * Lrad_imp 
+          scalars(i,iibg(i_imp)) = 1.d20 * r0_tmp * nimp_bg(i_imp) * Lrad_imp 
           frad_bg = frad_bg + nimp_bg(i_imp) * Lrad_imp
         end do
       else
@@ -1861,7 +1926,7 @@ if (SI_units) then
           stop
         end if
       end if
-      scalars(i,ibg_tot) = scalars(i,var_rho)*1.d20 * frad_bg
+      scalars(i,ibg_tot) = r0_tmp*1.d20 * frad_bg
     endif
 #endif /*(.not. with_Impurities)*/
 

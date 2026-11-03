@@ -23,13 +23,14 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 eta, visco, visco_par,                              &
                 restart, rst_format, regrid, bootstrap, write_ps,   &
                 bootstrap_psin_cutoff,                              &
-                regrid_from_rz,                                     &
+                regrid_from_rz, force_horizontal_Xline,             &
                 n_R, n_Z, n_radial, n_pol, n_tht, n_flux,           &
                 n_open, n_private, n_leg, n_leg_out, n_ext,         &
                 n_outer, n_inner, n_up_priv, n_up_leg, n_up_leg_out,&
                 n_tht_equidistant,                                  &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
                 XR_z, SIG_z, bgf_r, bgf_z, bgf_rpolar, bgf_tht,     &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
@@ -41,7 +42,6 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 R_geo, Z_geo, amin, mf, fbnd, fpsi, mode,           &
                 R_boundary, Z_boundary, psi_boundary, n_boundary,   &
                 R_Z_psi_bnd_file,                                   &
-                force_horizontal_Xline,                             &
                 n_pfc, manipulate_psi_map,                          &
                 Rmin_pfc, Rmax_pfc, Zmin_pfc, Zmax_pfc, current_pfc,&
                 n_jropes,                                           &
@@ -133,12 +133,12 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 RMP_psi_cos_file, RMP_psi_sin_file,                 &
                 V_0,V_1,V_coef, output_bnd_elements,                &
                 n_limiter, R_limiter, Z_limiter,                    &
-                first_target_point, last_target_point,		    &
+                first_target_point, last_target_point,              &
                 R_Z_psi_bnd_file, wall_file,time_evol_scheme,       &
                 spi_tor_rot, tor_frequency, spi_num_vol,            &
                 NEO, neo_file, aki_neo_const, amu_neo_const,        &
                 D_prof_neg_thresh, ZK_prof_neg_thresh, T_min,       &
-				T_min_neg,rho_min_neg,                              &
+                T_min_neg,rho_min_neg,                              &
                 ne_SI_min, Te_eV_min, rn0_min,                      &
                 D_neutral_x, D_neutral_y, D_neutral_p,              &
                 neutral_reflection, rho_min,                        &
@@ -182,12 +182,10 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 tgnum_psi, tgnum_u, tgnum_zj, tgnum_w, tgnum_rho,   &
                 tgnum_T, tgnum_Ti, tgnum_Te, tgnum_vpar, tgnum_rhon,&
                 tgnum_nre, tgnum_AR, tgnum_AZ, tgnum_A3,            &
-                n_particles, tstep_particles, nstep_particles,      &
+                tstep_particles, nstep_particles,      &
                 nsubstep_particles,                                 &
                 filter_perp,    filter_hyper,    filter_par,        &
                 filter_perp_n0, filter_hyper_n0, filter_par_n0,     &
-                use_kn_cx, use_kn_sputtering, use_kn_ionisation,             &
-                use_ncs, use_pcs, use_ccs,                          &
                 min_sheath_angle, bcs, cte_current_FB_fact, vacuum_min,    &
                 export_aux_node_list, xpoint_search_tries,          &
                 use_manual_random_seed, manual_seed,                &

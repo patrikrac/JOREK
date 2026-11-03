@@ -138,7 +138,7 @@ module mod_pastix
     type(type_PASTIX_SOLVER)             :: ptss
     type(type_SP_MATRIX)                 :: ad_mat, ac_mat
     integer                              :: tag
-    integer                              :: n_cpu, my_id, ierr, comm
+    integer                              :: n_mpi, my_id, ierr, comm
     integer(kind=int_all)                :: i, k, nnzg
     integer*8                            :: check_data
     integer                              :: block_size, block_size2, dof
@@ -155,7 +155,7 @@ module mod_pastix
     comm = ad_mat%comm
 
     call MPI_COMM_RANK(comm, my_id, ierr)
-    call MPI_COMM_SIZE(comm, n_cpu, ierr)
+    call MPI_COMM_SIZE(comm, n_mpi, ierr)
 
     if (.not.ptss%equilibrium) then
 
@@ -172,7 +172,7 @@ module mod_pastix
     endif
 
   ! centralize matrix if it's not distributed by columns; then it will be reduced and distributed
-    centralize = (n_cpu.gt.1).and.(.not.ad_mat%col_distributed)
+    centralize = (n_mpi.gt.1).and.(.not.ad_mat%col_distributed)
     if (centralize) then
   ! new ac_mat is allocated, ad_mat is deallocated
       call clck_time(t0)
@@ -349,30 +349,30 @@ module mod_pastix
 
     integer(kind=int_all), intent(out) :: jmin, jmax
 
-    integer :: n_cpu, my_id, comm, ierr
+    integer :: n_mpi, my_id, comm, ierr
     integer :: i, j, indx
 
     integer(kind=int_all), allocatable :: dist(:), myelm(:)
 
     call MPI_Comm_rank(ac_mat%comm, my_id, ierr)
-    call MPI_Comm_size(ac_mat%comm, n_cpu, ierr)
+    call MPI_Comm_size(ac_mat%comm, n_mpi, ierr)
 
     if (allocated(dist)) deallocate(dist)
-    allocate(dist(n_cpu + 1))
+    allocate(dist(n_mpi + 1))
 
-    ! number of rows/columns per cpu with the last one getting extra
-    dist(2:n_cpu + 1) = ac_mat%block_size*((ac_mat%ng/ac_mat%block_size)/n_cpu)
-    dist(n_cpu + 1) = dist(n_cpu + 1) + (ac_mat%ng - sum(dist(2:n_cpu + 1)))
+    ! number of rows/columns per mpi with the last one getting extra
+    dist(2:n_mpi + 1) = ac_mat%block_size*((ac_mat%ng/ac_mat%block_size)/n_mpi)
+    dist(n_mpi + 1) = dist(n_mpi + 1) + (ac_mat%ng - sum(dist(2:n_mpi + 1)))
 
     dist(1) = ac_mat%indexing
-    do i = 2, n_cpu + 1
+    do i = 2, n_mpi + 1
       dist(i) = dist(i) + dist(i-1)
     enddo
 
     jmin = dist(my_id + 1)
     jmax = dist(my_id + 2) - 1
 
-    if (n_cpu.gt.1) then
+    if (n_mpi.gt.1) then
 
       allocate(myelm(ac_mat%nnz))
       j = 1
@@ -473,7 +473,7 @@ module mod_pastix
     integer                              :: tag
     type(clcktype)                       :: t_itstart, t0, t1, t2, t3
     real*8                               :: tsecond
-    integer                              :: n_cpu, my_id, ierr, comm
+    integer                              :: n_mpi, my_id, ierr, comm
     integer                              :: i, j
     integer(kind=int_all)                :: k, nnz
     integer*8                            :: check_data
@@ -486,7 +486,7 @@ module mod_pastix
     comm = ad_mat%comm
 
     call MPI_COMM_RANK(comm, my_id, ierr)
-    call MPI_COMM_SIZE(comm, n_cpu, ierr)
+    call MPI_COMM_SIZE(comm, n_mpi, ierr)
 
     if (.not.ptss%equilibrium .and. .not. ptss%projection) then
 
@@ -505,7 +505,7 @@ module mod_pastix
 ! centralize matrix if it's not distributed by columns; then it will be reduced and distributed
 ! use reduce if not row_distributed (meaning matrix is on my_id_n==0)
     distributed = ad_mat%row_distributed.or.ad_mat%col_distributed
-    if ((n_cpu.gt.1).and.(.not.distributed)) then
+    if ((n_mpi.gt.1).and.(.not.distributed)) then
     ! matrix comes from communication, thus must be broadcasted
       call clck_time(t0)
 
@@ -515,7 +515,7 @@ module mod_pastix
       if (tag .ge. 0)  write(*,FMT_TIMING) tag, '## Elapsed time mpi_bcast :', tsecond
 
 
-    elseif ((n_cpu.gt.1).and.(distributed)) then
+    elseif ((n_mpi.gt.1).and.(distributed)) then
     ! matrix comes from direct construction, thus must be all-gathered
       call clck_time(t0)
 
@@ -525,7 +525,7 @@ module mod_pastix
       if (tag .ge. 0)  write(*,FMT_TIMING) tag, '## Elapsed time mpi_gather :', tsecond
 
     else
-    ! matrix is already reduced (n_cpu = 1)
+    ! matrix is already reduced (n_mpi = 1)
       call ad_mat%move_to(ac_mat, with_data=.true.)
       ac_mat%reduced = .true.
     endif

@@ -18,7 +18,7 @@ real*8,  parameter :: TICK             = 1d-12                    !< Time precis
 !> Action abstract type, representing anything that can be done to a simulation
 type, abstract :: action
   !> Logging variable, set this in an initializer
-  character(len=20) :: name = "unset action" !< Event name for logging
+  character(len=50) :: name = "unset action" !< Event name for logging
   logical :: log = .false. !< Output event duration
 
   !> Timing variables
@@ -441,13 +441,15 @@ subroutine do_count_action(this, sim, ev)
     n_alive = count(sim%groups(i_group)%particles(:)%i_elm .gt. 0)
     w_alive = sum(sim%groups(i_group)%particles(:)%weight, mask=sim%groups(i_group)%particles(:)%i_elm .gt. 0)
 
-    call MPI_Reduce(n_alive, n_alive_total, 1, MPI_INTEGER, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-    call MPI_Reduce(w_alive, w_alive_total, 1, MPI_REAL8, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_AllReduce(n_alive, n_alive_total, 1, MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, ierr)
+    call MPI_AllReduce(w_alive, w_alive_total, 1, MPI_REAL8, MPI_SUM, MPI_COMM_WORLD, ierr)
 
     if (sim%my_id .eq. 0) then
       write(*,'(A,g16.8,A,i2,A,i9,A,2g16.8)') 'Number of particles at ', sim%time, " in group ", i_group, ": ", n_alive_total,&
                                                ", w=", w_alive_total, sim%groups(i_group)%particles(1)%weight*n_alive_total
     end if
+
+    sim%groups(i_group)%average_weight = w_alive_total / n_alive_total
   end do
 end subroutine do_count_action
 
@@ -499,7 +501,7 @@ subroutine run(this, sim, ev)
   !$ w1 = omp_get_wtime()
 
   if (this%log) then
-    if (sim%n_cpu .gt. 1) then
+    if (sim%n_mpi .gt. 1) then
       mmm = mpi_minmeanmax(t1-this%t0)
       !$ mmm2 = mpi_minmeanmax(w1-this%w0)
       if (sim%my_id .eq. 0) then
@@ -537,15 +539,15 @@ function mpi_minmeanmax(in) result(out)
   use mpi
   real*8, intent(in) :: in
   real*8 :: out(3)
-  integer :: n_cpu, my_id, ierr
+  integer :: n_mpi, my_id, ierr
   real*8, allocatable :: in_all(:)
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)
-  allocate(in_all(n_cpu))
+  allocate(in_all(n_mpi))
   call MPI_Gather(in, 1, MPI_REAL8, in_all, 1, MPI_REAL8, 0, MPI_COMM_WORLd, ierr)
   if (my_id .eq. 0) then
     out(1) = minval(in_all,1)
-    out(2) = sum(in_all,1)/real(n_cpu)
+    out(2) = sum(in_all,1)/real(n_mpi)
     out(3) = maxval(in_all,1)
   else
     out = 0.d0
@@ -559,18 +561,18 @@ function mpi_minmeanmedmax(in) result(out)
   use mod_quicksort
   real*8, intent(in) :: in
   real*8 :: out(4)
-  integer :: n_cpu, my_id, ierr
+  integer :: n_mpi, my_id, ierr
   real*8, allocatable :: in_all(:)
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)
-  allocate(in_all(n_cpu))
+  allocate(in_all(n_mpi))
   call MPI_Gather(in, 1, MPI_REAL8, in_all, 1, MPI_REAL8, 0, MPI_COMM_WORLd, ierr)
   if (my_id .eq. 0) then
     call quicksort(in_all)
     out(1) = in_all(1)
-    out(2) = sum(in_all,1)/real(n_cpu)
-    out(3) = in_all((n_cpu+1)/2)
-    out(4) = in_all(n_cpu)
+    out(2) = sum(in_all,1)/real(n_mpi)
+    out(3) = in_all((n_mpi+1)/2)
+    out(4) = in_all(n_mpi)
   else
     out = 0.d0
   end if

@@ -60,14 +60,14 @@ end subroutine add_exchange_rules
 
 
 !> Exchange some indices of grid nodes in order to parallelize the vacuum boundary integral.
-subroutine initialize(node_list, my_id, n_cpu)
+subroutine initialize(node_list, my_id, n_mpi)
   
   use data_structure
   
   ! --- Routine parameters
   type(type_node_list), intent(inout) :: node_list
   integer,              intent(in)    :: my_id
-  integer,              intent(in)    :: n_cpu
+  integer,              intent(in)    :: n_mpi
 
   ! --- Local variables
   integer, allocatable :: first_index_usable(:), mm(:)
@@ -83,7 +83,7 @@ subroutine initialize(node_list, my_id, n_cpu)
     if ( node_list%node(i)%boundary > 0 ) n_bnd = n_bnd + 1
   end do
   if ( DEBUG_OUTPUT .and. (my_id == 0) ) then
-    write(*,*) 'n_cpu   =', n_cpu
+    write(*,*) 'n_mpi   =', n_mpi
     write(*,*) 'ind_max =', ind_max
     write(*,*) 'n_bnd   =', n_bnd
   end if
@@ -92,12 +92,12 @@ subroutine initialize(node_list, my_id, n_cpu)
   !     (as distribute_nodes_elements will be called only later on)
   if ( allocated(index_min) ) deallocate( index_min )
   if ( allocated(index_max) ) deallocate( index_max )
-  allocate( index_min(n_cpu), index_max(n_cpu) )
+  allocate( index_min(n_mpi), index_max(n_mpi) )
   index_min(1) = 1
-  do i = 1, n_cpu
-    index_max(i) = (i * ind_max) / n_cpu
+  do i = 1, n_mpi
+    index_max(i) = (i * ind_max) / n_mpi
   enddo
-  do i=2,n_cpu
+  do i=2,n_mpi
     index_min(i) = index_max(i-1) + 1
   enddo
   if ( DEBUG_OUTPUT ) then
@@ -112,10 +112,10 @@ subroutine initialize(node_list, my_id, n_cpu)
   if ( allocated(first_index_usable) ) deallocate( first_index_usable )
   if ( allocated(mm) )                 deallocate( mm )
   allocate(exchange_table(n_bnd*8,2))
-  allocate(first_index_usable(n_cpu))
-  allocate(mm(n_cpu))
+  allocate(first_index_usable(n_mpi))
+  allocate(mm(n_mpi))
   first_index_usable(:) = 999999
-  ii: do i = 1, n_cpu
+  ii: do i = 1, n_mpi
     do j = 1, node_list%n_nodes
       if ( is_responsible(node_list%node(j)%index(1), i) .and. (node_list%node(j)%index(1)>1) ) then
         first_index_usable(i) = MIN(first_index_usable(i), node_list%node(j)%index(1))
@@ -137,9 +137,9 @@ subroutine initialize(node_list, my_id, n_cpu)
   if ( DEBUG_OUTPUT ) write(*,*) 'mm before:', mm(:)
   do i = 1, node_list%n_nodes
     if ( node_list%node(i)%boundary > 0 ) then
-      k = (real(m)/real(n_bnd-1))*(n_cpu-1) + 1 ! with which MPI rank to we want to exchange this index?
+      k = (real(m)/real(n_bnd-1))*(n_mpi-1) + 1 ! with which MPI rank to we want to exchange this index?
       m = m + 1
-      if ( k == n_cpu ) cycle ! the last MPI rank doesn't need to exchange with itself
+      if ( k == n_mpi ) cycle ! the last MPI rank doesn't need to exchange with itself
       do l = 1, 4 ! the four dofs of one node
         ind1    = node_list%node(i)%index(l) ! exchange this index
         ind2    = mm(k) + l - 1              ! with this one for which MPI rank k is responsible
@@ -162,14 +162,14 @@ end subroutine initialize
 
   
 !> Exchange some indices of grid nodes in order to parallelize the vacuum boundary integral.
-subroutine exchange_indices(node_list, my_id, n_cpu, back)
+subroutine exchange_indices(node_list, my_id, n_mpi, back)
   
   use data_structure
     
   ! --- Routine parameters
   type(type_node_list), intent(inout) :: node_list
   integer,              intent(in)    :: my_id
-  integer,              intent(in)    :: n_cpu
+  integer,              intent(in)    :: n_mpi
   logical,              intent(in)    :: back   !< Change indices back (used to check alternating
                                                 !! order of forth and back exchanges only)
   
@@ -185,9 +185,9 @@ subroutine exchange_indices(node_list, my_id, n_cpu, back)
   
   ! --- A few checks and warnings
   if ( my_id == 0 ) write(*,*) 'EXCHANGE_INDICES to enhance free boundary simulation performance'
-  if ( DEBUG_OUTPUT ) write(*,*) my_id, n_cpu, back
+  if ( DEBUG_OUTPUT ) write(*,*) my_id, n_mpi, back
   
-  if ( n_cpu == 1 ) then
+  if ( n_mpi == 1 ) then
     write(*,*) my_id, 'Remark: Exchange_indices is skipped as you are running with a single MPI task.'
     return
   else if ( indices_exchanged .neqv. back ) then
@@ -199,7 +199,7 @@ subroutine exchange_indices(node_list, my_id, n_cpu, back)
   end if
   
   ! --- Initialize when called the first time in a run (or after a grid change)
-  if ( .not. initialized ) call initialize(node_list, my_id, n_cpu)
+  if ( .not. initialized ) call initialize(node_list, my_id, n_mpi)
 
   ! --- Exchange the indices
   l = 0

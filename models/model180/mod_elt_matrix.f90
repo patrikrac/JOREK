@@ -82,7 +82,7 @@ theta = time_evol_theta
 ! change zeta for variable dt
 zeta  = time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
 
-s_norm_s = 1.d0/float(n_flux-1)
+s_norm_s = 1.d0 * bloating_factor /float(n_flux-1)
 
 !---------------------------------------------------- value of (x,y) and derivatives on Gaussian points
 x_g  = 0.d0; x_s   = 0.d0; x_t   = 0.d0; x_p = 0.d0; x_st  = 0.d0; x_ss  = 0.d0; x_tt  = 0.d0; x_sp = 0.d0; x_tp = 0.d0; x_pp = 0.d0;

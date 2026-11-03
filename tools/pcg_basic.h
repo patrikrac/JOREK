@@ -27,12 +27,7 @@
  * has many additional features and is preferable if you can use C++ in
  * your project.
  */
-
-/*
- * 2016-06-06 the JOREK team: Add function to generate random doubles (with 2^-32 precision)
- * 2017-02-02 the JOREK team: Copy jumpahead from full pcg c library
- */
-
+ 
 #ifndef PCG_BASIC_H_INCLUDED
 #define PCG_BASIC_H_INCLUDED 1
 

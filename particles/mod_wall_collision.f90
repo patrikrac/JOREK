@@ -95,11 +95,11 @@ subroutine mod_wall_collision_export(sim, file, iangle_groups)
 
   character(len=5) :: group_name
   integer(HID_T) :: file_id, group_id
-  integer :: ierr, my_id, n_cpu, n_total, n_here, minid, maxid, i, j, k, i_elm
+  integer :: ierr, my_id, n_mpi, n_total, n_here, minid, maxid, i, j, k, i_elm
   real*8 :: E(3), B(3), psi, U, gamma
 
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)
 
   if ( my_id .eq. 0 ) then
      call HDF5_create(file, file_id, ierr)
@@ -126,7 +126,7 @@ subroutine mod_wall_collision_export(sim, file, iangle_groups)
         end if
 
         ! Find total number of markers and number of markers in this process
-        allocate(particles_per_proc(0:n_cpu-1))
+        allocate(particles_per_proc(0:n_mpi-1))
         particles_per_proc = 0
         n_here = size(sim%groups(i)%particles,1)
         call MPI_Gather(n_here,1,MPI_INTEGER,&
@@ -168,19 +168,19 @@ subroutine mod_wall_collision_export(sim, file, iangle_groups)
         ! Gather data from other processes
         allocate( wall_id_all(n_total), weight_all(n_total), energy_all(n_total), iangle_all(n_total) )
         call MPI_Gatherv(wall_id(:), n_here, MPI_INTEGER, &
-             wall_id_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_cpu-1)], &
+             wall_id_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_mpi-1)], &
              MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
 
         call MPI_Gatherv(weight(:), n_here, MPI_REAL8, &
-             weight_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_cpu-1)], &
+             weight_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_mpi-1)], &
              MPI_REAL8, 0, MPI_COMM_WORLD, ierr)
 
         call MPI_Gatherv(energy(:), n_here, MPI_REAL8, &
-             energy_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_cpu-1)], &
+             energy_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_mpi-1)], &
              MPI_REAL8, 0, MPI_COMM_WORLD, ierr)
 
         call MPI_Gatherv(iangle(:), n_here, MPI_REAL8, &
-             iangle_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_cpu-1)], &
+             iangle_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_mpi-1)], &
              MPI_REAL8, 0, MPI_COMM_WORLD, ierr)
 
         deallocate(particles_per_proc, wall_id, energy, weight, iangle)

@@ -218,6 +218,8 @@ do i=1, element_list%n_elements
         r_av = (r_psi(1)+r_psi(2)+r_psi(3)+r_psi(4))/4.d0
         s_av = (s_psi(1)+s_psi(2)+s_psi(3)+s_psi(4))/4.d0
 
+        if (maxval(abs(r_psi(1:4)-r_av))+maxval(abs(s_psi(1:4)-s_av)) < 1.d-14) cycle ! to skip degenerate element-surface crossing at (0,0)
+
         tht(1:4) = atan2(s_psi(1:4)-s_av,r_psi(1:4)-r_av)
 
         where (tht .lt. 0.d0) tht = tht + 2.d0*PI

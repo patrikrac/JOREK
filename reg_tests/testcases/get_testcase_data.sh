@@ -25,7 +25,7 @@ if [ -f ${TGZFILE} ]; then
 fi
 
 echo "Downloading ${TGZFILE}"
-wget -q --user=nrt --password=nrt_21745XtL ${DAV_URL}/${TGZFILE}
+wget -q ${DAV_URL}/${TGZFILE}
 returncode=$?
 if [ $returncode -ne 0 ]; then
   cat <<EOF

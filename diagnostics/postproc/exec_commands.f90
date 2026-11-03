@@ -215,6 +215,8 @@ module exec_commands
           call q_at_given_psin(command, first_step, ierr)
         case ( 'find_q_surface' )
           call find_q_surface(command, first_step, ierr)
+        case ( 'pol_contour_integrals' )
+          call pol_contour_integrals(command, first_step, ierr)
         case ( 'separatrix' )
           call separatrix(command, ierr)
         case ( 'set' )
@@ -246,7 +248,7 @@ module exec_commands
           'gourdon', 'jorek-units', 'jnorm_bnd_curr', 'si-units', 'grid', 'grid_diagnostics',      &
           'rectangle', 'rectangular_torus', 'energy_spectrum', 'average_h5', 'I_halo_TPF',         &
           'spi-state', 'shards', 'zeroD_quantities', 'boundary_quantities', 'find_q_surface',      &
-          'midplane2d', 'expressions_four', 'RHS_terms_vtk')
+          'pol_contour_integrals', 'midplane2d', 'expressions_four', 'RHS_terms_vtk')
           call add_to_command_queue(command, ierr)
         case ( 'help' )
           call help(command, ierr)
@@ -2513,7 +2515,7 @@ module exec_commands
     
     ! --- Find the PsiN locations
     npsi = 0
-    do i = 1, npts-1
+    do i = 2, npts-1  ! to avoid first and last point of q-profile which often is bad especially the first point is always zero
       if ( (q(i)-qvalue)*(q(i+1)-qvalue) < 0.d0 ) then ! is it between these two points?
         npsi = npsi + 1
         psi_values(npsi) = surface_list%psi_values(i) + ( surface_list%psi_values(i+1)-surface_list%psi_values(i) ) * (qvalue-q(i))/(q(i+1)-q(i))
@@ -2589,6 +2591,258 @@ module exec_commands
     
   end subroutine find_q_surface
   
+
+
+
+
+
+  !> integrals of poloidal flux contours performed as in export_helena
+  !!
+  !! Output columns:
+  !!   Psi_n     \oint R/|gradPsi|dl_pol     \oint R*|gradPsi|dl_pol   ...
+  !!
+  !! Usage:
+  !!   pol_contour_integrals
+  !!   pol_contour_integrals <n_flux>     ! optional number of flux surfaces (default: setting "surfaces")
+  subroutine pol_contour_integrals(command, first_step, ierr)
+
+    use mod_interp, only: interp, interp_RZ
+    use mod_sources
+
+    implicit none
+
+    ! --- Routine parameters
+    type(type_command), intent(in)  :: command
+    logical,            intent(in)  :: first_step
+    integer,            intent(out) :: ierr
+
+    ! --- Local variables
+    type(type_surface_list) :: surface_list
+    type(t_expr_list)       :: tmp_expr_list
+    character(len=1024)     :: filename, comment
+
+    integer :: n_flux, i, k, ig, i_elm
+    real*8  :: s_value
+
+    ! --- Gaussian points/weights (4-pt Gauss-Legendre on [-1,1])
+    real*8 :: xgs(4), wgs(4)
+    data xgs /-0.861136311594053d0, -0.339981043584856d0,  0.339981043584856d0,  0.861136311594053d0/
+    data wgs / 0.347854845137454d0,  0.652145154862546d0,  0.652145154862546d0,  0.347854845137454d0/
+
+    ! --- Variables copied from export_helena’s contour integral block
+    real*8 :: rr1, drr1, rr2, drr2, ss1, dss1, ss2, dss2
+    real*8 :: t, ri, dri, si, dsi
+    real*8 :: dp_int, zjz_int, sum_dl, qint, dl, dp_dpsi
+
+    real*8 :: PSgi, dPSgi_dr, dPSgi_ds, dPSgi_drs, dPSgi_drr, dPSgi_dss
+    real*8 :: R0gi, dR0gi_dr, dR0gi_ds, dR0gi_drs, dR0gi_drr, dR0gi_dss
+    real*8 :: T0gi, dT0gi_dr, dT0gi_ds, dT0gi_drs, dT0gi_drr, dT0gi_dss
+    real*8 :: Ti0gi, dTi0gi_dr, dTi0gi_ds, dTi0gi_drs, dTi0gi_drr, dTi0gi_dss
+    real*8 :: Te0gi, dTe0gi_dr, dTe0gi_ds, dTe0gi_drs, dTe0gi_drr, dTe0gi_dss
+    real*8 :: ZJgi, dZJgi_dr, dZJgi_ds, dZJgi_drs, dZJgi_drr, dZJgi_dss
+
+    real*8 :: RRgi, dRRgi_dr, dRRgi_ds, dRRgi_drs, dRRgi_drr, dRRgi_dss
+    real*8 :: ZZgi, dZZgi_dr, dZZgi_ds, dZZgi_drs, dZZgi_drr, dZZgi_dss
+    real*8 :: dRRgi_dt, dZZgi_dt
+    real*8 :: RZjac, PSI_R, PSI_Z, grad_psi
+    real*8 :: P0gi, dP0gi_dr, dP0gi_ds, P0_R, P0_Z
+
+    real*8 :: n_prof,   dn_dpsi, dn_dz,  dn_dpsi2,  dn_dz2,  dn_dpsi_dz,  dn_dpsi3,  dn_dpsi_dz2,  dn_dpsi2_dz
+    real*8 :: T_prof,   dT_dpsi, dT_dz,  dT_dpsi2,  dT_dz2,  dT_dpsi_dz,  dT_dpsi3,  dT_dpsi_dz2,  dT_dpsi2_dz
+    real*8 :: Ti_prof,  dTi_dpsi,dTi_dz, dTi_dpsi2, dTi_dz2, dTi_dpsi_dz, dTi_dpsi3, dTi_dpsi_dz2, dTi_dpsi2_dz
+    real*8 :: Te_prof,  dTe_dpsi,dTe_dz, dTe_dpsi2, dTe_dz2, dTe_dpsi_dz, dTe_dpsi3, dTe_dpsi_dz2, dTe_dpsi2_dz
+    real*8 :: particle_source, heat_source, heat_source_i, heat_source_e
+
+    real*8 :: psi_axis,  int1, int2, psi_val
+
+
+    ierr = 0
+
+    ! --- Checks
+    call check_args(command%n_args, ierr, 0, 1); if ( ierr /= 0 ) return
+    call check_step_imported(ierr);             if ( ierr /= 0 ) return
+
+    ! --- Choose number of surfaces
+    if (command%n_args == 1) then
+      n_flux = to_int(command%args(1), ierr); if ( ierr /= 0 ) return
+    else
+      n_flux = get_int_setting('surfaces', ierr); if ( ierr /= 0 ) return
+    end if
+    if (n_flux < 3) then
+      write(*,*) 'ERROR in qprofile_contour: need at least 3 surfaces.'
+      ierr = 1
+      return
+    end if
+
+    ! --- Output filename
+    write(filename,'(4a)') trim(DIR), 'pol_contour_integrals', trim(step_range_string(loop_min_step,loop_max_step)), '.dat'
+    write(comment,'(a,i6.6)') 'time step #', index_now
+
+    ! --- Build Psi grid 
+    surface_list%n_psi = n_flux
+    allocate(surface_list%psi_values(n_flux))
+    do i = 1, n_flux
+      s_value = dble(i) / dble(n_flux)
+      surface_list%psi_values(i) = ES%psi_axis + s_value * (ES%psi_bnd - ES%psi_axis)
+    end do
+
+    ! --- Find the surfaces
+    call find_flux_surfaces(0, ES%xpoint, ES%xcase, node_list, element_list, surface_list)
+
+    ! --- Prepare output array: (n_flux-1) rows, 18 columns
+    allocate(res1d(n_flux-1, 18))
+
+    ! --- Loop surfaces (skip i=1 like export_helena)
+    do i = 2, surface_list%n_psi
+
+      sum_dl  = 0.d0
+      qint    = 0.d0
+      int1    = 0.d0
+      int2    = 0.d0
+
+      do k = 1, surface_list%flux_surfaces(i)%n_pieces
+        do ig = 1, 4
+
+          t = xgs(ig)
+
+          rr1  = surface_list%flux_surfaces(i)%s(1,k)
+          drr1 = surface_list%flux_surfaces(i)%s(2,k)
+          rr2  = surface_list%flux_surfaces(i)%s(3,k)
+          drr2 = surface_list%flux_surfaces(i)%s(4,k)
+
+          ss1  = surface_list%flux_surfaces(i)%t(1,k)
+          dss1 = surface_list%flux_surfaces(i)%t(2,k)
+          ss2  = surface_list%flux_surfaces(i)%t(3,k)
+          dss2 = surface_list%flux_surfaces(i)%t(4,k)
+
+          call CUB1D(rr1, drr1, rr2, drr2, t, ri, dri)
+          call CUB1D(ss1, dss1, ss2, dss2, t, si, dsi)
+
+          i_elm = surface_list%flux_surfaces(i)%elm(k)
+
+          call interp(node_list,element_list,i_elm,var_psi,1,ri,si,PSgi,dPSgi_dr,dPSgi_ds,dPSgi_drs,dPSgi_drr,dPSgi_dss)
+
+          call interp_RZ(node_list,element_list,i_elm,ri,si,RRgi,dRRgi_dr,dRRgi_ds,dRRgi_drs,dRRgi_drr,dRRgi_dss, &
+                                                        ZZgi,dZZgi_dr,dZZgi_ds,dZZgi_drs,dZZgi_drr,dZZgi_dss)
+
+          ! Avoid open flux surfaces
+          if (get_psi_n(PSgi,ZZgi) >= 1.d0)  cycle
+
+          dRRgi_dt = dRRgi_dr * dri + dRRgi_ds * dsi
+          dZZgi_dt = dZZgi_dr * dri + dZZgi_ds * dsi
+
+          dl = sqrt(dRRgi_dt**2 + dZZgi_dt**2)
+
+          RZjac = dRRgi_dr * dZZgi_ds - dRRgi_ds * dZZgi_dr
+
+          PSI_R = (   dPSgi_dr * dZZgi_ds - dPSgi_ds * dZZgi_dr ) / RZjac
+          PSI_Z = ( - dPSgi_dr * dRRgi_ds + dPSgi_ds * dRRgi_dr ) / RZjac
+
+          grad_psi = sqrt(PSI_R*PSI_R + PSI_Z*PSI_Z)
+
+          sum_dl  = sum_dl  + wgs(ig) * dl
+          qint    = qint    + wgs(ig) * (1.d0/(RRgi*grad_psi)) * dl
+          int1    = int1    + wgs(ig) * RRgi / grad_psi * dl
+          int2    = int2    + wgs(ig) * RRgi * grad_psi * dl
+
+        end do
+      end do
+
+      if (sum_dl == 0.d0) then
+        sum_dl = 1.d99
+        write(*,*) 'WARNING: qprofile_contour: sum_dl==0 on surface i=', i
+      end if
+
+      psi_val = surface_list%psi_values(i)
+
+
+      ! --- Get input rho and Te profiles
+      call density(ES%xpoint, ES%xcase, ES%Z_axis, ES%Z_xpoint, psi_val, ES%psi_axis, ES%psi_bnd, &
+                   n_prof, dn_dpsi,dn_dz,dn_dpsi2,dn_dz2,dn_dpsi_dz,dn_dpsi3,dn_dpsi_dz2, dn_dpsi2_dz)
+
+      if ( with_TiTe ) then
+        call temperature_i(ES%xpoint, ES%xcase, ES%Z_axis, ES%Z_xpoint, psi_val, ES%psi_axis, ES%psi_bnd, &
+                    Ti_prof, dTi_dpsi,dTi_dz,dTi_dpsi2,dTi_dz2,dTi_dpsi_dz,dTi_dpsi3,dTi_dpsi_dz2, dTi_dpsi2_dz)
+
+        call temperature_e(ES%xpoint, ES%xcase, ES%Z_axis, ES%Z_xpoint, psi_val, ES%psi_axis, ES%psi_bnd, &
+                    Te_prof, dTe_dpsi,dTe_dz,dTe_dpsi2,dTe_dz2,dTe_dpsi_dz,dTe_dpsi3,dTe_dpsi_dz2, dTe_dpsi2_dz)
+      else
+        call temperature(ES%xpoint, ES%xcase, ES%Z_axis, ES%Z_xpoint, psi_val, ES%psi_axis, ES%psi_bnd, &
+                    T_prof, dT_dpsi,dT_dz,dT_dpsi2,dT_dz2,dT_dpsi_dz,dT_dpsi3,dT_dpsi_dz2, dT_dpsi2_dz)
+      end if
+
+      ! --- Get input sources
+#ifdef WITH_TiTe
+        call sources(ES%xpoint, ES%xcase, ES%Z_axis, ES%Z_xpoint, psi_val, ES%psi_axis, ES%psi_bnd, &
+                     particle_source, heat_source_i, heat_source_e)
+#else
+        call sources(ES%xpoint, ES%xcase, ES%Z_axis, ES%Z_xpoint, psi_val, ES%psi_axis, ES%psi_bnd, &
+                     particle_source, heat_source)
+#endif
+
+      res1d(i-1,1) = get_psi_n(psi_val)
+      res1d(i-1,2) = int1
+      res1d(i-1,3) = int2
+      res1d(i-1,4) = F0 * qint / (2.d0 * PI)
+      res1d(i-1,5) = n_prof
+      res1d(i-1,6) = dn_dpsi * (ES%Psi_bnd-ES%psi_axis)
+      res1d(i-1,7) = particle_source
+      if (with_TiTe) then
+        res1d(i-1,8)  = Ti_prof 
+        res1d(i-1,9)  = dTi_dpsi * (ES%Psi_bnd-ES%psi_axis)
+        res1d(i-1,10) = Te_prof 
+        res1d(i-1,11) = dTe_dpsi * (ES%Psi_bnd-ES%psi_axis)
+        res1d(i-1,12) = Ti_prof + Te_prof 
+        res1d(i-1,13) = (dTi_dpsi + dTe_dpsi) * (ES%Psi_bnd-ES%psi_axis)
+        res1d(i-1,14) = heat_source_i
+        res1d(i-1,15) = heat_source_e
+        res1d(i-1,16) = heat_source_i + heat_source_e
+      else
+        res1d(i-1,8)  = T_prof  * 0.5d0
+        res1d(i-1,9)  = dT_dpsi * (ES%Psi_bnd-ES%psi_axis) * 0.5d0
+        res1d(i-1,10) = T_prof  * 0.5d0
+        res1d(i-1,11) = dT_dpsi * (ES%Psi_bnd-ES%psi_axis) * 0.5d0
+        res1d(i-1,12) = T_prof 
+        res1d(i-1,13) = dT_dpsi * (ES%Psi_bnd-ES%psi_axis)
+        res1d(i-1,14) = heat_source * 0.5d0
+        res1d(i-1,15) = heat_source * 0.5d0
+        res1d(i-1,16) = heat_source
+      endif
+      res1d(i-1,17) = ES%psi_axis
+      res1d(i-1,18) = ES%psi_bnd
+
+    end do ! psi surfaces
+
+    ! --- Write out (table with header/comments like other postproc commands)
+    tmp_expr_list%n_expr = 18
+    tmp_expr_list%expr(1)%name = 'Psi_n'
+    tmp_expr_list%expr(2)%name = 'R/|gradPsi|'
+    tmp_expr_list%expr(3)%name = 'R|gradPsi|'
+    tmp_expr_list%expr(4)%name = 'q'
+    tmp_expr_list%expr(5)%name = 'density'
+    tmp_expr_list%expr(6)%name = 'dn_dpsin'
+    tmp_expr_list%expr(7)%name = 'src_part'
+    tmp_expr_list%expr(8)%name = 'Ti'
+    tmp_expr_list%expr(9)%name = 'dTi_dpsin'
+    tmp_expr_list%expr(10)%name = 'Te'
+    tmp_expr_list%expr(11)%name = 'dTe_dpsin'
+    tmp_expr_list%expr(12)%name = 'T'
+    tmp_expr_list%expr(13)%name = 'dT_dpsin'
+    tmp_expr_list%expr(14)%name = 'src_heat_i'
+    tmp_expr_list%expr(15)%name = 'src_heat_e'
+    tmp_expr_list%expr(16)%name = 'src_heat'
+    tmp_expr_list%expr(17)%name = 'psi_axis'
+    tmp_expr_list%expr(18)%name = 'psi_bnd'
+
+    call write_ascii_1d(ierr, ES, tmp_expr_list, res1d, FORM_TABLE, header=.true., &
+      filename=trim(filename), append=(.not.first_step), blanks=.true., comment=trim(comment))
+
+    ! --- Clean up
+    if (allocated(surface_list%psi_values))    deallocate(surface_list%psi_values)
+    if (allocated(surface_list%flux_surfaces)) deallocate(surface_list%flux_surfaces)
+
+  end subroutine pol_contour_integrals
+
 
 
   
@@ -2939,7 +3193,7 @@ module exec_commands
     
     integer   :: MPI_COMM_N, MPI_GROUP_MASTER, MPI_GROUP_WORLD, MPI_COMM_MASTER, MPI_COMM_TRANS
     integer   :: my_id, my_id_n, my_id_master
-    integer   :: i_rank(n_tor), n_cpu, n_cpu_n, n_cpu_master, m_cpu, n_masters, n_cpu_trans, my_id_trans
+    integer   :: i_rank(n_tor), n_mpi, n_mpi_n, n_mpi_master, m_mpi, n_masters, n_mpi_trans, my_id_trans
     integer*4 :: rank, comm_size 
     integer   :: nnz
     integer*8 :: check_data
@@ -2973,7 +3227,7 @@ module exec_commands
 
     ! --- Determine number of MPI procs
     call MPI_COMM_SIZE(MPI_COMM_WORLD, comm_size, ierr)
-    n_cpu = comm_size
+    n_mpi = comm_size
   
     ! --- Determine ID of each MPI proc
     call MPI_COMM_RANK(MPI_COMM_WORLD, rank, ierr)
@@ -3082,7 +3336,7 @@ module exec_commands
     call update_time_evol_params()
   
     if ( index_start <= 1 ) then
-      tstep_prev = tstep
+      tstep_prev = tstep_rst
     else
       tstep_prev = xtime(index_start) - xtime(index_start-1)
     end if

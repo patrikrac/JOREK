@@ -29,5 +29,6 @@ export MPIRUN="mpirun -np "
 export BATCHCOMMAND="qsub"
 export CXXFLAGS=-O0 # problem with stdio library on ITER http://gcc.1065356.n8.nabble.com/g-4-8-fails-with-Ox-option-td953876.html
 
-export http_proxy=${JOREK_HTTP_PROXY}
-export https_proxy=${JOREK_HTTP_PROXY}
+# Set JOREK_HTTP_PROXY if your site needs an HTTP proxy for outbound access.
+export http_proxy="${JOREK_HTTP_PROXY:-}"
+export https_proxy="${JOREK_HTTP_PROXY:-}"

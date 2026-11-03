@@ -27,7 +27,8 @@ real*8  :: tol, delta_phi, Zjac, psi_s, psi_t, R_in, Z_in, R_out, Z_out, Rmin, R
 real*8  :: small_delta, small_delta_s, small_delta_t, delta_phi_local, delta_phi_step
 real*8  :: atmp, cur_pert
 real*8  :: psi_out
-integer :: ierr
+real*8  :: R_axis_loc, Z_axis_loc
+integer :: ierr, checked_elms
 
 
 write(*,*) '***************************************'
@@ -52,6 +53,10 @@ allocate(element_neighbours(4,element_list%n_elements))
 
 element_neighbours = 0
 
+!$omp parallel default(none) &
+!$omp   shared(node_list, element_list, element_neighbours) &
+!$omp   private(i,j,iside_i,iside_j)
+!$omp do
 do i=1,element_list%n_elements
   
   do j=i+1,element_list%n_elements
@@ -63,6 +68,8 @@ do i=1,element_list%n_elements
     
   enddo
 enddo
+!$omp end do
+!$omp end parallel
 
 !-------- possibilities
 ! - total length of traced field line (connection length)
@@ -134,10 +141,6 @@ if ( ierr == 0 ) then ! stpts file exists, use it.
     curr = nr
     
   end do
-#if STELLARATOR_MODEL
-  read(21,*) s
-  if (trim(adjustl(s)) .eq. "override_phi") P_start = 2.d0*pi*float(i_plane_rtree - 1)/float(n_period*n_plane)
-#endif
   close(21)
 
 else ! if no stpts file exists, use the following hard-coded default startpoints
@@ -202,7 +205,8 @@ endif
 !$omp shared(node_list, element_list, n_lines, R_start, Z_start, P_start, n_turn, n_phi, delta_phi, element_neighbours, ES, iplot_type) &
 !$omp private(i_lines, ip, R_out, Z_out, i_elm, s_out, t_out, ifail, R_line, Z_line, p_line, s_line, t_line, i_turn, i_phi, &
 !$omp         delta_phi_local, i_steps, delta_phi_step, delta_s, delta_t, s_mid, t_mid, p_mid, small_delta_s, small_delta_t, &
-!$omp         small_delta, R_in, Z_in, i_elm_prev, i_elm_tmp, R, Z, psi_out, Rp, Zp, Tp, Pp, i)
+!$omp         small_delta, R_in, Z_in, i_elm_prev, i_elm_tmp, R, Z, psi_out, Rp, Zp, Tp, Pp, i, checked_elms, &
+!$omp         R_axis_loc, Z_axis_loc)
 
 ! --- Trace the fieldlines
 !$omp do
@@ -214,8 +218,12 @@ L_IL: do i_lines=1,n_lines
   write(*,'(1x,2(a,i6),a,2f8.3)') 'Line',i_lines,' of',n_lines,' started at',R_start(i_lines),Z_start(i_lines)
 !$omp end critical
 
+#if STELLARATOR_MODEL
+  call find_RZP(node_list,element_list,R_start(i_lines),Z_start(i_lines),P_start(i_lines),R_out,Z_out,i_elm,s_out,t_out,ifail,checked_elms) 
+#else
   call find_RZ(node_list,element_list,R_start(i_lines),Z_start(i_lines),R_out,Z_out,i_elm,s_out,t_out,ifail)
- 
+#endif
+
   if (ifail .ne. 0) then
     write(*,*) "Can not find RZ,", ifail 
     stop
@@ -425,7 +433,13 @@ L_IL: do i_lines=1,n_lines
 
     Rp(ip) = R_line
     Zp(ip) = Z_line
-    Tp(ip)  = atan2( Z_line - ES%Z_axis, R_line - ES%R_axis)
+#if STELLARATOR_MODEL
+    call interp_RZP(node_list, element_list, 1, 0.d0, 0.d0, p_line, R_axis_loc, Z_axis_loc)
+#else
+    R_axis_loc = ES%R_axis
+    Z_axis_loc = ES%Z_axis
+#endif
+    Tp(ip)  = atan2( Z_line - Z_axis_loc, R_line - R_axis_loc)
     Pp(ip)  = get_psi_n(psi_out, Z_line)
 
     if (i_elm .eq. 0) exit

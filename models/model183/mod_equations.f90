@@ -59,6 +59,9 @@ module mod_equations
   integer, parameter  :: var_Bv2         = 2*n_var+36
   integer, parameter  :: var_B2          = 2*n_var+37
   integer, parameter  :: var_zero        = 2*n_var+38
+  integer, parameter  :: var_aux_E0      = 2*n_var+39   ! kinetic energy source from particle feedback
+  integer, parameter  :: var_aux_mom_par0 = 2*n_var+40  ! momentum source from particle feedback
+  integer, parameter  :: var_aux_rho0     = 2*n_var+41  ! density source from particle feedback
 
   ! Variables at current time step
   type(algexpr), parameter, private :: Psi0       = algexpr(basic=.true.,var=var_Psi)
@@ -120,6 +123,9 @@ module mod_equations
   type(algexpr), parameter, private :: k_perp_i    = algexpr(basic=.true.,var=var_k_perp_i   )
   type(algexpr), parameter, private :: k_perp_e    = algexpr(basic=.true.,var=var_k_perp_e   )
   type(algexpr), parameter, private :: S_e         = algexpr(basic=.true.,var=var_S_e        )
+  type(algexpr), parameter, private :: aux_E0      = algexpr(basic=.true.,var=var_aux_E0     )
+  type(algexpr), parameter, private :: aux_mom_par0 = algexpr(basic=.true., var=var_aux_mom_par0)
+  type(algexpr), parameter, private :: aux_rho0     = algexpr(basic=.true., var=var_aux_rho0 )
   type(algexpr), parameter, private :: S_e_i       = algexpr(basic=.true.,var=var_S_e_i      )
   type(algexpr), parameter, private :: S_e_e       = algexpr(basic=.true.,var=var_S_e_e      )
   type(algexpr), parameter, private :: S_phi_pol   = algexpr(basic=.true.,var=var_S_phi_pol  )
@@ -144,7 +150,9 @@ module mod_equations
 
   type(const), private :: tstep, zeta, theta 
   type(const), private :: visco_num, visco_par, visco_par_par, visco_par_num, nu_phi_source, eta_num, D_perp_num, k_perp_num, gamma, reta
-  
+  type(const), private :: freeze_flag ! to freeze equations correctly, also in rhs_automatic.h
+  type(const), private :: core_freeze ! freeze core artifically
+
   type(algexpr), public  :: rhs_semianalytic(n_var)
   type(algexpr), public  :: amat_semianalytic(n_var, n_var)
   type(algexpr), private :: a_Bv2, a_B2
@@ -164,7 +172,7 @@ module mod_equations
     use phys_module, only: time_evol_zeta, time_evol_theta, Igamma => gamma, Itstep => tstep, Ivisco_num => visco_num,    &
                            Ivisco_par => visco_par, Ivisco_par_par => visco_par_par, Ivisco_par_num => visco_par_num,     &
                            Ieta_num => eta_num, ID_perp_num => D_perp_num, zk_perp_num,  &
-                           Ieta => eta, eta_ohmic, Inu_phi_source => nu_phi_source
+                           Ieta => eta, eta_ohmic, Inu_phi_source => nu_phi_source, freeze_psi_dynamics
     implicit none
     
     integer  :: i, i_var, j_var
@@ -190,6 +198,8 @@ module mod_equations
     D_perp_num       = const(value = ID_perp_num,       token = "D_perp_num"   )
     k_perp_num       = const(value = zk_perp_num,       token = "zk_perp_num"  )
     gamma            = const(value = Igamma,            token = "gamma"        )
+    freeze_flag      = const(value = 1.d0,              token = "freeze_flag"  )
+    core_freeze      = const(value = 1.d0,              token = "core_freeze"  )
     if (Ieta .ne. 0.d0) then
       reta           = const(value = eta_ohmic/Ieta,  token = "reta")
     else
@@ -394,15 +404,15 @@ module mod_equations
                                + i_k_perp*gradprod(v,i_T0-i_T0_equil)                                 & ! K_perp grad(T)
                                + (i_k_par-i_k_perp)*B0_parderiv(v)*B0_parderiv(i_T0-i_T0_equil)/B2    & ! (K_par - K_perp) grad_par(T)
                                + k_perp_num*Lap(v)*Lap(i_T0-i_T0_equil)                               & ! ad-hoc hyper-conductivity
-                               + D_perp*i_T0*gradprod(v, rho0-rho0_equil)                             & ! D_perp T grad(rho)
-                               + (D_par - D_perp)*i_T0*B0_parderiv(v)*B0_parderiv(rho0-rho0_equil)/B2 & ! (D_par - D_perp) T grad_par(rho) 
+                               + gamma*D_perp*i_T0*gradprod(v, rho0-rho0_equil)                             & ! D_perp T grad(rho)   ! TEMP 5/2 T Gamma_perp (for EMC3)
+                               + gamma*(D_par - D_perp)*i_T0*B0_parderiv(v)*B0_parderiv(rho0-rho0_equil)/B2 & ! (D_par - D_perp) T grad_par(rho)   ! TEMP. Was 3/2 (EMC3)
                                - v*i_S_e)                                                             & ! heat source
                                + zeta*v*(rho0*i_delta_T + i_T0*delta_rho)                               ! dp_dt
 
       amat_semianalytic(i_var, var_Psi)  = tstep*theta*(v*vpar0*Bv_pbrack(rho0*i_T0, Psi)            & ! v_par.grad(p) component
                                          + gamma*v*rho0*i_T0*Bv_pbrack(vpar0, Psi)                   & ! gamma p div(v_par) component 
                                          + (i_k_par - i_k_perp)*gradDgrad_par(v,i_T0-i_T0_equil)     & ! (K_par - K_perp) grad_par(T)
-                                         + (D_par - D_perp)*i_T0*gradDgrad_par(v,rho0-rho0_equil))     ! (D_par - D_perp) T grad_par(rho)
+                                         + gamma*(D_par - D_perp)*i_T0*gradDgrad_par(v,rho0-rho0_equil))     ! (D_par - D_perp) T grad_par(rho) ! TEMP 5/2 T Gamma_perp (for EMC3
 
       amat_semianalytic(i_var, var_Phi)  = tstep*theta*v*(Bv_pbrack(rho0*i_T0,Phi)                   & ! v_ExB.grad(p) component
                                          - gamma*rho0*i_T0*Bv_pbrack(Bv2,Phi)/Bv2)/Bv2                 ! gamma p div(v_ExB) component
@@ -414,8 +424,8 @@ module mod_equations
                                          - gamma*v*rho*i_T0*Bv_pbrack(Bv2,Phi0)/(Bv2*Bv2)            & ! gamma p div(v_ExB) component
                                          + gamma*v*rho*i_T0*Bv_parderiv(vpar0)                       & ! gamma p div(v_par) component
                                          + gamma*v*rho*i_T0*Bv_pbrack(vpar0, Psi0)                   & ! gamma p div(v_par) component 
-                                         + D_perp*i_T0*gradprod(v,rho)                               & ! D_perp T grad(rho)
-                                         + (D_par - D_perp)*i_T0*B0_parderiv(v)*B0_parderiv(rho)/B2)   ! (D_par - D_perp) T grad_par(rho)
+                                         + gamma*D_perp*i_T0*gradprod(v,rho)                               & ! D_perp T grad(rho)           ! TEMP. Was 3/2 (EMC3)
+                                         + gamma*(D_par - D_perp)*i_T0*B0_parderiv(v)*B0_parderiv(rho)/B2)   ! (D_par - D_perp) T grad_par(rho)  ! TEMP. Was 3/2 (EMC3)
 
       amat_semianalytic(i_var, i_var)    = (1.d0 + zeta)*v*rho0*i_T                                          &  ! dp_dt
                                          + tstep*theta*(v*Bv_pbrack(rho0*i_T,Phi0)/Bv2                       &  ! v_ExB.grad(p) component 
@@ -428,8 +438,8 @@ module mod_equations
                                          + (i_k_par - i_k_perp)*B0_parderiv(v)*B0_parderiv(i_T)/B2           &  ! (K_par - K_perp) grad_par(T)
                                          + i_dk_par_dT*i_T*B0_parderiv(v)*B0_parderiv(i_T0-i_T0_equil)/B2    &  ! (K_par - K_perp) grad_par(T)
                                          + k_perp_num*Lap(v)*Lap(i_T)                                        &  ! ad-hoc hyper-conductivity
-                                         + D_perp*i_T*gradprod(v,rho0-rho0_equil)                            &  ! D_perp T grad(rho)
-                                         + (D_par - D_perp)*i_T*B0_parderiv(v)*B0_parderiv(rho0-rho0_equil)/B2) ! (D_par - D_perp) T grad_par(rho)
+                                         + gamma*D_perp*i_T*gradprod(v,rho0-rho0_equil)                            &  ! D_perp T grad(rho)  ! TEMP. Was 3/2 (EMC3)
+                                         + gamma*(D_par - D_perp)*i_T*B0_parderiv(v)*B0_parderiv(rho0-rho0_equil)/B2) ! (D_par - D_perp) T grad_par(rho)  ! TEMP. Was 3/2 (EMC3)
 
       if (with_vpar) then
         amat_semianalytic(i_var, var_vpar) = tstep*theta*(v*vpar*Bv_parderiv(rho0*i_T0)              &  ! v_par.grad(p) component
@@ -548,6 +558,79 @@ module mod_equations
       end if 
     endif
 
+    !###################################################################################################
+    !#  Kinetic Particle Coupling (NCS/ICS aux_* source terms)                                         #    
+    !#                                                                                                 #
+    !#  Density (conservative): bare S_rho.                        NCS only — aux_rho0=0 for ICS.      #
+    !#  Parallel momentum (conservative): bare S_v, no -v*S_rho correction.                            #
+    !#  Pressure/T (non-conservative): need FULL correction --> S_E + (-v.S_v) + (1/2 v^2 S_rho).      #
+    !###################################################################################################
+
+    rhs_semianalytic(var_rho) = rhs_semianalytic(var_rho) + tstep*v*aux_rho0
+    rhs_semianalytic(var_T)   = rhs_semianalytic(var_T)   + tstep*v*aux_E0
+
+    if (with_vpar) then
+
+      ! RHS vpar additions
+      rhs_semianalytic(var_vpar) = rhs_semianalytic(var_vpar) + tstep*v*aux_mom_par0 ! momentum source to momentum equation
+
+      rhs_semianalytic(var_T) = rhs_semianalytic(var_T)                               & 
+                              - tstep*(gamma-1.d0)*v*aux_mom_par0*vpar0               & ! momentum source to pressure equation
+                              + tstep*(gamma-1.d0)*0.5d0*v*aux_rho0*vpar0*vpar0*B2      ! parallel-only, similar to aux_par0 and  
+                                                                                        ! matches model 600 convention
+
+      ! LHS entries due to vpar parametric dependence: theta * d(RHS(i))/dx_j. Partial derivatives already computed above
+      ! #if INCLUDE_ADDITIONAL_TERMS branch (seemingly not used), vpar2 is aliased to the full v2 also with ExB term
+      amat_semianalytic(var_T,var_vpar) = amat_semianalytic(var_T,var_vpar)                      &
+                                        + tstep*theta*(gamma-1.d0)*v*aux_mom_par0*vpar           &
+                                        - tstep*theta*(gamma-1.d0)*0.5d0*v*aux_rho0*vpar2_vpar
+
+      amat_semianalytic(var_T,var_Psi) = amat_semianalytic(var_T,var_Psi)                        &
+                                       - tstep*theta*(gamma-1.d0)*0.5d0*v*aux_rho0*vpar2_Psi
+
+      ! amat_semianalytic(var_T,var_Phi) = amat_semianalytic(var_T,var_Phi)                        &
+      !                                 - tstep*theta*(gamma-1.d0)*0.5d0*v*aux_rho0*v2_Phi  ! REMOVE - no Phi-dependence once v2 (ExB term) is dropped
+    endif
+
+    ! decide whether to freeze Psi through flag
+    rhs_semianalytic(var_Psi) = rhs_semianalytic(var_Psi) * (1.d0 - freeze_flag)
+    do j_var = 1, n_var
+      amat_semianalytic(var_Psi, j_var) = amat_semianalytic(var_Psi, j_var) * (1.d0 - freeze_flag)
+    end do
+    amat_semianalytic(var_Psi, var_Psi) = amat_semianalytic(var_Psi, var_Psi) + freeze_flag * v * Psi ! pure mass-matrix diagonal block
+
+    ! freeze rho in core
+    rhs_semianalytic(var_rho) = rhs_semianalytic(var_rho) * (1.d0 - core_freeze)
+    do j_var = 1, n_var
+      amat_semianalytic(var_rho, j_var) = amat_semianalytic(var_rho, j_var) * (1.d0 - core_freeze)
+    end do
+    amat_semianalytic(var_rho, var_rho) = amat_semianalytic(var_rho, var_rho) + core_freeze * v * rho
+
+    ! freeze single T in core
+    !if (.not. with_TiTe) then
+    !  rhs_semianalytic(var_T) = rhs_semianalytic(var_T) * (1.d0 - core_freeze)
+    !  do j_var = 1, n_var
+    !    amat_semianalytic(var_T, j_var) = amat_semianalytic(var_T, j_var) * (1.d0 - core_freeze)
+    !  end do
+    !  amat_semianalytic(var_T, var_T) = amat_semianalytic(var_T, var_T) + core_freeze * v * T
+    !end if
+
+    ! freeze Phi to match EMC3-Eirene with no ExB flows
+    rhs_semianalytic(var_Phi) = rhs_semianalytic(var_Phi) * (1.d0 - freeze_flag)
+    do j_var = 1, n_var
+      amat_semianalytic(var_Phi, j_var) = amat_semianalytic(var_Phi, j_var) * (1.d0 - freeze_flag)
+    end do
+    amat_semianalytic(var_Phi, var_Phi) = amat_semianalytic(var_Phi, var_Phi) + freeze_flag * v * Phi
+
+    ! Also freeze zj - -- its own "definition" equation otherwise relaxes
+    ! it toward the Psi=0-implied null current, not the true imported current
+    !  rhs_semianalytic(var_zj) = zero
+    !  do j_var = 1, n_var
+    !    amat_semianalytic(var_zj, j_var) = zero
+    !  end do
+    !  amat_semianalytic(var_zj, var_zj) = v*zj
+    ! endif
+
     ! Expansion of differential operators
     do i_var = 1, n_var
       if ((associated(rhs_semianalytic(i_var)%operand1)) .and. (associated(rhs_semianalytic(i_var)%operand2))) then
@@ -570,7 +653,7 @@ module mod_equations
     if (.not. allocated(thread_eq)) then
       allocate(thread_eq(nbthreads))
       do i=1,nbthreads
-        allocate(thread_eq(i)%eq(2*n_var+38,0:n_order-1,0:n_order-1,0:n_order-1,4))
+        allocate(thread_eq(i)%eq(2*n_var+41,0:n_order-1,0:n_order-1,0:n_order-1,4))
       end do
     end if
   end subroutine init_eq_struct

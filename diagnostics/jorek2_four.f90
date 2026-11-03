@@ -14,7 +14,7 @@ program JOREK2_FOUR
 
   implicit none
   
-  integer                      :: i, j, k, l, ierr, ivar, n_cpu, err, vars_per_cpu, nTht
+  integer                      :: i, j, k, l, ierr, ivar, n_mpi, err, vars_per_cpu, nTht
   type(t_theta_mapping)        :: mapping        ! Mapping between theta_mag and theta_geo
   type (type_bnd_element_list) :: bnd_elm_list
   type (type_bnd_node_list)    :: bnd_node_list

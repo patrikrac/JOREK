@@ -19,8 +19,8 @@ integer :: ierr, err, i
 namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 rst_hdf5, rst_hdf5_version, keep_current_prof,      &
                 restart, regrid, write_ps, time_evol_theta,         &
-                regrid_from_rz,                                     &
-                time_evol_zeta, force_horizontal_Xline,             &
+                regrid_from_rz, force_horizontal_Xline,             &
+                time_evol_zeta,                                     &
                 Mach1_openBC, thermalization,                       &
                 eta_ARAZ_const, eta_ARAZ_on, eta_ARAZ_simple,       & 
                 tauIC_ARAZ_on,                                      &
@@ -30,12 +30,14 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 n_outer, n_inner, n_up_priv, n_up_leg, n_up_leg_out,&
                 n_tht_equidistant,                                  &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
                 SIG_outer, SIG_inner, SIG_theta_up,                 &
                 dPSI_outer, dPSI_inner, dPSI_up_priv,               &
-                nout, nout_projection, xr1, sig1, xr2, sig2,        &
+                nout, nout_projection, nout_particles,              &
+                xr1, sig1, xr2, sig2,                               &
                 R_begin, R_end, Z_begin, Z_end,                     &
                 R_geo, Z_geo, amin, mf, fbnd, fpsi, mode,           &
                 R_Z_psi_bnd_file,                                   &
@@ -55,8 +57,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 zjz_0, zjz_1, zj_coef,                              &
                 rho_0, rho_1, rho_coef, rho_min,                    &
                 T_0,   T_1,   T_coef, T_min,                        &
-				T_min_neg,rho_min_neg,                              &
-				corr_neg_temp_coef, corr_neg_dens_coef,             &
+                T_min_neg,rho_min_neg,                              &
+                corr_neg_temp_coef, corr_neg_dens_coef,             &
                 Ti_0,  Ti_1,  Ti_coef,                              &
                 Te_0,  Te_1,  Te_coef,                              &
                 FF_0,  FF_1,  FF_coef,                              &
@@ -139,18 +141,17 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 voltage_coils, vert_FB_amp, find_pf_coil_currents,  &
                 delta_psi_GS, newton_GS_fixbnd, newton_GS_freebnd,  &
                 pastix_maxthrd, centralize_harm_mat, treat_axis,    &
-                n_particles, tstep_particles, nstep_particles,      & !Particles extension
+                tstep_particles, nstep_particles,                   & !Particles extension
                 nsubstep_particles, restart_particles,              &
                 filter_perp,    filter_hyper,    filter_par,        &
                 filter_perp_n0, filter_hyper_n0, filter_par_n0,     &
-                use_kn_cx, use_kn_sputtering, use_kn_ionisation,             &
-                use_ncs, use_pcs, use_ccs, cte_current_FB_fact,     &
+                cte_current_FB_fact,                                &
                 eta_ohmic, CARIDDI_mode, use_newton, maxNewton,     &
                 gamma_Newton, alpha_Newton, vacuum_min,             &
                 strumpack_matching, forceSDN, SDN_threshold,        &
                 xpoint_search_tries, export_aux_node_list,          &
                 use_manual_random_seed, manual_seed,                &
-                use_fixed_rng_value, fixed_rng_value,               &            
+                use_fixed_rng_value, fixed_rng_value,               &
                 bgf_rpolar, bgf_tht
 
 if (my_id .eq. 0) then

@@ -16,12 +16,12 @@ subroutine matrix_vector(x_vec, a_mat, y_vec)
   real*8, allocatable   :: y_tmp(:), y_tmp_block(:)
   integer,allocatable   :: recv_counts(:), recv_disp(:)
   integer               :: n, i, ir, jc
-  integer               :: my_id, n_cpu, ierr, counts
+  integer               :: my_id, n_mpi, ierr, counts
   integer(kind=int_all) :: n_blocksize, n_blocks, iA_start, ix_start, iy_start, index_offset, Int_tmp
   integer               :: ndof_local
   external              :: dgemv
   
-  call MPI_COMM_SIZE(a_mat%comm, n_cpu, ierr)
+  call MPI_COMM_SIZE(a_mat%comm, n_mpi, ierr)
   call MPI_COMM_RANK(a_mat%comm, my_id, ierr) 
 
   counts = x_vec%n
@@ -64,16 +64,16 @@ subroutine matrix_vector(x_vec, a_mat, y_vec)
 
   y_vec%val(1:y_vec%n) = 0.d0
 
-  allocate(recv_counts(n_cpu))
-  allocate(recv_disp(n_cpu))
+  allocate(recv_counts(n_mpi))
+  allocate(recv_disp(n_mpi))
 
-  do i = 1, n_cpu
+  do i = 1, n_mpi
      int_tmp = (a_mat%index_max(i) - a_mat%index_min(i) + 1)*n_blocksize       
      recv_counts(i) = int_tmp
   enddo
 
   recv_disp(1) = 0
-  do i = 2, n_cpu
+  do i = 2, n_mpi
      recv_disp(i) = recv_disp(i-1) + recv_counts(i-1)
   enddo
 

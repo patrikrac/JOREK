@@ -31,7 +31,7 @@ integer, parameter :: assumed_max_q = 8
 !-----------------------------------------!
 
 real*8    :: Rstart(n_lines), Zstart(n_lines)                      
-integer   :: i, j, k, i_elm, ifail, my_id, ierr, inode, i_cpu            
+integer   :: i, j, k, i_elm, ifail, my_id, ierr, inode, i_mpi            
 integer   :: iside_i, iside_j
 real*8    :: Rout, Zout, polturns, torturns
 logical   :: stop_tracing
@@ -44,7 +44,7 @@ real*8    :: dummy, dum01, dum02, dum03, dum04, dum05
 real*8    :: Rold, Zold
 
 integer   :: nsend, nrecv
-integer   :: required,provided,StatInfo, n_cpu
+integer   :: required,provided,StatInfo, n_mpi
 integer*4 :: rank, comm_size 
 logical   :: responsible(n_lines)
 integer   :: status(MPI_STATUS_SIZE)
@@ -69,7 +69,7 @@ required = MPI_THREAD_FUNNELED
 call MPI_Init_thread(required, provided, StatInfo)
 call init_threads()  ! on some systems init_threads needs to come after mpi_init_thread
 call MPI_COMM_SIZE(MPI_COMM_WORLD, comm_size, ierr)
-n_cpu = comm_size
+n_mpi = comm_size
 
 ! --- Determine ID of each MPI proc
 call MPI_COMM_RANK(MPI_COMM_WORLD, rank, ierr)
@@ -112,6 +112,7 @@ enddo
 phi = 2.d0*pi*float(i_plane_rtree - 1)/float(n_period*n_plane)
 call interp_RZP(node_list,element_list,1,0.0,0.0,phi,R_axis,Z_axis)
 call interp_RZP(node_list,element_list,element_list%n_elements,1.0,1.0,phi,R_max,dummy)
+R_max = (R_max-R_axis)/bloating_factor + R_axis   ! This will calculate approximately up to the LCFS.
 if ( my_id == 0 ) then
   write(*,*) '*** ...start tracing... ***'
   write(*,*) 'delta_phi        = ', delta_phi
@@ -128,7 +129,7 @@ endif
 responsible = .false.
 do i = 1, n_lines
   
-  if ( ( real(my_id)/real(n_cpu)*n_lines < i ) .and. ( real(my_id+1)/real(n_cpu)*n_lines >= i ) ) then
+  if ( ( real(my_id)/real(n_mpi)*n_lines < i ) .and. ( real(my_id+1)/real(n_mpi)*n_lines >= i ) ) then
     responsible(i) = .true.
     Rstart(i) = R_axis + float(i) * 0.99 * (R_max - R_axis)/n_lines
     Zstart(i) = Z_axis
@@ -137,7 +138,7 @@ do i = 1, n_lines
 end do
 
 ! --- Write out distribution of field lines among tasks
-do i = 0, n_cpu-1
+do i = 0, n_mpi-1
   if ( my_id == i ) then
     write(*,*) 'Task ', my_id, 'responsible for (field line number & radius):'
     do j = 1, n_lines
@@ -245,11 +246,11 @@ if (my_id .eq. 0) then
   enddo
   ! --- Write points for all other MPIs
   ! --- If this is mpi_0, we receive data from the other MPIs and print it
-  do i_cpu=1,n_cpu-1
+  do i_mpi=1,n_mpi-1
     nrecv = n_lines*num_pol_turns*n_period*assumed_max_q
-    call mpi_recv(R_poinc_tot,nrecv, MPI_DOUBLE_PRECISION, i_cpu, i_cpu, MPI_COMM_WORLD, status, ierr)
-    call mpi_recv(Z_poinc_tot,nrecv, MPI_DOUBLE_PRECISION, i_cpu, i_cpu, MPI_COMM_WORLD, status, ierr)
-    call mpi_recv(phi_poinc_tot,nrecv, MPI_DOUBLE_PRECISION, i_cpu, i_cpu, MPI_COMM_WORLD, status, ierr)
+    call mpi_recv(R_poinc_tot,nrecv, MPI_DOUBLE_PRECISION, i_mpi, i_mpi, MPI_COMM_WORLD, status, ierr)
+    call mpi_recv(Z_poinc_tot,nrecv, MPI_DOUBLE_PRECISION, i_mpi, i_mpi, MPI_COMM_WORLD, status, ierr)
+    call mpi_recv(phi_poinc_tot,nrecv, MPI_DOUBLE_PRECISION, i_mpi, i_mpi, MPI_COMM_WORLD, status, ierr)
     do i = 1, n_lines
       do j = 1, num_pol_turns*n_period*assumed_max_q 
         if (R_poinc_tot((i-1)*num_pol_turns*n_period*assumed_max_q+j) .ne. 0.0) then

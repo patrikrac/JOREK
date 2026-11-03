@@ -100,7 +100,7 @@ end subroutine find_RZ_general
 
 subroutine find_RZ_single(node_list,element_list,i_elm,R_find,Z_find,phi_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
 !-------------------------------------------------------------------------
-!< solves two non-linear equations using Newtons method (from numerical recipes)
+!< solves two non-linear equations using Newtons method
 !< LU decomposition replaced by explicit solution of 2x2 matrix.
 !<
 !< finds the crossing of two coordinate lines given as a series of cubics in element

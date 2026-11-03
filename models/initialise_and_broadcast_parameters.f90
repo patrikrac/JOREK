@@ -1,9 +1,11 @@
 !> Initialize parameters and broadcast them to all MPI procs.
-subroutine initialise_and_broadcast_parameters(my_id, filename)
+subroutine initialise_and_broadcast_parameters(my_id, filename, init_particles)
   
   use constants, only: mu_zero
   use mod_parameters,  only: n_tor, n_period
   use mod_plasma_functions, only: initialise_reference_parameters
+  use mod_particle_group_id
+  use mod_coupling_settings
   use phys_module
   
   implicit none
@@ -11,9 +13,34 @@ subroutine initialise_and_broadcast_parameters(my_id, filename)
   ! --- Routine parameters
   integer,                      intent(in) :: my_id
   character(len=*),             intent(in) :: filename
+  logical,                      intent(in) :: init_particles
   
   call initialise_parameters(my_id, filename)
+
+  ! Determine coupling parameters
+  if (my_id .eq. 0) then
+    if (init_particles) then
+
+      ! --- Initialize part_groups_in_use and determine n_part_groups
+      if (part_groups_in_use(1) == 'non') then !< part_groups_in_use not manually defined
+        !> generate the particle groups in use based on the defined groups in part_group_configs
+        call generate_part_groups_in_use()
+      endif
+
+      n_part_groups = count(part_groups_in_use /= 'non')
+      !> find the matching part_group_config for each group specified in part_groups_in_use
+      call match_part_groups_and_configs()
+        
+      ! --- Scan over n_part_groups and determine the coupling scheme parameters as well as their compatibility
+      call check_compatibility_and_determine_coupling_schemes()
   
+      ! --- Determine the coupling variables used, their index, and n_aux_var
+      call determine_coupling_variables() 
+
+      n_fluid_groups = count(fluid_configs%Z /= -999)
+    endif
+  endif
+
   ! --- Broadcast input parameters from MPI thread 0 to the others.
   call broadcast_phys(my_id)
   

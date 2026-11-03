@@ -9,7 +9,7 @@ subroutine Define_Boundary
 use constants
 use tr_module
 use phys_module
-
+use mod_spline_routines
 
 implicit none
 

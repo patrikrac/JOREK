@@ -39,7 +39,7 @@ real*8    :: AR, AR_p, AR_s, AR_t, AR_R, AR_Z, AZ, AZ_p, AZ_s, AZ_t, AZ_R, AZ_Z,
 real*8    :: RR, ZZ, Rnew, Znew, Rold, Zold
 real*8    :: Rnewtmp, Znewtmp, RRtmp, ZZtmp
 
-integer   :: required,provided,StatInfo, n_cpu
+integer   :: required,provided,StatInfo, n_mpi
 integer*4 :: rank, comm_size 
 logical   :: responsible(npoints)
 
@@ -50,7 +50,7 @@ required = MPI_THREAD_FUNNELED
 call MPI_Init_thread(required, provided, StatInfo)
 call init_threads()  ! on some systems init_threads needs to come after mpi_init_thread
 call MPI_COMM_SIZE(MPI_COMM_WORLD, comm_size, ierr)
-n_cpu = comm_size
+n_mpi = comm_size
 
 ! --- Determine ID of each MPI proc
 call MPI_COMM_RANK(MPI_COMM_WORLD, rank, ierr)
@@ -79,7 +79,7 @@ if ( my_id == 0 ) write(*,*) '*** ...start tracing... ***'
 responsible = .false.
 do i = 1, npoints
   
-  if ( ( real(my_id)/real(n_cpu)*npoints < i ) .and. ( real(my_id+1)/real(n_cpu)*npoints >= i ) ) then
+  if ( ( real(my_id)/real(n_mpi)*npoints < i ) .and. ( real(my_id+1)/real(n_mpi)*npoints >= i ) ) then
     responsible(i) = .true.
     Rstart(i) = ES%R_axis + REAL(i) * (ES%R_midpl(2) - ES%R_axis - 0.002d0)/npoints
     Zstart(i) = ES%Z_axis
@@ -88,7 +88,7 @@ do i = 1, npoints
 end do
 
 ! --- Write out distribution of field lines among tasks
-do i = 0, n_cpu-1
+do i = 0, n_mpi-1
   if ( my_id == i ) then
     write(*,*) 'Task ', my_id, 'responsible for (field line number & radius):'
     do j = 1, npoints

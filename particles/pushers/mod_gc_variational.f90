@@ -562,7 +562,7 @@ implicit none
 real*8, intent(in) :: x(3), A(3), dA(3,3)
 real*8             :: rotA(3)
   rotA(1) = dA(3,2) - dA(2,3) / x(1)
-  rotA(2) = dA(1,3) - dA(3,1) - A(3) / x(1)
+  rotA(2) = dA(1,3)/x(1) - dA(3,1) - A(3) / x(1)
   rotA(3) = dA(2,1) - dA(1,2) 
 return
 end    
@@ -574,7 +574,8 @@ real*8 :: Bstar(3), Estar(3), Bpar_star, delta_x(3), delta_u
   
   Bstar     = B + vpar * rot_tmp(x,Bnorm,dBnorm) / qom
   Bpar_star = dot_product(Bstar,Bnorm)
-  Estar     = E - zmu * dB /qom
+  Estar(1:2) = E(1:2) - zmu * dB(1:2)    /qom
+  Estar(3)   = E(3)   - zmu * dB(3)/x(1) /qom
         
   delta_x = (Bstar * vpar  - cross(Bnorm, Estar)) / Bpar_star
   delta_u = dot_product(Bstar,Estar) * qom        / Bpar_star
@@ -594,7 +595,8 @@ real*8 :: Bn, v_E(3), v_gradB(3), v_curvature(3)
   Bn        = norm2(B)
   Bstar     = B + vpar * rot_tmp(x,Bnorm,dBnorm) / qom
   Bpar_star = dot_product(Bstar,Bnorm)
-  Estar     = E - zmu * dB /qom
+  Estar(1:2) = E(1:2) - zmu * dB(1:2)    /qom
+  Estar(3)   = E(3)   - zmu * dB(3)/x(1) /qom
 
   v_E         =           - cross(B,E)  / Bn**2
   v_gradB     = zmu / qom * cross(B,dB) / Bn**2

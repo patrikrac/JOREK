@@ -22,7 +22,8 @@ export PRERUN="export OMP_NUM_THREADS=4"
 export MPIRUN="mpirun -np "
 export BATCHCOMMAND="qsub"
 
-export http_proxy=${JOREK_HTTP_PROXY}
-export https_proxy=${JOREK_HTTP_PROXY}
+# Set JOREK_HTTP_PROXY if your site needs an HTTP proxy for outbound access.
+export http_proxy="${JOREK_HTTP_PROXY:-}"
+export https_proxy="${JOREK_HTTP_PROXY:-}"
 
 export MPIRUN='mpirun --allow-run-as-root -n'

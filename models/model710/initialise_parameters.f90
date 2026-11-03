@@ -19,8 +19,8 @@ integer :: ierr, err, i
 namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 rst_hdf5, rst_hdf5_version, keep_current_prof,      &
                 restart, regrid, write_ps, time_evol_theta,         &
-                regrid_from_rz,                                     &
-                time_evol_zeta, force_horizontal_Xline,             &
+                regrid_from_rz, force_horizontal_Xline,             &
+                time_evol_zeta,                                     &
                 Mach1_openBC, Mach1_fix_B,                          &
                 eta_ARAZ_const, eta_ARAZ_on, eta_ARAZ_simple,       &
                 tauIC_ARAZ_on,                                      &
@@ -30,12 +30,14 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 n_outer, n_inner, n_up_priv, n_up_leg, n_up_leg_out,&
                 n_tht_equidistant,                                  &
                 psi_axis_init, XR_r, SIG_r, XR_tht, SIG_tht,        &
+                xr_closed,                                          &
                 SIG_closed, SIG_open, SIG_private, SIG_theta,       &
                 SIG_leg_0, SIG_leg_1, dPSI_open, dPSI_private,      &
                 SIG_up_leg_0, SIG_up_leg_1, SIG_up_priv,            &
                 SIG_outer, SIG_inner, SIG_theta_up,                 &
                 dPSI_outer, dPSI_inner, dPSI_up_priv,               &
-                nout, nout_projection, xr1, sig1, xr2, sig2,        &
+                nout, nout_projection, nout_particles,              &
+                xr1, sig1, xr2, sig2,                               &
                 R_begin, R_end, Z_begin, Z_end,                     &
                 R_geo, Z_geo, amin, mf, fbnd, fpsi, mode,           &
                 R_Z_psi_bnd_file,                                   &
@@ -54,8 +56,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 zjz_0, zjz_1, zj_coef,                              &
                 rho_0, rho_1, rho_coef, rho_min,                    &
                 T_0,   T_1,   T_coef, T_min,                        &
-				T_min_neg,rho_min_neg,                              &
-				corr_neg_temp_coef, corr_neg_dens_coef,             &
+                T_min_neg,rho_min_neg,                              &
+                corr_neg_temp_coef, corr_neg_dens_coef,             &
                 FF_0,  FF_1,  FF_coef,                              &
                 V_0, V_1, V_coef,                                   &
                 ZK_par, ZK_perp, ZK_par_max, D_par, D_perp,         &
@@ -117,18 +119,18 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 mode_families_modes, n_mode_families,               &
                 weights_per_family, autodistribute_ranks,           &
                 ranks_per_family, treat_axis, force_central_node,   &
-                n_particles, tstep_particles, nstep_particles,      & !Particles extension
+                tstep_particles, nstep_particles,                   & !Particles extension
+                proj_collection_period,                             &
                 nsubstep_particles, restart_particles,              &
                 filter_perp,    filter_hyper,    filter_par,        &
                 filter_perp_n0, filter_hyper_n0, filter_par_n0,     &
-                use_kn_cx, use_kn_sputtering, use_kn_ionisation,             &
-                use_ncs, use_pcs, use_ccs, use_pcs_full,            &
+                part_group_configs, part_groups_in_use,             &
                 cte_current_FB_fact, Z_xpoint_limit, eta_ohmic,     &
                 CARIDDI_mode, use_newton, maxNewton, gamma_Newton,  &
                 alpha_Newton, vacuum_min, strumpack_matching,       &
                 forceSDN, SDN_threshold, xpoint_search_tries,       &
                 use_manual_random_seed, manual_seed,                &
-                use_fixed_rng_value, fixed_rng_value,               &            
+                use_fixed_rng_value, fixed_rng_value,               &
                 export_aux_node_list, bgf_rpolar, bgf_tht
 
 if (my_id .eq. 0) then
@@ -212,7 +214,7 @@ if (my_id .eq. 0) then
   endif
 
   ! --- Checking consistency of eta_ARAZ parameters
-  if (eta_ARAZ_on == .true.) then
+  if (eta_ARAZ_on .eqv. .true.) then
      if (eta_ARAZ_const .ne. 0) then
         write(*,*) 'One should not use both eta_ARAZ_on and eta_ARAZ_const simultaneously, to avoid double-counting. Please use eta_ARAZ_on = .t. with eta_ARAZ_const = 0.d0, or eta_ARAZ_on = .f. with eta_ARAZ_const .ne. 0'
         stop

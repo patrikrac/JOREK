@@ -23,11 +23,11 @@ to build jorek2:
 
 to execute jorek2:
 
-mpirun -np n_cpu jorek2_model199 < namelist/model199/intear
+mpirun -np n_mpi jorek2_model199 < namelist/model199/intear
 
 this is a simple testcase (example output is available in test_output)
 
-the number of cpu's should be a multiple of the number of harmonics ((n_tor-1)/2+1)
+the number of mpi's should be a multiple of the number of harmonics ((n_tor-1)/2+1)
 
 
 Topic: Timing

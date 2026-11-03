@@ -49,7 +49,7 @@ write(*,*) '***************************************'
 write(*,*) '* JOREK2 : Penning trap test          *'
 write(*,*) '***************************************'
 
-call sim%initialize(num_groups=0)
+call sim%initialize()
 write(*,*) tstep_n
 
 t_norm  = sqrt(mu_zero * ATOMIC_MASS_UNIT * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds

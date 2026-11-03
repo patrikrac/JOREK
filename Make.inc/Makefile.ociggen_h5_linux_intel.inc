@@ -47,12 +47,12 @@ USE_WSMP   = 0
 USE_HDF5 = 1
 
 #Scotch library
-SCOTCH_HOME  = /home/jorekcp/jorek_tools_bullxmpi/scotch
+SCOTCH_HOME ?= /path/to/jorek_tools_bullxmpi/scotch
 LIB_SCOTCH   = -L$(SCOTCH_HOME)/lib -lscotch -lscotcherr
 INC_SCOTCH   = -I$(SCOTCH_HOME)/include
 
 # PASTIX
-PASTIX_HOME = /home/jorekcp/jorek_tools_bullxmpi/pastix_greatbear/install
+PASTIX_HOME ?= /path/to/jorek_tools_bullxmpi/pastix_greatbear/install
 LIB_PASTIX       = `$(PASTIX_HOME)/pastix-conf --libs` 
 LIB_PASTIX_MURGE = `$(PASTIX_HOME)/pastix-conf --libs_murge`
 LIB_PASTIX_BLAS  = `$(PASTIX_HOME)/pastix-conf --blas`

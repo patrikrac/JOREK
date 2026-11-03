@@ -28,10 +28,6 @@
  * your project.
  */
 
-/*
- * 2016-06-06 the JOREK team: Add function to generate random doubles (with 2^-32 precision)
- * 2017-02-02 the JOREK team: Copy advance_r from full pcg c library, cleanup
- */
 
 #include "pcg_basic.h"
 #include <stdio.h>

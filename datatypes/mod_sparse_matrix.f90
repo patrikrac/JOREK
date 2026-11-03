@@ -38,7 +38,7 @@ module mod_sparse_matrix
     integer                                      :: i_tor_max = 0        ! maximum toroidal Fourier number used in construction
     integer                                      :: block_size = 1
     integer                                      :: comm = 0             !< communicator over which the matrix is distributed
-    integer                                      :: ncpu = 1
+    integer                                      :: nmpi = 1
     logical                                      :: scaled = .false. !TODO: might be redundant with equilibrated flag, keeping for backwards compatibility
     logical                                      :: equilibrated = .false. !< Wether matrix has been equilibrated (row and column scaled)
     logical                                      :: row_distributed = .false.
@@ -96,7 +96,7 @@ module mod_sparse_matrix
     mat_a%i_tor_max       = self%i_tor_max
     mat_a%block_size      = self%block_size
     mat_a%comm            = self%comm
-    mat_a%ncpu            = self%ncpu
+    mat_a%nmpi            = self%nmpi
     mat_a%scaled          = self%scaled
     mat_a%equilibrated    = self%equilibrated
     mat_a%row_distributed = self%row_distributed
@@ -150,12 +150,12 @@ module mod_sparse_matrix
       mat_a%row_scaling(1:mat_a%ng) = self%row_scaling(1:self%ng)
     endif
     if (associated(self%index_min)) then
-      allocate(mat_a%index_min(mat_a%ncpu))
-      mat_a%index_min(1:mat_a%ncpu) = self%index_min(1:self%ncpu)
+      allocate(mat_a%index_min(mat_a%nmpi))
+      mat_a%index_min(1:mat_a%nmpi) = self%index_min(1:self%nmpi)
     endif
     if (associated(self%index_max)) then
-      allocate(mat_a%index_max(mat_a%ncpu))
-      mat_a%index_max(1:mat_a%ncpu) = self%index_max(1:self%ncpu)
+      allocate(mat_a%index_max(mat_a%nmpi))
+      mat_a%index_max(1:mat_a%nmpi) = self%index_max(1:self%nmpi)
     endif
     if (associated(self%ijA_size)) then
       allocate(mat_a%ijA_size(mat_a%my_ind_size))

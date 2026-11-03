@@ -1,3 +1,13 @@
+! SPDX-License-Identifier: LGPL-2.1-or-later
+!
+! Derived from SPARSKIT2 by Yousef Saad (coicsr).
+! Copyright (C) 2005 Regents of the University of Minnesota.
+! LGPL v2.1 or (at your option) any later version, hence compatible with
+! JOREK's LGPL-3.0-or-later. The coicsr_cmplx / coicsr2 / coicsr2_cmplx
+! variants are JOREK modifications of the original routine.
+! Source: https://www-users.cse.umn.edu/~saad/software/SPARSKIT/
+! See THIRD_PARTY_LICENSES.md.
+!
       module mod_coicsr
       use mod_integer_types
       implicit none

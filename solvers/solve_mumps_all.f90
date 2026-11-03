@@ -18,7 +18,7 @@ subroutine solve_mumps_all(mmss, a_mat, rhs_vec, solve_only, tag)
   real*8                   :: tsecond, t_analysis_0, t_analysis_1, t_fact_0, t_fact_1
   type(clcktype)           :: t0, t1
   integer                  :: k, j
-  integer                  :: my_id, n_cpu, comm, ierr
+  integer                  :: my_id, n_mpi, comm, ierr
   integer(kind=int_all)    :: i
 
   logical                  :: verbose = .false.
@@ -26,7 +26,7 @@ subroutine solve_mumps_all(mmss, a_mat, rhs_vec, solve_only, tag)
   comm = a_mat%comm
 
   call MPI_COMM_RANK(comm, my_id, ierr)
-  call MPI_COMM_SIZE(comm, n_cpu, ierr)
+  call MPI_COMM_SIZE(comm, n_mpi, ierr)
 
   if ((tag.ge.0).and.(my_id.eq.0)) verbose = .true.
 

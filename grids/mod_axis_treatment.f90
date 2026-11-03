@@ -175,8 +175,8 @@ do iv = 1, n_vertex_max
   if (iv==axis_vertex1 .or. iv==axis_vertex4) then
     if (nodes(iv)%axis_dof == dof2) then
 #if STELLARATOR_MODEL
-      Ptrans(dof2,dof3) = cos(theta)/(3.d0*float(n_flux-1)); Ptrans(dof2,dof4) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1)))
-      Ptrans(dof3,dof3) = sin(theta)/(3.d0*float(n_flux-1)); Ptrans(dof3,dof4) =  2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1)))
+      Ptrans(dof2,dof3) = cos(theta)/(3.d0*float(n_flux-1)/bloating_factor); Ptrans(dof2,dof4) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor)
+      Ptrans(dof3,dof3) = sin(theta)/(3.d0*float(n_flux-1)/bloating_factor); Ptrans(dof3,dof4) =  2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor)
 #else
       Ptrans(dof2,dof3) = nodes(iv)%x(1,dof3,1) ; Ptrans(dof2,dof4) = nodes(iv)%x(1,dof4,1)
       Ptrans(dof3,dof3) = nodes(iv)%x(1,dof3,2) ; Ptrans(dof3,dof4) = nodes(iv)%x(1,dof4,2)
@@ -185,8 +185,8 @@ do iv = 1, n_vertex_max
       Ptrans(dof4,dof4) = 0.d0
     else if (nodes(iv)%axis_dof == dof3) then
 #if STELLARATOR_MODEL
-      Ptrans(dof2,dof2) = cos(theta)/(3.d0*float(n_flux-1)); Ptrans(dof2,dof4) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1)))
-      Ptrans(dof3,dof2) = sin(theta)/(3.d0*float(n_flux-1)); Ptrans(dof3,dof4) =  2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1)))
+      Ptrans(dof2,dof2) = cos(theta)/(3.d0*float(n_flux-1)/bloating_factor); Ptrans(dof2,dof4) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor)
+      Ptrans(dof3,dof2) = sin(theta)/(3.d0*float(n_flux-1)/bloating_factor); Ptrans(dof3,dof4) =  2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor)
 #else
       Ptrans(dof2,dof2) = nodes(iv)%x(1,dof2,1) ; Ptrans(dof2,dof4) = nodes(iv)%x(1,dof4,1)
       Ptrans(dof3,dof2) = nodes(iv)%x(1,dof2,2) ; Ptrans(dof3,dof4) = nodes(iv)%x(1,dof4,2)
@@ -231,8 +231,8 @@ do iv = 1, n_vertex_max
     if (jv == axis_vertex1 .or. jv == axis_vertex4) then
       if (nodes(jv)%axis_dof == dof2) then
 #if STELLARATOR_MODEL
-        Pmat(dof3,dof2) = cos(theta)/(3.d0*float(n_flux-1)); Pmat(dof3,dof3) = sin(theta)/(3.d0*float(n_flux-1))
-        Pmat(dof4,dof2) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))); Pmat(dof4,dof3) = 2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1)))
+        Pmat(dof3,dof2) = cos(theta)/(3.d0*float(n_flux-1)/bloating_factor); Pmat(dof3,dof3) = sin(theta)/(3.d0*float(n_flux-1)/bloating_factor)
+        Pmat(dof4,dof2) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor); Pmat(dof4,dof3) = 2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor)
 #else
         Pmat(dof3,dof2)  = nodes(jv)%x(1,dof3,1) ; Pmat(dof3,dof3) = nodes(jv)%x(1,dof3,2)
         Pmat(dof4,dof2)  = nodes(jv)%x(1,dof4,1) ; Pmat(dof4,dof3) = nodes(jv)%x(1,dof4,2)
@@ -241,8 +241,8 @@ do iv = 1, n_vertex_max
         Pmat(dof4,dof4)  = 0.d0
       else if (nodes(jv)%axis_dof == dof3) then
 #if STELLARATOR_MODEL
-        Pmat(dof2,dof2) = cos(theta)/(3.d0*float(n_flux-1)); Pmat(dof2,dof3) = sin(theta)/(3.d0*float(n_flux-1))
-        Pmat(dof4,dof2) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))); Pmat(dof4,dof3) = 2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1)))
+        Pmat(dof2,dof2) = cos(theta)/(3.d0*float(n_flux-1)/bloating_factor); Pmat(dof2,dof3) = sin(theta)/(3.d0*float(n_flux-1)/bloating_factor)
+        Pmat(dof4,dof2) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor); Pmat(dof4,dof3) = 2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor)
 #else
         Pmat(dof2,dof2)  = nodes(jv)%x(1,dof2,1) ; Pmat(dof2,dof3) = nodes(jv)%x(1,dof2,2)
         Pmat(dof4,dof2)  = nodes(jv)%x(1,dof4,1) ; Pmat(dof4,dof3) = nodes(jv)%x(1,dof4,2)
@@ -307,16 +307,16 @@ dof1 = 1 ; dof2 = 2 ; dof3 = 3 ; dof4 = 4
 Pmat = 0.d0; Pmat(dof1,dof1) = 1.d0
 if (node_list%node(vg)%axis_dof == dof2) then
 #if STELLARATOR_MODEL
-  Pmat(dof3,dof2) = cos(theta)/(3.d0*float(n_flux-1)); Pmat(dof3,dof3) = sin(theta)/(3.d0*float(n_flux-1))
-  Pmat(dof4,dof2) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))); Pmat(dof4,dof3) = 2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1)))
+  Pmat(dof3,dof2) = cos(theta)/(3.d0*float(n_flux-1)/bloating_factor); Pmat(dof3,dof3) = sin(theta)/(3.d0*float(n_flux-1)/bloating_factor)
+  Pmat(dof4,dof2) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor); Pmat(dof4,dof3) = 2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor)
 #else
   Pmat(dof3,dof2) = node_list%node(vg)%x(1,dof3,1)  ;  Pmat(dof3,dof3) = node_list%node(vg)%x(1,dof3,2)
   Pmat(dof4,dof2) = node_list%node(vg)%x(1,dof4,1)  ;  Pmat(dof4,dof3) = node_list%node(vg)%x(1,dof4,2)
 #endif
 else if (node_list%node(vg)%axis_dof == dof3) then
 #if STELLARATOR_MODEL
-  Pmat(dof2,dof2) = cos(theta)/(3.d0*float(n_flux-1)); Pmat(dof2,dof3) = sin(theta)/(3.d0*float(n_flux-1))
-  Pmat(dof4,dof2) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))); Pmat(dof4,dof3) = 2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1)))
+  Pmat(dof2,dof2) = cos(theta)/(3.d0*float(n_flux-1)/bloating_factor); Pmat(dof2,dof3) = sin(theta)/(3.d0*float(n_flux-1)/bloating_factor)
+  Pmat(dof4,dof2) = -2.d0*pi*sin(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor); Pmat(dof4,dof3) = 2.d0*pi*cos(theta)/(9.d0*float(n_tht*(n_flux-1))/bloating_factor)
 #else
   Pmat(dof2,dof2) = node_list%node(vg)%x(1,dof2,1)  ;  Pmat(dof2,dof3) = node_list%node(vg)%x(1,dof2,2)
   Pmat(dof4,dof2) = node_list%node(vg)%x(1,dof4,1)  ;  Pmat(dof4,dof3) = node_list%node(vg)%x(1,dof4,2)

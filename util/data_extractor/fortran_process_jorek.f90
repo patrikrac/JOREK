@@ -27,7 +27,7 @@ program process_hdf5_jorek
   integer       :: itmp, icnt
   
   ! --- MPI variables
-  integer :: n_cpu, my_id, ierr, nrecv, nsend
+  integer :: n_mpi, my_id, ierr, nrecv, nsend
   integer :: status(MPI_STATUS_SIZE)
   
   ! --- Data variables
@@ -114,7 +114,7 @@ program process_hdf5_jorek
   ! --- MPI initilisation
   call MPI_INIT(IERR)
   call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)      ! id of each MPI proc
-  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)      ! number of MPI procs
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)      ! number of MPI procs
   
 
   if (my_id .eq. 0) then
@@ -936,11 +936,11 @@ program process_hdf5_jorek
     pix_start = 1
     pix_end   = ny_pix
     
-    pix_delta = (pix_end - pix_start) / n_cpu
+    pix_delta = (pix_end - pix_start) / n_mpi
     local_pix_start = pix_start + my_id*pix_delta + 1
     local_pix_end   = min(pix_end,pix_start+(my_id+1)*pix_delta)
     if (my_id .eq. 0      ) local_pix_start = local_pix_start - 1
-    if (my_id .eq. n_cpu-1) local_pix_end   = ny_pix
+    if (my_id .eq. n_mpi-1) local_pix_end   = ny_pix
     
     ! --- Some info print outs
     call MPI_Barrier(MPI_COMM_WORLD,ierr)
@@ -1214,7 +1214,7 @@ program process_hdf5_jorek
     ! --- Gather MPI data to process 0
     if (my_id .eq. 0) then
       ! --- If this is mpi_0, we receive data from the other MPIs and print it
-      do j=1,n_cpu-1
+      do j=1,n_mpi-1
         call mpi_recv(local_pix_start,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
         call mpi_recv(local_pix_end,  1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
         nrecv = (local_pix_end-local_pix_start+1)*nx_pix

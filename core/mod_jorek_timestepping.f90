@@ -24,7 +24,7 @@ type, extends(action) :: jorek_timestep_action
   integer                                       :: istep !< index in timestep size array from namelist (not jorek timestep number!)
     !< MPI settings
   integer                                       :: my_id = 0
-  integer                                       :: n_cpu = 1  
+  integer                                       :: n_mpi = 1  
 
   logical                                       :: setup_done = .false. !< have we set up the solvers etc?
 #ifdef USE_FFTW
@@ -77,7 +77,6 @@ function new_jorek_timestep_action(auxiliary_node_list) result(new)
   if (present(auxiliary_node_list)) new%auxiliary_node_list => auxiliary_node_list
   new%istep = 1
   new%name = "JOREK timestep"
-  new%log = .true.
 end function new_jorek_timestep_action
 
 
@@ -98,6 +97,9 @@ subroutine setup_solvers(this, sim)
   use vacuum_equilibrium,   only: import_external_fields
   use mod_startup_teardown, only: sanity_checks
   use mod_log_params,       only: log_parameters
+#if STELLARATOR_MODEL
+  use mod_chi, only: compute_chi_on_gauss_points
+#endif
 
   implicit none
 
@@ -112,7 +114,7 @@ subroutine setup_solvers(this, sim)
   integer :: inode, ierr, i, block_size, n_masters
 
   write(*,*) 'setting up the solvers'
-  call tr_meminit(sim%my_id, sim%n_cpu)
+  call tr_meminit(sim%my_id, sim%n_mpi)
   call tr_resetfile()
 
   ! Initialize clock
@@ -147,7 +149,7 @@ subroutine setup_solvers(this, sim)
   call log_parameters(sim%my_id)
 
   ! Warn on doing stupid stuff
-  call sanity_checks(sim%my_id, sim%n_cpu, 7, 7) ! #### the 7, 7 is just a dummy that needs to be removed later on; the sanity_checks should anyway not be part of setup_solvers in the end (to be addressed in a separate pull request) @TODO
+  call sanity_checks(sim%my_id, sim%n_mpi, 7, 7) ! #### the 7, 7 is just a dummy that needs to be removed later on; the sanity_checks should anyway not be part of setup_solvers in the end (to be addressed in a separate pull request) @TODO
 
   ! Initialise the boundary element and node list
   if (sim%my_id .eq. 0) then
@@ -186,10 +188,14 @@ subroutine setup_solvers(this, sim)
   endif
 
   ! nodes, elements, bnd_nodes and phys have already been broadcast
-  if ( freeboundary ) call broadcast_vacuum(sim%my_id, resistive_wall)
 
   call update_equil_state(sim%my_id, sim%fields%node_list, sim%fields%element_list, bnd_elm_list, xpoint, xcase)
   this%es = ES
+
+  if ( freeboundary ) then
+     call broadcast_vacuum(sim%my_id, resistive_wall)
+     call read_Z_axis_profile()
+  end if
 
   if ( sim%my_id == 0 ) then
     call print_equil_state(.true.)
@@ -202,9 +208,9 @@ subroutine setup_solvers(this, sim)
 #endif
 
   !***********************************************************************
-  !*              distribute nodes and elements over cpu's               *
+  !*              distribute nodes and elements over mpi's               *
   !***********************************************************************
-  index_size  = sim%n_cpu
+  index_size  = sim%n_mpi
   id_elements = sim%my_id
 
   call tr_allocatep(this%local_elms,1,sim%fields%element_list%n_elements,"local_elms",CAT_FEM)
@@ -213,7 +219,7 @@ subroutine setup_solvers(this, sim)
   this%a_mat%comm = MPI_COMM_WORLD
   
   this%mhd_sim%my_id         = sim%my_id
-  this%mhd_sim%n_cpu         = sim%n_cpu
+  this%mhd_sim%n_mpi         = sim%n_mpi
   this%mhd_sim%freeboundary  = freeboundary
   this%mhd_sim%restart       = restart
 
@@ -226,13 +232,23 @@ subroutine setup_solvers(this, sim)
     
   this%mhd_sim%sr_n_tor      = sr%n_tor  
   
-  call distribute_nodes_elements(id_elements, this%mhd_sim%n_cpu, index_size, this%mhd_sim%node_list, this%mhd_sim%element_list, .false., this%mhd_sim%local_elms, & 
+  call distribute_nodes_elements(id_elements, this%mhd_sim%n_mpi, index_size, this%mhd_sim%node_list, this%mhd_sim%element_list, .false., this%mhd_sim%local_elms, & 
                                    this%mhd_sim%n_local_elms, this%mhd_sim%restart, this%mhd_sim%freeboundary, this%a_mat)
 
   call update_deltas(this%mhd_sim%node_list,this%deltas)
                                    
   call global_matrix_structure(this%mhd_sim%node_list, this%mhd_sim%element_list, this%mhd_sim%bnd_elm_list, this%mhd_sim%freeboundary,&
-                                 this%mhd_sim%local_elms, this%mhd_sim%n_local_elms, this%a_mat, i_tor_min=1, i_tor_max=n_tor)                                   
+                                 this%mhd_sim%local_elms, this%mhd_sim%n_local_elms, this%a_mat, i_tor_min=1, i_tor_max=n_tor)                        
+
+#if STELLARATOR_MODEL
+  ! Precompute vacuum field chi on Gauss points for stellarator element matrix.
+  ! In jorek2_main this is called explicitly after distribute_nodes_elements.
+  ! kinetic_main uses this action, so we need to call it here instead.
+  call compute_chi_on_gauss_points(sim%my_id, sim%fields%element_list, &
+                                    sim%fields%node_list, &
+                                    this%mhd_sim%local_elms, &
+                                    this%mhd_sim%n_local_elms)
+#endif           
 
   call MPI_Barrier(MPI_COMM_WORLD,ierr)
   
@@ -323,7 +339,7 @@ subroutine do_jorek_timestep(this, sim, ev)
   if (.not. this%setup_done) then
     t_now = sim%time / sim%t_norm  
     index_now = index_start
-    if (sim%my_id .eq. 0) write(*,"(A,f16.8,A,g12.6,A)") "INFO: JOREK timestep: ", dt_jorek, " = ", dt, " s"
+    if (sim%my_id .eq. 0) write(*,"(A,f16.8,A,g13.6,A)") "INFO: JOREK timestep: ", dt_jorek, " = ", dt, " s"
     call setup_solvers(this, sim)
   end if
 
@@ -469,18 +485,30 @@ subroutine do_jorek_timestep(this, sim, ev)
 
     if (index_now > index_start+1) then
       if (n_tor .gt. 1) then
-        Growth_mag  = 0.5d0*log(abs(energies(n_tor,1,index_now)/energies(n_tor,1,index_now-1)))/ tstep
-        Growth_kin  = 0.5d0*log(abs(energies(n_tor,2,index_now)/energies(n_tor,2,index_now-1)))/ tstep
+        if (energies(n_tor,1,index_now) .ne. 0.d0 .and. &
+            energies(n_tor,1,index_now-1) .ne. 0.d0) then
+          Growth_mag  = 0.5d0*log(abs(energies(n_tor,1,index_now)/energies(n_tor,1,index_now-1)))/ tstep
+          Growth_kin  = 0.5d0*log(abs(energies(n_tor,2,index_now)/energies(n_tor,2,index_now-1)))/ tstep
+        else
+          Growth_mag  = 0.d0
+          Growth_kin  = 0.d0
+        end if
       else
-        Growth_mag  = 0.d0
-        Growth_kin  = 0.d0
-      endif
+          Growth_mag  = 0.d0
+          Growth_kin  = 0.d0
+      end if
       if (linear_run) then
         Growth_mag0 = 0.d0
         Growth_kin0 = 0.d0
       else
-        Growth_mag0 = 0.5d0*log(abs(energies(1,1,index_now)/energies(1,1,index_now-1)))/ tstep
-        Growth_kin0 = 0.5d0*log(abs(energies(1,2,index_now)/energies(1,2,index_now-1)))/ tstep
+        if (energies(1,1,index_now) .ne. 0.d0 .and. &
+            energies(1,1,index_now-1) .ne. 0.d0) then
+          Growth_mag0 = 0.5d0*log(abs(energies(1,1,index_now)/energies(1,1,index_now-1)))/ tstep
+          Growth_kin0 = 0.5d0*log(abs(energies(1,2,index_now)/energies(1,2,index_now-1)))/ tstep
+        else
+          Growth_mag0 = 0.d0
+          Growth_kin0 = 0.d0
+        end if
       endif
       write(*,131) 'Growth_mag,_kin =', Growth_mag0, Growth_mag, Growth_kin0, Growth_kin
     endif

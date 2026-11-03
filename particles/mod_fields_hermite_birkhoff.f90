@@ -238,7 +238,7 @@ end subroutine do_interp_PRZ_2
 pure subroutine do_interp_PRZP_1(this, time, i_elm, i_v, n_v, s, t, phi, P, P_s, P_t, P_phi, P_time, R, R_s, R_t, R_phi, Z, Z_s, Z_t, Z_phi)
   use mod_interp
   use constants, only: mu_zero, atomic_mass_unit
-  use phys_module, only: tstep, central_mass, central_density
+  use phys_module, only: tstep_rst, central_mass, central_density
   use mod_linear, only: linear_interp_differentials
   use mod_linear, only: linear_interp_differentials_dt
   class(jorek_fields_interp_hermite_birkhoff),  intent(in)  :: this
@@ -295,7 +295,7 @@ end function new_read_jorek_fields_interp_hermite_birkhoff
 !> The next read action is set for the time when we run out of derivatives, i.e.
 !> t(jend-1).
 subroutine do_read(this, sim, ev)
-  use phys_module, only: central_mass, central_density, t_start, tstep
+  use phys_module, only: central_mass, central_density, t_start, tstep_rst
   use constants, only: mu_zero, atomic_mass_unit
   use mpi
   use mod_neighbours
@@ -339,7 +339,7 @@ subroutine do_read(this, sim, ev)
       this%i = i
       call update_neighbours(f%node_list, f%element_list)
       call append_to_fields(f, f%node_list, f%element_list, t_start*t_norm, &
-        tstep*t_norm, from_deltas=.true.)
+        tstep_rst*t_norm, from_deltas=.true.)
       ! Set sim%time to this time also, to start at the right point
       if (sim%time .gt. 1d-16) then ! check if this is the right file if we have already set a time
         if (sim%time .lt. f%t(f%ind(f%len))) then
@@ -356,7 +356,7 @@ subroutine do_read(this, sim, ev)
       call read_next_file(this, f, i, prefer_plus_2=.true.)
       call update_neighbours(f%node_list, f%element_list)
       call append_to_fields(f, f%node_list, f%element_list, t_start*t_norm, &
-        tstep*t_norm, from_deltas=i - this%i .ge. 2)
+        tstep_rst*t_norm, from_deltas=i - this%i .ge. 2)
       ! note that t_start is set in import_hdf5_restart instead of t_now
       this%i = i ! update index of latest file read
       ! Now we have 3 or 4 time points in our list
@@ -394,7 +394,7 @@ subroutine do_read(this, sim, ev)
       call update_neighbours(f%node_list, f%element_list)
       if (my_id .eq. 0) write(*,"(i2,A)") i-this%i, " JOREK steps between restarts"
       call append_to_fields(f, f%node_list, f%element_list, t_start*t_norm, &
-        tstep*t_norm, from_deltas=i - this%i .ge. 2)
+        tstep_rst*t_norm, from_deltas=i - this%i .ge. 2)
         ! note that t_start is set in import_hdf5_restart instead of t_now
       this%i=i ! set index of last-read file
 
@@ -419,7 +419,7 @@ end subroutine do_read
 !> Starting from i+2 (if prefer_plus_2=.true.), i+1, i+N search for a next file and read it into
 !> f%node_list, f%element_list.
 !> Performs MPI communication to get values from root process to every other process.
-!> Also broadcasted are tstep and t_start
+!> Also broadcasted are tstep_rst and t_start
 subroutine read_next_file(this, f, i_found, prefer_plus_2)
   use mod_import_restart
   use phys_module
@@ -458,7 +458,7 @@ subroutine read_next_file(this, f, i_found, prefer_plus_2)
         call import_hdf5_restart(f%node_list,f%element_list,trim(restart_file),this%rst_format,ierr)
         call broadcast_elements(my_id, f%element_list)
         call broadcast_nodes(my_id, f%node_list)
-        call broadcast_phys(my_id) ! we only really use tstep and t_start but this is simpler to write
+        call broadcast_phys(my_id) ! we only really use tstep_rst and t_start but this is simpler to write
         if (ierr .ne. 0) then
           if (my_id .eq. 0) write(*,*) "ERROR: cannot open restart file"
           call exit(1)
@@ -478,7 +478,7 @@ subroutine read_next_file(this, f, i_found, prefer_plus_2)
   else
     call broadcast_elements(my_id, f%element_list)
     call broadcast_nodes(my_id, f%node_list)
-    call broadcast_phys(my_id) ! we only really use tstep and t_start but this is simpler to write
+    call broadcast_phys(my_id) ! we only really use tstep_rst and t_start but this is simpler to write
     call MPI_Bcast(i_found, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
   end if
 end subroutine read_next_file

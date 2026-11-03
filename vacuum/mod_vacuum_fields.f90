@@ -262,7 +262,7 @@ module mod_vacuum_fields
     real*8,  intent(inout)  :: bx(:), by(:), bz(:), psi(:)
 
     ! --- Local parameters
-    integer :: ierr, n_cpu, k_delta, k_min, k_max
+    integer :: ierr, n_mpi, k_delta, k_min, k_max
     integer :: i, j, k, np, ntri, omp_nthreads, omp_tid
     real*8  :: s1,s2,s3                                    &
               ,d221,d232,d213,al1,al2,al3                  &
@@ -290,10 +290,10 @@ module mod_vacuum_fields
     Ax_tmp = 0.d0;  Ay_tmp = 0.d0;  
 
     ! --- MPI initialization
-    call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr) ! number of MPI procs
-    n_cpu = max(n_cpu,1)
+    call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr) ! number of MPI procs
+    n_mpi = max(n_mpi,1)
 
-    k_delta = ceiling(float(ntri) / n_cpu)
+    k_delta = ceiling(float(ntri) / n_mpi)
     k_min   =      my_id     * k_delta + 1
     k_max   = min((my_id +1) * k_delta, ntri)
     ! --- OpenMP parallelization of given points loop
@@ -902,7 +902,7 @@ module mod_vacuum_fields
     real*8,  intent(inout)  :: green_B_tri(:,:), green_A_tri(:)
 
     ! --- Local parameters
-    integer :: ierr, n_cpu, k_delta, k_min, k_max
+    integer :: ierr, n_mpi, k_delta, k_min, k_max
     integer :: i, j, k, np, ntri, omp_nthreads, omp_tid
     real*8  :: s1,s2,s3                                    &
               ,d221,d232,d213,al1,al2,al3                  &

@@ -1,0 +1,36 @@
+&in1
+  !example input for the test_neutral_neutral_collision program, which tests the neutral neutral collisions algorithm in a gas box setting
+  !with this input, clear mixing can be seen between the two species
+  !For more information on the neutral neutral collisions, see https://jorek.eu/wiki/doku.php?id=particles:neutral_neutral_collisions 
+  !and for specific information on this scenario, see the reference document in the "How the code works" section of that wiki page
+
+  restart = .f.
+  regrid  = .f.
+  refinement=.false.
+
+  restart_particles = .f.
+
+  nstep = 1000 !to set the number of collisions
+  tstep_particles = 1.d-8
+  nstep_particles = 1 !to set the number of particle steps per collision
+  !tstep_particles and n_step_particles together define the timestep of the collisions. tstep is not used
+
+  particlesource = 5.d25 ! in this example, this variable means the total weight of all particles in the gas box simulation
+
+  part_groups_in_use = "P01"
+
+  part_group_configs(1)%id = "P01"
+  part_group_configs(1)%Z = -2
+  part_group_configs(1)%mass = 2.01410178
+  part_group_configs(1)%coupling_scheme = 'ncs'
+  part_group_configs(1)%n_particles     = 1e6
+  part_group_configs(1)%type            = 'particle_kinetic_leapfrog'
+  part_group_configs(1)%use_kin_neutral_coll = .t.
+  part_group_configs(1)%neutral_coll_dTw = 2.d-10, 273, 0.66 ! input parameters for the VHS which are explained in the documentation
+  
+  nout_projection = 10 ! each nout_projection collisional timesteps, diagnostic output is produced (vtk projections, weight per species and radial position, and MSD particle position)
+
+  !test_neutral_neutral_collision is deterministic so if you want perfectly reproduceable results, you could use:
+  !use_manual_random_seed = .t.
+ /
+ 

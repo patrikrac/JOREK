@@ -92,7 +92,7 @@ subroutine setup(rank,n_tasks,ifail)
   use_native_hdf5_mpio=.true.
 
   !> initialize the particle simulation
-  call sim_particles%initialize(n_groups,.false.,rank,n_tasks,.false.)
+  call sim_particles%initialize(.false.,rank,n_tasks,.false.,.true.,n_groups)
 
   !> set and broadcast simulation time
   if(rank.eq.0) then
@@ -163,7 +163,7 @@ subroutine test_particle_mpi_io_write_native_read
   use_hdf5_access_properties = .false.
 
   !> initialize the new particle simulation
-  call sim_particles_new%initialize(n_groups,.false.,rank_loc,n_tasks_loc,.false.)
+  call sim_particles_new%initialize(.false.,rank_loc,n_tasks_loc,.false.,.true.,n_groups)
 
   !> read default simulation from file and store in new sim
   call read_simulation_hdf5(sim_particles_new,trim(test_filename),&
@@ -193,7 +193,7 @@ subroutine test_particle_mpi_io_write_gatherv_read
   use_hdf5_access_properties = .false.;
 
   !> initialize the new particle simulation
-  call sim_particles_new%initialize(n_groups,.false.,rank_loc,n_tasks_loc,.false.)
+  call sim_particles_new%initialize(.false.,rank_loc,n_tasks_loc,.false.,.true.,n_groups)
 
   !> read default simulation from file and store in new sim
   call read_simulation_hdf5(sim_particles_new,trim(test_filename_gatherv),&
@@ -218,7 +218,7 @@ subroutine test_get_simulation_hdf5_time_write_native()
   !> read time
   time_new = get_simulation_hdf5_time(trim(test_filename),&
   use_hdf5_access_properties=use_hdf5_access_properties,&
-  mpi_comm_loc=mpi_comm_test,mpi_info_loc=mpi_info_test,n_cpu=n_tasks_loc)
+  mpi_comm_loc=mpi_comm_test,mpi_info_loc=mpi_info_test,n_mpi=n_tasks_loc)
   call assert_equals(sim_particles%time,time_new,tol_real8,&
   "Error get simulation time hdf5 (write hdf5 native): time mismatch!")
 end subroutine test_get_simulation_hdf5_time_write_native
@@ -233,7 +233,7 @@ subroutine test_get_simulation_hdf5_time_write_gatherv()
   !> read time
   time_new = get_simulation_hdf5_time(trim(test_filename_gatherv),&
   use_hdf5_access_properties=use_hdf5_access_properties,&
-  mpi_comm_loc=mpi_comm_test,mpi_info_loc=mpi_info_test,n_cpu=n_tasks_loc)
+  mpi_comm_loc=mpi_comm_test,mpi_info_loc=mpi_info_test,n_mpi=n_tasks_loc)
   call assert_equals(sim_particles%time,time_new,tol_real8,&
   "Error get simulation time (write gatherv): time mismatch!")
 end subroutine test_get_simulation_hdf5_time_write_gatherv

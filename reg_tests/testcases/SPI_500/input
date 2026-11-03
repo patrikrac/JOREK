@@ -256,6 +256,7 @@
  spi_Vel_diff   = 0.
  spi_angle      = 0.349
  spi_L_inj      = 0.20
+
  
  ! --- Ionisation energy of neutrals
  ksi_ion = 1.8d-24

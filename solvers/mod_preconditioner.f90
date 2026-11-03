@@ -15,17 +15,17 @@ module mod_preconditioner
     implicit none
 
     type(type_PRECOND) :: pc
-    integer            :: comm_glob, my_id, n_cpu, ierr
+    integer            :: comm_glob, my_id, n_mpi, ierr
     integer            :: i
     character(len=256) :: s
 
     pc%comm = comm_glob
 
     call MPI_COMM_RANK(pc%comm, my_id, ierr)
-    call MPI_COMM_SIZE(pc%comm, n_cpu, ierr)
+    call MPI_COMM_SIZE(pc%comm, n_mpi, ierr)
 
     pc%my_id = my_id
-    pc%n_cpu = n_cpu
+    pc%n_mpi = n_mpi
     if (pc%my_id.eq.0) write(*,*) "Initializing preconditioner"
 
     pc%autodistribute_ranks = autodistribute_ranks
@@ -38,7 +38,7 @@ module mod_preconditioner
       pc%n_mode_families = n_mode_families
     endif
 
-    call distribute_ranks(n_cpu, pc)
+    call distribute_ranks(n_mpi, pc)
 
     call create_communicators(pc)
     pc%mat%comm = pc%MPI_COMM_N ! communicator for PC matrix distribution
@@ -71,10 +71,10 @@ module mod_preconditioner
     type(type_PRECOND) :: pc
 
     integer, allocatable :: i_tor(:), ranks_tmp(:)
-    integer :: my_id, n_cpu, ierr
+    integer :: my_id, n_mpi, ierr
 
     my_id = pc%my_id
-    n_cpu = pc%n_cpu
+    n_mpi = pc%n_mpi
 
     call MPI_COMM_SPLIT(pc%comm, pc%family_id, my_id, pc%MPI_COMM_N, ierr)
     if (ierr.ne.0) then
@@ -82,11 +82,11 @@ module mod_preconditioner
       call MPI_Abort(MPI_COMM_WORLD, 0, ierr)
     endif
     call MPI_COMM_RANK(pc%MPI_COMM_N, pc%my_id_n, ierr)
-    call MPI_COMM_SIZE(pc%MPI_COMM_N, pc%n_cpu_n, ierr)
+    call MPI_COMM_SIZE(pc%MPI_COMM_N, pc%n_mpi_n, ierr)
 
-    allocate(i_tor(n_cpu)); i_tor = 0
+    allocate(i_tor(n_mpi)); i_tor = 0
     i_tor(my_id + 1) = pc%my_id_n
-    call MPI_Allreduce(MPI_IN_PLACE,i_tor,n_cpu,MPI_INT,MPI_SUM,pc%comm,ierr)
+    call MPI_Allreduce(MPI_IN_PLACE,i_tor,n_mpi,MPI_INT,MPI_SUM,pc%comm,ierr)
     call MPI_COMM_SPLIT(pc%comm,i_tor(my_id+1),my_id,pc%MPI_COMM_TRANS,ierr)
 
     pc%n_masters = pc%n_mode_families
@@ -166,33 +166,33 @@ module mod_preconditioner
   end subroutine distribute_modes
 
   !> Distribute MPI ranks among mode families
-  subroutine distribute_ranks(n_cpu,pc)
+  subroutine distribute_ranks(n_mpi,pc)
     use data_structure, only: type_PRECOND
     use phys_module, only: ranks_per_family
     implicit none
 
     type(type_PRECOND) :: pc
-    integer, intent(in)  :: n_cpu
-    integer :: mcpu, r, i, j
+    integer, intent(in)  :: n_mpi
+    integer :: m_mpi, r, i, j
     integer, dimension(:), pointer :: rank_id => Null()
 
     allocate(pc%rank_range(pc%n_mode_families + 1))
     allocate(pc%ranks_per_family(pc%n_mode_families))
-    allocate(pc%mode_families_ranks(pc%n_mode_families,n_cpu))
-    allocate(rank_id(n_cpu))
+    allocate(pc%mode_families_ranks(pc%n_mode_families,n_mpi))
+    allocate(rank_id(n_mpi))
 
     do i = 1, pc%n_mode_families
-      do j = 1, n_cpu
+      do j = 1, n_mpi
         pc%mode_families_ranks(i,j) = -1
       enddo
     enddo
 
-    mcpu = n_cpu/pc%n_mode_families
-    r = mod(n_cpu,pc%n_mode_families)
+    m_mpi = n_mpi/pc%n_mode_families
+    r = mod(n_mpi,pc%n_mode_families)
 
     if (pc%autodistribute_ranks) then
       do i=1, pc%n_mode_families
-        pc%ranks_per_family(i) = mcpu
+        pc%ranks_per_family(i) = m_mpi
         if ((r.gt.0).and.(i.le.r))  pc%ranks_per_family(i) = pc%ranks_per_family(i) + 1 ! add extra rank if avaiable
       enddo
     else
@@ -211,12 +211,12 @@ module mod_preconditioner
     do i= 2, pc%n_mode_families + 1
       r = r + pc%rank_range(i) - pc%rank_range(i-1)
     enddo
-    if (r.ne.n_cpu) then
+    if (r.ne.n_mpi) then
       write(*,*) "Error in distribution of ranks"
       call exit(0)
     endif
 
-    do i = 1, n_cpu
+    do i = 1, n_mpi
       do j = 2, pc%n_mode_families + 1
         if ((i.ge.pc%rank_range(j-1)).and.(i.lt.pc%rank_range(j))) then
           rank_id(i) = j - 1
@@ -227,7 +227,7 @@ module mod_preconditioner
 
     do j=1,pc%n_mode_families
       r = 0
-      do i = 1, n_cpu
+      do i = 1, n_mpi
         if (rank_id(i).eq.j) then
           r = r + 1
           pc%mode_families_ranks(j,r) = i - 1

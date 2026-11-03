@@ -46,7 +46,7 @@ real*8  :: value_out, psi_bnd
 real*8  :: phi_start, rho_norm, t_norm
 
 integer :: r_delta, n_div, n_r_start
-integer :: my_id, ikeep, n_cpu, ierr, nsend, nrecv, ikeep0, inode1, inode2, i_line0
+integer :: my_id, ikeep, n_mpi, ierr, nsend, nrecv, ikeep0, inode1, inode2, i_line0
 real*4,allocatable :: RZkeep(:,:),scalars(:,:)
 real*4             :: ZERO
 integer            :: status(MPI_STATUS_SIZE)
@@ -72,7 +72,7 @@ call MPI_INIT(IERR)
 !required=MPI_THREAD_MULTIPLE
 !call MPI_Init_thread(required,provided,StatInfo)
 call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)      ! id of each MPI proc
-call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr)      ! number of MPI procs
+call MPI_COMM_SIZE(MPI_COMM_WORLD, n_mpi, ierr)      ! number of MPI procs
 write(*,*) 'my_id = ', my_id
 
 
@@ -273,11 +273,11 @@ i_strike = 0
 
 n_R_start = n_div
 
-!r_delta = (n_R_start - 1) / n_cpu
+!r_delta = (n_R_start - 1) / n_mpi
 
-allocate(k_list(size( (/ (k, k=1+my_id, n_R_start, n_cpu ) /) )))
+allocate(k_list(size( (/ (k, k=1+my_id, n_R_start, n_mpi ) /) )))
 
-k_list = (/ (k, k=1+my_id, n_R_start, n_cpu ) /)
+k_list = (/ (k, k=1+my_id, n_R_start, n_mpi ) /)
 
 !local_r_start = 1 + my_id*r_delta
 
@@ -888,7 +888,7 @@ if (my_id .eq. 0) then
 endif
 
 if (my_id .eq. 0) then
-  do j=1,n_cpu-1
+  do j=1,n_mpi-1
     call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
     if (ikeep .gt. 0) then
       nrecv = 2*ikeep
@@ -923,7 +923,7 @@ do i_var =1, n_scalars
   endif
 
   if (my_id .eq. 0) then
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(ikeep,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (ikeep .gt. 0) then
         nrecv = ikeep
@@ -971,7 +971,7 @@ open(newunit=f_turns_minus, file='n_turns_minus.dat', action='write', status='re
      connection_length_minus_all(k_list, :) = connection_length_minus
      n_turn_plus_all(k_list, :) = n_turn_plus
      n_turn_minus_all(k_list, :) = n_turn_minus
-     do j=1,n_cpu-1
+     do j=1,n_mpi-1
         call mpi_recv(local_ks,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
         print *, 'nk = ', local_ks(1)
         allocate(local_k_list(local_ks(1)))
@@ -1087,7 +1087,7 @@ if (my_id .eq. 0) then
 endif
 
 if (my_id .eq. 0) then
-  do j=1,n_cpu-1
+  do j=1,n_mpi-1
     call mpi_recv(i_strike,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
     if (i_strike .gt. 0) then
       nrecv = i_strike
@@ -1127,7 +1127,7 @@ do i_var =1, n_scalars
   endif
 
   if (my_id .eq. 0) then
-    do j=1,n_cpu-1
+    do j=1,n_mpi-1
       call mpi_recv(i_strike,1, MPI_INTEGER, j, j, MPI_COMM_WORLD, status, ierr)
       if (i_strike .gt. 0) then
         nrecv = i_strike

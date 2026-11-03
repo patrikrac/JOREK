@@ -1,0 +1,89 @@
+ 
+  &in1
+  
+  restart = .f.
+  tstep   = 0.01 
+  nstep   = 0 
+
+  nstep_particles    = 100000 ! 1000000 
+  nsubstep_particles = 1
+  tstep_particles    = 0.1044656280E-06  
+  
+  filter_perp  = 0d0
+  filter_hyper = 1d-10
+  filter_par   = 1.d0 
+
+  filter_perp_n0  = 1e-6 
+  filter_hyper_n0 = 1d-10
+  filter_par_n0   = 100.d0
+
+  nout = 100 
+
+  rst_hdf5 = 1 
+ 
+  use_mumps_eq = .true.
+  use_pastix_eq = .false.
+
+  force_central_node = .false.
+  fix_axis_nodes     = .true.
+
+  !_____________________________________boundary definition
+  mf = 0
+
+  ellip  = 1.0d0
+  tria_u = 0.0d0
+  tria_l = 0.0d0
+  quad_u = 0.0d0
+  quad_l = 0.0d0
+
+  R_geo = 1.     
+  Z_geo = 0.     
+  F0    = -1. 
+  
+  amin  = 0.2 
+ 
+  !_____________________________________grid parameters
+ 
+  n_radial = 41
+  n_pol    = 65 
+  n_flux   = 41 
+  n_tht    = 65 
+  
+  !xr1  = 0.7
+  !sig1 = 0.2
+
+  FF_0 = -1.
+  FF_1 = -1.
+  FF_coef(1)  = 0.0
+  FF_coef(2)  = 0.d0
+  FF_coef(3)  = 0.d0
+  FF_coef(4)  = 0.03d0
+  FF_coef(5)  = 5.0d0
+  FF_coef(6)  = 1.d0
+  FF_coef(7)  = 10.d0
+  FF_coef(8)  = 1.d0
+
+ heatsource     = 0.d0
+ particlesource = 0.d0
+
+  T_0 = 1.d-8
+  T_1 = 1.d-8
+  T_coef(1) = 0.0d0
+  T_coef(2) = 0.0d0
+  T_coef(3) = 0.d0
+  T_coef(4) = 1.d0
+  T_coef(5) = 5.d0
+
+  rho_0 = 1.
+  rho_1 = 1.
+  rho_coef(1)  =  0.0
+  rho_coef(2)  =  0.0
+  rho_coef(3)  =  0.0
+  rho_coef(4)  =  1.d0
+  rho_coef(5)  =  5.d0
+
+  central_density = 1.d0 
+  central_mass    = 2.00
+
+  &end
+

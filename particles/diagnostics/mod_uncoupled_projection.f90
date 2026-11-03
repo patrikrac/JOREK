@@ -74,6 +74,7 @@ contains
     use mod_particle_sim, only: particle_sim
     use mod_parameters, only: n_tor, n_vertex_max, n_degrees
     use phys_module, only: n_aux_var
+    use data_structure, only: init_node
 
     use mpi_mod
     use mod_event
@@ -91,7 +92,7 @@ contains
     real*8,  allocatable :: my_rhs(:,:), y_tmp(:)
     integer, allocatable :: recv_counts(:), recv_disp(:)
     integer :: n_rhs, n_rhs_f, i_rhs, n_tor_local, i_tor_local, n_loc_n
-    integer :: in_local, in_global, index_n, id_master_in_world, offset
+    integer :: in_local, in_global, index_n, id_master_in_world, offset, i_glob1, i_glob2
     logical :: halt(size(IEEE_USUAL,1)), found_nan
 
     call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, ierr)
@@ -113,6 +114,11 @@ contains
       n_rhs_f = size(this%rhs_f,5)
     end if
 
+    ! reinitialise the storage node_list to ensure all projections fit
+    do i=1, this%node_list%n_nodes
+      call init_node(this%node_list%node(i), n_rhs_f+n_rhs)
+    enddo
+
     n_tor_local = this%n_tor_local
     i_tor_local = this%i_tor_local
 
@@ -124,6 +130,9 @@ contains
       write(*,*) n_tor_local*this%n_dof,  this%rhs_vec%n
     endif
 
+    if (associated(this%rhs_vec%val)) then
+      deallocate(this%rhs_vec%val); this%rhs_vec%val => Null()
+    endif
     allocate(this%rhs_vec%val(this%rhs_vec%n*this%rhs_vec%nrhs))
     this%rhs_vec%val = 0.d0
 
@@ -204,7 +213,7 @@ contains
     call MPI_Reduce(my_rhs(:,1),this%rhs_vec%val,this%rhs_vec%n*this%rhs_vec%nrhs, MPI_REAL8, MPI_SUM, 0, this%mpi_comm_world, ierr)
 
     do in=2, n_tor, 2
-      id_master_in_world = in/2 * this%m_cpu
+      id_master_in_world = in/2 * this%m_mpi
       index_n = in/2 + 1
       call MPI_Reduce(my_rhs(:,index_n),this%rhs_vec%val,this%rhs_vec%n*this%rhs_vec%nrhs, MPI_REAL8, MPI_SUM, id_master_in_world, this%mpi_comm_world, ierr)
     enddo
@@ -233,8 +242,8 @@ contains
     
       allocate(y_tmp(n_loc_n*(n_tor+1)))            ! allocate only on my_id=0???
 
-      allocate(recv_counts(this%n_cpu/this%m_cpu))
-      allocate(recv_disp(this%n_cpu/this%m_cpu))
+      allocate(recv_counts(this%n_mpi/this%m_mpi))
+      allocate(recv_disp(this%n_mpi/this%m_mpi))
       
       y_tmp = 0.d0
 
@@ -258,7 +267,7 @@ contains
     ! Write the solution to the node_list
     if (this%my_id .eq. 0) then
 
-      do i_var=1,min(n_rhs+n_rhs_f, n_aux_var)
+      do i_var=1,n_rhs+n_rhs_f
     
         found_nan = .false.
         
@@ -268,26 +277,37 @@ contains
         
             index = this%node_list%node(i)%index(k)
 
+            i_glob1 = 2*(index-1) + 1 + 2*this%n_dof*(i_var-1)
+
             if (this%do_zonal) then
-              this%node_list%node(i)%values(1,k,i_var) = y_tmp(2*(index-1) + 1 + 2*this%n_dof*(i_var-1)) + y_tmp(2*(index-1) + 2 + 2*this%n_dof*(i_var-1))
-              this%node_list%node(i)%values(1,k,2)     = y_tmp(2*(index-1) + 2 + 2*this%n_dof*(i_var-1))
+              this%node_list%node(i)%deltas(1,k,i_var) = y_tmp(i_glob1) + y_tmp(i_glob1+1) - this%node_list%node(i)%values(1,k, i_var)
+              this%node_list%node(i)%deltas(1,k,2)     = y_tmp(i_glob1+1)                  - this%node_list%node(i)%values(1,k,     2)
+              
+              this%node_list%node(i)%values(1,k,i_var) = y_tmp(i_glob1) + y_tmp(i_glob1+1)
+              this%node_list%node(i)%values(1,k,2)     = y_tmp(i_glob1+1)
             else
-              this%node_list%node(i)%values(1,k,i_var) = y_tmp(2*(index-1) + 1 + 2*this%n_dof*(i_var-1))
+              this%node_list%node(i)%deltas(1,k,i_var) = y_tmp(i_glob1) - this%node_list%node(i)%values(1,   k, i_var)
+              this%node_list%node(i)%values(1,k,i_var) = y_tmp(i_glob1)
             endif
 
             offset = 2*this%n_dof * this%rhs_vec%nrhs
             
             do i_tor=2,n_tor,2
 
-              this%node_list%node(i)%values(i_tor,  k,i_var) = y_tmp(2*(index-1) + 1 + offset + 2*this%n_dof*(i_var-1) + (i_tor-2)*this%n_dof * this%rhs_vec%nrhs)
-              this%node_list%node(i)%values(i_tor+1,k,i_var) = y_tmp(2*(index-1) + 2 + offset + 2*this%n_dof*(i_var-1) + (i_tor-2)*this%n_dof * this%rhs_vec%nrhs)
+              i_glob2 = 2*(index-1) + 1 + offset + 2*this%n_dof*(i_var-1) + (i_tor-2)*this%n_dof * this%rhs_vec%nrhs
+
+              this%node_list%node(i)%deltas(i_tor,  k,i_var) = y_tmp(i_glob2)   - this%node_list%node(i)%values(i_tor,   k, i_var)
+              this%node_list%node(i)%deltas(i_tor+1,k,i_var) = y_tmp(i_glob2+1) - this%node_list%node(i)%values(i_tor+1, k, i_var)
+
+              this%node_list%node(i)%values(i_tor,  k,i_var) = y_tmp(i_glob2)   
+              this%node_list%node(i)%values(i_tor+1,k,i_var) = y_tmp(i_glob2+1)
             
             end do
           
           enddo    ! order
           
           ! Check for NaNs in the projection
-          if (any(ieee_is_nan(this%node_list%node(i)%values(:,:,i_var)))) then
+          if (any(ieee_is_nan(this%node_list%node(i)%values(:,:,i_var))) .or. any(ieee_is_nan(this%node_list%node(i)%deltas(:,:,i_var)))) then
             found_nan = .true.
           end if
         
@@ -908,7 +928,7 @@ contains
           psi_y = (- x_t(ms,mt) * psi_s(ms,mt) + x_s(ms,mt) * psi_t(ms,mt)) / xjac
 
           BB2 = 1.d0
-          if (filter_parallel_n0 .gt. 0.d0) BB2 = (F0*F0 + psi_x * psi_x + psi_y * psi_y )/x_g(ms,mt)
+          if (filter_parallel_n0 .gt. 0.d0) BB2 = (F0*F0 + psi_x * psi_x + psi_y * psi_y )/x_g(ms,mt)**2
 
           area   = area   + xjac * wst
           volume = volume + TWOPI * x_g(ms,mt) * xjac * wst
