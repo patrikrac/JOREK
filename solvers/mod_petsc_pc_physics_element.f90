@@ -116,6 +116,16 @@ contains
       call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
                                            mhd_sim, g_ctx%W_force)
     endif
+    ! TEST ONLY: -sf_w_scale s multiplies W (0 drops it, e.g. when the u rows are frozen to a mass)
+    block
+      PetscReal :: wsc
+      PetscBool :: wset
+      PetscCallA(PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-sf_w_scale", wsc, wset, ierr))
+      if (wset) then
+        PetscCallA(MatScale(g_ctx%W_force, wsc, ierr))
+        if (my_id .eq. 0) write(*,'(A,ES10.3)') "[Physics PC]   W_force scaled by -sf_w_scale ", wsc
+      endif
+    end block
     g_ctx%w_force_ready = .true.
     call PetscLogEventEnd(pcev_elem_asm, ierr)
 
