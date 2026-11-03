@@ -45,7 +45,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 tokamak_device, gvec_grid_import,bloating_factor,   &
                 freeze_psi_dynamics,                                &
                 use_core_freeze, core_freeze_s0, core_freeze_sig,   &
-                assemble_rhoT_only,                                 &
+                rhoT_only,                                 &
                 zkpar_picard,                                       &
                 decay_bc_enable, decay_lambda_T, decay_lambda_n,    &
                 decay_R0, decay_rmin, decay_conv,                   &

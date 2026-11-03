@@ -64,7 +64,7 @@ real*8     :: T0_e, T0_e_s, T0_e_ss
 real*8     :: BigR_x, vv2, eta_T, visco_T, deta_dT, d2eta_d2T, dvisco_dT
 real*8     :: theta, zeta, reta
 logical    :: xpoint2, use_fft
-logical    :: keep_blk(n_var,n_var)   !< (test, trial) variable blocks assembled; see assemble_rhoT_only
+logical    :: keep_blk(n_var,n_var)   !< (test, trial) variable blocks assembled; see rhoT_only
 integer    :: iv_e, jv_e
 
 real*8     :: T0_i_corr, T0_e_corr                      !> temperature for T^(-1.5)
@@ -120,10 +120,10 @@ ELM   = 0.d0; RHS   = 0.d0
 rhs_ij  = 0.d0
 amat_ij = 0.d0
 
-! --- assemble_rhoT_only: with psi/u frozen only (rho,T)x(rho,T) and the frozen
+! --- rhoT_only: with psi/u frozen only (rho,T)x(rho,T) and the frozen
 ! --- variables' own diagonal blocks are kept; their couplings act on zero increments
 keep_blk = .true.
-if (assemble_rhoT_only) then
+if (rhoT_only) then
   keep_blk = .false.
   do iv_e = 1, n_var
     keep_blk(iv_e, iv_e) = .true.

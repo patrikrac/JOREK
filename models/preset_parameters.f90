@@ -70,7 +70,7 @@ subroutine preset_parameters
   bloating_factor = 1.0d0
   freeze_psi_dynamics = .false.
   use_core_freeze  = .false.   ! mirrors freeze_psi_dynamics's own convention exactly
-  assemble_rhoT_only = .false.
+  rhoT_only = .false.
   core_freeze_s0   = 0.30d0    ! meaningful physical default now, not a disabling trick
   core_freeze_sig = 0.02d0
   zkpar_picard = .false. 
