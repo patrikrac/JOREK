@@ -25,18 +25,6 @@ module mod_petsc
     PetscLogStage :: stage_solve = -1
   end type type_PETSC_SYSTEM
 
-  !> rhoT_only (model183 with psi/u frozen): the (rho,T) rows/columns of the AIJ
-  !! copy as their own system, its KSP and the scatter from the full vectors
-  type type_RHOT_SYSTEM
-    Mat  :: A_aij, A_rt
-    Vec  :: x_rt, b_rt
-    IS   :: is_rt
-    VecScatter :: sc
-    KSP  :: ksp
-    logical :: ready = .false.
-  end type type_RHOT_SYSTEM
-  type(type_RHOT_SYSTEM), save :: rt_sys
-
 
 contains
 
@@ -389,7 +377,7 @@ contains
   !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
-    use phys_module, only: use_physics_pc, rhoT_only
+    use phys_module, only: use_physics_pc
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
     use mod_petsc_pc_physics_ctx, only: physics_pc_mem
     use mod_petsc_pc_sf, only: sf_report
@@ -412,12 +400,6 @@ contains
     PetscBool :: full_lu, central_rhs
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
-    ! rhoT_only with use_physics_pc: the SF's rho/T stages (GMG) on the full system;
-    ! without it: the reduced (rho,T) system with a MUMPS LU (reference)
-    if (rhoT_only .and. .not. use_physics_pc) then
-      call petsc_solve_rhot_only(petsc_sys, solve_only, n_iter, converged)
-      return
-    endif
     ! The physics PC reads its blocks row by row and FGMRES only needs
     ! matvecs, so both work on JOREK's own BAIJ matrix and the AIJ copy (a
     ! second full Jacobian) is never made. A_aij then ALIASES A, which JOREK
@@ -607,129 +589,6 @@ contains
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
     if (my_id .eq.0) write(*,'(A,ES12.4)') "[PETSc] solution norm: ", petsc_norm
   end subroutine petsc_solve_iterative_and_retrieve
-
-
-  !> rhoT_only: solve only the (rho,T) unknowns, all harmonics coupled; the frozen
-  !! variables' increments are set to zero. Inside a node block the unknowns are
-  !! variable-major, (var-1)*n_tor + i_tor (as in mod_petsc_pc_toroidal). The
-  !! default PC is one MUMPS LU of the (rho,T) system; -rhot_* options override.
-  !! The LU reference: with use_physics_pc the SF's rho/T GMG runs instead.
-  subroutine petsc_solve_rhot_only(petsc_sys, solve_only, n_iter, converged)
-    use mod_clock, only: FMT_TIMING
-    use mod_parameters, only: n_tor, n_var, var_rho, var_T
-    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    logical, intent(in)  :: solve_only
-    integer, intent(out) :: n_iter
-    logical, intent(out) :: converged
-
-    PetscErrorCode :: ierr
-    integer :: comm, my_id, mpierr
-    PetscInt :: rstart, rend, i, off, n_loc, bs, its
-    PetscInt, allocatable :: idx(:)
-    PetscLogDouble :: ts1, ts2, t1, t2
-    PC :: pc
-    KSPConvergedReason :: reason
-    PetscViewerAndFormat :: vf
-    PetscReal :: rt, petsc_norm
-    PetscInt :: mi, rs
-    PetscBool :: set
-
-    call PetscObjectGetComm(petsc_sys%A, comm, ierr)
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-    bs = n_var*n_tor
-
-    call MPI_Barrier(comm, mpierr)
-    PetscCallA(PetscTime(ts1, ierr))
-    if (.not. rt_sys%ready) then
-      PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
-      PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
-      PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, rt_sys%A_aij, ierr))
-      PetscCallA(MatGetOwnershipRange(rt_sys%A_aij, rstart, rend, ierr))
-      allocate(idx(rend-rstart))
-      n_loc = 0
-      do i = rstart, rend-1
-        off = mod(i, bs)
-        if (off/n_tor + 1 == var_rho .or. off/n_tor + 1 == var_T) then
-          n_loc = n_loc + 1
-          idx(n_loc) = i
-        endif
-      enddo
-      PetscCallA(ISCreateGeneral(comm, n_loc, idx(1:n_loc), PETSC_COPY_VALUES, rt_sys%is_rt, ierr))
-      deallocate(idx)
-      PetscCallA(MatCreateSubMatrix(rt_sys%A_aij, rt_sys%is_rt, rt_sys%is_rt, MAT_INITIAL_MATRIX, rt_sys%A_rt, ierr))
-      PetscCallA(MatCreateVecs(rt_sys%A_rt, rt_sys%x_rt, rt_sys%b_rt, ierr))
-      PetscCallA(VecScatterCreate(petsc_sys%b, rt_sys%is_rt, rt_sys%b_rt, PETSC_NULL_IS, rt_sys%sc, ierr))
-
-      PetscCallA(KSPCreate(comm, rt_sys%ksp, ierr))
-      PetscCallA(KSPSetOptionsPrefix(rt_sys%ksp, "rhot_", ierr))
-      PetscCallA(KSPSetOperators(rt_sys%ksp, rt_sys%A_rt, rt_sys%A_rt, ierr))
-      PetscCallA(KSPSetType(rt_sys%ksp, KSPFGMRES, ierr))
-      PetscCallA(KSPSetInitialGuessNonzero(rt_sys%ksp, PETSC_FALSE, ierr))
-      ! same outer controls as the full-system path (-jorek_outer_rtol/_maxit/_restart)
-      rt = 1.d-8; mi = 400; rs = 40
-      PetscCallA(PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_rtol", rt, set, ierr))
-      PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_maxit", mi, set, ierr))
-      PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_restart", rs, set, ierr))
-      PetscCallA(KSPSetTolerances(rt_sys%ksp, rt, 1.d-36, PETSC_CURRENT_REAL, mi, ierr))
-      PetscCallA(KSPGMRESSetRestart(rt_sys%ksp, rs, ierr))
-      PetscCallA(KSPGetPC(rt_sys%ksp, pc, ierr))
-      PetscCallA(PCSetType(pc, PCLU, ierr))
-      PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
-      ! centralized dense RHS for this factor too (see petsc_default_mumps_central_rhs)
-      PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-rhot_mat_mumps_icntl_20", set, ierr))
-      if (.not. set) PetscCallA(PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-rhot_mat_mumps_icntl_20", "0", ierr))
-      PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
-      PetscCallA(KSPMonitorSet(rt_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
-      PetscCallA(KSPSetFromOptions(rt_sys%ksp, ierr))
-      if (my_id == 0) write(*,'(A,I0,A,ES10.3,A,I0)') " [PETSc] rhoT_only: (rho,T) system of ", &
-        2*(rend-rstart)/n_var, " local rows on rank 0, FGMRES + MUMPS LU (-rhot_ overrides), rtol ", rt, ", maxit ", mi
-      PetscCallA(KSPSetUp(rt_sys%ksp, ierr))
-      rt_sys%ready = .true.
-      PetscCallA(PetscLogStagePop(ierr))
-    else if (.not. solve_only) then
-      if (my_id .eq. 0) write(*,*) "[PETSc] PC rebuild: refactorizing"
-      PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, rt_sys%A_aij, ierr))
-      PetscCallA(MatCreateSubMatrix(rt_sys%A_aij, rt_sys%is_rt, rt_sys%is_rt, MAT_REUSE_MATRIX, rt_sys%A_rt, ierr))
-      PetscCallA(KSPSetOperators(rt_sys%ksp, rt_sys%A_rt, rt_sys%A_rt, ierr))
-      PetscCallA(KSPSetReusePreconditioner(rt_sys%ksp, PETSC_FALSE, ierr))
-      PetscCallA(KSPSetUp(rt_sys%ksp, ierr))
-      PetscCallA(PetscLogStagePop(ierr))
-    else
-      if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
-      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, rt_sys%A_aij, ierr))
-      PetscCallA(MatCreateSubMatrix(rt_sys%A_aij, rt_sys%is_rt, rt_sys%is_rt, MAT_REUSE_MATRIX, rt_sys%A_rt, ierr))
-      PetscCallA(KSPSetOperators(rt_sys%ksp, rt_sys%A_rt, rt_sys%A_rt, ierr))
-      PetscCallA(KSPSetReusePreconditioner(rt_sys%ksp, PETSC_TRUE, ierr))
-    endif
-    call MPI_Barrier(comm, mpierr)
-    PetscCallA(PetscTime(ts2, ierr))
-    if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
-
-    ! b_rt = b(rho,T); solve; x = 0 outside (rho,T)
-    PetscCallA(VecScatterBegin(rt_sys%sc, petsc_sys%b, rt_sys%b_rt, INSERT_VALUES, SCATTER_FORWARD, ierr))
-    PetscCallA(VecScatterEnd(rt_sys%sc, petsc_sys%b, rt_sys%b_rt, INSERT_VALUES, SCATTER_FORWARD, ierr))
-    call MPI_Barrier(comm, mpierr)
-    PetscCallA(PetscTime(t1, ierr))
-    PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
-    PetscCallA(KSPSolve(rt_sys%ksp, rt_sys%b_rt, rt_sys%x_rt, ierr))
-    PetscCallA(PetscLogStagePop(ierr))
-    call MPI_Barrier(comm, mpierr)
-    PetscCallA(PetscTime(t2, ierr))
-    PetscCallA(VecSet(petsc_sys%x, 0.0d0, ierr))
-    PetscCallA(VecScatterBegin(rt_sys%sc, rt_sys%x_rt, petsc_sys%x, INSERT_VALUES, SCATTER_REVERSE, ierr))
-    PetscCallA(VecScatterEnd(rt_sys%sc, rt_sys%x_rt, petsc_sys%x, INSERT_VALUES, SCATTER_REVERSE, ierr))
-
-    PetscCallA(KSPGetConvergedReason(rt_sys%ksp, reason, ierr))
-    PetscCallA(KSPGetIterationNumber(rt_sys%ksp, its, ierr))
-    n_iter    = its
-    converged = (reason%v > 0)
-    if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
-    if (my_id == 0) write(*,'(A,I5,A,I0)') "[PETSc] outer iterations: ", n_iter, "   converged reason: ", reason%v
-    PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
-    if (my_id .eq.0) write(*,'(A,ES12.4)') "[PETSc] solution norm: ", petsc_norm
-  end subroutine petsc_solve_rhot_only
 
 
   subroutine petsc_recover_solution(petsc_sys, sol_vec)
