@@ -16,6 +16,14 @@ module mod_gmg_ring_btd
   private
 
   integer, parameter, public :: RS_THOMAS = 1, RS_HYB = 2
+  !> Precision of the ring and line smoother solves: the factors are computed in
+  !! double and rounded to this kind for the solves. Single by default; the
+  !! compile-time switch -DSF_RING_DP keeps them in double.
+#ifdef SF_RING_DP
+  integer, parameter, public :: rk_ring = 8
+#else
+  integer, parameter, public :: rk_ring = 4
+#endif
   !> node-block products up to this many entries skip the BLAS (sgemv_s)
   integer, parameter :: GEMV_SMALL = 1024
 
@@ -38,7 +46,7 @@ module mod_gmg_ring_btd
   public :: btd_plan, btd_index, btd_factor, btd_equil, btd_invert, btd_solve_sp
   public :: hyb_end, hyb_fac_seg, hyb_fac_sep, hyb_sol_fwd_sp, hyb_sol_sep_sp, hyb_sol_bwd_sp
 
-  external :: dgetrf, dgetrs, dgetri, dgemm, sgetrs, sgemv
+  external :: dgetrf, dgetrs, dgetri, dgemm, sgetrs, sgemv, dgemv
 
 contains
 

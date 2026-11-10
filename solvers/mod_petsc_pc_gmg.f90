@@ -118,7 +118,7 @@ module mod_petsc_pc_gmg
     logical, allocatable :: band(:)                        !< LAPACK band storage, else dense
     integer(8), allocatable :: loff(:), loff4(:)           !< factor offset in lu; < 0: ring solver, in lu4 at loff4
     real*8, allocatable  :: lu(:)                          !< LAPACK factors
-    real*4, allocatable  :: lu4(:)                         !< ring-solver factors (single precision)
+    real(rk_ring), allocatable :: lu4(:)                   !< ring-solver factors (kind rk_ring: single unless -DSF_RING_DP)
     integer(8) :: nlu = 0                                  !< size(lu): lu_index codes above address lu4
     real*8, allocatable  :: eqs(:)                         !< ring blocks' equilibration (btd_equil), else 1
     logical, allocatable :: axblk(:)                       !< the axis block's blocks
@@ -149,7 +149,7 @@ module mod_petsc_pc_gmg
     type(btd_ring), allocatable :: rg(:)
     integer, allocatable :: lb(:), lk(:)                   !< threaded hybrid: (block, segment) work items
     real*8, allocatable :: wk(:)                           !< threaded hybrid: work vector, block order
-    real*4, allocatable :: wk4(:)                          !< its single-precision copy
+    real(rk_ring), allocatable :: wk4(:)                   !< its rk_ring copy
   end type blk_t
 
   !> One hierarchy (an instance of gmg_select). Level 0 is the fine level;
@@ -207,7 +207,7 @@ module mod_petsc_pc_gmg
   ! block-solve work arrays (max block size, 0:threads-1), shared by all
   ! levels and hierarchies (their solves never overlap), grow-only
   real*8, allocatable, save :: wbuf(:,:)
-  real*4, allocatable, save :: wbuf4(:,:)
+  real(rk_ring), allocatable, save :: wbuf4(:,:)
 
   ! -log_view events; the apply-side ones per instance (GMG_*, GMG<k>_*)
   PetscLogEvent, save :: gev_ptap = -1, gev_smsetup = -1, gev_coarselu = -1
@@ -2050,7 +2050,7 @@ contains
           ib(2), " banded, max kl ", im(1), "; ", ib(3), " singular -> point)"
         if (H%harm_pair == 2) write(*,'(A)', advance="no") ", all slots per block"
         if (ib(4) > 0) write(*,'(A,I0,A,I0,A)', advance="no") ", ring solver on ", ib(4), &
-          " blocks over all levels (single precision, up to ", im(2), " segments on level 0)"
+          " blocks over all levels ("//merge("double", "single", rk_ring == 8)//" precision, up to ", im(2), " segments on level 0)"
         write(*,'(A,F9.2,A,F9.2,A)') "; factors ", st(1) * 8.d-6, " MB (max rank ", st(2) * 8.d-6, " MB)"
         if (H%smoother == GMG_SM_ZEBRA_RINGS) write(*,'(A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, &
           ": zebra ring blocks on fine rings I < ", H%ring_is, ", zebra radial lines outside"
@@ -2320,7 +2320,7 @@ contains
     integer :: g
     smoother_storage = 0.d0
     do g = 0, H%nlev - 2
-      if (allocated(H%blk(g)%lu4)) smoother_storage = smoother_storage + 0.5d0 * size(H%blk(g)%lu4, kind=8)
+      if (allocated(H%blk(g)%lu4)) smoother_storage = smoother_storage + (rk_ring / 8.d0) * size(H%blk(g)%lu4, kind=8)
       if (allocated(H%blk(g)%lu)) then
         smoother_storage = smoother_storage + dble(size(H%blk(g)%lu, kind=8))
       endif
@@ -2664,7 +2664,7 @@ contains
           endif
           if (abs(dv) < tiny(1.0d0)) dv = 1.0d0
           if (ix > B%nlu) then
-            B%lu4(ix - B%nlu) = real(dv, 4)
+            B%lu4(ix - B%nlu) = real(dv, rk_ring)
           else
             B%lu(ix) = dv
           endif
@@ -2724,7 +2724,7 @@ contains
       real*8, intent(inout) :: w(:)
       if (binfo(bb_) /= 0) return
       call btd_invert(B%rg(bb_), w, B%piv(B%off(bb_) + 1))
-      B%lu4(B%loff4(bb_) + 1 : B%loff4(bb_) + B%rg(bb_)%tot) = real(w(1:B%rg(bb_)%tot), 4)
+      B%lu4(B%loff4(bb_) + 1 : B%loff4(bb_) + B%rg(bb_)%tot) = real(w(1:B%rg(bb_)%tot), rk_ring)
     end subroutine ring_out
 
     !> hybrid ring bb in w: its segments on the threads, then the separators
@@ -3222,7 +3222,7 @@ contains
       endif
       d = B%vd(k)
       if (d > B%nlu) then
-        B%lu4(d - B%nlu) = real(v, 4)
+        B%lu4(d - B%nlu) = real(v, rk_ring)
       else if (d > 0) then
         B%lu(d) = v
       else
@@ -3235,7 +3235,7 @@ contains
       v = vg_(B%gs(k))
       d = B%gd(k)
       if (d > B%nlu) then
-        B%lu4(d - B%nlu) = real(v, 4)
+        B%lu4(d - B%nlu) = real(v, rk_ring)
       else if (d > 0) then
         B%lu(d) = v
       else
@@ -4145,7 +4145,7 @@ contains
             w(q) = w(q) / B%lu4(lu_index(B, bb, q, q) - B%nlu)
           enddo
         else
-          wbuf4(1:n, t) = real(w(1:n) * B%eqs(B%off(bb) + 1 : B%off(bb) + n), 4)
+          wbuf4(1:n, t) = real(w(1:n) * B%eqs(B%off(bb) + 1 : B%off(bb) + n), rk_ring)
           call btd_solve_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), wbuf4(1, t))
           w(1:n) = wbuf4(1:n, t) * B%eqs(B%off(bb) + 1 : B%off(bb) + n)
         endif
@@ -4228,7 +4228,7 @@ contains
           v = gp(r - B%nrow + 1)
         endif
         if (sp) then
-          B%wk4(B%off(bb) + q) = real(v * B%eqs(B%off(bb) + q), 4)
+          B%wk4(B%off(bb) + q) = real(v * B%eqs(B%off(bb) + q), rk_ring)
         else
           B%wk(B%off(bb) + q) = v
         endif

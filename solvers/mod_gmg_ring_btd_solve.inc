@@ -1,18 +1,26 @@
-! The single-precision ring solves of mod_gmg_ring_btd (included there). a holds
-! the factors as btd_factor / btd_invert leave them, rounded to single, piv their
-! pivots, x a vector in block order.
+! The ring solves of mod_gmg_ring_btd (included there), in kind rk_ring (single by
+! default, double with -DSF_RING_DP). a holds the factors as btd_factor /
+! btd_invert leave them, rounded to rk_ring, piv their pivots, x a vector in
+! block order. The _sp names are kept for both precisions.
+#ifdef SF_RING_DP
+#define GEMV_RK dgemv
+#define GETRS_RK dgetrs
+#else
+#define GEMV_RK sgemv
+#define GETRS_RK sgetrs
+#endif
 
   !> y = alpha A x + beta y (A m x n, column-major): node blocks up to
   !! GEMV_SMALL entries as column axpys, where a BLAS call costs more than the
   !! multiply-adds, larger ones by sgemv.
   subroutine sgemv_s(m, n, alpha, a, lda, x, beta, y)
     integer, intent(in)   :: m, n, lda
-    real*4, intent(in)    :: alpha, beta, a(lda, *), x(*)
-    real*4, intent(inout) :: y(*)
-    real*4 :: t
+    real(rk_ring), intent(in)    :: alpha, beta, a(lda, *), x(*)
+    real(rk_ring), intent(inout) :: y(*)
+    real(rk_ring) :: t
     integer :: j
     if (m * n > GEMV_SMALL) then
-      call sgemv('N', m, n, alpha, a, lda, x, 1, beta, y, 1)
+      call GEMV_RK('N', m, n, alpha, a, lda, x, 1, beta, y, 1)
       return
     endif
     if (beta == 0) then
@@ -29,9 +37,9 @@
   !> x = A^-1 x, serially
   subroutine btd_solve_sp(rg, a, piv, x)
     type(btd_ring), intent(in) :: rg
-    real*4, intent(in)    :: a(*)
+    real(rk_ring), intent(in)    :: a(*)
     integer, intent(in)   :: piv(*)
-    real*4, intent(inout) :: x(*)
+    real(rk_ring), intent(inout) :: x(*)
     integer :: k
     if (rg%meth == RS_THOMAS) then
       call thomas_solve_sp(rg, a, piv, x)
@@ -49,18 +57,18 @@
   !> x_J = D~_J^-1 x_J: one gemv with the inverse (btd_invert), else the LU solve
   subroutine node_solve_sp(rg, a, piv, J, x)
     type(btd_ring), intent(in) :: rg
-    real*4, intent(in)    :: a(*)
+    real(rk_ring), intent(in)    :: a(*)
     integer, intent(in)   :: piv(*), J
-    real*4, intent(inout) :: x(*)
-    real*4, parameter :: one = 1, zero = 0
-    real*4 :: t(rg%bs(J))
+    real(rk_ring), intent(inout) :: x(*)
+    real(rk_ring), parameter :: one = 1, zero = 0
+    real(rk_ring) :: t(rg%bs(J))
     integer :: bj, info
     bj = rg%bs(J)
     if (rg%inv) then
       t = x(rg%rp(J) + 1 : rg%rp(J) + bj)
       call sgemv_s(bj, bj, one, a(rg%od(J) + 1), bj, t, zero, x(rg%rp(J) + 1))
     else
-      call sgetrs('N', bj, 1, a(rg%od(J) + 1), bj, piv(rg%rp(J) + 1), x(rg%rp(J) + 1), bj, info)
+      call GETRS_RK('N', bj, 1, a(rg%od(J) + 1), bj, piv(rg%rp(J) + 1), x(rg%rp(J) + 1), bj, info)
     endif
   end subroutine node_solve_sp
 
@@ -68,10 +76,10 @@
   !! the corner, then backward
   subroutine thomas_solve_sp(rg, a, piv, x)
     type(btd_ring), intent(in) :: rg
-    real*4, intent(in)    :: a(*)
+    real(rk_ring), intent(in)    :: a(*)
     integer, intent(in)   :: piv(*)
-    real*4, intent(inout) :: x(*)
-    real*4, parameter :: one = 1, mone = -1
+    real(rk_ring), intent(inout) :: x(*)
+    real(rk_ring), parameter :: one = 1, mone = -1
     integer :: J, c, bj, bc
     c = rg%nn - 1; bc = rg%bs(c)
     do J = 0, c - 1
@@ -95,10 +103,10 @@
   !! written by one segment only)
   subroutine hyb_sol_fwd_sp(rg, a, piv, x, k)
     type(btd_ring), intent(in) :: rg
-    real*4, intent(in)    :: a(*)
+    real(rk_ring), intent(in)    :: a(*)
     integer, intent(in)   :: piv(*), k
-    real*4, intent(inout) :: x(*)
-    real*4, parameter :: one = 1, mone = -1
+    real(rk_ring), intent(inout) :: x(*)
+    real(rk_ring), parameter :: one = 1, mone = -1
     integer :: s, J, bj, ba
     s = rg%sep(k); ba = rg%bs(s)
     do J = s + 1, hyb_end(rg, k)
@@ -114,12 +122,12 @@
   !! of the previous segment's last node, then the separators' system
   subroutine hyb_sol_sep_sp(rg, a, piv, x)
     type(btd_ring), intent(in) :: rg
-    real*4, intent(in)    :: a(*)
+    real(rk_ring), intent(in)    :: a(*)
     integer, intent(in)   :: piv(*)
-    real*4, intent(inout) :: x(*)
-    real*4, parameter :: one = 1, mone = -1
+    real(rk_ring), intent(inout) :: x(*)
+    real(rk_ring), parameter :: one = 1, mone = -1
     integer :: k, n, np, b, q, info, ipv(rg%nf)
-    real*4 :: w(rg%nf)
+    real(rk_ring) :: w(rg%nf)
     q = 0
     do k = 0, rg%ns - 1
       n = rg%sep(k); b = rg%bs(n); np = modulo(n - 1, rg%nn)
@@ -129,7 +137,7 @@
       q = q + b
     enddo
     if (rg%ns <= 3) then
-      call sgetrs('N', rg%nf, 1, a(rg%of + 1), rg%nf, ipv, w, rg%nf, info)
+      call GETRS_RK('N', rg%nf, 1, a(rg%of + 1), rg%nf, ipv, w, rg%nf, info)
     else
       call thomas_solve_sp(rg%sub, a(rg%of + 1), ipv, w)
     endif
@@ -144,10 +152,10 @@
   !> hybrid, segment k backward: x_J = z_J - H_J x_a - G_J x_J+1 (x_b at the end)
   subroutine hyb_sol_bwd_sp(rg, a, x, k)
     type(btd_ring), intent(in) :: rg
-    real*4, intent(in)    :: a(*)
+    real(rk_ring), intent(in)    :: a(*)
     integer, intent(in)   :: k
-    real*4, intent(inout) :: x(*)
-    real*4, parameter :: one = 1, mone = -1
+    real(rk_ring), intent(inout) :: x(*)
+    real(rk_ring), parameter :: one = 1, mone = -1
     integer :: s, J, bj, jn
     s = rg%sep(k)
     do J = hyb_end(rg, k), s + 1, -1
