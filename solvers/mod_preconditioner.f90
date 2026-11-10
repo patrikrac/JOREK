@@ -8,8 +8,8 @@ module mod_preconditioner
 !> Initialize preconditioner structure (PC)
 !! call subroutines for setting mode families, creating communicators, distributing tasks
   subroutine initialize_preconditioner(pc,comm_glob)
-    use phys_module, only: autodistribute_modes, n_mode_families, autodistribute_ranks, centralize_harm_mat
-    use mod_parameters, only: n_tor
+    use phys_module, only: autodistribute_modes, autodistribute_ranks, centralize_harm_mat
+    use mod_mode_families, only: mode_family_count
     use data_structure, only: type_PRECOND
     use mpi_mod
     implicit none
@@ -32,11 +32,7 @@ module mod_preconditioner
     pc%autodistribute_modes = autodistribute_modes
     !pc%mat%row_distributed  = .not.centralize_harm_mat
 
-    if (pc%autodistribute_modes) then
-      pc%n_mode_families = (n_tor + 1)/2
-    else
-      pc%n_mode_families = n_mode_families
-    endif
+    pc%n_mode_families = mode_family_count()
 
     call distribute_ranks(n_cpu, pc)
 
@@ -113,51 +109,24 @@ module mod_preconditioner
 
   end subroutine create_communicators
 
-  !> Distribute toroidal modes among mode families
+  !> Distribute toroidal modes among mode families.
+  !! The partition itself lives in mod_mode_families, shared with the PETSc
+  !! backend; this only unpacks it into type_PRECOND and picks out the local family.
   subroutine distribute_modes(pc)
     use data_structure, only: type_PRECOND
-    use phys_module, only: modes_per_family, mode_families_modes, weights_per_family
+    use mod_mode_families, only: mode_family_distribute_modes, mode_family_weight
     implicit none
 
     type(type_PRECOND) :: pc
-    integer            :: i, j, n_fam_max
 
-    allocate(pc%modes_per_family(pc%n_mode_families))
+    call mode_family_distribute_modes(pc%n_mode_families, pc%modes_per_family, &
+                                      pc%mode_families_modes)
 
-    if (pc%autodistribute_modes) then
-      pc%row_factor = 1.0
-      pc%modes_per_family(1) = 1
-      if (pc%n_mode_families>1) pc%modes_per_family(2:pc%n_mode_families) = 2
-    else
-      do i = 1, pc%n_mode_families
-        pc%row_factor = weights_per_family(i)
-        pc%modes_per_family(i) = modes_per_family(i)
-      enddo
-    endif
-
-    n_fam_max = 1
-    do i = 1, pc%n_mode_families
-      n_fam_max = max(n_fam_max,pc%modes_per_family(i))
-    enddo
-
-    allocate(pc%mode_families_modes(pc%n_mode_families,n_fam_max))
-    pc%mode_families_modes(:,:) = -1
-
-    if (pc%autodistribute_modes) then
-      pc%mode_families_modes(1,1) = 1
-      if (pc%n_mode_families.gt.1) then
-        do i = 2, pc%n_mode_families
-          pc%mode_families_modes(i,1) =  (i - 1)*2
-          pc%mode_families_modes(i,2) =  (i - 1)*2 + 1
-        enddo
-      endif
-    else
-      do i = 1, pc%n_mode_families
-        do j = 1, modes_per_family(i)
-          pc%mode_families_modes(i,j) = mode_families_modes(i,j)
-        enddo
-      enddo
-    endif
+    ! The weight of *this rank's* family. It used to be assigned in a loop over all
+    ! families to a scalar, so every rank ended up holding weights_per_family of the
+    ! last family rather than of its own - invisible while all weights are equal,
+    ! which is the documented usage, and wrong as soon as they are not.
+    pc%row_factor = mode_family_weight(pc%family_id)
 
     pc%mode_set_n = pc%modes_per_family(pc%family_id)
     allocate(pc%mode_set(pc%mode_set_n))
@@ -165,78 +134,31 @@ module mod_preconditioner
 
   end subroutine distribute_modes
 
-  !> Distribute MPI ranks among mode families
+  !> Distribute MPI ranks among mode families.
+  !! The partition itself lives in mod_mode_families, shared with the PETSc backend.
   subroutine distribute_ranks(n_cpu,pc)
     use data_structure, only: type_PRECOND
-    use phys_module, only: ranks_per_family
+    use mod_mode_families, only: mode_family_distribute_ranks
+    use mpi_mod
     implicit none
 
     type(type_PRECOND) :: pc
     integer, intent(in)  :: n_cpu
-    integer :: mcpu, r, i, j
-    integer, dimension(:), pointer :: rank_id => Null()
+    integer :: ierr
+    logical :: ok
+    integer, dimension(:), pointer :: family_of_rank => Null()
 
-    allocate(pc%rank_range(pc%n_mode_families + 1))
-    allocate(pc%ranks_per_family(pc%n_mode_families))
-    allocate(pc%mode_families_ranks(pc%n_mode_families,n_cpu))
-    allocate(rank_id(n_cpu))
-
-    do i = 1, pc%n_mode_families
-      do j = 1, n_cpu
-        pc%mode_families_ranks(i,j) = -1
-      enddo
-    enddo
-
-    mcpu = n_cpu/pc%n_mode_families
-    r = mod(n_cpu,pc%n_mode_families)
-
-    if (pc%autodistribute_ranks) then
-      do i=1, pc%n_mode_families
-        pc%ranks_per_family(i) = mcpu
-        if ((r.gt.0).and.(i.le.r))  pc%ranks_per_family(i) = pc%ranks_per_family(i) + 1 ! add extra rank if avaiable
-      enddo
-    else
-      do i = 1, pc%n_mode_families
-        pc%ranks_per_family(i) = ranks_per_family(i)
-      enddo
+    call mode_family_distribute_ranks(n_cpu, pc%n_mode_families, pc%ranks_per_family, &
+                                      pc%rank_range, pc%mode_families_ranks, &
+                                      family_of_rank, ok)
+    if (.not. ok) then
+      if (pc%my_id .eq. 0) write(*,*) "Error in distribution of ranks: ranks_per_family must be", &
+                                      " positive for every family and sum to", n_cpu
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     endif
 
-    pc%rank_range(1) = 1
-    do i = 2, pc%n_mode_families+1
-      pc%rank_range(i) = pc%rank_range(i-1) + pc%ranks_per_family(i-1)
-    enddo
-
-    ! check for consistency
-    r = 0
-    do i= 2, pc%n_mode_families + 1
-      r = r + pc%rank_range(i) - pc%rank_range(i-1)
-    enddo
-    if (r.ne.n_cpu) then
-      write(*,*) "Error in distribution of ranks"
-      call exit(0)
-    endif
-
-    do i = 1, n_cpu
-      do j = 2, pc%n_mode_families + 1
-        if ((i.ge.pc%rank_range(j-1)).and.(i.lt.pc%rank_range(j))) then
-          rank_id(i) = j - 1
-          exit
-        endif
-      enddo
-    enddo
-
-    do j=1,pc%n_mode_families
-      r = 0
-      do i = 1, n_cpu
-        if (rank_id(i).eq.j) then
-          r = r + 1
-          pc%mode_families_ranks(j,r) = i - 1
-        endif
-      enddo
-    enddo
-
-    pc%family_id = rank_id(pc%my_id + 1)
-    deallocate(rank_id)
+    pc%family_id = family_of_rank(pc%my_id + 1)
+    deallocate(family_of_rank)
 
     return
 

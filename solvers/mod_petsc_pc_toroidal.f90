@@ -1,11 +1,17 @@
 module mod_petsc_pc_toroidal
 #ifdef USE_PETSC
   use mpi_mod
+  use mod_petsc_direct_solver, only: petsc_configure_direct_solver, petsc_report_solver
+  use mod_petsc_dump,          only: petsc_dump_operator
 #include "petsc/finclude/petsc.h"
   use petsc
   implicit none
   private
   public :: petsc_setup_toroidal_harmonic_pc
+
+  !> Shared options prefix for every PCFIELDSPLIT block, e.g.
+  !! -jorek_pcblock_pc_factor_mat_solver_type superlu_dist
+  character(len=*), parameter :: PC_BLOCK_PREFIX = 'jorek_pcblock_'
 
 contains
 
@@ -20,15 +26,18 @@ contains
     Mat, intent(in)    :: A
 
     integer :: i, j, k, n_split, split_size, field_size, n_modes_in_fam, idx
+    Mat :: block_A
+    character(len=32) :: dump_tag
     PetscInt :: block_size
     PetscCount :: field_count
     PetscInt, allocatable :: fields(:)
     integer, allocatable :: fam_modes(:)
-    Mat :: F
     PC :: pc, subpc
     KSP, pointer, dimension(:) :: subksp_array
+    integer :: comm, my_id, mpierr
     PetscErrorCode :: ierr
 
+    PetscCallA(PetscObjectGetComm(ksp, comm, ierr))
     PetscCallA(MatGetBlockSize(A, block_size, ierr))
     PetscCallA(KSPGetPC(ksp, pc, ierr))
     PetscCallA(PCSetType(pc, PCFIELDSPLIT, ierr))
@@ -76,19 +85,39 @@ contains
     PetscCallA(KSPSetUp(ksp, ierr))
     PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
     do i = 1, n_split
+      ! All blocks share one options prefix rather than PETSc's per-split
+      ! fieldsplit_<N>_, so that a single option configures every toroidal mode
+      ! family instead of having to be repeated once per split.
+      PetscCallA(KSPSetOptionsPrefix(subksp_array(i), PC_BLOCK_PREFIX, ierr))
       PetscCallA(KSPSetType(subksp_array(i), KSPPREONLY, ierr))
+      ! Establish JOREK's default block PC *before* any option is processed.
+      ! KSPSetFromOptions below configures whatever PC the sub-KSP currently has,
+      ! and an untyped PC falls back to PETSc's own default - PCBJACOBI when the
+      ! block is parallel, but PCILU when it is sequential. PCILU is a factor PC,
+      ! so it consumes -jorek_pcblock_pc_factor_mat_solver_type and aborts on any
+      ! package with no ILU (MUMPS: "does not support factorization type ILU").
+      ! petsc_configure_direct_solver sets PCLU too, but it runs afterwards, which
+      ! is too late to protect that first pass. Users can still override the type
+      ! here or there - PCSetFromOptions is applied after this in both places.
       PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
       PetscCallA(PCSetType(subpc, PCLU, ierr))
       PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
+      PetscCallA(KSPSetFromOptions(subksp_array(i), ierr))
+      call petsc_configure_direct_solver(subpc)
       PetscCallA(KSPSetUp(subksp_array(i), ierr))
-      PetscCallA(PCFactorGetMatrix(subpc, F, ierr))
-      PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (automatic)
-      PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
-      PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
-      PetscCallA(MatMumpsSetIcntl(F, 22, 1,  ierr))   ! out-of-core processing
+      ! Opt-in, inert unless -jorek_dump_mat is set: write this block out so it
+      ! can be replayed offline against other factorization packages.
+      PetscCallA(KSPGetOperators(subksp_array(i), block_A, PETSC_NULL_MAT, ierr))
+      write(dump_tag,'(A,I0)') 'pcblock', i
+      call petsc_dump_operator(block_A, trim(dump_tag))
     enddo
+    ! One line describes every block: they share PC_BLOCK_PREFIX. The splits live
+    ! on the parent communicator, so its rank 0 is the right one to print from.
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+    if (my_id == 0) call petsc_report_solver(subksp_array(1), PC_BLOCK_PREFIX)
     PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
   end subroutine petsc_setup_toroidal_harmonic_pc
+
 
 #endif
 end module mod_petsc_pc_toroidal

@@ -2,6 +2,8 @@ module mod_petsc_pc
 #ifdef USE_PETSC
   use mod_petsc_pc_toroidal
   use mod_petsc_pc_physics
+  use mod_petsc_pc_modesplit
+  use mod_petsc_direct_solver, only: petsc_setup_wrapped_solver, petsc_configure_direct_solver
 #include "petsc/finclude/petsc.h"
   use petsc
   implicit none
@@ -10,29 +12,25 @@ module mod_petsc_pc
   integer, parameter :: PETSC_PC_TOROIDAL_HARMONIC = 1
   integer, parameter :: PETSC_PC_PHYSICS           = 2
   integer, parameter :: PETSC_PC_FULL_LU           = 3
+  !> Same block-diagonal-in-mode-families operator as PETSC_PC_TOROIDAL_HARMONIC,
+  !! but with each family on its own disjoint sub-communicator so the blocks are
+  !! factorized and solved concurrently. Selected with -jorek_pc_mode_split.
+  integer, parameter :: PETSC_PC_MODE_SPLIT        = 4
 
 contains
 
-  !> One MUMPS LU of the whole coupled system (all harmonics, all variables):
-  !! the direct-solve reference for the scaling study. Same MUMPS controls as
-  !! the per-harmonic fieldsplit blocks, except in-core (ICNTL(22) = 0), so the
-  !! factor is not written to disk inside the timed region.
+  !> One LU of the whole coupled system (all harmonics, all variables): the
+  !! direct-solve reference. Same solver and controls as the mode-family blocks
+  !! (LU via MUMPS, mod_petsc_direct_solver), configurable under the outer
+  !! prefix, e.g. -jorek_pc_factor_mat_solver_type.
   subroutine petsc_setup_full_lu_pc(ksp)
     KSP, intent(inout) :: ksp
 
     PC :: pc
-    Mat :: F
     PetscErrorCode :: ierr
 
     PetscCallA(KSPGetPC(ksp, pc, ierr))
-    PetscCallA(PCSetType(pc, PCLU, ierr))
-    PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
-    PetscCallA(PCFactorSetUpMatSolverType(pc, ierr))
-    PetscCallA(PCFactorGetMatrix(pc, F, ierr))
-    PetscCallA(MatMumpsSetIcntl(F, 7,  7,  ierr))   ! fill-reducing ordering (automatic)
-    PetscCallA(MatMumpsSetIcntl(F, 14, 50, ierr))   ! workspace expansion %
-    PetscCallA(MatMumpsSetIcntl(F, 8,  77, ierr))   ! numerical scaling (auto)
-    PetscCallA(MatMumpsSetIcntl(F, 22, 0,  ierr))   ! in-core
+    call petsc_configure_direct_solver(pc)
   end subroutine petsc_setup_full_lu_pc
 
   !> Dispatch to the requested preconditioner setup routine.
@@ -48,7 +46,49 @@ contains
         call petsc_setup_physics_pc(ksp, A)
       case (PETSC_PC_FULL_LU)
         call petsc_setup_full_lu_pc(ksp)
+      case (PETSC_PC_MODE_SPLIT)
+        call petsc_setup_modesplit_pc(ksp, A)
     end select
   end subroutine petsc_setup_pc
+
+
+  !> Finish setting up the block solvers, after KSPSetUpOnBlocks has done what it can.
+  !!
+  !! KSPSetUpOnBlocks stops at any PCTELESCOPE, which implements no setuponblocks,
+  !! leaving the factorization it wraps to be triggered by the first PCApply inside
+  !! the GMRES solve. Walking the blocks here keeps that cost in the setup stage
+  !! where the rest of the factorization work is already accounted.
+  !!
+  !! Independent of which preconditioner petsc_setup_pc selected, and a no-op when
+  !! no telescope is in use.
+  subroutine petsc_setup_pc_blocks(ksp)
+    KSP, intent(inout) :: ksp
+
+    PC       :: pc, subpc
+    PCType   :: ptype
+    integer  :: i
+    PetscInt :: n_split
+    KSP, pointer, dimension(:) :: subksp_array
+    PetscErrorCode :: ierr
+
+    PetscCallA(KSPGetPC(ksp, pc, ierr))
+    PetscCallA(PCGetType(pc, ptype, ierr))
+
+    ! The mode-split PC factorizes its blocks inside its own PCSetUp callback, on
+    ! the sub-communicator that owns them; there is nothing here to reach into.
+    if (ptype == PCSHELL) return
+
+    if (ptype /= PCFIELDSPLIT) then
+      call petsc_setup_wrapped_solver(pc)
+      return
+    endif
+
+    PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
+    do i = 1, n_split
+      PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
+      call petsc_setup_wrapped_solver(subpc)
+    enddo
+    PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
+  end subroutine petsc_setup_pc_blocks
 #endif
 end module mod_petsc_pc

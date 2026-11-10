@@ -283,6 +283,11 @@ subroutine global_matrix_structure(node_list, element_list, boundary_list, freeb
   enddo
 
   a_mat%nnz = a_mat%ijA_index(a_mat%my_ind_max-a_mat%my_ind_min + 1, a_mat%ijA_size(a_mat%my_ind_max-a_mat%my_ind_min+1)) + a_mat%block_size**2 - 1
+
+  ! The sparsity pattern has just been rebuilt, so any COO preallocation handed to
+  ! PETSc from a previous structure is stale: force the index arrays to be
+  ! reallocated and refilled on the next construct_matrix.
+  a_mat%coo_structure_fixed = .false.
   a_mat%nr = (a_mat%my_ind_max - a_mat%my_ind_min + 1)*a_mat%block_size
 
   !---- for debugging purpose

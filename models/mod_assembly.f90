@@ -78,8 +78,14 @@ contains
       !   & "val=", a_mat%val(ilarge_vp)
       !endif
 
-       a_mat%irn(ilarge_vp) =  n_tor_local * n_var * (index_node -1) + (k -1)*n_tor_local + in - a_mat%i_tor_min + 1
-       a_mat%jcn(ilarge_vp) =  n_tor_local * n_var * (index_node2-1) + (k2-1)*n_tor_local + in2 - a_mat%i_tor_min + 1
+       ! Indices are only written for backends that consume them; on the COO path
+       ! prepare_matrix_storage leaves irn/jcn unassociated and PETSc derives the
+       ! sparsity from the block structure. The value overwrite below is the part
+       ! that matters every step.
+       if (associated(a_mat%irn)) then
+         a_mat%irn(ilarge_vp) =  n_tor_local * n_var * (index_node -1) + (k -1)*n_tor_local + in - a_mat%i_tor_min + 1
+         a_mat%jcn(ilarge_vp) =  n_tor_local * n_var * (index_node2-1) + (k2-1)*n_tor_local + in2 - a_mat%i_tor_min + 1
+       endif
 
        a_mat%val(ilarge_vp) = ZBIG
 

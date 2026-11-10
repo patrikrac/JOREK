@@ -2,6 +2,8 @@ module mod_petsc
 #ifdef USE_PETSC
   use mpi_mod
   use mod_petsc_pc
+  use mod_petsc_direct_solver, only: petsc_configure_direct_solver
+  use mod_petsc_dump,          only: petsc_dump_operator
 #include "petsc/finclude/petsc.h"
   use petsc
 #ifdef USE_SLEPC
@@ -12,15 +14,45 @@ module mod_petsc
   implicit none
 
 
+  !> Run-directory file read by PetscInitialize for solver options.
+  character(len=*), parameter :: PETSC_OPTIONS_FILE = 'jorek.petsc'
+  !> Options prefix of the main iterative solve, e.g. -jorek_ksp_rtol 1e-9
+  character(len=*), parameter :: PETSC_MAIN_PREFIX   = 'jorek_'
+  !> Options prefix of the one-shot direct solve path
+  character(len=*), parameter :: PETSC_DIRECT_PREFIX = 'jorek_direct_'
+
+  !> Operator storage formats selectable with -jorek_mat_format.
+  !! 'baij' is the historical path: MATMPIBAIJ filled block-by-block with
+  !! MatSetValuesBlocked, then MatConvert'ed to MATMPIAIJ for the KSP on every
+  !! solve. 'aij' assembles MATAIJ once through PETSc's COO interface and hands
+  !! it to the KSP directly - no conversion, and the only format that can ever be
+  !! device-resident (PETSc implements COO and the cusparse/kokkos matrix types
+  !! for AIJ only, never for BAIJ).
+  character(len=*), parameter :: PETSC_FORMAT_BAIJ = 'baij'
+  character(len=*), parameter :: PETSC_FORMAT_AIJ  = 'aij'
+
   type type_PETSC_SYSTEM
-    Mat  :: A              ! BAIJ system matrix (from JOREK block-CSR)
-    Mat  :: A_aij          ! AIJ version used by KSP (persistent)
-    Vec  :: x, b           ! BAIJ solution/RHS vectors
-    Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (persistent)
+    Mat  :: A              ! system matrix: MATMPIBAIJ, or MATAIJ when aij_native
+    Mat  :: A_aij          ! AIJ version used by KSP (persistent; unused when aij_native)
+    Vec  :: x, b           ! solution/RHS vectors matching A
+    Vec  :: x_aij, b_aij   ! AIJ solution/RHS vectors for KSP (unused when aij_native)
     KSP  :: ksp            ! Krylov solver context (persistent)
+    !> Cached gather of x onto every rank, rebuilt only when the layout changes.
+    !! JOREK's sol_vec is replicated, so every solve needs this; creating and
+    !! destroying it per solve allocated an n_global vector each time and, on the
+    !! device path, rebuilt the scatter plan on every time step.
+    Vec        :: x_seq
+    VecScatter :: x_scatter
+    logical    :: scatter_ready = .false.
     logical :: initialized   = .false.  ! A, x, b created
     logical :: owns_A        = .false.  ! .true. when A was created by petsc_init_system (old path)
     logical :: ksp_ready     = .false.  ! KSP, A_aij, PC setup + factored
+    !> .true. when A is already the AIJ operator the KSP consumes, so A_aij /
+    !! x_aij / b_aij are never created and no MatConvert or VecCopy happens.
+    logical :: aij_native    = .false.
+    !> .true. when A_aij is not a copy but a second reference to the BAIJ matrix A
+    !! (the physics PC, which reads A row by row): no MatConvert ever happens.
+    logical :: a_alias       = .false.
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
   end type type_PETSC_SYSTEM
@@ -28,14 +60,30 @@ module mod_petsc
 
 contains
 
+  !> Initialize PETSc, reading solver options from PETSC_OPTIONS_FILE in the run
+  !! directory when it exists. That file is the supported way to reconfigure the
+  !! solvers at run time; see namelist/jorek.petsc.example for the available
+  !! prefixes. Passing a file name that does not exist is a fatal error in PETSc,
+  !! hence the inquire.
   subroutine petsc_initialize()
     PetscErrorCode :: ierr
+    logical :: have_opts
     ! PetscCallA(PetscOptionsSetValue(PETSC_NULL_OPTIONS, "-log_view", PETSC_NULL_CHARACTER, ierr))
+
+    inquire(file=PETSC_OPTIONS_FILE, exist=have_opts)
 #ifdef USE_SLEPC
-    call SlepcInitialize(PETSC_NULL_CHARACTER, ierr)  ! superset of PetscInitialize
+    if (have_opts) then
+      call SlepcInitialize(PETSC_OPTIONS_FILE, ierr)  ! superset of PetscInitialize
+    else
+      call SlepcInitialize(PETSC_NULL_CHARACTER, ierr)
+    endif
     if (ierr /= 0) print *, "Error initializing SLEPc/PETSc"
 #else
-    call PetscInitialize(PETSC_NULL_CHARACTER, ierr)
+    if (have_opts) then
+      call PetscInitialize(PETSC_OPTIONS_FILE, ierr)
+    else
+      call PetscInitialize(PETSC_NULL_CHARACTER, ierr)
+    endif
     if (ierr /= 0) print *, "Error initializing PETSc"
 #endif
   end subroutine
@@ -46,26 +94,98 @@ contains
   !! of bounds and corrupts the heap on some MUMPS builds (seen as an np > 1 bus
   !! error, also with JOREK's default PC). PETSc reads this value only from the
   !! options database at the symbolic factorisation, so MatMumpsSetIcntl cannot
-  !! set it. Covers the un-prefixed factors and the fieldsplit sub-solvers; a
-  !! value given by the user (command line, PETSC_OPTIONS) is left alone.
+  !! set it. Covers the un-prefixed factors, the full-LU reference (outer prefix),
+  !! the mode-family blocks and PETSc's own fieldsplit sub-solvers; a value given
+  !! by the user (command line, jorek.petsc, PETSC_OPTIONS) is left alone.
   !! Applied by the physics PC and the full-LU reference, whose setups need it;
-  !! the default path only with -jorek_mumps_central_rhs, since it is a
+  !! the mode-family PCs only with -jorek_mumps_central_rhs, since it is a
   !! workaround for a build, not a solver choice.
   subroutine petsc_default_mumps_central_rhs()
     PetscErrorCode :: ierr
     PetscBool      :: has
     character(len=64) :: nm
     integer :: k
-    do k = -1, 7
-      if (k < 0) then
-        nm = "-mat_mumps_icntl_20"
-      else
-        write(nm, '(A,I0,A)') "-fieldsplit_", k, "_mat_mumps_icntl_20"
-      endif
+    do k = -3, 7
+      select case (k)
+        case (-3); nm = "-mat_mumps_icntl_20"
+        case (-2); nm = "-"//PETSC_MAIN_PREFIX//"mat_mumps_icntl_20"
+        case (-1); nm = "-"//PETSC_MAIN_PREFIX//"pcblock_mat_mumps_icntl_20"
+        case default; write(nm, '(A,I0,A)') "-fieldsplit_", k, "_mat_mumps_icntl_20"
+      end select
       call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), has, ierr)
       if (.not. has) call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(nm), "0", ierr)
     enddo
   end subroutine petsc_default_mumps_central_rhs
+
+
+  !> Which preconditioner the main solve uses.
+  !!
+  !! use_physics_pc (namelist) selects the physics-based SF preconditioner.
+  !! Otherwise -jorek_pc_full_lu selects one LU of the whole coupled system (the
+  !! direct-solve reference), and the default is the harmonic block preconditioner,
+  !! block-diagonal in the toroidal mode families, in one of two parallel layouts.
+  !! PCFIELDSPLIT (default) keeps every block on the full communicator and applies
+  !! them one after another. -jorek_pc_mode_split gives each family its own
+  !! disjoint sub-communicator, so the blocks are factorized and solved
+  !! concurrently - which is where the parallel efficiency of a sparse direct
+  !! block solver comes from, and the only way more than one GPU is ever busy with
+  !! cuDSS.
+  integer function select_pc_type()
+    use phys_module, only: use_physics_pc
+    PetscBool      :: mode_split, full_lu, is_set
+    PetscErrorCode :: ierr
+
+    mode_split = PETSC_FALSE
+    full_lu    = PETSC_FALSE
+    PetscCallA(PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_MAIN_PREFIX, '-pc_mode_split', mode_split, is_set, ierr))
+    PetscCallA(PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_MAIN_PREFIX, '-pc_full_lu', full_lu, is_set, ierr))
+    if (use_physics_pc) then
+      select_pc_type = PETSC_PC_PHYSICS
+    else if (full_lu) then
+      select_pc_type = PETSC_PC_FULL_LU
+    else if (mode_split) then
+      select_pc_type = PETSC_PC_MODE_SPLIT
+    else
+      select_pc_type = PETSC_PC_TOROIDAL_HARMONIC
+    endif
+  end function select_pc_type
+
+
+  !> Report the main solve configuration actually resolved from the defaults
+  !! plus whatever jorek.petsc supplied.
+  subroutine report_main_solver(ksp, my_id, pc_type)
+    KSP, intent(in)     :: ksp
+    integer, intent(in) :: my_id
+    integer, intent(in) :: pc_type
+
+    KSPType        :: ktype
+    PetscReal      :: rtol, abstol, dtol
+    PetscInt       :: maxits
+    character(len=64) :: pc_desc
+    PetscErrorCode :: ierr
+
+    if (my_id /= 0) return
+
+    ! The PC is installed by petsc_setup_pc *after* this runs, so its type has to
+    ! be named from the selection rather than queried off the object - which used
+    ! to be hardcoded to fieldsplit, and would now be wrong half the time.
+    select case (pc_type)
+      case (PETSC_PC_MODE_SPLIT)
+        pc_desc = 'mode-split (one sub-communicator per mode family)'
+      case (PETSC_PC_PHYSICS)
+        pc_desc = 'physics-based (SF)'
+      case (PETSC_PC_FULL_LU)
+        pc_desc = 'full-system LU'
+      case default
+        pc_desc = PCFIELDSPLIT//' (mode families, shared communicator)'
+    end select
+
+    PetscCallA(KSPGetType(ksp, ktype, ierr))
+    PetscCallA(KSPGetTolerances(ksp, rtol, abstol, dtol, maxits, ierr))
+    write(*,*) '[PETSc] main solve (-'//PETSC_MAIN_PREFIX//'...): '//trim(ktype) &
+               //' + '//trim(pc_desc)
+    write(*,*) '[PETSc]   rtol =', rtol, ' max_it =', maxits
+  end subroutine report_main_solver
 
 
   subroutine petsc_finalize()
@@ -82,6 +202,7 @@ contains
     PetscErrorCode :: ierr
     integer :: my_id, mpierr
     character(len=256) :: version_string
+
     call PetscGetVersion(version_string, ierr)
     if (ierr == 0) then
       call MPI_COMM_RANK(MPI_COMM_WORLD, my_id, mpierr)
@@ -94,13 +215,295 @@ contains
   end subroutine petsc_print_version
 
 
+  !> Operator format requested with -jorek_mat_format {baij|aij}, defaulting to
+  !! baij so an unconfigured run behaves exactly as before.
+  !!
+  !! Resolved from the options database once and cached: this is queried from
+  !! construct_matrix on every time step and from the solver on every setup, and
+  !! the two MUST agree - construct_matrix leaves petsc_assembled .false. for aij
+  !! precisely so that the solver takes the COO path. Reading the database twice
+  !! per step was both wasteful and one PetscOptionsClear away from a mismatch.
+  function petsc_mat_format() result(fmt)
+    character(len=8) :: fmt
+    PetscBool        :: found
+    PetscErrorCode   :: ierr
+
+    character(len=8), save :: fmt_cached = ''
+    logical,          save :: resolved   = .false.
+
+    if (.not. resolved) then
+      fmt_cached = PETSC_FORMAT_BAIJ
+      ! NOTE: PetscCallA is a cpp macro, so its argument must stay on one line - a
+      ! Fortran '&' continuation splits it before cpp ever sees the second half.
+      PetscCallA(PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, '-'//PETSC_MAIN_PREFIX//'mat_format', fmt_cached, found, ierr))
+      resolved = .true.
+    endif
+
+    fmt = fmt_cached
+  end function petsc_mat_format
+
+
+  !> .true. when the operator is assembled as MATAIJ through the COO interface.
+  !! Thin wrapper so callers stop repeating trim()/comparison against the string.
+  logical function petsc_format_is_aij()
+    petsc_format_is_aij = (trim(petsc_mat_format()) == PETSC_FORMAT_AIJ)
+  end function petsc_format_is_aij
+
+
+  !> Generate the 0-based COO index pair for every reserved matrix slot straight
+  !! from the block sparsity (ijA_size / irn_jcn / ijA_index), without reading
+  !! a_mat%irn or a_mat%jcn at all. That is the point: it lets the AIJ path skip
+  !! allocating and filling those two nnz-length arrays entirely.
+  !!
+  !! It mirrors, entry for entry, what add_block_to_sp_matrix writes into irn/jcn
+  !! (construct_matrix_mod.f90): the block living at ijA_position carries, at
+  !! offset (jj-1)*bs + ll, row index_large_i + jj and column index_large_k + ll,
+  !! where index_large_* = bs*(block index - 1). The 0-based shift is the only
+  !! difference. petsc_verify_coo_indices checks that claim against the real
+  !! arrays; keep the two in step if either side ever changes.
+  !!
+  !! One deliberate behaviour change: this also covers slots the element loop
+  !! never writes. global_matrix_structure reserves a bs^2 block for every
+  !! (row, col) pair it finds and a few are never touched; they now get their
+  !! true (i,j) and become explicit zeros in the operator. Previously such a slot
+  !! arrived here as index 0, turned into -1 under the shift, and was silently
+  !! dropped by PETSc - correct, but resting on a sentinel that had to be
+  !! explained every time it was read.
+  subroutine build_coo_indices(a_mat, coo_i, coo_j)
+    use data_structure, only: type_SP_MATRIX
+    use mod_integer_types, only: int_all
+
+    type(type_SP_MATRIX), intent(in) :: a_mat
+    PetscInt, intent(out) :: coo_i(:), coo_j(:)
+
+    integer :: i_local, j, jj, ll, bs, n_block_local
+    integer(kind=int_all) :: pos, base_i, base_k, off
+
+    bs            = a_mat%block_size
+    n_block_local = a_mat%my_ind_max - a_mat%my_ind_min + 1
+
+    !$omp parallel do default(none) schedule(static) &
+    !$omp   shared(a_mat, coo_i, coo_j, bs, n_block_local) &
+    !$omp   private(i_local, j, jj, ll, pos, base_i, base_k, off)
+    do i_local = 1, n_block_local
+      base_i = int(bs, int_all) * int(a_mat%my_ind_min + i_local - 2, int_all)
+      do j = 1, a_mat%ijA_size(i_local)
+        base_k = int(bs, int_all) * (a_mat%irn_jcn(i_local, j) - 1)
+        pos    = a_mat%ijA_index(i_local, j)
+        do jj = 1, bs
+          off = pos - 1 + int(jj - 1, int_all) * int(bs, int_all)
+          do ll = 1, bs
+            coo_i(off + ll) = int(base_i + jj - 1, kind=kind(coo_i))
+            coo_j(off + ll) = int(base_k + ll - 1, kind=kind(coo_j))
+          enddo
+        enddo
+      enddo
+    enddo
+    !$omp end parallel do
+  end subroutine build_coo_indices
+
+
+  !> .true. when -jorek_coo_verify_indices asked for the generated COO indices to
+  !! be checked against irn/jcn. Read by prepare_matrix_storage as well, because
+  !! the check needs those arrays to still exist: the flag has to keep them alive
+  !! on a path whose whole point is not allocating them. One switch, both effects.
+  logical function petsc_coo_verify_requested()
+    PetscBool      :: do_check
+    PetscErrorCode :: ierr
+
+    logical, save :: cached   = .false.
+    logical, save :: resolved = .false.
+
+    if (.not. resolved) then
+      do_check = PETSC_FALSE
+      PetscCallA(PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, '-'//PETSC_MAIN_PREFIX//'coo_verify_indices', do_check, PETSC_NULL_BOOL, ierr))
+      cached   = (do_check .eqv. PETSC_TRUE)
+      resolved = .true.
+    endif
+
+    petsc_coo_verify_requested = cached
+  end function petsc_coo_verify_requested
+
+
+  !> Cross-check build_coo_indices against the irn/jcn the element loop filled.
+  !! Opt-in with -jorek_coo_verify_indices; aborts on the first disagreement.
+  !!
+  !! This exists because build_coo_indices duplicates an index convention that
+  !! lives in construct_matrix_mod, and nothing else would catch the two drifting
+  !! apart: a wrong index produces a well-formed matrix with entries in the wrong
+  !! places, which shows up as a convergence change rather than an error. Slots
+  !! the element loop never wrote are skipped (irn == 0); see build_coo_indices.
+  subroutine petsc_verify_coo_indices(a_mat, coo_i, coo_j)
+    use data_structure, only: type_SP_MATRIX
+    use mod_integer_types, only: int_all
+
+    type(type_SP_MATRIX), intent(in) :: a_mat
+    PetscInt, intent(in) :: coo_i(:), coo_j(:)
+
+    integer(kind=int_all) :: k, n_bad, n_skipped
+    integer :: my_id, mpierr
+    PetscErrorCode :: ierr
+
+    if (.not. petsc_coo_verify_requested()) return
+
+    if (.not. associated(a_mat%irn) .or. .not. associated(a_mat%jcn)) then
+      SETERRA(PETSC_COMM_SELF, PETSC_ERR_ARG_WRONGSTATE, '-jorek_coo_verify_indices needs irn/jcn, which this run did not keep')
+    endif
+
+    call MPI_COMM_RANK(a_mat%comm, my_id, mpierr)
+    n_bad     = 0
+    n_skipped = 0
+    do k = 1, a_mat%nnz
+      if (a_mat%irn(k) == 0) then
+        n_skipped = n_skipped + 1
+        cycle
+      endif
+      if (coo_i(k) /= int(a_mat%irn(k) - 1, kind=kind(coo_i)) .or. &
+          coo_j(k) /= int(a_mat%jcn(k) - 1, kind=kind(coo_j))) then
+        if (n_bad < 10) write(*,'(A,I0,A,I0,A,2I12,A,2I12)') "[RANK ", my_id, &
+          "] COO index mismatch at ", k, ": generated", coo_i(k), coo_j(k), " expected", a_mat%irn(k)-1, a_mat%jcn(k)-1
+        n_bad = n_bad + 1
+      endif
+    enddo
+
+    write(*,'(A,I0,A,I0,A,I0,A,I0)') "[RANK ", my_id, "] COO index check: ", a_mat%nnz, &
+      " slots, mismatches=", n_bad, ", unwritten (skipped)=", n_skipped
+    if (n_bad > 0) then
+      SETERRA(PETSC_COMM_SELF, PETSC_ERR_PLIB, 'generated COO indices disagree with irn/jcn')
+    endif
+  end subroutine petsc_verify_coo_indices
+
+
+  !> Initialize a MATAIJ operator whose values are pushed with PETSc's COO
+  !! interface.
+  !!
+  !! JOREK's a_mat is already a duplicate-free COO triplet set: mod_global_matrix_structure
+  !! builds irn_jcn as a sorted, deduplicated block-column list per block row (it
+  !! explicitly rejects a repeated index) and ijA_index gives each block a contiguous
+  !! slice of val, so every scalar entry has exactly one slot. That means the COO
+  !! index pairs follow directly from the block structure (build_coo_indices) and the
+  !! per-timestep value array IS a_mat%val - no expansion and no re-ordering, because
+  !! COO is per scalar entry.
+  !!
+  !! It also means boundary conditions need no special handling here: the ZBIG penalty
+  !! writes (mod_assembly.f90, mod_axis_treatment.f90, mod_fix_axis_nodes.f90) and the
+  !! vacuum response contributions are all resolved into a_mat%val on the JOREK side
+  !! before this routine ever sees them, so a single INSERT_VALUES push is correct.
+  !!
+  !! Ranks own disjoint block-row ranges [my_ind_min, my_ind_max] and store full rows,
+  !! so no (i,j) is submitted by two ranks. This matters: PETSc SUMS duplicate COO
+  !! entries across ranks regardless of the InsertMode.
+  subroutine petsc_init_system_coo(petsc_sys, a_mat)
+    use data_structure, only: type_SP_MATRIX
+    use tr_module,      only: tr_deallocatep, CAT_DMATRIX
+    use phys_module,    only: use_matrix_equilibration
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_SP_MATRIX), intent(inout) :: a_mat
+
+    integer :: comm, my_id, mpierr
+    integer :: block_size
+    PetscInt :: n_local, n_global
+    PetscInt, allocatable :: coo_i(:), coo_j(:)
+    PetscCount :: ncoo
+    PetscErrorCode :: ierr
+
+    comm = a_mat%comm
+    call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    block_size = a_mat%block_size
+    n_global   = int(a_mat%ng, kind=kind(n_global))
+    n_local    = int((a_mat%my_ind_max - a_mat%my_ind_min + 1) * block_size, kind=kind(n_local))
+
+    call MatCreate(comm, petsc_sys%A, ierr)
+    call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
+    call MatSetType(petsc_sys%A, MATAIJ, ierr)
+    ! Keep the block size as metadata: PCFIELDSPLIT still slices the operator by
+    ! toroidal mode family and MatSetBlockSize is what makes that indexing valid.
+    call MatSetBlockSize(petsc_sys%A, block_size, ierr)
+    ! The prefix is what makes -jorek_mat_type reach this matrix; without it the key
+    ! would have to be the un-prefixed -mat_type and would hit every other Mat too.
+    call MatSetOptionsPrefix(petsc_sys%A, PETSC_MAIN_PREFIX, ierr)
+    ! Honours -jorek_mat_type aijcusparse (or aijkokkos) without another switch here.
+    call MatSetFromOptions(petsc_sys%A, ierr)
+
+    ! PETSc copies the index arrays, so these are scratch. They are PetscInt (32-bit
+    ! under the cuDSS build) while JOREK's are int_all, hence the conversion inside
+    ! build_coo_indices.
+    ncoo = int(a_mat%nnz, kind=kind(ncoo))
+
+    ! Indices come from the block sparsity, not from irn/jcn, so this routine no
+    ! longer needs those arrays to exist - which is what lets construct_matrix skip
+    ! allocating them entirely. Peak here is val + coo_i + coo_j (16 B/nnz) plus
+    ! PETSc's own map, rather than the 24 B/nnz of the previous copy-then-free
+    ! dance, so the preallocation moment is no longer the high-water mark of the
+    ! run.
+    allocate(coo_i(a_mat%nnz), coo_j(a_mat%nnz))
+    call build_coo_indices(a_mat, coo_i, coo_j)
+    call petsc_verify_coo_indices(a_mat, coo_i, coo_j)
+
+    ! Whatever irn/jcn still exist have no reader left on this path once PETSc owns
+    ! the sparsity - except under equilibration, where matrix_equilibration and
+    ! scale_by_cols index through jcn on every solve.
+    if (associated(a_mat%irn)) call tr_deallocatep(a_mat%irn, "irn", CAT_DMATRIX)
+    if (associated(a_mat%jcn) .and. (.not. use_matrix_equilibration)) then
+      call tr_deallocatep(a_mat%jcn, "jcn", CAT_DMATRIX)
+    endif
+
+    PetscCallA(MatSetPreallocationCOO(petsc_sys%A, ncoo, coo_i, coo_j, ierr))
+    deallocate(coo_i, coo_j)
+
+    ! PETSc now owns the sparsity: from here on construct_matrix only refreshes val,
+    ! and every routine that used to write irn/jcn checks this flag first.
+    a_mat%coo_structure_fixed = .true.
+
+    call MatCreateVecs(petsc_sys%A, petsc_sys%x, petsc_sys%b, ierr)
+
+    petsc_sys%initialized = .true.
+    petsc_sys%owns_A      = .true.
+    petsc_sys%aij_native  = .true.
+    if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0,A,I0)') "[PETSc] init: AIJ/COO matrix ", n_global, "x", n_global, &
+                                                       ", block_size=", block_size, ", local nnz=", a_mat%nnz
+  end subroutine petsc_init_system_coo
+
+
+  !> Push JOREK's value array into the COO-preallocated operator. This replaces the
+  !! whole per-block MatSetValuesBlocked loop of petsc_update_matrix with one call.
+  !!
+  !! a_mat%val is passed as a single contiguous array on purpose, and must stay that
+  !! way: MatSetValuesCOO_SeqAIJCUSPARSE memtype-detects its value pointer
+  !! (aijcusparse.cu:4422) and consumes device memory directly, so moving JOREK's
+  !! assembly onto the GPU later requires no change on this side - only to where
+  !! a_mat%val is allocated and written.
+  subroutine petsc_update_matrix_coo(petsc_sys, a_mat)
+    use data_structure, only: type_SP_MATRIX
+
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    type(type_SP_MATRIX), intent(in) :: a_mat
+    PetscErrorCode :: ierr
+
+    ! The COO map PETSc holds describes the sparsity as it was at preallocation. If
+    ! global_matrix_structure has rebuilt it since (it clears this flag), val no
+    ! longer matches that map and pushing it would silently produce a wrong matrix
+    ! rather than fail - so refuse instead. Re-meshing on this path would need the
+    ! operator torn down and petsc_init_system_coo re-run.
+    if (.not. a_mat%coo_structure_fixed) then
+      SETERRA(PETSC_COMM_SELF, PETSC_ERR_ARG_WRONGSTATE, 'matrix structure was rebuilt after the COO preallocation')
+    endif
+
+    ! INSERT_VALUES, not ADD_VALUES: a_mat holds one slot per (i,j) with all element,
+    ! boundary-condition and vacuum contributions already accumulated into it.
+    PetscCallA(MatSetValuesCOO(petsc_sys%A, a_mat%val, INSERT_VALUES, ierr))
+  end subroutine petsc_update_matrix_coo
+
+
   !> Initialize BAIJ matrix structure and BAIJ vecs — called once when !initialized
   !TODO: Redundant with petsc_create_matrix. One must go...
   subroutine petsc_init_system(petsc_sys, a_mat)
     use data_structure, only: type_SP_MATRIX
 
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
-    type(type_SP_MATRIX), intent(in) :: a_mat
+    type(type_SP_MATRIX), intent(inout) :: a_mat
 
     integer :: i, k
     integer :: comm, my_id, mpierr
@@ -108,6 +511,19 @@ contains
     integer :: r_start, r_end, c_global, block_col
     PetscInt, allocatable :: d_nnz(:), o_nnz(:)
     PetscErrorCode :: ierr
+
+    if (petsc_format_is_aij()) then
+      call petsc_init_system_coo(petsc_sys, a_mat)
+      return
+    endif
+
+    ! REACHABILITY ASSERTION (see the TODO above). construct_matrix sets
+    ! petsc_assembled for every non-harmonic BAIJ matrix, and mod_sparse only calls
+    ! this routine when that flag is clear - so on the BAIJ path this point should
+    ! be unreachable and the body below is dead. petsc_create_matrix +
+    ! add_block_to_petsc is the live BAIJ path. Assert rather than assume; if no
+    ! run trips this, the remainder of the routine can be deleted outright.
+    SETERRA(PETSC_COMM_SELF, PETSC_ERR_SUP, 'petsc_init_system: BAIJ body believed dead - please report the case that reached it')
 
     comm = a_mat%comm
     call MPI_COMM_RANK(comm, my_id, mpierr)
@@ -225,6 +641,15 @@ contains
     PetscScalar, allocatable :: vals_petsc(:)
     PetscErrorCode :: ierr
 
+    if (petsc_sys%aij_native) then
+      call petsc_update_matrix_coo(petsc_sys, a_mat)
+      return
+    endif
+
+    ! Same reachability assertion as petsc_init_system: this BAIJ fill from JOREK's
+    ! block-CSR is believed dead, superseded by add_block_to_petsc.
+    SETERRA(PETSC_COMM_SELF, PETSC_ERR_SUP, 'petsc_update_matrix: BAIJ body believed dead - please report the case that reached it')
+
     call MPI_COMM_RANK(a_mat%comm, my_id, mpierr)
 
     block_size = a_mat%block_size
@@ -242,7 +667,7 @@ contains
         c_global = a_mat%jcn((k-1)*block_size2 + 1)
         idxn(1) = c_global / block_size
         val_ptr_start = (k - 1) * block_size2 + 1
-        val_ptr_end   = val_ptr_start + block_size2
+        val_ptr_end   = val_ptr_start + block_size2 - 1
         vals_petsc(1:block_size2) = a_mat%val(val_ptr_start : val_ptr_end)
         PetscCallA(MatSetValuesBlocked(petsc_sys%A, 1, idxm, 1, idxn, vals_petsc, INSERT_VALUES, ierr))
       enddo
@@ -261,44 +686,38 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_RHS), intent(in) :: rhs_vec
 
-    integer :: i, my_id, mpierr, comm
     PetscInt :: i_start, i_end, n_local
-    PetscInt, allocatable :: indices_petsc(:)
+    PetscScalar, pointer :: b_arr(:)
     PetscErrorCode :: ierr
 
-    PetscCallA(PetscObjectGetComm(petsc_sys%b, comm, ierr))
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-
+    ! rhs_vec%val is the full global rhs on every rank, so the owned slice can be
+    ! written straight into the Vec's local array - no index list, no assembly pass.
     PetscCallA(VecGetOwnershipRange(petsc_sys%b, i_start, i_end, ierr))
     n_local = i_end - i_start
 
-    allocate(indices_petsc(n_local))
-    do i = 1, n_local
-      indices_petsc(i) = i_start + (i - 1)
-    end do
-
-    PetscCallA(VecSetValues(petsc_sys%b, n_local, indices_petsc, rhs_vec%val(i_start+1:i_end), INSERT_VALUES, ierr))
-    PetscCallA(VecAssemblyBegin(petsc_sys%b, ierr))
-    PetscCallA(VecAssemblyEnd(petsc_sys%b, ierr))
-    deallocate(indices_petsc)
+    ! Write access, not read-write: the slice is overwritten in full, so
+    ! VecGetArray's device->host sync of the previous contents is pure waste on a
+    ! device Vec (and the dirty flag it leaves forces a copy back up either way).
+    PetscCallA(VecGetArrayWrite(petsc_sys%b, b_arr, ierr))
+    b_arr(1:n_local) = rhs_vec%val(i_start+1:i_end)
+    PetscCallA(VecRestoreArrayWrite(petsc_sys%b, b_arr, ierr))
 
   end subroutine petsc_update_rhs
 
 
-  !> Load an FGMRES initial guess into petsc_sys%x from the JOREK sol_vec (the
-  !! previous time-step increment). Mirrors petsc_update_rhs ownership slicing so
-  !! that x and b share the same global layout. If sol_vec is not yet allocated
-  !! (e.g. the first step of a fresh, non-restart run) the guess degrades to zero,
-  !! reproducing the standard zero-start. Used together with KSPSetInitialGuessNonzero.
+  !> Load an initial guess into petsc_sys%x from the JOREK sol_vec (the previous
+  !! time-step increment). Mirrors petsc_update_rhs ownership slicing so that x
+  !! and b share the same global layout. If sol_vec is not yet allocated (e.g. the
+  !! first step of a fresh, non-restart run) the guess degrades to zero, reproducing
+  !! the standard zero-start. Used together with KSPSetInitialGuessNonzero.
   subroutine petsc_update_initial_guess(petsc_sys, sol_vec)
     use data_structure, only: type_RHS
 
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_RHS), intent(in) :: sol_vec
 
-    integer :: i, my_id, mpierr, comm
     PetscInt :: i_start, i_end, n_local
-    PetscInt, allocatable :: indices_petsc(:)
+    PetscScalar, pointer :: x_arr(:)
     PetscErrorCode :: ierr
 
     if (.not. associated(sol_vec%val)) then
@@ -306,21 +725,14 @@ contains
       return
     endif
 
-    PetscCallA(PetscObjectGetComm(petsc_sys%x, comm, ierr))
-    call MPI_COMM_RANK(comm, my_id, mpierr)
-
+    ! Same ownership slicing as petsc_update_rhs, written directly into the local array.
     PetscCallA(VecGetOwnershipRange(petsc_sys%x, i_start, i_end, ierr))
     n_local = i_end - i_start
 
-    allocate(indices_petsc(n_local))
-    do i = 1, n_local
-      indices_petsc(i) = i_start + (i - 1)
-    end do
-
-    PetscCallA(VecSetValues(petsc_sys%x, n_local, indices_petsc, sol_vec%val(i_start+1:i_end), INSERT_VALUES, ierr))
-    PetscCallA(VecAssemblyBegin(petsc_sys%x, ierr))
-    PetscCallA(VecAssemblyEnd(petsc_sys%x, ierr))
-    deallocate(indices_petsc)
+    ! Write access for the same reason as petsc_update_rhs.
+    PetscCallA(VecGetArrayWrite(petsc_sys%x, x_arr, ierr))
+    x_arr(1:n_local) = sol_vec%val(i_start+1:i_end)
+    PetscCallA(VecRestoreArrayWrite(petsc_sys%x, x_arr, ierr))
 
   end subroutine petsc_update_initial_guess
 
@@ -341,6 +753,7 @@ contains
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
     PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
+    PetscCallA(KSPSetOptionsPrefix(petsc_sys%ksp, PETSC_DIRECT_PREFIX, ierr))
     PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A, petsc_sys%A, ierr))
 
     PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
@@ -348,11 +761,17 @@ contains
 
     PetscCallA(KSPSetType(petsc_sys%ksp, KSPPREONLY, ierr))
 
-    ! Set the preconditioner
+    ! Set the preconditioner: direct solve, LU via MUMPS unless overridden by
+    ! -jorek_direct_pc_* options. PCLU is set before KSPSetFromOptions because an
+    ! untyped PC would otherwise be configured from options as PETSc's default
+    ! (PCILU for a sequential operator), which consumes the factor-package option
+    ! and aborts for any package without an ILU. Same reason as the block PC in
+    ! mod_petsc_pc_toroidal.
     PetscCallA(KSPGetPC(petsc_sys%ksp, pc, ierr))
-    ! --- LU
     PetscCallA(PCSetType(pc, PCLU, ierr))
     PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
+    PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
+    call petsc_configure_direct_solver(pc)
 
     PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
     petsc_sys%ksp_ready = .true.
@@ -371,10 +790,92 @@ contains
   end subroutine petsc_solve_and_retrieve
 
 
+  !> The operator and vectors the KSP actually works on. On the BAIJ path these are
+  !! the converted AIJ duplicates; on the native AIJ path they are simply A, b and x,
+  !! so no conversion or vector copy is needed anywhere in the solve.
+  subroutine ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
+    type(type_PETSC_SYSTEM), intent(in) :: petsc_sys
+    Mat, intent(out) :: A_ksp
+    Vec, intent(out) :: b_ksp, x_ksp
+
+    if (petsc_sys%aij_native) then
+      A_ksp = petsc_sys%A
+      b_ksp = petsc_sys%b
+      x_ksp = petsc_sys%x
+    else
+      A_ksp = petsc_sys%A_aij
+      b_ksp = petsc_sys%b_aij
+      x_ksp = petsc_sys%x_aij
+    endif
+  end subroutine ksp_operands
+
+
+  !> Make the KSP operator reflect the values just assembled into petsc_sys%A.
+  !!
+  !! On the native AIJ path this is nothing at all: A already IS the KSP operator,
+  !! so MatSetValuesCOO has updated it in place. On the BAIJ path it is a full
+  !! host-side rebuild of the operator as MATMPIAIJ - measured at 35% of that
+  !! path's total runtime - reusing the sparsity after the first call.
+  subroutine petsc_refresh_ksp_operator(petsc_sys, first_call)
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    logical, intent(in) :: first_call
+    PetscErrorCode :: ierr
+
+    if (petsc_sys%aij_native) return
+
+    if (petsc_sys%a_alias) then
+      ! A_aij is A itself, which JOREK refills in place every step; the extra
+      ! reference keeps petsc_cleanup's MatDestroy(A_aij) balanced.
+      if (first_call) then
+        PetscCallA(PetscObjectReference(petsc_sys%A, ierr))
+        petsc_sys%A_aij = petsc_sys%A
+        PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      endif
+      return
+    endif
+
+    if (first_call) then
+      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
+      PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+    else
+      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
+    endif
+  end subroutine petsc_refresh_ksp_operator
+
+
+  !> Move the rhs and the warm-start guess into the vectors the KSP will use, and
+  !! (direction = .false.) the solution back out. Both are no-ops on the native AIJ
+  !! path, where b_aij/x_aij are b/x. See ksp_operands.
+  subroutine petsc_sync_ksp_vectors(petsc_sys, to_ksp)
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    logical, intent(in) :: to_ksp
+    PetscErrorCode :: ierr
+
+    if (petsc_sys%aij_native) return
+
+    if (to_ksp) then
+      PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
+      PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for GMRES
+    else
+      PetscCallA(VecCopy(petsc_sys%x_aij, petsc_sys%x, ierr))
+    endif
+  end subroutine petsc_sync_ksp_vectors
+
+
   !> Iterative solve with persistent KSP/PC across time steps.
-  !! On first call (!ksp_ready): creates AIJ matrix, KSP, sets up PCFIELDSPLIT+MUMPS.
-  !! When !solve_only: converts A to AIJ (reuse sparsity), calls KSPSetUp to refactorize.
-  !! When solve_only:  converts A to AIJ, sets KSPSetReusePreconditioner to skip refactorization.
+  !! On first call (!ksp_ready): creates the KSP and sets up the preconditioner.
+  !! When !solve_only: calls KSPSetUp to rebuild / refactorize the preconditioner.
+  !! When solve_only:  sets KSPSetReusePreconditioner to skip the rebuild.
+  !! On the BAIJ path each of the three additionally converts A to AIJ (reusing the
+  !! sparsity after the first call); on the native AIJ path, and for the physics PC
+  !! (A_aij aliases A), no conversion happens at all. See ksp_operands.
+  !!
+  !! The outer Krylov method is the same for every preconditioner: FGMRES(40)
+  !! (right preconditioning, so the monitored and tested residual is the true one,
+  !! ||b - A x||), rtol 1e-8 relative to ||b||, at most 400 iterations, warm start
+  !! from the previous increment. All of it can be overridden with -jorek_ksp_*.
+  !! The preconditioner setup, including every block factorization, is charged to
+  !! the setup timer; the solve timer covers KSPSolve only.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
     use mod_clock, only: FMT_TIMING
     use phys_module, only: use_physics_pc
@@ -388,34 +889,30 @@ contains
 
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
-    PC :: pc_shell
+    Mat :: A_ksp
+    Vec :: b_ksp, x_ksp
     KSPConvergedReason :: reason
     PetscLogDouble :: t1, t2
     PetscLogDouble :: ts1, ts2
-    KSPType :: ksp_type
     PetscInt :: its
+    integer :: pc_type
     PetscReal :: petsc_norm
     PetscViewerAndFormat :: vf
-    logical :: no_aij
-    PetscBool :: full_lu, central_rhs
+    PetscBool :: central_rhs
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
-    ! The physics PC reads its blocks row by row and FGMRES only needs
-    ! matvecs, so both work on JOREK's own BAIJ matrix and the AIJ copy (a
-    ! second full Jacobian) is never made. A_aij then ALIASES A, which JOREK
-    ! creates once and refills in place every step; the extra reference keeps
-    ! petsc_cleanup's MatDestroy(A_aij) balanced.
-    no_aij = use_physics_pc
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
     if (.not. petsc_sys%ksp_ready) then
-      ! First solve: create AIJ matrix, vecs, KSP, and set up PCFIELDSPLIT+MUMPS
-      ! -jorek_pc_full_lu: one MUMPS LU of the whole coupled system instead of
-      ! the per-harmonic fieldsplit (the direct-solve reference; with
-      ! iter_precon = 0 it is refactorised every step).
-      PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_pc_full_lu", full_lu, ierr))
+      pc_type = select_pc_type()
+      ! The physics PC reads its blocks row by row and FGMRES only needs matvecs,
+      ! so both work on JOREK's own BAIJ matrix and the AIJ copy (a second full
+      ! Jacobian) is never made.
+      petsc_sys%a_alias = (pc_type == PETSC_PC_PHYSICS) .and. (.not. petsc_sys%aij_native)
       PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_mumps_central_rhs", central_rhs, ierr))
-      if (use_physics_pc .or. full_lu .or. central_rhs) call petsc_default_mumps_central_rhs()
+      if (pc_type == PETSC_PC_PHYSICS .or. pc_type == PETSC_PC_FULL_LU .or. central_rhs) &
+        call petsc_default_mumps_central_rhs()
+
       PetscCallA(PetscLogStageRegister("KSP Setup", petsc_sys%stage_setup, ierr))
       PetscCallA(PetscLogStageRegister("KSP Solve", petsc_sys%stage_solve, ierr))
       PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
@@ -423,86 +920,50 @@ contains
       PetscCallA(PetscTime(ts1, ierr))
 
       call physics_pc_mem("solver: before AIJ copy (JOREK assembled)", my_id)
-      if (no_aij) then
-        PetscCallA(PetscObjectReference(petsc_sys%A, ierr))
-        petsc_sys%A_aij = petsc_sys%A
-        if (my_id == 0) write(*,*) "[PETSc] setup: no AIJ copy, KSP and physics PC use the BAIJ matrix"
-      else
-        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
-      endif
+      call petsc_refresh_ksp_operator(petsc_sys, first_call=.true.)
+      call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
       call physics_pc_mem("solver: after AIJ copy", my_id)
-      PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      ! Opt-in, inert unless -jorek_dump_mat is set.
+      call petsc_dump_operator(A_ksp, 'system')
 
       PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      PetscCallA(KSPSetOptionsPrefix(petsc_sys%ksp, PETSC_MAIN_PREFIX, ierr))
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
       PetscCallA(KSPSetType(petsc_sys%ksp, KSPFGMRES, ierr))
 
       ! Warm-start: consume the JOREK initial guess (previous-step increment) loaded into
-      ! petsc_sys%x_aij before each KSPSolve. The convergence reference stays the rhs norm
+      ! petsc_sys%x before each KSPSolve. The convergence reference stays the rhs norm
       ! ||b|| (PETSc default; KSPConvergedDefaultSetUIRNorm is NOT set), so the stopping
       ! criterion is identical to the zero-start behaviour - only the starting point changes.
+      ! -jorek_ksp_initial_guess_nonzero 0 starts from zero instead.
       PetscCallA(KSPSetInitialGuessNonzero(petsc_sys%ksp, PETSC_TRUE, ierr))
-      ! -jorek_outer_zero_guess: start from zero instead. The previous increment is a poor
-      ! guess while stiff transients flip sign from step to step (Crank-Nicolson on a fresh
-      ! state): its residual can exceed ||b|| by orders of magnitude and trip the
-      ! divergence test (KSP_DIVERGED_DTOL) at iteration 0.
-      block
-        PetscBool :: zg, set
-        zg = PETSC_FALSE
-        PetscCallA(PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_zero_guess", zg, set, ierr))
-        if (zg) then
-          PetscCallA(KSPSetInitialGuessNonzero(petsc_sys%ksp, PETSC_FALSE, ierr))
-          if (my_id .eq. 0) write(*,'(A)') " [PETSc] outer FGMRES from a zero initial guess"
-        endif
-      end block
 
-      ! Set the maximum iterations and restart
+      ! Set GMRES parameters
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
-      ! -jorek_outer_restart k: the outer FGMRES restart length (default 40)
-      block
-        PetscInt :: rs
-        PetscBool :: set
-        rs = 40
-        PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_restart", rs, set, ierr))
-        if (set) PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, rs, ierr))
-      end block
-      ! -jorek_outer_rtol r, -jorek_outer_maxit k: the outer FGMRES relative tolerance
-      ! and iteration cap (defaults 1e-8, 400; the input's gmres_tol/gmres_max_iter
-      ! are not used on this path)
-      block
-        PetscReal :: rt
-        PetscInt :: mi
-        PetscBool :: set_rt, set_mi
-        rt = 1.d-8
-        mi = 400
-        PetscCallA(PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_rtol", rt, set_rt, ierr))
-        PetscCallA(PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_outer_maxit", mi, set_mi, ierr))
-        if (set_rt .or. set_mi) then
-          PetscCallA(KSPSetTolerances(petsc_sys%ksp, rt, 1.d-36, PETSC_CURRENT_REAL, mi, ierr))
-          if (my_id .eq. 0) write(*,'(A,ES10.3,A,I0)') " [PETSc] outer FGMRES rtol ", rt, ", maxit ", mi
-        endif
-      end block
+      PetscCallA(KSPGMRESSetOrthogonalization(petsc_sys%ksp, KSPGMRESClassicalGramSchmidtOrthogonalization, ierr))
+      PetscCallA(KSPGMRESSetCGSRefinementType(petsc_sys%ksp, KSP_GMRES_CGS_REFINE_IFNEEDED, ierr))
 
-      if (use_physics_pc) then
-        if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + Physics PCSHELL"
-      else if (full_lu) then
-        if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + full-system LU (MUMPS)"
-      else
-        if (my_id .eq. 0) write(*,*) "[PETSc] setup: FGMRES + PCFIELDSPLIT + MUMPS"
-      endif
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
-      if (use_physics_pc) then
-        call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_PHYSICS)
-        call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
-      else if (full_lu) then
-        call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_FULL_LU)
-      else
-        call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, PETSC_PC_TOROIDAL_HARMONIC)
-      endif
+
+      ! Options after the defaults above, so anything in jorek.petsc overrides
+      ! them: -jorek_ksp_rtol, -jorek_ksp_max_it, -jorek_ksp_gmres_restart, ...
+      ! -jorek_pc_type is deliberately NOT a knob: the outer PC is structural, so
+      ! petsc_setup_pc below always sets it (see select_pc_type for the choices).
+      ! The direct-solver blocks are configurable under the -jorek_pcblock_ prefix.
+      PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
+      call report_main_solver(petsc_sys%ksp, my_id, pc_type)
+      call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, pc_type)
+      if (pc_type == PETSC_PC_PHYSICS) call petsc_physics_pc_build_reduced(A_ksp)
 
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+      ! Force the sub-KSP factorizations here so they are timed as setup, not solve
+      ! (no-op for the toroidal PC, which sets its sub-KSPs up explicitly).
+      PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
+      ! KSPSetUpOnBlocks stops at a PCTELESCOPE, which implements no setuponblocks,
+      ! so a telescoped block solver is factorized here rather than in the solve.
+      call petsc_setup_pc_blocks(petsc_sys%ksp)
       petsc_sys%ksp_ready = .true.
       call physics_pc_mem("solver: setup done", my_id)
 
@@ -517,13 +978,19 @@ contains
       call MPI_Barrier(comm, mpierr)
       PetscCallA(PetscTime(ts1, ierr))
 
-      if (.not. no_aij) then
-        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
-      endif
-      if (use_physics_pc) call petsc_physics_pc_build_reduced(petsc_sys%A_aij)
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      call petsc_refresh_ksp_operator(petsc_sys, first_call=.false.)
+      call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
+      if (use_physics_pc) call petsc_physics_pc_build_reduced(A_ksp)
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
       PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+      ! KSPSetUp only rebuilds PCFIELDSPLIT itself; the sub-KSP LU/MUMPS numerical
+      ! factorizations are otherwise deferred to KSPSetUpOnBlocks inside KSPSolve, which
+      ! would charge the whole factorization cost to the GMRES solve timer below.
+      PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
+      ! ... and KSPSetUpOnBlocks in turn stops at a PCTELESCOPE, which implements no
+      ! setuponblocks, so the block solver it wraps has to be reached separately.
+      call petsc_setup_pc_blocks(petsc_sys%ksp)
       call physics_pc_mem("solver: rebuild done", my_id)
 
       call MPI_Barrier(comm, mpierr)
@@ -534,41 +1001,23 @@ contains
     else
       ! solve_only: update A for mat-vec products but reuse PC factorization
       if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
-      if (.not. no_aij) then
-        PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
-      endif
-      PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A_aij, petsc_sys%A_aij, ierr))
+      call petsc_refresh_ksp_operator(petsc_sys, first_call=.false.)
+      call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
     end if
 
-    ! Copy RHS and warm-start guess, solve, copy solution back
-    PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
-    PetscCallA(VecCopy(petsc_sys%x, petsc_sys%x_aij, ierr))   ! initial guess for FGMRES
+    call petsc_sync_ksp_vectors(petsc_sys, to_ksp=.true.)
 
-    ! -jorek_dump_outer <file>: the outer operator in PETSc binary, once
-    ! (diagnostics of the outer matvec's cost)
-    block
-      character(len=256) :: dfile
-      PetscBool :: dset
-      PetscViewer :: dv
-      logical, save :: dumped = .false.
-      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_dump_outer", dfile, dset, ierr)
-      if (dset .and. .not. dumped) then
-        call PetscViewerBinaryOpen(comm, trim(dfile), FILE_MODE_WRITE, dv, ierr)
-        call MatView(petsc_sys%A_aij, dv, ierr)
-        call PetscViewerDestroy(dv, ierr)
-        dumped = .true.
-      endif
-    end block
     call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
-    PetscCallA(KSPSolve(petsc_sys%ksp, petsc_sys%b_aij, petsc_sys%x_aij, ierr))
+    PetscCallA(KSPSolve(petsc_sys%ksp, b_ksp, x_ksp, ierr))
     PetscCallA(PetscLogStagePop(ierr))
     call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t2, ierr))
 
-    PetscCallA(VecCopy(petsc_sys%x_aij, petsc_sys%x, ierr))
+    call petsc_sync_ksp_vectors(petsc_sys, to_ksp=.false.)
     call physics_pc_mem("solver: solve done", my_id)
 
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
@@ -594,26 +1043,29 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_RHS), intent(inout) :: sol_vec
 
-    Vec             :: x_seq
-    VecScatter      :: scatter
     PetscScalar, pointer :: x_arr(:)
     PetscErrorCode :: ierr
 
-    PetscCallA(VecScatterCreateToAll(petsc_sys%x, scatter, x_seq, ierr))
+    ! Built once and kept: the layout of x does not change between solves, so the
+    ! scatter plan and its sequential target are reusable. petsc_cleanup destroys
+    ! them.
+    if (.not. petsc_sys%scatter_ready) then
+      PetscCallA(VecScatterCreateToAll(petsc_sys%x, petsc_sys%x_scatter, petsc_sys%x_seq, ierr))
+      petsc_sys%scatter_ready = .true.
+    endif
 
-    PetscCallA(VecScatterBegin(scatter, petsc_sys%x, x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
-    PetscCallA(VecScatterEnd(scatter, petsc_sys%x, x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
+    PetscCallA(VecScatterBegin(petsc_sys%x_scatter, petsc_sys%x, petsc_sys%x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
+    PetscCallA(VecScatterEnd(petsc_sys%x_scatter, petsc_sys%x, petsc_sys%x_seq, INSERT_VALUES, SCATTER_FORWARD, ierr))
 
-    PetscCallA(VecGetArray(x_seq, x_arr, ierr))
+    ! Read access: only the host copy is consumed here, and x_seq is overwritten in
+    ! full by the next scatter, so nothing needs to travel back to the device.
+    PetscCallA(VecGetArrayRead(petsc_sys%x_seq, x_arr, ierr))
 
     if (associated(sol_vec%val)) then
       sol_vec%val(1:sol_vec%n) = x_arr(1:sol_vec%n)
     end if
 
-    PetscCallA(VecRestoreArray(x_seq, x_arr, ierr))
-
-    PetscCallA(VecScatterDestroy(scatter, ierr))
-    PetscCallA(VecDestroy(x_seq, ierr))
+    PetscCallA(VecRestoreArrayRead(petsc_sys%x_seq, x_arr, ierr))
   end subroutine petsc_recover_solution
 
 
@@ -628,13 +1080,13 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     type(type_SP_MATRIX), intent(in)       :: a_mat
 
-    integer :: k, r
+    integer :: k, r, c, j, owner
     integer :: comm, my_id, n_cpu, mpierr
     PetscInt :: n_global, n_local
     PetscInt :: row(1), col(1)
     PetscScalar :: v(1)
-    PetscInt, allocatable :: d_nnz(:), o_nnz(:), cnt(:)
-    PetscInt :: r_start, r_end
+    PetscInt, allocatable :: d_nnz(:), o_nnz(:)
+    integer, allocatable  :: d_all(:), o_all(:), d_loc(:), o_loc(:), counts(:), displs(:)
     PetscErrorCode :: ierr
 
     comm = a_mat%comm
@@ -659,31 +1111,60 @@ contains
       call MatSeqAIJSetPreallocation(petsc_sys%A, 0, d_nnz, ierr)
       deallocate(d_nnz)
     else
-      ! Preallocating n_global per row overflows PetscInt (local rows x n_global
-      ! > 2^31 at 161x64 on np <= 8) and reserves O(n_local*n_global) otherwise.
-      ! Count the COO entries per row on rank 0 instead, broadcast, and bound each
-      ! rank's diagonal/off-diagonal counts by the block widths.
+      ! Fix the row split up front so rank 0, which holds the whole COO, can work out
+      ! every rank's ownership range and count its rows exactly. The previous
+      ! n_global-per-row preallocation was effectively dense and grew as O(n^2).
       n_local = PETSC_DECIDE
       call PetscSplitOwnership(comm, n_local, n_global, ierr)
-      call MPI_Scan(n_local, r_end, 1, MPIU_INTEGER, MPI_SUM, comm, mpierr)
-      r_start = r_end - n_local
-      allocate(cnt(n_global))
-      cnt = 0
-      if (my_id .eq. 0) then
-        do k = 1, a_mat%nnz
-          r = a_mat%irn(k)
-          cnt(r) = cnt(r) + 1
-        enddo
-      endif
-      call MPI_Bcast(cnt, int(n_global), MPIU_INTEGER, 0, comm, mpierr)
-      allocate(d_nnz(n_local), o_nnz(n_local))
-      do k = 1, int(n_local)
-        d_nnz(k) = min(cnt(r_start + k), n_local)
-        o_nnz(k) = min(cnt(r_start + k), n_global - n_local)
-      enddo
-      deallocate(cnt)
       call MatSetSizes(petsc_sys%A, n_local, n_local, n_global, n_global, ierr)
       call MatSetType(petsc_sys%A, MATAIJ, ierr)
+
+      allocate(counts(n_cpu), displs(n_cpu))
+      call MPI_Allgather(int(n_local), 1, MPI_INTEGER, counts, 1, MPI_INTEGER, comm, mpierr)
+      displs(1) = 0
+      do k = 2, n_cpu
+        displs(k) = displs(k-1) + counts(k-1)
+      enddo
+
+      ! Per global row, count entries inside vs outside the diagonal block of the rank
+      ! owning that row (duplicates included - a safe overestimate).
+      if (my_id .eq. 0) then
+        allocate(d_all(n_global), o_all(n_global))
+        d_all = 0
+        o_all = 0
+        do k = 1, a_mat%nnz
+          r = a_mat%irn(k)
+          c = a_mat%jcn(k)
+          owner = 1
+          do j = n_cpu, 1, -1
+            if (r-1 >= displs(j)) then
+              owner = j
+              exit
+            endif
+          enddo
+          if (c-1 >= displs(owner) .and. c-1 < displs(owner) + counts(owner)) then
+            d_all(r) = d_all(r) + 1
+          else
+            o_all(r) = o_all(r) + 1
+          endif
+        enddo
+      else
+        allocate(d_all(1), o_all(1))
+      endif
+
+      allocate(d_loc(n_local), o_loc(n_local))
+      call MPI_Scatterv(d_all, counts, displs, MPI_INTEGER, d_loc, int(n_local), MPI_INTEGER, 0, comm, mpierr)
+      call MPI_Scatterv(o_all, counts, displs, MPI_INTEGER, o_loc, int(n_local), MPI_INTEGER, 0, comm, mpierr)
+      deallocate(d_all, o_all)
+
+      ! Clamp to the width actually available in each block; PETSc rejects larger values.
+      allocate(d_nnz(n_local), o_nnz(n_local))
+      do k = 1, n_local
+        d_nnz(k) = min(d_loc(k), int(n_local))
+        o_nnz(k) = min(o_loc(k), int(n_global - n_local))
+      enddo
+      deallocate(d_loc, o_loc, counts, displs)
+
       call MatMPIAIJSetPreallocation(petsc_sys%A, 0, d_nnz, 0, o_nnz, ierr)
       deallocate(d_nnz, o_nnz)
     endif
@@ -754,10 +1235,19 @@ contains
 
     if (petsc_sys%ksp_ready) then
       call KSPDestroy(petsc_sys%ksp, ierr)
-      call MatDestroy(petsc_sys%A_aij, ierr)
-      call VecDestroy(petsc_sys%b_aij, ierr)
-      call VecDestroy(petsc_sys%x_aij, ierr)
+      ! On the native AIJ path A_aij/b_aij/x_aij were never created - the KSP ran on
+      ! A, b and x directly - so destroying them here would be a double free.
+      if (.not. petsc_sys%aij_native) then
+        call MatDestroy(petsc_sys%A_aij, ierr)
+        call VecDestroy(petsc_sys%b_aij, ierr)
+        call VecDestroy(petsc_sys%x_aij, ierr)
+      endif
       petsc_sys%ksp_ready = .false.
+    endif
+    if (petsc_sys%scatter_ready) then
+      call VecScatterDestroy(petsc_sys%x_scatter, ierr)
+      call VecDestroy(petsc_sys%x_seq, ierr)
+      petsc_sys%scatter_ready = .false.
     endif
     if (petsc_sys%initialized) then
       call VecDestroy(petsc_sys%b, ierr)
@@ -767,9 +1257,10 @@ contains
         petsc_sys%owns_A = .false.
       endif
       petsc_sys%initialized = .false.
+      petsc_sys%aij_native  = .false.
+      petsc_sys%a_alias     = .false.
     endif
   end subroutine petsc_cleanup
-
 
 #endif
 end module mod_petsc

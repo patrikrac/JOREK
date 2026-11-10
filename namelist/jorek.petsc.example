@@ -1,0 +1,203 @@
+# ---------------------------------------------------------------------------
+# PETSc solver options for JOREK.
+#
+# Copy this file to  jorek.petsc  in the run directory and uncomment what you
+# need. It is read automatically at startup when present; if it is absent JOREK
+# runs with its built-in defaults, which are exactly the settings listed as
+# "default:" below.
+#
+# Format is the standard PETSc options file: one option per line, '#' comments.
+# Anything set here overrides JOREK's compiled-in default.
+#
+# Three prefixes exist:
+#   -jorek_          the main iterative (GMRES) solve
+#   -jorek_pcblock_  the direct solver inside every preconditioner block
+#   -jorek_direct_   the one-shot direct solve path
+#
+# The -jorek_pcblock_ prefix is shared by all toroidal mode-family blocks, so a
+# single option below reconfigures every one of them.
+# ---------------------------------------------------------------------------
+
+# --- Operator storage format ------------------------------------------------
+# How the system matrix is built and handed to the KSP.
+#
+#   baij (default)  MATMPIBAIJ, filled block-by-block with MatSetValuesBlocked
+#                   straight from the element loop, then MatConvert'ed to
+#                   MATMPIAIJ for the KSP on EVERY solve.
+#   aij             JOREK assembles into its own val array and pushes it to a
+#                   MATAIJ operator with one MatSetValuesCOO; the COO indices are
+#                   derived from the block sparsity, so irn/jcn are not even
+#                   allocated. The KSP consumes that matrix directly - no
+#                   conversion, and no b/x vector copies.
+#
+# Use aij for anything GPU: PETSc implements the COO interface and the device
+# matrix types (aijcusparse, aijkokkos) for AIJ only, never for BAIJ, so baij
+# can never be device-resident. On CPU the two agree to solver tolerance -
+# identical GMRES iteration counts - and differ only in assembly cost.
+# -jorek_mat_format          aij        # default: baij
+#
+# With aij you can additionally pick the concrete PETSc matrix type, e.g.
+# -jorek_mat_type            aijcusparse
+# The solution/RHS vectors are created with MatCreateVecs and so follow the
+# matrix type automatically - there is no separate vector option to set.
+#
+# -jorek_mat_type is read ONLY on the aij path, because that is the only path
+# that calls MatSetFromOptions on the operator. Setting it without also setting
+# -jorek_mat_format aij leaves it unused, which -options_left reports as
+#   Option left: name:-jorek_mat_type value:aijcusparse
+# The log line says which path ran: "[PETSc] init: AIJ/COO matrix ..." for aij,
+# "[PETSc] create_matrix: BAIJ ..." for baij.
+#
+# MEMORY: aij costs about 16 bytes per nonzero more than baij at steady state -
+# JOREK's val array (8) plus PETSc's persistent COO map (16), against the
+# converted-AIJ duplicate baij carries (8). At ~3e8 nonzeros per rank that is
+# ~2.4 GB, which is enough to turn a job that just fits into one that is killed.
+# Raise the memory request before switching a large case over.
+#
+# NOTE on use_matrix_equilibration: equilibration indexes through jcn and the
+# block-CSR map on every solve, so with it enabled the aij path keeps both and
+# the memory saving above does not apply. Be aware also that equilibration is
+# currently applied only when PETSc is NOT assembling the matrix directly, so
+# baij + use_matrix_equilibration silently skips it while aij does not - the two
+# formats are then not comparable.
+#
+# -jorek_coo_verify_indices             # debugging: cross-check the generated
+#     COO indices against the irn/jcn the element loop fills, and abort on any
+#     disagreement. Keeps irn/jcn alive for the comparison, so it costs the
+#     memory the aij path normally saves. Use after touching either the block
+#     structure or the index convention in add_block_to_sp_matrix.
+
+# --- Main iterative solve ---------------------------------------------------
+# -jorek_ksp_type            gmres      # default: gmres
+# -jorek_ksp_rtol            1e-8       # default: 1e-8
+# -jorek_ksp_max_it          400        # default: 400
+# -jorek_ksp_gmres_restart   40         # default: 40
+# -jorek_ksp_view                       # dump the full solver configuration
+#
+# Note: -jorek_pc_type is not a supported knob. The outer preconditioner carries
+# the toroidal mode-family decomposition and is structural. What you can choose
+# is how that decomposition is laid out across the ranks - see the next section.
+
+# --- Parallel layout of the mode-family preconditioner ----------------------
+# The preconditioner is block-diagonal in the toroidal mode families. There are
+# two ways to spread those blocks over the ranks, and they differ enormously in
+# parallel efficiency.
+#
+#   PCFIELDSPLIT (default)  every block lives on the full communicator, and the
+#                           blocks are applied one after another. Each block is
+#                           therefore factorized across ALL ranks - exactly the
+#                           regime in which a sparse direct solver stops scaling.
+#
+#   -jorek_pc_mode_split    each mode family gets its own disjoint MPI
+#                           sub-communicator, holding that family's sub-matrix
+#                           and its own direct solver. Because the communicators
+#                           are disjoint, all blocks are factorized and solved
+#                           CONCURRENTLY, each by a smaller set of ranks. This is
+#                           the layout JOREK's legacy (non-PETSc) solver has
+#                           always used.
+#
+# -jorek_pc_mode_split                  # default: off (PCFIELDSPLIT)
+#
+# Which mode families exist, and how many ranks each gets, come from the JOREK
+# namelist, not from here - the same variables the legacy path uses:
+#   autodistribute_modes, n_mode_families, modes_per_family, mode_families_modes,
+#   weights_per_family, autodistribute_ranks, ranks_per_family
+# With autodistribute_modes (the default) there is one family per toroidal
+# harmonic - family 1 is the n=0 mode alone, every other family is a sin/cos
+# pair - and autodistribute_ranks spreads the ranks over them evenly.
+#
+# REQUIREMENT: at least one rank per mode family, so n_ranks >= n_mode_families.
+# JOREK says so and stops if that is not met. Family 1 holds half as many modes
+# as the others, so its block is smaller; ranks_per_family is how you compensate,
+# e.g. ranks_per_family = 1,2,2,2 with autodistribute_ranks = .f.
+#
+# Startup prints the resulting partition:
+#   [PETSc] mode-split PC: 2 mode families over 2 ranks
+#     family 1: 1 rank(s), weight 1.00, modes: 1
+#     family 2: 1 rank(s), weight 1.00, modes: 2 3
+#
+# The blocks are configured exactly as under PCFIELDSPLIT: everything below under
+# the -jorek_pcblock_ prefix applies unchanged.
+
+# Under -jorek_pc_mode_split each rebuild also reports where its time went:
+#   [PETSc] mode-split PCSetUp: extraction   1.2345E-01 s, factorization   4.5678E+00 s
+# Extraction is carving the family operators out of the global one - a collective
+# on the full communicator, paid by every rank. Factorization is the family-local
+# direct solve setup, and the only half that concurrency or any future background
+# scheme can act on. The factorization figure is family 1's, measured on rank 0;
+# the families are not synchronized against each other, so it is a lower bound on
+# the slowest one.
+
+# --- Direct solver used in each preconditioner block ------------------------
+# Which factorization package. Requires the package in your PETSc build;
+# PETSc reports clearly at startup if it is missing.
+# -jorek_pcblock_pc_factor_mat_solver_type mumps          # default
+# -jorek_pcblock_pc_factor_mat_solver_type superlu_dist
+# -jorek_pcblock_pc_factor_mat_solver_type strumpack
+#
+# Note: PETSc's built-in LU ('petsc') is NOT usable here - the blocks are MPIAIJ
+# and it only factorizes SEQAIJ. PETSc says so clearly if you try. The same
+# applies to cuDSS, which is why it needs the telescope recipe further down
+# rather than appearing in the list above.
+#
+# MUMPS controls. JOREK's defaults are ICNTL(7)=7 (METIS ordering),
+# ICNTL(14)=50 (workspace %), ICNTL(8)=77 (auto scaling), ICNTL(22)=0 (in-core).
+# Setting one here overrides just that one; the rest keep JOREK's values.
+# -jorek_pcblock_mat_mumps_icntl_22 1    # 1 = out-of-core factorization
+# -jorek_pcblock_mat_mumps_icntl_7  5
+#
+# SuperLU_DIST / STRUMPACK / cuDSS controls follow the same pattern:
+# -jorek_pcblock_mat_superlu_dist_colperm PARMETIS
+# -jorek_pcblock_mat_strumpack_compression NONE
+#
+# The block solver itself can also be replaced wholesale, e.g. to try an
+# iterative block solve instead of a direct one:
+# -jorek_pcblock_ksp_type richardson
+# -jorek_pcblock_pc_type  hypre
+
+# --- Sequential block solvers, via PCTELESCOPE ------------------------------
+# A sequential package (cuDSS, or PETSc's built-in LU) cannot factorize an
+# MPIAIJ block directly. PCTELESCOPE reduces the block onto a smaller
+# communicator first; with a reduction factor equal to the number of ranks that
+# communicator has size 1, and PETSc then resolves the block to SEQAIJ, which
+# those packages do accept.
+#
+# -jorek_pcblock_pc_type                        telescope
+# -jorek_pcblock_pc_telescope_reduction_factor  4          # = number of MPI ranks
+# -jorek_pcblock_telescope_pc_factor_mat_solver_type cudss
+#
+# Everything the block solver understands moves under the extra 'telescope_'
+# prefix, JOREK's own defaults included: selecting telescope and nothing else
+# still gives LU via MUMPS with JOREK's ICNTLs, and an override is written
+# -jorek_pcblock_telescope_mat_mumps_icntl_14 20
+#
+# Caveat when comparing against MUMPS: MUMPS factorizes the block across all
+# ranks, whereas a telescoped block is factorized on one. Telescope both, or
+# compare on a single rank, or the numbers are not measuring the same thing.
+#
+# ON MORE THAN ONE RANK, PREFER -jorek_pc_mode_split TO THIS RECIPE. PETSc's
+# PetscSubcomm_isActiveRank puts colour 0 on rank 0 for every reduction factor
+# and subcomm type, so every telescoped block is reduced onto the SAME rank: one
+# GPU does all the work and the rest idle, and no prefix or factor changes that.
+# The mode-split PC gives each family its own communicator instead, so at one
+# rank per family PETSc resolves each block to SEQAIJ - what cuDSS needs - on a
+# DIFFERENT rank, and every GPU is busy:
+#
+#   -jorek_pc_mode_split
+#   -jorek_pcblock_pc_factor_mat_solver_type cudss
+#
+# Telescope remains the right tool for reducing a block below one rank per
+# family, or for reaching cuDSS reorderings only available on a single rank.
+
+# --- One-shot direct solve path ---------------------------------------------
+# -jorek_direct_pc_factor_mat_solver_type mumps           # default
+
+# --- Matrix dumping ---------------------------------------------------------
+# Write the operators JOREK actually solves with to PETSc binary files, so they
+# can be replayed offline against different factorization packages (e.g. with
+# PETSc's src/mat/tests/ex125 -f <file>). Off unless set; costs nothing when absent.
+# -jorek_dump_mat  jorekmat        # -> jorekmat_system.dat, jorekmat_pcblock1.dat, ...
+
+# --- Diagnostics ------------------------------------------------------------
+# -options_left                         # report unused (i.e. misspelled) options
+# -log_view                             # PETSc performance summary
