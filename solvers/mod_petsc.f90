@@ -60,7 +60,10 @@ module mod_petsc
     !! them in one iteration, and a test relative to the full ||b|| stops before the
     !! interior has converged.
     logical   :: penalty_free_norm = .true.
-    PetscReal :: penalty_diag      = 1.d10   !< rows with |A_ii| >= this are penalty rows
+    !> rows with |A_ii| >= this are penalty rows: zbig = 1e12 on the value dofs, and
+    !! zbig times element sizes (1e9 - 1e10) where a BC acts on derivative dofs (the
+    !! model600 Mach-1 sheath condition); physical diagonals stay below ~1e5
+    PetscReal :: penalty_diag      = 1.d7
     PetscReal :: rtol_user         = 1.d-8   !< relative tolerance requested (-jorek_ksp_rtol)
     Vec       :: diag                        !< diagonal of the KSP operator (penalty mask)
     logical   :: diag_ready = .false.
@@ -1031,6 +1034,7 @@ contains
     call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t2, ierr))
 
+    call field_residual_report(petsc_sys, A_ksp, b_ksp, x_ksp, comm, my_id)
     call petsc_sync_ksp_vectors(petsc_sys, to_ksp=.false.)
     call physics_pc_mem("solver: solve done", my_id)
 
@@ -1054,7 +1058,7 @@ contains
   !> Read the outer stopping-test settings once, after KSPSetFromOptions:
   !! the relative tolerance the user asked for (-jorek_ksp_rtol, default 1e-8),
   !! -jorek_ksp_penalty_free_norm (default true) and -jorek_ksp_penalty_diag
-  !! (default 1e10, the smallest |A_ii| treated as a penalty row).
+  !! (default 1e7, the smallest |A_ii| treated as a penalty row).
   subroutine read_outer_tolerance_options(petsc_sys)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     PetscReal :: rtol, abstol, dtol
@@ -1123,6 +1127,76 @@ contains
       "[PETSc] stop test: ||b|| = ", bn_full, ", ||b|| without penalty rows = ", bn_int, &
       " (", nint(glob(3)), " penalty rows), atol = ", atol
   end subroutine set_outer_tolerance
+
+
+  !> Diagnostic (-jorek_ksp_field_norms): per physical variable, ||b_k|| and the
+  !! true residual ||(b - A x)_k|| over the non-penalty rows after the solve.
+  !! Row g belongs to variable (mod(g, n_var n_tor) / n_tor) + 1. One extra matvec.
+  subroutine field_residual_report(petsc_sys, A_ksp, b_ksp, x_ksp, comm, my_id)
+    use mod_parameters, only: n_var, n_tor
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    Mat, intent(in) :: A_ksp
+    Vec, intent(in) :: b_ksp, x_ksp
+    integer, intent(in) :: comm, my_id
+    PetscBool :: on, set
+    Vec :: r
+    PetscScalar, pointer :: rr(:), bb(:), d(:)
+    PetscInt :: n, i, i0, i1, g
+    integer :: k, mpierr
+    real(kind=8) :: loc(2*n_var), glob(2*n_var)
+    integer, parameter :: DLO = -16, DHI = 16          ! decades of |A_ii| in the histogram
+    real(kind=8) :: hl(2, n_var, DLO:DHI), hg(2, n_var, DLO:DHI)
+    integer :: e
+    PetscErrorCode :: ierr
+
+    on = PETSC_FALSE
+    PetscCallA(PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_MAIN_PREFIX, '-ksp_field_norms', on, set, ierr))
+    if (.not. on) return
+    PetscCallA(VecDuplicate(b_ksp, r, ierr))
+    PetscCallA(MatMult(A_ksp, x_ksp, r, ierr))
+    PetscCallA(VecAYPX(r, -1.d0, b_ksp, ierr))          ! r = b - A x
+    if (.not. petsc_sys%diag_ready) then
+      PetscCallA(MatCreateVecs(A_ksp, petsc_sys%diag, PETSC_NULL_VEC, ierr))
+      petsc_sys%diag_ready = .true.
+    endif
+    PetscCallA(MatGetDiagonal(A_ksp, petsc_sys%diag, ierr))
+    PetscCallA(VecGetOwnershipRange(r, i0, i1, ierr))
+    n = i1 - i0
+    PetscCallA(VecGetArrayRead(r, rr, ierr))
+    PetscCallA(VecGetArrayRead(b_ksp, bb, ierr))
+    PetscCallA(VecGetArrayRead(petsc_sys%diag, d, ierr))
+    loc = 0.d0; hl = 0.d0
+    do i = 1, n
+      g = i0 + i - 1
+      k = int(mod(g, int(n_var*n_tor, kind=kind(g))) / n_tor) + 1
+      e = DLO
+      if (abs(d(i)) > 0.d0) e = max(DLO, min(DHI, floor(log10(abs(d(i))))))
+      hl(1, k, e) = hl(1, k, e) + 1.d0
+      hl(2, k, e) = hl(2, k, e) + bb(i)**2
+      if (abs(d(i)) >= petsc_sys%penalty_diag) cycle
+      loc(k)         = loc(k) + bb(i)**2
+      loc(n_var + k) = loc(n_var + k) + rr(i)**2
+    enddo
+    PetscCallA(VecRestoreArrayRead(petsc_sys%diag, d, ierr))
+    PetscCallA(VecRestoreArrayRead(b_ksp, bb, ierr))
+    PetscCallA(VecRestoreArrayRead(r, rr, ierr))
+    PetscCallA(VecDestroy(r, ierr))
+    call MPI_Allreduce(loc, glob, 2*n_var, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+    call MPI_Allreduce(hl, hg, size(hl), MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+    if (my_id == 0) then
+      do k = 1, n_var
+        do e = DLO, DHI
+          if (hg(1, k, e) > 0.d0) write(*,'(A,I0,A,I3,A,I9,A,ES11.3)') "[PETSc] diag hist field ", k, &
+            ": |A_ii| ~ 1e", e, "  rows ", nint(hg(1, k, e)), "  ||b|| over them ", sqrt(hg(2, k, e))
+        enddo
+      enddo
+      do k = 1, n_var
+        write(*,'(A,I0,A,ES11.3,A,ES11.3,A,ES11.3)') "[PETSc] field ", k, ": ||b_k|| = ", sqrt(glob(k)), &
+          "  ||r_k|| = ", sqrt(glob(n_var + k)), "  ||r_k||/||b_k|| = ", &
+          sqrt(glob(n_var + k)) / max(sqrt(glob(k)), tiny(1.d0))
+      enddo
+    endif
+  end subroutine field_residual_report
 
 
   subroutine petsc_recover_solution(petsc_sys, sol_vec)
