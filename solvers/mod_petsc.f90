@@ -53,6 +53,17 @@ module mod_petsc
     !> .true. when A_aij is not a copy but a second reference to the BAIJ matrix A
     !! (the physics PC, which reads A row by row): no MatConvert ever happens.
     logical :: a_alias       = .false.
+    !> Stopping test of the outer solve: ||r|| <= rtol_user * ||b without penalty rows||
+    !! (set_outer_tolerance). Penalty boundary rows carry diagonals of zbig = 1e12 and
+    !! right-hand sides of zbig times the boundary mismatch; where boundary values are
+    !! driven (sheath BCs) they dominate ||b|| by orders of magnitude, every PC resolves
+    !! them in one iteration, and a test relative to the full ||b|| stops before the
+    !! interior has converged.
+    logical   :: penalty_free_norm = .true.
+    PetscReal :: penalty_diag      = 1.d10   !< rows with |A_ii| >= this are penalty rows
+    PetscReal :: rtol_user         = 1.d-8   !< relative tolerance requested (-jorek_ksp_rtol)
+    Vec       :: diag                        !< diagonal of the KSP operator (penalty mask)
+    logical   :: diag_ready = .false.
     PetscLogStage :: stage_setup = -1
     PetscLogStage :: stage_solve = -1
   end type type_PETSC_SYSTEM
@@ -184,7 +195,8 @@ contains
     PetscCallA(KSPGetTolerances(ksp, rtol, abstol, dtol, maxits, ierr))
     write(*,*) '[PETSc] main solve (-'//PETSC_MAIN_PREFIX//'...): '//trim(ktype) &
                //' + '//trim(pc_desc)
-    write(*,*) '[PETSc]   rtol =', rtol, ' max_it =', maxits
+    write(*,*) '[PETSc]   rtol =', rtol, ' max_it =', maxits, &
+               ' (rtol w.r.t. ||b|| without penalty rows unless -jorek_ksp_penalty_free_norm 0)'
   end subroutine report_main_solver
 
 
@@ -953,6 +965,7 @@ contains
       ! petsc_setup_pc below always sets it (see select_pc_type for the choices).
       ! The direct-solver blocks are configurable under the -jorek_pcblock_ prefix.
       PetscCallA(KSPSetFromOptions(petsc_sys%ksp, ierr))
+      call read_outer_tolerance_options(petsc_sys)
       call report_main_solver(petsc_sys%ksp, my_id, pc_type)
       call petsc_setup_pc(petsc_sys%ksp, petsc_sys%A, pc_type)
       if (pc_type == PETSC_PC_PHYSICS) call petsc_physics_pc_build_reduced(A_ksp)
@@ -1008,6 +1021,7 @@ contains
     end if
 
     call petsc_sync_ksp_vectors(petsc_sys, to_ksp=.true.)
+    call set_outer_tolerance(petsc_sys, A_ksp, b_ksp, comm, my_id)
 
     call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t1, ierr))
@@ -1035,6 +1049,80 @@ contains
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))
     if (my_id .eq.0) write(*,'(A,ES12.4)') "[PETSc] solution norm: ", petsc_norm
   end subroutine petsc_solve_iterative_and_retrieve
+
+
+  !> Read the outer stopping-test settings once, after KSPSetFromOptions:
+  !! the relative tolerance the user asked for (-jorek_ksp_rtol, default 1e-8),
+  !! -jorek_ksp_penalty_free_norm (default true) and -jorek_ksp_penalty_diag
+  !! (default 1e10, the smallest |A_ii| treated as a penalty row).
+  subroutine read_outer_tolerance_options(petsc_sys)
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    PetscReal :: rtol, abstol, dtol
+    PetscInt  :: maxits
+    PetscBool :: pf, set
+    PetscErrorCode :: ierr
+
+    PetscCallA(KSPGetTolerances(petsc_sys%ksp, rtol, abstol, dtol, maxits, ierr))
+    petsc_sys%rtol_user = rtol
+    pf = PETSC_TRUE
+    PetscCallA(PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_MAIN_PREFIX, '-ksp_penalty_free_norm', pf, set, ierr))
+    petsc_sys%penalty_free_norm = (pf .eqv. PETSC_TRUE)
+    PetscCallA(PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_MAIN_PREFIX, '-ksp_penalty_diag', petsc_sys%penalty_diag, set, ierr))
+  end subroutine read_outer_tolerance_options
+
+
+  !> Set the outer stopping test for this solve: ||b - A x|| <= rtol_user * ||b_int||,
+  !! b_int = b without the penalty boundary rows (|A_ii| >= penalty_diag), passed to
+  !! PETSc as abstol with rtol = 0. Without penalty rows in b (fixed boundary values)
+  !! this is the usual test relative to ||b||. Logged every solve.
+  subroutine set_outer_tolerance(petsc_sys, A_ksp, b_ksp, comm, my_id)
+    type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
+    Mat, intent(in) :: A_ksp
+    Vec, intent(in) :: b_ksp
+    integer, intent(in) :: comm, my_id
+
+    PetscScalar, pointer :: d(:), bb(:)
+    PetscInt  :: n, i
+    real(kind=8) :: loc(3), glob(3)
+    PetscReal :: bn_full, bn_int, atol
+    integer :: mpierr
+    PetscErrorCode :: ierr
+
+    if (.not. petsc_sys%penalty_free_norm) then
+      PetscCallA(KSPSetTolerances(petsc_sys%ksp, petsc_sys%rtol_user, PETSC_CURRENT_REAL, PETSC_CURRENT_REAL, PETSC_CURRENT_INTEGER, ierr))
+      return
+    endif
+    if (.not. petsc_sys%diag_ready) then
+      PetscCallA(MatCreateVecs(A_ksp, petsc_sys%diag, PETSC_NULL_VEC, ierr))
+      petsc_sys%diag_ready = .true.
+    endif
+    PetscCallA(MatGetDiagonal(A_ksp, petsc_sys%diag, ierr))
+    PetscCallA(VecGetLocalSize(b_ksp, n, ierr))
+    PetscCallA(VecGetArrayRead(petsc_sys%diag, d, ierr))
+    PetscCallA(VecGetArrayRead(b_ksp, bb, ierr))
+    loc = 0.d0
+    do i = 1, n
+      loc(1) = loc(1) + bb(i)**2
+      if (abs(d(i)) < petsc_sys%penalty_diag) then
+        loc(2) = loc(2) + bb(i)**2
+      else
+        loc(3) = loc(3) + 1.d0
+      endif
+    enddo
+    PetscCallA(VecRestoreArrayRead(b_ksp, bb, ierr))
+    PetscCallA(VecRestoreArrayRead(petsc_sys%diag, d, ierr))
+    call MPI_Allreduce(loc, glob, 3, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+    bn_full = sqrt(glob(1)); bn_int = sqrt(glob(2))
+    if (bn_int > 0.d0) then
+      atol = petsc_sys%rtol_user * bn_int
+    else
+      atol = petsc_sys%rtol_user * bn_full
+    endif
+    PetscCallA(KSPSetTolerances(petsc_sys%ksp, 0.d0, atol, PETSC_CURRENT_REAL, PETSC_CURRENT_INTEGER, ierr))
+    if (my_id == 0) write(*,'(A,ES12.4,A,ES12.4,A,I0,A,ES12.4)') &
+      "[PETSc] stop test: ||b|| = ", bn_full, ", ||b|| without penalty rows = ", bn_int, &
+      " (", nint(glob(3)), " penalty rows), atol = ", atol
+  end subroutine set_outer_tolerance
 
 
   subroutine petsc_recover_solution(petsc_sys, sol_vec)
@@ -1243,6 +1331,10 @@ contains
         call VecDestroy(petsc_sys%x_aij, ierr)
       endif
       petsc_sys%ksp_ready = .false.
+    endif
+    if (petsc_sys%diag_ready) then
+      call VecDestroy(petsc_sys%diag, ierr)
+      petsc_sys%diag_ready = .false.
     endif
     if (petsc_sys%scatter_ready) then
       call VecScatterDestroy(petsc_sys%x_scatter, ierr)
