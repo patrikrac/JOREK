@@ -590,7 +590,7 @@ write(*,*) "n elements:", element_list%n_elements
   
    ! --- Initialize FFTW
 #ifdef USE_FFTW
-  call dfftw_plan_dft_r2c_1d(fftw_plan,n_plane,in_fft,out_fft,FFTW_PATIENT)
+  call dfftw_plan_dft_r2c_1d(fftw_plan,n_plane,in_fft,out_fft,ior(FFTW_PATIENT,FFTW_UNALIGNED))
 #endif
  
   call tr_debug_write("JMAIN:End_init elt_list",element_list%n_elements)
