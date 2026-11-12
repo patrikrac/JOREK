@@ -2602,7 +2602,9 @@ contains
     endif
     if (.not. allocated(B%eqs)) allocate(B%eqs(size(B%rows)))
     B%eqs = 1.d0
-    !$omp parallel do schedule(dynamic, 1) private(bb, n, ldab, wsc)
+    ! wsc freed explicitly: ifx does not free the threads' allocated private copies
+    !$omp parallel private(bb, n, ldab, wsc)
+    !$omp do schedule(dynamic, 1)
     do bb = 1, B%nb
       if (B%axblk(bb)) cycle
       n = B%sz(bb)
@@ -2620,7 +2622,9 @@ contains
         call dgetrf(n, n, B%lu(B%loff(bb) + 1), n, B%piv(B%off(bb) + 1), binfo(bb))
       endif
     enddo
-    !$omp end parallel do
+    !$omp end do
+    if (allocated(wsc)) deallocate(wsc)
+    !$omp end parallel
     if (allocated(B%wk)) then
       do bb = 1, B%nb
         if (.not. B%btd(bb)) cycle
