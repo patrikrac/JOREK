@@ -64,14 +64,16 @@ contains
   end subroutine petsc_create_pc_matrix
 
 
-  !> Assemble the physics PC's element-level operator W (and v_par's W
-  !! terms). It needs mhd_sim, the linearisation state, so it is assembled
-  !! here rather than in the PC build.
+  !> Assemble the physics PC's element-level operators: W (and v_par's W
+  !! terms) for the SF sweep, M_rho (and once D_bc) for the vorticity-space
+  !! Schur PC. They need mhd_sim, the linearisation state, so they are
+  !! assembled here rather than in the PC build.
   subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
-    use construct_pc_matrix_mod, only: construct_force_operator_matrix
+    use construct_pc_matrix_mod, only: construct_pc_element_matrices
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
     use mod_petsc_pc_sf_solver, only: sf_vpar_w_assembled
+    use mod_petsc_pc_physics_ctx, only: physics_pc_method_id, PC_METHOD_SF
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
@@ -81,6 +83,10 @@ contains
     PetscErrorCode :: ierr
 
     call physics_pc_log_events_register()       ! runs before the first PC build
+    if (physics_pc_method_id() /= PC_METHOD_SF) then
+      call assemble_vs_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
+      return
+    endif
     call PetscLogEventBegin(pcev_elem_asm, ierr)
 
     ! created once, zeroed before every refill: W keeps its identity and
@@ -107,13 +113,13 @@ contains
         PetscCallA(MatSetOption(g_ctx%W_vu, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
         PetscCallA(MatSetOption(g_ctx%W_uv, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
       endif
-      call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
-                                           mhd_sim, g_ctx%W_force, &
-                                           W_vv=g_ctx%W_vv, W_vu=g_ctx%W_vu, W_uv=g_ctx%W_uv)
+      call construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat, &
+                                         mhd_sim, W_force=g_ctx%W_force, &
+                                         W_vv=g_ctx%W_vv, W_vu=g_ctx%W_vu, W_uv=g_ctx%W_uv)
       g_ctx%w_v_ready = .true.
     else
-      call construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, &
-                                           mhd_sim, g_ctx%W_force)
+      call construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat, &
+                                         mhd_sim, W_force=g_ctx%W_force)
     endif
     g_ctx%w_force_ready = .true.
     call PetscLogEventEnd(pcev_elem_asm, ierr)
@@ -126,6 +132,49 @@ contains
       endif
     endif
   end subroutine petsc_assemble_pc_matrices
+
+
+  !> The vorticity-space Schur PC's matrices: M_rho on every call, D_bc once.
+  !! Their Dirichlet rows at u's constrained DOFs get 1 with eliminated
+  !! boundary DOFs; with penalty rows they get the penalty, so that the
+  !! operators built on them carry penalty rows where the Jacobian does.
+  subroutine assemble_vs_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
+    use construct_pc_matrix_mod, only: construct_pc_element_matrices, construct_bc_diagonal
+    use data_structure,  only: type_SP_MATRIX
+    use mod_simulation_data, only: type_MHD_SIM
+    use phys_module, only: eliminate_boundary_dofs
+    use mod_petsc_pc_vs, only: vs_init
+    !> the penalty of the Jacobian's boundary rows (mod_boundary_conditions)
+    real*8, parameter :: D_PENALTY = 1.d12
+
+    integer,              intent(in) :: my_id
+    integer, pointer,     intent(in) :: local_elms(:)
+    integer,              intent(in) :: n_local_elms
+    type(type_SP_MATRIX), intent(in) :: a_mat
+    type(type_MHD_SIM),   intent(in) :: mhd_sim
+    PetscErrorCode :: ierr
+    real*8 :: d
+
+    call vs_init(my_id)                         ! refuses unsupported models first
+    call PetscLogEventBegin(pcev_elem_asm, ierr)
+    d = merge(1.d0, D_PENALTY, eliminate_boundary_dofs)
+    if (g_ctx%m_rho_ready) then
+      PetscCallA(MatZeroEntries(g_ctx%M_rho, ierr))
+    else
+      call petsc_create_pc_matrix(g_ctx%M_rho, a_mat, 1)
+      PetscCallA(MatSetOption(g_ctx%M_rho, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
+    endif
+    call construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim, &
+                                       M_rho=g_ctx%M_rho, d_bc=d)
+    g_ctx%m_rho_ready = .true.
+    if (.not. g_ctx%d_bc_ready) then
+      call petsc_create_pc_matrix(g_ctx%D_bc, a_mat, 1)
+      call construct_bc_diagonal(local_elms, n_local_elms, a_mat, g_ctx%D_bc, d)
+      g_ctx%d_bc_ready = .true.
+    endif
+    call PetscLogEventEnd(pcev_elem_asm, ierr)
+    if (my_id == 0) write(*,'(A)') "[Physics PC]   M_rho (inertia) assembled"
+  end subroutine assemble_vs_matrices
 
 #endif
 end module mod_petsc_pc_physics_element

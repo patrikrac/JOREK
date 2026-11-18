@@ -134,7 +134,8 @@ contains
 
   !> Which preconditioner the main solve uses.
   !!
-  !! use_physics_pc (namelist) selects the physics-based SF preconditioner.
+  !! use_physics_pc (namelist) selects the physics-based preconditioner
+  !! (physics_pc_method: the SF sweep or the vorticity-space Schur PC).
   !! Otherwise -jorek_pc_full_lu selects one LU of the whole coupled system (the
   !! direct-solve reference), and the default is the harmonic block preconditioner,
   !! block-diagonal in the toroidal mode families, in one of two parallel layouts.
@@ -168,6 +169,7 @@ contains
   !> Report the main solve configuration actually resolved from the defaults
   !! plus whatever jorek.petsc supplied.
   subroutine report_main_solver(ksp, my_id, pc_type)
+    use mod_petsc_pc_physics_ctx, only: physics_pc_method_label
     KSP, intent(in)     :: ksp
     integer, intent(in) :: my_id
     integer, intent(in) :: pc_type
@@ -187,7 +189,7 @@ contains
       case (PETSC_PC_MODE_SPLIT)
         pc_desc = 'mode-split (one sub-communicator per mode family)'
       case (PETSC_PC_PHYSICS)
-        pc_desc = 'physics-based (SF)'
+        pc_desc = 'physics-based ('//trim(physics_pc_method_label())//')'
       case (PETSC_PC_FULL_LU)
         pc_desc = 'full-system LU'
       case default
@@ -896,7 +898,7 @@ contains
     use phys_module, only: use_physics_pc
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
     use mod_petsc_pc_physics_ctx, only: physics_pc_mem
-    use mod_petsc_pc_sf, only: sf_report
+    use mod_petsc_pc_physics, only: petsc_physics_pc_report
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
@@ -956,8 +958,13 @@ contains
       ! Set GMRES parameters
       PetscCallA(KSPSetTolerances(petsc_sys%ksp, 1.d-8, 1.d-36, PETSC_CURRENT_REAL, 400, ierr))
       PetscCallA(KSPGMRESSetRestart(petsc_sys%ksp, 40, ierr))
+#if PETSC_VERSION_GE(3,26,0)
+      PetscCallA(KSPOrthogonalizationSet(petsc_sys%ksp, KSPOrthogonalizationClassicalGramSchmidt, ierr))
+      PetscCallA(KSPOrthogonalizationSetCGSRefinementType(petsc_sys%ksp, KSP_ORTHOGONALIZATION_CGS_REFINE_IFNEEDED, ierr))
+#else
       PetscCallA(KSPGMRESSetOrthogonalization(petsc_sys%ksp, KSPGMRESClassicalGramSchmidtOrthogonalization, ierr))
       PetscCallA(KSPGMRESSetCGSRefinementType(petsc_sys%ksp, KSP_GMRES_CGS_REFINE_IFNEEDED, ierr))
+#endif
 
       PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
       PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
@@ -1047,7 +1054,7 @@ contains
 
     if (my_id == 0) write(*,'(A,I5,A,I0)') &
       "[PETSc] outer iterations: ", n_iter, "   converged reason: ", reason%v
-    if (use_physics_pc) call sf_report(my_id)
+    if (use_physics_pc) call petsc_physics_pc_report(my_id)
 
     ! Calculate the norm of the solution
     PetscCallA(VecNorm(petsc_sys%x, NORM_2, petsc_norm, ierr))

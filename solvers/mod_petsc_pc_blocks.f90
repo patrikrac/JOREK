@@ -1,5 +1,6 @@
-!> Operations on the packed diagonal blocks of the SF preconditioner: the
-!! symmetric field scaling and the decoupling of penalty rows.
+!> Operations on the packed diagonal blocks of the physics preconditioners:
+!! the symmetric field scaling and the decoupling of penalty rows; and the
+!! penalty rows of the full Jacobian with their back-substitution.
 module mod_petsc_pc_blocks
 #ifdef USE_PETSC
   use mpi_mod
@@ -8,7 +9,20 @@ module mod_petsc_pc_blocks
   implicit none
   private
 
+  !> The full Jacobian's penalty rows (eliminate_boundary_dofs = .f.; with
+  !! .t. the test finds the eliminated rows, their diagonal alone): local
+  !! offsets and diagonals, refreshed on every build.
+  type, public :: penalty_rows_t
+    Mat     :: a                           !< the full Jacobian
+    integer :: n = 0                       !< penalty rows on the communicator
+    integer, allocatable :: loc(:)
+    real*8, allocatable  :: d(:)
+    Vec     :: w
+    logical :: w_made = .false.
+  end type penalty_rows_t
+
   public :: pc_print_block_setup, make_field_block_scale, decouple_penalty_rows
+  public :: full_penalty_rows, penalty_backsub
 
 contains
 
@@ -181,6 +195,74 @@ contains
       write(*,'(A,A,A,A)') "[Physics PC]   ", trim(label), " penalty rows decoupled:", trim(sn)
     endif
   end subroutine decouple_penalty_rows
+
+  !> The full Jacobian's penalty rows, for the back-substitution closing a
+  !! preconditioner apply: |a_ii| > 1e6 max |a_ij| over the row's own
+  !! variable (the Mach-1 rows also hold zbig couplings to other variables).
+  subroutine full_penalty_rows(pr, A, comm, my_id, report)
+    use mod_parameters, only: n_tor
+    type(penalty_rows_t), intent(inout) :: pr
+    Mat :: A
+    integer, intent(in) :: comm, my_id
+    logical, intent(in) :: report             !< print the count
+    PetscInt :: rs, re, row, ncols, bs
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
+    PetscErrorCode :: ierr
+    integer :: jc, n, iv, mpierr
+    real*8 :: dg, off
+    integer, allocatable :: tl(:)
+    real*8, allocatable :: td(:)
+    pr%a = A
+    call MatGetBlockSize(A, bs, ierr)
+    call MatGetOwnershipRange(A, rs, re, ierr)
+    allocate(tl(re - rs), td(re - rs))
+    n = 0
+    do row = rs, re - 1
+      iv = int(mod(row, bs)) / n_tor
+      call MatGetRow(A, row, ncols, cols, vals, ierr)
+      dg = 0.d0; off = 0.d0
+      do jc = 1, int(ncols)
+        if (cols(jc) == row) then
+          dg = vals(jc)
+        else if (int(mod(cols(jc), bs)) / n_tor == iv) then
+          off = max(off, abs(vals(jc)))
+        endif
+      enddo
+      call MatRestoreRow(A, row, ncols, cols, vals, ierr)
+      if (abs(dg) > 0.d0 .and. abs(dg) > 1.d6 * off) then
+        n = n + 1; tl(n) = int(row - rs) + 1; td(n) = dg
+      endif
+    enddo
+    pr%loc = tl(1:n); pr%d = td(1:n)
+    call MPI_Allreduce(n, pr%n, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
+    if (.not. pr%w_made) call MatCreateVecs(A, pr%w, PETSC_NULL_VEC, ierr)
+    pr%w_made = .true.
+    if (my_id == 0 .and. report) write(*,'(A,I0,A)') "[Physics PC]   full Jacobian: ", pr%n, &
+      " penalty rows, back-substituted after every sweep"
+  end subroutine full_penalty_rows
+
+  !> The penalty rows' z_b += (r_b - sum_j a_bj z_j) / a_bb with the
+  !! preconditioner's z: their residual is zbig times z_b's error, which the
+  !! decoupled block rows leave at the size of the whole outer residual.
+  !! Changes the other rows' residual by O(1 / zbig).
+  subroutine penalty_backsub(pr, r, z)
+    type(penalty_rows_t), intent(inout) :: pr
+    Vec :: r, z
+    PetscScalar, pointer :: zp(:), rp(:), wp(:)
+    PetscErrorCode :: ierr
+    integer :: q
+    call MatMult(pr%a, z, pr%w, ierr)
+    call VecGetArray(z, zp, ierr)
+    call VecGetArrayRead(r, rp, ierr)
+    call VecGetArrayRead(pr%w, wp, ierr)
+    do q = 1, size(pr%loc)
+      zp(pr%loc(q)) = zp(pr%loc(q)) + (rp(pr%loc(q)) - wp(pr%loc(q))) / pr%d(q)
+    enddo
+    call VecRestoreArrayRead(pr%w, wp, ierr)
+    call VecRestoreArrayRead(r, rp, ierr)
+    call VecRestoreArray(z, zp, ierr)
+  end subroutine penalty_backsub
 
 #endif
 end module mod_petsc_pc_blocks

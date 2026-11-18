@@ -20,10 +20,10 @@ module mod_petsc_pc_sf
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx, physics_pc_mem, pcev_extract, pcev_fact_pj, pcev_fact_w, &
        pcev_fact_rhot, pcev_solve_pj, pcev_solve_w, pcev_solve_rhot, pcev_apply
-  use mod_petsc_pc_blocks, only: make_field_block_scale, decouple_penalty_rows
+  use mod_petsc_pc_blocks, only: penalty_rows_t, full_penalty_rows, penalty_backsub
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_ops, only: sf_op_t, sfo_layout, sfo_build, sfo_fill, sfo_vars_in, sfo_vars_out, &
-       sfo_comm, sfo_n1
+       sfo_comm, sfo_define, sfo_b65_used
   use mod_petsc_raw_csr, only: blockmv_attach
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
   implicit none
@@ -65,14 +65,7 @@ module mod_petsc_pc_sf
   Vec, save :: zv                              !< zero field
   logical, save :: vecs_ready = .false.
 
-  !> penalty rows of the full Jacobian (eliminate_boundary_dofs = .f.): local
-  !! offsets and diagonals, refreshed on every build
-  Mat, save :: a_full_s
-  integer, save :: npen_full = 0
-  integer, allocatable, save :: pen_loc(:)
-  real*8, allocatable, save  :: pen_d(:)
-  Vec, save :: pen_w
-  logical, save :: pen_w_made = .false.
+  type(penalty_rows_t), save :: pen           !< the full Jacobian's penalty rows
 
   public :: sf_build, sf_apply, sf_report
 
@@ -90,10 +83,10 @@ contains
 
     if (sf_init_done) return
 
-    bk_pj  = backend_of(physics_pc_sf_pair_psi, "physics_pc_sf_pair_psi")
-    bk_w   = backend_of(physics_pc_sf_pair_w,   "physics_pc_sf_pair_w")
-    bk_rho = backend_of(physics_pc_sf_rho,      "physics_pc_sf_rho")
-    bk_T   = backend_of(physics_pc_sf_T,        "physics_pc_sf_T")
+    bk_pj  = sf_backend(physics_pc_sf_pair_psi, "physics_pc_sf_pair_psi", my_id)
+    bk_w   = sf_backend(physics_pc_sf_pair_w,   "physics_pc_sf_pair_w",   my_id)
+    bk_rho = sf_backend(physics_pc_sf_rho,      "physics_pc_sf_rho",      my_id)
+    bk_T   = sf_backend(physics_pc_sf_T,        "physics_pc_sf_T",        my_id)
 
     if (jorek_model /= 199 .and. jorek_model /= 600 .and. jorek_model /= 183) &
       call fatal("physics_pc_sf supports model199, model600 and model183 only")
@@ -114,7 +107,7 @@ contains
       call fatal("physics_pc_sf_corrector = 3 supports model199 only (rho / T mass = opz B_44)")
 
     if (with_v) then
-      bk_v   = backend_of(physics_pc_sf_vpar, "physics_pc_sf_vpar")
+      bk_v   = sf_backend(physics_pc_sf_vpar, "physics_pc_sf_vpar", my_id)
       vstage = sf_vpar_stage()
       if (vstage < 0) call fatal("physics_pc_sf_vpar_stage must be v0 | b0 | b1, got '"// &
                                  trim(physics_pc_sf_vpar_stage)//"'")
@@ -164,17 +157,6 @@ contains
     sf_init_done = .true.
 
   contains
-
-    integer function backend_of(s, nm)
-      character(len=*), intent(in) :: s, nm
-      select case (trim(adjustl(s)))
-      case ("lu");  backend_of = SF_LU
-      case ("gmg"); backend_of = SF_GMG
-      case default
-        backend_of = SF_LU
-        call fatal(trim(nm)//" must be lu | gmg, got '"//trim(s)//"'")
-      end select
-    end function backend_of
 
     subroutine fatal(msg)
       character(len=*), intent(in) :: msg
@@ -227,7 +209,7 @@ contains
     enddo
     call PetscLogEventEnd(pcev_extract, ierr)
     if (first) then
-      call set_use_b65(o_cb(CB_65)%mat, comm_s)
+      use_b65 = sfo_b65_used(o_cb(CB_65), comm_s)
       nno = 0
       do k = 1, ncb_on
         if (.not. blockmv_attach(o_cb(k)%mat, int(pc_ntor))) nno = nno + 1
@@ -239,15 +221,15 @@ contains
 
     ! penalty rows as Dirichlet rows of the diagonal blocks, before the scaling
     if (.not. eliminate_boundary_dofs) then
-      call full_penalty_rows(A_full)
-      call penalty_rows(slv_pj, o_pj)
-      call penalty_rows(slv_w, o_w)
-      call penalty_rows(slv_rho, o_rho)
-      call penalty_rows(slv_T, o_T)
-      if (with_v .and. vstage /= SF_VPAR_B1) call penalty_rows(slv_v, o_v)
+      call full_penalty_rows(pen, A_full, comm, my_id, first)
+      call sf_solver_penalty_rows(slv_pj, o_pj, comm_s, my_id)
+      call sf_solver_penalty_rows(slv_w, o_w, comm_s, my_id)
+      call sf_solver_penalty_rows(slv_rho, o_rho, comm_s, my_id)
+      call sf_solver_penalty_rows(slv_T, o_T, comm_s, my_id)
+      if (with_v .and. vstage /= SF_VPAR_B1) call sf_solver_penalty_rows(slv_v, o_v, comm_s, my_id)
     endif
-    call block_scale(slv_pj, o_pj)
-    call block_scale(slv_w, o_w)
+    call sf_solver_block_scale(slv_pj, o_pj, comm_s, my_id)
+    call sf_solver_block_scale(slv_w, o_w, comm_s, my_id)
 
     call PetscLogEventBegin(pcev_fact_pj, ierr)
     call sf_solver_setup(slv_pj, o_pj%mat, bk_pj, "pair_psi", comm_s, my_id, rtol, gmg_inst=2, nfields=2, &
@@ -312,15 +294,15 @@ contains
                                                 "B_61", "B_62", "B_63", "B_65", "B_71", "B_72", "B_75", "B_76", &
                                                 "B_57", "B_67"]
       integer :: k
-      call full_op(o_pj, "pair_psi", 1, [var_psi, var_zj])
+      call sfo_define(o_pj, "pair_psi", 1, [var_psi, var_zj])
       if (with_v .and. vstage == SF_VPAR_B1) then
         ! v_par's row and column carry only u: psi_w must not enter its row
-        call full_op(o_w, "pair_w (wpj + v_par)", 2, [var_u, var_w, var_psi, var_zj, var_Vpar])
+        call sfo_define(o_w, "pair_w (wpj + v_par)", 2, [var_u, var_w, var_psi, var_zj, var_Vpar])
         o_w%se(2, 3:5) = 0; o_w%se(3, 2) = 0; o_w%se(3, 5) = 0; o_w%se(4, 1:2) = 0; o_w%se(4, 5) = 0
         o_w%se(5, 2:4) = 0
         o_w%wid(5, 5) = WS_VV; o_w%wid(5, 1) = WS_VU; o_w%wid(1, 5) = WS_UV
       else
-        call full_op(o_w, "pair_w (wpj)", 2, [var_u, var_w, var_psi, var_zj])
+        call sfo_define(o_w, "pair_w (wpj)", 2, [var_u, var_w, var_psi, var_zj])
         o_w%se(2, 3:4) = 0; o_w%se(3, 2) = 0; o_w%se(4, 1:2) = 0
       endif
       ! the psi row's mass: opz B_33, in model183 B_11
@@ -330,15 +312,15 @@ contains
         o_w%se(3, 3) = var_zj;  o_w%sv(3, 3) = var_zj;  o_w%scl(3, 3) = 1
       endif
       o_w%wid(1, 1) = WS_C
-      call full_op(o_rho, "B_55", 3, [var_rho])
-      call full_op(o_T,   "B_66", 4, [var_T])
+      call sfo_define(o_rho, "B_55", 3, [var_rho])
+      call sfo_define(o_T,   "B_66", 4, [var_T])
       if (with_v .and. vstage /= SF_VPAR_B1) then
-        call full_op(o_v, "B_77", 5, [var_Vpar])
+        call sfo_define(o_v, "B_77", 5, [var_Vpar])
         if (vstage == SF_VPAR_B0) then
           o_v%wid(1, 1) = WS_VV; o_v%label = "B_77 + W_vv"
         endif
       endif
-      if (corr == 3) call full_op(o_m, "B_44", NDIAG + NCB + 1, [var_w])
+      if (corr == 3) call sfo_define(o_m, "B_44", NDIAG + NCB + 1, [var_w])
       do k = 1, ncb_on
         o_cb(k)%label = cn(k); o_cb(k)%nf = 1; o_cb(k)%tag = NDIAG + k
         o_cb(k)%se(1, 1) = ce(k); o_cb(k)%sv(1, 1) = cv(k)
@@ -347,73 +329,6 @@ contains
         o_cb(CB_72)%wid(1, 1) = WS_VU; o_cb(CB_72)%label = "B_72 + W_vu"
       endif
     end subroutine define_operators
-
-    subroutine full_op(op, label, tag, vars)
-      type(sf_op_t), intent(inout) :: op
-      character(len=*), intent(in) :: label
-      integer, intent(in) :: tag, vars(:)
-      integer :: a
-      op%label = label; op%nf = size(vars); op%tag = tag
-      do a = 1, size(vars)
-        op%se(a, 1:size(vars)) = vars(a); op%sv(1:size(vars), a) = vars(a)
-      enddo
-    end subroutine full_op
-
-    subroutine block_scale(slv, op)
-      type(block_solver_t), intent(inout) :: slv
-      type(sf_op_t), intent(inout) :: op
-      if (slv%scaled) call VecDestroy(slv%dscale, ierr)
-      call make_field_block_scale(op%mat, spread(sfo_n1, 1, op%nf), slv%dscale, comm_s, my_id, op%label)
-      slv%scaled = .true.
-    end subroutine block_scale
-
-    subroutine penalty_rows(slv, op)
-      type(block_solver_t), intent(inout) :: slv
-      type(sf_op_t), intent(inout) :: op
-      call decouple_penalty_rows(op%mat, spread(sfo_n1, 1, op%nf), slv%pfac, slv%penal, comm_s, my_id, op%label)
-    end subroutine penalty_rows
-
-    !> The full Jacobian's penalty rows, for the back-substitution closing
-    !! sf_apply: |a_ii| > 1e6 max |a_ij| over the row's own variable (the
-    !! Mach-1 rows also hold zbig couplings to other variables).
-    subroutine full_penalty_rows(A)
-      use mod_parameters, only: n_tor
-      Mat :: A
-      PetscInt :: rs, re, row, ncols, bs
-      PetscInt, pointer :: cols(:)
-      PetscScalar, pointer :: vals(:)
-      integer :: jc, n, iv, mpierr
-      real*8 :: dg, off
-      integer, allocatable :: tl(:)
-      real*8, allocatable :: td(:)
-      a_full_s = A
-      call MatGetBlockSize(A, bs, ierr)
-      call MatGetOwnershipRange(A, rs, re, ierr)
-      allocate(tl(re - rs), td(re - rs))
-      n = 0
-      do row = rs, re - 1
-        iv = int(mod(row, bs)) / n_tor
-        call MatGetRow(A, row, ncols, cols, vals, ierr)
-        dg = 0.d0; off = 0.d0
-        do jc = 1, int(ncols)
-          if (cols(jc) == row) then
-            dg = vals(jc)
-          else if (int(mod(cols(jc), bs)) / n_tor == iv) then
-            off = max(off, abs(vals(jc)))
-          endif
-        enddo
-        call MatRestoreRow(A, row, ncols, cols, vals, ierr)
-        if (abs(dg) > 0.d0 .and. abs(dg) > 1.d6 * off) then
-          n = n + 1; tl(n) = int(row - rs) + 1; td(n) = dg
-        endif
-      enddo
-      pen_loc = tl(1:n); pen_d = td(1:n)
-      call MPI_Allreduce(n, npen_full, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
-      if (.not. pen_w_made) call MatCreateVecs(A, pen_w, PETSC_NULL_VEC, ierr)
-      pen_w_made = .true.
-      if (my_id == 0 .and. first) write(*,'(A,I0,A)') "[Physics PC]   full Jacobian: ", npen_full, &
-        " penalty rows, back-substituted after every sweep"
-    end subroutine full_penalty_rows
 
     subroutine create_work_vectors()
       integer :: k_
@@ -445,22 +360,6 @@ contains
     end subroutine build_fatal
 
   end subroutine sf_build
-
-  !> use_b65 = B_65 has a nonzero entry anywhere on comm.
-  subroutine set_use_b65(a, comm)
-    Mat :: a
-    integer, intent(in) :: comm
-    real*8 :: nrm
-    integer :: mpierr, me
-    PetscErrorCode :: ierr
-    call MatNorm(a, NORM_FROBENIUS, nrm, ierr)
-    nrm = nrm**2
-    call MPI_Allreduce(MPI_IN_PLACE, nrm, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
-    use_b65 = (nrm > 0.d0)
-    call MPI_Comm_rank(comm, me, mpierr)
-    if (me == 0 .and. use_b65) write(*,'(A,ES10.3,A)') "[Physics PC]   SF: |B_65|_F = ", sqrt(nrm), &
-      " (max over ranks), applied in the rho -> T sweep"
-  end subroutine set_use_b65
 
   !> y = P^-1 x, the block-LDU sweep:
   !!   1. predictor: (psi*, j*) by pair_psi; rho*, T* against them
@@ -499,20 +398,20 @@ contains
     ! 1. (psi*, j*) = pair_psi^-1 (x_psi, x_j); x_j, not 0, makes j* the mass
     ! back-substitution M_j^-1 (x_j - B_31 psi*)
     call sf_split_parts(rhs_PJ, [x_psi, x_j], .true.)
-    call solve(slv_pj, rhs_PJ, sol_PJ, pcev_solve_pj)
+    call sf_solver_solve(slv_pj, rhs_PJ, sol_PJ, pcev_solve_pj)
     call sf_split_parts(sol_PJ, [y_psi, y_j], .false.)
 
     ! rho* = B_55^-1 (x_rho - B_51 psi*)
     call MatMult(o_cb(CB_51)%mat, y_psi, w3, ierr)
     call VecWAXPY(w4, -1.0d0, w3, x_rho, ierr)
-    call solve(slv_rho, w4, t_rho, pcev_solve_rhot)
+    call sf_solver_solve(slv_rho, w4, t_rho, pcev_solve_rhot)
 
     ! T* = B_66^-1 (x_T - B_61 psi* - B_63 j* - B_65 rho*)
     call MatMult(o_cb(CB_61)%mat, y_psi, w3, ierr)
     call VecWAXPY(w4, -1.0d0, w3, x_T, ierr)
     call sub_mult(CB_63, y_j, w4)
     if (use_b65) call sub_mult(CB_65, t_rho, w4)
-    call solve(slv_T, w4, t_T, pcev_solve_rhot)
+    call sf_solver_solve(slv_T, w4, t_T, pcev_solve_rhot)
 
     ! 2. pair_w on (x_u - B_21 psi* - B_23 j* - B_25 rho* - B_26 T*, x_w,
     ! -B_16 T* or 0, 0): the omega row has no lower coupling, and x_psi, x_j
@@ -537,7 +436,7 @@ contains
     else
       call sf_split_parts(rhs_W, [w5, x_w, w4, zv], .true.)
     endif
-    call solve(slv_w, rhs_W, sol_W, pcev_solve_w)
+    call sf_solver_solve(slv_w, rhs_W, sol_W, pcev_solve_w)
     ! w3, w4 = psi_w, j_w (dropped by corrector 0)
     if (vb1) then
       call sf_split_parts(sol_W, [y_u, y_w, w3, w4, y_v], .false.)
@@ -552,7 +451,7 @@ contains
       call sub_mult(CB_75, t_rho, wv2)
       call sub_mult(CB_76, t_T, wv2)
       call sub_mult(CB_72, y_u, wv2)
-      call solve(slv_v, wv2, y_v, pcev_solve_rhot)
+      call sf_solver_solve(slv_v, wv2, y_v, pcev_solve_rhot)
     endif
 
     ! corrector 4: pair_w's change of (psi, j) in the rho / T corrections,
@@ -575,7 +474,7 @@ contains
       call VecAXPY(w3, 1.0d0, w4, ierr)
       call VecZeroEntries(w4, ierr)
       call sf_split_parts(rhs_PJ, [w3, w4], .true.)
-      call solve(slv_pj, rhs_PJ, sol_PJ, pcev_solve_pj)
+      call sf_solver_solve(slv_pj, rhs_PJ, sol_PJ, pcev_solve_pj)
       call sf_split_parts(sol_PJ, [w3, w4], .false.)
       call VecAXPY(y_psi, -1.0d0, w3, ierr)
       call VecAXPY(y_j,   -1.0d0, w4, ierr)
@@ -596,14 +495,14 @@ contains
       call MatMult(o_cb(CB_52)%mat, y_u, w3, ierr)
       if (corr == 4) call VecAXPY(w3, 1.0d0, y_rho, ierr)
       if (vb0 .or. vb1) call add_mult(CB_57, y_v, w3)
-      call solve(slv_rho, w3, w5, pcev_solve_rhot)
+      call sf_solver_solve(slv_rho, w3, w5, pcev_solve_rhot)
       call VecWAXPY(y_rho, -1.0d0, w5, t_rho, ierr)
 
       call MatMult(o_cb(CB_62)%mat, y_u, w3, ierr)
       if (corr == 4) call VecAXPY(w3, 1.0d0, y_T, ierr)
       if (vb0 .or. vb1) call add_mult(CB_67, y_v, w3)
       if (use_b65) call sub_mult(CB_65, w5, w3)
-      call solve(slv_T, w3, w5, pcev_solve_rhot)
+      call sf_solver_solve(slv_T, w3, w5, pcev_solve_rhot)
       call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
     endif
 
@@ -614,27 +513,18 @@ contains
       call sub_mult(CB_72, y_u, wv2)
       call sub_mult(CB_75, y_rho, wv2)
       call sub_mult(CB_76, y_T, wv2)
-      call solve(slv_v, wv2, y_v, pcev_solve_rhot)
+      call sf_solver_solve(slv_v, wv2, y_v, pcev_solve_rhot)
     endif
 
     t1 = MPI_Wtime()
     call sfo_vars_out(sv_y, y)
     t_scat  = t_scat + (MPI_Wtime() - t1)
     t_apply = t_apply + (MPI_Wtime() - t0)
-    if (npen_full > 0) call penalty_backsub(x, y)
+    if (pen%n > 0) call penalty_backsub(pen, x, y)
     call PetscLogEventEnd(pcev_apply, ierr)
     ierr = 0
 
   contains
-
-    subroutine solve(slv, b, s, ev)
-      type(block_solver_t), intent(inout) :: slv
-      Vec :: b, s
-      PetscLogEvent, intent(in) :: ev
-      call PetscLogEventBegin(ev, ierr)
-      call sf_solver_apply(slv, b, s, ierr)
-      call PetscLogEventEnd(ev, ierr)
-    end subroutine solve
 
     !> r -= B_k v
     subroutine sub_mult(k, v, r)
@@ -664,26 +554,6 @@ contains
         s = w3
       endif
     end function scratch
-
-    !> The penalty rows' x_b = (r_b - sum_j a_bj y_j) / a_bb with the sweep's
-    !! y: their residual is zbig times x_b's error, which the decoupled block
-    !! rows leave at the size of the whole outer residual. Changes the other
-    !! rows' residual by O(1 / zbig).
-    subroutine penalty_backsub(r, z)
-      Vec :: r, z
-      PetscScalar, pointer :: zp(:), rp(:), wp(:)
-      integer :: q
-      call MatMult(a_full_s, z, pen_w, ierr)
-      call VecGetArray(z, zp, ierr)
-      call VecGetArrayRead(r, rp, ierr)
-      call VecGetArrayRead(pen_w, wp, ierr)
-      do q = 1, size(pen_loc)
-        zp(pen_loc(q)) = zp(pen_loc(q)) + (rp(pen_loc(q)) - wp(pen_loc(q))) / pen_d(q)
-      enddo
-      call VecRestoreArrayRead(pen_w, wp, ierr)
-      call VecRestoreArrayRead(r, rp, ierr)
-      call VecRestoreArray(z, zp, ierr)
-    end subroutine penalty_backsub
 
   end subroutine sf_apply
 

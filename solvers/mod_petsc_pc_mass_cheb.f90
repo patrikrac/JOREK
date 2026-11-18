@@ -1,8 +1,9 @@
 !> A mass matrix B applied as B^-1 by a fixed-degree Chebyshev iteration on
 !! additive Schwarz (overlap 1, local ICC(0)): corrector 3's rho / T mass
-!! inverse in the SF sweep. The preconditioned C1 mass has a mesh-independent
+!! inverse in the SF sweep, the j and omega mass inverses of the
+!! vorticity-space Schur PC. The preconditioned C1 mass has a mesh-independent
 !! condition number (Wathen, IMA J. Numer. Anal. 7 (1987)); the degree meets
-!! 2 rho^d <= TARGET for bounds from one Lanczos run, checked against the
+!! 2 rho^d <= target for bounds from one Lanczos run, checked against the
 !! measured B-norm error. Without norms the apply is a fixed linear operator.
 module mod_petsc_pc_mass_cheb
 #ifdef USE_PETSC
@@ -12,7 +13,7 @@ module mod_petsc_pc_mass_cheb
   use mod_petsc_raw_csr, only: blockmv_attach
   implicit none
   private
-  real*8, parameter  :: TARGET = 1.d-1   !< Chebyshev B-norm error bound per apply
+  real*8, parameter  :: TARGET = 1.d-1   !< Chebyshev B-norm error bound per apply (default)
   integer, parameter :: DEG_MIN = 2
 
   type, public :: mass_cheb_t
@@ -28,21 +29,24 @@ contains
 
   !> Configure, estimate the bounds, choose the degree and gate it. Once per
   !! run (B's values never change). Collective on comm.
-  subroutine mass_cheb_setup(MC, B, comm, label, nharm)
+  subroutine mass_cheb_setup(MC, B, comm, label, nharm, target)
     use mod_parameters, only: n_tor
     type(mass_cheb_t), intent(inout) :: MC
     Mat, intent(in)              :: B
     integer, intent(in)          :: comm
     character(len=*), intent(in) :: label
     integer, intent(in), optional :: nharm   !< B's harmonics per node block (default n_tor)
+    real*8, intent(in), optional  :: target  !< B-norm error bound per apply (default TARGET)
     KSP :: est
     PC  :: pc
     PetscErrorCode :: ierr
     PetscInt :: its
-    real*8 :: emax, emin, bound
+    real*8 :: emax, emin, bound, tgt
     integer :: rank, k
     logical :: okb
 
+    tgt = TARGET
+    if (present(target)) tgt = target
     call MPI_Comm_rank(comm, rank, ierr)
     if (present(nharm)) then
       okb = blockmv_attach(B, nharm)          ! the iteration's matvec on the threads
@@ -124,7 +128,7 @@ contains
 
     integer function cheb_degree(kk)
       real*8, intent(in) :: kk
-      cheb_degree = max(DEG_MIN, ceiling(log(2.d0 / TARGET) / log(1.d0 / max(rho(kk), 1.d-12))))
+      cheb_degree = max(DEG_MIN, ceiling(log(2.d0 / tgt) / log(1.d0 / max(rho(kk), 1.d-12))))
     end function cheb_degree
 
   end subroutine mass_cheb_setup

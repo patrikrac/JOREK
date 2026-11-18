@@ -155,6 +155,7 @@ module phys_module
   !--- The physics-based (SF) preconditioner, solvers/mod_petsc_pc_sf.f90;
   !--- the defaults are its production configuration.
   logical :: use_physics_pc       !< Use the SF preconditioner instead of JOREK's per-harmonic PCFIELDSPLIT (PETSc only)
+  character(len=16) :: physics_pc_method !< The physics PC: "sf" (default, the split-field sweep) | "vs_ideal" | "vs_resistive" (vorticity-space Schur, solvers/mod_petsc_pc_vs.f90, with the ideal or the resistive line bending; backends from physics_pc_sf_pair_psi, _pair_w (vorticity system, Laplacian), _rho, _T) | "vs_lumped" (experimental: vs_ideal with the vorticity system as one lumped scalar operator)
   character(len=16) :: physics_pc_sf_pair_psi !< pair_psi = [[B_11,B_13],[B_31,B_33]] solver: "gmg" (default, FGMRES + one C1 GMG V-cycle) | "lu" (MUMPS, exact)
   character(len=16) :: physics_pc_sf_pair_w   !< pair_w (u, omega, psi, j) solver: "gmg" (default) | "lu"
   character(len=16) :: physics_pc_sf_rho      !< rho block B_55 solver: "gmg" (default) | "lu"

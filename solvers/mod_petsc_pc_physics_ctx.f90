@@ -1,4 +1,5 @@
-!> The physics PC's shared state (g_ctx), its log events and memory audit.
+!> The physics PC's shared state (g_ctx), the method selection, its log
+!! events and memory audit.
 module mod_petsc_pc_physics_ctx
 #ifdef USE_PETSC
   use mpi_mod
@@ -17,12 +18,23 @@ module mod_petsc_pc_physics_ctx
     !! B_77, W_vu (v_par row, u column) on B_72, W_uv (u row, v_par column) on B_27.
     Mat :: W_vv, W_vu, W_uv
     logical :: w_v_ready = .false.
+    !> The vorticity-space Schur PC's two one-variable matrices, block size
+    !! n_tor: the inertia opz (rho0 R^3 v, w) with Dirichlet rows at u's
+    !! constrained DOFs, and the diagonal of those DOFs (built once).
+    Mat :: M_rho, D_bc
+    logical :: m_rho_ready = .false., d_bc_ready = .false.
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx
 
+  !> physics_pc_method: the split-field sweep, or the vorticity-space Schur
+  !! PC with the ideal or the resistive line bending, or the ideal one as a
+  !! lumped scalar operator (an experiment)
+  integer, parameter :: PC_METHOD_SF = 1, PC_METHOD_VS_IDEAL = 2, PC_METHOD_VS_RESISTIVE = 3, &
+                        PC_METHOD_VS_LUMPED = 4
+
   ! -log_view events of the physics PC ("PhysPC_*")
-  PetscLogEvent, save :: pcev_elem_asm   = -1  !< the force-operator element assembly
+  PetscLogEvent, save :: pcev_elem_asm   = -1  !< the element assembly (W, or M_rho and D_bc)
   PetscLogEvent, save :: pcev_extract    = -1  !< operator extraction / refill
   PetscLogEvent, save :: pcev_fact_pj    = -1  !< pair_psi solver setup
   PetscLogEvent, save :: pcev_fact_w     = -1  !< pair_w solver setup
@@ -31,10 +43,44 @@ module mod_petsc_pc_physics_ctx
   PetscLogEvent, save :: pcev_solve_pj   = -1  !< pair_psi solves
   PetscLogEvent, save :: pcev_solve_w    = -1  !< pair_w solves
   PetscLogEvent, save :: pcev_solve_rhot = -1  !< rho/T solves
+  PetscLogEvent, save :: pcev_fact_vort  = -1  !< vorticity-system solver setup
+  PetscLogEvent, save :: pcev_fact_lap   = -1  !< Laplacian and mass solver setup (once)
+  PetscLogEvent, save :: pcev_solve_vort = -1  !< vorticity-system solves
+  PetscLogEvent, save :: pcev_solve_lap  = -1  !< Laplacian solves
+  PetscLogEvent, save :: pcev_solve_mass = -1  !< mass solves of j and omega
 
   logical, save, private :: pcev_registered = .false.
 
 contains
+
+  !> physics_pc_method as PC_METHOD_*; an unknown name stops the run.
+  integer function physics_pc_method_id()
+    use phys_module, only: physics_pc_method
+    integer :: me, mpierr
+    select case (trim(adjustl(physics_pc_method)))
+    case ("sf");           physics_pc_method_id = PC_METHOD_SF
+    case ("vs_ideal");     physics_pc_method_id = PC_METHOD_VS_IDEAL
+    case ("vs_resistive"); physics_pc_method_id = PC_METHOD_VS_RESISTIVE
+    case ("vs_lumped");    physics_pc_method_id = PC_METHOD_VS_LUMPED
+    case default
+      physics_pc_method_id = 0
+      call MPI_Comm_rank(MPI_COMM_WORLD, me, mpierr)
+      if (me == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_method must be sf | vs_ideal | "// &
+        "vs_resistive | vs_lumped, got '"//trim(physics_pc_method)//"'"
+      call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+    end select
+  end function physics_pc_method_id
+
+  !> The method's name for the solver report.
+  function physics_pc_method_label() result(s)
+    character(len=16) :: s
+    select case (physics_pc_method_id())
+    case (PC_METHOD_SF);       s = "SF"
+    case (PC_METHOD_VS_IDEAL); s = "VS, ideal"
+    case (PC_METHOD_VS_RESISTIVE); s = "VS, resistive"
+    case default;              s = "VS, lumped"
+    end select
+  end function physics_pc_method_label
 
   !> Register the physics-PC log events, once (a second registration would
   !! split the timings between two events of the same name).
@@ -52,6 +98,11 @@ contains
     call PetscLogEventRegister("PhysPC_SolvePJ",   0, pcev_solve_pj,   ierr)
     call PetscLogEventRegister("PhysPC_SolveW",    0, pcev_solve_w,    ierr)
     call PetscLogEventRegister("PhysPC_SolveRhoT", 0, pcev_solve_rhot, ierr)
+    call PetscLogEventRegister("PhysPC_FactVort",  0, pcev_fact_vort,  ierr)
+    call PetscLogEventRegister("PhysPC_FactLap",   0, pcev_fact_lap,   ierr)
+    call PetscLogEventRegister("PhysPC_SolveVort", 0, pcev_solve_vort, ierr)
+    call PetscLogEventRegister("PhysPC_SolveLap",  0, pcev_solve_lap,  ierr)
+    call PetscLogEventRegister("PhysPC_SolveMass", 0, pcev_solve_mass, ierr)
 
     pcev_registered = .true.
   end subroutine physics_pc_log_events_register

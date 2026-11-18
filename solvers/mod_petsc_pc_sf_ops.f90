@@ -67,9 +67,39 @@ module mod_petsc_pc_sf_ops
 
   integer, parameter :: TAG_LEN = 0, TAG_COL = 8, TAG_VAL = 16, TAG_STRIDE = 32
 
-  public :: sfo_layout, sfo_build, sfo_fill, sfo_vars_in, sfo_vars_out
+  public :: sfo_layout, sfo_build, sfo_fill, sfo_vars_in, sfo_vars_out, sfo_define, sfo_b65_used
 
 contains
+
+  !> op = the full nf x nf operator of the JOREK variables vars: block (a, b)
+  !! is A(vars(a), vars(b)), nf = size(vars).
+  subroutine sfo_define(op, label, tag, vars)
+    type(sf_op_t), intent(inout) :: op
+    character(len=*), intent(in) :: label
+    integer, intent(in) :: tag, vars(:)
+    integer :: a
+    op%label = label; op%nf = size(vars); op%tag = tag
+    do a = 1, size(vars)
+      op%se(a, 1:size(vars)) = vars(a); op%sv(1:size(vars), a) = vars(a)
+    enddo
+  end subroutine sfo_define
+
+  !> Is B_65 (T row, rho column) nonzero anywhere on comm? It vanishes in
+  !! model199, and the sweeps apply it only where it does not.
+  logical function sfo_b65_used(b65, comm)
+    type(sf_op_t), intent(in) :: b65
+    integer, intent(in) :: comm
+    real*8 :: nrm
+    integer :: mpierr, me
+    PetscErrorCode :: ierr
+    call MatNorm(b65%mat, NORM_FROBENIUS, nrm, ierr)
+    nrm = nrm**2
+    call MPI_Allreduce(MPI_IN_PLACE, nrm, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
+    sfo_b65_used = (nrm > 0.d0)
+    call MPI_Comm_rank(comm, me, mpierr)
+    if (me == 0 .and. sfo_b65_used) write(*,'(A,ES10.3,A)') "[Physics PC]   SF: |B_65|_F = ", sqrt(nrm), &
+      " (max over ranks), applied in the rho -> T sweep"
+  end function sfo_b65_used
 
   !> Fix the layout, once: split = the mode split; cross = keep the entries
   !! between different |n| (global layout only).

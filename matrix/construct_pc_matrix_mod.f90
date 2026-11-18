@@ -1,6 +1,7 @@
-!> Element assembly of the SF preconditioner's force operator W into a
-!! one-variable PETSc BAIJ matrix (no mesh refinement, all toroidal modes on
-!! every process).
+!> Element assembly of the physics preconditioner's one-variable PETSc BAIJ
+!! matrices: the SF sweep's force operator W, the vorticity-space Schur PC's
+!! inertia M_rho, and the latter's boundary diagonal D_bc (no mesh
+!! refinement, all toroidal modes on every process).
 module construct_pc_matrix_mod
 #ifdef USE_PETSC
 #include "petsc/finclude/petsc.h"
@@ -8,15 +9,16 @@ use petsc
 #endif
 implicit none
 private
-public :: construct_force_operator_matrix
+public :: construct_pc_element_matrices, construct_bc_diagonal
 
 contains
 
 !> Zero the rows of a one-variable PC matrix at the boundary DOFs the model
 !! constrains (boundary type 1: value and ds, 2: value and dt, 3: all three;
-!! modes with is_freebound skipped), so that adding it to a block keeps that
-!! block's boundary equations.
-subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
+!! modes with is_freebound skipped) and put diag on their diagonal. diag = 0
+!! keeps the boundary equations of a block the matrix is added to; diag /= 0
+!! makes them Dirichlet rows of the matrix itself.
+subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, diag, local_elms, n_local_elms, &
                                    my_ind_min, my_ind_max)
 
   use mod_parameters,   only: n_tor, n_vertex_max, n_order
@@ -30,6 +32,7 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
   Mat, intent(inout) :: pc_mat
 #endif
   integer, intent(in) :: var_index
+  real*8,  intent(in) :: diag
   integer, intent(in) :: local_elms(:)
   integer, intent(in) :: n_local_elms
   integer, intent(in) :: my_ind_min, my_ind_max
@@ -106,22 +109,24 @@ subroutine zero_bc_rows_pc_matrix(pc_mat, var_index, local_elms, n_local_elms, &
     enddo    ! iv
   enddo      ! i
 
-  ! collective; diagonal 0, duplicates are harmless
-  PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, 0.0d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
+  ! collective; duplicates are harmless
+  PetscCallA(MatZeroRows(pc_mat, n_rows_to_zero, rows_to_zero, diag, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr))
 
   deallocate(rows_to_zero)
 #endif
 
 end subroutine zero_bc_rows_pc_matrix
 
-!> Assemble the force operator W that is added to B_22 (one variable, block
-!! size n_tor) on the linearisation state. With W_vv, W_vu, W_uv present
-!! (model600, v_par stages b0 / b1) the same pass assembles v_par's
-!! sound-wave Schur terms.
-subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, mhd_sim, W_force, &
-                                           W_vv, W_vu, W_uv)
+!> Assemble the element-level matrices of the physics PC (one variable,
+!! block size n_tor) on the linearisation state, in one pass: the force
+!! operator W that is added to B_22 where W_force is present, with v_par's
+!! sound-wave Schur terms where W_vv, W_vu, W_uv are present too (model600,
+!! v_par stages b0 / b1); the inertia M_rho where present, with d_bc on the
+!! diagonal of its rows at u's constrained DOFs.
+subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim, W_force, &
+                                         W_vv, W_vu, W_uv, M_rho, d_bc)
 
-  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_force_fft
+  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho
   use mod_parameters,  only: n_tor, n_degrees, n_vertex_max, var_u, var_Vpar
   use data_structure,  only: type_SP_MATRIX, type_element, type_node
   use mod_simulation_data, only: type_MHD_SIM
@@ -137,9 +142,11 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   type(type_SP_MATRIX), intent(in) :: a_mat
   type(type_MHD_SIM),   intent(in) :: mhd_sim
 #ifdef USE_PETSC
-  Mat, intent(inout) :: W_force
+  Mat, intent(inout), optional :: W_force
   Mat, intent(inout), optional :: W_vv, W_vu, W_uv
+  Mat, intent(inout), optional :: M_rho
 #endif
+  real*8, intent(in), optional :: d_bc
 
 #define NBV (n_vertex_max*n_degrees)
 #define DFV_CM (n_tor*NBV)
@@ -150,7 +157,7 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   type(type_node),    allocatable :: nodes_thr(:,:)
   real*8, allocatable :: ELM(:,:), ELMv(:,:,:), buf(:)
   integer :: idx(NBV), rsel(NBV), nr
-  logical :: do_v
+  logical :: do_w, do_v, do_m
   integer :: ife, ielm, iv, q, b, t, nthreads
 #ifdef USE_PETSC
   PetscErrorCode :: ierr
@@ -161,12 +168,14 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   my_ind_min = a_mat%index_min(my_id+1)
   my_ind_max = a_mat%index_max(my_id+1)
 
-  do_v = .false.
+  do_w = .false.; do_v = .false.; do_m = .false.
 #ifdef USE_PETSC
-  do_v = present(W_vv) .and. present(W_vu) .and. present(W_uv)
+  do_w = present(W_force)
+  do_v = do_w .and. present(W_vv) .and. present(W_vu) .and. present(W_uv)
   if (do_v) then
     Wv(1) = W_vv; Wv(2) = W_vu; Wv(3) = W_uv
   endif
+  do_m = present(M_rho) .and. present(d_bc)
 #endif
 
   nthreads = 1
@@ -197,12 +206,6 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
       nodes_thr(iv, t) = node_list%node(element_thr(t)%vertex(iv))
     enddo
 
-    if (do_v) then
-      call pc_elt_matrix_force_fft(element_thr(t), nodes_thr(:, t), ELM, ELM_v=ELMv)
-    else
-      call pc_elt_matrix_force_fft(element_thr(t), nodes_thr(:, t), ELM)
-    endif
-
 #ifdef USE_PETSC
     ! the element's (vertex, degree) block rows this rank owns, all columns
     nr = 0
@@ -214,17 +217,39 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
       rsel(nr) = q
       idxm(nr) = idx(q) - 1
     enddo
-    if (nr > 0) then
-      call pack_rows(ELM, rsel, nr, buf)
-      !$omp critical (pc_force_insert)
-      PetscCallA(MatSetValuesBlocked(W_force, nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
-      do b = 1, merge(3, 0, do_v)
-        call pack_rows(ELMv(:,:,b), rsel, nr, buf)
-        PetscCallA(MatSetValuesBlocked(Wv(b), nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
-      enddo
-      !$omp end critical (pc_force_insert)
-    endif
 #endif
+
+    if (do_w) then
+      if (do_v) then
+        call pc_elt_matrix_force_fft(element_thr(t), nodes_thr(:, t), ELM, ELM_v=ELMv)
+      else
+        call pc_elt_matrix_force_fft(element_thr(t), nodes_thr(:, t), ELM)
+      endif
+#ifdef USE_PETSC
+      if (nr > 0) then
+        call pack_rows(ELM, rsel, nr, buf)
+        !$omp critical (pc_force_insert)
+        PetscCallA(MatSetValuesBlocked(W_force, nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
+        do b = 1, merge(3, 0, do_v)
+          call pack_rows(ELMv(:,:,b), rsel, nr, buf)
+          PetscCallA(MatSetValuesBlocked(Wv(b), nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
+        enddo
+        !$omp end critical (pc_force_insert)
+      endif
+#endif
+    endif
+
+    if (do_m) then
+      call pc_elt_matrix_mass_rho(element_thr(t), nodes_thr(:, t), ELM)
+#ifdef USE_PETSC
+      if (nr > 0) then
+        call pack_rows(ELM, rsel, nr, buf)
+        !$omp critical (pc_force_insert)
+        PetscCallA(MatSetValuesBlocked(M_rho, nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
+        !$omp end critical (pc_force_insert)
+      endif
+#endif
+    endif
   enddo
   !$omp end do
   deallocate(ELM, ELMv, buf)
@@ -232,13 +257,15 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   deallocate(element_thr, nodes_thr)
 
 #ifdef USE_PETSC
-  PetscCallA(MatAssemblyBegin(W_force, MAT_FINAL_ASSEMBLY, ierr))
-  PetscCallA(MatAssemblyEnd  (W_force, MAT_FINAL_ASSEMBLY, ierr))
-  ! W is added to blocks whose boundary rows are Dirichlet rows: its own
-  ! entries there would break the constraint
-  if (eliminate_boundary_dofs) then
-    call zero_bc_rows_pc_matrix(W_force, var_u, local_elms, n_local_elms, &
-                                a_mat%my_ind_min, a_mat%my_ind_max)
+  if (do_w) then
+    PetscCallA(MatAssemblyBegin(W_force, MAT_FINAL_ASSEMBLY, ierr))
+    PetscCallA(MatAssemblyEnd  (W_force, MAT_FINAL_ASSEMBLY, ierr))
+    ! W is added to blocks whose boundary rows are Dirichlet rows: its own
+    ! entries there would break the constraint
+    if (eliminate_boundary_dofs) then
+      call zero_bc_rows_pc_matrix(W_force, var_u, 0.d0, local_elms, n_local_elms, &
+                                  a_mat%my_ind_min, a_mat%my_ind_max)
+    endif
   endif
   if (do_v) then
     do b = 1, 3
@@ -246,13 +273,20 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
       PetscCallA(MatAssemblyEnd  (Wv(b), MAT_FINAL_ASSEMBLY, ierr))
     enddo
     if (eliminate_boundary_dofs) then         ! by each block's row variable
-      call zero_bc_rows_pc_matrix(Wv(1), var_Vpar, local_elms, n_local_elms, &
+      call zero_bc_rows_pc_matrix(Wv(1), var_Vpar, 0.d0, local_elms, n_local_elms, &
                                   a_mat%my_ind_min, a_mat%my_ind_max)
-      call zero_bc_rows_pc_matrix(Wv(2), var_Vpar, local_elms, n_local_elms, &
+      call zero_bc_rows_pc_matrix(Wv(2), var_Vpar, 0.d0, local_elms, n_local_elms, &
                                   a_mat%my_ind_min, a_mat%my_ind_max)
-      call zero_bc_rows_pc_matrix(Wv(3), var_u, local_elms, n_local_elms, &
+      call zero_bc_rows_pc_matrix(Wv(3), var_u, 0.d0, local_elms, n_local_elms, &
                                   a_mat%my_ind_min, a_mat%my_ind_max)
     endif
+  endif
+  if (do_m) then
+    PetscCallA(MatAssemblyBegin(M_rho, MAT_FINAL_ASSEMBLY, ierr))
+    PetscCallA(MatAssemblyEnd  (M_rho, MAT_FINAL_ASSEMBLY, ierr))
+    ! Dirichlet rows in both boundary modes: the row of u is replaced, not kept
+    call zero_bc_rows_pc_matrix(M_rho, var_u, d_bc, local_elms, n_local_elms, &
+                                a_mat%my_ind_min, a_mat%my_ind_max)
   endif
 #endif
 
@@ -275,6 +309,43 @@ contains
     enddo
   end subroutine pack_rows
 
-end subroutine construct_force_operator_matrix
+end subroutine construct_pc_element_matrices
+
+!> D_bc: d on the diagonal of every row at u's constrained DOFs, zero on the
+!! other diagonal blocks (one variable, block size n_tor, created by the
+!! caller with A's block rows). Geometry only: built once.
+subroutine construct_bc_diagonal(local_elms, n_local_elms, a_mat, D_bc, d)
+
+  use mod_parameters, only: n_tor, var_u
+  use data_structure, only: type_SP_MATRIX
+
+  implicit none
+
+  integer, pointer,     intent(in) :: local_elms(:)
+  integer,              intent(in) :: n_local_elms
+  type(type_SP_MATRIX), intent(in) :: a_mat
+#ifdef USE_PETSC
+  Mat, intent(inout) :: D_bc
+#endif
+  real*8, intent(in) :: d
+
+#ifdef USE_PETSC
+  PetscErrorCode :: ierr
+  PetscInt :: ib(1)
+  real*8   :: zero_blk(n_tor * n_tor)
+  integer  :: i
+
+  zero_blk = 0.d0
+  do i = a_mat%my_ind_min, a_mat%my_ind_max
+    ib(1) = i - 1
+    PetscCallA(MatSetValuesBlocked(D_bc, 1, ib, 1, ib, zero_blk, INSERT_VALUES, ierr))
+  enddo
+  PetscCallA(MatAssemblyBegin(D_bc, MAT_FINAL_ASSEMBLY, ierr))
+  PetscCallA(MatAssemblyEnd  (D_bc, MAT_FINAL_ASSEMBLY, ierr))
+  call zero_bc_rows_pc_matrix(D_bc, var_u, d, local_elms, n_local_elms, &
+                              a_mat%my_ind_min, a_mat%my_ind_max)
+#endif
+
+end subroutine construct_bc_diagonal
 
 end module construct_pc_matrix_mod

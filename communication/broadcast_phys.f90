@@ -769,6 +769,7 @@ if (my_id .eq. 0) then
   call MPI_PACK(strumpack_matching,     1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(use_physics_pc,         1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   ! the physics PC's flags; the order must match the UNPACK block
+  call MPI_PACK(physics_pc_method, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_pair_psi, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_pair_w, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(physics_pc_sf_rho, 16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -1646,6 +1647,7 @@ if (my_id .ne. 0) then
   call MPI_UNPACK(buffer,bufsize,position,use_strumpack_prj,      1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,strumpack_matching,     1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,use_physics_pc,         1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,physics_pc_method, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_pair_psi, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_pair_w, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,physics_pc_sf_rho, 16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)

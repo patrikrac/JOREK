@@ -8,7 +8,8 @@ module mod_petsc_pc_sf_solver
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: physics_pc_mumps_mem
-  use mod_petsc_pc_blocks,      only: pc_print_block_setup
+  use mod_petsc_pc_blocks,      only: pc_print_block_setup, make_field_block_scale, decouple_penalty_rows
+  use mod_petsc_pc_sf_ops,      only: sf_op_t, sfo_n1
   use mod_petsc_pc_gmg,         only: GMG_SM_RINGS, GMG_SM_LINES, GMG_SM_ZEBRA_RINGS
   implicit none
   private
@@ -65,10 +66,27 @@ module mod_petsc_pc_sf_solver
     character(len=32) :: label = ""
   end type block_solver_t
 
-  public :: sf_solver_setup, sf_solver_apply, sf_solver_reset_counters, sf_solver_report
+  public :: sf_solver_setup, sf_solver_apply, sf_solver_solve, sf_solver_reset_counters, sf_solver_report
+  public :: sf_solver_block_scale, sf_solver_penalty_rows, sf_backend
   public :: sf_split_parts, sf_opz, sf_vpar_stage, sf_vpar_w_assembled
 
 contains
+
+  !> A backend name of the namelist ("lu" | "gmg") as SF_LU / SF_GMG; any
+  !! other name stops the run. nm is the namelist variable, for the message.
+  integer function sf_backend(s, nm, my_id)
+    character(len=*), intent(in) :: s, nm
+    integer, intent(in) :: my_id
+    integer :: mpierr
+    select case (trim(adjustl(s)))
+    case ("lu");  sf_backend = SF_LU
+    case ("gmg"); sf_backend = SF_GMG
+    case default
+      sf_backend = SF_LU
+      if (my_id == 0) write(*,'(A,A)') "[Physics PC]   FATAL: ", trim(nm)//" must be lu | gmg, got '"//trim(s)//"'"
+      call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
+    end select
+  end function sf_backend
 
   !> physics_pc_sf_vpar_stage as SF_VPAR_*, -1 for an unknown string.
   integer function sf_vpar_stage()
@@ -214,6 +232,39 @@ contains
     call KSPGetConvergedReason(slv%ksp, reason, ierr)
     if (reason%v < 0) slv%nfail = slv%nfail + 1
   end subroutine sf_solver_apply
+
+  !> sf_solver_apply inside the log event ev.
+  subroutine sf_solver_solve(slv, rhs, sol, ev)
+    type(block_solver_t), intent(inout) :: slv
+    Vec :: rhs, sol
+    PetscLogEvent, intent(in) :: ev
+    PetscErrorCode :: ierr
+    ierr = 0
+    call PetscLogEventBegin(ev, ierr)
+    call sf_solver_apply(slv, rhs, sol, ierr)
+    call PetscLogEventEnd(ev, ierr)
+  end subroutine sf_solver_solve
+
+  !> The symmetric field scaling of op (make_field_block_scale), kept in slv
+  !! for its solves; at every rebuild, after the refill.
+  subroutine sf_solver_block_scale(slv, op, comm, my_id)
+    type(block_solver_t), intent(inout) :: slv
+    type(sf_op_t), intent(inout) :: op
+    integer, intent(in) :: comm, my_id
+    PetscErrorCode :: ierr
+    if (slv%scaled) call VecDestroy(slv%dscale, ierr)
+    call make_field_block_scale(op%mat, spread(sfo_n1, 1, op%nf), slv%dscale, comm, my_id, op%label)
+    slv%scaled = .true.
+  end subroutine sf_solver_block_scale
+
+  !> op's penalty rows as Dirichlet rows (decouple_penalty_rows), with their
+  !! right-hand-side factor kept in slv; before the scaling.
+  subroutine sf_solver_penalty_rows(slv, op, comm, my_id)
+    type(block_solver_t), intent(inout) :: slv
+    type(sf_op_t), intent(inout) :: op
+    integer, intent(in) :: comm, my_id
+    call decouple_penalty_rows(op%mat, spread(sfo_n1, 1, op%nf), slv%pfac, slv%penal, comm, my_id, op%label)
+  end subroutine sf_solver_penalty_rows
 
   subroutine sf_solver_reset_counters(slv)
     type(block_solver_t), intent(inout) :: slv

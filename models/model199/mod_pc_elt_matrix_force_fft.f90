@@ -17,7 +17,7 @@ module mod_pc_elt_matrix_force_fft
   implicit none
   private
 
-  public :: pc_elt_matrix_force_fft
+  public :: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho
 
 contains
 
@@ -149,5 +149,94 @@ subroutine pc_elt_matrix_force_fft(element, nodes, ELM, ELM_v)
   ELM = 0.5d0 * ELM
 
 end subroutine pc_elt_matrix_force_fft
+
+!> The inertia of the vorticity-space Schur PC (mod_petsc_pc_vs), one
+!! variable: M_rho(v, w) = opz int rho0 R^3 v w dR dZ, with rho0 the full
+!! density (all harmonics, through the FFT scatter). With B_44 = (v, w R) and
+!! B_42 = (grad v, R grad u), the inertia part of B_22,
+!! -opz (grad v, rho0 R^3 grad u), is -M_rho B_44^-1 B_42 up to the
+!! gradients of rho0 R^2.
+subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
+
+  use mod_parameters
+  use data_structure, only: type_element, type_node
+  use gauss
+  use basis_at_gaussian
+  use phys_module
+
+  implicit none
+
+  type(type_element), intent(in) :: element
+  type(type_node),    intent(in) :: nodes(n_vertex_max)
+  real*8, dimension(DFV, DFV), intent(out) :: ELM
+
+  real*8, dimension(n_plane, NFV, NFV) :: ELM_p
+  real*8, dimension(n_gauss, n_gauss) :: x_g, x_s, x_t, y_s, y_t
+  real*8, dimension(n_plane, n_gauss, n_gauss) :: r_g     !< rho0 on the planes
+  real*8 :: f_v(NFV)                                       !< basis values at the Gauss point
+  integer :: i, j, ms, mt, mp, in, q
+  real*8  :: wst, xjac, wr, zeta_t, sz
+  real*8     :: in_fft(1:n_plane)
+  complex*16 :: out_fft(1:n_plane)
+
+  ELM   = 0.d0
+  ELM_p = 0.d0
+  zeta_t = time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
+
+  x_g = 0.d0; x_s = 0.d0; x_t = 0.d0; y_s = 0.d0; y_t = 0.d0; r_g = 0.d0
+  do i = 1, n_vertex_max
+    do j = 1, n_degrees
+      sz = element%size(i,j)
+      do ms = 1, n_gauss
+        do mt = 1, n_gauss
+          x_g(ms,mt) = x_g(ms,mt) + nodes(i)%x(1,j,1) * sz * H(i,j,ms,mt)
+          x_s(ms,mt) = x_s(ms,mt) + nodes(i)%x(1,j,1) * sz * H_s(i,j,ms,mt)
+          x_t(ms,mt) = x_t(ms,mt) + nodes(i)%x(1,j,1) * sz * H_t(i,j,ms,mt)
+          y_s(ms,mt) = y_s(ms,mt) + nodes(i)%x(1,j,2) * sz * H_s(i,j,ms,mt)
+          y_t(ms,mt) = y_t(ms,mt) + nodes(i)%x(1,j,2) * sz * H_t(i,j,ms,mt)
+          do mp = 1, n_plane
+            do in = 1, n_tor
+              r_g(mp,ms,mt) = r_g(mp,ms,mt) + nodes(i)%values(in,j,var_rho) * sz * H(i,j,ms,mt) * HZ(in,mp)
+            enddo
+          enddo
+        enddo
+      enddo
+    enddo
+  enddo
+
+  do ms = 1, n_gauss
+    do mt = 1, n_gauss
+      wst  = wgauss(ms)*wgauss(mt)
+      xjac = x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
+      do q = 1, NFV
+        f_v(q) = H((q - 1) / n_degrees + 1, mod(q - 1, n_degrees) + 1, ms, mt) &
+                 * element%size((q - 1) / n_degrees + 1, mod(q - 1, n_degrees) + 1)
+      enddo
+      do mp = 1, n_plane
+        ! the model's inertia: r0_hat BigR = rho0 R^3, rho0 = |rho| as in its element matrix
+        wr = wst * abs(r_g(mp,ms,mt)) * x_g(ms,mt)**3 * xjac
+        do i = 1, NFV
+          do j = 1, NFV
+            ELM_p(mp,i,j) = ELM_p(mp,i,j) + wr * f_v(i) * f_v(j)
+          enddo
+        enddo
+      enddo
+    enddo
+  enddo
+
+  do i = 1, NFV
+    do j = 1, NFV
+      in_fft = ELM_p(1:n_plane,i,j)
+#ifdef USE_FFTW
+      call dfftw_execute_dft_r2c(fftw_plan, in_fft, out_fft)
+#else
+      call pc_my_fft(in_fft, out_fft, n_plane)
+#endif
+      call scatter_fft_to_elm(out_fft, i, j, ELM, DFV)
+    enddo
+  enddo
+  ELM = 0.5d0 * (1.d0 + zeta_t) * ELM
+
+end subroutine pc_elt_matrix_mass_rho
 
 end module mod_pc_elt_matrix_force_fft

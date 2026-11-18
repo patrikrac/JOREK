@@ -75,7 +75,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 wall_resistivity, wall_resistivity_fact,            &
                 bc_natural_open,                                    &
                 use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
-                use_physics_pc,                                     &
+                use_physics_pc, physics_pc_method,                  &
                 physics_pc_sf_pair_psi, physics_pc_sf_pair_w,       &
                 physics_pc_sf_rho, physics_pc_sf_T,                 &
                 physics_pc_sf_rtol, physics_pc_sf_corrector,        &

@@ -19,7 +19,7 @@ module mod_pc_elt_matrix_force_fft
   implicit none
   private
 
-  public :: pc_elt_matrix_force_fft
+  public :: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho
 
 contains
 
@@ -207,5 +207,25 @@ contains
   end function grad
 
 end subroutine pc_elt_matrix_force_fft
+
+!> The vorticity-space Schur PC's inertia: model183's psi row has the mass
+!! B_11, not opz B_33, so the PC refuses it (mod_petsc_pc_vs); the common
+!! interface only.
+subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
+
+  use mod_parameters
+  use data_structure, only: type_element, type_node
+
+  implicit none
+
+  type(type_element), intent(in) :: element
+  type(type_node),    intent(in) :: nodes(n_vertex_max)
+  real*8, dimension(n_tor*n_vertex_max*n_degrees, n_tor*n_vertex_max*n_degrees), intent(out) :: ELM
+
+  ELM = 0.d0
+  write(*,'(A)') "[Physics PC] FATAL: model183 has no inertia matrix for the vorticity-space Schur PC"
+  stop 1
+
+end subroutine pc_elt_matrix_mass_rho
 
 end module mod_pc_elt_matrix_force_fft
