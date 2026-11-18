@@ -155,9 +155,19 @@ module phys_module
   !--- The physics-based (SF) preconditioner, solvers/mod_petsc_pc_sf.f90;
   !--- the defaults are its production configuration.
   logical :: use_physics_pc       !< Use the SF preconditioner instead of JOREK's per-harmonic PCFIELDSPLIT (PETSc only)
-  character(len=16) :: physics_pc_method !< The physics PC: "sf" (default, the split-field sweep) | "vs_ideal" | "vs_resistive" (vorticity-space Schur, solvers/mod_petsc_pc_vs.f90, with the ideal or the resistive line bending; backends from physics_pc_sf_pair_psi, _pair_w (vorticity system, Laplacian), _rho, _T) | "vs_lumped" (experimental: vs_ideal with the vorticity system as one lumped scalar operator)
-  character(len=16) :: physics_pc_sf_pair_psi !< pair_psi = [[B_11,B_13],[B_31,B_33]] solver: "gmg" (default, FGMRES + one C1 GMG V-cycle) | "lu" (MUMPS, exact)
-  character(len=16) :: physics_pc_sf_pair_w   !< pair_w (u, omega, psi, j) solver: "gmg" (default) | "lu"
+  ! physics_pc_method, the physics PC:
+  !   "sf"            (default) the split-field sweep, solvers/mod_petsc_pc_sf.f90
+  !   "vs_ideal"      vorticity-space Schur, solvers/mod_petsc_pc_vs.f90, ideal line bending
+  !   "vs_resistive"  the same with the resistive line bending
+  !   "vs_lumped"     experimental: vs_ideal with the vorticity system as one lumped scalar operator
+  !                   (the three use physics_pc_sf_pair_psi, _pair_w (vorticity system, Laplacian), _rho, _T)
+  !   "vs_alfven"     block-triangular, solvers/mod_petsc_pc_vs_alfven.f90: the Jacobian's (u, omega, psi, j)
+  !                   block plus the SF force operator W, then rho and T by forward substitution; uses
+  !                   physics_pc_sf_pair_w, _rho, _T, not _pair_psi
+  ! All vs_* methods: model199 / model600 with the 6 variables (psi, u, zj, w, rho, T) only.
+  character(len=16) :: physics_pc_method !< The physics PC: sf | vs_ideal | vs_resistive | vs_lumped | vs_alfven (see above)
+  character(len=16) :: physics_pc_sf_pair_psi !< pair_psi = [[B_11,B_13],[B_31,B_33]] solver: "gmg" (default, FGMRES + one C1 GMG V-cycle) | "lu" (MUMPS, exact); not used by vs_alfven
+  character(len=16) :: physics_pc_sf_pair_w   !< pair_w (u, omega, psi, j) solver, also K_W of vs_alfven: "gmg" (default) | "lu"
   character(len=16) :: physics_pc_sf_rho      !< rho block B_55 solver: "gmg" (default) | "lu"
   character(len=16) :: physics_pc_sf_T        !< T block B_66 solver: "gmg" (default) | "lu"
   integer :: physics_pc_sf_corrector !< Step 3 of the sweep. 4 (default; -1 = 4) = consistent: (psi, j) from pair_w, -B_16 T* on its psi row, B_51 psi_w and B_61 psi_w + B_63 j_w in the rho / T corrections. 0 = Chacon JCP 526 (2025) Eq. (16), a second pair_psi solve. 1 = Eq. (17), as 4 without pair_w's (psi, j) in rho / T. 2 = as 1 without B_16 T*. 3 = as 2 with rho / T by their mass inverse (model199 only).

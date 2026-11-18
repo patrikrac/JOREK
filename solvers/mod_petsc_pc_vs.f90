@@ -81,6 +81,10 @@ module mod_petsc_pc_vs
   logical, save :: lumped       = .false.     !< P as the lumped scalar operator
   logical, save :: famode       = .false.     !< mode split
   logical, save :: harm_all     = .true.      !< physics_pc_sf_harm_couple
+  integer, save :: comm_g = MPI_COMM_NULL     !< the full system's communicator
+  !> this rank's wall time in vs_apply and in its gather / scatter since the
+  !! last report (the mode split's per-family report)
+  real*8, save  :: t_apply = 0.d0, t_scat = 0.d0
 
   type(block_solver_t), save :: slv_vort, slv_lap, slv_pj, slv_rho, slv_T
   integer, save :: bk_vort = SF_GMG, bk_pj = SF_GMG, bk_rho = SF_GMG, bk_T = SF_GMG
@@ -135,12 +139,13 @@ contains
     bk_T    = sf_backend(physics_pc_sf_T,        "physics_pc_sf_T",        my_id)
 
     if (jorek_model /= 199 .and. jorek_model /= 600) &
-      call fatal("physics_pc_method = vs_* supports model199 and model600 only (model183's psi row "// &
-                 "has the mass B_11, not opz B_33)")
+      call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped supports model199 and model600 "// &
+                 "only (model183's psi row has the mass B_11, not opz B_33)")
     if (n_var /= 6 .or. var_T /= 6) &
-      call fatal("physics_pc_method = vs_* supports (psi, u, zj, w, rho, T) only: build without v_par, "// &
-                 "with_TiTe, with_neutrals and with_impurities")
-    if (mod(n_tor, 2) /= 1) call fatal("physics_pc_method = vs_* needs n_tor odd (n = 0 plus cos/sin pairs)")
+      call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped supports (psi, u, zj, w, rho, T) "// &
+                 "only: build without v_par, with_TiTe, with_neutrals and with_impurities")
+    if (mod(n_tor, 2) /= 1) call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped needs n_tor "// &
+                                       "odd (n = 0 plus cos/sin pairs)")
 
     harm_all    = physics_pc_sf_harm_couple
     sf_gmg_harm = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
@@ -204,8 +209,9 @@ contains
     Mat :: wm(1), wd(1)
 
     call vs_init(my_id)
-    first = vs_first
-    rtol  = physics_pc_sf_rtol
+    first  = vs_first
+    comm_g = comm
+    rtol   = physics_pc_sf_rtol
 
     if (first) then
       if (.not. (g_ctx%m_rho_ready .and. g_ctx%d_bc_ready)) &
@@ -231,6 +237,8 @@ contains
     endif
     call PetscLogEventEnd(pcev_extract, ierr)
     if (first) then
+      ! on the operators' communicator: B_65 is refilled at every build, the
+      ! flag only skips its product, so the families need not agree
       use_b65 = sfo_b65_used(o_cb(CB_65), comm_s)
       nno = 0
       do k = 1, NCB
@@ -412,10 +420,13 @@ contains
     PetscErrorCode, intent(out) :: ierr
     Vec :: x_psi, x_u, x_j, x_w, x_rho, x_T
     Vec :: y_psi, y_u, y_j, y_w, y_rho, y_T
+    real*8 :: t0, t1
 
     ierr = 0
     call PetscLogEventBegin(pcev_apply, ierr)
+    t0 = MPI_Wtime()
     call sfo_vars_in(x, sv_x)
+    t_scat = t_scat + (MPI_Wtime() - t0)
     x_psi = sv_x(var_psi); x_u   = sv_x(var_u);   x_j = sv_x(var_zj)
     x_w   = sv_x(var_w);   x_rho = sv_x(var_rho); x_T = sv_x(var_T)
     y_psi = sv_y(var_psi); y_u   = sv_y(var_u);   y_j = sv_y(var_zj)
@@ -467,8 +478,11 @@ contains
     call sf_solver_solve(slv_T, w1, y_T, pcev_solve_rhot)
 
     ! 7.
+    t1 = MPI_Wtime()
     call sfo_vars_out(sv_y, y)
+    t_scat  = t_scat + (MPI_Wtime() - t1)
     if (pen%n > 0) call penalty_backsub(pen, x, y)
+    t_apply = t_apply + (MPI_Wtime() - t0)
     call PetscLogEventEnd(pcev_apply, ierr)
     ierr = 0
 
@@ -484,20 +498,25 @@ contains
 
   end subroutine vs_apply
 
-  !> Inner-iteration summary, one line per block (mode split: those of rank
-  !! 0's family), then reset.
+  !> Inner-iteration summary, one line per block (mode split: per family),
+  !! then reset. Collective.
   subroutine vs_report(my_id)
     integer, intent(in) :: my_id
-    call sf_solver_report(slv_vort, my_id)
-    call sf_solver_report(slv_lap,  my_id)
-    call sf_solver_report(slv_pj,   my_id)
-    call sf_solver_report(slv_rho,  my_id)
-    call sf_solver_report(slv_T,    my_id)
+    if (famode) then
+      call sf_solver_family_report("VS", [slv_vort, slv_lap, slv_pj, slv_rho, slv_T], t_apply, t_scat, comm_g)
+    else
+      call sf_solver_report(slv_vort, my_id)
+      call sf_solver_report(slv_lap,  my_id)
+      call sf_solver_report(slv_pj,   my_id)
+      call sf_solver_report(slv_rho,  my_id)
+      call sf_solver_report(slv_T,    my_id)
+    endif
     call sf_solver_reset_counters(slv_vort)
     call sf_solver_reset_counters(slv_lap)
     call sf_solver_reset_counters(slv_pj)
     call sf_solver_reset_counters(slv_rho)
     call sf_solver_reset_counters(slv_T)
+    t_apply = 0.d0;  t_scat = 0.d0
   end subroutine vs_report
 
 #endif

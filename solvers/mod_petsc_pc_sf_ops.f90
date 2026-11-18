@@ -68,6 +68,7 @@ module mod_petsc_pc_sf_ops
   integer, parameter :: TAG_LEN = 0, TAG_COL = 8, TAG_VAL = 16, TAG_STRIDE = 32
 
   public :: sfo_layout, sfo_build, sfo_fill, sfo_vars_in, sfo_vars_out, sfo_define, sfo_b65_used
+  public :: sfo_block_used, sfo_destroy
 
 contains
 
@@ -91,15 +92,43 @@ contains
     integer, intent(in) :: comm
     real*8 :: nrm
     integer :: mpierr, me
-    PetscErrorCode :: ierr
-    call MatNorm(b65%mat, NORM_FROBENIUS, nrm, ierr)
-    nrm = nrm**2
-    call MPI_Allreduce(MPI_IN_PLACE, nrm, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
-    sfo_b65_used = (nrm > 0.d0)
+    sfo_b65_used = sfo_block_used(b65, comm, nrm)
     call MPI_Comm_rank(comm, me, mpierr)
-    if (me == 0 .and. sfo_b65_used) write(*,'(A,ES10.3,A)') "[Physics PC]   SF: |B_65|_F = ", sqrt(nrm), &
+    if (me == 0 .and. sfo_b65_used) write(*,'(A,ES10.3,A)') "[Physics PC]   SF: |B_65|_F = ", nrm, &
       " (max over ranks), applied in the rho -> T sweep"
   end function sfo_b65_used
+
+  !> Is op nonzero anywhere on comm? nrm: its Frobenius norm, the maximum
+  !! over comm (op's communicator may be a part of comm). Collective on comm,
+  !! silent.
+  logical function sfo_block_used(op, comm, nrm)
+    type(sf_op_t), intent(in) :: op
+    integer, intent(in) :: comm
+    real*8, intent(out), optional :: nrm
+    real*8 :: s
+    integer :: mpierr
+    PetscErrorCode :: ierr
+    call MatNorm(op%mat, NORM_FROBENIUS, s, ierr)
+    s = s**2
+    call MPI_Allreduce(MPI_IN_PLACE, s, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
+    sfo_block_used = (s > 0.d0)
+    if (present(nrm)) nrm = sqrt(s)
+  end function sfo_block_used
+
+  !> Free op's matrix, values and message plans (an operator no longer
+  !! needed); its layout definition stays. Rank-local.
+  subroutine sfo_destroy(op)
+    type(sf_op_t), intent(inout) :: op
+    PetscErrorCode :: ierr
+    call MatDestroy(op%mat, ierr)
+    if (allocated(op%val)) deallocate(op%val)
+    if (allocated(op%rsrc)) deallocate(op%rsrc, op%rtag, op%roff, op%rcnt)
+    if (allocated(op%sdst)) deallocate(op%sdst, op%stag, op%soff, op%scnt)
+    if (allocated(op%sa)) deallocate(op%sa)
+    if (allocated(op%sw)) deallocate(op%sw, op%ss)
+    if (allocated(op%sc)) deallocate(op%sc)
+    op%nrecv = 0; op%nsend = 0; op%has_w = .false.
+  end subroutine sfo_destroy
 
   !> Fix the layout, once: split = the mode split; cross = keep the entries
   !! between different |n| (global layout only).

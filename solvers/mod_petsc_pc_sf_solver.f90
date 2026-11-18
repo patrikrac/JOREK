@@ -67,7 +67,7 @@ module mod_petsc_pc_sf_solver
   end type block_solver_t
 
   public :: sf_solver_setup, sf_solver_apply, sf_solver_solve, sf_solver_reset_counters, sf_solver_report
-  public :: sf_solver_block_scale, sf_solver_penalty_rows, sf_backend
+  public :: sf_solver_family_report, sf_solver_block_scale, sf_solver_penalty_rows, sf_backend
   public :: sf_split_parts, sf_opz, sf_vpar_stage, sf_vpar_w_assembled
 
 contains
@@ -284,6 +284,63 @@ contains
       write(*,*)
     endif
   end subroutine sf_solver_report
+
+  !> Mode split: a heading line, then one line per family on the rank 0 of
+  !! comm (the full system's communicator): each block's mean inner
+  !! iterations and solve time, the rest of the application and the
+  !! scatters, the maxima over the family's ranks. The scatter back waits for
+  !! every family, so the critical family is the one with the smallest
+  !! scatter time. Collective on comm. (mod_petsc_pc_sf keeps its own
+  !! family_report, whose log must not change.)
+  subroutine sf_solver_family_report(name, slv, t_apply, t_scat, comm)
+    use mod_petsc_pc_sf_ops, only: sfo_comm, sfo_fam, sfo_nfam
+    character(len=*), intent(in)     :: name      !< the method, for the heading
+    type(block_solver_t), intent(in) :: slv(:)    !< the blocks, in report order
+    real*8, intent(in)  :: t_apply, t_scat        !< this rank's apply and scatter times
+    integer, intent(in) :: comm
+    real*8, allocatable :: v(:), tab(:, :), tab_g(:, :)
+    integer :: nb, nv, i_rest, i_scat, i_fail, i_nrk, b, f, me, fme, fnp, mpierr
+
+    ! v = (its(1:nb), solve s(1:nb), rest, scatter, unconverged solves, ranks)
+    nb = size(slv)
+    i_rest = 2 * nb + 1; i_scat = i_rest + 1; i_fail = i_scat + 1; i_nrk = i_fail + 1
+    nv = i_nrk
+    allocate(v(nv), tab(nv, sfo_nfam), tab_g(nv, sfo_nfam))
+    v = 0.d0
+    do b = 1, nb
+      if (slv(b)%nsolve > 0) v(b) = dble(slv(b)%its_sum) / dble(slv(b)%nsolve)
+      v(nb + b) = slv(b)%t_sum
+    enddo
+    v(i_rest) = t_apply - t_scat - sum(v(nb + 1:2 * nb))
+    v(i_scat) = t_scat
+    v(i_fail) = dble(sum(slv%nfail))
+    ! the maxima over the family; the rank count is the family's size, not a maximum
+    call MPI_Allreduce(MPI_IN_PLACE, v, i_nrk - 1, MPI_DOUBLE_PRECISION, MPI_MAX, sfo_comm, mpierr)
+    call MPI_Comm_rank(sfo_comm, fme, mpierr)
+    call MPI_Comm_size(sfo_comm, fnp, mpierr)
+    v(i_nrk) = dble(fnp)
+    ! one column per family, from its first rank
+    tab = 0.d0
+    if (fme == 0) tab(:, sfo_fam) = v
+    call MPI_Reduce(tab, tab_g, nv * sfo_nfam, MPI_DOUBLE_PRECISION, MPI_SUM, 0, comm, mpierr)
+    call MPI_Comm_rank(comm, me, mpierr)
+    if (me /= 0) return
+
+    write(*,'(A)') "[Physics PC]   "//name//" mode split per family: inner its / solve s (max over its "// &
+      "ranks), rest of the application, scatters incl. the wait for the slowest family"
+    do f = 1, sfo_nfam
+      write(*,'(A,I0,A,I0,A)', advance="no") "[Physics PC]     family ", f, " (", nint(tab_g(i_nrk, f)), " rk):"
+      do b = 1, nb
+        write(*,'(A,F5.2,A,F7.3)', advance="no") "  "//trim(slv(b)%label)//" ", tab_g(b, f), " /", tab_g(nb + b, f)
+      enddo
+      write(*,'(A,F7.3,A,F7.3,A)', advance="no") "  rest ", tab_g(i_rest, f), "  scatter ", tab_g(i_scat, f), " s"
+      if (tab_g(i_fail, f) > 0.d0) then
+        write(*,'(A,I0,A)') ", WARNING ", nint(tab_g(i_fail, f)), " not converged"
+      else
+        write(*,*)
+      endif
+    enddo
+  end subroutine sf_solver_family_report
 
   !> Between a packed vector p = [h(1) local | h(2) local | ...] and its
   !! fields h(:), rank-local.

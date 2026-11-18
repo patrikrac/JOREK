@@ -11,7 +11,10 @@ module mod_petsc_pc_blocks
 
   !> The full Jacobian's penalty rows (eliminate_boundary_dofs = .f.; with
   !! .t. the test finds the eliminated rows, their diagonal alone): local
-  !! offsets and diagonals, refreshed on every build.
+  !! offsets and diagonals, refreshed on every build. With the compact
+  !! option, ap holds those rows of A alone (A's row and column layout), so
+  !! that the back-substitution's product and its halo exchange are of
+  !! boundary size rather than the whole Jacobian's.
   type, public :: penalty_rows_t
     Mat     :: a                           !< the full Jacobian
     integer :: n = 0                       !< penalty rows on the communicator
@@ -19,6 +22,8 @@ module mod_petsc_pc_blocks
     real*8, allocatable  :: d(:)
     Vec     :: w
     logical :: w_made = .false.
+    Mat     :: ap                          !< the penalty rows of a (compact option)
+    logical :: ap_made = .false.
   end type penalty_rows_t
 
   public :: pc_print_block_setup, make_field_block_scale, decouple_penalty_rows
@@ -199,24 +204,32 @@ contains
   !> The full Jacobian's penalty rows, for the back-substitution closing a
   !! preconditioner apply: |a_ii| > 1e6 max |a_ij| over the row's own
   !! variable (the Mach-1 rows also hold zbig couplings to other variables).
-  subroutine full_penalty_rows(pr, A, comm, my_id, report)
+  !! compact (default .f.): also keep those rows as the matrix pr%ap, refilled
+  !! in place while the detected rows stay the same, rebuilt when they change.
+  subroutine full_penalty_rows(pr, A, comm, my_id, report, compact)
     use mod_parameters, only: n_tor
     type(penalty_rows_t), intent(inout) :: pr
     Mat :: A
     integer, intent(in) :: comm, my_id
     logical, intent(in) :: report             !< print the count
-    PetscInt :: rs, re, row, ncols, bs
+    logical, intent(in), optional :: compact
+    PetscInt :: rs, re, cs, ce, row, ncols, bs
     PetscInt, pointer :: cols(:)
     PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
     integer :: jc, n, iv, mpierr
+    logical :: want_ap
     real*8 :: dg, off
     integer, allocatable :: tl(:)
     real*8, allocatable :: td(:)
+    PetscInt, allocatable :: tnd(:), tno(:)  !< a detected row's entries inside / outside A's diagonal block
+    want_ap = .false.
+    if (present(compact)) want_ap = compact
     pr%a = A
     call MatGetBlockSize(A, bs, ierr)
     call MatGetOwnershipRange(A, rs, re, ierr)
-    allocate(tl(re - rs), td(re - rs))
+    call MatGetOwnershipRangeColumn(A, cs, ce, ierr)
+    allocate(tl(re - rs), td(re - rs), tnd(re - rs), tno(re - rs))
     n = 0
     do row = rs, re - 1
       iv = int(mod(row, bs)) / n_tor
@@ -229,30 +242,73 @@ contains
           off = max(off, abs(vals(jc)))
         endif
       enddo
-      call MatRestoreRow(A, row, ncols, cols, vals, ierr)
       if (abs(dg) > 0.d0 .and. abs(dg) > 1.d6 * off) then
         n = n + 1; tl(n) = int(row - rs) + 1; td(n) = dg
+        tnd(n) = count(cols(1:ncols) >= cs .and. cols(1:ncols) < ce)
+        tno(n) = ncols - tnd(n)
       endif
+      call MatRestoreRow(A, row, ncols, cols, vals, ierr)
     enddo
+    if (want_ap) call penalty_matrix()
     pr%loc = tl(1:n); pr%d = td(1:n)
     call MPI_Allreduce(n, pr%n, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
     if (.not. pr%w_made) call MatCreateVecs(A, pr%w, PETSC_NULL_VEC, ierr)
     pr%w_made = .true.
     if (my_id == 0 .and. report) write(*,'(A,I0,A)') "[Physics PC]   full Jacobian: ", pr%n, &
       " penalty rows, back-substituted after every sweep"
+
+  contains
+
+    !> pr%ap = the detected rows of A: refilled in place if they are the
+    !! stored ones on every rank, created anew otherwise. Before pr%loc is
+    !! overwritten.
+    subroutine penalty_matrix()
+      PetscInt, parameter :: ZERO = 0, ONE = 1
+      PetscInt, allocatable :: dnz(:), onz(:)
+      PetscInt :: q
+      logical :: same, same_all
+      same = pr%ap_made
+      if (same) same = (size(pr%loc) == n)
+      if (same) same = all(pr%loc == tl(1:n))
+      call MPI_Allreduce(same, same_all, 1, MPI_LOGICAL, MPI_LAND, comm, mpierr)
+      if (.not. same_all) then
+        if (pr%ap_made) call MatDestroy(pr%ap, ierr)
+        allocate(dnz(re - rs), onz(re - rs))
+        dnz = 0; onz = 0
+        do q = 1, n
+          dnz(tl(q)) = tnd(q); onz(tl(q)) = tno(q)
+        enddo
+        call MatCreateAIJ(comm, re - rs, ce - cs, PETSC_DETERMINE, PETSC_DETERMINE, ZERO, dnz, ZERO, onz, pr%ap, ierr)
+        pr%ap_made = .true.
+      endif
+      do q = 1, n
+        row = rs + tl(q) - 1
+        call MatGetRow(A, row, ncols, cols, vals, ierr)
+        call MatSetValues(pr%ap, ONE, [row], ncols, cols, vals, INSERT_VALUES, ierr)
+        call MatRestoreRow(A, row, ncols, cols, vals, ierr)
+      enddo
+      call MatAssemblyBegin(pr%ap, MAT_FINAL_ASSEMBLY, ierr)
+      call MatAssemblyEnd(pr%ap, MAT_FINAL_ASSEMBLY, ierr)
+    end subroutine penalty_matrix
+
   end subroutine full_penalty_rows
 
   !> The penalty rows' z_b += (r_b - sum_j a_bj z_j) / a_bb with the
   !! preconditioner's z: their residual is zbig times z_b's error, which the
   !! decoupled block rows leave at the size of the whole outer residual.
-  !! Changes the other rows' residual by O(1 / zbig).
+  !! Changes the other rows' residual by O(1 / zbig). The product is pr%ap's
+  !! (the penalty rows alone) where it exists, the whole Jacobian's otherwise.
   subroutine penalty_backsub(pr, r, z)
     type(penalty_rows_t), intent(inout) :: pr
     Vec :: r, z
     PetscScalar, pointer :: zp(:), rp(:), wp(:)
     PetscErrorCode :: ierr
     integer :: q
-    call MatMult(pr%a, z, pr%w, ierr)
+    if (pr%ap_made) then
+      call MatMult(pr%ap, z, pr%w, ierr)
+    else
+      call MatMult(pr%a, z, pr%w, ierr)
+    endif
     call VecGetArray(z, zp, ierr)
     call VecGetArrayRead(r, rp, ierr)
     call VecGetArrayRead(pr%w, wp, ierr)

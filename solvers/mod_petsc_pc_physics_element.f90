@@ -64,29 +64,60 @@ contains
   end subroutine petsc_create_pc_matrix
 
 
-  !> Assemble the physics PC's element-level operators: W (and v_par's W
-  !! terms) for the SF sweep, M_rho (and once D_bc) for the vorticity-space
-  !! Schur PC. They need mhd_sim, the linearisation state, so they are
-  !! assembled here rather than in the PC build.
+  !> Assemble the physics PC's element-level operators, those the method
+  !! needs (physics_pc_elements): W for the SF sweep (with v_par's W terms
+  !! where its v_par stage needs them) and for the Alfven block (without),
+  !! M_rho (and once D_bc) for the vorticity-space Schur PC. They need
+  !! mhd_sim, the linearisation state, so they are assembled here rather than
+  !! in the PC build.
   subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
-    use construct_pc_matrix_mod, only: construct_pc_element_matrices
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
-    use mod_petsc_pc_sf_solver, only: sf_vpar_w_assembled
-    use mod_petsc_pc_physics_ctx, only: physics_pc_method_id, PC_METHOD_SF
+    use mod_petsc_pc_physics_ctx, only: physics_pc_method_id, PC_METHOD_SF, PC_METHOD_VS_IDEAL, &
+                                        PC_METHOD_VS_RESISTIVE, PC_METHOD_VS_LUMPED, PC_METHOD_VS_ALFVEN, &
+                                        physics_pc_elements_t, physics_pc_elements
+    use mod_petsc_pc_vs, only: vs_init
+    use mod_petsc_pc_vs_alfven, only: vsa_init
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
     integer,              intent(in) :: n_local_elms
     type(type_SP_MATRIX), intent(in) :: a_mat
     type(type_MHD_SIM),   intent(in) :: mhd_sim
-    PetscErrorCode :: ierr
+    type(physics_pc_elements_t) :: need
 
     call physics_pc_log_events_register()       ! runs before the first PC build
-    if (physics_pc_method_id() /= PC_METHOD_SF) then
-      call assemble_vs_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
-      return
-    endif
+    ! the methods' refusals of unsupported models come before any assembly
+    select case (physics_pc_method_id())
+    case (PC_METHOD_SF)
+      ! its checks run in sf_build
+    case (PC_METHOD_VS_IDEAL, PC_METHOD_VS_RESISTIVE, PC_METHOD_VS_LUMPED)
+      call vs_init(my_id)
+    case (PC_METHOD_VS_ALFVEN)
+      call vsa_init(my_id)
+    end select
+    need = physics_pc_elements()
+    if (need%w)     call assemble_w(my_id, local_elms, n_local_elms, a_mat, mhd_sim, need%w_vpar)
+    if (need%m_rho) call assemble_vs_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
+  end subroutine petsc_assemble_pc_matrices
+
+
+  !> W, the composed force operator, and v_par's W terms where want_vpar_w
+  !! and the SF sweep's v_par stage needs them.
+  subroutine assemble_w(my_id, local_elms, n_local_elms, a_mat, mhd_sim, want_vpar_w)
+    use construct_pc_matrix_mod, only: construct_pc_element_matrices
+    use data_structure,  only: type_SP_MATRIX
+    use mod_simulation_data, only: type_MHD_SIM
+    use mod_petsc_pc_sf_solver, only: sf_vpar_w_assembled
+
+    integer,              intent(in) :: my_id
+    integer, pointer,     intent(in) :: local_elms(:)
+    integer,              intent(in) :: n_local_elms
+    type(type_SP_MATRIX), intent(in) :: a_mat
+    type(type_MHD_SIM),   intent(in) :: mhd_sim
+    logical,              intent(in) :: want_vpar_w
+    PetscErrorCode :: ierr
+
     call PetscLogEventBegin(pcev_elem_asm, ierr)
 
     ! created once, zeroed before every refill: W keeps its identity and
@@ -99,7 +130,7 @@ contains
       PetscCallA(MatSetOption(g_ctx%W_force, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr))
     endif
 
-    if (sf_vpar_w_assembled()) then
+    if (want_vpar_w .and. sf_vpar_w_assembled()) then
       ! v_par's sound-wave Schur terms, the same lifecycle as W
       if (g_ctx%w_v_ready) then
         PetscCallA(MatZeroEntries(g_ctx%W_vv, ierr))
@@ -131,7 +162,7 @@ contains
         write(*,'(A)') "[Physics PC]   W (composed force operator) assembled"
       endif
     endif
-  end subroutine petsc_assemble_pc_matrices
+  end subroutine assemble_w
 
 
   !> The vorticity-space Schur PC's matrices: M_rho on every call, D_bc once.
@@ -143,7 +174,6 @@ contains
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
     use phys_module, only: eliminate_boundary_dofs
-    use mod_petsc_pc_vs, only: vs_init
     !> the penalty of the Jacobian's boundary rows (mod_boundary_conditions)
     real*8, parameter :: D_PENALTY = 1.d12
 
@@ -155,7 +185,6 @@ contains
     PetscErrorCode :: ierr
     real*8 :: d
 
-    call vs_init(my_id)                         ! refuses unsupported models first
     call PetscLogEventBegin(pcev_elem_asm, ierr)
     d = merge(1.d0, D_PENALTY, eliminate_boundary_dofs)
     if (g_ctx%m_rho_ready) then

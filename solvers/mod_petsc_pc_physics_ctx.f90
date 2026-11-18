@@ -29,19 +29,31 @@ module mod_petsc_pc_physics_ctx
 
   !> physics_pc_method: the split-field sweep, or the vorticity-space Schur
   !! PC with the ideal or the resistive line bending, or the ideal one as a
-  !! lumped scalar operator (an experiment)
+  !! lumped scalar operator (an experiment), or the Alfven-block triangular
+  !! PC (mod_petsc_pc_vs_alfven)
   integer, parameter :: PC_METHOD_SF = 1, PC_METHOD_VS_IDEAL = 2, PC_METHOD_VS_RESISTIVE = 3, &
-                        PC_METHOD_VS_LUMPED = 4
+                        PC_METHOD_VS_LUMPED = 4, PC_METHOD_VS_ALFVEN = 5
+
+  !> The element-level matrices a method builds on (petsc_assemble_pc_matrices).
+  type :: physics_pc_elements_t
+    !> W_force: the SF sweep (pair_w) and vs_alfven (K_W)
+    logical :: w      = .false.
+    !> v_par's W_vv, W_vu, W_uv: the SF sweep only, and there only where its
+    !! v_par stage needs them (sf_vpar_w_assembled)
+    logical :: w_vpar = .false.
+    !> M_rho, and D_bc once: vs_ideal, vs_resistive, vs_lumped
+    logical :: m_rho  = .false.
+  end type physics_pc_elements_t
 
   ! -log_view events of the physics PC ("PhysPC_*")
   PetscLogEvent, save :: pcev_elem_asm   = -1  !< the element assembly (W, or M_rho and D_bc)
   PetscLogEvent, save :: pcev_extract    = -1  !< operator extraction / refill
   PetscLogEvent, save :: pcev_fact_pj    = -1  !< pair_psi solver setup
-  PetscLogEvent, save :: pcev_fact_w     = -1  !< pair_w solver setup
+  PetscLogEvent, save :: pcev_fact_w     = -1  !< pair_w solver setup (also K_W of vs_alfven)
   PetscLogEvent, save :: pcev_fact_rhot  = -1  !< rho and T solver setup
   PetscLogEvent, save :: pcev_apply      = -1  !< one whole PC apply
   PetscLogEvent, save :: pcev_solve_pj   = -1  !< pair_psi solves
-  PetscLogEvent, save :: pcev_solve_w    = -1  !< pair_w solves
+  PetscLogEvent, save :: pcev_solve_w    = -1  !< pair_w solves (also K_W of vs_alfven)
   PetscLogEvent, save :: pcev_solve_rhot = -1  !< rho/T solves
   PetscLogEvent, save :: pcev_fact_vort  = -1  !< vorticity-system solver setup
   PetscLogEvent, save :: pcev_fact_lap   = -1  !< Laplacian and mass solver setup (once)
@@ -62,11 +74,12 @@ contains
     case ("vs_ideal");     physics_pc_method_id = PC_METHOD_VS_IDEAL
     case ("vs_resistive"); physics_pc_method_id = PC_METHOD_VS_RESISTIVE
     case ("vs_lumped");    physics_pc_method_id = PC_METHOD_VS_LUMPED
+    case ("vs_alfven");    physics_pc_method_id = PC_METHOD_VS_ALFVEN
     case default
       physics_pc_method_id = 0
       call MPI_Comm_rank(MPI_COMM_WORLD, me, mpierr)
       if (me == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_method must be sf | vs_ideal | "// &
-        "vs_resistive | vs_lumped, got '"//trim(physics_pc_method)//"'"
+        "vs_resistive | vs_lumped | vs_alfven, got '"//trim(physics_pc_method)//"'"
       call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
     end select
   end function physics_pc_method_id
@@ -75,12 +88,28 @@ contains
   function physics_pc_method_label() result(s)
     character(len=16) :: s
     select case (physics_pc_method_id())
-    case (PC_METHOD_SF);       s = "SF"
-    case (PC_METHOD_VS_IDEAL); s = "VS, ideal"
+    case (PC_METHOD_SF);           s = "SF"
+    case (PC_METHOD_VS_IDEAL);     s = "VS, ideal"
     case (PC_METHOD_VS_RESISTIVE); s = "VS, resistive"
-    case default;              s = "VS, lumped"
+    case (PC_METHOD_VS_LUMPED);    s = "VS, lumped"
+    case (PC_METHOD_VS_ALFVEN);    s = "Alfven block"
+    case default;                  s = "unknown"
     end select
   end function physics_pc_method_label
+
+  !> The element-level matrices of the method: W for the SF sweep and the
+  !! Alfven block, M_rho and D_bc for the vorticity-space Schur variants.
+  function physics_pc_elements() result(e)
+    type(physics_pc_elements_t) :: e
+    select case (physics_pc_method_id())
+    case (PC_METHOD_SF)
+      e%w = .true.; e%w_vpar = .true.
+    case (PC_METHOD_VS_ALFVEN)
+      e%w = .true.
+    case (PC_METHOD_VS_IDEAL, PC_METHOD_VS_RESISTIVE, PC_METHOD_VS_LUMPED)
+      e%m_rho = .true.
+    end select
+  end function physics_pc_elements
 
   !> Register the physics-PC log events, once (a second registration would
   !! split the timings between two events of the same name).

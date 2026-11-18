@@ -1,0 +1,449 @@
+!> The Alfven-block physics-based preconditioner (use_physics_pc,
+!! physics_pc_method = "vs_alfven"): a block lower-triangular factorization
+!! of the Jacobian with the Alfven group a = (u, omega, psi, j) first and the
+!! fields f = (rho, T) after it, beside the split-field sweep of
+!! mod_petsc_pc_sf and the vorticity-space Schur PC of mod_petsc_pc_vs. The
+!! name vs_alfven groups it with the VS variants; no vorticity-space Schur
+!! complement is formed. With B_ij = A(equation i, variable j), 1 psi, 2 u,
+!! 3 j, 4 omega, 5 rho, 6 T:
+!!
+!!   A = [[K, C], [L, D]],    K = A(a, a),   D = [[B_55, 0], [B_65, B_66]]
+!!   P = [[K_W, 0], [L, D]]
+!!
+!!   K_W = [[B_22 + W, B_24, B_21, B_23],     (u, omega, psi, j)
+!!          [B_42,     B_44, 0,    0   ],
+!!          [B_12,     0,    B_11, B_13],
+!!          [0,        0,    B_31, B_33]]
+!!
+!! W is the SF sweep's force operator (Chacon Eqs. 17-19, as mod_petsc_pc_sf):
+!! it stands in for the Schur term -C D^-1 L of rho and T. K_W is the SF
+!! sweep's pair_w with the psi row's own B_11 in the place of opz B_33. Its
+!! zero blocks are zeros of the Jacobian in model199 and model600 (their
+!! element matrices assign none of B_14, B_32, B_34, B_41, B_43), so K_W is K
+!! plus W. With W = -C D^-1 L exactly, A P^-1 = [[I, C D^-1], [0, I]] has all
+!! eigenvalues 1 and a minimal polynomial of degree 2: no predictor and no
+!! corrector, the outer count is set by W and by the inner solves. With
+!! physics_pc_sf_harm_couple = .f. K_W, W and L are |n|-diagonal, so this
+!! statement holds for the coupled layout only. The upper part C (B_15,
+!! B_16 = eta'(T), B_25, B_26) does not enter the application.
+!!
+!! L and D as used: B_51, B_52 and B_61, B_62, B_63 always; B_64 (model600,
+!! viscous heating) and B_65 where they are nonzero; B_53, B_54 vanish in
+!! both models. B_56 (model600: tauIC, the sheath term of the open boundary)
+!! would make D non-triangular: it is left out, with a warning at the first
+!! build.
+!!
+!! One application y of the preconditioner to x:
+!!   1. K_W (u, omega, psi, j) = (x_u, x_omega, x_psi, x_j)
+!!   2. B_55 rho = x_rho - B_51 psi - B_52 u
+!!   3. B_66 T   = x_T - B_61 psi - B_62 u - B_63 j - B_64 omega - B_65 rho
+!!   4. the full Jacobian's penalty rows by back-substitution
+!! With eliminated boundary rows there is no step 4: K_W, B_55 and B_66 hold
+!! the Jacobian's own diagonal rows there and W's rows vanish, so those rows
+!! are solved exactly. Step 4's product holds the penalty rows alone
+!! (full_penalty_rows' compact option): in mode split it is the one exchange
+!! on the full system's layout inside an application besides the gather and
+!! the scatter, and it is of boundary size.
+!!
+!! Backends: K_W physics_pc_sf_pair_w, B_55 physics_pc_sf_rho, B_66
+!! physics_pc_sf_T; physics_pc_sf_pair_psi is not used.
+!!
+!! The Alfven group's pieces of x and y are host-array views
+!! (VecCreateMPIWithArray) into the storage of K_W's packed right-hand side
+!! and solution: the gather of x fills step 1's right-hand side and step 1
+!! writes y's pieces. Step 1 consumes x's pieces (the right-hand side is
+!! scaled in place), the rho and T solves consume x_rho and x_T, in which
+!! steps 2 and 3 accumulate their right-hand sides. A device Vec type would
+!! break the aliasing.
+module mod_petsc_pc_vs_alfven
+#ifdef USE_PETSC
+  use mpi_mod
+  use mod_parameters, only: n_var, var_psi, var_u, var_zj, var_w, var_rho, var_T
+  use mod_model_settings, only: jorek_model
+#include "petsc/finclude/petsc.h"
+  use petsc
+  use mod_petsc_pc_physics_ctx, only: g_ctx, physics_pc_mem, pcev_extract, pcev_fact_w, pcev_fact_rhot, &
+       pcev_solve_w, pcev_solve_rhot, pcev_apply
+  use mod_petsc_pc_blocks, only: penalty_rows_t, full_penalty_rows, penalty_backsub
+  use mod_petsc_pc_sf_solver
+  use mod_petsc_pc_sf_ops, only: sf_op_t, sfo_layout, sfo_build, sfo_fill, sfo_vars_in, sfo_vars_out, &
+       sfo_comm, sfo_define, sfo_block_used, sfo_destroy, sfo_n1
+  use mod_petsc_raw_csr, only: blockmv_attach
+  implicit none
+  private
+
+  interface
+    !> PETSc's Fortran stub (src/sys/ftn-custom/zsys.c); the petsc module
+    !! declares no interface for it
+    subroutine PetscObjectStateIncrease(obj, ierr)
+      import
+      Vec :: obj
+      PetscErrorCode :: ierr
+    end subroutine PetscObjectStateIncrease
+  end interface
+
+  logical, save :: vsa_init_done = .false.     !< the namelist resolved and checked (vsa_init)
+  logical, save :: vsa_first     = .true.      !< the next build is the first: patterns, layout, vectors
+  logical, save :: famode        = .false.     !< mode split
+  logical, save :: harm_all      = .true.      !< physics_pc_sf_harm_couple
+  integer, save :: comm_g = MPI_COMM_NULL      !< the full system's communicator
+
+  type(block_solver_t), save :: slv_kw, slv_rho, slv_T
+  integer, save :: bk_kw = SF_GMG, bk_rho = SF_GMG, bk_T = SF_GMG
+
+  !> K_W's fields in their packed order
+  integer, parameter :: NKW = 4
+  integer, parameter :: KW_VAR(NKW) = [var_u, var_w, var_psi, var_zj]
+
+  !> The operators K_W, B_55, B_66 and the coupling blocks: the blocks B_51,
+  !! B_52, B_61, B_62, B_63, B_64 of L and B_65 of D. Unlike in mod_petsc_pc_sf
+  !! and _vs the coupling blocks are stored NEGATED, o_cb(CB_ij) = -B_ij
+  !! (negated again after every refill, see vsa_build), so that each coupling
+  !! product is one in-place MatMultAdd: rhs = rhs + (-B_ij) v.
+  type(sf_op_t), save :: o_kw, o_rho, o_T
+  integer, parameter :: CB_51 = 1, CB_52 = 2, CB_61 = 3, CB_62 = 4, CB_63 = 5, CB_64 = 6, CB_65 = 7
+  integer, parameter :: NCB = 7
+  type(sf_op_t), save :: o_cb(NCB)
+  !> the coupling blocks in use: B_64 and B_65 vanish in model199 (B_64 also
+  !! in model600 without viscous heating) and are kept, refilled and applied
+  !! only where they do not, decided once on all ranks alike
+  logical, save :: cb_on(NCB) = .true.
+  type(penalty_rows_t), save :: pen           !< the full Jacobian's penalty rows
+  !> this rank's wall time in vsa_apply (step 4 included) and in its gather /
+  !! scatter since the last report (the mode split's per-family report)
+  real*8, save :: t_apply = 0.d0, t_scat = 0.d0
+
+  !> K_W's packed right-hand side and solution (fields in KW_VAR order, each
+  !! sfo_n1 long) and their storage, which the Alfven group's pieces of
+  !! sv_x / sv_y (by JOREK variable) share
+  PetscScalar, allocatable, target, save :: kw_rhs_store(:), kw_sol_store(:)
+  Vec, save :: rhs_kw, sol_kw
+  integer, parameter :: NSV = 6
+  Vec, save :: sv_x(NSV), sv_y(NSV)
+  logical, save :: vecs_ready = .false.
+
+  public :: vsa_init, vsa_build, vsa_apply, vsa_report
+
+contains
+
+  !> Resolve the namelist once and refuse configurations the method cannot
+  !! run. Called before the first assembly of W.
+  subroutine vsa_init(my_id)
+    use phys_module, only: physics_pc_sf_pair_psi, physics_pc_sf_pair_w, physics_pc_sf_rho, physics_pc_sf_T, &
+                           physics_pc_sf_rtol, physics_pc_sf_harm_couple, physics_pc_sf_mode_split
+    use mod_parameters, only: n_tor
+    integer, intent(in) :: my_id
+    PetscErrorCode :: ierr
+    character(len=*), parameter :: P = "[Physics PC]   "
+
+    if (vsa_init_done) return
+
+    bk_kw  = sf_backend(physics_pc_sf_pair_w, "physics_pc_sf_pair_w", my_id)
+    bk_rho = sf_backend(physics_pc_sf_rho,    "physics_pc_sf_rho",    my_id)
+    bk_T   = sf_backend(physics_pc_sf_T,      "physics_pc_sf_T",      my_id)
+
+    if (jorek_model /= 199 .and. jorek_model /= 600) &
+      call fatal("physics_pc_method = vs_alfven supports model199 and model600 only: the blocks of K_W and "// &
+                 "the forward substitution are those of their reduced MHD (psi, u, zj, w, rho, T)")
+    if (n_var /= 6 .or. var_T /= 6) &
+      call fatal("physics_pc_method = vs_alfven supports (psi, u, zj, w, rho, T) only, the forward "// &
+                 "substitution has no block for further variables: build without v_par, with_TiTe, "// &
+                 "with_neutrals and with_impurities")
+    if (mod(n_tor, 2) /= 1) &
+      call fatal("physics_pc_method = vs_alfven needs n_tor odd: the operators' toroidal slots are n = 0 "// &
+                 "plus cos/sin pairs")
+
+    harm_all    = physics_pc_sf_harm_couple
+    sf_gmg_harm = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
+    famode      = physics_pc_sf_mode_split .and. .not. harm_all
+
+    if (my_id == 0) then
+      write(*,'(A)') "[Physics PC] =========== Alfven-block (vs_alfven) preconditioner ==========="
+      write(*,'(A,A)') P//"K_W      : ", trim(physics_pc_sf_pair_w)//" (u, omega, psi, j; B_11 exact, "// &
+                       "W = SF force operator), one solve per application, no predictor / corrector"
+      write(*,'(A,A)') P//"rho / T  : ", trim(physics_pc_sf_rho)//" / "//trim(physics_pc_sf_T)// &
+                       " (forward substitution)"
+      write(*,'(A,A,A)') P//"pair_psi : not used (physics_pc_sf_pair_psi = ", trim(physics_pc_sf_pair_psi), &
+                         " has no effect)"
+      write(*,'(A,ES9.2)') P//"inner rtol: ", physics_pc_sf_rtol
+      if (harm_all) then
+        write(*,'(A)') P//"cross-|n|: all kept, all slots per GMG smoother block"
+      else
+        write(*,'(A)') P//"cross-|n|: none, |n|-diagonal blocks, cos / sin per GMG smoother block"
+      endif
+      if (famode) then
+        write(*,'(A)') P//"layout   : one |n| family per rank group (physics_pc_sf_mode_split)"
+      else
+        write(*,'(A)') P//"layout   : global operators"
+      endif
+    endif
+
+    vsa_init_done = .true.
+
+  contains
+
+    subroutine fatal(msg)
+      character(len=*), intent(in) :: msg
+      if (my_id == 0) write(*,'(A,A)') P//"FATAL: ", trim(msg)
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    end subroutine fatal
+
+  end subroutine vsa_init
+
+  !> Build the preconditioner from the assembled Jacobian A_full, at every PC
+  !! rebuild. The operators' patterns, the layout and the vectors are fixed by
+  !! the first build; later builds refill the operators, so MUMPS and the GMG
+  !! keep their setups.
+  subroutine vsa_build(A_full, comm, my_id)
+    use phys_module, only: physics_pc_sf_rtol, eliminate_boundary_dofs
+    use mod_petsc_pc_harm, only: pc_ntor
+    Mat, intent(in)     :: A_full
+    integer, intent(in) :: comm, my_id
+    !> operator tags (MPI message tags of sfo_build / sfo_fill): K_W, B_55,
+    !! B_66, then the coupling blocks, then B_56's test
+    integer, parameter :: NDIAG = 3
+    PetscErrorCode :: ierr
+    logical :: first
+    real*8  :: rtol
+    integer :: k, nno, comm_s
+    Mat :: ws(1)
+
+    call vsa_init(my_id)
+    first  = vsa_first
+    comm_g = comm
+    rtol   = physics_pc_sf_rtol
+
+    if (first) then
+      if (.not. g_ctx%w_force_ready) call build_fatal("W_force was never assembled (petsc_assemble_pc_matrices)")
+      call sfo_layout(A_full, comm, famode, harm_all, my_id)
+      call define_operators()
+    endif
+    comm_s = sfo_comm
+
+    ! the one W source, W_force: read by K_W's (u, u) block alone
+    ws = g_ctx%W_force
+    call PetscLogEventBegin(pcev_extract, ierr)
+    call build_or_fill(o_kw); call build_or_fill(o_rho); call build_or_fill(o_T)
+    do k = 1, NCB
+      if (.not. cb_on(k)) cycle
+      call build_or_fill(o_cb(k))
+      ! the coupling blocks are kept as -B_ij (vsa_apply adds them to the rhs);
+      ! sfo_fill restores +B_ij, so the sign is applied after every refill
+      call MatScale(o_cb(k)%mat, -1.0d0, ierr)
+    enddo
+    if (first) call check_b56()
+    call PetscLogEventEnd(pcev_extract, ierr)
+    if (first) then
+      ! the optional blocks on the full system's communicator: their refill
+      ! is collective there, so every family must take the same decision
+      call drop_if_zero(CB_64, "B_64", "omega in the T row")
+      call drop_if_zero(CB_65, "B_65", "rho in the T row")
+      nno = 0
+      do k = 1, NCB
+        if (.not. cb_on(k)) cycle
+        if (.not. blockmv_attach(o_cb(k)%mat, int(pc_ntor))) nno = nno + 1
+      enddo
+      if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   vs_alfven: WARNING ", nno, &
+        " coupling block(s) not AIJ, left on PETSc's matvec"
+    endif
+    call physics_pc_mem("vs_alfven build: operators filled", my_id)
+
+    ! Penalty rows (eliminated rows are diagonal-only rows of K_W, B_55 and
+    ! B_66, solved exactly, and need nothing here): the full Jacobian's for
+    ! step 4, and the blocks' as Dirichlet rows, after the refill and before
+    ! the scaling.
+    if (.not. eliminate_boundary_dofs) then
+      call full_penalty_rows(pen, A_full, comm, my_id, first, compact=.true.)
+      call sf_solver_penalty_rows(slv_kw, o_kw, comm_s, my_id)
+      call sf_solver_penalty_rows(slv_rho, o_rho, comm_s, my_id)
+      call sf_solver_penalty_rows(slv_T, o_T, comm_s, my_id)
+    endif
+    call sf_solver_block_scale(slv_kw, o_kw, comm_s, my_id)
+
+    ! The GMG hierarchies are global state per instance, one method being
+    ! active: 1 = K_W (configured as the SF sweep's pair_w), 3 = rho,
+    ! 4 = T, as in the SF sweep and the VS variants. K_W's psi - u coupling
+    ! runs along the field lines at large dt, hence flux-surface rings.
+    call PetscLogEventBegin(pcev_fact_w, ierr)
+    call sf_solver_setup(slv_kw, o_kw%mat, bk_kw, "K_W", comm_s, my_id, rtol, gmg_inst=1, nfields=o_kw%nf, &
+                         smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                         pre0=SF_W_PRE0, post0=SF_W_POST0, nsmooth_c=SF_W_NSC, &
+                         axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    call PetscLogEventEnd(pcev_fact_w, ierr)
+
+    call PetscLogEventBegin(pcev_fact_rhot, ierr)
+    call sf_solver_setup(slv_rho, o_rho%mat, bk_rho, "rho", comm_s, my_id, rtol, gmg_inst=3, nfields=1, &
+                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
+    call sf_solver_setup(slv_T, o_T%mat, bk_T, "T", comm_s, my_id, rtol, gmg_inst=4, nfields=1, &
+                         smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS_RHOT)
+    call PetscLogEventEnd(pcev_fact_rhot, ierr)
+    call physics_pc_mem("vs_alfven build: solvers set up", my_id)
+
+    if (.not. vecs_ready) call create_vectors()
+    g_ctx%reduced_ready = .true.
+    vsa_first = .false.
+    ! the families finish their setups at different times: wait here, so that
+    ! the setup timer holds the slowest one rather than the first apply
+    if (famode) call MPI_Barrier(comm, ierr)
+
+  contains
+
+    !> sf_opz(): sfo_build / sfo_fill take opz for the blocks they scale; no
+    !! block of these operators is scaled.
+    subroutine build_or_fill(op)
+      type(sf_op_t), intent(inout) :: op
+      if (first) then
+        call sfo_build(op, A_full, ws, sf_opz(), my_id)
+      else
+        call sfo_fill(op, A_full, ws, sf_opz())
+      endif
+    end subroutine build_or_fill
+
+    !> The operators' block layouts.
+    subroutine define_operators()
+      integer, parameter :: ce(NCB) = [var_rho, var_rho, var_T, var_T, var_T, var_T, var_T]
+      integer, parameter :: cv(NCB) = [var_psi, var_u, var_psi, var_u, var_zj, var_w, var_rho]
+      character(len=5), parameter :: cn(NCB) = ["-B_51", "-B_52", "-B_61", "-B_62", "-B_63", "-B_64", "-B_65"]
+      integer :: k_
+      call sfo_define(o_kw, "K_W", 1, KW_VAR)
+      ! the zero blocks of the SF sweep's pair_w (zeros of the Jacobian too):
+      ! omega's row has no psi and j, psi's row no omega, j's row no u and omega
+      o_kw%se(2, 3:4) = 0; o_kw%se(3, 2) = 0; o_kw%se(4, 1:2) = 0
+      o_kw%wid(1, 1) = 1                                ! + W in the (u, u) block
+      call sfo_define(o_rho, "B_55", 2, [var_rho])
+      call sfo_define(o_T,   "B_66", NDIAG, [var_T])
+      do k_ = 1, NCB
+        o_cb(k_)%label = cn(k_); o_cb(k_)%nf = 1; o_cb(k_)%tag = NDIAG + k_
+        o_cb(k_)%se(1, 1) = ce(k_); o_cb(k_)%sv(1, 1) = cv(k_)
+      enddo
+    end subroutine define_operators
+
+    !> Keep coupling block k only if it is nonzero somewhere (decided on comm,
+    !! the full system's communicator), and say so where it is.
+    subroutine drop_if_zero(k, name, what)
+      integer, intent(in) :: k
+      character(len=*), intent(in) :: name, what
+      real*8 :: nrm
+      cb_on(k) = sfo_block_used(o_cb(k), comm, nrm)
+      if (cb_on(k)) then
+        if (my_id == 0) write(*,'(A,ES10.3,A)') "[Physics PC]   vs_alfven: |"//name//"|_F = ", nrm, &
+          " (max over ranks), "//what//", applied in the T right-hand side"
+      else
+        call sfo_destroy(o_cb(k))
+      endif
+    end subroutine drop_if_zero
+
+    !> B_56 (rho row, T column) cannot enter the forward substitution: warn
+    !! if it is nonzero, then free it.
+    subroutine check_b56()
+      type(sf_op_t) :: o_56
+      real*8 :: nrm
+      o_56%label = "B_56"; o_56%nf = 1; o_56%tag = NDIAG + NCB + 1
+      o_56%se(1, 1) = var_rho; o_56%sv(1, 1) = var_T
+      call sfo_build(o_56, A_full, ws, sf_opz(), my_id)
+      if (sfo_block_used(o_56, comm, nrm) .and. my_id == 0) write(*,'(A,ES10.3,A)') &
+        "[Physics PC]   vs_alfven: WARNING B_56 (T in the rho row) is nonzero, |B_56|_F = ", nrm, &
+        " (max over ranks): it would make D non-triangular and is left out"
+      call sfo_destroy(o_56)
+    end subroutine check_b56
+
+    !> rhs_kw, sol_kw and the Alfven group's pieces on one storage each; rho's
+    !! and T's pieces of their own. A first gather (of a zero vector) creates
+    !! the mode split's scatter here rather than in the first apply.
+    subroutine create_vectors()
+      PetscInt, parameter :: ONE = 1
+      PetscInt :: n1, o
+      integer :: f
+      Vec :: x0
+
+      n1 = sfo_n1
+      ! at least one entry, so that kw_*_store(o) below exists on a rank without rows
+      allocate(kw_rhs_store(max(NKW * n1, ONE)), kw_sol_store(max(NKW * n1, ONE)))
+      call VecCreateMPIWithArray(sfo_comm, ONE, NKW * n1, PETSC_DETERMINE, kw_rhs_store, rhs_kw, ierr)
+      call VecCreateMPIWithArray(sfo_comm, ONE, NKW * n1, PETSC_DETERMINE, kw_sol_store, sol_kw, ierr)
+      do f = 1, NKW
+        o = (f - 1) * n1 + 1
+        call VecCreateMPIWithArray(sfo_comm, ONE, n1, PETSC_DETERMINE, kw_rhs_store(o), sv_x(KW_VAR(f)), ierr)
+        call VecCreateMPIWithArray(sfo_comm, ONE, n1, PETSC_DETERMINE, kw_sol_store(o), sv_y(KW_VAR(f)), ierr)
+      enddo
+      call MatCreateVecs(o_rho%mat, sv_x(var_rho), sv_y(var_rho), ierr)
+      call MatCreateVecs(o_T%mat, sv_x(var_T), sv_y(var_T), ierr)
+      call MatCreateVecs(A_full, x0, PETSC_NULL_VEC, ierr)
+      call VecSet(x0, 0.0d0, ierr)
+      call sfo_vars_in(x0, sv_x)
+      call VecDestroy(x0, ierr)
+      vecs_ready = .true.
+    end subroutine create_vectors
+
+    subroutine build_fatal(msg)
+      character(len=*), intent(in) :: msg
+      if (my_id == 0) write(*,'(A,A)') "[Physics PC]   FATAL: ", msg
+      call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+    end subroutine build_fatal
+
+  end subroutine vsa_build
+
+  !> y = P^-1 x, steps 1 to 4 of the module header.
+  subroutine vsa_apply(x, y, ierr)
+    Vec :: x, y
+    PetscErrorCode, intent(out) :: ierr
+    real*8 :: t0, t1
+
+    ierr = 0
+    call PetscLogEventBegin(pcev_apply, ierr)
+    t0 = MPI_Wtime()
+    call sfo_vars_in(x, sv_x)
+    t_scat = t_scat + (MPI_Wtime() - t0)
+    ! the gather wrote rhs_kw's storage through its pieces, which leaves
+    ! rhs_kw's object state (and any norm cached on it) behind
+    call PetscObjectStateIncrease(rhs_kw, ierr)
+
+    ! 1. (u, omega, psi, j) into y's pieces; rhs_kw is scaled in place, its
+    ! pieces of x are not read again
+    call sf_solver_solve(slv_kw, rhs_kw, sol_kw, pcev_solve_w)
+
+    ! 2. B_55 rho = x_rho - B_51 psi - B_52 u    (o_cb = -B, accumulated in
+    ! place in x_rho; v3 = v2 is allowed)
+    call MatMultAdd(o_cb(CB_51)%mat, sv_y(var_psi), sv_x(var_rho), sv_x(var_rho), ierr)
+    call MatMultAdd(o_cb(CB_52)%mat, sv_y(var_u),   sv_x(var_rho), sv_x(var_rho), ierr)
+    call sf_solver_solve(slv_rho, sv_x(var_rho), sv_y(var_rho), pcev_solve_rhot)
+
+    ! 3. B_66 T = x_T - B_61 psi - B_62 u - B_63 j - B_64 omega - B_65 rho
+    ! (o_cb = -B, accumulated in place in x_T)
+    call MatMultAdd(o_cb(CB_61)%mat, sv_y(var_psi), sv_x(var_T), sv_x(var_T), ierr)
+    call MatMultAdd(o_cb(CB_62)%mat, sv_y(var_u),   sv_x(var_T), sv_x(var_T), ierr)
+    call MatMultAdd(o_cb(CB_63)%mat, sv_y(var_zj),  sv_x(var_T), sv_x(var_T), ierr)
+    if (cb_on(CB_64)) call MatMultAdd(o_cb(CB_64)%mat, sv_y(var_w),   sv_x(var_T), sv_x(var_T), ierr)
+    if (cb_on(CB_65)) call MatMultAdd(o_cb(CB_65)%mat, sv_y(var_rho), sv_x(var_T), sv_x(var_T), ierr)
+    call sf_solver_solve(slv_T, sv_x(var_T), sv_y(var_T), pcev_solve_rhot)
+
+    t1 = MPI_Wtime()
+    call sfo_vars_out(sv_y, y)
+    t_scat = t_scat + (MPI_Wtime() - t1)
+    ! 4. penalty rows of the full Jacobian (pen%n = 0 with eliminated
+    ! boundary rows: nothing to do)
+    if (pen%n > 0) call penalty_backsub(pen, x, y)
+    t_apply = t_apply + (MPI_Wtime() - t0)
+    call PetscLogEventEnd(pcev_apply, ierr)
+    ierr = 0
+  end subroutine vsa_apply
+
+  !> Inner-iteration summary, one line per block (mode split: per family),
+  !! then reset. Collective.
+  subroutine vsa_report(my_id)
+    integer, intent(in) :: my_id
+    if (famode) then
+      call sf_solver_family_report("Alfven block", [slv_kw, slv_rho, slv_T], t_apply, t_scat, comm_g)
+    else
+      call sf_solver_report(slv_kw,  my_id)
+      call sf_solver_report(slv_rho, my_id)
+      call sf_solver_report(slv_T,   my_id)
+    endif
+    call sf_solver_reset_counters(slv_kw)
+    call sf_solver_reset_counters(slv_rho)
+    call sf_solver_reset_counters(slv_T)
+    t_apply = 0.d0;  t_scat = 0.d0
+  end subroutine vsa_report
+
+#endif
+end module mod_petsc_pc_vs_alfven
