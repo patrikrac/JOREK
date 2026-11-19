@@ -163,8 +163,10 @@ module phys_module
   !                   (the three use physics_pc_sf_pair_psi, _pair_w (vorticity system, Laplacian), _rho, _T)
   !   "vs_alfven"     block-triangular, solvers/mod_petsc_pc_vs_alfven.f90: the Jacobian's (u, omega, psi, j)
   !                   block plus the SF force operator W, then rho and T by forward substitution; uses
-  !                   physics_pc_sf_pair_w, _rho, _T, not _pair_psi
-  ! All vs_* methods: model199 / model600 with the 6 variables (psi, u, zj, w, rho, T) only.
+  !                   physics_pc_sf_pair_w, _rho, _T, not _pair_psi; with v_par (model600) also
+  !                   physics_pc_sf_vpar and physics_pc_sf_vpar_stage
+  ! All vs_* methods: model199 / model600 with the 6 variables (psi, u, zj, w, rho, T); vs_alfven also
+  ! model600 with v_par.
   character(len=16) :: physics_pc_method !< The physics PC: sf | vs_ideal | vs_resistive | vs_lumped | vs_alfven (see above)
   character(len=16) :: physics_pc_sf_pair_psi !< pair_psi = [[B_11,B_13],[B_31,B_33]] solver: "gmg" (default, FGMRES + one C1 GMG V-cycle) | "lu" (MUMPS, exact); not used by vs_alfven
   character(len=16) :: physics_pc_sf_pair_w   !< pair_w (u, omega, psi, j) solver, also K_W of vs_alfven: "gmg" (default) | "lu"
@@ -173,8 +175,8 @@ module phys_module
   integer :: physics_pc_sf_corrector !< Step 3 of the sweep. 4 (default; -1 = 4) = consistent: (psi, j) from pair_w, -B_16 T* on its psi row, B_51 psi_w and B_61 psi_w + B_63 j_w in the rho / T corrections. 0 = Chacon JCP 526 (2025) Eq. (16), a second pair_psi solve. 1 = Eq. (17), as 4 without pair_w's (psi, j) in rho / T. 2 = as 1 without B_16 T*. 3 = as 2 with rho / T by their mass inverse (model199 only).
   logical :: physics_pc_sf_harm_couple !< .true. (default) = every cross-|n| entry kept and all slots of a node in one GMG smoother block, global operators. .false. = |n|-diagonal blocks, cos / sin per smoother block.
   logical :: physics_pc_sf_mode_split  !< With harm_couple .false. only: .true. (default) = one |n| family per rank group, families concurrent (needs (n_tor+1)/2 ranks); .false. = global operators.
-  character(len=16) :: physics_pc_sf_vpar       !< v_par block solver (models with v_par): "gmg" (default) | "lu"
-  character(len=16) :: physics_pc_sf_vpar_stage !< v_par in the sweep: "v0" (default, B_77 last, no feedback) | "b0" (B_77 + W_vv right after pair_w, then in the rho / T correctors) | "b1" (pair_w's 5th field; mode split and corrector 1 | 2). b0 / b1: model600.
+  character(len=16) :: physics_pc_sf_vpar       !< v_par block solver (models with v_par), SF sweep and vs_alfven: "gmg" (default) | "lu"; not used by vs_alfven's b1
+  character(len=16) :: physics_pc_sf_vpar_stage !< v_par in the SF sweep: "v0" (default, B_77 last, no feedback) | "b0" (B_77 + W_vv right after pair_w, then in the rho / T correctors) | "b1" (pair_w's 5th field; mode split and corrector 1 | 2). In vs_alfven: "v0" (B_77 V solved last, after rho and T) | "b0" ((B_77 + W_vv) V after K_W, before rho and T, which take B_57 V, B_67 V) | "b1" (V as the 5th field of K_W, solved by physics_pc_sf_pair_w; then rho and T as in b0). b0 / b1: model600.
   real*8 :: physics_pc_sf_rtol !< Relative tolerance of every iterative inner solve (default 1e-1)
   logical :: eliminate_boundary_dofs !< Zero boundary-DOF rows in the physics PC's force operator W and use elm-diagonal BC scaling in global matrix
   logical :: use_newton           !< Use inexact Newton method

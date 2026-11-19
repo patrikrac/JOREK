@@ -65,9 +65,9 @@ contains
 
 
   !> Assemble the physics PC's element-level operators, those the method
-  !! needs (physics_pc_elements): W for the SF sweep (with v_par's W terms
-  !! where its v_par stage needs them) and for the Alfven block (without),
-  !! M_rho (and once D_bc) for the vorticity-space Schur PC. They need
+  !! needs (physics_pc_elements): W for the SF sweep and for the Alfven
+  !! block, with v_par's W terms where the v_par stage needs them, M_rho
+  !! (and once D_bc) for the vorticity-space Schur PC. They need
   !! mhd_sim, the linearisation state, so they are assembled here rather than
   !! in the PC build.
   subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
@@ -103,7 +103,7 @@ contains
 
 
   !> W, the composed force operator, and v_par's W terms where want_vpar_w
-  !! and the SF sweep's v_par stage needs them.
+  !! and the v_par stage needs them.
   subroutine assemble_w(my_id, local_elms, n_local_elms, a_mat, mhd_sim, want_vpar_w)
     use construct_pc_matrix_mod, only: construct_pc_element_matrices
     use data_structure,  only: type_SP_MATRIX

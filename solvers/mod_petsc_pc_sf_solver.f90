@@ -99,7 +99,8 @@ contains
     end select
   end function sf_vpar_stage
 
-  !> Does the SF sweep need v_par's W terms (stages b0 / b1)?
+  !> Does the v_par stage need v_par's W terms (b0 / b1, the SF sweep and
+  !! vs_alfven)?
   logical function sf_vpar_w_assembled()
     use mod_parameters, only: var_Vpar
     use phys_module,    only: use_physics_pc

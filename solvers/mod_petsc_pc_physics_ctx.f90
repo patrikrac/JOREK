@@ -38,8 +38,8 @@ module mod_petsc_pc_physics_ctx
   type :: physics_pc_elements_t
     !> W_force: the SF sweep (pair_w) and vs_alfven (K_W)
     logical :: w      = .false.
-    !> v_par's W_vv, W_vu, W_uv: the SF sweep only, and there only where its
-    !! v_par stage needs them (sf_vpar_w_assembled)
+    !> v_par's W_vv, W_vu, W_uv: the SF sweep and vs_alfven, and there only
+    !! where the v_par stage needs them (sf_vpar_w_assembled)
     logical :: w_vpar = .false.
     !> M_rho, and D_bc once: vs_ideal, vs_resistive, vs_lumped
     logical :: m_rho  = .false.
@@ -97,15 +97,14 @@ contains
     end select
   end function physics_pc_method_label
 
-  !> The element-level matrices of the method: W for the SF sweep and the
-  !! Alfven block, M_rho and D_bc for the vorticity-space Schur variants.
+  !> The element-level matrices of the method: W, and v_par's W terms, for
+  !! the SF sweep and the Alfven block, M_rho and D_bc for the
+  !! vorticity-space Schur variants.
   function physics_pc_elements() result(e)
     type(physics_pc_elements_t) :: e
     select case (physics_pc_method_id())
-    case (PC_METHOD_SF)
+    case (PC_METHOD_SF, PC_METHOD_VS_ALFVEN)
       e%w = .true.; e%w_vpar = .true.
-    case (PC_METHOD_VS_ALFVEN)
-      e%w = .true.
     case (PC_METHOD_VS_IDEAL, PC_METHOD_VS_RESISTIVE, PC_METHOD_VS_LUMPED)
       e%m_rho = .true.
     end select
