@@ -30,9 +30,10 @@ module mod_petsc_pc_physics_ctx
   !> physics_pc_method: the split-field sweep, or the vorticity-space Schur
   !! PC with the ideal or the resistive line bending, or the ideal one as a
   !! lumped scalar operator (an experiment), or the Alfven-block triangular
-  !! PC (mod_petsc_pc_vs_alfven)
+  !! PC (mod_petsc_pc_vs_alfven), or one GMG V-cycle on the whole Jacobian
+  !! (mod_petsc_pc_vs_mono)
   integer, parameter :: PC_METHOD_SF = 1, PC_METHOD_VS_IDEAL = 2, PC_METHOD_VS_RESISTIVE = 3, &
-                        PC_METHOD_VS_LUMPED = 4, PC_METHOD_VS_ALFVEN = 5
+                        PC_METHOD_VS_LUMPED = 4, PC_METHOD_VS_ALFVEN = 5, PC_METHOD_VS_MONO = 6
 
   !> The element-level matrices a method builds on (petsc_assemble_pc_matrices).
   type :: physics_pc_elements_t
@@ -49,11 +50,11 @@ module mod_petsc_pc_physics_ctx
   PetscLogEvent, save :: pcev_elem_asm   = -1  !< the element assembly (W, or M_rho and D_bc)
   PetscLogEvent, save :: pcev_extract    = -1  !< operator extraction / refill
   PetscLogEvent, save :: pcev_fact_pj    = -1  !< pair_psi solver setup
-  PetscLogEvent, save :: pcev_fact_w     = -1  !< pair_w solver setup (also K_W of vs_alfven)
+  PetscLogEvent, save :: pcev_fact_w     = -1  !< pair_w solver setup (also K_W of vs_alfven, A_p of vs_mono)
   PetscLogEvent, save :: pcev_fact_rhot  = -1  !< rho and T solver setup
   PetscLogEvent, save :: pcev_apply      = -1  !< one whole PC apply
   PetscLogEvent, save :: pcev_solve_pj   = -1  !< pair_psi solves
-  PetscLogEvent, save :: pcev_solve_w    = -1  !< pair_w solves (also K_W of vs_alfven)
+  PetscLogEvent, save :: pcev_solve_w    = -1  !< pair_w solves (also K_W of vs_alfven, A_p of vs_mono)
   PetscLogEvent, save :: pcev_solve_rhot = -1  !< rho/T solves
   PetscLogEvent, save :: pcev_fact_vort  = -1  !< vorticity-system solver setup
   PetscLogEvent, save :: pcev_fact_lap   = -1  !< Laplacian and mass solver setup (once)
@@ -75,11 +76,12 @@ contains
     case ("vs_resistive"); physics_pc_method_id = PC_METHOD_VS_RESISTIVE
     case ("vs_lumped");    physics_pc_method_id = PC_METHOD_VS_LUMPED
     case ("vs_alfven");    physics_pc_method_id = PC_METHOD_VS_ALFVEN
+    case ("vs_mono");      physics_pc_method_id = PC_METHOD_VS_MONO
     case default
       physics_pc_method_id = 0
       call MPI_Comm_rank(MPI_COMM_WORLD, me, mpierr)
       if (me == 0) write(*,'(A)') "[Physics PC]   FATAL: physics_pc_method must be sf | vs_ideal | "// &
-        "vs_resistive | vs_lumped | vs_alfven, got '"//trim(physics_pc_method)//"'"
+        "vs_resistive | vs_lumped | vs_alfven | vs_mono, got '"//trim(physics_pc_method)//"'"
       call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
     end select
   end function physics_pc_method_id
@@ -93,13 +95,14 @@ contains
     case (PC_METHOD_VS_RESISTIVE); s = "VS, resistive"
     case (PC_METHOD_VS_LUMPED);    s = "VS, lumped"
     case (PC_METHOD_VS_ALFVEN);    s = "Alfven block"
+    case (PC_METHOD_VS_MONO);      s = "monolithic GMG"
     case default;                  s = "unknown"
     end select
   end function physics_pc_method_label
 
   !> The element-level matrices of the method: W, and v_par's W terms, for
   !! the SF sweep and the Alfven block, M_rho and D_bc for the
-  !! vorticity-space Schur variants.
+  !! vorticity-space Schur variants, none for the monolithic GMG.
   function physics_pc_elements() result(e)
     type(physics_pc_elements_t) :: e
     select case (physics_pc_method_id())
@@ -107,6 +110,8 @@ contains
       e%w = .true.; e%w_vpar = .true.
     case (PC_METHOD_VS_IDEAL, PC_METHOD_VS_RESISTIVE, PC_METHOD_VS_LUMPED)
       e%m_rho = .true.
+    case (PC_METHOD_VS_MONO)
+      ! none: vs_mono reads the Jacobian alone
     end select
   end function physics_pc_elements
 

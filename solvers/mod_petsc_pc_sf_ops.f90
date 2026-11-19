@@ -22,7 +22,9 @@ module mod_petsc_pc_sf_ops
   implicit none
   private
 
-  integer, parameter, public :: SFO_NFMAX = 5          !< fields per operator (pair_w with v_par)
+  !> fields per operator (vs_mono's whole Jacobian with v_par); the MPI tags
+  !! of an operator's fields, TAG_* + field - 1, stay apart up to 8
+  integer, parameter, public :: SFO_NFMAX = 7
 
   !> Operator of nf x nf fields: block (a, b) is A(se(a,b), sv(a,b)) (JOREK
   !! variables, 0 = none), times opz where scl(a,b) = 1, plus W source wid(a,b)

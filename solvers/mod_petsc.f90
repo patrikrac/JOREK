@@ -135,8 +135,8 @@ contains
   !> Which preconditioner the main solve uses.
   !!
   !! use_physics_pc (namelist) selects the physics-based preconditioner
-  !! (physics_pc_method: the SF sweep, the vorticity-space Schur PC or the
-  !! Alfven-block PC).
+  !! (physics_pc_method: the SF sweep, the vorticity-space Schur PC, the
+  !! Alfven-block PC or the monolithic GMG).
   !! Otherwise -jorek_pc_full_lu selects one LU of the whole coupled system (the
   !! direct-solve reference), and the default is the harmonic block preconditioner,
   !! block-diagonal in the toroidal mode families, in one of two parallel layouts.

@@ -646,7 +646,7 @@ subroutine preset_parameters
   
   ! the physics-based (SF) preconditioner; the defaults are its production configuration
   use_physics_pc              = .false.     ! Use the physics-based (SF) preconditioner (PETSc)
-  physics_pc_method           = "sf"        ! sf (split-field sweep) | vs_ideal | vs_resistive | vs_lumped (vorticity-space Schur) | vs_alfven (block-triangular Alfven group + rho, T)
+  physics_pc_method           = "sf"        ! sf (split-field sweep) | vs_ideal | vs_resistive | vs_lumped (vorticity-space Schur) | vs_alfven (block-triangular Alfven group + rho, T) | vs_mono (one GMG V-cycle on the whole Jacobian)
   physics_pc_sf_pair_psi      = "gmg"       ! pair_psi backend: gmg | lu
   physics_pc_sf_pair_w        = "gmg"       ! pair_w backend: gmg | lu
   physics_pc_sf_rho           = "gmg"       ! rho block backend: gmg | lu

@@ -165,11 +165,15 @@ module phys_module
   !                   block plus the SF force operator W, then rho and T by forward substitution; uses
   !                   physics_pc_sf_pair_w, _rho, _T, not _pair_psi; with v_par (model600) also
   !                   physics_pc_sf_vpar and physics_pc_sf_vpar_stage
-  ! All vs_* methods: model199 / model600 with the 6 variables (psi, u, zj, w, rho, T); vs_alfven also
-  ! model600 with v_par.
-  character(len=16) :: physics_pc_method !< The physics PC: sf | vs_ideal | vs_resistive | vs_lumped | vs_alfven (see above)
-  character(len=16) :: physics_pc_sf_pair_psi !< pair_psi = [[B_11,B_13],[B_31,B_33]] solver: "gmg" (default, FGMRES + one C1 GMG V-cycle) | "lu" (MUMPS, exact); not used by vs_alfven
-  character(len=16) :: physics_pc_sf_pair_w   !< pair_w (u, omega, psi, j) solver, also K_W of vs_alfven: "gmg" (default) | "lu"
+  !   "vs_mono"       monolithic, solvers/mod_petsc_pc_vs_mono.f90: one C1 GMG V-cycle on the whole
+  !                   Jacobian (all variables in one operator), no W, predictor or corrector; uses
+  !                   physics_pc_sf_pair_w ("lu" = MUMPS on the whole system, the exact reference),
+  !                   _harm_couple and _mode_split; PETSc options -vs_mono_* (see the module)
+  ! All vs_* methods: model199 / model600 with the 6 variables (psi, u, zj, w, rho, T); vs_alfven and
+  ! vs_mono also model600 with v_par.
+  character(len=16) :: physics_pc_method !< The physics PC: sf | vs_ideal | vs_resistive | vs_lumped | vs_alfven | vs_mono (see above)
+  character(len=16) :: physics_pc_sf_pair_psi !< pair_psi = [[B_11,B_13],[B_31,B_33]] solver: "gmg" (default, FGMRES + one C1 GMG V-cycle) | "lu" (MUMPS, exact); not used by vs_alfven and vs_mono
+  character(len=16) :: physics_pc_sf_pair_w   !< pair_w (u, omega, psi, j) solver, also K_W of vs_alfven and the whole Jacobian of vs_mono: "gmg" (default) | "lu"
   character(len=16) :: physics_pc_sf_rho      !< rho block B_55 solver: "gmg" (default) | "lu"
   character(len=16) :: physics_pc_sf_T        !< T block B_66 solver: "gmg" (default) | "lu"
   integer :: physics_pc_sf_corrector !< Step 3 of the sweep. 4 (default; -1 = 4) = consistent: (psi, j) from pair_w, -B_16 T* on its psi row, B_51 psi_w and B_61 psi_w + B_63 j_w in the rho / T corrections. 0 = Chacon JCP 526 (2025) Eq. (16), a second pair_psi solve. 1 = Eq. (17), as 4 without pair_w's (psi, j) in rho / T. 2 = as 1 without B_16 T*. 3 = as 2 with rho / T by their mass inverse (model199 only).

@@ -1,7 +1,8 @@
 !> The solver of one diagonal block of the SF sweep (mod_petsc_pc_sf), with
 !! two backends: FGMRES around one V-cycle of the geometric multigrid
-!! (mod_petsc_pc_gmg), or PREONLY + MUMPS LU as the exact reference. The GMG
-!! configuration is fixed here, per block, rather than in the namelist.
+!! (mod_petsc_pc_gmg), or one V-cycle alone (one_cycle, vs_mono), or
+!! PREONLY + MUMPS LU as the exact reference. The GMG configuration is fixed
+!! here, per block, rather than in the namelist.
 module mod_petsc_pc_sf_solver
 #ifdef USE_PETSC
   use mpi_mod
@@ -111,9 +112,11 @@ contains
   !> Configure slv to solve A. The KSP is created once and re-pointed at the
   !! refilled operator on every rebuild, so MUMPS and the GMG reuse their
   !! symbolic phases. The GMG KSP takes PETSc options with the prefix
-  !! sf_gmg<gmg_inst>_.
+  !! sf_gmg<gmg_inst>_. one_cycle (GMG backend, default .false.): PREONLY
+  !! around the V-cycle, one cycle per solve, instead of FGMRES to rtol; set
+  !! before the options, so -sf_gmg<gmg_inst>_ksp_type still overrides it.
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, nfields, &
-                             smoother, maxits, pre0, post0, nsmooth_c, axis_rings)
+                             smoother, maxits, pre0, post0, nsmooth_c, axis_rings, one_cycle)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
@@ -127,16 +130,20 @@ contains
     integer, intent(in)          :: smoother   !< SF_GMG_SMOOTHER_*
     integer, intent(in)          :: maxits     !< FGMRES iteration cap
     integer, intent(in), optional :: pre0, post0, nsmooth_c, axis_rings
+    logical, intent(in), optional :: one_cycle
     PC :: pc
     PetscErrorCode :: ierr
-    logical :: ok, fresh
+    logical :: ok, fresh, one
     character(len=24) :: tstr
     character(len=16) :: prefix
+    KSPType :: ktyp
     type(gmg_opts_t) :: o
 
     fresh       = .not. slv%created
     slv%backend = backend
     slv%label   = label
+    one         = .false.
+    if (present(one_cycle)) one = one_cycle
 
     select case (backend)
 
@@ -177,8 +184,12 @@ contains
 
       if (fresh) then
         call KSPCreate(comm, slv%ksp, ierr)
-        call KSPSetType(slv%ksp, KSPFGMRES, ierr)
-        call KSPGMRESSetRestart(slv%ksp, maxits, ierr)
+        if (one) then
+          call KSPSetType(slv%ksp, KSPPREONLY, ierr)
+        else
+          call KSPSetType(slv%ksp, KSPFGMRES, ierr)
+          call KSPGMRESSetRestart(slv%ksp, maxits, ierr)
+        endif
         call KSPSetTolerances(slv%ksp, rtol, 1.d-50, 1.d6, maxits, ierr)
         write(prefix, '(A,I0,A)') "sf_gmg", gmg_inst, "_"
         call KSPSetOptionsPrefix(slv%ksp, trim(prefix), ierr)
@@ -197,7 +208,18 @@ contains
       call KSPSetOperators(slv%ksp, A, A, ierr)
       call KSPSetUp(slv%ksp, ierr)
       write(tstr,'(ES9.2)') rtol
-      call pc_print_block_setup(comm, label, "FGMRES + GMG V-cycle, rtol "//trim(adjustl(tstr)))
+      if (.not. one) then
+        call pc_print_block_setup(comm, label, "FGMRES + GMG V-cycle, rtol "//trim(adjustl(tstr)))
+      else
+        ! the KSP type the options left
+        call KSPGetType(slv%ksp, ktyp, ierr)
+        if (trim(ktyp) == KSPPREONLY) then
+          call pc_print_block_setup(comm, label, "PREONLY + GMG V-cycle (one cycle per solve)")
+        else
+          call pc_print_block_setup(comm, label, trim(ktyp)//" + GMG V-cycle (by the options), rtol "// &
+                                    trim(adjustl(tstr)))
+        endif
+      endif
 
     case default
       if (my_id == 0) write(*,'(A,I0)') "[Physics PC]   FATAL: sf_solver_setup got an unknown backend ", backend

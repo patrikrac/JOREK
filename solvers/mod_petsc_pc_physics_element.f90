@@ -67,17 +67,18 @@ contains
   !> Assemble the physics PC's element-level operators, those the method
   !! needs (physics_pc_elements): W for the SF sweep and for the Alfven
   !! block, with v_par's W terms where the v_par stage needs them, M_rho
-  !! (and once D_bc) for the vorticity-space Schur PC. They need
-  !! mhd_sim, the linearisation state, so they are assembled here rather than
-  !! in the PC build.
+  !! (and once D_bc) for the vorticity-space Schur PC, none for the
+  !! monolithic GMG. They need mhd_sim, the linearisation state, so they are
+  !! assembled here rather than in the PC build.
   subroutine petsc_assemble_pc_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim)
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
     use mod_petsc_pc_physics_ctx, only: physics_pc_method_id, PC_METHOD_SF, PC_METHOD_VS_IDEAL, &
                                         PC_METHOD_VS_RESISTIVE, PC_METHOD_VS_LUMPED, PC_METHOD_VS_ALFVEN, &
-                                        physics_pc_elements_t, physics_pc_elements
+                                        PC_METHOD_VS_MONO, physics_pc_elements_t, physics_pc_elements
     use mod_petsc_pc_vs, only: vs_init
     use mod_petsc_pc_vs_alfven, only: vsa_init
+    use mod_petsc_pc_vs_mono, only: vsm_init
 
     integer,              intent(in) :: my_id
     integer, pointer,     intent(in) :: local_elms(:)
@@ -95,6 +96,8 @@ contains
       call vs_init(my_id)
     case (PC_METHOD_VS_ALFVEN)
       call vsa_init(my_id)
+    case (PC_METHOD_VS_MONO)
+      call vsm_init(my_id)
     end select
     need = physics_pc_elements()
     if (need%w)     call assemble_w(my_id, local_elms, n_local_elms, a_mat, mhd_sim, need%w_vpar)

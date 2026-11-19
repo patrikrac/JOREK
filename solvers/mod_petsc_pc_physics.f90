@@ -1,6 +1,7 @@
 !> Entry point of the physics-based preconditioner (use_physics_pc): the SF
-!! sweep of mod_petsc_pc_sf, the vorticity-space Schur PC of mod_petsc_pc_vs
-!! or the Alfven-block PC of mod_petsc_pc_vs_alfven, by physics_pc_method.
+!! sweep of mod_petsc_pc_sf, the vorticity-space Schur PC of mod_petsc_pc_vs,
+!! the Alfven-block PC of mod_petsc_pc_vs_alfven or the monolithic GMG of
+!! mod_petsc_pc_vs_mono, by physics_pc_method.
 !! jorek2_main assembles their element matrices through
 !! petsc_assemble_pc_matrices, mod_petsc registers the PCSHELL, rebuilds the
 !! preconditioner at every PC rebuild and reports it. A new method adds a
@@ -13,7 +14,7 @@ module mod_petsc_pc_physics
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx, physics_pc_log_events_register, physics_pc_method_id, PC_METHOD_SF, &
                                       PC_METHOD_VS_IDEAL, PC_METHOD_VS_RESISTIVE, PC_METHOD_VS_LUMPED, &
-                                      PC_METHOD_VS_ALFVEN
+                                      PC_METHOD_VS_ALFVEN, PC_METHOD_VS_MONO
   use mod_petsc_pc_physics_element, only: petsc_assemble_pc_matrices
   implicit none
   private
@@ -44,6 +45,7 @@ contains
     use mod_petsc_pc_sf, only: sf_build
     use mod_petsc_pc_vs, only: vs_build
     use mod_petsc_pc_vs_alfven, only: vsa_build
+    use mod_petsc_pc_vs_mono, only: vsm_build
     Mat, intent(in) :: A_full
 
     PetscErrorCode :: ierr
@@ -59,6 +61,8 @@ contains
       call vs_build(A_full, comm, my_id)
     case (PC_METHOD_VS_ALFVEN)
       call vsa_build(A_full, comm, my_id)
+    case (PC_METHOD_VS_MONO)
+      call vsm_build(A_full, comm, my_id)
     case default
       ! unreachable: physics_pc_method_id stops the run on an unknown name
     end select
@@ -71,6 +75,7 @@ contains
     use mod_petsc_pc_sf, only: sf_report
     use mod_petsc_pc_vs, only: vs_report
     use mod_petsc_pc_vs_alfven, only: vsa_report
+    use mod_petsc_pc_vs_mono, only: vsm_report
     integer, intent(in) :: my_id
 
     select case (physics_pc_method_id())
@@ -80,6 +85,8 @@ contains
       call vs_report(my_id)
     case (PC_METHOD_VS_ALFVEN)
       call vsa_report(my_id)
+    case (PC_METHOD_VS_MONO)
+      call vsm_report(my_id)
     case default
       ! unreachable: physics_pc_method_id stops the run on an unknown name
     end select
@@ -92,6 +99,7 @@ contains
     use mod_petsc_pc_sf, only: sf_apply
     use mod_petsc_pc_vs, only: vs_apply
     use mod_petsc_pc_vs_alfven, only: vsa_apply
+    use mod_petsc_pc_vs_mono, only: vsm_apply
     PC :: pc_obj
     Vec :: x, y
     PetscErrorCode :: ierr
@@ -107,6 +115,8 @@ contains
       call vs_apply(x, y, ierr)
     case (PC_METHOD_VS_ALFVEN)
       call vsa_apply(x, y, ierr)
+    case (PC_METHOD_VS_MONO)
+      call vsm_apply(x, y, ierr)
     case default
       ierr = 1        ! unreachable: physics_pc_method_id stops the run on an unknown name
     end select
