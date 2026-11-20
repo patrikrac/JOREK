@@ -10,9 +10,19 @@ module mod_petsc_pc_harm
   integer, save, public :: pc_ntor = n_tor          !< slots per (field, scalar DOF)
   integer, allocatable, save :: pc_mode(:)          !< local slot (0-based) -> global slot
 
-  public :: pc_harm_set, pc_grp, pc_ngrp
+  public :: pc_harm_set, pc_grp, pc_ngrp, pc_global_slot
 
 contains
+
+  !> The global slot (0-based; 0 is n = 0) of local slot m.
+  integer function pc_global_slot(m)
+    integer, intent(in) :: m
+    if (allocated(pc_mode)) then
+      pc_global_slot = pc_mode(m)
+    else
+      pc_global_slot = m
+    endif
+  end function pc_global_slot
 
   !> Restrict the layout to the global slots `modes` (0-based, ascending).
   subroutine pc_harm_set(modes)

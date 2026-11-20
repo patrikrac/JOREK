@@ -21,7 +21,7 @@ module mod_pc_elt_matrix_force_fft
   implicit none
   private
 
-  public :: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho
+  public :: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho, pc_elt_matrix_eta
 
 contains
 
@@ -315,5 +315,31 @@ subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
   ELM = 0.5d0 * (1.d0 + zeta_t) * ELM
 
 end subroutine pc_elt_matrix_mass_rho
+
+!> The resistive line bending of vs_lumped needs M_eta and K_eta with the
+!! model's eta_T. model600's psi and j rows have model199's form, but its eta_T
+!! comes from resistivity() with the Coulomb logarithm, Z_eff and T_e, and its
+!! hyper-resistivity may depend on T (mod_plasma_functions); this assembly does
+!! not replicate them. The vorticity-space Schur PC refuses -vs_bending
+!! resistive for model600 (mod_petsc_pc_vs) before any assembly: the common
+!! interface only.
+subroutine pc_elt_matrix_eta(element, nodes, ELM_m, ELM_k, ELM_h)
+
+  use mod_parameters
+  use data_structure, only: type_element, type_node
+
+  implicit none
+
+  type(type_element), intent(in) :: element
+  type(type_node),    intent(in) :: nodes(n_vertex_max)
+  real*8, dimension(DFV, DFV), intent(out) :: ELM_m, ELM_k
+  real*8, dimension(DFV, DFV), intent(out), optional :: ELM_h
+
+  ELM_m = 0.d0; ELM_k = 0.d0
+  if (present(ELM_h)) ELM_h = 0.d0
+  write(*,'(A)') "[Physics PC] FATAL: model600 has no M_eta / K_eta for the resistive line bending of vs_lumped"
+  stop 1
+
+end subroutine pc_elt_matrix_eta
 
 end module mod_pc_elt_matrix_force_fft

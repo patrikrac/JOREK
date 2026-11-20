@@ -122,11 +122,14 @@ end subroutine zero_bc_rows_pc_matrix
 !! operator W that is added to B_22 where W_force is present, with v_par's
 !! sound-wave Schur terms where W_vv, W_vu, W_uv are present too (model600,
 !! v_par stages b0 / b1); the inertia M_rho where present, with d_bc on the
-!! diagonal of its rows at u's constrained DOFs.
+!! diagonal of its rows at u's constrained DOFs; the resistive line bending's
+!! M_eta and K_eta where present (vs_lumped, -vs_bending resistive), and K_1
+!! with them for the preconditioner's self-check. M_eta, K_eta and K_1 keep
+!! their boundary rows: the preconditioner masks them in its own layout.
 subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat, mhd_sim, W_force, &
-                                         W_vv, W_vu, W_uv, M_rho, d_bc)
+                                         W_vv, W_vu, W_uv, M_rho, d_bc, M_eta, K_eta, K_1)
 
-  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho
+  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho, pc_elt_matrix_eta
   use mod_parameters,  only: n_tor, n_degrees, n_vertex_max, var_u, var_Vpar
   use data_structure,  only: type_SP_MATRIX, type_element, type_node
   use mod_simulation_data, only: type_MHD_SIM
@@ -145,6 +148,7 @@ subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat,
   Mat, intent(inout), optional :: W_force
   Mat, intent(inout), optional :: W_vv, W_vu, W_uv
   Mat, intent(inout), optional :: M_rho
+  Mat, intent(inout), optional :: M_eta, K_eta, K_1
 #endif
   real*8, intent(in), optional :: d_bc
 
@@ -155,20 +159,20 @@ subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat,
   ! per thread (large derived types stay off the thread stacks)
   type(type_element), allocatable :: element_thr(:)
   type(type_node),    allocatable :: nodes_thr(:,:)
-  real*8, allocatable :: ELM(:,:), ELMv(:,:,:), buf(:)
+  real*8, allocatable :: ELM(:,:), ELMv(:,:,:), ELMe(:,:,:), buf(:)
   integer :: idx(NBV), rsel(NBV), nr
-  logical :: do_w, do_v, do_m
+  logical :: do_w, do_v, do_m, do_e, do_h
   integer :: ife, ielm, iv, q, b, t, nthreads
 #ifdef USE_PETSC
   PetscErrorCode :: ierr
   PetscInt :: idxm(NBV), idxn(NBV)
-  Mat :: Wv(3)
+  Mat :: Wv(3), We(3)
 #endif
 
   my_ind_min = a_mat%index_min(my_id+1)
   my_ind_max = a_mat%index_max(my_id+1)
 
-  do_w = .false.; do_v = .false.; do_m = .false.
+  do_w = .false.; do_v = .false.; do_m = .false.; do_e = .false.; do_h = .false.
 #ifdef USE_PETSC
   do_w = present(W_force)
   do_v = do_w .and. present(W_vv) .and. present(W_vu) .and. present(W_uv)
@@ -176,6 +180,12 @@ subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat,
     Wv(1) = W_vv; Wv(2) = W_vu; Wv(3) = W_uv
   endif
   do_m = present(M_rho) .and. present(d_bc)
+  do_e = present(M_eta) .and. present(K_eta)
+  do_h = do_e .and. present(K_1)
+  if (do_e) then
+    We(1) = M_eta; We(2) = K_eta
+  endif
+  if (do_h) We(3) = K_1
 #endif
 
   nthreads = 1
@@ -183,7 +193,7 @@ subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat,
   allocate(element_thr(nthreads), nodes_thr(n_vertex_max, nthreads))
 
   !$omp parallel default(shared) &
-  !$omp   private(ife, ielm, iv, q, b, t, ELM, ELMv, buf, idx, rsel, nr &
+  !$omp   private(ife, ielm, iv, q, b, t, ELM, ELMv, ELMe, buf, idx, rsel, nr &
 #ifdef USE_PETSC
   !$omp           , ierr, idxm, idxn &
 #endif
@@ -193,6 +203,11 @@ subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat,
     allocate(ELMv(DFV_CM, DFV_CM, 3))
   else
     allocate(ELMv(1, 1, 1))
+  endif
+  if (do_e) then
+    allocate(ELMe(DFV_CM, DFV_CM, 3))
+  else
+    allocate(ELMe(1, 1, 1))
   endif
 
   t = 1
@@ -250,9 +265,27 @@ subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat,
       endif
 #endif
     endif
+
+    if (do_e) then
+      if (do_h) then
+        call pc_elt_matrix_eta(element_thr(t), nodes_thr(:, t), ELMe(:,:,1), ELMe(:,:,2), ELMe(:,:,3))
+      else
+        call pc_elt_matrix_eta(element_thr(t), nodes_thr(:, t), ELMe(:,:,1), ELMe(:,:,2))
+      endif
+#ifdef USE_PETSC
+      if (nr > 0) then
+        !$omp critical (pc_force_insert)
+        do b = 1, merge(3, 2, do_h)
+          call pack_rows(ELMe(:,:,b), rsel, nr, buf)
+          PetscCallA(MatSetValuesBlocked(We(b), nr, idxm, NBV, idxn, buf, ADD_VALUES, ierr))
+        enddo
+        !$omp end critical (pc_force_insert)
+      endif
+#endif
+    endif
   enddo
   !$omp end do
-  deallocate(ELM, ELMv, buf)
+  deallocate(ELM, ELMv, ELMe, buf)
   !$omp end parallel
   deallocate(element_thr, nodes_thr)
 
@@ -287,6 +320,12 @@ subroutine construct_pc_element_matrices(my_id, local_elms, n_local_elms, a_mat,
     ! Dirichlet rows in both boundary modes: the row of u is replaced, not kept
     call zero_bc_rows_pc_matrix(M_rho, var_u, d_bc, local_elms, n_local_elms, &
                                 a_mat%my_ind_min, a_mat%my_ind_max)
+  endif
+  if (do_e) then
+    do b = 1, merge(3, 2, do_h)
+      PetscCallA(MatAssemblyBegin(We(b), MAT_FINAL_ASSEMBLY, ierr))
+      PetscCallA(MatAssemblyEnd  (We(b), MAT_FINAL_ASSEMBLY, ierr))
+    enddo
   endif
 #endif
 

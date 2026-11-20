@@ -264,20 +264,8 @@ do ms=1, n_gauss
      delta_u_x = (   y_t(ms,mt) * delta_s(mp,2,ms,mt) - y_s(ms,mt) * delta_t(mp,2,ms,mt) ) / xjac
      delta_u_y = ( - x_t(ms,mt) * delta_s(mp,2,ms,mt) + x_s(ms,mt) * delta_t(mp,2,ms,mt) ) / xjac
 
-     ! --- Temperature dependent resistivity
-     if ( eta_T_dependent .and. corr_neg_temp(T0) <= T_max_eta) then
-       eta_T     = eta   * (corr_neg_temp(T0)/T_0)**(-1.5d0)
-       deta_dT   = - eta   * (1.5d0)  * corr_neg_temp(T0)**(-2.5d0) * T_0**(1.5d0)
-       d2eta_d2T =   eta   * (3.75d0) * corr_neg_temp(T0)**(-3.5d0) * T_0**(1.5d0)
-     else if ( eta_T_dependent .and. corr_neg_temp(T0) > T_max_eta) then
-       eta_T     = eta   * (T_max_eta/T_0)**(-1.5d0)
-       deta_dT   = 0.d0
-       d2eta_d2T = 0.d0     
-     else
-       eta_T     = eta
-       deta_dT   = 0.d0
-       d2eta_d2T = 0.d0
-     end if
+     ! --- Temperature dependent resistivity (in place: the statements shared with the physics PC)
+#include "model_eta_T.h"
 
      ! --- Eta for ohmic heating
      if ( eta_T_dependent .and. corr_neg_temp(T0) <= T_max_eta_ohm) then

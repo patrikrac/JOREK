@@ -19,7 +19,7 @@ module mod_pc_elt_matrix_force_fft
   implicit none
   private
 
-  public :: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho
+  public :: pc_elt_matrix_force_fft, pc_elt_matrix_mass_rho, pc_elt_matrix_eta
 
 contains
 
@@ -227,5 +227,26 @@ subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
   stop 1
 
 end subroutine pc_elt_matrix_mass_rho
+
+!> The resistive line bending of vs_lumped (model199 only; the vorticity-space
+!! Schur PC refuses model183): the common interface.
+subroutine pc_elt_matrix_eta(element, nodes, ELM_m, ELM_k, ELM_h)
+
+  use mod_parameters
+  use data_structure, only: type_element, type_node
+
+  implicit none
+
+  type(type_element), intent(in) :: element
+  type(type_node),    intent(in) :: nodes(n_vertex_max)
+  real*8, dimension(n_tor*n_vertex_max*n_degrees, n_tor*n_vertex_max*n_degrees), intent(out) :: ELM_m, ELM_k
+  real*8, dimension(n_tor*n_vertex_max*n_degrees, n_tor*n_vertex_max*n_degrees), intent(out), optional :: ELM_h
+
+  ELM_m = 0.d0; ELM_k = 0.d0
+  if (present(ELM_h)) ELM_h = 0.d0
+  write(*,'(A)') "[Physics PC] FATAL: model183 has no resistive line bending for the vorticity-space Schur PC"
+  stop 1
+
+end subroutine pc_elt_matrix_eta
 
 end module mod_pc_elt_matrix_force_fft

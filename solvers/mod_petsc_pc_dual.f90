@@ -14,7 +14,31 @@
 !! JOREK index i (0-based) and the operator's slot q, ns slots per index, in
 !! either layout. A patch can cross rank boundaries: each rank fetches the
 !! rows and columns of its patches once (MatCreateSubMatrices) and computes
-!! the rows of Z it owns. M's values must not change afterwards.
+!! the rows of Z it owns. Z holds M's values of the call: a changed M needs a
+!! new call.
+!!
+!! The patches come from the grid, not from M's pattern: M can be any operator
+!! of this layout that the patch matrices invert well, as the mass plus a
+!! resistive term (the resistive line bending of vs_lumped). Entries of M that
+!! couple two slots or leave the patch are not read.
+!!
+!! The core (option core of dual_basis): the blocks of more than one node (the
+!! polar axis) and the blocks of their patches share one patch, the union of
+!! their patches (one solve for all of them). For an operator much stiffer
+!! than a mass on the small elements at the axis, whose inverse is not local
+!! there (the resistive line bending: without the core its Z has negative
+!! eigenvalues at the axis on fine grids).
+!!
+!! Symmetric forms of Z (dual_symmetrize), for a product U' Z U that must be
+!! symmetric:
+!!   DUAL_AVG   (Z + Z') / 2        the symmetric part, on Z's pattern. U' Z U
+!!                                  and U' ((Z + Z') / 2) U have the same
+!!                                  quadratic form: the average takes the skew
+!!                                  part out and leaves the definiteness
+!!   DUAL_SYM   Z + Z' - Z' M Z     1 - Z_sym M = (1 - Z' M)(1 - Z M), so
+!!                                  Z_sym <= M^-1, and positive definite where
+!!                                  the M-norm of 1 - Z M is below 1; couplings
+!!                                  up to three nodes apart
 module mod_petsc_pc_dual
 #ifdef USE_PETSC
   use mpi_mod
@@ -23,19 +47,48 @@ module mod_petsc_pc_dual
   implicit none
   private
 
-  public :: dual_basis
+  integer, parameter, public :: DUAL_PLAIN = 0, DUAL_AVG = 1, DUAL_SYM = 2
+
+  public :: dual_basis, dual_symmetrize
 
 contains
 
+  !> Z := the symmetric form `form` (DUAL_AVG | DUAL_SYM) of the local dual
+  !! basis Z of the symmetric M; DUAL_PLAIN leaves Z. Collective.
+  subroutine dual_symmetrize(Z, M, form)
+    Mat, intent(inout)  :: Z
+    Mat, intent(in)     :: M
+    integer, intent(in) :: form
+    Mat :: zt, ztmz
+    PetscErrorCode :: ierr
+
+    if (form == DUAL_PLAIN) return
+    call MatTranspose(Z, MAT_INITIAL_MATRIX, zt, ierr)
+    if (form == DUAL_SYM) then
+      call MatPtAP(M, Z, MAT_INITIAL_MATRIX, 2.0d0, ztmz, ierr)
+      call MatAXPY(Z, 1.0d0, zt, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatAXPY(Z, -1.0d0, ztmz, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatDestroy(ztmz, ierr)
+    else
+      call MatAXPY(Z, 1.0d0, zt, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatScale(Z, 0.5d0, ierr)
+    endif
+    call MatDestroy(zt, ierr)
+  end subroutine dual_symmetrize
+
   !> Z, the local dual basis of M (MPIAIJ, M's layout and communicator, the
-  !! options prefix vs_dual_: -vs_dual_mat_view shows it). Collective.
-  subroutine dual_basis(M, ns, Z, my_id)
+  !! options prefix vs_dual_: -vs_dual_mat_view shows it). Collective. With
+  !! `name` (the operator's name) rank 0 reports the patches; core: the core
+  !! patch at the axis (module header).
+  subroutine dual_basis(M, ns, Z, my_id, name, core)
     use nodes_elements, only: node_list, element_list
     use mod_parameters, only: n_degrees, n_vertex_max
     Mat, intent(in)     :: M
     integer, intent(in) :: ns           !< toroidal slots per index in M's layout
     Mat, intent(out)    :: Z
     integer, intent(in) :: my_id
+    character(len=*), intent(in), optional :: name
+    logical, intent(in), optional :: core
     external :: dgesv
     PetscInt, parameter :: zero = 0, one = 1
     PetscInt :: rs, re, ng, ncols, nloc
@@ -45,7 +98,10 @@ contains
     IS :: isr
     PetscErrorCode :: ierr
     integer :: comm, n_idx, i0, i1, nn, ne, n, k, i, e, iv, b, c, p, q, a, j, nj, no, info, mpierr
-    integer :: nmy, nh, ent, stamp, nsum
+    integer :: nmy, nh, ent, stamp, nsum, njc
+    logical :: core_done
+    logical, allocatable :: incore(:)
+    integer, allocatable :: jcore(:)
     integer, allocatable :: parent(:), owner(:), root(:), blk(:)
     integer, allocatable :: bn0(:), bnod(:), bm0(:), bmem(:), ne0(:), nel(:), cnt(:)
     integer, allocatable :: mine(:), hal(:), posh(:), posj(:), jl(:), ol(:), piv(:), mark(:), seen(:)
@@ -110,6 +166,10 @@ contains
     ! my blocks (those holding an index of mine) and the halo of their patches
     allocate(mark(nn), seen(nn), posh(0:n_idx - 1), posj(0:n_idx - 1))
     mark = 0; seen = 0; stamp = 0; nmy = 0
+    allocate(incore(nn)); incore = .false.; njc = 0
+    if (present(core)) then
+      if (core) call make_core()
+    endif
     allocate(mine(nn))
     do i = i0, i1 - 1
       if (mark(blk(i)) == 0) then
@@ -162,10 +222,17 @@ contains
     enddo
     allocate(zc(max(zr0(nloc + 1), 1)), zv(max(zr0(nloc + 1), 1)))
     posj = 0
+    core_done = .false.
     do b = 1, nmy
+      if (incore(mine(b))) then                         ! the core: one solve for all its blocks
+        if (core_done) cycle
+        core_done = .true.
+        ol = pack(jcore, incore(blk(jcore)))
+      else
+        ol = bmem(bm0(mine(b)) : bm0(mine(b) + 1) - 1)
+      endif
+      no = size(ol)
       call patch(mine(b), jl, nj)
-      no = bm0(mine(b) + 1) - bm0(mine(b))
-      ol = bmem(bm0(mine(b)) : bm0(mine(b) + 1) - 1)
       do a = 1, nj
         posj(jl(a)) = a
       enddo
@@ -186,7 +253,7 @@ contains
           y(posj(ol(k)), k) = 1.d0
         enddo
         call dgesv(nj, no, mjj, nj, piv, y, nj, info)
-        if (info /= 0) call fail("a singular patch mass matrix")
+        if (info /= 0) call fail("a singular patch matrix")
         do k = 1, no
           i = ol(k)
           if (i < i0 .or. i >= i1) cycle
@@ -221,9 +288,13 @@ contains
     enddo
     call MatAssemblyBegin(Z, MAT_FINAL_ASSEMBLY, ierr)
     call MatAssemblyEnd(Z, MAT_FINAL_ASSEMBLY, ierr)
-    call MPI_Allreduce(nmy, nsum, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
-    if (my_id == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   local dual basis of B_33: ", nsum, &
-      " block patches (summed over ranks), ", ns, " slot(s) each"
+    if (present(name)) then
+      call MPI_Allreduce(nmy, nsum, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
+      if (my_id == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   local dual basis of "//name//": ", nsum, &
+        " block patches (summed over ranks), ", ns, " slot(s) each"
+      if (my_id == 0 .and. njc > 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]     core at the axis: ", &
+        count(incore), " blocks, one patch of ", njc, " indices"
+    endif
 
   contains
 
@@ -258,14 +329,44 @@ contains
       enddo
     end subroutine csr_count
 
+    !> The core (incore, jcore, njc): the blocks of more than one node, the
+    !! blocks of their patches, and the union of these blocks' patches.
+    subroutine make_core()
+      integer :: t, s, x
+      logical, allocatable :: inc(:), inj(:)
+      allocate(inc(nn), inj(0:n_idx - 1)); inc = .false.; inj = .false.
+      do t = 1, nn
+        if (root(t) /= t .or. bn0(t + 1) - bn0(t) < 2) cycle
+        inc(t) = .true.
+        call patch(t, jl, nj)
+        do s = 1, nj
+          inc(blk(jl(s))) = .true.
+        enddo
+      enddo
+      do t = 1, nn
+        if (.not. inc(t)) cycle
+        call patch(t, jl, nj)
+        do s = 1, nj
+          inj(jl(s)) = .true.
+        enddo
+      enddo
+      jcore = pack([(x, x = 0, n_idx - 1)], inj)
+      njc = size(jcore)
+      incore = inc
+    end subroutine make_core
+
     !> The patch of block bb: the sorted indices of every block of a node that
-    !! shares an element with a node of bb.
+    !! shares an element with a node of bb; the core's patch for a core block.
     subroutine patch(bb, jl_, nj_)
       integer, intent(in) :: bb
       integer, allocatable, intent(out) :: jl_(:)
       integer, intent(out) :: nj_
       integer :: t, s, x, w, nb_
       integer, allocatable :: bl(:)
+      if (incore(bb)) then
+        jl_ = jcore; nj_ = njc
+        return
+      endif
       allocate(bl(0)); nb_ = 0
       stamp = stamp + 1
       do t = bn0(bb), bn0(bb + 1) - 1

@@ -23,6 +23,13 @@ module mod_petsc_pc_physics_ctx
     !! constrained DOFs, and the diagonal of those DOFs (built once).
     Mat :: M_rho, D_bc
     logical :: m_rho_ready = .false., d_bc_ready = .false.
+    !> vs_lumped's resistive line bending (-vs_bending resistive), block size
+    !! n_tor, on every assembly: M_eta = theta dt (eta_T v, w / R), the eta
+    !! part of -B_13, and K_eta = theta dt (eta_T grad v, grad w / R); and once,
+    !! for the self-check of the first build, K_1 = theta dt eta_num (grad v,
+    !! grad w), the hyper-resistive part of -B_13 (destroyed after the check).
+    Mat :: M_eta, K_eta, K_1
+    logical :: eta_ready = .false., k1_ready = .false., k1_done = .false.
   end type type_physics_pc_ctx
 
   type(type_physics_pc_ctx), save :: g_ctx

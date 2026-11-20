@@ -2,7 +2,9 @@
 !! two backends: FGMRES around one V-cycle of the geometric multigrid
 !! (mod_petsc_pc_gmg), or one V-cycle alone (one_cycle, vs_mono), or
 !! PREONLY + MUMPS LU as the exact reference. The GMG configuration is fixed
-!! here, per block, rather than in the namelist.
+!! here, per block, rather than in the namelist. A third backend, SF_SPDMG,
+!! is the ring-free multigrid of mod_petsc_pc_spdmg for a scalar symmetric
+!! positive definite block (vs_lumped's P, -vs_p_solver spdmg).
 module mod_petsc_pc_sf_solver
 #ifdef USE_PETSC
   use mpi_mod
@@ -17,6 +19,9 @@ module mod_petsc_pc_sf_solver
 
   integer, parameter, public :: SF_LU  = 1
   integer, parameter, public :: SF_GMG = 2
+  !> The ring-free multigrid for a scalar SPD block (mod_petsc_pc_spdmg):
+  !! vs_lumped's P with -vs_p_solver spdmg; not a namelist backend.
+  integer, parameter, public :: SF_SPDMG = 3
 
   !> Radial-line blocks: rho, v_par v0.
   integer, parameter, public :: SF_GMG_SMOOTHER_LINES = GMG_SM_LINES
@@ -120,6 +125,8 @@ contains
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
+    use mod_petsc_pc_spdmg, only: spdmg_ksp_setup
+    use mod_petsc_pc_harm, only: pc_ntor
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
     integer, intent(in)          :: backend, comm, my_id
@@ -219,6 +226,21 @@ contains
           call pc_print_block_setup(comm, label, trim(ktyp)//" + GMG V-cycle (by the options), rtol "// &
                                     trim(adjustl(tstr)))
         endif
+      endif
+
+    case (SF_SPDMG)
+      ! one field, all toroidal slots of the operator per node block
+      if (nfields /= 1) then
+        if (my_id == 0) write(*,'(A,A)') "[Physics PC]   FATAL: the SPD multigrid takes one field, got ", trim(label)
+        call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+      endif
+      if (fresh) call KSPCreate(comm, slv%ksp, ierr)
+      call spdmg_ksp_setup(slv%ksp, A, int(pc_ntor), comm, my_id, rtol, maxits, label, fresh)
+      if (fresh) then
+        call KSPGetType(slv%ksp, ktyp, ierr)
+        write(tstr,'(ES9.2)') rtol
+        call pc_print_block_setup(comm, label, trim(ktyp)//" + SPD-MG V-cycle (ring-free), rtol "// &
+                                  trim(adjustl(tstr)))
       endif
 
     case default

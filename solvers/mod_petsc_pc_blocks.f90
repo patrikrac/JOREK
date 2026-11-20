@@ -27,9 +27,54 @@ module mod_petsc_pc_blocks
   end type penalty_rows_t
 
   public :: pc_print_block_setup, make_field_block_scale, decouple_penalty_rows
-  public :: full_penalty_rows, penalty_backsub
+  public :: full_penalty_rows, penalty_backsub, penalty_row_mask
 
 contains
+
+  !> mask = 0 on the penalty rows of the one-field operator A and on the
+  !! diagonal-only rows that eliminate_boundary_dofs leaves, 1 elsewhere, by
+  !! the test of decouple_penalty_rows: |a_ii| > 1e6 max_(j /= i) |a_ij|. The
+  !! constrained DOFs of A's variable in either boundary mode. Creates mask
+  !! (A's row layout); rank-local apart from the creation.
+  subroutine penalty_row_mask(A, mask, nmask)
+    Mat, intent(in)    :: A
+    Vec, intent(out)   :: mask
+    integer, intent(out), optional :: nmask    !< masked rows on A's communicator
+    real*8, parameter :: PEN_TAU = 1.d6        !< as in decouple_penalty_rows
+    PetscErrorCode :: ierr
+    PetscInt :: rs, re, row, ncols
+    PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:), mp(:)
+    integer :: jc, nloc, comm, mpierr
+    real*8 :: dg, off
+
+    call MatCreateVecs(A, mask, PETSC_NULL_VEC, ierr)
+    call MatGetOwnershipRange(A, rs, re, ierr)
+    call VecGetArray(mask, mp, ierr)
+    nloc = 0
+    do row = rs, re - 1
+      call MatGetRow(A, row, ncols, cols, vals, ierr)
+      dg = 0.d0; off = 0.d0
+      do jc = 1, int(ncols)
+        if (cols(jc) == row) then
+          dg = abs(vals(jc))
+        else
+          off = max(off, abs(vals(jc)))
+        endif
+      enddo
+      call MatRestoreRow(A, row, ncols, cols, vals, ierr)
+      mp(row - rs + 1) = 1.d0
+      if ((dg > 0.d0) .and. (dg > PEN_TAU * off)) then
+        mp(row - rs + 1) = 0.d0
+        nloc = nloc + 1
+      endif
+    enddo
+    call VecRestoreArray(mask, mp, ierr)
+    if (present(nmask)) then
+      call PetscObjectGetComm(A, comm, ierr)
+      call MPI_Allreduce(nloc, nmask, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
+    endif
+  end subroutine penalty_row_mask
 
   !> "[Physics PC]   <label>: <method>" on the rank 0 of comm.
   subroutine pc_print_block_setup(comm, label, method)
