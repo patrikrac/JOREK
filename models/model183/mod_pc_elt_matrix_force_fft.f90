@@ -228,8 +228,8 @@ subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
 
 end subroutine pc_elt_matrix_mass_rho
 
-!> The resistive line bending of vs_lumped (model199 only; the vorticity-space
-!! Schur PC refuses model183): the common interface.
+!> The resistive line bending of vs_lumped (model199 and model600 only; the
+!! vorticity-space Schur PC refuses model183): the common interface.
 subroutine pc_elt_matrix_eta(element, nodes, ELM_m, ELM_k, ELM_h)
 
   use mod_parameters

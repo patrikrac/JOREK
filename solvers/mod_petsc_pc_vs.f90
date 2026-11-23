@@ -68,7 +68,10 @@
 !!                                                              the eta part of
 !!                                                              -B_31 B_11^-1 B_13
 !!              M_eta and K_eta are assembled with the model's eta_T(T0) at
-!!              every PC build (petsc_assemble_pc_matrices; model199 only).
+!!              every PC build (petsc_assemble_pc_matrices, the model's
+!!              pc_elt_matrix_eta: model199 and model600; for model600
+!!              eta_T(T0, rho0) of resistivity() with the Coulomb
+!!              logarithm).
 !!              S = B_33 - B_31 B_11^-1 B_13 (vs_resistive) is not symmetric
 !!              with eta(T) (eta Delta is not self-adjoint) and sym(S) is then
 !!              not positive definite; S_s is symmetric positive definite for
@@ -83,9 +86,13 @@
 !!              and K_eta, so that S_s has B_33's boundary rows. The first
 !!              build checks the assembly against the Jacobian: rank 0
 !!              prints |B_13 + M_eta + K_1|_F / |M_eta|_F on the interior
-!!              rows, K_1 = theta dt eta_num (grad v, grad w) assembled once,
-!!              which catches any difference between the eta_T of the PC and
-!!              the model's (a WARNING above 1e-8).
+!!              rows, K_1 = theta dt (eta_num_T grad v, grad w) the
+!!              hyper-resistive part of -B_13 assembled once with the
+!!              model's coefficient (model199: the constant eta_num;
+!!              model600: eta_num_T(T0, psi_N) of hyper_resistivity()),
+!!              which catches any difference between the eta_T or eta_num_T
+!!              of the PC and the model's (a WARNING above 1e-8). K_hyp
+!!              itself stays -B_13 - M_eta, from the Jacobian.
 !!              The dual basis reads the slot-diagonal part of S_s only (a
 !!              state whose T0 has harmonics couples the slots in K_eta).
 !! P_lumped's boundary rows lose their columns in both boundary modes (M_rho
@@ -268,10 +275,9 @@ contains
                  "only: build without v_par, with_TiTe, with_neutrals and with_impurities")
     if (mod(n_tor, 2) /= 1) call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped needs n_tor "// &
                                        "odd (n = 0 plus cos/sin pairs)")
-    if (res_dual .and. jorek_model /= 199) &
-      call fatal("-vs_bending resistive needs the model's eta(T) in the PC's element assembly (M_eta, K_eta), "// &
-                 "implemented for model199 only (model600's eta depends on the Coulomb logarithm, Z_eff and "// &
-                 "T_e, its hyper-resistivity on T); use -vs_bending ideal or physics_pc_method = vs_resistive")
+    ! -vs_bending resistive: the models above assemble M_eta, K_eta and K_1
+    ! with their own eta_T and eta_num_T (pc_elt_matrix_eta); model600's
+    ! without its extensions, which n_var 6 excludes
 
     harm_all    = physics_pc_sf_harm_couple
     sf_gmg_harm = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
@@ -563,11 +569,13 @@ contains
 
     !> The first build's check of M_eta against the Jacobian: K_hyp - K_1 =
     !! -(B_13 + M_eta + K_1) on the interior rows and columns, against M_eta
-    !! and B_13 there (Frobenius norms). Then K_1 is freed.
+    !! and B_13 there (Frobenius norms), and K_hyp's skew part (its
+    !! coefficient eta_num_T is a function of the state in model600). Then
+    !! K_1 is freed.
     subroutine eta_self_check()
       type(sf_op_t) :: o_k1
       Mat :: dm, bm
-      real*8 :: nd, nb, nm, nref
+      real*8 :: nd, nb, nm, nref, nks, nkh
       o_k1%label = "K_1"; o_k1%nf = 1; o_k1%tag = o_keta%tag + 1
       o_k1%se(1, 1) = 0; o_k1%sv(1, 1) = 0; o_k1%wid(1, 1) = 1
       if (.not. g_ctx%k1_ready) call build_fatal("K_1 was never assembled (petsc_assemble_pc_matrices)")
@@ -585,19 +593,29 @@ contains
       call MatDiagonalScale(bm, mask_psi, mask_j, ierr)
       call MatNorm(bm, NORM_FROBENIUS, nm, ierr)
       call MatDestroy(bm, ierr)
+      ! K_hyp' - K_hyp on the rows and columns interior to psi and j both
+      call MatTranspose(k_hyp, MAT_INITIAL_MATRIX, dm, ierr)
+      call MatAXPY(dm, -1.0d0, k_hyp, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatDiagonalScale(dm, mask_psi, mask_psi, ierr)
+      call MatDiagonalScale(dm, mask_j, mask_j, ierr)
+      call MatNorm(dm, NORM_FROBENIUS, nks, ierr)
+      call MatDestroy(dm, ierr)
+      call MatNorm(k_hyp, NORM_FROBENIUS, nkh, ierr)
       call sfo_destroy(o_k1)
       call MatDestroy(g_ctx%K_1, ierr)
       g_ctx%k1_ready = .false.; g_ctx%k1_done = .true.
       if (my_id == 0) then
         write(*,'(A,ES10.3,A,ES10.3,A,ES10.3,A)') "[Physics PC]   resistive bending check: |B_13 + M_eta + K_1|_F = ", &
           nd, " of |M_eta|_F = ", nm, ", of |B_13|_F = ", nb, &
-          " (K_1 = theta dt eta_num (grad v, grad w), interior rows)"
+          " (K_1 = theta dt (eta_num_T grad v, grad w), interior rows)"
         ! against M_eta, or B_13 where eta = 0
         nref = nm
         if (nref <= 0.d0) nref = nb
         if (nref > 0.d0 .and. nd > ETA_CHECK_TOL * nref) write(*,'(A,ES10.3,A)') &
           "[Physics PC]   WARNING: -B_13 - M_eta differs from the hyper-resistive part by ", nd / nref, &
-          " of |M_eta| (|B_13| if eta = 0): the resistive bending does not use the model's eta_T"
+          " of |M_eta| (|B_13| if eta = 0): the resistive bending does not use the model's eta_T and eta_num_T"
+        if (nkh > 0.d0) write(*,'(A,ES9.2,A)') "[Physics PC]   K_hyp = -B_13 - M_eta: skew part ", &
+          0.5d0 * nks / nkh, " of its Frobenius norm (interior rows)"
       endif
     end subroutine eta_self_check
 

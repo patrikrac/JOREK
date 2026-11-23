@@ -316,17 +316,34 @@ subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
 
 end subroutine pc_elt_matrix_mass_rho
 
-!> The resistive line bending of vs_lumped needs M_eta and K_eta with the
-!! model's eta_T. model600's psi and j rows have model199's form, but its eta_T
-!! comes from resistivity() with the Coulomb logarithm, Z_eff and T_e, and its
-!! hyper-resistivity may depend on T (mod_plasma_functions); this assembly does
-!! not replicate them. The vorticity-space Schur PC refuses -vs_bending
-!! resistive for model600 (mod_petsc_pc_vs) before any assembly: the common
-!! interface only.
+!> The resistive line bending of vs_lumped (mod_petsc_pc_vs, -vs_bending
+!! resistive), one variable each, as model199's
+!! (models/model199/mod_pc_elt_matrix_force_fft.f90) with model600's
+!! coefficients of amat(var_psi,var_zj) on the toroidal planes, all harmonics
+!! (through the FFT scatter, as M_rho):
+!!   ELM_m = M_eta(v, w) = theta dt int eta_T v w / R dR dZ            the eta part of -B_13
+!!   ELM_k = K_eta(v, w) = theta dt int eta_T grad v . grad w / R      its self-adjoint form
+!!   ELM_h = K_1(v, w)   = theta dt int eta_num_T grad v . grad w      the hyper-resistive part
+!!                                                                      of -B_13 (optional, the
+!!                                                                      preconditioner's self-check)
+!! eta_T and eta_num_T come from the model's own routines
+!! (mod_plasma_functions: coulomb_log_ei, resistivity, hyper_resistivity) with
+!! the model's arguments: T_or_Te = T0 and corr_neg_temp(T0) (T0 the raw T, not
+!! |T|), the Coulomb logarithm from rho0 and corr_neg_dens(rho0), Z_eff = 1,
+!! psi_N = get_psi_n(psi0, Z). Without the model's extensions only (with_TiTe:
+!! Te; with_impurities: Z_eff and rho_imp), which mod_petsc_pc_vs requires
+!! (n_var 6). The Gauss-point quantities are formed as in mod_elt_matrix_fft,
+!! so that M_eta + K_1 is -B_13 to rounding.
 subroutine pc_elt_matrix_eta(element, nodes, ELM_m, ELM_k, ELM_h)
 
   use mod_parameters
   use data_structure, only: type_element, type_node
+  use gauss
+  use basis_at_gaussian
+  use phys_module
+  use corr_neg, only: corr_neg_temp, corr_neg_dens
+  use equil_info, only: get_psi_n
+  use mod_plasma_functions, only: coulomb_log_ei, resistivity, hyper_resistivity
 
   implicit none
 
@@ -335,10 +352,123 @@ subroutine pc_elt_matrix_eta(element, nodes, ELM_m, ELM_k, ELM_h)
   real*8, dimension(DFV, DFV), intent(out) :: ELM_m, ELM_k
   real*8, dimension(DFV, DFV), intent(out), optional :: ELM_h
 
+  real*8, dimension(n_plane, NFV, NFV) :: Em_p, Ek_p, Eh_p
+  real*8, dimension(n_gauss, n_gauss) :: x_g, x_s, x_t, y_g, y_s, y_t
+  !> psi0 (1), rho0 (2) and T0 (3) on the planes
+  real*8, dimension(n_plane, 3, n_gauss, n_gauss) :: eq_g
+  integer, parameter :: vst(3) = [var_psi, var_rho, var_T]
+  real*8 :: f_v(NFV), f_x(NFV), f_y(NFV)                    !< basis values and gradients at the Gauss point
+  integer :: i, j, k, ms, mt, mp, in, q
+  real*8  :: wst, xjac, BigR, theta, sz, wm, wk, wh, gg
+  real*8  :: T0, T0_corr, r0, r0_corr, lnA, eta_T, eta_num_T, psi_norm
+  logical :: do_h
+  real*8     :: in_fft(1:n_plane)
+  complex*16 :: out_fft(1:n_plane)
+
+  do_h = present(ELM_h)
   ELM_m = 0.d0; ELM_k = 0.d0
-  if (present(ELM_h)) ELM_h = 0.d0
-  write(*,'(A)') "[Physics PC] FATAL: model600 has no M_eta / K_eta for the resistive line bending of vs_lumped"
-  stop 1
+  Em_p = 0.d0; Ek_p = 0.d0
+  if (do_h) then
+    ELM_h = 0.d0; Eh_p = 0.d0
+  endif
+  theta = time_evol_theta
+
+  x_g = 0.d0; x_s = 0.d0; x_t = 0.d0; y_g = 0.d0; y_s = 0.d0; y_t = 0.d0; eq_g = 0.d0
+  do i = 1, n_vertex_max
+    do j = 1, n_degrees
+      do ms = 1, n_gauss
+        do mt = 1, n_gauss
+          x_g(ms,mt) = x_g(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H(i,j,ms,mt)
+          x_s(ms,mt) = x_s(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H_s(i,j,ms,mt)
+          x_t(ms,mt) = x_t(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H_t(i,j,ms,mt)
+          y_g(ms,mt) = y_g(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H(i,j,ms,mt)
+          y_s(ms,mt) = y_s(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H_s(i,j,ms,mt)
+          y_t(ms,mt) = y_t(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H_t(i,j,ms,mt)
+          do k = 1, 3
+            do in = 1, n_tor
+              do mp = 1, n_plane
+                eq_g(mp,k,ms,mt) = eq_g(mp,k,ms,mt) + nodes(i)%values(in,j,vst(k)) * element%size(i,j) &
+                                   * H(i,j,ms,mt) * HZ(in,mp)
+              enddo
+            enddo
+          enddo
+        enddo
+      enddo
+    enddo
+  enddo
+
+  do ms = 1, n_gauss
+    do mt = 1, n_gauss
+      wst  = wgauss(ms)*wgauss(mt)
+      xjac = x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
+      BigR = x_g(ms,mt)
+      ! the basis functions as the model forms v, v_x, v_y
+      do q = 1, NFV
+        i = (q - 1) / n_degrees + 1; j = mod(q - 1, n_degrees) + 1
+        sz = element%size(i,j)
+        f_v(q) = H(i,j,ms,mt) * sz
+        f_x(q) = (  y_t(ms,mt) * h_s(i,j,ms,mt) - y_s(ms,mt) * h_t(i,j,ms,mt) ) * sz / xjac
+        f_y(q) = (- x_t(ms,mt) * h_s(i,j,ms,mt) + x_s(ms,mt) * h_t(i,j,ms,mt) ) * sz / xjac
+      enddo
+      do mp = 1, n_plane
+        ! the model's T_or_Te, its corrected value and the Coulomb logarithm (no impurities)
+        T0      = eq_g(mp,3,ms,mt)
+        T0_corr = corr_neg_temp(T0)
+        r0      = eq_g(mp,2,ms,mt)
+        r0_corr = corr_neg_dens(r0)
+        call coulomb_log_ei(T0, T0_corr, r0, r0_corr, 0.d0, 0.d0, 0.d0, lnA)
+        call resistivity(eta, T0, T0_corr, T_max_eta, T_0, 1.d0, lnA, eta_T)
+        psi_norm = get_psi_n(eq_g(mp,1,ms,mt), y_g(ms,mt))
+        call hyper_resistivity(T0, T0_corr, T_0, psi_norm, eta_num_T)
+        do i = 1, NFV
+          do j = 1, NFV
+            gg = f_x(i) * f_x(j) + f_y(i) * f_y(j)
+            ! amat(var_psi,var_zj) = - eta_num_T (v_x zj_x + v_y zj_y) xjac theta dt - eta_T v zj / R xjac theta dt
+            wm = eta_T * f_v(i) * f_v(j) / BigR * xjac * theta * tstep
+            wk = eta_T * gg / BigR * xjac * theta * tstep
+            Em_p(mp,i,j) = Em_p(mp,i,j) + wst * wm
+            Ek_p(mp,i,j) = Ek_p(mp,i,j) + wst * wk
+            if (do_h) then
+              wh = eta_num_T * gg * xjac * theta * tstep
+              Eh_p(mp,i,j) = Eh_p(mp,i,j) + wst * wh
+            endif
+          enddo
+        enddo
+      enddo
+    enddo
+  enddo
+
+  do i = 1, NFV
+    do j = 1, NFV
+      in_fft = Em_p(1:n_plane,i,j)
+      call fft_plane(in_fft, out_fft)
+      call scatter_fft_to_elm(out_fft, i, j, ELM_m, DFV)
+      in_fft = Ek_p(1:n_plane,i,j)
+      call fft_plane(in_fft, out_fft)
+      call scatter_fft_to_elm(out_fft, i, j, ELM_k, DFV)
+      if (do_h) then
+        in_fft = Eh_p(1:n_plane,i,j)
+        call fft_plane(in_fft, out_fft)
+        call scatter_fft_to_elm(out_fft, i, j, ELM_h, DFV)
+      endif
+    enddo
+  enddo
+  ! the scatter accumulates each (row, col) pair twice (as mod_elt_matrix_fft)
+  ELM_m = 0.5d0 * ELM_m
+  ELM_k = 0.5d0 * ELM_k
+  if (do_h) ELM_h = 0.5d0 * ELM_h
+
+contains
+
+  subroutine fft_plane(a, b)
+    real*8, intent(inout)   :: a(1:n_plane)
+    complex*16, intent(out) :: b(1:n_plane)
+#ifdef USE_FFTW
+    call dfftw_execute_dft_r2c(fftw_plan, a, b)
+#else
+    call pc_my_fft(a, b, n_plane)
+#endif
+  end subroutine fft_plane
 
 end subroutine pc_elt_matrix_eta
 
