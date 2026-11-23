@@ -10,6 +10,10 @@ module mod_petsc_pc_mass_cheb
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_raw_csr, only: blockmv_attach
+#if PETSC_VERSION_LT(3,23,0)
+  use mod_petsc_raw_csr, only: pc_asm_get_sub_ksp
+#endif
+#include "petsc_f90_compat.h"
   implicit none
   private
   real*8, parameter  :: TARGET = 1.d-1   !< Chebyshev B-norm error bound per apply
@@ -114,7 +118,11 @@ contains
         call PCSetType(spc, PCICC, ierr)
         call PCFactorSetMatOrderingType(spc, MATORDERINGND, ierr)
       enddo
+#if PETSC_VERSION_LT(3,23,0)
+      nullify(sub)
+#else
       call PCASMRestoreSubKSP(pc_, nsub, first, sub, ierr)
+#endif
     end subroutine set_schwarz
 
     real*8 function rho(kk)

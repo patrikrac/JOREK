@@ -21,7 +21,7 @@ module mod_pc_elt_matrix_force_fft
   implicit none
   private
 
-  public :: pc_elt_matrix_force_fft
+  public :: pc_elt_matrix_force_fft, pc_elt_matrix_force_pfafem
 
 contains
 
@@ -228,5 +228,210 @@ contains
   end subroutine one_channel
 
 end subroutine pc_elt_matrix_force_fft
+
+subroutine pc_elt_matrix_force_pfafem(node_list, element_list, ielm, W_vp, WV_vp)
+  use mod_parameters
+  use data_structure, only: type_node_list, type_element_list
+  use gauss, only: n_gauss, xgauss, wgauss
+  use phys_module
+  use mod_pfafem, only: pfafem_cache, pfafem_el_lo, pfafem_el_hi, pfafem_ng_tor, pfafem_tau_q, &
+                        pfafem_w_tor, pfafem_dphi, pfafem_qp_cached, pfafem_qp_geom, &
+                        pfafem_qp_ngrp, pfafem_qp_gu, pfafem_qp_gjb, pfafem_qp_db, &
+                        pfafem_eval_elem_geom, pfafem_eval_qp_basis
+  implicit none
+
+  type(type_node_list),    intent(in)            :: node_list
+  type(type_element_list), intent(in)            :: element_list
+  integer,                 intent(in)            :: ielm
+  real*8,                  intent(out)           :: W_vp(:, :, :, :, :)
+  real*8,                  intent(out), optional :: WV_vp(:, :, :, :, :, :)
+
+  logical :: do_v, has_axis_u, use_qp_c
+  integer :: eP, ep1, iq, ms, mt, iel_loc, a, b, unode, ivp
+  integer :: n_grp, g_a, a0, io_a, u_a, jb_a
+  integer :: iv_T, iv_Ti, iv_Te
+  integer :: n_raw, raw_u(64), raw_io(64), raw_jb(64)
+  integer :: n_act, act_u(64), act_io(64), act_jb(64)
+  real*8  :: GAMMA_l, theta, zeta_t, pref, phi_q
+  real*8  :: BigR, y_g, Rs, Rt, Zs, Zt, xjac, wst_tor, cv
+  real*8  :: rv(64), rR(64), rZ(64), rP(64), r_jet4(4)
+  real*8  :: bv(64), bR(64), bZ(64), bP(64)
+  real*8  :: vpsi_a, vr_a, vt_a
+  real*8  :: ps0_x, ps0_y, r0_raw, r0, r0_x, r0_y, r0_p
+  real*8  :: T0_raw, T0, T0_x, T0_y, T0_p, p0, p0_x, p0_y, p0_p, P_B
+  real*8  :: v_y, u_x, u_y, a_curv, a_uu, Db_tst, Db_tri, q_tri
+
+  W_vp = 0.d0
+  do_v = present(WV_vp)
+  if (do_v) WV_vp = 0.d0
+
+  GAMMA_l = gamma
+  theta   = time_evol_theta
+  zeta_t  = time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
+  pref    = (theta * tstep)**2 / (1.d0 + zeta_t)
+
+  iv_T  = max(1, var_T)
+  iv_Ti = max(1, var_Ti)
+  iv_Te = max(1, var_Te)
+
+  iel_loc    = ielm - pfafem_el_lo + 1
+  use_qp_c   = pfafem_qp_cached .and. (ielm >= pfafem_el_lo) .and. (ielm <= pfafem_el_hi)
+  has_axis_u = .false.
+  if (treat_axis) then
+    do a = 1, pfafem_cache(ielm)%n_unodes
+      if (node_list%node(pfafem_cache(ielm)%unodes(a))%axis_node) then
+        has_axis_u = .true.
+        exit
+      end if
+    end do
+  end if
+
+  do eP = 0, n_tor - 1
+    ep1 = eP + 1
+    do iq = 1, pfafem_ng_tor
+      phi_q = (dble(eP) + pfafem_tau_q(iq)) * pfafem_dphi
+      do ms = 1, n_gauss
+        do mt = 1, n_gauss
+          if (use_qp_c) then
+            BigR = pfafem_qp_geom(1,  ms, mt, iq, ep1, iel_loc)
+            y_g  = pfafem_qp_geom(2,  ms, mt, iq, ep1, iel_loc)
+            xjac = pfafem_qp_geom(13, ms, mt, iq, ep1, iel_loc)
+          else
+            call pfafem_eval_elem_geom(node_list, element_list, ielm, xgauss(ms), xgauss(mt), phi_q, &
+                                       BigR, y_g, Rs, Rt, Zs, Zt)
+            xjac = Rs * Zt - Rt * Zs
+          end if
+          wst_tor = wgauss(ms) * wgauss(mt) * pfafem_w_tor(iq)
+          cv      = pref * xjac
+
+          ps0_x  = 0.d0; ps0_y = 0.d0
+          r0_raw = 0.d0; r0_x  = 0.d0; r0_y = 0.d0; r0_p = 0.d0
+          T0_raw = 0.d0; T0_x  = 0.d0; T0_y = 0.d0; T0_p = 0.d0
+
+          if (use_qp_c) then
+            n_grp = int(pfafem_qp_ngrp(ms, mt, iq, ep1, iel_loc))
+            n_raw = 4 * n_grp
+            do g_a = 1, n_grp
+              u_a   = int(pfafem_qp_gu(g_a, ms, mt, iq, ep1, iel_loc))
+              jb_a  = int(pfafem_qp_gjb(g_a, ms, mt, iq, ep1, iel_loc))
+              unode = pfafem_cache(ielm)%unodes(u_a)
+              a0    = 4 * (g_a - 1)
+              do io_a = 1, 4
+                a         = a0 + io_a
+                raw_u(a)  = u_a
+                raw_io(a) = io_a
+                raw_jb(a) = jb_a
+                r_jet4 = pfafem_qp_db(1:4, a, ms, mt, iq, ep1, iel_loc)
+                rv(a) = r_jet4(1); rR(a) = r_jet4(2); rZ(a) = r_jet4(3); rP(a) = r_jet4(4)
+                vpsi_a = node_list%node(unode)%values(jb_a, io_a, var_psi)
+                vr_a   = node_list%node(unode)%values(jb_a, io_a, var_rho)
+                if (with_TiTe) then
+                  vt_a = node_list%node(unode)%values(jb_a, io_a, iv_Ti) &
+                       + node_list%node(unode)%values(jb_a, io_a, iv_Te)
+                else
+                  vt_a = node_list%node(unode)%values(jb_a, io_a, iv_T)
+                end if
+                ps0_x  = ps0_x  + vpsi_a * r_jet4(2)
+                ps0_y  = ps0_y  + vpsi_a * r_jet4(3)
+                r0_raw = r0_raw + vr_a   * r_jet4(1)
+                r0_x   = r0_x   + vr_a   * r_jet4(2)
+                r0_y   = r0_y   + vr_a   * r_jet4(3)
+                r0_p   = r0_p   + vr_a   * r_jet4(4)
+                T0_raw = T0_raw + vt_a   * r_jet4(1)
+                T0_x   = T0_x   + vt_a   * r_jet4(2)
+                T0_y   = T0_y   + vt_a   * r_jet4(3)
+                T0_p   = T0_p   + vt_a   * r_jet4(4)
+              end do
+            end do
+          else
+            call pfafem_eval_qp_basis(node_list, element_list, ielm, eP, iq, ms, mt, &
+                                      BigR, y_g, phi_q, .false., n_raw, raw_u, raw_io, raw_jb, &
+                                      rv, rR, rZ, rP)
+            do a = 1, n_raw
+              unode  = pfafem_cache(ielm)%unodes(raw_u(a))
+              vpsi_a = node_list%node(unode)%values(raw_jb(a), raw_io(a), var_psi)
+              vr_a   = node_list%node(unode)%values(raw_jb(a), raw_io(a), var_rho)
+              if (with_TiTe) then
+                vt_a = node_list%node(unode)%values(raw_jb(a), raw_io(a), iv_Ti) &
+                     + node_list%node(unode)%values(raw_jb(a), raw_io(a), iv_Te)
+              else
+                vt_a = node_list%node(unode)%values(raw_jb(a), raw_io(a), iv_T)
+              end if
+
+              ps0_x  = ps0_x  + vpsi_a * rR(a)
+              ps0_y  = ps0_y  + vpsi_a * rZ(a)
+              r0_raw = r0_raw + vr_a   * rv(a)
+              r0_x   = r0_x   + vr_a   * rR(a)
+              r0_y   = r0_y   + vr_a   * rZ(a)
+              r0_p   = r0_p   + vr_a   * rP(a)
+              T0_raw = T0_raw + vt_a   * rv(a)
+              T0_x   = T0_x   + vt_a   * rR(a)
+              T0_y   = T0_y   + vt_a   * rZ(a)
+              T0_p   = T0_p   + vt_a   * rP(a)
+            end do
+          end if
+
+          r0   = abs(r0_raw)
+          T0   = abs(T0_raw)
+          p0   = r0 * T0
+          p0_x = r0_x * T0 + r0 * T0_x
+          p0_y = r0_y * T0 + r0 * T0_y
+          if (do_v) then
+            p0_p = r0_p * T0 + r0 * T0_p
+            P_B  = (F0 / BigR) * p0_p + (p0_x * ps0_y - p0_y * ps0_x)
+          end if
+
+          if (has_axis_u) then
+            call pfafem_eval_qp_basis(node_list, element_list, ielm, eP, iq, ms, mt, &
+                                      BigR, y_g, phi_q, .true., n_act, act_u, act_io, act_jb, &
+                                      bv, bR, bZ, bP)
+          else
+            n_act = n_raw
+            act_u(1:n_act)  = raw_u(1:n_act)
+            act_io(1:n_act) = raw_io(1:n_act)
+            act_jb(1:n_act) = raw_jb(1:n_act)
+            bv(1:n_act) = rv(1:n_act); bR(1:n_act) = rR(1:n_act)
+            bZ(1:n_act) = rZ(1:n_act); bP(1:n_act) = rP(1:n_act)
+          end if
+
+          do a = 1, n_act
+            v_y = bZ(a)
+            if (do_v) Db_tst = (F0 / BigR) * bP(a) + (bR(a) * ps0_y - v_y * ps0_x)
+
+            do b = 1, n_act
+              ivp    = pfafem_cache(ielm)%pair_map(act_u(a), act_u(b))
+              u_x    = bR(b)
+              u_y    = bZ(b)
+              a_curv = -2.d0 * BigR**2 * v_y * (p0_x * u_y - p0_y * u_x) &
+                       -4.d0 * GAMMA_l * BigR * p0 * v_y * u_y
+              a_uu   = cv * a_curv
+
+              W_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp) = &
+                W_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp) + wst_tor * a_uu
+
+              if (do_v) then
+                Db_tri = (F0 / BigR) * bP(b) + (u_x * ps0_y - u_y * ps0_x)
+                q_tri  = bv(b) * P_B + GAMMA_l * p0 * Db_tri
+
+                WV_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp, 1) = &
+                  WV_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp, 1) &
+                  + wst_tor * cv * (Db_tst * q_tri / BigR)
+
+                WV_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp, 2) = &
+                  WV_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp, 2) &
+                  - wst_tor * cv * Db_tst * (2.d0 * GAMMA_l * p0 * u_y)
+
+                WV_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp, 3) = &
+                  WV_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp, 3) &
+                  + wst_tor * cv * (2.d0 * v_y * q_tri)
+              end if
+            end do
+          end do
+
+        end do
+      end do
+    end do
+  end do
+end subroutine pc_elt_matrix_force_pfafem
 
 end module mod_pc_elt_matrix_force_fft

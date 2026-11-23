@@ -19,6 +19,7 @@ module mod_petsc_pc_sf_ops
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_raw_csr, only: split_parts, get_ij, put_ij, c_baij_get, c_baij_restore
+#include "petsc_f90_compat.h"
   implicit none
   private
 
@@ -43,6 +44,8 @@ module mod_petsc_pc_sf_ops
     integer, allocatable :: sdst(:), stag(:), soff(:), scnt(:)
     integer(c_int32_t), allocatable :: sa(:), sw(:)    !< +k / -k: k-th value of A's (W's) diagonal / off-diagonal part
     integer(c_int8_t), allocatable :: ss(:), sc(:)     !< W source of sw; 1 = times opz
+    integer :: nb_ad = 0, nb_ao = 0, nb_wd = 0, nb_wo = 0
+    integer(c_int32_t), allocatable :: sl_blk(:), su_blk(:)
   end type sf_op_t
 
   logical, save, public  :: sfo_split = .false.         !< mode split layout
@@ -61,7 +64,7 @@ module mod_petsc_pc_sf_ops
   PetscInt, allocatable, save :: rsx(:)                 !< first full-system row of each global rank
   integer, allocatable, save :: myslots(:)
   VecScatter, save :: scv
-  Vec, save :: stagev
+  Vec, save :: stagev, xtv
   integer, save :: nsv = 0
   logical, save :: vec_ok = .false.
 
@@ -103,7 +106,7 @@ contains
     n_idx = idx0(gnp)
 
     ! ranks per family in proportion to its slots, largest remainder first
-    sfo_nfam = merge((n_tor + 1) / 2, 1, split)
+    sfo_nfam = merge(n_tor / 2 + 1, 1, split)
     if (gnp < sfo_nfam) then
       if (my_id == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   FATAL: physics_pc_sf_mode_split needs at "// &
         "least one rank per |n| family: ", sfo_nfam, " families, ", gnp, " ranks"
@@ -111,6 +114,7 @@ contains
     endif
     allocate(nrk(sfo_nfam), ideal(sfo_nfam), fr0(sfo_nfam + 1))
     ideal = 2.d0; ideal(1) = 1.d0
+    if (split .and. mod(n_tor, 2) == 0) ideal(sfo_nfam) = 1.d0
     ideal = gnp * ideal / sum(ideal)
     nrk = max(1, int(ideal))
     do while (sum(nrk) < gnp)
@@ -199,6 +203,8 @@ contains
       s = [(m, m = 0, n_tor - 1)]
     else if (f == 1) then
       s = [0]
+    else if (2 * f - 2 >= n_tor) then
+      s = [2 * f - 3]
     else
       s = [2 * f - 3, 2 * f - 2]
     endif
@@ -223,6 +229,10 @@ contains
       if (f == 1) then
         write(*,'(A,I0,A,I0,A,I0,A,I0)') "[Physics PC]     family ", f, ": ", nrk(f), &
           " rank(s), slot 0 (n = 0), indices/rank ", nmin, "-", nmax
+      else if (size(fslots(f)) == 1) then
+        write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0)') "[Physics PC]     family ", f, ": ", nrk(f), &
+          " rank(s), slot ", 2 * f - 3, " (Nyquist |n| group ", f - 1, "), indices/rank ", &
+          nmin, "-", nmax
       else
         write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,I0)') "[Physics PC]     family ", f, ": ", nrk(f), &
           " rank(s), slots ", 2 * f - 3, ", ", 2 * f - 2, " (|n| group ", f - 1, "), indices/rank ", &
@@ -236,6 +246,7 @@ contains
   !! communicator.
   subroutine sfo_build(op, Aj, W, opz, my_id)
     use mod_parameters, only: n_tor, n_var
+    use phys_module,    only: use_pfafem
     type(sf_op_t), intent(inout) :: op
     Mat, intent(in)     :: Aj, W(:)
     real*8, intent(in)  :: opz
@@ -266,6 +277,8 @@ contains
     call split_parts(Aj, .true., Ad, Ao, ga)
     call get_ij(Ad, .true., nad, aia, aja)
     call get_ij(Ao, .true., nao, oia, oja)
+    op%nb_ad = int(aia(nad + 1)); op%nb_ao = int(oia(nao + 1))
+    op%nb_wd = 0; op%nb_wo = 0
     na_d = int(aia(nad + 1), 8) * bsa * bsa
     na_o = int(oia(nao + 1), 8) * bsa * bsa
     nw_d = 0; nw_o = 0
@@ -278,6 +291,7 @@ contains
       call get_ij(Wd, .true., nwd, wia, wja)
       call get_ij(Wo, .true., nwo, woia, woja)
       if (nwd /= nad) call fail("W's block rows are not A's")
+      op%nb_wd = int(wia(nwd + 1)); op%nb_wo = int(woia(nwo + 1))
       nw_d = int(wia(nwd + 1), 8) * n_tor * n_tor
       nw_o = int(woia(nwo + 1), 8) * n_tor * n_tor
       do iw = 1, size(W)
@@ -526,8 +540,126 @@ contains
     if (k < 0) apos = -apos
   end function apos
 
+  pure integer function find_diag_blk(ia, ja, l, col_loc) result(p)
+    PetscInt, intent(in) :: ia(:), ja(:)
+    integer, intent(in)  :: l, col_loc
+    integer :: lo, hi, mid, v
+    lo = int(ia(l + 1)) + 1
+    hi = int(ia(l + 2))
+    p = 0
+    do while (lo <= hi)
+      mid = (lo + hi) / 2
+      v = int(ja(mid))
+      if (v == col_loc) then
+        p = mid
+        return
+      else if (v < col_loc) then
+        lo = mid + 1
+      else
+        hi = mid - 1
+      endif
+    enddo
+  end function find_diag_blk
+
+  pure integer function find_offd_blk(ia, ja, gmap, l, col_glob) result(p)
+    PetscInt, intent(in) :: ia(:), ja(:), gmap(:)
+    integer, intent(in)  :: l, col_glob
+    integer :: lo, hi, mid, v
+    lo = int(ia(l + 1)) + 1
+    hi = int(ia(l + 2))
+    p = 0
+    do while (lo <= hi)
+      mid = (lo + hi) / 2
+      v = int(gmap(ja(mid) + 1))
+      if (v == col_glob) then
+        p = mid
+        return
+      else if (v < col_glob) then
+        lo = mid + 1
+      else
+        hi = mid - 1
+      endif
+    enddo
+  end function find_offd_blk
+
+  subroutine sfo_refresh_pfafem_offsets(op, Ad, Ao, ga, W)
+    use mod_parameters, only: n_tor, n_var
+    type(sf_op_t), intent(inout) :: op
+    Mat, intent(in) :: Ad, Ao, W(:)
+    PetscInt, pointer, intent(in) :: ga(:)
+    Mat :: Wd, Wo
+    PetscInt, pointer :: aia(:), aja(:), oia(:), oja(:)
+    PetscInt, pointer :: gw(:), wia(:), wja(:), woia(:), woja(:)
+    PetscInt :: nad, nao, nwd, nwo
+    integer :: bsa, me0, iw0, k, l, u, p_blk
+    integer(8) :: bsa2, bsw2, rem8
+    logical :: a_changed, w_changed
+
+    bsa  = n_var * n_tor
+    bsa2 = int(bsa, 8) * int(bsa, 8)
+    bsw2 = int(n_tor, 8) * int(n_tor, 8)
+    me0  = idx0(gme)
+
+    call get_ij(Ad, .true., nad, aia, aja)
+    call get_ij(Ao, .true., nao, oia, oja)
+    a_changed = (int(aia(nad + 1)) /= op%nb_ad) .or. (int(oia(nao + 1)) /= op%nb_ao)
+    if (a_changed) then
+      do k = 1, size(op%sa)
+        if (op%sa(k) == 0) cycle
+        l = int(op%sl_blk(k))
+        u = int(op%su_blk(k))
+        rem8 = mod(int(abs(op%sa(k)), 8) - 1_8, bsa2)
+        if (op%sa(k) > 0) then
+          p_blk = find_diag_blk(aia, aja, l, u - me0)
+          if (p_blk <= 0) call fail("missing A diagonal block after dynamic sparsity update")
+          op%sa(k) = int((int(p_blk, 8) - 1_8) * bsa2 + rem8 + 1_8, c_int32_t)
+        else
+          p_blk = find_offd_blk(oia, oja, ga, l, u)
+          if (p_blk <= 0) call fail("missing A off-diagonal block after dynamic sparsity update")
+          op%sa(k) = -int((int(p_blk, 8) - 1_8) * bsa2 + rem8 + 1_8, c_int32_t)
+        endif
+      enddo
+      op%nb_ad = int(aia(nad + 1))
+      op%nb_ao = int(oia(nao + 1))
+    endif
+    call put_ij(Ad, .true., nad, aia, aja)
+    call put_ij(Ao, .true., nao, oia, oja)
+
+    if (op%has_w) then
+      iw0 = minval(op%wid(1:op%nf, 1:op%nf), mask=op%wid(1:op%nf, 1:op%nf) > 0)
+      call split_parts(W(iw0), .true., Wd, Wo, gw)
+      call get_ij(Wd, .true., nwd, wia, wja)
+      call get_ij(Wo, .true., nwo, woia, woja)
+      w_changed = (int(wia(nwd + 1)) /= op%nb_wd) .or. (int(woia(nwo + 1)) /= op%nb_wo)
+      if (w_changed) then
+        do k = 1, size(op%sw)
+          if (op%sw(k) == 0) cycle
+          l = int(op%sl_blk(k))
+          u = int(op%su_blk(k))
+          rem8 = mod(int(abs(op%sw(k)), 8) - 1_8, bsw2)
+          if (op%sw(k) > 0) then
+            p_blk = find_diag_blk(wia, wja, l, u - me0)
+            if (p_blk <= 0) call fail("missing W diagonal block after dynamic sparsity update")
+            op%sw(k) = int((int(p_blk, 8) - 1_8) * bsw2 + rem8 + 1_8, c_int32_t)
+          else
+            p_blk = find_offd_blk(woia, woja, gw, l, u)
+            if (p_blk <= 0) call fail("missing W off-diagonal block after dynamic sparsity update")
+            op%sw(k) = -int((int(p_blk, 8) - 1_8) * bsw2 + rem8 + 1_8, c_int32_t)
+          endif
+        enddo
+        op%nb_wd = int(wia(nwd + 1))
+        op%nb_wo = int(woia(nwo + 1))
+      endif
+      call put_ij(Wd, .true., nwd, wia, wja)
+      call put_ij(Wo, .true., nwo, woia, woja)
+    endif
+  end subroutine sfo_refresh_pfafem_offsets
+
   !> Refill op from A and W. Collective on the global communicator.
   subroutine sfo_fill(op, A, W, opz)
+    use mod_parameters, only: n_tor, n_var
+    use phys_module,    only: use_pfafem
+    use mod_pfafem,     only: pfafem_Q
     type(sf_op_t), intent(inout) :: op
     Mat, intent(in)    :: A, W(:)
     real*8, intent(in) :: opz
@@ -535,6 +667,7 @@ contains
       Mat :: d, o
       type(c_ptr) :: pd, po
       real(c_double), pointer :: vd(:) => null(), vo(:) => null()
+      real(c_double), allocatable :: cd(:), co(:)
       logical :: on = .false.
     end type wvals_t
     Mat :: Ad, Ao
@@ -542,14 +675,18 @@ contains
     type(c_ptr) :: pad, pao
     real(c_double), pointer :: va_d(:), va_o(:)
     type(wvals_t), allocatable :: wv(:)
-    real(c_double), allocatable :: sbuf(:)
+    real(c_double), allocatable :: sbuf(:), ca_d(:,:,:), ca_o(:,:,:)
     integer(c_int) :: rc
-    integer :: k, nreq, mpierr, iw
+    integer :: k, nreq, mpierr, iw, bsa, rem, cw, rw, v0, e0, m, qs, p_t, q_t, nval_op
+    integer :: a_f, b_f, e_f, v_f, n_ev, iev, iblk, ev_id(n_var, n_var), ev_e(n_var * n_var), ev_v(n_var * n_var)
+    integer(8) :: bsa2, bsw2, pos8, blk_off
     integer, allocatable :: reqs(:)
-    real*8 :: x
+    real*8 :: x, acc_p, tmp_mq(n_tor, n_tor)
+    logical :: local_direct
     PetscErrorCode :: ierr
 
     call split_parts(A, .true., Ad, Ao, ga)
+    if (use_pfafem .and. allocated(op%sl_blk)) call sfo_refresh_pfafem_offsets(op, Ad, Ao, ga, W)
     rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pad); call chk(rc)
     rc = c_baij_get(transfer(Ao%v, 0_c_intptr_t), pao); call chk(rc)
     call c_f_pointer(pad, va_d, [huge(1)])
@@ -567,28 +704,224 @@ contains
       enddo
     endif
 
-    allocate(sbuf(max(size(op%sa), 1)))
-    !$omp parallel do private(x) schedule(static)
-    do k = 1, size(op%sa)
-      x = 0.d0
-      if (op%sa(k) > 0) then
-        x = va_d(op%sa(k))
-      else if (op%sa(k) < 0) then
-        x = va_o(-op%sa(k))
-      endif
-      if (allocated(op%sc)) then
-        if (op%sc(k) == 1) x = x * opz
-      endif
-      if (op%has_w) then
-        if (op%sw(k) > 0) then
-          x = x + wv(op%ss(k))%vd(op%sw(k))
-        else if (op%sw(k) < 0) then
-          x = x + wv(op%ss(k))%vo(-op%sw(k))
-        endif
-      endif
-      sbuf(k) = x
+    nval_op = 1
+    do k = 1, op%nrecv
+      nval_op = max(nval_op, op%roff(k) + op%rcnt(k))
     enddo
-    !$omp end parallel do
+    if (.not. allocated(op%val)) allocate(op%val(nval_op))
+    local_direct = (.not. sfo_split) .and. (size(op%sa) == nval_op)
+    if (.not. local_direct) allocate(sbuf(max(size(op%sa), 1)))
+    if (use_pfafem) then
+      bsa  = n_var * n_tor
+      bsa2 = int(bsa, 8) * int(bsa, 8)
+      bsw2 = int(n_tor, 8) * int(n_tor, 8)
+
+      ! Collect unique active (e, v) variable blocks accessed by op
+      ev_id = 0
+      n_ev  = 0
+      do a_f = 1, op%nf
+        do b_f = 1, op%nf
+          e_f = op%se(a_f, b_f)
+          v_f = op%sv(a_f, b_f)
+          if (e_f > 0 .and. v_f > 0) then
+            if (ev_id(e_f, v_f) == 0) then
+              n_ev = n_ev + 1
+              ev_id(e_f, v_f) = n_ev
+              ev_e(n_ev) = e_f
+              ev_v(n_ev) = v_f
+            endif
+          endif
+        enddo
+      enddo
+
+      if (n_ev > 0) then
+        allocate(ca_d(int(bsw2), n_ev, max(1, op%nb_ad)))
+        allocate(ca_o(int(bsw2), n_ev, max(1, op%nb_ao)))
+        !$omp parallel default(shared) private(iblk, blk_off, iev, e0, v0, q_t, m, p_t, qs, acc_p, x, tmp_mq)
+        !$omp do schedule(static)
+        do iblk = 1, op%nb_ad
+          blk_off = int(iblk - 1, 8) * bsa2
+          do iev = 1, n_ev
+            e0 = (ev_e(iev) - 1) * n_tor
+            v0 = (ev_v(iev) - 1) * n_tor
+            do q_t = 0, n_tor - 1
+              do m = 0, n_tor - 1
+                acc_p = 0.d0
+                do p_t = 0, n_tor - 1
+                  acc_p = acc_p + pfafem_Q(p_t + 1, m + 1) * va_d(blk_off + int((v0 + q_t) * bsa + (e0 + p_t) + 1, 8))
+                enddo
+                tmp_mq(m + 1, q_t + 1) = acc_p
+              enddo
+            enddo
+            do qs = 0, n_tor - 1
+              do m = 0, n_tor - 1
+                if (.not. kept(m, qs)) cycle
+                x = 0.d0
+                do q_t = 0, n_tor - 1
+                  x = x + pfafem_Q(q_t + 1, qs + 1) * tmp_mq(m + 1, q_t + 1)
+                enddo
+                ca_d(qs * n_tor + m + 1, iev, iblk) = x
+              enddo
+            enddo
+          enddo
+        enddo
+        !$omp end do nowait
+
+        !$omp do schedule(static)
+        do iblk = 1, op%nb_ao
+          blk_off = int(iblk - 1, 8) * bsa2
+          do iev = 1, n_ev
+            e0 = (ev_e(iev) - 1) * n_tor
+            v0 = (ev_v(iev) - 1) * n_tor
+            do q_t = 0, n_tor - 1
+              do m = 0, n_tor - 1
+                acc_p = 0.d0
+                do p_t = 0, n_tor - 1
+                  acc_p = acc_p + pfafem_Q(p_t + 1, m + 1) * va_o(blk_off + int((v0 + q_t) * bsa + (e0 + p_t) + 1, 8))
+                enddo
+                tmp_mq(m + 1, q_t + 1) = acc_p
+              enddo
+            enddo
+            do qs = 0, n_tor - 1
+              do m = 0, n_tor - 1
+                if (.not. kept(m, qs)) cycle
+                x = 0.d0
+                do q_t = 0, n_tor - 1
+                  x = x + pfafem_Q(q_t + 1, qs + 1) * tmp_mq(m + 1, q_t + 1)
+                enddo
+                ca_o(qs * n_tor + m + 1, iev, iblk) = x
+              enddo
+            enddo
+          enddo
+        enddo
+        !$omp end do
+        !$omp end parallel
+      endif
+
+      if (op%has_w) then
+        do iw = 1, size(W)
+          if (.not. wv(iw)%on) cycle
+          allocate(wv(iw)%cd(max(1_8, int(op%nb_wd, 8) * bsw2)))
+          allocate(wv(iw)%co(max(1_8, int(op%nb_wo, 8) * bsw2)))
+          !$omp parallel default(shared) private(iblk, blk_off, q_t, m, p_t, qs, acc_p, x, tmp_mq)
+          !$omp do schedule(static)
+          do iblk = 1, op%nb_wd
+            blk_off = int(iblk - 1, 8) * bsw2
+            do q_t = 0, n_tor - 1
+              do m = 0, n_tor - 1
+                acc_p = 0.d0
+                do p_t = 0, n_tor - 1
+                  acc_p = acc_p + pfafem_Q(p_t + 1, m + 1) * wv(iw)%vd(blk_off + int(q_t * n_tor + p_t + 1, 8))
+                enddo
+                tmp_mq(m + 1, q_t + 1) = acc_p
+              enddo
+            enddo
+            do qs = 0, n_tor - 1
+              do m = 0, n_tor - 1
+                if (.not. kept(m, qs)) cycle
+                x = 0.d0
+                do q_t = 0, n_tor - 1
+                  x = x + pfafem_Q(q_t + 1, qs + 1) * tmp_mq(m + 1, q_t + 1)
+                enddo
+                wv(iw)%cd(blk_off + int(qs * n_tor + m + 1, 8)) = x
+              enddo
+            enddo
+          enddo
+          !$omp end do nowait
+
+          !$omp do schedule(static)
+          do iblk = 1, op%nb_wo
+            blk_off = int(iblk - 1, 8) * bsw2
+            do q_t = 0, n_tor - 1
+              do m = 0, n_tor - 1
+                acc_p = 0.d0
+                do p_t = 0, n_tor - 1
+                  acc_p = acc_p + pfafem_Q(p_t + 1, m + 1) * wv(iw)%vo(blk_off + int(q_t * n_tor + p_t + 1, 8))
+                enddo
+                tmp_mq(m + 1, q_t + 1) = acc_p
+              enddo
+            enddo
+            do qs = 0, n_tor - 1
+              do m = 0, n_tor - 1
+                if (.not. kept(m, qs)) cycle
+                x = 0.d0
+                do q_t = 0, n_tor - 1
+                  x = x + pfafem_Q(q_t + 1, qs + 1) * tmp_mq(m + 1, q_t + 1)
+                enddo
+                wv(iw)%co(blk_off + int(qs * n_tor + m + 1, 8)) = x
+              enddo
+            enddo
+          enddo
+          !$omp end do
+          !$omp end parallel
+        enddo
+      endif
+
+      !$omp parallel do private(x, pos8, iblk, rem, cw, rw, v_f, e_f, qs, m, iev) schedule(static)
+      do k = 1, size(op%sa)
+        x = 0.d0
+        if (op%sa(k) /= 0) then
+          pos8 = int(abs(op%sa(k)), 8) - 1_8
+          iblk = int(pos8 / bsa2) + 1
+          rem  = int(pos8 - int(iblk - 1, 8) * bsa2)
+          cw   = rem / bsa
+          rw   = rem - cw * bsa
+          v_f  = cw / n_tor + 1
+          qs   = cw - (v_f - 1) * n_tor
+          e_f  = rw / n_tor + 1
+          m    = rw - (e_f - 1) * n_tor
+          iev  = ev_id(e_f, v_f)
+          if (op%sa(k) > 0) then
+            x = ca_d(qs * n_tor + m + 1, iev, iblk)
+          else
+            x = ca_o(qs * n_tor + m + 1, iev, iblk)
+          endif
+        endif
+        if (allocated(op%sc)) then
+          if (op%sc(k) == 1) x = x * opz
+        endif
+        if (op%has_w) then
+          if (op%sw(k) > 0) then
+            x = x + wv(op%ss(k))%cd(op%sw(k))
+          else if (op%sw(k) < 0) then
+            x = x + wv(op%ss(k))%co(-op%sw(k))
+          endif
+        endif
+        if (local_direct) then
+          op%val(k) = x
+        else
+          sbuf(k) = x
+        endif
+      enddo
+      !$omp end parallel do
+      if (allocated(ca_d)) deallocate(ca_d, ca_o)
+    else
+      !$omp parallel do private(x) schedule(static)
+      do k = 1, size(op%sa)
+        x = 0.d0
+        if (op%sa(k) > 0) then
+          x = va_d(op%sa(k))
+        else if (op%sa(k) < 0) then
+          x = va_o(-op%sa(k))
+        endif
+        if (allocated(op%sc)) then
+          if (op%sc(k) == 1) x = x * opz
+        endif
+        if (op%has_w) then
+          if (op%sw(k) > 0) then
+            x = x + wv(op%ss(k))%vd(op%sw(k))
+          else if (op%sw(k) < 0) then
+            x = x + wv(op%ss(k))%vo(-op%sw(k))
+          endif
+        endif
+        if (local_direct) then
+          op%val(k) = x
+        else
+          sbuf(k) = x
+        endif
+      enddo
+      !$omp end parallel do
+    endif
 
     rc = c_baij_restore(transfer(Ao%v, 0_c_intptr_t), pao); call chk(rc)
     rc = c_baij_restore(transfer(Ad%v, 0_c_intptr_t), pad); call chk(rc)
@@ -598,21 +931,25 @@ contains
       rc = c_baij_restore(transfer(wv(iw)%d%v, 0_c_intptr_t), wv(iw)%pd); call chk(rc)
     enddo
 
-    allocate(reqs(op%nrecv + op%nsend))
-    nreq = 0
-    do k = 1, op%nrecv
-      nreq = nreq + 1
-      call MPI_Irecv(op%val(op%roff(k) + 1), op%rcnt(k), MPI_DOUBLE_PRECISION, op%rsrc(k), op%rtag(k), &
-                     gcomm, reqs(nreq), mpierr)
-    enddo
-    do k = 1, op%nsend
-      nreq = nreq + 1
-      call MPI_Isend(sbuf(op%soff(k) + 1), op%scnt(k), MPI_DOUBLE_PRECISION, op%sdst(k), op%stag(k), &
-                     gcomm, reqs(nreq), mpierr)
-    enddo
-    call MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE, mpierr)
+    if (.not. local_direct) then
+      allocate(reqs(op%nrecv + op%nsend))
+      nreq = 0
+      do k = 1, op%nrecv
+        nreq = nreq + 1
+        call MPI_Irecv(op%val(op%roff(k) + 1), op%rcnt(k), MPI_DOUBLE_PRECISION, op%rsrc(k), op%rtag(k), &
+                       gcomm, reqs(nreq), mpierr)
+      enddo
+      do k = 1, op%nsend
+        nreq = nreq + 1
+        call MPI_Isend(sbuf(op%soff(k) + 1), op%scnt(k), MPI_DOUBLE_PRECISION, op%sdst(k), op%stag(k), &
+                       gcomm, reqs(nreq), mpierr)
+      enddo
+      call MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE, mpierr)
+      deallocate(reqs, sbuf)
+    endif
     ! in place: same pattern and arrays, a new object state for MUMPS and the GMG
     call MatUpdateMPIAIJWithArray(op%mat, op%val, ierr)
+    deallocate(op%val)
 
   contains
 
@@ -634,17 +971,34 @@ contains
   !! k = 1 .. size(v). Rank-local on the global layout.
   subroutine sfo_vars_in(x, v)
     use mod_parameters, only: n_var, n_tor
+    use phys_module,    only: use_pfafem
+    use mod_pfafem,     only: pfafem_QT
     Vec :: x
     Vec :: v(:)
-    PetscScalar, pointer :: xa(:), va(:)
+    PetscScalar, pointer :: xa(:), xta(:), va(:)
     PetscErrorCode :: ierr
     PetscInt :: nl
     integer :: k, i, bs
 
     if (sfo_split) then
       call vec_setup(x, size(v))
-      call VecScatterBegin(scv, x, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
-      call VecScatterEnd(scv, x, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      if (use_pfafem) then
+        call VecGetLocalSize(x, nl, ierr)
+        call VecGetArrayRead(x, xa, ierr)
+        call VecGetArray(xtv, xta, ierr)
+        !$omp parallel do private(i) schedule(static)
+        do i = 0, int(nl) / n_tor - 1
+          xta(i * n_tor + 1 : (i + 1) * n_tor) = matmul(pfafem_QT, xa(i * n_tor + 1 : (i + 1) * n_tor))
+        enddo
+        !$omp end parallel do
+        call VecRestoreArray(xtv, xta, ierr)
+        call VecRestoreArrayRead(x, xa, ierr)
+        call VecScatterBegin(scv, xtv, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
+        call VecScatterEnd(scv, xtv, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      else
+        call VecScatterBegin(scv, x, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
+        call VecScatterEnd(scv, x, stagev, INSERT_VALUES, SCATTER_FORWARD, ierr)
+      endif
       call VecGetArrayRead(stagev, xa, ierr)
       do k = 1, nsv
         call VecGetArray(v(k), va, ierr)
@@ -659,9 +1013,19 @@ contains
     call VecGetArrayRead(x, xa, ierr)
     do k = 1, size(v)
       call VecGetArray(v(k), va, ierr)
-      do i = 0, int(nl) / bs - 1
-        va(i * n_tor + 1 : (i + 1) * n_tor) = xa(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor)
-      enddo
+      if (use_pfafem) then
+        !$omp parallel do private(i) schedule(static)
+        do i = 0, int(nl) / bs - 1
+          va(i * n_tor + 1 : (i + 1) * n_tor) = matmul(pfafem_QT, xa(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor))
+        enddo
+        !$omp end parallel do
+      else
+        !$omp parallel do private(i) schedule(static)
+        do i = 0, int(nl) / bs - 1
+          va(i * n_tor + 1 : (i + 1) * n_tor) = xa(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor)
+        enddo
+        !$omp end parallel do
+      endif
       call VecRestoreArray(v(k), va, ierr)
     enddo
     call VecRestoreArrayRead(x, xa, ierr)
@@ -671,9 +1035,11 @@ contains
   !! further variables of y are left untouched.
   subroutine sfo_vars_out(v, y)
     use mod_parameters, only: n_var, n_tor
+    use phys_module,    only: use_pfafem
+    use mod_pfafem,     only: pfafem_Q
     Vec :: v(:)
     Vec :: y
-    PetscScalar, pointer :: ya(:), va(:)
+    PetscScalar, pointer :: ya(:), xta(:), va(:)
     PetscErrorCode :: ierr
     PetscInt :: nl
     integer :: k, i, bs
@@ -686,8 +1052,28 @@ contains
         call VecRestoreArrayRead(v(k), va, ierr)
       enddo
       call VecRestoreArray(stagev, ya, ierr)
-      call VecScatterBegin(scv, stagev, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
-      call VecScatterEnd(scv, stagev, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
+      if (use_pfafem) then
+        call VecZeroEntries(xtv, ierr)
+        call VecScatterBegin(scv, stagev, xtv, INSERT_VALUES, SCATTER_REVERSE, ierr)
+        call VecScatterEnd(scv, stagev, xtv, INSERT_VALUES, SCATTER_REVERSE, ierr)
+        call VecGetLocalSize(y, nl, ierr)
+        bs = n_var * n_tor
+        call VecGetArrayRead(xtv, xta, ierr)
+        call VecGetArray(y, ya, ierr)
+        !$omp parallel do private(i, k) schedule(static)
+        do i = 0, int(nl) / bs - 1
+          do k = 1, nsv
+            ya(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor) = &
+              matmul(pfafem_Q, xta(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor))
+          enddo
+        enddo
+        !$omp end parallel do
+        call VecRestoreArray(y, ya, ierr)
+        call VecRestoreArrayRead(xtv, xta, ierr)
+      else
+        call VecScatterBegin(scv, stagev, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
+        call VecScatterEnd(scv, stagev, y, INSERT_VALUES, SCATTER_REVERSE, ierr)
+      endif
       return
     endif
     call VecGetLocalSize(y, nl, ierr)
@@ -695,9 +1081,19 @@ contains
     call VecGetArray(y, ya, ierr)
     do k = 1, size(v)
       call VecGetArrayRead(v(k), va, ierr)
-      do i = 0, int(nl) / bs - 1
-        ya(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor) = va(i * n_tor + 1 : (i + 1) * n_tor)
-      enddo
+      if (use_pfafem) then
+        !$omp parallel do private(i) schedule(static)
+        do i = 0, int(nl) / bs - 1
+          ya(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor) = matmul(pfafem_Q, va(i * n_tor + 1 : (i + 1) * n_tor))
+        enddo
+        !$omp end parallel do
+      else
+        !$omp parallel do private(i) schedule(static)
+        do i = 0, int(nl) / bs - 1
+          ya(i * bs + (k - 1) * n_tor + 1 : i * bs + k * n_tor) = va(i * n_tor + 1 : (i + 1) * n_tor)
+        enddo
+        !$omp end parallel do
+      endif
       call VecRestoreArrayRead(v(k), va, ierr)
     enddo
     call VecRestoreArray(y, ya, ierr)
@@ -707,6 +1103,7 @@ contains
   !! layout of variables 1 .. nvars, once.
   subroutine vec_setup(x, nvars)
     use mod_parameters, only: n_tor, n_var
+    use phys_module,    only: use_pfafem
     Vec, intent(in) :: x
     integer, intent(in) :: nvars
     PetscInt, allocatable :: idx(:)
@@ -733,6 +1130,7 @@ contains
     enddo
     call ISCreateGeneral(gcomm, k, idx, PETSC_COPY_VALUES, isv, ierr)
     call VecCreateMPI(gcomm, k, PETSC_DETERMINE, stagev, ierr)
+    if (use_pfafem) call VecDuplicate(x, xtv, ierr)
     call VecScatterCreate(x, isv, stagev, PETSC_NULL_IS, scv, ierr)
     call ISDestroy(isv, ierr)
     vec_ok = .true.

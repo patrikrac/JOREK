@@ -33,12 +33,30 @@ module mod_integrals3D
   use mod_atomic_coeff_deuterium, only: rec_rate_to_kinetic, atomic_coeff_deuterium
   use mod_sources
   use mod_edge_elements, only : elm_coords
+  use mod_pfafem, only : pfafem_ready, pfafem_cache_epoch, pfafem_eval_point_jet, &
+                         pfafem_trace_point_1st, pfafem_eval_cached_1st
 
   implicit none
   
   private
   
   public :: int3d_new 
+
+#ifndef fullmhd
+  integer, save :: pf_diag_epoch   = -1
+  integer, save :: pf_diag_ife_min = 0
+  integer, save :: pf_diag_ife_max = -1
+  integer, save :: pf_diag_nbnd    = -1
+  integer, allocatable, save :: pf_dvol_em(:,:,:,:,:)
+  real*8,  allocatable, save :: pf_dvol_sm(:,:,:,:,:), pf_dvol_tm(:,:,:,:,:)
+  real*8,  allocatable, save :: pf_dvol_M(:,:,:,:,:,:), pf_dvol_fl(:,:,:,:,:)
+#if STELLARATOR_MODEL
+  real*8,  allocatable, save :: pf_dvol_chi(:,:,:,:,:)
+#endif
+  integer, allocatable, save :: pf_dbnd_em(:,:,:,:)
+  real*8,  allocatable, save :: pf_dbnd_sm(:,:,:,:), pf_dbnd_tm(:,:,:,:)
+  real*8,  allocatable, save :: pf_dbnd_M(:,:,:,:,:), pf_dbnd_fl(:,:,:,:)
+#endif
   
   contains
 
@@ -110,16 +128,18 @@ real*8, allocatable :: qval(:), radav(:)
 
 real*8  :: R_axis,Z_axis,s_axis,t_axis
 real*8  :: current_tot, beta_p, beta_n, beta_t, aminor, current_MA, current_R_tot
-real*8  :: xjac, xjac_R, xjac_Z, BigR, wst, P_int, P_e_int, P_i_int, C_intern, zj0, ps0, r0, T0, Te0, Ti0
-real*8  :: Vol, Volume, Area, Bgeo, area1, surface_area 
+real*8  :: xjac, xjac_R, xjac_Z, BigR, wst, P_int, P_e_int, P_i_int, mag_pres_int, C_intern, zj0, ps0, r0, T0, Te0, Ti0
+real*8  :: Vol_in, Volume_in, Vol_ext, Volume_ext, Volume, Area, Bgeo, area1, surface_area
 real*8  :: psi_as_coord
 real*8  :: AR0, AR0_p, AR0_s, AR0_t, AR0_sp, AR0_tp, AR0_Rp, AZ0, AZ0_p, AZ0_s, AZ0_t, AZ0_sp, AZ0_tp, AZ0_Zp, A30
 real*8  :: A30_p, A30_s, A30_t, A30_ss, A30_tt, A30_st, A30_R, A30_RR, A30_ZZ
 real*8  :: BR_Z, BZ_R
 real*8  :: r0_corr, T0_corr, Te0_corr, Ti0_corr, dTe0_corr_dT, T_or_Te, T_or_Te_corr, T_or_Te_0  
-real*8  :: density_tot, density_in, density_out,  pressure, pressure_in, pressure_out
+real*8  :: density_tot, density_in, density_out,  pressure, pressure_in, pressure_out, mag_pressure, mag_pressure_in, mag_pressure_out
 real*8  :: pressure_e, pressure_e_in, pressure_e_out, pressure_i, pressure_i_in, pressure_i_out
-real*8  :: current_in, current_out, D_int, D_ext, P_ext, C_ext, delta_phi, phi, P_tot, D_tot
+real*8  :: current_in, current_out, D_int, D_ext, P_ext, mag_pres_ext, C_ext, delta_phi, phi, P_tot, mag_pres_tot, D_tot
+real*8  :: beta_tot, beta_in, beta_out, vmec_beta_tot, vmec_beta_in, vmec_beta_out
+real*8  :: VB_int, VB_ext, VB_tot
 real*8  :: C_intern_3d, C_ext_3d, current_R_in, current_R_out, current_R, P_e_ext, P_i_ext, P_e_tot, P_i_tot
 real*8  :: VP_int, VP_ext, VK_int, VK_ext, vpar0, Bv2, BB2, VP_tot, VK_tot
 real*8  :: kin_par_in, kin_par_out, kin_par_tot, kin_perp_in, kin_perp_out, kin_perp_tot
@@ -269,6 +289,13 @@ real*8     :: frad_bg, Lrad_imp                               ! Retain hard-code
 
 ! SAW energy functional (linear MHD)
 real*8     :: SAW_tot, saw_energy_tot, saw_ene_dens, BB2_zero
+integer    :: pf_n_act, pf_a, pf_inode(64), pf_io(64), pf_jb(64)
+real*8     :: pf_bval(64), pf_bdR(64), pf_bdZ(64), pf_bdP(64)
+real*8     :: pf_bdRR(64), pf_bdRZ(64), pf_bdZZ(64), pf_bdRP(64), pf_bdZP(64), pf_bdPP(64)
+real*8     :: pf_u, pf_uR, pf_uZ, pf_uP, pf_uRR, pf_uRZ, pf_uZZ, pf_uRP, pf_uZP
+real*8     :: pf_u3d_R, pf_u3d_Z, pf_vfull, pf_vavg, pf_phi
+real*8     :: pf_hz(n_tor), pf_dhz(n_tor), pf_ddhz(n_tor)
+logical    :: pf_excl_n0
 
 #ifndef NOMPIVERSION
 call MPI_COMM_SIZE(MPI_COMM_WORLD, n_cpu, ierr) ! number of MPI procs
@@ -291,6 +318,9 @@ density_tot  = 0.d0
 pressure = 0.d0
 pressure_i = 0.d0
 pressure_e = 0.d0
+mag_pres_tot = 0.d0
+mag_pres_int = 0.d0
+mag_pres_ext = 0.d0
 D_int    = 0.d0
 P_int    = 0.d0
 P_e_int  = 0.d0
@@ -304,6 +334,7 @@ VP_int   = 0.d0
 local_mom_par_int = 0.d0 
 VK_int   = 0.d0
 VM_int   = 0.d0
+VB_int   = 0.d0
 J2_int   = 0.d0
 D_ext    = 0.d0
 P_ext    = 0.d0
@@ -318,8 +349,10 @@ VP_ext   = 0.d0
 local_mom_par_ext = 0.d0
 VK_ext   = 0.d0
 VM_ext   = 0.d0
+VB_ext   = 0.d0
 J2_ext   = 0.d0
-Vol      = 0.d0
+Vol_in   = 0.d0
+Vol_ext  = 0.d0
 surface_area = 0.d0
 area1    = 0.d0
 P_tot    = 0.d0
@@ -331,6 +364,7 @@ VP_tot   = 0.d0
 local_mom_par_tot = 0.d0
 VK_tot   = 0.d0
 VM_tot   = 0.d0
+VB_tot   = 0.d0
 J2_tot   = 0.d0
 hel1     = 0.d0
 heli_tot = 0.d0
@@ -424,16 +458,32 @@ ife_delta = ceiling(float(element_list%n_elements) / n_cpu)
 ife_min   =      my_id     * ife_delta + 1
 ife_max   = min((my_id +1) * ife_delta, element_list%n_elements)
 
+#ifndef fullmhd
+if (use_pfafem .and. pfafem_ready) then
+  if ((pf_diag_epoch /= pfafem_cache_epoch) .or. (pf_diag_ife_min /= ife_min) .or. &
+      (pf_diag_ife_max /= ife_max) .or. (pf_diag_nbnd /= bnd_elm_list%n_bnd_elements)) then
+    call ensure_pfafem_diag_cache(node_list, element_list, bnd_elm_list, ife_min, ife_max)
+  end if
+end if
+#endif
+
 #ifdef WITH_TiTe
 Tie_min_neg = 0.5*T_min_neg
 #endif
+
+! Pre-initialize to avoid Intel IFX 2025 firstprivate allocatable crash
+do iv = 1, n_vertex_max
+  call init_node(nodes(iv), n_var)
+  call init_node(aux_nodes(iv), n_var)
+end do
 
 !$omp parallel default(none)                                                                                  &
 !$omp   shared(element_list,node_list, aux_node_list, H, H_s, H_t, HZ, HZ_p, ife_min, ife_max, xpoint, xcase, &
 !$omp          H_ss, H_tt, H_st, HZ_pp, HZ_coord, HZ_coord_p,                                                 &
 !$omp          R_xpoint, Z_xpoint, my_id, use_pellet, delta_phi, R_axis, Z_axis, psi_axis, psi_bnd,           &
-!$omp          D_tot, D_int, D_Ext, P_tot, P_int, P_ext, Vol, surface_area, C_intern, C_ext, VP_ext, VP_int,  &
-!$omp          VK_ext, VK_int, VK_tot, VM_ext, VM_int, VM_tot, J2_tot, J2_ext, J2_int,                        &
+!$omp          D_tot, D_int, D_Ext, P_tot, P_int, P_ext, mag_pres_tot, mag_pres_int, mag_pres_ext,            &
+!$omp          Vol_in, Vol_ext, surface_area, C_intern, C_ext, VP_ext, VP_int, VK_ext, VK_int, VK_tot,        &
+!$omp          VM_ext, VM_int, VM_tot, VB_ext, VB_int, VB_tot, J2_tot, J2_ext, J2_int,                        &
 !$omp          H_int, H_ext, S_int, S_ext,psi_xpoint,  F0, VP_tot,eta, T_0, Te_0, T_min,                      &
 !$omp          ne_SI_min, Te_eV_min, rn0_min, P_e_tot, P_i_tot, P_e_int, P_i_int, P_e_ext, P_i_ext,           &
 !$omp          C_intern_3d,C_ext_3d,pellet_amplitude,pellet_R,pellet_Z,pellet_psi,pellet_phi,                 &
@@ -447,7 +497,7 @@ Tie_min_neg = 0.5*T_min_neg
 !$omp          eta_ohmic, central_mass, R2curr_tmp, Zcurr_tmp, ksi_ion,                                       &
 !$omp          local_mom_par_int, local_mom_par_ext, local_mom_par_tot,                                       &
 !$omp          use_ncs, local_Nion, local_Nrec, local_pn, local_Prec, local_Prb, local_Prb_cooling,           &
-!$omp          local_aux_mom_par_int,local_aux_mom_par_ext,local_aux_mom_par_tot,                             &
+!$omp          local_aux_mom_par_int,local_aux_mom_par_ext,local_aux_mom_par_tot, bloating_factor,            &
 #if (defined WITH_Neutrals) || (defined WITH_Impurities)
 !$omp          spi_num_vol, local_source_volume, local_source_volume_drift, drift_distance,                   &
 !$omp          using_spi, n_spi_tot, n_inj, n_spi,                                                            &
@@ -465,8 +515,19 @@ Tie_min_neg = 0.5*T_min_neg
 !$omp          index_main_imp,                                                                                &
 #endif
 !$omp          T_1, T_max_eta, T_max_eta_ohm, eta_T_dependent,                                                & 
+!$omp          use_pfafem, pfafem_ready,                                                                      &
+#ifndef fullmhd
+!$omp          pf_dvol_em, pf_dvol_sm, pf_dvol_tm, pf_dvol_M, pf_dvol_fl,                                     &
+#if STELLARATOR_MODEL
+!$omp          pf_dvol_chi,                                                                                   &
+#endif
+#endif
 !$omp          wgauss_copy, varmin, varmax)                                                                   &
 !$omp   private(ife,iv,inode,element,i,j, k,in, mp, ms, mt,                                             &
+!$omp           pf_n_act, pf_a, pf_inode, pf_io, pf_jb, pf_bval, pf_bdR, pf_bdZ, pf_bdP,                      &
+!$omp           pf_bdRR, pf_bdRZ, pf_bdZZ, pf_bdRP, pf_bdZP, pf_bdPP,                                         &
+!$omp           pf_u, pf_uR, pf_uZ, pf_uP, pf_uRR, pf_uRZ, pf_uZZ, pf_uRP, pf_uZP,                            &
+!$omp           pf_u3d_R, pf_u3d_Z, pf_vfull, pf_vavg, pf_phi, pf_hz, pf_dhz, pf_ddhz,                        &
 !$omp           x_g, y_g, x_s, y_s, x_t, y_t, x_p, y_p, xjac, xjac_R, xjac_Z, eq_g, eq_s, eq_t, eq_p,         &
 !$omp           x_ss, x_tt, x_st, y_ss, y_tt, y_st, eq_ss, eq_tt, eq_st, eq_sp, eq_tp,                        &
 !$omp           eq_spp, eq_tpp, psi_axisym,s_norm, stel_current_source,eq_s_3d, eq_t_3d, wst, BigR,           &
@@ -537,8 +598,10 @@ omp_tid      = 0
 #endif
 !$omp                D_int, D_ext, P_int, H_int, S_int, H_ext, S_ext, P_ext, C_intern, C_ext, &
 !$omp                P_e_int, P_i_int, P_e_ext, P_i_ext, P_e_tot, P_i_tot,                    &
+!$omp                mag_pres_tot, mag_pres_int, mag_pres_ext,                                &
 !$omp                VP_int, VP_ext, VP_tot, VK_tot, VK_int, VK_ext, VM_ext,                  &
-!$omp                VM_int, VM_tot, Vol, surface_area, P_tot, D_tot,J2_tot, J2_int, J2_ext,                &
+!$omp                VM_int, VM_tot, VB_ext, VB_int, VB_tot, Vol_in, Vol_ext,                 &
+!$omp                surface_area, P_tot, D_tot,J2_tot, J2_int, J2_ext,                       &
 !$omp                local_Nion, local_Nrec, local_pn, local_Prec, local_Prb ,                &
 !$omp                local_aux_mom_par_int,local_aux_mom_par_ext,local_aux_mom_par_tot,       &
 !$omp                local_mom_par_int, local_mom_par_ext, local_mom_par_tot,                        &
@@ -594,16 +657,22 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 
 #ifdef fullmhd
           ! --- Equilibrium psi (n=0 only)
-          psi_axisym(ms,mt) = psi_axisym(ms,mt) + nodes(i)%values(1,j,var_A3) * element%size(i,j) * H(i,j,ms,mt)
+          if (use_pfafem .and. pfafem_ready) then
+            psi_axisym(ms,mt) = psi_axisym(ms,mt) + (sum(nodes(i)%values(1:n_tor,j,var_A3))/dble(n_tor)) * element%size(i,j) * H(i,j,ms,mt)
+          else
+            psi_axisym(ms,mt) = psi_axisym(ms,mt) + nodes(i)%values(1,j,var_A3) * element%size(i,j) * H(i,j,ms,mt)
+          end if
 #endif
 
 #if STELLARATOR_MODEL
           s_norm(ms, mt) = s_norm(ms,mt) + nodes(i)%r_tor_eq(j)*element%size(i,j)*H(i,j,ms,mt)
-          do mp=1,n_plane
-            do in=1,n_tor
-              stel_current_source(mp,ms,mt) = stel_current_source(mp,ms,mt) + nodes(i)%j_source(in,j)*element%size(i,j)*H(i,j,ms,mt)*HZ(in,mp)
+          if (.not. (use_pfafem .and. pfafem_ready)) then
+            do mp=1,n_plane
+              do in=1,n_tor
+                stel_current_source(mp,ms,mt) = stel_current_source(mp,ms,mt) + nodes(i)%j_source(in,j)*element%size(i,j)*H(i,j,ms,mt)*HZ(in,mp)
+              end do
             end do
-          end do
+          end if
 #endif
 
         enddo
@@ -613,6 +682,104 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 
   eq_g(:,:,:,:) = 0.d0; eq_s(:,:,:,:) = 0.d0; eq_t(:,:,:,:) = 0.d0; eq_p(:,:,:,:) = 0.d0; eq_ss(:,:,:,:) = 0.d0; eq_tt(:,:,:,:) = 0.d0; eq_st(:,:,:,:) = 0.d0; 
   eq_sp(:,:,:,:) = 0.d0; eq_tp(:,:,:,:) = 0.d0; eq_spp(:,:,:,:) = 0.d0; eq_tpp(:,:,:,:) = 0.d0; eq_s_3d(:,:,:,:) = 0.d0; eq_t_3d(:,:,:,:) = 0.d0;
+  if (use_pfafem .and. pfafem_ready) then
+    do mp=1,n_plane
+      pf_phi = 2.d0 * PI * dble(mp - 1) / dble(n_plane * n_period)
+      call pfafem_hz_interp(pf_phi, pf_hz, pf_dhz, pf_ddhz)
+      do ms=1, n_gauss
+        do mt=1, n_gauss
+#ifdef fullmhd
+          call pfafem_eval_point_jet(node_list, element_list, x_g(mp,ms,mt), y_g(mp,ms,mt), pf_phi, &
+                                     .false., pf_n_act, pf_inode, pf_io, pf_jb, &
+                                     pf_bval, pf_bdR, pf_bdZ, pf_bdP, &
+                                     pf_bdRR, pf_bdRZ, pf_bdZZ, pf_bdRP, pf_bdZP, pf_bdPP)
+#else
+          call pfafem_eval_cached_1st(element_list, pf_phi, &
+                                      pf_dvol_em(:, ms, mt, mp, ife - ife_min + 1), &
+                                      pf_dvol_sm(:, ms, mt, mp, ife - ife_min + 1), &
+                                      pf_dvol_tm(:, ms, mt, mp, ife - ife_min + 1), &
+                                      pf_dvol_M(:, :, ms, mt, mp, ife - ife_min + 1), &
+                                      pf_dvol_fl(:, ms, mt, mp, ife - ife_min + 1), &
+                                      pf_n_act, pf_inode, pf_io, pf_jb, &
+                                      pf_bval, pf_bdR, pf_bdZ, pf_bdP)
+#endif
+#if STELLARATOR_MODEL
+          do pf_a = 1, pf_n_act
+            stel_current_source(mp,ms,mt) = stel_current_source(mp,ms,mt) &
+              + node_list%node(pf_inode(pf_a))%j_source(pf_jb(pf_a), pf_io(pf_a)) * pf_bval(pf_a)
+          end do
+#endif
+          do k=1,n_var
+            pf_u = 0.d0; pf_uR = 0.d0; pf_uZ = 0.d0; pf_uP = 0.d0
+#ifdef fullmhd
+            pf_uRR = 0.d0; pf_uRZ = 0.d0; pf_uZZ = 0.d0; pf_uRP = 0.d0; pf_uZP = 0.d0
+#endif
+            pf_u3d_R = 0.d0; pf_u3d_Z = 0.d0
+            do pf_a = 1, pf_n_act
+              pf_vfull = node_list%node(pf_inode(pf_a))%values(pf_jb(pf_a), pf_io(pf_a), k)
+              pf_vavg  = sum(node_list%node(pf_inode(pf_a))%values(1:n_tor, pf_io(pf_a), k)) / dble(n_tor)
+              pf_u     = pf_u   + pf_vfull * pf_bval(pf_a)
+              pf_uR    = pf_uR  + pf_vfull * pf_bdR(pf_a)
+              pf_uZ    = pf_uZ  + pf_vfull * pf_bdZ(pf_a)
+              pf_uP    = pf_uP  + pf_vfull * pf_bdP(pf_a)
+#ifdef fullmhd
+              pf_uRR   = pf_uRR + pf_vfull * pf_bdRR(pf_a)
+              pf_uRZ   = pf_uRZ + pf_vfull * pf_bdRZ(pf_a)
+              pf_uZZ   = pf_uZZ + pf_vfull * pf_bdZZ(pf_a)
+              pf_uRP   = pf_uRP + pf_vfull * pf_bdRP(pf_a)
+              pf_uZP   = pf_uZP + pf_vfull * pf_bdZP(pf_a)
+#endif
+              pf_u3d_R = pf_u3d_R + (pf_vfull - pf_vavg) * pf_bdR(pf_a)
+              pf_u3d_Z = pf_u3d_Z + (pf_vfull - pf_vavg) * pf_bdZ(pf_a)
+            end do
+            eq_g(mp,k,ms,mt)  = pf_u
+            eq_s(mp,k,ms,mt)  = pf_uR * x_s(mp,ms,mt) + pf_uZ * y_s(mp,ms,mt)
+            eq_t(mp,k,ms,mt)  = pf_uR * x_t(mp,ms,mt) + pf_uZ * y_t(mp,ms,mt)
+            eq_p(mp,k,ms,mt)  = pf_uP + pf_uR * x_p(mp,ms,mt) + pf_uZ * y_p(mp,ms,mt)
+#ifdef fullmhd
+            eq_ss(mp,k,ms,mt) = pf_uRR * x_s(mp,ms,mt)**2 + 2.d0 * pf_uRZ * x_s(mp,ms,mt) * y_s(mp,ms,mt) &
+                              + pf_uZZ * y_s(mp,ms,mt)**2 + pf_uR * x_ss(mp,ms,mt) + pf_uZ * y_ss(mp,ms,mt)
+            eq_tt(mp,k,ms,mt) = pf_uRR * x_t(mp,ms,mt)**2 + 2.d0 * pf_uRZ * x_t(mp,ms,mt) * y_t(mp,ms,mt) &
+                              + pf_uZZ * y_t(mp,ms,mt)**2 + pf_uR * x_tt(mp,ms,mt) + pf_uZ * y_tt(mp,ms,mt)
+            eq_st(mp,k,ms,mt) = pf_uRR * x_s(mp,ms,mt) * x_t(mp,ms,mt) &
+                              + pf_uRZ * (x_s(mp,ms,mt) * y_t(mp,ms,mt) + x_t(mp,ms,mt) * y_s(mp,ms,mt)) &
+                              + pf_uZZ * y_s(mp,ms,mt) * y_t(mp,ms,mt) + pf_uR * x_st(mp,ms,mt) + pf_uZ * y_st(mp,ms,mt)
+            eq_sp(mp,k,ms,mt) = (pf_uRP + pf_uRR * x_p(mp,ms,mt) + pf_uRZ * y_p(mp,ms,mt)) * x_s(mp,ms,mt) &
+                              + (pf_uZP + pf_uRZ * x_p(mp,ms,mt) + pf_uZZ * y_p(mp,ms,mt)) * y_s(mp,ms,mt)
+            eq_tp(mp,k,ms,mt) = (pf_uRP + pf_uRR * x_p(mp,ms,mt) + pf_uRZ * y_p(mp,ms,mt)) * x_t(mp,ms,mt) &
+                              + (pf_uZP + pf_uRZ * x_p(mp,ms,mt) + pf_uZZ * y_p(mp,ms,mt)) * y_t(mp,ms,mt)
+#endif
+            eq_s_3d(mp,k,ms,mt) = pf_u3d_R * x_s(mp,ms,mt) + pf_u3d_Z * y_s(mp,ms,mt)
+            eq_t_3d(mp,k,ms,mt) = pf_u3d_R * x_t(mp,ms,mt) + pf_u3d_Z * y_t(mp,ms,mt)
+            if (k == var_u .and. var_u > 0) then
+              do i = 1, n_vertex_max
+                do j = 1, n_degrees
+                  do in = 1, n_tor
+                    eq_spp(mp,k,ms,mt) = eq_spp(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_s(i,j,ms,mt) * pf_ddhz(in)
+                    eq_tpp(mp,k,ms,mt) = eq_tpp(mp,k,ms,mt) + nodes(i)%values(in,j,k) * element%size(i,j) * H_t(i,j,ms,mt) * pf_ddhz(in)
+                  end do
+                end do
+              end do
+            end if
+            if (present(aux_node_list)) then
+              pf_u = 0.d0; pf_uR = 0.d0; pf_uZ = 0.d0; pf_uP = 0.d0
+              do pf_a = 1, pf_n_act
+                pf_vfull = aux_node_list%node(pf_inode(pf_a))%values(pf_jb(pf_a), pf_io(pf_a), k)
+                pf_u  = pf_u  + pf_vfull * pf_bval(pf_a)
+                pf_uR = pf_uR + pf_vfull * pf_bdR(pf_a)
+                pf_uZ = pf_uZ + pf_vfull * pf_bdZ(pf_a)
+                pf_uP = pf_uP + pf_vfull * pf_bdP(pf_a)
+              end do
+              eq_aux_g(mp,k,ms,mt) = pf_u
+              eq_aux_s(mp,k,ms,mt) = pf_uR * x_s(mp,ms,mt) + pf_uZ * y_s(mp,ms,mt)
+              eq_aux_t(mp,k,ms,mt) = pf_uR * x_t(mp,ms,mt) + pf_uZ * y_t(mp,ms,mt)
+              eq_aux_p(mp,k,ms,mt) = pf_uP + pf_uR * x_p(mp,ms,mt) + pf_uZ * y_p(mp,ms,mt)
+            end if
+          end do
+        end do
+      end do
+    end do
+  else
   do i=1,n_vertex_max
     do j=1,n_degrees
 
@@ -652,6 +819,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
       enddo !mp nplane
     enddo !j n_degrees
   enddo !i n_vertex_max
+  end if
    
   ! --- Determine smallest and largest values of the variables in the whole domain (on Gauss points and toroidal integration surfaces)
   !$omp critical
@@ -698,7 +866,18 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
         BigR = x_g(mp,ms,mt)
 
 #if STELLARATOR_MODEL
+#ifndef fullmhd
+        if (use_pfafem .and. pfafem_ready) then
+          chi = 0.d0
+          chi(1,0,0) = pf_dvol_chi(1, ms, mt, mp, ife - ife_min + 1)
+          chi(0,1,0) = pf_dvol_chi(2, ms, mt, mp, ife - ife_min + 1)
+          chi(0,0,1) = pf_dvol_chi(3, ms, mt, mp, ife - ife_min + 1)
+        else
+          chi = get_chi(x_g(mp,ms,mt),y_g(mp,ms,mt),phi,node_list,element_list,ife,xgauss(ms),xgauss(mt))
+        end if
+#else
         chi = get_chi(x_g(mp,ms,mt),y_g(mp,ms,mt),phi,node_list,element_list,ife,xgauss(ms),xgauss(mt))
+#endif
         Bv2 = chi(1,0,0)**2 + chi(0,1,0)**2 + chi(0,0,1)**2/BigR**2
 #endif
 
@@ -1228,9 +1407,15 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
                - (chi(1,0,0)*dudx + chi(0,1,0)*dudy + chi(0,0,1)*dudp/BigR**2)**2/Bv2**2)*xjac*BigR*wst*delta_phi
         VM_tot = VM_tot + (Bv2*(dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2) &
                - (chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)*xjac*BigR*wst*delta_phi/F0**2
+        VB_tot = VB_tot + 2.0*r0*T0 / (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                    - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2) *xjac*BigR*wst*delta_phi
+        mag_pres_tot = mag_pres_tot + (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                    - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2)/2 *xjac*BigR*wst*delta_phi
 #else
         VK_tot = VK_tot + r0 * (dudx**2 + dudy**2) * BigR**2 * xjac * BigR * wst * delta_phi
         VM_tot = VM_tot + (dpsidx**2+dpsidy**2)/BigR**2 * xjac * BigR * wst * delta_phi
+        VB_tot = VB_tot + 2.0*r0*T0 / BB2 * xjac * BigR * wst * delta_phi
+        mag_pres_tot = mag_pres_tot + BB2/2 * xjac * BigR * wst * delta_phi
 #endif
         J2_tot = J2_tot + eta_T_ohm *(ZJ0/BigR)**2.d0 * xjac * BigR * wst * delta_phi
         
@@ -1432,7 +1617,7 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 #endif
 
 #if STELLARATOR_MODEL
-        if (s_norm(ms,mt) <= 1.d0) then
+        if (s_norm(ms,mt) <= 1.d0 / bloating_factor) then
 #else
         if ( get_psi_n(psi_as_coord, y_g(mp,ms,mt)) <= 1.d0 ) then   !inside LCFS
 #endif
@@ -1474,17 +1659,25 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
           C_intern = C_intern - zj0 /BigR * xjac *        wst * delta_phi    ! 2D integral
           C_intern_3d = C_intern_3d - zj0 * xjac * wst * delta_phi ! 3D integral
           area1    = area1    +  xjac * wst * delta_phi         
-          Vol   = Vol   +             xjac * BigR * wst * delta_phi
+          Vol_in   = Vol_in   +  xjac * BigR * wst * delta_phi
           H_int = H_int + heat_source     * xjac * BigR * wst * delta_phi
           S_int = S_int + particle_source * xjac * BigR * wst * delta_phi
           VP_int = VP_int + r0 * vpar0**2 * BB2 * xjac * BigR * wst * delta_phi
           local_mom_par_int = local_mom_par_int + r0 * vpar0 * sqrt(BB2) * xjac * BigR * wst * delta_phi
 #if STELLARATOR_MODEL
           VK_int = VK_int + r0*(dudx**2 + dudy**2)*BigR**2*xjac*BigR*wst*delta_phi/F0**2
+          VM_int = VM_int + (Bv2*(dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2) &
+                 - (chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)*xjac*BigR*wst*delta_phi/F0**2
+          VB_int = VB_int + 2.0*r0*T0 / (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                      - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2) *xjac*BigR*wst*delta_phi
+          mag_pres_int = mag_pres_int + (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                      - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2)/2 *xjac*BigR*wst*delta_phi
 #else
           VK_int = VK_int + r0 * (dudx**2 + dudy**2) * BigR**2 * xjac * BigR * wst * delta_phi
-#endif
           VM_int = VM_int + (dpsidx**2+dpsidy**2)/BigR**2 * xjac * BigR * wst * delta_phi
+          VB_int = VB_int + 2.0*r0*T0 / BB2 * xjac * BigR * wst * delta_phi
+          mag_pres_int = mag_pres_int + BB2/2 * xjac * BigR * wst * delta_phi
+#endif
           J2_int = J2_int + eta_T_ohm * (ZJ0/BigR)**2.d0 * xjac * BigR * wst * delta_phi
 
           if (use_ncs) then 
@@ -1532,14 +1725,23 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
           C_ext_3d = C_ext_3d - zj0 * xjac * wst * delta_phi
           H_ext = H_ext + heat_source     * xjac * BigR * wst * delta_phi
           S_ext = S_ext + particle_source * xjac * BigR * wst * delta_phi
+          Vol_ext = Vol_ext + xjac * BigR * wst * delta_phi
           VP_ext = VP_ext + r0 * vpar0**2 * BB2 * xjac * BigR * wst * delta_phi
           local_mom_par_ext = local_mom_par_ext + r0 * vpar0 * sqrt(BB2) * xjac * BigR * wst * delta_phi
 #if STELLARATOR_MODEL
           VK_ext = VK_ext + r0*(dudx**2 + dudy**2)*BigR**2*xjac*BigR*wst*delta_phi/F0**2
+          VM_ext = VM_ext + (Bv2*(dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2) &
+                 - (chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)*xjac*BigR*wst*delta_phi/F0**2
+          VB_ext = VB_ext + 2.0*r0*T0 / (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                      - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2) *xjac*BigR*wst*delta_phi
+          mag_pres_ext = mag_pres_ext + (Bv2*(1.d0 + (dpsidx**2 + dpsidy**2 + dpsidp**2/BigR**2)/F0**2) &
+                                      - ((chi(1,0,0)*dpsidx + chi(0,1,0)*dpsidy + chi(0,0,1)*dpsidp/BigR**2)**2)/F0**2)/2 *xjac*BigR*wst*delta_phi
 #else
           VK_ext = VK_ext + r0 * (dudx**2 + dudy**2) * BigR**2 * xjac * BigR * wst * delta_phi
-#endif
           VM_ext = VM_ext + (dpsidx**2+dpsidy**2)/BigR**2 * xjac * BigR * wst * delta_phi
+          VB_ext = VB_ext + 2.0*r0*T0 / BB2 * xjac * BigR * wst * delta_phi
+          mag_pres_ext = mag_pres_ext + BB2/2 * xjac * BigR * wst * delta_phi
+#endif
           J2_ext = J2_ext + eta_T_ohm * (ZJ0/BigR)**2.d0 * xjac * BigR * wst * delta_phi
 
           if (use_ncs) then 
@@ -1566,6 +1768,11 @@ aux_q0    = 0.d0; aux_jx0   = 0.d0; aux_jy0   = 0.d0; aux_jz0   = 0.d0; aux_jz0_
 enddo
 !$omp end do
 !$omp end parallel
+
+do iv = 1, n_vertex_max
+  call dealloc_node(nodes(iv))
+  call dealloc_node(aux_nodes(iv))
+end do
 
 !------ Calculate boundary fluxes --------------------------------------------------------
 !--- go through the boundary elements
@@ -1601,36 +1808,88 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
 #if STELLARATOR_MODEL
       do mp=1,n_plane
         s_norm_1D(mp,:) = s_norm_1D(mp,:) + node_k%r_tor_eq(k_dof)*k_size*H1(k_vertex,k_dof,:)
-        do in=1,n_tor
-          stel_current_source_1D(mp,:) = stel_current_source_1D(mp,:) + node_k%j_source(in,k_dir)*k_size*H1(k_vertex,k_dof,:)*HZ(in,mp)
-        enddo
+        if (.not. (use_pfafem .and. pfafem_ready)) then
+          do in=1,n_tor
+            stel_current_source_1D(mp,:) = stel_current_source_1D(mp,:) + node_k%j_source(in,k_dir)*k_size*H1(k_vertex,k_dof,:)*HZ(in,mp)
+          enddo
+        end if
       enddo
 #endif
 
-      do k=1,n_var
-        do mp=1, n_plane 
-          do in=1, n_tor
-            if (present(exclude_n0)) then 
-              if (exclude_n0 .and. in == 1) then
-                if (n_tor > 1) then
-                  cycle
-                else  
-                  write(*,*) 'n_tor = 1 , cannot exclude axisymmetric part'
-                endif
-              endif  
-            endif
-            eq_g_1D(mp,k,:) = eq_g_1D(mp,k,:) + node_k%values(in,k_dir,k) * k_size * H1(k_vertex,k_dof,:)   * HZ(in,mp)
-            eq_s_1D(mp,k,:) = eq_s_1D(mp,k,:) + node_k%values(in,k_dir,k) * k_size * H1_s(k_vertex,k_dof,:) * HZ(in,mp)
+      if (.not. (use_pfafem .and. pfafem_ready)) then
+        do k=1,n_var
+          do mp=1, n_plane 
+            do in=1, n_tor
+              if (present(exclude_n0)) then 
+                if (exclude_n0 .and. in == 1) then
+                  if (n_tor > 1) then
+                    cycle
+                  else  
+                    write(*,*) 'n_tor = 1 , cannot exclude axisymmetric part'
+                  endif
+                endif  
+              endif
+              eq_g_1D(mp,k,:) = eq_g_1D(mp,k,:) + node_k%values(in,k_dir,k) * k_size * H1(k_vertex,k_dof,:)   * HZ(in,mp)
+              eq_s_1D(mp,k,:) = eq_s_1D(mp,k,:) + node_k%values(in,k_dir,k) * k_size * H1_s(k_vertex,k_dof,:) * HZ(in,mp)
 
-            delta_g_1D(mp,k,:) = delta_g_1D(mp,k,:) + node_k%deltas(in,k_dir,k) * k_size * H1(k_vertex,k_dof,:)   * HZ(in,mp)
+              delta_g_1D(mp,k,:) = delta_g_1D(mp,k,:) + node_k%deltas(in,k_dir,k) * k_size * H1(k_vertex,k_dof,:)   * HZ(in,mp)
+            enddo
           enddo
         enddo
-      enddo
+      end if
 
     end do
   end do
 
   call dealloc_node(node_k)
+
+  if (use_pfafem .and. pfafem_ready) then
+    pf_excl_n0 = .false.
+    if (present(exclude_n0)) then
+      if (exclude_n0 .and. n_tor > 1) pf_excl_n0 = .true.
+    end if
+    do mp = 1, n_plane
+      pf_phi = 2.d0 * PI * dble(mp - 1) / dble(n_plane * n_period)
+      do ms = 1, n_gauss
+#ifdef fullmhd
+        call pfafem_eval_point_jet(node_list, element_list, x_g_1D(mp,ms), y_g_1D(mp,ms), pf_phi, &
+                                   .false., pf_n_act, pf_inode, pf_io, pf_jb, &
+                                   pf_bval, pf_bdR, pf_bdZ, pf_bdP)
+#else
+        call pfafem_eval_cached_1st(element_list, pf_phi, &
+                                    pf_dbnd_em(:, ms, mp, m_bndelem), &
+                                    pf_dbnd_sm(:, ms, mp, m_bndelem), &
+                                    pf_dbnd_tm(:, ms, mp, m_bndelem), &
+                                    pf_dbnd_M(:, :, ms, mp, m_bndelem), &
+                                    pf_dbnd_fl(:, ms, mp, m_bndelem), &
+                                    pf_n_act, pf_inode, pf_io, pf_jb, &
+                                    pf_bval, pf_bdR, pf_bdZ, pf_bdP)
+#endif
+#if STELLARATOR_MODEL
+        do pf_a = 1, pf_n_act
+          stel_current_source_1D(mp,ms) = stel_current_source_1D(mp,ms) &
+            + node_list%node(pf_inode(pf_a))%j_source(pf_jb(pf_a), pf_io(pf_a)) * pf_bval(pf_a)
+        end do
+#endif
+        do k = 1, n_var
+          pf_u = 0.d0; pf_uR = 0.d0; pf_uZ = 0.d0; pf_uP = 0.d0
+          do pf_a = 1, pf_n_act
+            pf_vfull = node_list%node(pf_inode(pf_a))%values(pf_jb(pf_a), pf_io(pf_a), k)
+            if (pf_excl_n0) pf_vfull = pf_vfull - sum(node_list%node(pf_inode(pf_a))%values(1:n_tor, pf_io(pf_a), k)) / dble(n_tor)
+            pf_u  = pf_u  + pf_vfull * pf_bval(pf_a)
+            pf_uR = pf_uR + pf_vfull * pf_bdR(pf_a)
+            pf_uZ = pf_uZ + pf_vfull * pf_bdZ(pf_a)
+            pf_vavg = node_list%node(pf_inode(pf_a))%deltas(pf_jb(pf_a), pf_io(pf_a), k)
+            if (pf_excl_n0) pf_vavg = pf_vavg - sum(node_list%node(pf_inode(pf_a))%deltas(1:n_tor, pf_io(pf_a), k)) / dble(n_tor)
+            pf_uP = pf_uP + pf_vavg * pf_bval(pf_a)
+          end do
+          eq_g_1D(mp,k,ms)    = pf_u
+          eq_s_1D(mp,k,ms)    = pf_uR * x_s_1D(mp,ms) + pf_uZ * y_s_1D(mp,ms)
+          delta_g_1D(mp,k,ms) = pf_uP
+        end do
+      end do
+    end do
+  end if
 
 
   !--- Find out correct sign of the normal (it has to point outwards the domain)
@@ -1744,6 +2003,85 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
       Te_s   = 0.d0; Te_t   = 0.d0;
       vpar_s = 0.d0; vpar_t = 0.d0; 
 
+      if (use_pfafem .and. pfafem_ready) then
+        pf_excl_n0 = .false.
+        if (present(exclude_n0)) then
+          if (exclude_n0 .and. n_tor > 1) pf_excl_n0 = .true.
+        end if
+#ifdef fullmhd
+        call pfafem_eval_point_jet(node_list, element_list, R, Z, phi, &
+                                   .false., pf_n_act, pf_inode, pf_io, pf_jb, &
+                                   pf_bval, pf_bdR, pf_bdZ, pf_bdP)
+#else
+        call pfafem_eval_cached_1st(element_list, phi, &
+                                    pf_dbnd_em(:, ms, mp, m_bndelem), &
+                                    pf_dbnd_sm(:, ms, mp, m_bndelem), &
+                                    pf_dbnd_tm(:, ms, mp, m_bndelem), &
+                                    pf_dbnd_M(:, :, ms, mp, m_bndelem), &
+                                    pf_dbnd_fl(:, ms, mp, m_bndelem), &
+                                    pf_n_act, pf_inode, pf_io, pf_jb, &
+                                    pf_bval, pf_bdR, pf_bdZ, pf_bdP)
+#endif
+        do k = 1, n_var
+          pf_uR = 0.d0; pf_uZ = 0.d0; pf_uP = 0.d0
+          do pf_a = 1, pf_n_act
+            pf_vfull = node_list%node(pf_inode(pf_a))%values(pf_jb(pf_a), pf_io(pf_a), k)
+            if (pf_excl_n0) pf_vfull = pf_vfull - sum(node_list%node(pf_inode(pf_a))%values(1:n_tor, pf_io(pf_a), k)) / dble(n_tor)
+            pf_uR = pf_uR + pf_vfull * pf_bdR(pf_a)
+            pf_uZ = pf_uZ + pf_vfull * pf_bdZ(pf_a)
+            pf_uP = pf_uP + pf_vfull * pf_bdP(pf_a)
+          end do
+          if (k == var_psi) then
+            psi_s = pf_uR * R_s + pf_uZ * Z_s
+            psi_t = pf_uR * R_t + pf_uZ * Z_t
+          else if (k == var_u .and. var_u /= 0) then
+            u_s = pf_uR * R_s + pf_uZ * Z_s
+            u_t = pf_uR * R_t + pf_uZ * Z_t
+            u_p = pf_uP + pf_uR * R_phi + pf_uZ * Z_phi
+          else if (k == var_rho) then
+            rho_s = pf_uR * R_s + pf_uZ * Z_s
+            rho_t = pf_uR * R_t + pf_uZ * Z_t
+          end if
+#ifdef WITH_TiTe
+          if (k == var_Ti) then
+            Ti_s = pf_uR * R_s + pf_uZ * Z_s
+            Ti_t = pf_uR * R_t + pf_uZ * Z_t
+          else if (k == var_Te) then
+            Te_s = pf_uR * R_s + pf_uZ * Z_s
+            Te_t = pf_uR * R_t + pf_uZ * Z_t
+          end if
+          T_s = Te_s + Ti_s
+          T_t = Te_t + Ti_t
+#else
+          if (k == var_T) then
+            T_s  = pf_uR * R_s + pf_uZ * Z_s
+            T_t  = pf_uR * R_t + pf_uZ * Z_t
+            Te_s = 0.5d0 * T_s
+            Te_t = 0.5d0 * T_t
+            Ti_s = 0.5d0 * T_s
+            Ti_t = 0.5d0 * T_t
+          end if
+#endif
+#ifdef WITH_Vpar
+          if (k == var_Vpar) then
+            vpar_s = pf_uR * R_s + pf_uZ * Z_s
+            vpar_t = pf_uR * R_t + pf_uZ * Z_t
+          end if
+#endif
+#if (defined WITH_Neutrals)
+          if (k == var_rhon) then
+            rhon_s = pf_uR * R_s + pf_uZ * Z_s
+            rhon_t = pf_uR * R_t + pf_uZ * Z_t
+          end if
+#endif
+#if (defined WITH_Impurities)
+          if (k == var_rhoimp) then
+            rhoimp_s = pf_uR * R_s + pf_uZ * Z_s
+            rhoimp_t = pf_uR * R_t + pf_uZ * Z_t
+          end if
+#endif
+        end do
+      else
       do in = 1,n_tor
         if (present(exclude_n0)) then
           if (exclude_n0 .and. in == 1) then
@@ -1819,6 +2157,7 @@ do m_bndelem = 1, bnd_elm_list%n_bnd_elements
 #endif
 
       enddo
+      end if
 
       dTedx  = (   Z_t * Te_s  - Z_s * Te_t  ) / xjac
       dTedy  = ( - R_t * Te_s  + R_s * Te_t  ) / xjac
@@ -2032,13 +2371,17 @@ call MPI_AllReduce(P_e_int,pressure_e_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM
 call MPI_AllReduce(P_e_ext,pressure_e_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(P_i_int,pressure_i_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(P_i_ext,pressure_i_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(mag_pres_tot,mag_pressure,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(mag_pres_int,mag_pressure_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(mag_pres_ext,mag_pressure_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(C_intern,current_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(C_ext,current_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(C_intern_3d,current_R_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(C_ext_3d,current_R_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(R2curr_tmp,      R2curr,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(Zcurr_tmp , Z_curr_cent,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
-call MPI_AllReduce(Vol,Volume,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(Vol_in,Volume_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(Vol_ext,Volume_ext,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(area1,area,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(D_tot,density_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(P_tot,pressure,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
@@ -2059,6 +2402,9 @@ call MPI_AllReduce(VK_tot,kin_perp_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_W
 call MPI_AllReduce(VM_int,mag_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(VM_ext,mag_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(VM_tot,mag_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(VB_tot,beta_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(VB_int,beta_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
+call MPI_AllReduce(VB_ext,beta_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(SAW_tot,saw_energy_tot,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(J2_int,ohm_in,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
 call MPI_AllReduce(J2_ext,ohm_out,1,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
@@ -2108,13 +2454,17 @@ pressure_e_in        = P_e_int
 pressure_e_out       = P_e_ext
 pressure_i_in        = P_i_int
 pressure_i_out       = P_i_ext
+mag_pressure         = mag_pres_tot
+mag_pressure_in      = mag_pres_int
+mag_pressure_out     = mag_pres_ext
 current_in           = C_intern
 current_out          = C_ext
 current_R_in         = C_intern_3d
 current_R_out        = C_ext_3d
 R2curr               = R2curr_tmp
 Z_curr_cent          = Zcurr_tmp
-Volume               = Vol
+Volume_in            = Vol_in
+Volume_ext           = Vol_ext
 area                 = area1
 density_tot          = D_tot
 pressure             = P_tot
@@ -2135,6 +2485,9 @@ kin_perp_tot         = VK_tot
 mag_in               = VM_int
 mag_out              = VM_ext
 mag_tot              = VM_tot
+beta_tot             = VB_tot
+beta_in              = VB_int
+beta_out             = VB_ext
 saw_energy_tot       = SAW_tot
 ohm_in               = J2_int
 ohm_out              = J2_ext
@@ -2256,6 +2609,9 @@ pressure_e_out       = n_period * pressure_e_out* fact_mu0  / (GAMMA-1.d0)
 pressure_i           = n_period * pressure_i    * fact_mu0  / (GAMMA-1.d0)
 pressure_i_in        = n_period * pressure_i_in * fact_mu0  / (GAMMA-1.d0)
 pressure_i_out       = n_period * pressure_i_out* fact_mu0  / (GAMMA-1.d0)
+mag_pressure         = n_period * mag_pressure    * fact_mu0 / (GAMMA-1.d0)
+mag_pressure_in      = n_period * mag_pressure_in * fact_mu0 / (GAMMA-1.d0)
+mag_pressure_out     = n_period * mag_pressure_out* fact_mu0 / (GAMMA-1.d0)
 kin_par_tot          = n_period * kin_par_tot * fact_mu0  * 0.5d0
 kin_par_in           = n_period * kin_par_in  * fact_mu0  * 0.5d0
 kin_par_out          = n_period * kin_par_out * fact_mu0  * 0.5d0
@@ -2286,9 +2642,17 @@ visco_dissip_tot     = n_period * visco_dissip_tot    * fact_flux
 viscopar_dissip_tot  = n_period * viscopar_dissip_tot * fact_flux
 friction_dissip_tot  = n_period * friction_dissip_tot * fact_flux
 mag_source_tot       = n_period * mag_source_tot      * fact_flux
-volume               = n_period * volume
+Volume_in            = n_period * Volume_in
+Volume_ext           = n_period * Volume_ext
 area                 = n_period * area / (2.d0 * PI)
 surface_area         = n_period * surface_area
+beta_tot             = n_period * beta_tot / (Volume_in + Volume_ext)
+beta_in              = n_period * beta_in  / Volume_in
+if (Volume_ext .ne. 0.d0) then
+  beta_out           = n_period * beta_out / Volume_ext
+else
+  beta_out           = 0.d0
+endif
 mom_par_int      = n_period * mom_par_int * rho_norm / t_norm
 mom_par_ext      = n_period * mom_par_ext * rho_norm / t_norm
 mom_par_tot      = n_period * mom_par_tot * rho_norm / t_norm
@@ -2334,6 +2698,7 @@ else
 endif
 
 ! --- Derived quantities
+Volume       = Volume_in + Volume_ext
 E_tot        = mag_tot + pressure     + kin_par_tot + kin_perp_tot 
 E_in         = mag_in  + pressure_in  + kin_par_in  + kin_perp_in 
 E_out        = mag_out + pressure_out + kin_par_out + kin_perp_out 
@@ -2346,13 +2711,20 @@ Bgeo         = F0 / R_geo
 current_MA   = current_in * 1.d-6 * (1.d0/fact_mu0) * (1/mu_zero)
 current_R    = current_R_in * (1.d0/fact_mu0) * (1/mu_zero)
 beta_p       = 4.d0 * pressure_in/(R_geo * current_in**2 )     * (GAMMA-1)*fact_mu0
-beta_t       = 2.d0 * pressure_in / volume / Bgeo**2           * (GAMMA-1)/fact_mu0
+beta_t       = 2.d0 * pressure_in / volume_in / Bgeo**2           * (GAMMA-1)/fact_mu0
 beta_n       = 100.d0 * beta_t * Bgeo/current_MA * ES%LCFS_a
 li3          = 2.d0 * mag_in /0.5  /( current_in**2 * R_geo ) * fact_mu0
 li3_tot      = 2.d0 * mag_tot/0.5  /(current_tot**2 * R_geo ) * fact_mu0
 sheath_heatflux =  gamma_stangeby * (gamma-1)/(2.d0*gamma) * vn_p0 ! the factor comes to obtain n T_e v from vn_p0
 R_curr_cent  = sqrt(R2curr / current_tot) 
 Z_curr_cent  = Z_curr_cent / current_tot 
+vmec_beta_tot        = pressure/mag_pressure
+vmec_beta_in         = pressure_in/mag_pressure_in
+if (mag_pressure_out .ne. 0.d0) then
+  vmec_beta_out      = pressure_out/mag_pressure_out
+else
+  vmec_beta_out      = 0.d0
+endif
 
 
 ! --- Externally calculated quantities
@@ -2633,7 +3005,7 @@ if (my_id .eq. 0) then
         res(iexpr) = area 
 
       case ( 'volume' )
-        res(iexpr) = volume
+        res(iexpr) = volume_in
 
       case ( 'q02' )
         res(iexpr) = q02 
@@ -2752,10 +3124,13 @@ if (my_id .eq. 0) then
     end do
   endif
 #endif
+  write(*,'(A,2es14.6,A)') ' Volume_in                       : ',xt,Volume_in,' [m^3]'
+  write(*,'(A,2es14.6,A)') ' Volume_ext                      : ',xt,Volume_ext,' [m^3]'
   write(*,'(A,2es14.6,A)') ' Volume                          : ',xt,volume,' [m^3]'
   write(*,'(A,2es14.6,A)') ' Surface area                    : ',xt,surface_area, '[m^2]'
   write(*,'(A,4es14.6,A)') ' density  (total/in/out)         : ',xt,density_tot,  density_in,  density_out,'[ 10^20/m^3]'
   write(*,'(A,4es14.6,A)') ' pressure (total/in/out)         : ',xt,pressure/1.d6, pressure_in/1.d6, pressure_out/1.d6,' [MJ]'
+  write(*,'(A,4es14.6,A)') ' magnetic pressure (total/in/out): ',xt,mag_pressure/1.d6, mag_pressure_in/1.d6, mag_pressure_out/1.d6, ' [MJ]'
   write(*,'(A,4es14.6,A)') ' kinetic parallel (total/in/out) : ',xt,kin_par_tot/1.d6, kin_par_in/1.d6, kin_par_out/1.d6,' [MJ]'
   write(*,'(A,4es14.6,A)') ' kinetic perp (total/in/out)     : ',xt,kin_perp_tot/1.d6, kin_perp_in/1.d6, kin_perp_out/1.d6,' [MJ]'
   write(*,'(A,4e14.6,A)')  ' parallel momentum (total/in/out): ',xt,mom_par_tot, mom_par_int, mom_par_ext,' [kg m/s]'
@@ -2769,6 +3144,8 @@ if (my_id .eq. 0) then
 
   write(*,'(A,2es14.6)')   ' li(3)                           : ',xt, li3 
   write(*,'(A,2es14.6)')   ' betap(1)                        : ',xt, beta_p
+  write(*,'(A,4es14.6)')   ' beta (total/in/out)             : ',xt,beta_tot,beta_in,beta_out
+  write(*,'(A,4es14.6)')   ' vmec_beta (total/in/out)        : ',xt,vmec_beta_tot,vmec_beta_in,vmec_beta_out
 
   write(*,'(A)')           ' sum ,time ,density_tot, pressure, Wkin_par, Wkin_perp, Wmag, Ohm, heating, source'
 
@@ -2878,7 +3255,7 @@ if (my_id .eq. 0) then
     part_src_in_t(index_now)         = source_in
     part_src_out_t(index_now)        = source_out
     area_t(index_now)                = area
-    volume_t(index_now)              = volume
+    volume_t(index_now)              = volume_in
     mag_ener_src_tot(index_now)      = mag_source_tot
     beta_n_t(index_now)              = beta_n
     beta_t_t(index_now)              = beta_t
@@ -2970,6 +3347,120 @@ if (my_id .eq. 0) then
 
 endif !--- my_id
 end subroutine int3d_new 
+
+#ifndef fullmhd
+subroutine ensure_pfafem_diag_cache(node_list, element_list, bnd_elm_list, ife_min, ife_max)
+  implicit none
+  type(type_node_list),        intent(in) :: node_list
+  type(type_element_list),     intent(in) :: element_list
+  type(type_bnd_element_list), intent(in) :: bnd_elm_list
+  integer,                     intent(in) :: ife_min, ife_max
+
+  integer :: n_el_loc, nbnd, ife, iloc, mp, ms, mt, i, j, in, inode
+  integer :: mb, k_vertex, k_dof, k_node, k_dir
+  real*8  :: phi_mp, x_pt, y_pt, k_size
+  real*8  :: rx_ij(n_vertex_max, n_degrees), ry_ij(n_vertex_max, n_degrees)
+  real*8  :: chi_loc(0:n_order-1, 0:n_order-1, 0:n_order-1)
+
+  n_el_loc = max(1, ife_max - ife_min + 1)
+  nbnd     = max(1, bnd_elm_list%n_bnd_elements)
+
+  if (allocated(pf_dvol_em)) deallocate(pf_dvol_em, pf_dvol_sm, pf_dvol_tm, pf_dvol_M, pf_dvol_fl)
+  allocate(pf_dvol_em(4, n_gauss, n_gauss, n_plane, n_el_loc))
+  allocate(pf_dvol_sm(4, n_gauss, n_gauss, n_plane, n_el_loc))
+  allocate(pf_dvol_tm(4, n_gauss, n_gauss, n_plane, n_el_loc))
+  allocate(pf_dvol_M(4, 4, n_gauss, n_gauss, n_plane, n_el_loc))
+  allocate(pf_dvol_fl(2, n_gauss, n_gauss, n_plane, n_el_loc))
+#if STELLARATOR_MODEL
+  if (allocated(pf_dvol_chi)) deallocate(pf_dvol_chi)
+  allocate(pf_dvol_chi(3, n_gauss, n_gauss, n_plane, n_el_loc))
+  pf_dvol_chi = 0.d0
+#endif
+
+  if (allocated(pf_dbnd_em)) deallocate(pf_dbnd_em, pf_dbnd_sm, pf_dbnd_tm, pf_dbnd_M, pf_dbnd_fl)
+  allocate(pf_dbnd_em(4, n_gauss, n_plane, nbnd))
+  allocate(pf_dbnd_sm(4, n_gauss, n_plane, nbnd))
+  allocate(pf_dbnd_tm(4, n_gauss, n_plane, nbnd))
+  allocate(pf_dbnd_M(4, 4, n_gauss, n_plane, nbnd))
+  allocate(pf_dbnd_fl(2, n_gauss, n_plane, nbnd))
+
+  if (ife_max >= ife_min) then
+    !$omp parallel do collapse(2) schedule(dynamic, 4) &
+    !$omp private(ife, mp, iloc, phi_mp, i, j, in, inode, rx_ij, ry_ij, ms, mt, x_pt, y_pt, chi_loc)
+    do ife = ife_min, ife_max
+      do mp = 1, n_plane
+        iloc   = ife - ife_min + 1
+        phi_mp = 2.d0 * PI * dble(mp - 1) / dble(n_plane * n_period)
+        do i = 1, n_vertex_max
+          inode = element_list%element(ife)%vertex(i)
+          do j = 1, n_degrees
+            rx_ij(i, j) = sum(node_list%node(inode)%x(1:n_coord_tor, j, 1) * HZ_coord(1:n_coord_tor, mp)) &
+                        * element_list%element(ife)%size(i, j)
+            ry_ij(i, j) = sum(node_list%node(inode)%x(1:n_coord_tor, j, 2) * HZ_coord(1:n_coord_tor, mp)) &
+                        * element_list%element(ife)%size(i, j)
+          end do
+        end do
+        do ms = 1, n_gauss
+          do mt = 1, n_gauss
+            x_pt = sum(rx_ij * H(:, :, ms, mt))
+            y_pt = sum(ry_ij * H(:, :, ms, mt))
+            call pfafem_trace_point_1st(node_list, element_list, x_pt, y_pt, phi_mp, &
+                                        pf_dvol_em(:, ms, mt, mp, iloc), &
+                                        pf_dvol_sm(:, ms, mt, mp, iloc), &
+                                        pf_dvol_tm(:, ms, mt, mp, iloc), &
+                                        pf_dvol_M(:, :, ms, mt, mp, iloc), &
+                                        pf_dvol_fl(:, ms, mt, mp, iloc))
+#if STELLARATOR_MODEL
+            chi_loc = get_chi(x_pt, y_pt, phi_mp, node_list, element_list, ife, xgauss(ms), xgauss(mt))
+            pf_dvol_chi(1, ms, mt, mp, iloc) = chi_loc(1, 0, 0)
+            pf_dvol_chi(2, ms, mt, mp, iloc) = chi_loc(0, 1, 0)
+            pf_dvol_chi(3, ms, mt, mp, iloc) = chi_loc(0, 0, 1)
+#endif
+          end do
+        end do
+      end do
+    end do
+    !$omp end parallel do
+  end if
+
+  if (bnd_elm_list%n_bnd_elements >= 1) then
+    !$omp parallel do collapse(2) schedule(dynamic, 4) &
+    !$omp private(mb, mp, phi_mp, ms, x_pt, y_pt, k_vertex, k_node, k_dof, k_dir, k_size, in)
+    do mb = 1, bnd_elm_list%n_bnd_elements
+      do mp = 1, n_plane
+        phi_mp = 2.d0 * PI * dble(mp - 1) / dble(n_plane * n_period)
+        do ms = 1, n_gauss
+          x_pt = 0.d0
+          y_pt = 0.d0
+          do k_vertex = 1, 2
+            k_node = bnd_elm_list%bnd_element(mb)%vertex(k_vertex)
+            do k_dof = 1, 2
+              k_dir  = bnd_elm_list%bnd_element(mb)%direction(k_vertex, k_dof)
+              k_size = bnd_elm_list%bnd_element(mb)%size(k_vertex, k_dof) * H1(k_vertex, k_dof, ms)
+              do in = 1, n_coord_tor
+                x_pt = x_pt + node_list%node(k_node)%x(in, k_dir, 1) * k_size * HZ_coord(in, mp)
+                y_pt = y_pt + node_list%node(k_node)%x(in, k_dir, 2) * k_size * HZ_coord(in, mp)
+              end do
+            end do
+          end do
+          call pfafem_trace_point_1st(node_list, element_list, x_pt, y_pt, phi_mp, &
+                                      pf_dbnd_em(:, ms, mp, mb), &
+                                      pf_dbnd_sm(:, ms, mp, mb), &
+                                      pf_dbnd_tm(:, ms, mp, mb), &
+                                      pf_dbnd_M(:, :, ms, mp, mb), &
+                                      pf_dbnd_fl(:, ms, mp, mb))
+        end do
+      end do
+    end do
+    !$omp end parallel do
+  end if
+
+  pf_diag_epoch   = pfafem_cache_epoch
+  pf_diag_ife_min = ife_min
+  pf_diag_ife_max = ife_max
+  pf_diag_nbnd    = bnd_elm_list%n_bnd_elements
+end subroutine ensure_pfafem_diag_cache
+#endif
 
 #ifndef NOMPIVERSION
 end module mod_integrals3D

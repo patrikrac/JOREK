@@ -98,6 +98,17 @@ program JOREK2
     use mod_petsc_pc_physics, only: petsc_assemble_pc_matrices
     use mod_petsc, only: petsc_initialize, petsc_finalize, petsc_print_version
 #endif
+  use mod_pfafem, only: pfafem_build_cache, pfafem_bcast_restart_state, &
+                        pfafem_stage_fourier_from_nodes, pfafem_project_restart, &
+                        pfafem_retrace_and_project, pfafem_cleanup, &
+                        pfafem_restart_needs_projection, pfafem_restart_src_type, &
+                        pfafem_restart_values
+#if STELLARATOR_MODEL
+  use mod_pfafem, only: pfafem_restart_jsrc
+#endif
+#if JOREK_MODEL == 180
+  use mod_boundary_conditions, only: setup_boundary_condition_pfafem
+#endif
 
   use, intrinsic :: iso_c_binding
   use, intrinsic :: iso_fortran_env, only : stdin=>input_unit, &
@@ -610,6 +621,28 @@ write(*,*) "n elements:", element_list%n_elements
     call save_special_points('special_equilibrium_points.dat', .false., ierr)
   end if
 
+  if (use_pfafem) then
+    if (.not. restart) then
+      call pfafem_stage_fourier_from_nodes(node_list)
+      call pfafem_build_cache(my_id, node_list, element_list, .true., .false.)
+      call pfafem_project_restart(my_id, node_list, element_list)
+#if JOREK_MODEL == 180
+      call setup_boundary_condition_pfafem(my_id, node_list, element_list, bnd_node_list, bnd_elm_list)
+#endif
+    else
+#if STELLARATOR_MODEL
+      if (my_id == 0 .and. pfafem_restart_needs_projection .and. &
+          current_prof_initialized .and. .not. allocated(pfafem_restart_jsrc)) then
+        allocate(pfafem_restart_jsrc(size(pfafem_restart_values, 1), n_degrees, node_list%n_nodes))
+        pfafem_restart_jsrc(:, :, :) = pfafem_restart_values(:, :, var_zj, :)
+      end if
+#endif
+      call pfafem_bcast_restart_state(my_id, node_list)
+      call pfafem_build_cache(my_id, node_list, element_list, .false., (pfafem_restart_src_type /= 1))
+      call pfafem_project_restart(my_id, node_list, element_list)
+    end if
+  end if
+
   !***********************************************************************
   !*                 end of initilisation/equilibrium                    *
   !***********************************************************************
@@ -839,6 +872,14 @@ write(*,*) "n elements:", element_list%n_elements
 
       call update_values(mhd_sim%element_list, mhd_sim%node_list, deltas)         ! add solution to node values
       call update_deltas(mhd_sim%node_list, deltas)
+
+      if (use_pfafem .and. pfafem_retrace) then
+        call pfafem_retrace_and_project(my_id, mhd_sim%node_list, mhd_sim%element_list)
+        if (.not. a_mat%petsc_assembled) then
+          call global_matrix_structure(mhd_sim%node_list, mhd_sim%element_list, mhd_sim%bnd_elm_list, freeboundary, &
+                                       mhd_sim%local_elms, mhd_sim%n_local_elms, a_mat, i_tor_min=1, i_tor_max=n_tor)
+        end if
+      end if
 
       t_now = t_now + tstep
 
@@ -1251,6 +1292,7 @@ if (allocated(node_list%node)) call dealloc_node_list(node_list)
 if (allocated(aux_node_list%node)) call dealloc_node_list(aux_node_list)
 
   call r3_info_summary ()                                ! timing
+  if (use_pfafem) call pfafem_cleanup()
 #ifdef USE_PETSC
   call petsc_finalize()                                  ! finalize PETSc before MPI
 #endif

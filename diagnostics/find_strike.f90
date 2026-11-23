@@ -4,9 +4,11 @@
 subroutine find_strike(node_list, bnd_elm_list)
   
   use data_structure
+  use mod_parameters, only: n_tor
   use gauss
   use equil_info
   use basis_at_gaussian
+  use phys_module, only: pfafem_values_active
   
   implicit none
   
@@ -26,8 +28,13 @@ subroutine find_strike(node_list, bnd_elm_list)
     iv1  = bnd_elm_list%bnd_element(ibndelm)%vertex(1)
     iv2  = bnd_elm_list%bnd_element(ibndelm)%vertex(2)
     
-    psi1 = node_list%node(iv1)%values(1,1,1)
-    psi2 = node_list%node(iv2)%values(1,1,1)
+    if (pfafem_values_active) then
+      psi1 = sum(node_list%node(iv1)%values(1:n_tor,1,1)) / dble(n_tor)
+      psi2 = sum(node_list%node(iv2)%values(1:n_tor,1,1)) / dble(n_tor)
+    else
+      psi1 = node_list%node(iv1)%values(1,1,1)
+      psi2 = node_list%node(iv2)%values(1,1,1)
+    end if
     
     R1   = node_list%node(iv1)%x(1,1,1)
     Z1   = node_list%node(iv1)%x(1,1,2)

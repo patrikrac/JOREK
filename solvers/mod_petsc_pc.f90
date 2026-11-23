@@ -83,12 +83,21 @@ contains
       return
     endif
 
+#if PETSC_VERSION_LT(3,23,0)
+    allocate(subksp_array(1024))
     PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
+#else
+    PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
+#endif
     do i = 1, n_split
       PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
       call petsc_setup_wrapped_solver(subpc)
     enddo
+#if PETSC_VERSION_LT(3,23,0)
+    deallocate(subksp_array)
+#else
     PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
+#endif
   end subroutine petsc_setup_pc_blocks
 #endif
 end module mod_petsc_pc

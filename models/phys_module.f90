@@ -166,6 +166,15 @@ module phys_module
   character(len=16) :: physics_pc_sf_vpar_stage !< v_par in the sweep: "v0" (default, B_77 last, no feedback) | "b0" (B_77 + W_vv right after pair_w, then in the rho / T correctors) | "b1" (pair_w's 5th field; mode split and corrector 1 | 2). b0 / b1: model600.
   real*8 :: physics_pc_sf_rtol !< Relative tolerance of every iterative inner solve (default 1e-1)
   logical :: eliminate_boundary_dofs !< Zero boundary-DOF rows in the physics PC's force operator W and use elm-diagonal BC scaling in global matrix
+  !--- PFAFEM (Piecewise Field-Aligned Finite Element Method) toroidal discretization
+  logical :: use_pfafem          !< Enable PFAFEM toroidal discretization (cubic B-splines along traced field lines)
+  integer :: pfafem_n_substeps   !< RK4 substeps per toroidal trace interval (default 4)
+  integer :: pfafem_n_gauss_tor  !< Gauss-Legendre quadrature points per toroidal cell (default 4)
+  integer :: pfafem_spline_nr    !< Structured cubic B-spline intervals in R for B-field evaluation (default 96)
+  integer :: pfafem_spline_nz    !< Structured cubic B-spline intervals in Z for B-field evaluation (default 96)
+  logical :: pfafem_openbc       !< Enable OpenBC boundary Hermite continuation & clamping for open field lines
+  logical :: pfafem_retrace      !< Dynamically re-trace basis from evolving B(t) on preconditioner rebuilds
+  logical :: pfafem_values_active = .false. !< True once node%values/deltas store PFAFEM B-spline nodal DOFs
   logical :: use_newton           !< Use inexact Newton method
   integer :: maxNewton            !< maximum number of Newton iterations
   real(kind=8) :: gamma_Newton    !< Newton gamma-parameter: gmres_tol = gamma_Newton*(normRHScurrent/normRHSprevious)**alpha_Newton
@@ -243,6 +252,7 @@ module phys_module
   logical :: extended_boundary    !< Choose if extended boundary conditions (Biot-Savart version) should be used, default (false) is grad_chi with Dommaschk potentials
   real*8  :: j_cutoff_rcoord      !< Radial location from which the current is set to zero as it approaches the boundary - rcoord corresponds to the normalised toroidal flux
   real*8  :: j_cutoff_sig         !< Radial width over which the current is ramped down to zero towards the boundary
+  real*8  :: bloating_factor      !< Linear radial factor by which the boundary has been bloated/extended. The LCFS should be at rcoord=1/(bloating_factor).
 
   !> Points used as blocks to extend grid into complex wall structures, see https://www.jorek.eu/wiki/doku.php?id=wallgrid_tutorial
   real*8  :: surface_cross_tol                                                  !< Tolerance when looking for crossing of polar lines and surfaces, needs to be > 1.0

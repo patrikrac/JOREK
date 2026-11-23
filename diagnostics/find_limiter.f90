@@ -6,7 +6,8 @@
 !!
 subroutine find_limiter(my_id, node_list, element_list, bnd_elm_list, psi_lim, R_lim, Z_lim)
 
-use phys_module, only: n_limiter, R_limiter, Z_limiter
+use phys_module, only: n_limiter, R_limiter, Z_limiter, pfafem_values_active
+use mod_parameters, only: n_tor
 use data_structure
 use gauss
 use basis_at_gaussian
@@ -101,10 +102,17 @@ do ibnd=1,bnd_elm_list%n_bnd_elements + n_limiter
     idir2 = bnd_elm_list%bnd_element(ibnd)%direction(2,2) 
  
     ! --- Map Bezier coefficients into the Hermite 1D representation 
-    PSIM  =  node_list%node(n1)%values(1,1,1)     * bnd_elm_list%bnd_element(ibnd)%size(1,1)              ! PSI(1,n1)
-    PSIMR =  node_list%node(n1)%values(1,idir1,1) * bnd_elm_list%bnd_element(ibnd)%size(1,2) * 3.d0/2.d0  ! PSI(3,n1)
-    PSIP  =  node_list%node(n2)%values(1,1,1)     * bnd_elm_list%bnd_element(ibnd)%size(2,1)              ! PSI(1,n2)
-    PSIPR =  - node_list%node(n2)%values(1,idir2,1) * bnd_elm_list%bnd_element(ibnd)%size(2,2) * 3.d0/2.d0  ! PSI(3,n2)
+    if (pfafem_values_active) then
+      PSIM  =   (sum(node_list%node(n1)%values(1:n_tor,1,1))     / dble(n_tor)) * bnd_elm_list%bnd_element(ibnd)%size(1,1)
+      PSIMR =   (sum(node_list%node(n1)%values(1:n_tor,idir1,1)) / dble(n_tor)) * bnd_elm_list%bnd_element(ibnd)%size(1,2) * 3.d0/2.d0
+      PSIP  =   (sum(node_list%node(n2)%values(1:n_tor,1,1))     / dble(n_tor)) * bnd_elm_list%bnd_element(ibnd)%size(2,1)
+      PSIPR = - (sum(node_list%node(n2)%values(1:n_tor,idir2,1)) / dble(n_tor)) * bnd_elm_list%bnd_element(ibnd)%size(2,2) * 3.d0/2.d0
+    else
+      PSIM  =  node_list%node(n1)%values(1,1,1)     * bnd_elm_list%bnd_element(ibnd)%size(1,1)              ! PSI(1,n1)
+      PSIMR =  node_list%node(n1)%values(1,idir1,1) * bnd_elm_list%bnd_element(ibnd)%size(1,2) * 3.d0/2.d0  ! PSI(3,n1)
+      PSIP  =  node_list%node(n2)%values(1,1,1)     * bnd_elm_list%bnd_element(ibnd)%size(2,1)              ! PSI(1,n2)
+      PSIPR =  - node_list%node(n2)%values(1,idir2,1) * bnd_elm_list%bnd_element(ibnd)%size(2,2) * 3.d0/2.d0  ! PSI(3,n2)
+    end if
     
     PSMA = MAX(PSIM,PSIP)
     PSMI = MIN(PSIM,PSIP)

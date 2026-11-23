@@ -7,6 +7,8 @@ use gauss
 use basis_at_gaussian
 use phys_module
 use nodes_elements
+use mod_interp, only: pfafem_harm_from_bspline
+use mod_pfafem, only: pfafem_ready
 
 implicit none
 
@@ -22,6 +24,7 @@ real*8     :: AR0_p(n_gauss,n_gauss), AZ0_p(n_gauss,n_gauss), AR0_Z, AZ0_R, A30_
 integer    :: i, j, k, in, ms, mt, iv, inode, ife, n_elements
 real*8     :: W_kin(n_tor), W_mag(n_tor), xjac, BigR, wst
 real*8     :: ps0_x, ps0_y, u0_x, u0_y
+real*8     :: spec_tor(n_tor)
 
 W_mag = 0.d0
 W_kin = 0.d0
@@ -33,6 +36,16 @@ do ife =1,  element_list%n_elements
   do iv = 1, n_vertex_max
     inode     = element%vertex(iv)
     call make_deep_copy_node(node_list%node(inode), nodes(iv))
+    if (pfafem_values_active .and. n_tor > 1) then
+      do k = 1, n_var
+        do j = 1, n_degrees
+          spec_tor = nodes(iv)%values(1:n_tor, j, k)
+          do in = 1, n_tor
+            nodes(iv)%values(in, j, k) = pfafem_harm_from_bspline(spec_tor, in)
+          end do
+        end do
+      end do
+    end if
   enddo
 
   x_g(:,:) = 0.d0;    x_s(:,:) = 0.d0;    x_t(:,:) = 0.d0;

@@ -15,6 +15,10 @@ module mod_petsc_pc_gmg_axis
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
+#if PETSC_VERSION_LT(3,23,0)
+  use mod_petsc_raw_csr, only: mat_get_row, mat_restore_row, mat_create_submatrices, mat_destroy_submatrices
+#endif
+#include "petsc_f90_compat.h"
   implicit none
   private
 
@@ -83,6 +87,7 @@ contains
     character(len=*), intent(in) :: tag, pre
     PetscInt :: rst, ren, ncols, nn
     PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
     PetscInt, parameter :: izero = 0, four = 4
     PetscErrorCode :: ierr
     integer, parameter :: WMAX = 3         !< widest chain the separators handle
@@ -123,10 +128,10 @@ contains
     npc = -1; pjl = -1
     do q = 1, nl
       nd = 0
-      call MatGetRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      call MatGetRow(A, rst + loc(q), ncols, cols, vals, ierr)
       if (same_row(q)) then
         bmine(q) = bmine(q - 1)
-        call MatRestoreRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+        call MatRestoreRow(A, rst + loc(q), ncols, cols, vals, ierr)
         cycle
       endif
       k = 0
@@ -137,7 +142,7 @@ contains
           seen(jall(k)) = q; nd = nd + 1
         endif
       enddo
-      call MatRestoreRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      call MatRestoreRow(A, rst + loc(q), ncols, cols, vals, ierr)
       bmine(q) = merge(1, 0, nd > thr)
     enddo
     call MPI_Allgatherv(bmine, nl, MPI_INTEGER, ball, cnts, dsps(0:np - 1), MPI_INTEGER, comm, mpierr)
@@ -149,9 +154,9 @@ contains
     do q = 1, nl
       k = dsps(me) + q
       if (ball(k) == 1) cycle
-      call MatGetRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      call MatGetRow(A, rst + loc(q), ncols, cols, vals, ierr)
       if (same_row(q)) then
-        call MatRestoreRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+        call MatRestoreRow(A, rst + loc(q), ncols, cols, vals, ierr)
         cycle
       endif
       t = 0
@@ -161,7 +166,7 @@ contains
         if (ball(t) == 1) cycle
         w = max(w, min(abs(jall(t) - jall(k)), nj - abs(jall(t) - jall(k))))
       enddo
-      call MatRestoreRow(A, rst + loc(q), ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      call MatRestoreRow(A, rst + loc(q), ncols, cols, vals, ierr)
     enddo
     call MPI_Allreduce(MPI_IN_PLACE, w, 1, MPI_INTEGER, MPI_MAX, comm, mpierr)
     w = max(w, 1)

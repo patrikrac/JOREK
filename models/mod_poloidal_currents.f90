@@ -155,6 +155,7 @@ module mod_poloidal_currents
     real*8                :: I_halo_mp(n_plane), phi(n_plane)
     real*8                :: k_size, I_net
     real*8                :: R(n_gauss), Z(n_gauss), R_s(n_gauss), Z_s(n_gauss)    
+    real*8                :: hz_pf(n_tor), dhz_pf(n_tor), phi_mp
     type(type_node)       :: node_k
     type(type_bnd_element):: bndelem
     character(len=1024)   :: filename
@@ -199,14 +200,20 @@ module mod_poloidal_currents
           Z_s(:)   = Z_s(:)  + node_k%x(1,k_dir,2) * k_size * H1_s(k_vertex,k_dof,:)
         
           do mp=1,n_plane
+            if (pfafem_values_active) then
+              phi_mp = 2.d0*PI*dble(mp-1)/dble(n_plane*n_period)
+              call pfafem_hz_interp(phi_mp, hz_pf, dhz_pf)
+            else
+              hz_pf(:) = HZ(:,mp)
+            end if
             do in=1,n_tor
-              psi_s(:,mp) = psi_s(:,mp)  + node_k%values(in,k_dir,1) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
-              zj   (:,mp) = zj   (:,mp)  + node_k%values(in,k_dir,3) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
+              psi_s(:,mp) = psi_s(:,mp)  + node_k%values(in,k_dir,1) * k_size*H1_s(k_vertex,k_dof,:) * hz_pf(in)
+              zj   (:,mp) = zj   (:,mp)  + node_k%values(in,k_dir,3) * k_size*  H1(k_vertex,k_dof,:) * hz_pf(in)
               if (jorek_model > 190) then  
-                rho  (:,mp) = rho  (:,mp)  + node_k%values(in,k_dir,5) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
-                rho_s(:,mp) = rho_s(:,mp)  + node_k%values(in,k_dir,5) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
-                T0   (:,mp) = T0   (:,mp)  + node_k%values(in,k_dir,6) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,mp)
-                T0_s (:,mp) = T0_s (:,mp)  + node_k%values(in,k_dir,6) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,mp)
+                rho  (:,mp) = rho  (:,mp)  + node_k%values(in,k_dir,5) * k_size*  H1(k_vertex,k_dof,:) * hz_pf(in)
+                rho_s(:,mp) = rho_s(:,mp)  + node_k%values(in,k_dir,5) * k_size*H1_s(k_vertex,k_dof,:) * hz_pf(in)
+                T0   (:,mp) = T0   (:,mp)  + node_k%values(in,k_dir,6) * k_size*  H1(k_vertex,k_dof,:) * hz_pf(in)
+                T0_s (:,mp) = T0_s (:,mp)  + node_k%values(in,k_dir,6) * k_size*H1_s(k_vertex,k_dof,:) * hz_pf(in)
               else
                 rho = 1.d0; rho_s = 0.d0; T0 = 0.d0; T0_s = 0.d0 
               endif
@@ -284,6 +291,7 @@ module mod_poloidal_currents
     real*8                :: k_size, fact, R_c, Z_c, vec_inside(2), grad_t(2)
     real*8                :: G(4,n_degrees), sign_out
     real*8                :: R(n_gauss), Z(n_gauss), R_s(n_gauss), Z_s(n_gauss)    
+    real*8                :: hz_pf(n_tor), dhz_pf(n_tor), phi_ip
     type(type_node)       :: node_k
     type(type_element)    :: elm_k
     type(type_bnd_element):: bndelem
@@ -326,14 +334,20 @@ module mod_poloidal_currents
           R_s(:)   = R_s(:)  + node_k%x(1,k_dir,1) * k_size * H1_s(k_vertex,k_dof,:)
           Z_s(:)   = Z_s(:)  + node_k%x(1,k_dir,2) * k_size * H1_s(k_vertex,k_dof,:)
         
+          if (pfafem_values_active) then
+            phi_ip = 2.d0*PI*dble(i_plane-1)/dble(n_plane*n_period)
+            call pfafem_hz_interp(phi_ip, hz_pf, dhz_pf)
+          else
+            hz_pf(:) = HZ(:,i_plane)
+          end if
           do in=1,n_tor
-            psi_s(:) = psi_s(:) + node_k%values(in,k_dir,1) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
-            zj   (:) = zj   (:) + node_k%values(in,k_dir,3) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
+            psi_s(:) = psi_s(:) + node_k%values(in,k_dir,1) * k_size*H1_s(k_vertex,k_dof,:) * hz_pf(in)
+            zj   (:) = zj   (:) + node_k%values(in,k_dir,3) * k_size*  H1(k_vertex,k_dof,:) * hz_pf(in)
             if (jorek_model > 200 ) then
-              rho  (:) = rho  (:) + node_k%values(in,k_dir,5) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
-              rho_s(:) = rho_s(:) + node_k%values(in,k_dir,5) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
-              T0   (:) = T0   (:) + node_k%values(in,k_dir,6) * k_size*  H1(k_vertex,k_dof,:) * HZ(in,i_plane)
-              T0_s (:) = T0_s (:) + node_k%values(in,k_dir,6) * k_size*H1_s(k_vertex,k_dof,:) * HZ(in,i_plane)
+              rho  (:) = rho  (:) + node_k%values(in,k_dir,5) * k_size*  H1(k_vertex,k_dof,:) * hz_pf(in)
+              rho_s(:) = rho_s(:) + node_k%values(in,k_dir,5) * k_size*H1_s(k_vertex,k_dof,:) * hz_pf(in)
+              T0   (:) = T0   (:) + node_k%values(in,k_dir,6) * k_size*  H1(k_vertex,k_dof,:) * hz_pf(in)
+              T0_s (:) = T0_s (:) + node_k%values(in,k_dir,6) * k_size*H1_s(k_vertex,k_dof,:) * hz_pf(in)
             else
               rho = 1.d0; rho_s = 0.d0; T0 = 0.d0; T0_s = 0.d0 
             endif        

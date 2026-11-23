@@ -19,7 +19,7 @@ module mod_pc_elt_matrix_force_fft
   implicit none
   private
 
-  public :: pc_elt_matrix_force_fft
+  public :: pc_elt_matrix_force_fft, pc_elt_matrix_force_pfafem
 
 contains
 
@@ -57,11 +57,13 @@ subroutine pc_elt_matrix_force_fft(element, nodes, ELM, ELM_v)
   real*8, dimension(n_plane,n_gauss,n_gauss) :: x_g, x_s, x_t, x_p, y_s, y_t, y_p
   !> rho0 (1) and T0 (2): value, s, t and fixed-(s,t) phi derivatives
   real*8, dimension(n_plane,2,n_gauss,n_gauss) :: eq_g, eq_s, eq_t, eq_p
-  integer, parameter :: vrt(2) = [var_rho, var_T]
+  integer, parameter :: iv_T  = max(1, var_T)
+  integer, parameter :: iv_Ti = max(1, var_Ti)
+  integer, parameter :: iv_Te = max(1, var_Te)
 
-  integer :: i, j, k, ms, mt, mp, in, a, b, q
+  integer :: i, j, ms, mt, mp, in, a, b, q
   integer :: index_ij, index_kl
-  real*8  :: wst, BigR, xjac, theta, zeta_t, pref, GAMMA_l, wvol, sz, xp, yp
+  real*8  :: wst, BigR, xjac, theta, zeta_t, pref, GAMMA_l, wvol, sz, xp, yp, vr_m, vt_m
   real*8  :: dr0(3), dT0(3), r0, T0, p0, gp0(3)
   real*8  :: ch(0:2,0:2,0:2), chR, chZ, chP, Bv2, gBv2(3)
   real*8  :: dv(3,0:1)                                  !< (R, Z, phi) gradient per channel
@@ -100,13 +102,21 @@ subroutine pc_elt_matrix_force_fft(element, nodes, ELM, ELM_v)
               y_t(mp,ms,mt) = y_t(mp,ms,mt) + nodes(i)%x(in,j,2)*sz*H_t(i,j,ms,mt)*HZ_coord  (in,mp)
               y_p(mp,ms,mt) = y_p(mp,ms,mt) + nodes(i)%x(in,j,2)*sz*H  (i,j,ms,mt)*HZ_coord_p(in,mp)
             enddo
-            do k = 1, 2
-              do in = 1, n_tor
-                eq_g(mp,k,ms,mt) = eq_g(mp,k,ms,mt) + nodes(i)%values(in,j,vrt(k))*sz*H  (i,j,ms,mt)*HZ  (in,mp)
-                eq_s(mp,k,ms,mt) = eq_s(mp,k,ms,mt) + nodes(i)%values(in,j,vrt(k))*sz*H_s(i,j,ms,mt)*HZ  (in,mp)
-                eq_t(mp,k,ms,mt) = eq_t(mp,k,ms,mt) + nodes(i)%values(in,j,vrt(k))*sz*H_t(i,j,ms,mt)*HZ  (in,mp)
-                eq_p(mp,k,ms,mt) = eq_p(mp,k,ms,mt) + nodes(i)%values(in,j,vrt(k))*sz*H  (i,j,ms,mt)*HZ_p(in,mp)
-              enddo
+            do in = 1, n_tor
+              vr_m = nodes(i)%values(in,j,var_rho)
+              if (with_TiTe) then
+                vt_m = nodes(i)%values(in,j,iv_Ti) + nodes(i)%values(in,j,iv_Te)
+              else
+                vt_m = nodes(i)%values(in,j,iv_T)
+              endif
+              eq_g(mp,1,ms,mt) = eq_g(mp,1,ms,mt) + vr_m*sz*H  (i,j,ms,mt)*HZ  (in,mp)
+              eq_s(mp,1,ms,mt) = eq_s(mp,1,ms,mt) + vr_m*sz*H_s(i,j,ms,mt)*HZ  (in,mp)
+              eq_t(mp,1,ms,mt) = eq_t(mp,1,ms,mt) + vr_m*sz*H_t(i,j,ms,mt)*HZ  (in,mp)
+              eq_p(mp,1,ms,mt) = eq_p(mp,1,ms,mt) + vr_m*sz*H  (i,j,ms,mt)*HZ_p(in,mp)
+              eq_g(mp,2,ms,mt) = eq_g(mp,2,ms,mt) + vt_m*sz*H  (i,j,ms,mt)*HZ  (in,mp)
+              eq_s(mp,2,ms,mt) = eq_s(mp,2,ms,mt) + vt_m*sz*H_s(i,j,ms,mt)*HZ  (in,mp)
+              eq_t(mp,2,ms,mt) = eq_t(mp,2,ms,mt) + vt_m*sz*H_t(i,j,ms,mt)*HZ  (in,mp)
+              eq_p(mp,2,ms,mt) = eq_p(mp,2,ms,mt) + vt_m*sz*H  (i,j,ms,mt)*HZ_p(in,mp)
             enddo
           enddo
         enddo
@@ -207,5 +217,182 @@ contains
   end function grad
 
 end subroutine pc_elt_matrix_force_fft
+
+subroutine pc_elt_matrix_force_pfafem(node_list, element_list, ielm, W_vp, WV_vp)
+  use mod_parameters
+  use data_structure, only: type_node_list, type_element_list
+  use gauss, only: n_gauss, xgauss, wgauss
+  use phys_module
+  use mod_pfafem, only: pfafem_cache, pfafem_el_lo, pfafem_el_hi, pfafem_ep_dim, &
+                        pfafem_ng_tor, pfafem_ng_pol, pfafem_tau_q, pfafem_w_tor, &
+                        pfafem_t_pol, pfafem_w_pol, pfafem_dphi, pfafem_chi_q, &
+                        pfafem_qp_cached, pfafem_qp_geom, pfafem_qp_ngrp, &
+                        pfafem_qp_gu, pfafem_qp_gjb, pfafem_qp_db, &
+                        pfafem_eval_elem_geom, pfafem_eval_qp_basis
+  implicit none
+
+  type(type_node_list),    intent(in)            :: node_list
+  type(type_element_list), intent(in)            :: element_list
+  integer,                 intent(in)            :: ielm
+  real*8,                  intent(out)           :: W_vp(:, :, :, :, :)
+  real*8,                  intent(out), optional :: WV_vp(:, :, :, :, :, :)
+
+  integer, parameter :: iv_T  = max(1, var_T)
+  integer, parameter :: iv_Ti = max(1, var_Ti)
+  integer, parameter :: iv_Te = max(1, var_Te)
+  integer :: eP, ep1, iep_q, iq, ms, mt, iel_loc, a, b, unode, ivp
+  integer :: n_grp, g_a, a0, io_a, u_a, jb_a
+  integer :: n_raw, raw_u(64), raw_io(64), raw_jb(64)
+  integer :: n_act, act_u(64), act_io(64), act_jb(64)
+  real*8  :: GAMMA_l, theta, zeta_t, pref, phi_q, t_q, w_t, BigR, y_g, Rs, Rt, Zs, Zt, xjac, wvol
+  real*8  :: rv(64), rR(64), rZ(64), rP(64), r_jet4(4)
+  real*8  :: bv(64), bR(64), bZ(64), bP(64)
+  real*8  :: r0, T0, p0, dr0(3), dT0(3), gp0(3), vr_a, vt_a
+  real*8  :: ch(0:2, 0:2, 0:2), chR, chZ, chP, Bv2, gBv2(3), dva(3), fc(64), fd(64)
+  logical :: has_axis_u, use_qp_c
+
+  W_vp = 0.d0
+  if (present(WV_vp)) WV_vp = 0.d0
+
+  GAMMA_l = 5.d0 / 3.d0
+  theta   = time_evol_theta
+  zeta_t  = time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
+  pref    = (theta * tstep)**2 / (1.d0 + zeta_t)
+  iel_loc = ielm - pfafem_el_lo + 1
+  use_qp_c = pfafem_qp_cached .and. (ielm >= pfafem_el_lo) .and. (ielm <= pfafem_el_hi)
+  has_axis_u = .false.
+  if (treat_axis) then
+    do a = 1, pfafem_cache(ielm)%n_unodes
+      if (node_list%node(pfafem_cache(ielm)%unodes(a))%axis_node) then
+        has_axis_u = .true.
+        exit
+      end if
+    end do
+  end if
+
+  do eP = 0, n_tor - 1
+    ep1   = eP + 1
+    iep_q = merge(1, ep1, pfafem_ep_dim == 1)
+    do iq = 1, pfafem_ng_tor
+      phi_q = (dble(eP) + pfafem_tau_q(iq)) * pfafem_dphi
+      do ms = 1, n_gauss
+        do mt = 1, pfafem_ng_pol
+          if (use_qp_c) then
+            BigR = pfafem_qp_geom(1,  ms, mt, iq, ep1, iel_loc)
+            y_g  = pfafem_qp_geom(2,  ms, mt, iq, ep1, iel_loc)
+            wvol = pfafem_qp_geom(20, ms, mt, iq, ep1, iel_loc)
+          else
+            if (ielm >= pfafem_el_lo .and. ielm <= pfafem_el_hi) then
+              t_q = pfafem_t_pol(ms, mt, iq, iep_q, iel_loc)
+              w_t = pfafem_w_pol(ms, mt, iq, iep_q, iel_loc)
+            else
+              t_q = xgauss(min(n_gauss, mt))
+              w_t = wgauss(min(n_gauss, mt))
+            end if
+            call pfafem_eval_elem_geom(node_list, element_list, ielm, xgauss(ms), t_q, phi_q, &
+                                       BigR, y_g, Rs, Rt, Zs, Zt)
+            xjac = Rs * Zt - Rt * Zs
+            wvol = wgauss(ms) * w_t * pfafem_w_tor(iq) * BigR * xjac
+          end if
+
+          r0  = 0.d0; dr0 = 0.d0
+          T0  = 0.d0; dT0 = 0.d0
+          if (use_qp_c) then
+            n_grp = int(pfafem_qp_ngrp(ms, mt, iq, ep1, iel_loc))
+            n_raw = 4 * n_grp
+            do g_a = 1, n_grp
+              u_a   = int(pfafem_qp_gu(g_a, ms, mt, iq, ep1, iel_loc))
+              jb_a  = int(pfafem_qp_gjb(g_a, ms, mt, iq, ep1, iel_loc))
+              unode = pfafem_cache(ielm)%unodes(u_a)
+              a0    = 4 * (g_a - 1)
+              do io_a = 1, 4
+                a         = a0 + io_a
+                raw_u(a)  = u_a
+                raw_io(a) = io_a
+                raw_jb(a) = jb_a
+                r_jet4 = pfafem_qp_db(1:4, a, ms, mt, iq, ep1, iel_loc)
+                rv(a) = r_jet4(1); rR(a) = r_jet4(2); rZ(a) = r_jet4(3); rP(a) = r_jet4(4)
+                vr_a  = node_list%node(unode)%values(jb_a, io_a, var_rho)
+                if (with_TiTe) then
+                  vt_a = node_list%node(unode)%values(jb_a, io_a, iv_Ti) &
+                       + node_list%node(unode)%values(jb_a, io_a, iv_Te)
+                else
+                  vt_a = node_list%node(unode)%values(jb_a, io_a, iv_T)
+                end if
+                r0     = r0     + vr_a * r_jet4(1)
+                dr0(1) = dr0(1) + vr_a * r_jet4(2)
+                dr0(2) = dr0(2) + vr_a * r_jet4(3)
+                dr0(3) = dr0(3) + vr_a * r_jet4(4)
+                T0     = T0     + vt_a * r_jet4(1)
+                dT0(1) = dT0(1) + vt_a * r_jet4(2)
+                dT0(2) = dT0(2) + vt_a * r_jet4(3)
+                dT0(3) = dT0(3) + vt_a * r_jet4(4)
+              end do
+            end do
+          else
+            call pfafem_eval_qp_basis(node_list, element_list, ielm, eP, iq, ms, mt, &
+                                      BigR, y_g, phi_q, .false., n_raw, raw_u, raw_io, raw_jb, &
+                                      rv, rR, rZ, rP)
+            do a = 1, n_raw
+              unode = pfafem_cache(ielm)%unodes(raw_u(a))
+              vr_a  = node_list%node(unode)%values(raw_jb(a), raw_io(a), var_rho)
+              if (with_TiTe) then
+                vt_a = node_list%node(unode)%values(raw_jb(a), raw_io(a), iv_Ti) &
+                     + node_list%node(unode)%values(raw_jb(a), raw_io(a), iv_Te)
+              else
+                vt_a = node_list%node(unode)%values(raw_jb(a), raw_io(a), iv_T)
+              end if
+              r0     = r0     + vr_a * rv(a)
+              dr0(1) = dr0(1) + vr_a * rR(a)
+              dr0(2) = dr0(2) + vr_a * rZ(a)
+              dr0(3) = dr0(3) + vr_a * rP(a)
+              T0     = T0     + vt_a * rv(a)
+              dT0(1) = dT0(1) + vt_a * rR(a)
+              dT0(2) = dT0(2) + vt_a * rZ(a)
+              dT0(3) = dT0(3) + vt_a * rP(a)
+            end do
+          end if
+          p0  = r0 * T0
+          gp0 = dr0 * T0 + r0 * dT0
+
+          ch  = pfafem_chi_q(0:2, 0:2, 0:2, ms, mt, iq, ep1, iel_loc)
+          chR = ch(1, 0, 0); chZ = ch(0, 1, 0); chP = ch(0, 0, 1)
+          Bv2 = chR**2 + chZ**2 + chP**2 / BigR**2
+          gBv2(1) = 2.d0 * (chR*ch(2,0,0) + chZ*ch(1,1,0) + chP*ch(1,0,1)/BigR**2) - 2.d0*chP**2/BigR**3
+          gBv2(2) = 2.d0 * (chR*ch(1,1,0) + chZ*ch(0,2,0) + chP*ch(0,1,1)/BigR**2)
+          gBv2(3) = 2.d0 * (chR*ch(1,0,1) + chZ*ch(0,1,1) + chP*ch(0,0,2)/BigR**2)
+
+          if (has_axis_u) then
+            call pfafem_eval_qp_basis(node_list, element_list, ielm, eP, iq, ms, mt, &
+                                      BigR, y_g, phi_q, .true., n_act, act_u, act_io, act_jb, &
+                                      bv, bR, bZ, bP)
+          else
+            n_act = n_raw
+            act_u(1:n_act)  = raw_u(1:n_act)
+            act_io(1:n_act) = raw_io(1:n_act)
+            act_jb(1:n_act) = raw_jb(1:n_act)
+            bv(1:n_act) = rv(1:n_act); bR(1:n_act) = rR(1:n_act)
+            bZ(1:n_act) = rZ(1:n_act); bP(1:n_act) = rP(1:n_act)
+          end if
+          do a = 1, n_act
+            dva   = [bR(a), bZ(a), bP(a)]
+            fc(a) = -vbr(gBv2, dva, chR, chZ, chP, BigR) / Bv2**2
+            fd(a) = (vbr(gp0, dva, chR, chZ, chP, BigR) &
+                    - GAMMA_l * p0 * vbr(gBv2, dva, chR, chZ, chP, BigR) / Bv2) / Bv2
+          end do
+
+          do a = 1, n_act
+            do b = 1, n_act
+              ivp = pfafem_cache(ielm)%pair_map(act_u(a), act_u(b))
+              W_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp) = &
+                W_vp(act_jb(a), act_jb(b), act_io(a), act_io(b), ivp) &
+                + wvol * pref * (-fd(b) * fc(a))
+            end do
+          end do
+        end do
+      end do
+    end do
+  end do
+end subroutine pc_elt_matrix_force_pfafem
 
 end module mod_pc_elt_matrix_force_fft

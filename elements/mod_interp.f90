@@ -1,9 +1,10 @@
 !> Interpolation in the JOREK elements for values, deltas or x
 module mod_interp
+use constants, only: pi
 use data_structure
 use mod_basisfunctions
 use mod_parameters, only: n_period, n_coord_period, n_tor, n_coord_tor, n_degrees
-use phys_module, only: mode, mode_coord
+use phys_module, only: mode, mode_coord, pfafem_values_active
 implicit none
 private
 public :: interp !< interp a specific harmonic in finite elements
@@ -16,6 +17,7 @@ public :: interp_PRZ !< interp variable + pos at values or deltas
 public :: interp_PRZP !< interp variable + pos at values or deltas at a given (s,t,phi) for a non-axisymmetric configuration
 public :: interp_gvec !< interpolate equilibrium parameters imported from GVEC
 public :: sincosperiod_moivre, mode_moivre !< public for regtesting, used by interp_PRZ
+public :: pfafem_hz_interp, pfafem_harm_from_bspline
 public :: interp_PRZ_combined !< same as interp, but for any variable, including R and Z
 
 interface interp
@@ -65,7 +67,11 @@ logical :: my_deltas
 
 call basisfunctions(s,t,H_T)
 H = transpose(H_T)
-call sincosperiod_moivre(phi, HZ, dHZ) ! dHZ unused
+if (pfafem_values_active) then
+  call pfafem_hz_interp(phi, HZ, dHZ)
+else
+  call sincosperiod_moivre(phi, HZ, dHZ) ! dHZ unused
+end if
 
 P = 0.d0
 
@@ -136,7 +142,11 @@ call basisfunctions_T(s,t,H,H_s,H_t)
 P = 0.d0; P_s = 0.d0; P_t = 0.d0; P_phi = 0.d0
 
 ! 7% exec time
-call sincosperiod_moivre(phi, HZ, dHZ)
+if (pfafem_values_active) then
+  call pfafem_hz_interp(phi, HZ, dHZ)
+else
+  call sincosperiod_moivre(phi, HZ, dHZ)
+end if
 
 my_deltas = .false.
 if (present(deltas)) then
@@ -217,10 +227,14 @@ call basisfunctions_T(s,t,H,H_s,H_t,H_st,H_ss,H_tt)
 P = 0.d0; P_s = 0.d0; P_t = 0.d0; P_st = 0.d0; P_ss = 0.d0; P_tt = 0.d0
 P_phi = 0.d0; P_sphi = 0.d0; P_tphi = 0.d0; P_phiphi = 0.d0
 
-call sincosperiod_moivre(phi, HZ, dHZ)
-do i=1,n_tor
-  ddHZ(i) = HZ(i)*(n_period*(i/2))**2
-end do
+if (pfafem_values_active) then
+  call pfafem_hz_interp(phi, HZ, dHZ, ddHZ)
+else
+  call sincosperiod_moivre(phi, HZ, dHZ)
+  do i=1,n_tor
+    ddHZ(i) = HZ(i)*(n_period*(i/2))**2
+  end do
+end if
 
 my_deltas = .false.
 if (present(deltas)) then
@@ -307,7 +321,11 @@ logical :: my_deltas
 
 call basisfunctions(s,t,H_T)
 H = transpose(H_T)
-call sincosperiod_moivre(phi, HZ, dHZ) ! dHZ unused
+if (pfafem_values_active) then
+  call pfafem_hz_interp(phi, HZ, dHZ)
+else
+  call sincosperiod_moivre(phi, HZ, dHZ) ! dHZ unused
+end if
 call sincosperiod_moivre_ncoord(phi, HZ_coord, dHZ_coord) ! dHZ unused
 
 P = 0.d0; R = 0.d0; Z = 0.d0
@@ -386,7 +404,11 @@ R = 0.d0; R_s = 0.d0; R_t = 0.d0; R_phi = 0.d0
 Z = 0.d0; Z_s = 0.d0; Z_t = 0.d0; Z_phi = 0.d0
 
 ! 7% exec time
-call sincosperiod_moivre(phi, HZ, dHZ)
+if (pfafem_values_active) then
+  call pfafem_hz_interp(phi, HZ, dHZ)
+else
+  call sincosperiod_moivre(phi, HZ, dHZ)
+end if
 call sincosperiod_moivre_ncoord(phi, HZ_coord, dHZ_coord)
 
 my_deltas = .false.
@@ -480,10 +502,14 @@ P = 0.d0; P_s = 0.d0; P_t = 0.d0; P_st = 0.d0; P_ss = 0.d0; P_tt = 0.d0; P_phi =
 R = 0.d0; R_s = 0.d0; R_t = 0.d0; R_st = 0.d0; R_ss = 0.d0; R_tt = 0.d0; R_phi = 0.d0; R_sphi = 0.d0; R_tphi = 0.d0; R_phiphi = 0.d0
 Z = 0.d0; Z_s = 0.d0; Z_t = 0.d0; Z_st = 0.d0; Z_ss = 0.d0; Z_tt = 0.d0; Z_phi = 0.d0; Z_sphi = 0.d0; Z_tphi = 0.d0; Z_phiphi = 0.d0
 
-call sincosperiod_moivre(phi, HZ, dHZ)
-do i=1,n_tor
-  ddHZ(i) = HZ(i)*(n_period*(i/2))**2
-end do
+if (pfafem_values_active) then
+  call pfafem_hz_interp(phi, HZ, dHZ, ddHZ)
+else
+  call sincosperiod_moivre(phi, HZ, dHZ)
+  do i=1,n_tor
+    ddHZ(i) = HZ(i)*(n_period*(i/2))**2
+  end do
+end if
 call sincosperiod_moivre_ncoord(phi, HZ_coord, dHZ_coord)
 do i=1,n_coord_tor
   ddHZ_coord(i) = HZ_coord(i)*(n_coord_period*(i/2))**2
@@ -622,6 +648,19 @@ pure subroutine sincosperiod_moivre(phi,HZ,dHZ)
     dHZ(2*i+1) = HZ(2*i)  *( n_period*i)
 #endif
   end do
+#ifdef UNIT_TESTS
+  if (mod(n_tor_loc, 2) == 0) then
+    phase          = real(n_period_loc*(n_tor_loc/2),8)*phi
+    HZ(n_tor_loc)  = cos(phase)
+    dHZ(n_tor_loc) = -real(n_period_loc*(n_tor_loc/2),8)*sin(phase)
+  endif
+#else
+  if (mod(n_tor, 2) == 0) then
+    phase      = real(n_period*(n_tor/2),8)*phi
+    HZ(n_tor)  = cos(phase)
+    dHZ(n_tor) = -real(n_period*(n_tor/2),8)*sin(phase)
+  endif
+#endif
 
 end subroutine sincosperiod_moivre
 
@@ -693,6 +732,11 @@ pure subroutine mode_moivre(phi,HZ)
     HZ(2*i)   = real(H_complex)
     HZ(2*i+1) = aimag(H_complex)
   enddo
+#ifdef UNIT_TESTS
+  if (mod(n_tor_loc, 2) == 0) HZ(n_tor_loc) = cos(real(n_period_loc*(n_tor_loc/2),8)*phi)
+#else
+  if (mod(n_tor, 2) == 0) HZ(n_tor) = cos(real(n_period*(n_tor/2),8)*phi)
+#endif
 
 !  if (n_mode .gt. 0) then
 !    HZ(2) = cos(n_period*phi)
@@ -720,6 +764,7 @@ real*8,                   intent(out) :: P, P_s, P_t, P_st, P_ss, P_tt
 
 ! --- Local variables
 real*8 :: G(4,n_degrees), G_s(4,n_degrees), G_t(4,n_degrees), G_st(4,n_degrees), G_ss(4,n_degrees), G_tt(4,n_degrees)
+real*8 :: v_harm
 integer :: kv, iv, kf 
 
 call basisfunctions(s,t,G, G_s, G_t, G_st, G_ss, G_tt)
@@ -747,12 +792,17 @@ do kv = 1,n_vertex_max  ! 4 vertices
       P_tt = P_tt + node_list%node(iv)%psi_eq(kf) * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
     else
 #endif
-      P    = P    + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
-      P_s  = P_s  + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
-      P_t  = P_t  + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
-      P_st = P_st + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_st(kv,kf)
-      P_ss = P_ss + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_ss(kv,kf)
-      P_tt = P_tt + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
+      if (pfafem_values_active) then
+        v_harm = pfafem_harm_from_bspline(node_list%node(iv)%values(1:n_tor,kf,i_var), i_harm)
+      else
+        v_harm = node_list%node(iv)%values(i_harm,kf,i_var)
+      end if
+      P    = P    + v_harm * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
+      P_s  = P_s  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
+      P_t  = P_t  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
+      P_st = P_st + v_harm * element_list%element(i_elm)%size(kv,kf) * G_st(kv,kf)
+      P_ss = P_ss + v_harm * element_list%element(i_elm)%size(kv,kf) * G_ss(kv,kf)
+      P_tt = P_tt + v_harm * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
 #ifdef fullmhd
     endif
 #endif
@@ -775,6 +825,7 @@ real*8,                   intent(out) :: P, P_s, P_t, P_st, P_ss, P_tt
 
 ! --- Local variables
 real*8 :: G(4,n_degrees), G_s(4,n_degrees), G_t(4,n_degrees), G_st(4,n_degrees), G_ss(4,n_degrees), G_tt(4,n_degrees)
+real*8 :: v_harm
 integer :: kv, iv, kf 
 
 call basisfunctions(s,t,G, G_s, G_t, G_st, G_ss, G_tt)
@@ -784,12 +835,17 @@ P = 0.d0; P_s = 0.d0; P_t = 0.d0; P_st = 0.d0; P_ss = 0.d0; P_tt = 0.d0
 do kv = 1,n_vertex_max  ! 4 vertices
   iv = element_list%element(i_elm)%vertex(kv)  ! the node number
   do kf = 1, n_degrees       ! basis functions
-    P    = P    + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
-    P_s  = P_s  + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
-    P_t  = P_t  + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
-    P_st = P_st + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_st(kv,kf)
-    P_ss = P_ss + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_ss(kv,kf)
-    P_tt = P_tt + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
+    if (pfafem_values_active) then
+      v_harm = pfafem_harm_from_bspline(node_list%node(iv)%deltas(1:n_tor,kf,i_var), i_harm)
+    else
+      v_harm = node_list%node(iv)%deltas(i_harm,kf,i_var)
+    end if
+    P    = P    + v_harm * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
+    P_s  = P_s  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
+    P_t  = P_t  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
+    P_st = P_st + v_harm * element_list%element(i_elm)%size(kv,kf) * G_st(kv,kf)
+    P_ss = P_ss + v_harm * element_list%element(i_elm)%size(kv,kf) * G_ss(kv,kf)
+    P_tt = P_tt + v_harm * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
   end do
 end do
 end subroutine interp_2_delta
@@ -807,7 +863,7 @@ real*8,                   intent(in)  :: t
 real*8,                   intent(out) :: P, P_s, P_t
 
 ! --- Local variables
-real*8 :: G(4,n_degrees), G_s(4,n_degrees), G_t(4,n_degrees)
+real*8 :: G(4,n_degrees), G_s(4,n_degrees), G_t(4,n_degrees), v_harm
 integer :: kv, iv, kf 
 
 call basisfunctions(s,t,G,G_s,G_t)
@@ -829,9 +885,14 @@ do kv = 1,n_vertex_max  ! 4 vertices
       P_t  = P_t  + node_list%node(iv)%psi_eq(kf) * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
     else
 #endif
-      P    = P    + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
-      P_s  = P_s  + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
-      P_t  = P_t  + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
+      if (pfafem_values_active) then
+        v_harm = pfafem_harm_from_bspline(node_list%node(iv)%values(1:n_tor,kf,i_var), i_harm)
+      else
+        v_harm = node_list%node(iv)%values(i_harm,kf,i_var)
+      end if
+      P    = P    + v_harm * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
+      P_s  = P_s  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
+      P_t  = P_t  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
 #ifdef fullmhd
     endif
 #endif
@@ -852,7 +913,7 @@ real*8,                   intent(in)  :: t
 real*8,                   intent(out) :: P, P_s, P_t
 
 ! --- Local variables
-real*8 :: G(4,n_degrees), G_s(4,n_degrees), G_t(4,n_degrees)
+real*8 :: G(4,n_degrees), G_s(4,n_degrees), G_t(4,n_degrees), v_harm
 integer :: kv, iv, kf 
 
 call basisfunctions(s,t,G,G_s,G_t)
@@ -862,9 +923,14 @@ P = 0.d0; P_s = 0.d0; P_t = 0.d0;
 do kv = 1,n_vertex_max  ! 4 vertices
   iv = element_list%element(i_elm)%vertex(kv)  ! the node number
   do kf = 1, n_degrees       ! basis functions
-    P    = P    + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
-    P_s  = P_s  + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
-    P_t  = P_t  + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
+    if (pfafem_values_active) then
+      v_harm = pfafem_harm_from_bspline(node_list%node(iv)%deltas(1:n_tor,kf,i_var), i_harm)
+    else
+      v_harm = node_list%node(iv)%deltas(i_harm,kf,i_var)
+    end if
+    P    = P    + v_harm * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
+    P_s  = P_s  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
+    P_t  = P_t  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
   end do
 end do
 end subroutine interp_1_delta
@@ -882,7 +948,7 @@ real*8,                   intent(in)  :: t
 real*8,                   intent(out) :: P
 
 ! --- Local variables
-real*8 :: G(4,n_degrees)
+real*8 :: G(4,n_degrees), v_harm
 integer :: kv, iv, kf 
 
 call basisfunctions(s,t,G)
@@ -900,7 +966,12 @@ do kv = 1,n_vertex_max  ! 4 vertices
       P    = P    + node_list%node(iv)%psi_eq(kf) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
     else
 #endif
-      P    = P    + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
+      if (pfafem_values_active) then
+        v_harm = pfafem_harm_from_bspline(node_list%node(iv)%values(1:n_tor,kf,i_var), i_harm)
+      else
+        v_harm = node_list%node(iv)%values(i_harm,kf,i_var)
+      end if
+      P    = P    + v_harm * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
 #ifdef fullmhd
     endif
 #endif
@@ -921,7 +992,7 @@ real*8,                   intent(in)  :: t
 real*8,                   intent(out) :: P
 
 ! --- Local variables
-real*8 :: G(4,n_degrees)
+real*8 :: G(4,n_degrees), v_harm
 integer :: kv, iv, kf 
 
 call basisfunctions(s,t,G)
@@ -931,7 +1002,12 @@ P = 0.d0;
 do kv = 1,n_vertex_max  ! 4 vertices
   iv = element_list%element(i_elm)%vertex(kv)  ! the node number
   do kf = 1, n_degrees       ! basis functions
-    P    = P    + node_list%node(iv)%deltas(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
+    if (pfafem_values_active) then
+      v_harm = pfafem_harm_from_bspline(node_list%node(iv)%deltas(1:n_tor,kf,i_var), i_harm)
+    else
+      v_harm = node_list%node(iv)%deltas(i_harm,kf,i_var)
+    end if
+    P    = P    + v_harm * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
   end do
 end do
 end subroutine interp_0_single_harmonic_delta
@@ -945,12 +1021,25 @@ integer,                  intent(in)  :: n_v, i_v(n_v)
 real*8,                   intent(in)  :: s, t, phi
 real*8,                   intent(out) :: P(n_v)
 
-real*8  :: H(4,n_degrees), ss, mode
+real*8  :: H(4,n_degrees), HZ(n_tor), dHZ(n_tor), ss, mode
 integer :: kv, iv, kf, m, i, i_harm, i_tor
 
 call basisfunctions(s,t,H)
 
 P = 0.d0
+if (pfafem_values_active) then
+  call pfafem_hz_interp(phi, HZ, dHZ)
+  do kv = 1,n_vertex_max
+    iv = element_list%element(i_elm)%vertex(kv)
+    do kf = 1, n_degrees
+      ss = element_list%element(i_elm)%size(kv,kf) * H(kv,kf)
+      do i = 1, n_v
+        P(i) = P(i) + dot_product(node_list%node(iv)%values(1:n_tor,kf,i_v(i)), HZ(1:n_tor)) * ss
+      end do
+    end do
+  end do
+  return
+end if
 
 do kv = 1,n_vertex_max  ! 4 vertices
   iv = element_list%element(i_elm)%vertex(kv)  ! the node number
@@ -981,12 +1070,25 @@ integer,                  intent(in)  :: n_v, i_v(n_v)
 real*8,                   intent(in)  :: s, t, phi
 real*8,                   intent(out) :: P(n_v)
 
-real*8  :: H(4,n_degrees), ss, mode
+real*8  :: H(4,n_degrees), HZ(n_tor), dHZ(n_tor), ss, mode
 integer :: kv, iv, kf, m, i, i_harm, i_tor
 
 call basisfunctions(s,t,H)
 
 P = 0.d0
+if (pfafem_values_active) then
+  call pfafem_hz_interp(phi, HZ, dHZ)
+  do kv = 1,n_vertex_max
+    iv = element_list%element(i_elm)%vertex(kv)
+    do kf = 1, n_degrees
+      ss = element_list%element(i_elm)%size(kv,kf) * H(kv,kf)
+      do i = 1, n_v
+        P(i) = P(i) + dot_product(node_list%node(iv)%deltas(1:n_tor,kf,i_v(i)), HZ(1:n_tor)) * ss
+      end do
+    end do
+  end do
+  return
+end if
 
 do kv = 1,n_vertex_max  ! 4 vertices
   iv = element_list%element(i_elm)%vertex(kv)  ! the node number
@@ -1130,6 +1232,7 @@ real*8,                   intent(out) :: P, P_s, P_t, P_st, P_ss, P_tt
 
 ! --- Local variables
 real*8 :: G(4,n_degrees), G_s(4,n_degrees), G_t(4,n_degrees), G_st(4,n_degrees), G_ss(4,n_degrees), G_tt(4,n_degrees)
+real*8 :: v_harm
 integer :: kv, iv, kf 
 
 call basisfunctions(s,t,G, G_s, G_t, G_st, G_ss, G_tt)
@@ -1154,12 +1257,17 @@ else
   do kv = 1,n_vertex_max  ! 4 vertices
     iv = element_list%element(i_elm)%vertex(kv)  ! the node number
     do kf = 1, n_degrees       ! basis functions
-      P    = P    + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
-      P_s  = P_s  + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
-      P_t  = P_t  + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
-      P_st = P_st + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_st(kv,kf)
-      P_ss = P_ss + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_ss(kv,kf)
-      P_tt = P_tt + node_list%node(iv)%values(i_harm,kf,i_var) * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
+      if (pfafem_values_active) then
+        v_harm = pfafem_harm_from_bspline(node_list%node(iv)%values(1:n_tor,kf,i_var), i_harm)
+      else
+        v_harm = node_list%node(iv)%values(i_harm,kf,i_var)
+      end if
+      P    = P    + v_harm * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
+      P_s  = P_s  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
+      P_t  = P_t  + v_harm * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
+      P_st = P_st + v_harm * element_list%element(i_elm)%size(kv,kf) * G_st(kv,kf)
+      P_ss = P_ss + v_harm * element_list%element(i_elm)%size(kv,kf) * G_ss(kv,kf)
+      P_tt = P_tt + v_harm * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
     end do
   end do
 endif
@@ -1330,6 +1438,7 @@ end subroutine interp_RZP_2
 !!   3: pressure
 !!   4: radial coordinate (in GVEC, this is the square root of the normalised toroidal flux)
 !!   5: scalar potential for vacuum magnetic field
+!!   6: vacuum magnetic field imported with GVEC
 pure subroutine interp_gvec(node_list, element_list, i_elm, i_var, i_dim, i_harm, s, t, P, P_s, P_t, P_st, P_ss, P_tt)
 type (type_node_list),    intent(in)  :: node_list
 type (type_element_list), intent(in)  :: element_list
@@ -1386,7 +1495,7 @@ do kv = 1,n_vertex_max  ! 4 vertices
       P_tt = P_tt + node_list%node(iv)%pressure(kf) * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
 #endif /*JOREK_MODEL == 180*/
     else if (i_var == 5) then    
-#ifndef USE_DOMM    
+#if !defined(USE_DOMM) && !defined(USE_EXT_FIELD)
       ! The equilibrium is a scalar, axisymmetric profile, so i_dim and i_harm have no influence on the results
       P    = P    + node_list%node(iv)%chi_correction(i_harm,kf) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
       P_s  = P_s  + node_list%node(iv)%chi_correction(i_harm,kf) * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
@@ -1394,12 +1503,113 @@ do kv = 1,n_vertex_max  ! 4 vertices
       P_st = P_st + node_list%node(iv)%chi_correction(i_harm,kf) * element_list%element(i_elm)%size(kv,kf) * G_st(kv,kf)
       P_ss = P_ss + node_list%node(iv)%chi_correction(i_harm,kf) * element_list%element(i_elm)%size(kv,kf) * G_ss(kv,kf)
       P_tt = P_tt + node_list%node(iv)%chi_correction(i_harm,kf) * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
-#endif /*USE_DOMM*/
+#endif /*!defined(USE_DOMM) && !defined(USE_EXT_FIELD)*/
+    else if (i_var == 6) then
+#if !defined(USE_DOMM) && defined(USE_EXT_FIELD)
+      P    = P    + node_list%node(iv)%b_vac_field(i_harm,kf,i_dim) * element_list%element(i_elm)%size(kv,kf) * G(kv,kf)
+      P_s  = P_s  + node_list%node(iv)%b_vac_field(i_harm,kf,i_dim) * element_list%element(i_elm)%size(kv,kf) * G_s(kv,kf)
+      P_t  = P_t  + node_list%node(iv)%b_vac_field(i_harm,kf,i_dim) * element_list%element(i_elm)%size(kv,kf) * G_t(kv,kf)
+      P_st = P_st + node_list%node(iv)%b_vac_field(i_harm,kf,i_dim) * element_list%element(i_elm)%size(kv,kf) * G_st(kv,kf)
+      P_ss = P_ss + node_list%node(iv)%b_vac_field(i_harm,kf,i_dim) * element_list%element(i_elm)%size(kv,kf) * G_ss(kv,kf)
+      P_tt = P_tt + node_list%node(iv)%b_vac_field(i_harm,kf,i_dim) * element_list%element(i_elm)%size(kv,kf) * G_tt(kv,kf)
+#endif /*!defined(USE_DOMM) && defined(USE_EXT_FIELD)*/
     endif
   end do
 end do
 #endif /*STELLARATOR_MODEL*/
 
 end subroutine interp_gvec
+
+pure subroutine pfafem_hz_interp(phi, HZ, dHZ, ddHZ)
+  real*8,           intent(in)  :: phi
+  real*8,           intent(out) :: HZ(n_tor), dHZ(n_tor)
+  real*8, optional, intent(out) :: ddHZ(n_tor)
+
+  integer :: eP, lb, jb
+  real*8  :: phi_per, dphi, phi_mod, t, mt, nb(4), dnb(4), ddnb(4)
+
+  HZ = 0.d0
+  dHZ = 0.d0
+  if (present(ddHZ)) ddHZ = 0.d0
+  if (n_tor <= 1) then
+    if (n_tor == 1) HZ(1) = 1.d0
+    return
+  end if
+
+  phi_per = 2.d0 * pi / dble(max(1, n_period))
+  dphi    = phi_per / dble(n_tor)
+  phi_mod = modulo(phi, phi_per)
+  eP      = min(n_tor - 1, max(0, int(phi_mod / dphi)))
+  t       = max(0.d0, min(1.d0, phi_mod / dphi - dble(eP)))
+  mt      = 1.d0 - t
+
+  nb(1)   = mt * mt * mt / 6.d0
+  nb(2)   = (3.d0*t*t*t - 6.d0*t*t + 4.d0) / 6.d0
+  nb(3)   = (-3.d0*t*t*t + 3.d0*t*t + 3.d0*t + 1.d0) / 6.d0
+  nb(4)   = t * t * t / 6.d0
+
+  dnb(1)  = -0.5d0 * mt * mt
+  dnb(2)  = (9.d0*t*t - 12.d0*t) / 6.d0
+  dnb(3)  = (-9.d0*t*t + 6.d0*t + 3.d0) / 6.d0
+  dnb(4)  = 0.5d0 * t * t
+
+  ddnb(1) = mt
+  ddnb(2) = 3.d0*t - 2.d0
+  ddnb(3) = -3.d0*t + 1.d0
+  ddnb(4) = t
+
+  do lb = 1, 4
+    jb = 1 + modulo(eP - 2 + lb, n_tor)
+    HZ(jb)  = HZ(jb)  + nb(lb)
+    dHZ(jb) = dHZ(jb) + dnb(lb) / dphi
+    if (present(ddHZ)) ddHZ(jb) = ddHZ(jb) + ddnb(lb) / (dphi * dphi)
+  end do
+end subroutine pfafem_hz_interp
+
+pure real*8 function pfafem_harm_from_bspline(c_spl, i_harm) result(val)
+  real*8,  intent(in) :: c_spl(n_tor)
+  integer, intent(in) :: i_harm
+
+  integer :: j, k
+  real*8  :: th, w, acc, ang
+
+  val = 0.d0
+  if (i_harm < 1 .or. i_harm > n_tor) return
+  if (i_harm == 1) then
+    val = sum(c_spl(1:n_tor)) / dble(max(1, n_tor))
+    return
+  end if
+
+  if (mod(n_tor, 2) == 0 .and. i_harm == n_tor) then
+    w   = (2.d0 / pi)**4
+    acc = 0.d0
+    do j = 1, n_tor
+      if (mod(j - 1, 2) == 0) then
+        acc = acc + c_spl(j)
+      else
+        acc = acc - c_spl(j)
+      end if
+    end do
+    val = (2.d0 * w / dble(n_tor)) * acc
+    return
+  end if
+
+  k  = i_harm / 2
+  th = pi * dble(k) / dble(n_tor)
+  w  = (sin(th) / th)**4
+  acc = 0.d0
+  if (mod(i_harm, 2) == 0) then
+    do j = 1, n_tor
+      ang = 2.d0 * pi * dble(k * (j - 1)) / dble(n_tor)
+      acc = acc + c_spl(j) * cos(ang)
+    end do
+  else
+    do j = 1, n_tor
+      ang = 2.d0 * pi * dble(k * (j - 1)) / dble(n_tor)
+      acc = acc + c_spl(j) * sin(ang)
+    end do
+  end if
+  val = (2.d0 * w / dble(n_tor)) * acc
+end function pfafem_harm_from_bspline
 
 end module mod_interp

@@ -77,7 +77,7 @@ ifeq ($(COMPILER_FAMILY), intel)
   endif
 
   ifeq ($(shell test $(COMPILER_MAJOR_VERSION) -gt 19; echo $$?),0)
-    FFLAGS +: -warn noexternal
+    FFLAGS += -warn noexternal
   else ifeq ($(shell test $(COMPILER_MAJOR_VERSION) -eq 19; echo $$?),0)
     ifeq ($(shell test $(COMPILER_MAJOR_VERSION_ID) -ge 1; echo $$?),0)
       FFLAGS += -warn noexternal
@@ -176,17 +176,23 @@ USE_DOMM ?= 1
 ifeq ($(USE_DOMM), 1)
   DEFINES := $(DEFINES) -DUSE_DOMM              # Use Dommaschk potentials, without FE correction of n.B on boundary 
 endif
+USE_EXT_FIELD ?= 0
+ifeq ($(USE_EXT_FIELD), 1)
+  ifeq ($(USE_DOMM), 0)                         # Should only be set if USE_DOMM=0
+    DEFINES := $(DEFINES) -DUSE_EXT_FIELD       # Use external magnetic field from gvec2jorek file
+  endif
+endif
 # -heap-arrays is Intel-only; gfortran would read it as -h (fatal)
 ifeq (model180, $(MODEL))
   DEFINES := $(DEFINES) -DSEMIANALYTICAL -DSTELLARATOR_MODEL
   ifeq ($(COMPILER_FAMILY), intel)
-    FFLAGS  := $(FFLAGS) -heap-arrays
+    FFLAGS  := $(FFLAGS) -heap-arrays 64
   endif
 endif
 ifeq (model183, $(MODEL))
   DEFINES := $(DEFINES) -DSEMIANALYTICAL -DSTELLARATOR_MODEL
   ifeq ($(COMPILER_FAMILY), intel)
-    FFLAGS  := $(FFLAGS) -heap-arrays
+    FFLAGS  := $(FFLAGS) -heap-arrays 64
   endif
 endif
 ifeq (.true., $(shell ./util/config.sh -p with_vpar))

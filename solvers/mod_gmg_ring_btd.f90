@@ -12,6 +12,7 @@
 !! Factored in double, pivot blocks inverted (btd_invert); the smoothing solves
 !! (mod_gmg_ring_btd_solve.inc) run on the factors rounded to single.
 module mod_gmg_ring_btd
+  !$ use omp_lib
   implicit none
   private
 
@@ -77,6 +78,7 @@ contains
       rg%ol(J) = t; t = t + int(bs(J), 8) * bs(prv(J))
     enddo
     if (meth == RS_THOMAS) then
+      rg%ns = 0; rg%nf = 0; rg%of = 0
       c = nn - 1
       allocate(rg%oc(0:c - 1), rg%orr(0:c - 1))
       do J = 0, c - 1
@@ -358,6 +360,8 @@ contains
     integer :: J, Jn, Jp, i, k, nb, nn
     real*8 :: d
     nn = rg%nn
+    !$omp parallel private(J, Jn, Jp, i, k, nb, d) if (nn > 1 .and. .not. omp_in_parallel())
+    !$omp do schedule(static)
     do J = 0, nn - 1
       nb = rg%bs(J)
       do i = 1, nb
@@ -366,6 +370,8 @@ contains
         if (d > 0.d0) sc(rg%rp(J) + i) = 1.d0 / sqrt(d)
       enddo
     enddo
+    !$omp end do
+    !$omp do schedule(static)
     do J = 0, nn - 1
       nb = rg%bs(J); Jn = modulo(J + 1, nn); Jp = modulo(J - 1, nn)
       do k = 1, nb
@@ -387,6 +393,8 @@ contains
         enddo
       enddo
     enddo
+    !$omp end do
+    !$omp end parallel
   end subroutine btd_equil
 
   !> After a factorisation: the LU-factored pivot blocks (Thomas: every node;
@@ -397,29 +405,36 @@ contains
     type(btd_ring), intent(inout) :: rg
     real*8, intent(inout) :: a(*)
     integer, intent(in)   :: piv(*)
-    integer :: J, k, bj, info
+    integer :: J, k, n_inv, idx, bj, lw, info
+    integer :: j_list(0:rg%nn - 1)
     real*8, allocatable :: w(:)
-    allocate(w(64 * maxval(rg%bs)))
+    lw = max(1, 64 * maxval(rg%bs))
+    n_inv = 0
     if (rg%meth == RS_THOMAS) then
       do J = 0, rg%nn - 1
-        call inv1(J)
+        j_list(n_inv) = J
+        n_inv = n_inv + 1
       enddo
     else
       do k = 0, rg%ns - 1
         do J = rg%sep(k) + 1, hyb_end(rg, k)
-          call inv1(J)
+          j_list(n_inv) = J
+          n_inv = n_inv + 1
         enddo
       enddo
     endif
+    !$omp parallel private(w, idx, J, bj, info) if (n_inv > 1 .and. maxval(rg%bs) < 300 .and. .not. omp_in_parallel())
+    allocate(w(lw))
+    !$omp do schedule(dynamic, 1)
+    do idx = 0, n_inv - 1
+      J  = j_list(idx)
+      bj = rg%bs(J)
+      call dgetri(bj, a(rg%od(J) + 1), bj, piv(rg%rp(J) + 1), w, lw, info)
+    enddo
+    !$omp end do
+    deallocate(w)
+    !$omp end parallel
     rg%inv = .true.
-
-  contains
-
-    subroutine inv1(J_)
-      integer, intent(in) :: J_
-      bj = rg%bs(J_)
-      call dgetri(bj, a(rg%od(J_) + 1), bj, piv(rg%rp(J_) + 1), w, size(w), info)
-    end subroutine inv1
   end subroutine btd_invert
 
 #include "mod_gmg_ring_btd_solve.inc"

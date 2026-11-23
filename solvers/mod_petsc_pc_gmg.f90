@@ -20,8 +20,13 @@ module mod_petsc_pc_gmg
   use iso_c_binding, only: c_ptr, c_double
   use mod_petsc_raw_csr, only: aij_parts, get_ij, put_ij, aij_vals_read, aij_vals_done, blockmv_attach, &
                                galerkin_blk
+#if PETSC_VERSION_LT(3,23,0)
+  use mod_petsc_raw_csr, only: mat_get_row, mat_restore_row, mat_create_submatrices, mat_destroy_submatrices, &
+                               petsc_object_get_id, mat_get_nonzero_state
+#endif
   use mod_petsc_pc_gmg_axis, only: axd_t, axd_nsec, axd_setup, axd_refill, axd_factor, axd_solve, axd_destroy
   use mod_gmg_ring_btd
+#include "petsc_f90_compat.h"
   implicit none
   private
 
@@ -150,6 +155,7 @@ module mod_petsc_pc_gmg
     integer, allocatable :: lb(:), lk(:)                   !< threaded hybrid: (block, segment) work items
     real*8, allocatable :: wk(:)                           !< threaded hybrid: work vector, block order
     real(rk_ring), allocatable :: wk4(:)                   !< its rk_ring copy
+    logical :: big_btd = .false.                           !< few large super-node rings: thread inside sgemv_s
   end type blk_t
 
   !> One hierarchy (an instance of gmg_select). Level 0 is the fine level;
@@ -317,15 +323,25 @@ contains
     endif
     if (R%member) then
       if (fresh) then
-        ! a large coarsest level: MUMPS (SCOTCH ordering, half the fill of PETSc's ND LU)
+        ! axis / coarse blocks >= 400 rows: OpenMP-threaded MKL PARDISO (or MUMPS) instead of scalar PETSc LU
         block
           PetscInt :: nsub
           call MatGetSize(R%sub(1), nsub, PETSC_NULL_INTEGER, ierr)
-          if (what == "coarse" .and. nsub >= CRS_MUMPS_MIN) then
+#if defined(PETSC_HAVE_MKL_PARDISO)
+          if (nsub >= 400) then
+            call rds_make_ksp("mkl_pardiso")
+          else
+            call rds_make_ksp(MATSOLVERPETSC)
+          endif
+#elif defined(PETSC_HAVE_MUMPS)
+          if (nsub >= CRS_MUMPS_MIN) then
             call rds_make_ksp(MATSOLVERMUMPS)
           else
             call rds_make_ksp(MATSOLVERPETSC)
           endif
+#else
+          call rds_make_ksp(MATSOLVERPETSC)
+#endif
         end block
         call MatCreateVecs(R%sub(1), R%x, R%b, ierr)
       else
@@ -340,11 +356,21 @@ contains
         call KSPGetPC(R%ksp, pc, ierr)
         call PCGetFailedReason(pc, why, ierr)
         if (why /= PC_NOERROR) then
+#if defined(PETSC_HAVE_MUMPS)
           write(*,'(A,I0,A,A,A)') "[Physics PC]   GMG", cur_inst, " ", tag, &
             ": PETSc LU failed (zero pivot?), refactoring with MUMPS"
           call KSPDestroy(R%ksp, ierr)
           call rds_make_ksp(MATSOLVERMUMPS)
           call KSPSetUp(R%ksp, ierr)
+#else
+          write(*,'(A,I0,A,A,A)') "[Physics PC]   GMG", cur_inst, " ", tag, &
+            ": PETSc LU failed (zero pivot?), retrying with nonzero shift"
+          call KSPDestroy(R%ksp, ierr)
+          call rds_make_ksp(MATSOLVERPETSC)
+          call KSPGetPC(R%ksp, pc, ierr)
+          call PCFactorSetShiftType(pc, MAT_SHIFT_NONZERO, ierr)
+          call KSPSetUp(R%ksp, ierr)
+#endif
         endif
       end block
     endif
@@ -352,14 +378,22 @@ contains
       if (R%me == 0) then
         block
           Mat :: F
+#if PETSC_VERSION_LT(3,23,0)
+          MatInfo :: finfo(MAT_INFO_SIZE)
+#else
           MatInfo :: finfo
+#endif
           PetscInt :: nax
           call KSPGetPC(R%ksp, pc, ierr)
           call PCFactorGetMatrix(pc, F, ierr)
           call MatGetInfo(F, MAT_LOCAL, finfo, ierr)
           call ISGetSize(R%isq, nax, ierr)
           write(*,'(A,I0,A,A,A,I0,A,I0,A,ES10.3)') "[Mem] GMG", cur_inst, " ", tag, " LU: ", &
+#if PETSC_VERSION_LT(3,23,0)
+            nax, " rows on ", R%np, " rank(s), factor entries ", finfo(MAT_INFO_NZ_USED)
+#else
             nax, " rows on ", R%np, " rank(s), factor entries ", finfo%nz_used
+#endif
         end block
       endif
     endif
@@ -386,7 +420,23 @@ contains
         endif
       endif
       write(pre, '(A,I0,A,A,A)') "sf_gmg", cur_inst, "_", what, "_"
-      if (stype == MATSOLVERMUMPS) then
+      if (stype == "mkl_pardiso") then
+        ! Override PETSc's default MKL_DOMAIN_PARDISO = 1 thread and enable two-level parallel LU
+        block
+          character(len=80) :: nm, sv
+          integer :: nt_p
+          PetscBool :: has
+          nt_p = 1
+          !$ nt_p = omp_get_max_threads()
+          write(sv, '(I0)') max(1, nt_p)
+          nm = "-"//trim(pre)//"mat_mkl_pardiso_65"
+          call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), has, ierr)
+          if (.not. has) call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(nm), trim(sv), ierr)
+          nm = "-"//trim(pre)//"mat_mkl_pardiso_24"
+          call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(nm), has, ierr)
+          if (.not. has) call PetscOptionsSetValue(PETSC_NULL_OPTIONS, trim(nm), "1", ierr)
+        end block
+      else if (stype == MATSOLVERMUMPS) then
         ! SCOTCH ordering unless the user chose one
         block
           character(len=80) :: nm
@@ -425,7 +475,7 @@ contains
     integer :: q, nl, o, mpierr
     if (.not. R%member) return
     nl = size(R%loc)
-    o = R%dsp(R%me)
+    o  = R%dsp(R%me)
     call VecGetArray(R%b, bp, ie)
     if (R%np == 1) then
       do q = 1, nl
@@ -554,8 +604,8 @@ contains
       call fail("needs the bicubic Hermite element (n_degrees = 4)")
       return
     endif
-    if (treat_axis .and. hier_root()) write(*,'(A)') "[Physics PC]   GMG WARNING: treat_axis shares "// &
-      "Cartesian axis DOFs, which the coarse spaces do not represent (slower V-cycles near the axis)"
+    if (treat_axis .and. hier_root()) write(*,'(A,I0,A)') "[Physics PC]   GMG", cur_inst, &
+      ": treat_axis active, 3 shared Cartesian axis DOFs (u0, u_R, u_Z) represented on all coarse levels"
 
     !--- gate 1: the (i-1)*n_tht + j polar layout; an X-point grid takes its
     !--- own builder
@@ -653,15 +703,15 @@ contains
     nlev_cap = MAX_LEV_FULL
     if (semi_r > 0) nlev_cap = MAX_LEV
     do g = 1, nlev_cap - 1
-      if (mod(ni - 1, 2) /= 0) exit
+      if (ni <= 3) exit
       if (g > semi_r .and. (mod(nj, 2) /= 0 .or. nj < 4)) exit
-      ni = (ni - 1) / 2 + 1
+      ni = ni / 2 + 1
       if (g > semi_r) nj = nj / 2
       call make_level(lv(g), ni, nj)
       H%nlev = H%nlev + 1
     enddo
     if (H%nlev < 2) then
-      call fail("mesh cannot be coarsened (need (n_flux-1) even and n_tht divisible by 4)")
+      call fail("mesh cannot be coarsened (need n_flux >= 4 and n_tht divisible by 4)")
       return
     endif
 
@@ -681,7 +731,7 @@ contains
       ly(g)%own = -1
       do ci = 0, lv(g)%ni - 1
         do cj = 0, lv(g)%nj - 1
-          n = (ci * 2**g) * n_tht + cj * (n_tht / lv(g)%nj) + 1
+          n = min(ci * 2**g, n_flux - 1) * n_tht + cj * (n_tht / lv(g)%nj) + 1
           own_ = ly(0)%own(node_list%node(n)%index(1) - 1)
           do k = 0, 3
             dd = lv(g)%d(ci, cj, k)
@@ -711,8 +761,15 @@ contains
         idx = node_list%node(n)%index(k + 1) - 1
         if (done(idx + 1)) cycle             ! the shared axis value: one row
         done(idx + 1) = .true.
+        if (treat_axis .and. i == 0) then
+          if (k <= 2) then
+            ns = ns + 1
+            rs(ns) = idx; cs(ns) = k; ws(ns) = 1.0d0
+          endif
+          cycle
+        endif
         if (o(n, k) == 0) cycle              ! inactive (fixed) axis DOF: empty row
-        call interp_row(i, j, k, lv(1), lv(1)%nj == n_tht, cols, w, nent)
+        call interp_row(i, j, k, n_flux, 1, lv(1), lv(1)%nj == n_tht, o, cols, w, nent)
         rs(ns + 1:ns + nent) = idx
         cs(ns + 1:ns + nent) = cols(1:nent)
         ws(ns + 1:ns + nent) = o(n, k) * w(1:nent)
@@ -732,8 +789,15 @@ contains
           do k = 0, 3
             idx = lv(g - 1)%d(i, j, k)
             if (idx < 0) cycle
+            if (treat_axis .and. i == 0) then
+              if (j == 0) then
+                ns = ns + 1
+                rs(ns) = idx; cs(ns) = idx; ws(ns) = 1.0d0
+              endif
+              cycle
+            endif
             if (i == 0 .and. k == 0 .and. j > 0) cycle   ! shared axis value
-            call interp_row(i, j, k, lv(g), lv(g)%nj == lv(g - 1)%nj, cols, w, nent)
+            call interp_row(i, j, k, lv(g - 1)%ni, g, lv(g), lv(g - 1)%nj == lv(g)%nj, o, cols, w, nent)
             rs(ns + 1:ns + nent) = idx
             cs(ns + 1:ns + nent) = cols(1:nent)
             ws(ns + 1:ns + nent) = w(1:nent)
@@ -1765,6 +1829,7 @@ contains
   !! value and per-node a, c (a coarse angular slope b there is not in the fine
   !! space); the boundary drops the Dirichlet DOFs u, b (subdivision keeps them 0).
   subroutine make_level(L, ni, nj)
+    use phys_module, only: treat_axis
     type(lvl_t), intent(inout) :: L
     integer, intent(in) :: ni, nj
     integer :: I, J, k, cnt
@@ -1772,12 +1837,21 @@ contains
     L%ni = ni; L%nj = nj
     allocate(L%d(0:ni - 1, 0:nj - 1, 0:3))
     L%d = -1
-    cnt = 1                                       ! 0 = the shared axis value
-    do J = 0, nj - 1
-      L%d(0, J, 0) = 0
-      L%d(0, J, 1) = cnt; cnt = cnt + 1
-      L%d(0, J, 3) = cnt; cnt = cnt + 1
-    enddo
+    if (treat_axis) then
+      do J = 0, nj - 1
+        L%d(0, J, 0) = 0
+        L%d(0, J, 1) = 1
+        L%d(0, J, 2) = 2
+      enddo
+      cnt = 3
+    else
+      cnt = 1                                       ! 0 = the shared axis value
+      do J = 0, nj - 1
+        L%d(0, J, 0) = 0
+        L%d(0, J, 1) = cnt; cnt = cnt + 1
+        L%d(0, J, 3) = cnt; cnt = cnt + 1
+      enddo
+    endif
     do I = 1, ni - 1
       do J = 0, nj - 1
         do k = 0, 3
@@ -1806,18 +1880,64 @@ contains
     endif
   end subroutine sources_1d
 
+  !> 1D radial sources of fine level-local index fi (0..nf-1) on coarse level g
+  !! of nc nodes, with boundary node nc-1 clamped to s = nflux - 1.
+  subroutine sources_1d_rad(fi, nf, nc, g, nflux, s, W, ns)
+    integer, intent(in)  :: fi, nf, nc, g, nflux
+    integer, intent(out) :: s(2), ns
+    real*8, intent(out)  :: W(2, 2, 2)
+    integer :: sf, s0, s1
+    real*8  :: al, xi
+
+    if (fi == nf - 1) then
+      ns = 1; s(1) = nc - 1; W(:, :, 1) = W_CO
+    else if (mod(fi, 2) == 0) then
+      ns = 1; s(1) = fi / 2; W(:, :, 1) = W_CO
+    else
+      ns = 2
+      s(1) = (fi - 1) / 2
+      s(2) = s(1) + 1
+      sf = fi * 2**(g - 1)
+      s0 = s(1) * 2**g
+      s1 = min(s(2) * 2**g, nflux - 1)
+      if (s1 - s0 == 2**g) then
+        W(:, :, 1) = W_L; W(:, :, 2) = W_R
+      else
+        al = dble(s1 - s0) / dble(2**g)
+        xi = dble(sf - s0) / dble(s1 - s0)
+        W(1, 1, 1) = 1.0d0 - 3.0d0 * xi**2 + 2.0d0 * xi**3
+        W(1, 2, 1) = 3.0d0 * al * xi * (1.0d0 - xi)**2
+        W(2, 1, 1) = xi * (xi - 1.0d0) / al
+        W(2, 2, 1) = 0.5d0 * (1.0d0 - 4.0d0 * xi + 3.0d0 * xi**2)
+        W(1, 1, 2) = 3.0d0 * xi**2 - 2.0d0 * xi**3
+        W(1, 2, 2) = 3.0d0 * al * xi**2 * (xi - 1.0d0)
+        W(2, 1, 2) = xi * (1.0d0 - xi) / al
+        W(2, 2, 2) = 0.5d0 * (3.0d0 * xi**2 - 2.0d0 * xi)
+      endif
+    endif
+  end subroutine sources_1d_rad
+
   !> Canonical fine quantity k at (fi, fj) as a combination of coarse DOFs.
-  subroutine interp_row(fi, fj, k, c, jsame, cols, w, nent)
-    integer, intent(in)      :: fi, fj, k
+  subroutine interp_row(fi, fj, k, nf, g, c, jsame, o, cols, w, nent)
+    use constants,      only: PI
+    use nodes_elements, only: node_list
+    use phys_module,    only: n_flux, n_tht, treat_axis, bloating_factor
+    integer, intent(in)      :: fi, fj, k, nf, g
     type(lvl_t), intent(in)  :: c
     logical, intent(in)      :: jsame           !< J not coarsened (semi_r): fine node = coarse node
+    integer, intent(in)      :: o(:, 0:)
     integer, intent(out)     :: cols(MAX_ENT), nent
     real*8, intent(out)      :: w(MAX_ENT)
-    integer :: si(2), sj(2), nsi, nsj, a, b, kc, d, q
-    real*8  :: Wi(2, 2, 2), Wj(2, 2, 2), wt
-    logical :: found
+    integer :: si(2), sj(2), nsi, nsj, a, b, kc, d, mj, n_ax, sgn3
+#ifndef STELLARATOR_MODEL
+    integer :: ax_src
+#else
+    real*8  :: tht, sax
+#endif
+    integer :: ax_k
+    real*8  :: Wi(2, 2, 2), Wj(2, 2, 2), wt, cR2, cZ2, cR4, cZ4, sc1, sc3
 
-    call sources_1d(fi, c%ni, .false., si, Wi, nsi)
+    call sources_1d_rad(fi, nf, c%ni, g, n_flux, si, Wi, nsi)
     if (jsame) then
       nsj = 1; sj(1) = fj; Wj(:, :, 1) = W_ID
     else
@@ -1829,20 +1949,62 @@ contains
         do kc = 0, 3
           wt = Wi(PQ_I(k) + 1, PQ_I(kc) + 1, a) * Wj(PQ_J(k) + 1, PQ_J(kc) + 1, b)
           if (wt == 0.0d0) cycle
+          if (treat_axis .and. si(a) == 0) then
+            if (kc == 0) then
+              call add_col(0, wt)
+            else if (kc == 1 .or. kc == 3) then
+              mj = n_tht / c%nj
+              n_ax = sj(b) * mj + 1
+#ifdef STELLARATOR_MODEL
+              tht = 2.0d0 * PI * dble(n_ax - 1) / dble(n_tht)
+              sax = dble(n_flux - 1) / bloating_factor
+              cR2 = cos(tht) / (3.0d0 * sax)
+              cZ2 = sin(tht) / (3.0d0 * sax)
+              cR4 = -2.0d0 * PI * sin(tht) / (9.0d0 * dble(n_tht) * sax)
+              cZ4 =  2.0d0 * PI * cos(tht) / (9.0d0 * dble(n_tht) * sax)
+#else
+              ax_src = merge(3, 2, node_list%node(n_ax)%axis_dof == 2)
+              cR2 = node_list%node(n_ax)%x(1, ax_src, 1)
+              cZ2 = node_list%node(n_ax)%x(1, ax_src, 2)
+              cR4 = node_list%node(n_ax)%x(1, 4, 1)
+              cZ4 = node_list%node(n_ax)%x(1, 4, 2)
+#endif
+              if (kc == 1) then
+                ax_k = merge(2, 1, node_list%node(n_ax)%axis_dof == 2)
+                sc1 = (2.0d0**g) * dble(o(n_ax, ax_k))
+                call add_col(1, wt * sc1 * cR2)
+                call add_col(2, wt * sc1 * cZ2)
+              else
+                sgn3 = merge(o(n_ax, 3), o(n_tht + n_ax, 3), o(n_ax, 3) /= 0)
+                sc3 = (2.0d0**g) * dble(mj * sgn3)
+                call add_col(1, wt * sc3 * cR4)
+                call add_col(2, wt * sc3 * cZ4)
+              endif
+            endif
+            cycle
+          endif
           d = c%d(si(a), sj(b), kc)
           if (d < 0) cycle                       ! dropped axis b
-          found = .false.
-          do q = 1, nent
-            if (cols(q) == d) then
-              w(q) = w(q) + wt; found = .true.; exit
-            endif
-          enddo
-          if (.not. found) then
-            nent = nent + 1; cols(nent) = d; w(nent) = wt
-          endif
+          call add_col(d, wt)
         enddo
       enddo
     enddo
+
+  contains
+
+    subroutine add_col(col_, wt_)
+      integer, intent(in) :: col_
+      real*8,  intent(in) :: wt_
+      integer :: q_
+      if (wt_ == 0.0d0) return
+      do q_ = 1, nent
+        if (cols(q_) == col_) then
+          w(q_) = w(q_) + wt_; return
+        endif
+      enddo
+      nent = nent + 1; cols(nent) = col_; w(nent) = wt_
+    end subroutine add_col
+
   end subroutine interp_row
 
   !> Galerkin chain, smoothers, coarse and axis solves for operator A, at
@@ -1851,13 +2013,19 @@ contains
   !! are the coarse operators and the LUs' symbolic phases.
   subroutine gmg_setup_operator(A, comm, my_id, tag, opts)
     use mod_petsc_pc_harm, only: pc_ntor
+    use phys_module,       only: use_pfafem, treat_axis
+    use mod_settings,      only: n_coord_tor
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
     character(len=*), intent(in), optional :: tag   !< label for the prints
     type(gmg_opts_t), intent(in) :: opts
     PetscErrorCode :: ierr
     PC   :: pc
+#if PETSC_VERSION_LT(3,23,0)
+    MatInfo :: minfo(MAT_INFO_SIZE)
+#else
     MatInfo :: minfo
+#endif
     PetscInt :: nr
     integer :: g, rich_lev, mpierr, nlev
     real*8 :: nz0, nzt, nzg
@@ -1982,11 +2150,14 @@ contains
       end block
     endif
     if (H%axis_k < 0) call fatal("axis_rings must be >= 0 or -2")
+    if (treat_axis .and. .not. H%xgrid) H%axis_k = max(H%axis_k, 1)
     ! levels >= RICH_FROM smooth with Richardson on the same blocks: no global
-    ! reductions there. The mixed pair on X-point grids keeps GMRES (its coarse
-    ! levels stall under Richardson at large dt)
+    ! reductions there. The mixed pair on X-point, 3D stellarator, or PFAFEM
+    ! grids keeps GMRES (its coarse levels can amplify under fixed-weight Richardson)
     rich_lev = RICH_FROM
-    if (H%xgrid .and. H%smoother == GMG_SM_RINGS .and. H%nfields > 1) rich_lev = nlev
+    if ((H%xgrid .or. use_pfafem .or. n_coord_tor > 1) .and. &
+        ((H%smoother == GMG_SM_RINGS .and. (H%nfields > 1 .or. use_pfafem)) .or. &
+         (H%smoother == GMG_SM_LINES .and. use_pfafem))) rich_lev = nlev
     do g = 0, nlev - 2
       ! created once per hierarchy; a rebuild re-points the operators and
       ! refactors the smoother blocks
@@ -1999,14 +2170,13 @@ contains
           call KSPSetNormType(H%sm_ksp(g), KSP_NORM_NONE, ierr)
           call KSPSetTolerances(H%sm_ksp(g), 1.d-30, 1.d-50, 1.d30, SM_STEPS, ierr)
         else
-          call KSPSetType(H%sm_ksp(g), KSPGMRES, ierr)
+          call KSPSetType(H%sm_ksp(g), KSPFGMRES, ierr)
           if (g == 0) then
             call KSPGMRESSetRestart(H%sm_ksp(g), max(H%pre0, H%post0), ierr)
           else
             call KSPGMRESSetRestart(H%sm_ksp(g), H%nsmooth_c, ierr)
           endif
           call KSPSetTolerances(H%sm_ksp(g), 1.d-30, 1.d-50, 1.d30, SM_STEPS, ierr)
-          call KSPSetPCSide(H%sm_ksp(g), PC_RIGHT, ierr)
         endif
         call KSPSetInitialGuessNonzero(H%sm_ksp(g), PETSC_TRUE, ierr)
         call KSPGetPC(H%sm_ksp(g), pc, ierr)
@@ -2097,12 +2267,20 @@ contains
 
     ! operator complexity, first build only
     call MatGetInfo(H%A(0), MAT_GLOBAL_SUM, minfo, ierr)
+#if PETSC_VERSION_LT(3,23,0)
+    nz0 = minfo(MAT_INFO_NZ_USED); nzt = nz0
+#else
     nz0 = minfo%nz_used; nzt = nz0
+#endif
     if (my_id == 0) write(*,'(A)', advance="no") "[Physics PC]   GMG levels n (nnz/row):"
     do g = 0, nlev - 1
       call MatGetSize(H%A(g), nr, PETSC_NULL_INTEGER, ierr)
       call MatGetInfo(H%A(g), MAT_GLOBAL_SUM, minfo, ierr)
+#if PETSC_VERSION_LT(3,23,0)
+      nzg = minfo(MAT_INFO_NZ_USED)
+#else
       nzg = minfo%nz_used
+#endif
       if (g > 0) nzt = nzt + nzg
       if (my_id == 0) write(*,'(A,I0,A,F7.1,A)', advance="no") " ", nr, " (", nzg / max(dble(nr), 1.d0), ")"
     enddo
@@ -2336,20 +2514,21 @@ contains
     integer(8), parameter :: PM = 2147483647_8
     PetscInt :: rst, ren, r, ncols, c
     PetscInt, pointer :: cols(:)
+    PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
     integer :: mpierr
     integer(8) :: h1, h2, v
     call MatGetOwnershipRange(A, rst, ren, ierr)
     h1 = mod(int(rst, 8) + 1_8, PM); h2 = mod(int(ren, 8) + 7_8, PM)
     do r = rst, ren - 1
-      call MatGetRow(A, r, ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      call MatGetRow(A, r, ncols, cols, vals, ierr)
       h1 = mod(h1 * 131_8 + int(ncols, 8) + 1_8, PM)
       do c = 1, ncols
         v = mod(int(cols(c), 8), PM)
         h1 = mod(h1 * 131_8 + v + 1_8, PM)
         h2 = mod(h2 * 1000003_8 + v + 3_8, PM)
       enddo
-      call MatRestoreRow(A, r, ncols, cols, PETSC_NULL_SCALAR_POINTER, ierr)
+      call MatRestoreRow(A, r, ncols, cols, vals, ierr)
     enddo
     sig = [h1, h2]
     call MPI_Allreduce(MPI_IN_PLACE, sig, 2, MPI_INTEGER8, MPI_SUM, comm, mpierr)
@@ -2460,6 +2639,7 @@ contains
   !! the pattern part once per operator pattern (blk_pattern), the numeric
   !! part every rebuild (gather, factor; a singular block falls back to its diagonal).
   subroutine build_blocks(g, A)
+    use phys_module, only: use_pfafem
     integer, intent(in) :: g
     Mat, intent(in)     :: A
     type(blk_t), pointer :: B
@@ -2584,7 +2764,11 @@ contains
         call PetscLogEventEnd(gev_blkpat, ierr)
         B%pat_id = int(aid, 8); B%pat_nz = int(nzst, 8)
       else if (B%ovl) then
-        call MatCreateSubMatrices(A, one, [B%isg], [B%isall], MAT_REUSE_MATRIX, B%sg, ierr)
+        if (associated(B%sg)) then
+          call MatCreateSubMatrices(A, one, [B%isg], [B%isall], MAT_REUSE_MATRIX, B%sg, ierr)
+        else
+          call MatCreateSubMatrices(A, one, [B%isg], [B%isall], MAT_INITIAL_MATRIX, B%sg, ierr)
+        endif
       endif
     end block
     call PetscLogEventBegin(gev_blknum, ierr)
@@ -2622,13 +2806,159 @@ contains
     enddo
     !$omp end parallel do
     if (allocated(B%wk)) then
-      do bb = 1, B%nb
-        if (.not. B%btd(bb)) cycle
-        call scratch_in(bb, wsc)
-        call btd_equil(B%rg(bb), wsc, B%eqs(B%off(bb) + 1))
-        call seg_factor(bb, wsc)
-        call ring_out(bb, wsc)
-      enddo
+      block
+        integer(8) :: tot4_all, j8, b_off8
+        integer :: n_eq_all, n_inv_all, lw_inv, max_bs, k_seg, inf_seg, Jn, Jp, nb_j, ii_j, kk_j
+        integer, allocatable :: eq_bb(:), eq_J(:), inv_bb(:), inv_J(:)
+        real*8,  allocatable :: w_all(:), w_inv(:)
+        logical :: all_hyb
+        external :: dgetri
+
+        tot4_all = size(B%lu4, kind=8)
+        all_hyb  = .true.
+        n_eq_all = 0; n_inv_all = 0; max_bs = 1
+        do bb = 1, B%nb
+          if (.not. B%btd(bb)) cycle
+          if (B%rg(bb)%meth /= RS_HYB) all_hyb = .false.
+          n_eq_all = n_eq_all + B%rg(bb)%nn
+          max_bs   = max(max_bs, maxval(B%rg(bb)%bs))
+          if (B%rg(bb)%meth == RS_HYB) then
+            do k_seg = 0, B%rg(bb)%ns - 1
+              n_inv_all = n_inv_all + max(0, hyb_end(B%rg(bb), k_seg) - B%rg(bb)%sep(k_seg))
+            enddo
+          endif
+        enddo
+
+        if (all_hyb .and. (.not. B%big_btd) .and. tot4_all > 0_8 .and. tot4_all <= 250000000_8) then
+          allocate(w_all(tot4_all), eq_bb(n_eq_all), eq_J(n_eq_all), inv_bb(max(1, n_inv_all)), inv_J(max(1, n_inv_all)))
+          q = 0; n = 0
+          do bb = 1, B%nb
+            if (.not. B%btd(bb)) cycle
+            do J = 0, B%rg(bb)%nn - 1
+              q = q + 1; eq_bb(q) = bb; eq_J(q) = J
+            enddo
+            do k_seg = 0, B%rg(bb)%ns - 1
+              do J = B%rg(bb)%sep(k_seg) + 1, hyb_end(B%rg(bb), k_seg)
+                n = n + 1; inv_bb(n) = bb; inv_J(n) = J
+              enddo
+            enddo
+          enddo
+          lw_inv = max(1, 64 * max_bs)
+
+          !$omp parallel default(shared) &
+          !$omp   private(j8, q, bb, J, Jn, Jp, nb_j, ii_j, kk_j, dv, b_off8, k_seg, inf_seg, w_inv)
+          allocate(w_inv(lw_inv))
+
+          !$omp do schedule(static)
+          do j8 = 1_8, tot4_all
+            w_all(j8) = real(B%lu4(j8), 8)
+          enddo
+          !$omp end do
+
+          !$omp do schedule(static)
+          do q = 1, n_eq_all
+            bb     = eq_bb(q); J = eq_J(q)
+            b_off8 = B%loff4(bb) + B%rg(bb)%od(J)
+            nb_j   = B%rg(bb)%bs(J)
+            do ii_j = 1, nb_j
+              dv = abs(w_all(b_off8 + int(ii_j - 1, 8) * nb_j + ii_j))
+              B%eqs(B%off(bb) + B%rg(bb)%rp(J) + ii_j) = 1.d0
+              if (dv > 0.d0) B%eqs(B%off(bb) + B%rg(bb)%rp(J) + ii_j) = 1.d0 / sqrt(dv)
+            enddo
+          enddo
+          !$omp end do
+
+          !$omp do schedule(static)
+          do q = 1, n_eq_all
+            bb   = eq_bb(q); J = eq_J(q)
+            nb_j = B%rg(bb)%bs(J)
+            Jn   = modulo(J + 1, B%rg(bb)%nn)
+            Jp   = modulo(J - 1, B%rg(bb)%nn)
+            b_off8 = B%loff4(bb) + B%rg(bb)%od(J)
+            do kk_j = 1, nb_j
+              do ii_j = 1, nb_j
+                w_all(b_off8 + int(kk_j - 1, 8) * nb_j + ii_j) = w_all(b_off8 + int(kk_j - 1, 8) * nb_j + ii_j) &
+                  * B%eqs(B%off(bb) + B%rg(bb)%rp(J) + ii_j) * B%eqs(B%off(bb) + B%rg(bb)%rp(J) + kk_j)
+              enddo
+            enddo
+            b_off8 = B%loff4(bb) + B%rg(bb)%ou(J)
+            do kk_j = 1, B%rg(bb)%bs(Jn)
+              do ii_j = 1, nb_j
+                w_all(b_off8 + int(kk_j - 1, 8) * nb_j + ii_j) = w_all(b_off8 + int(kk_j - 1, 8) * nb_j + ii_j) &
+                  * B%eqs(B%off(bb) + B%rg(bb)%rp(J) + ii_j) * B%eqs(B%off(bb) + B%rg(bb)%rp(Jn) + kk_j)
+              enddo
+            enddo
+            b_off8 = B%loff4(bb) + B%rg(bb)%ol(J)
+            do kk_j = 1, B%rg(bb)%bs(Jp)
+              do ii_j = 1, nb_j
+                w_all(b_off8 + int(kk_j - 1, 8) * nb_j + ii_j) = w_all(b_off8 + int(kk_j - 1, 8) * nb_j + ii_j) &
+                  * B%eqs(B%off(bb) + B%rg(bb)%rp(J) + ii_j) * B%eqs(B%off(bb) + B%rg(bb)%rp(Jp) + kk_j)
+              enddo
+            enddo
+          enddo
+          !$omp end do
+
+          !$omp do schedule(dynamic, 1)
+          do q = 1, size(B%lb)
+            bb = B%lb(q)
+            if (.not. B%btd(bb)) cycle
+            k_seg = B%lk(q)
+            call hyb_fac_seg(B%rg(bb), w_all(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), k_seg, inf_seg)
+            if (inf_seg /= 0) then
+              !$omp atomic write
+              binfo(bb) = inf_seg
+            endif
+          enddo
+          !$omp end do
+
+          !$omp do schedule(dynamic, 1)
+          do bb = 1, B%nb
+            if (.not. B%btd(bb)) cycle
+            if (binfo(bb) == 0) call hyb_fac_sep(B%rg(bb), w_all(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), binfo(bb))
+          enddo
+          !$omp end do
+
+          !$omp do schedule(dynamic, 1)
+          do q = 1, n_inv_all
+            bb = inv_bb(q)
+            if (binfo(bb) /= 0) cycle
+            J    = inv_J(q)
+            nb_j = B%rg(bb)%bs(J)
+            call dgetri(nb_j, w_all(B%loff4(bb) + B%rg(bb)%od(J) + 1), nb_j, &
+                        B%piv(B%off(bb) + B%rg(bb)%rp(J) + 1), w_inv, lw_inv, inf_seg)
+          enddo
+          !$omp end do
+
+          !$omp do schedule(dynamic, 1)
+          do bb = 1, B%nb
+            if (.not. B%btd(bb) .or. binfo(bb) /= 0) cycle
+            do j8 = B%loff4(bb) + 1_8, B%loff4(bb) + B%rg(bb)%tot
+              B%lu4(j8) = real(w_all(j8), rk_ring)
+            enddo
+          enddo
+          !$omp end do
+
+          deallocate(w_inv)
+          !$omp end parallel
+
+          do bb = 1, B%nb
+            if (B%btd(bb) .and. binfo(bb) == 0) B%rg(bb)%inv = .true.
+          enddo
+          deallocate(w_all, eq_bb, eq_J, inv_bb, inv_J)
+        else
+          do bb = 1, B%nb
+            if (.not. B%btd(bb)) cycle
+            call scratch_in(bb, wsc)
+            call btd_equil(B%rg(bb), wsc, B%eqs(B%off(bb) + 1))
+            if (B%rg(bb)%meth == RS_THOMAS) then
+              call btd_factor(B%rg(bb), wsc, B%piv(B%off(bb) + 1), binfo(bb))
+            else
+              call seg_factor(bb, wsc)
+            endif
+            call ring_out(bb, wsc)
+          enddo
+        endif
+      end block
     endif
     B%nsing = 0
     do bb = 1, B%nb
@@ -2672,6 +3002,10 @@ contains
         enddo
       endif
     enddo
+    if (B%ovl .and. associated(B%sg)) then
+      call MatDestroySubMatrices(one, B%sg, ierr)
+      nullify(B%sg)
+    endif
     if (allocated(B%wk)) then
       if (allocated(B%wk4)) then
         if (size(B%wk4) /= size(B%wk)) deallocate(B%wk4)
@@ -2696,7 +3030,7 @@ contains
       B%axpend = .true.
       B%axA = A
       call PetscLogEventEnd(gev_axnum, ierr)
-    else if (H%axis_k > 0 .and. .not. allocated(B%axd)) then
+    else if (H%axis_k > 0 .and. .not. use_pfafem .and. .not. allocated(B%axd)) then
       call PetscLogEventBegin(gev_axtry, ierr)
       call axd_prepare(g, A, B)
       call PetscLogEventEnd(gev_axtry, ierr)
@@ -2722,9 +3056,15 @@ contains
     subroutine ring_out(bb_, w)
       integer, intent(in) :: bb_
       real*8, intent(inout) :: w(:)
+      integer(8) :: j8_, t8_
       if (binfo(bb_) /= 0) return
       call btd_invert(B%rg(bb_), w, B%piv(B%off(bb_) + 1))
-      B%lu4(B%loff4(bb_) + 1 : B%loff4(bb_) + B%rg(bb_)%tot) = real(w(1:B%rg(bb_)%tot), rk_ring)
+      t8_ = B%rg(bb_)%tot
+      !$omp parallel do schedule(static) private(j8_) if (t8_ >= 65536_8 .and. .not. omp_in_parallel())
+      do j8_ = 1_8, t8_
+        B%lu4(B%loff4(bb_) + j8_) = real(w(j8_), rk_ring)
+      enddo
+      !$omp end parallel do
     end subroutine ring_out
 
     !> hybrid ring bb in w: its segments on the threads, then the separators
@@ -2732,7 +3072,7 @@ contains
       integer, intent(in) :: bb_
       real*8, intent(inout) :: w(:)
       integer :: k, inf
-      !$omp parallel do schedule(dynamic, 1) private(inf)
+      !$omp parallel do schedule(dynamic, 1) private(inf) if (.not. B%big_btd)
       do k = 0, B%rg(bb_)%ns - 1
         call hyb_fac_seg(B%rg(bb_), w, B%piv(B%off(bb_) + 1), k, inf)
         if (inf /= 0) then
@@ -2915,14 +3255,14 @@ contains
     PetscInt, pointer :: garr(:), dia(:), dja(:), oia(:), oja(:), sia(:), sja(:)
     PetscInt :: nd, no, ns
     logical :: has_o
-    integer :: pass, R, nall, bb, n, nva, nvg, nbad, mpierr
-    integer, allocatable :: cva(:), cvg(:)
-    logical, allocatable :: bad(:)
+    integer :: pass, R, nall, bb, n, nva, nvg, nbad, nsup, ncap, pmax_glob, mpierr
+    integer, allocatable :: cva(:), cvg(:), max_d(:)
+    logical, allocatable :: bad(:), btd_cap(:)
     !> one row's scan (scan_row): its block, zebra entries, ghost search
     !! hint (comb), map positions (own, ghost), band below / above the
     !! diagonal, a coupling the ring solver cannot take
     type :: row_scan_t
-      integer :: bb = 0, kz = 0, chint = 0, nva = 0, nvg = 0, kl = 0, ku = 0
+      integer :: bb = 0, kz = 0, chint = 0, nva = 0, nvg = 0, kl = 0, ku = 0, max_d = 0
       logical :: bad = .false.
     end type row_scan_t
     PetscInt :: k
@@ -2956,8 +3296,8 @@ contains
     B%zp = 0
     ! pass 1 counts each row's entries and gathers the band widths, the ring
     ! check (bad) and the zebra counts; pass 2 writes the maps
-    allocate(cva(0:nall), cvg(0:nall), bad(B%nb))
-    bad = .false.
+    allocate(cva(0:nall), cvg(0:nall), bad(B%nb), btd_cap(B%nb), max_d(B%nb))
+    bad = .false.; btd_cap = .false.; max_d = 0
     do pass = 1, 2
       !$omp parallel do schedule(dynamic, 16)
       do R = 0, nall - 1
@@ -2965,18 +3305,40 @@ contains
       enddo
       !$omp end parallel do
       if (pass == 2) exit
-      nbad = count(bad .and. B%btd)
-      if (nbad > 0) then
-        ! demoted ring blocks: back to the band order, pass 1 again for the band widths
-        call band_order()
-        B%kl = 0; B%ku = 0
+      nsup = 0; ncap = 0; pmax_glob = 0; nbad = 0
+      if (any(bad .and. B%btd)) then
+        ! group consecutive ring nodes into super-nodes where nn / pd >= 4
+        ! (capping periodic RS_HYB rings with nn >= 12 at pd <= nn / 8 so tail
+        ! couplings do not force O(N^3) dense LU), demoting only tiny coarse rings
+        call supernode_regroup(nsup, ncap, pmax_glob)
+        if (any(bad .and. B%btd)) then
+          nbad = nbad + count(bad .and. B%btd)
+          call band_order()
+        endif
+        B%kl = 0; B%ku = 0; max_d = 0
         !$omp parallel do schedule(dynamic, 16)
         do R = 0, nall - 1
           call scan_row(R, 1)
         enddo
         !$omp end parallel do
+        if (any(bad .and. B%btd)) then
+          nbad = nbad + count(bad .and. B%btd)
+          call band_order()
+          B%kl = 0; B%ku = 0
+          !$omp parallel do schedule(dynamic, 16)
+          do R = 0, nall - 1
+            call scan_row(R, 1)
+          enddo
+          !$omp end parallel do
+        endif
       endif
+      call refresh_lb_lk()
+      call MPI_Allreduce(MPI_IN_PLACE, nsup, 1, MPI_INTEGER, MPI_SUM, H%comm, mpierr)
+      call MPI_Allreduce(MPI_IN_PLACE, ncap, 1, MPI_INTEGER, MPI_SUM, H%comm, mpierr)
+      call MPI_Allreduce(MPI_IN_PLACE, pmax_glob, 1, MPI_INTEGER, MPI_MAX, H%comm, mpierr)
       call MPI_Allreduce(MPI_IN_PLACE, nbad, 1, MPI_INTEGER, MPI_SUM, H%comm, mpierr)
+      if (H%my_id == 0 .and. nsup > 0) write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, " level ", g, &
+        ": ", nsup, " ring block(s) grouped into super-nodes (", ncap, " band-capped, max |dJ| = ", pmax_glob, ") for BTD ring solver"
       if (H%my_id == 0 .and. nbad > 0) write(*,'(A,I0,A,I0,A,I0,A)') "[Physics PC]   GMG", cur_inst, " level ", g, &
         ": ", nbad, " ring block(s) couple beyond J +- 1, LAPACK band LU instead of the ring solver"
       nva = 0; nvg = 0
@@ -3047,6 +3409,98 @@ contains
       bad = .false.
     end subroutine band_order
 
+    !> Group consecutive ring nodes into super-nodes of width >= max_d(b_) whenever
+    !! nn / max_d(b_) >= 4 so periodic rings with wider poloidal stencil (e.g. PFAFEM
+    !! field-line twist reaching J +- 2) remain exact block-tridiagonal chains in btd_ring.
+    subroutine supernode_regroup(nsup_, ncap_, pmax_)
+      integer, intent(out) :: nsup_, ncap_, pmax_
+      integer :: b_, nn0, pd_raw, pd, cap_div, nn_s, s_, w_base, n_rem, w_s, j0_, q1_, q2_, meth0, nthr_, nbtd_, ns_t, ns_h
+      integer, allocatable :: bs_s(:)
+      nsup_   = 0; ncap_ = 0; pmax_ = 0
+      cap_div = 8
+      ns_t    = 1
+      if (allocated(B%wk)) then
+        nthr_ = 1
+        !$ nthr_ = omp_get_max_threads()
+        nbtd_ = 0
+        do b_ = 1, B%nb
+          if (.not. B%btd(b_)) cycle
+          nn0 = B%rg(b_)%nn
+          pd  = max(2, max_d(b_))
+          if (B%rg(b_)%meth == RS_HYB .and. nn0 >= 4) pd = min(pd, max(1, min(nn0 / 4, max(2, nn0 / cap_div))))
+          if (.not. bad(b_) .or. (nn0 / pd >= 4)) nbtd_ = nbtd_ + 1
+        enddo
+        nbtd_ = max(nbtd_, 1)
+        if (nbtd_ < nthr_) ns_t = (nthr_ + nbtd_ - 1) / nbtd_
+      endif
+      do b_ = 1, B%nb
+        if (.not. (bad(b_) .and. B%btd(b_))) cycle
+        nn0    = B%rg(b_)%nn
+        pd_raw = max(2, max_d(b_))
+        pd     = pd_raw
+        if (B%rg(b_)%meth == RS_HYB .and. nn0 >= 4) pd = min(pd_raw, max(1, min(nn0 / 4, max(2, nn0 / cap_div))))
+        nn_s = nn0 / pd
+        if (nn_s < 4) cycle
+        if (pd < pd_raw) then
+          btd_cap(b_) = .true.
+          ncap_       = ncap_ + 1
+        endif
+        allocate(bs_s(0:nn_s - 1))
+        w_base = nn0 / nn_s
+        n_rem  = mod(nn0, nn_s)
+        j0_    = 0
+        do s_ = 0, nn_s - 1
+          w_s      = w_base + merge(1, 0, s_ < n_rem)
+          bs_s(s_) = sum(B%rg(b_)%bs(j0_ : j0_ + w_s - 1))
+          q1_      = B%rg(b_)%rp(j0_) + 1
+          q2_      = B%rg(b_)%rp(j0_ + w_s)
+          B%qn(B%off(b_) + q1_ : B%off(b_) + q2_) = s_
+          j0_ = j0_ + w_s
+        enddo
+        meth0 = B%rg(b_)%meth
+        if (meth0 == RS_THOMAS .or. (count(.not. B%axblk) <= 8 .and. maxval(bs_s) >= 300)) then
+          call btd_plan(B%rg(b_), RS_THOMAS, nn_s, bs_s, 1)
+        else
+          ns_h = min(ns_t, max(1, int(sqrt(dble(nn_s)))))
+          call btd_plan(B%rg(b_), RS_HYB, nn_s, bs_s, ns_h)
+        endif
+        deallocate(bs_s)
+        bad(b_) = .false.
+        nsup_   = nsup_ + 1
+        pmax_   = max(pmax_, pd)
+      enddo
+    end subroutine supernode_regroup
+
+    subroutine refresh_lb_lk()
+      integer :: q_, n_, b_, k_, max_bs_
+      B%big_btd = .false.
+      max_bs_   = 0
+      do b_ = 1, B%nb
+        if (B%btd(b_)) max_bs_ = max(max_bs_, maxval(B%rg(b_)%bs))
+      enddo
+      if (count(.not. B%axblk) <= 8 .and. max_bs_ >= 300) B%big_btd = .true.
+      if (.not. allocated(B%wk)) return
+      if (allocated(B%lb)) deallocate(B%lb, B%lk)
+      if (.not. any(B%btd)) then
+        deallocate(B%wk)
+        if (allocated(B%wk4)) deallocate(B%wk4)
+        return
+      endif
+      do q_ = 1, 2
+        n_ = 0
+        do b_ = 1, B%nb
+          if (B%axblk(b_)) cycle
+          do k_ = 0, merge(max(1, B%rg(b_)%ns), 1, B%btd(b_)) - 1
+            n_ = n_ + 1
+            if (q_ == 2) then
+              B%lb(n_) = b_; B%lk(n_) = k_
+            endif
+          enddo
+        enddo
+        if (q_ == 1) allocate(B%lb(n_), B%lk(n_))
+      enddo
+    end subroutine refresh_lb_lk
+
     !> Row R's entries, pass 1 (count, band, ring check, zebra count) or 2
     !! (the maps, from the row's offsets). Thread-safe: row-private state,
     !! per-block results by atomic updates.
@@ -3083,6 +3537,10 @@ contains
           !$omp atomic
           B%ku(st%bb) = max(B%ku(st%bb), st%ku)
         endif
+        if (st%max_d > 1) then
+          !$omp atomic
+          max_d(st%bb) = max(max_d(st%bb), st%max_d)
+        endif
         if (st%bad) then
           !$omp atomic write
           bad(st%bb) = .true.
@@ -3096,7 +3554,7 @@ contains
       integer, intent(in) :: R_, pass_, C, src
       type(row_scan_t), intent(inout) :: st
       logical, intent(in) :: ghost
-      integer :: cb, pr, pc
+      integer :: cb, pr, pc, jr, jc, nn_r, dc
       if (C < 0) return                           ! outside the rank's rows and ghosts
       cb = B%bid(C + 1)
       if (H%smoother == GMG_SM_ZEBRA_RINGS .and. B%bcol(st%bb) == 1 .and. B%bcol(cb) == 0) then
@@ -3105,12 +3563,23 @@ contains
         st%kz = st%kz + 1
       else if (cb == st%bb) then
         pr = B%pos(R_ + 1); pc = B%pos(C + 1)
+        if (B%btd(st%bb) .and. btd_cap(st%bb)) then
+          jr = B%qn(B%off(st%bb) + pr); jc = B%qn(B%off(st%bb) + pc)
+          if (btd_index(B%rg(st%bb), jr, 1, jc, 1) == 0) return
+        endif
         if (pass_ == 1) then
           st%kl = max(st%kl, pr - pc)
           st%ku = max(st%ku, pc - pr)
-          if (B%btd(st%bb) .and. .not. st%bad) then
-            ! a ring solved as a block-tridiagonal chain: J +- 1 couplings only
-            st%bad = btd_index(B%rg(st%bb), B%qn(B%off(st%bb) + pr), 1, B%qn(B%off(st%bb) + pc), 1) == 0
+          if (B%btd(st%bb)) then
+            jr   = B%qn(B%off(st%bb) + pr)
+            jc   = B%qn(B%off(st%bb) + pc)
+            nn_r = B%rg(st%bb)%nn
+            dc   = min(modulo(jc - jr, nn_r), modulo(jr - jc, nn_r))
+            st%max_d = max(st%max_d, dc)
+            if (dc > 1) st%bad = .true.
+            if (.not. st%bad) then
+              st%bad = btd_index(B%rg(st%bb), jr, 1, jc, 1) == 0
+            endif
           endif
         endif
         if (.not. B%axblk(st%bb)) then
@@ -4121,7 +4590,7 @@ contains
       ! axis first: it depends on x only, and the ranks enter here in step,
       ! which a J-sector solve needs
       call ax_solve(x, y)
-      if (allocated(B%wk)) then
+      if (allocated(B%wk) .and. .not. B%big_btd) then
         call lines_solve_par(x, y)
       else
         call lines_solve(x, y)
@@ -4145,9 +4614,17 @@ contains
             w(q) = w(q) / B%lu4(lu_index(B, bb, q, q) - B%nlu)
           enddo
         else
-          wbuf4(1:n, t) = real(w(1:n) * B%eqs(B%off(bb) + 1 : B%off(bb) + n), rk_ring)
+          !$omp parallel do schedule(static) private(q) if (n >= 1500 .and. .not. omp_in_parallel())
+          do q = 1, n
+            wbuf4(q, t) = real(w(q) * B%eqs(B%off(bb) + q), rk_ring)
+          enddo
+          !$omp end parallel do
           call btd_solve_sp(B%rg(bb), B%lu4(B%loff4(bb) + 1), B%piv(B%off(bb) + 1), wbuf4(1, t))
-          w(1:n) = wbuf4(1:n, t) * B%eqs(B%off(bb) + 1 : B%off(bb) + n)
+          !$omp parallel do schedule(static) private(q) if (n >= 1500 .and. .not. omp_in_parallel())
+          do q = 1, n
+            w(q) = wbuf4(q, t) * B%eqs(B%off(bb) + q)
+          enddo
+          !$omp end parallel do
         endif
       else if (B%band(bb)) then
         call band_solve(n, B%kl(bb), B%ku(bb), B%lu(B%loff(bb) + 1), B%piv(B%off(bb) + 1), w)
@@ -4257,7 +4734,7 @@ contains
     logical function reduced(bb)
       integer, intent(in) :: bb
       reduced = .false.
-      if (B%btd(bb)) reduced = .not. B%jac(bb)
+      if (B%btd(bb)) reduced = (.not. B%jac(bb)) .and. (B%rg(bb)%meth == RS_HYB)
     end function reduced
 
     !> y(rows outside the axis block) = the block solves of x, on the rank's
@@ -4277,13 +4754,15 @@ contains
       ! handful per rank, each a whole flux surface)
       ck = 4
       !$ ck = max(1, min(4, B%nb / (8 * omp_get_max_threads())))
-      ! small (coarse) levels stay serial: fork/join would cost more than the work
-      !$omp parallel do schedule(dynamic, ck) private(bb, q, n, t, r) if (B%nrow >= LINES_OMP_MIN)
+      ! small (coarse) levels stay serial: fork/join would cost more than the work;
+      ! levels with a handful of large super-node rings thread inside sgemv_s
+      !$omp parallel do schedule(dynamic, ck) private(bb, q, n, t, r) if (B%nrow >= LINES_OMP_MIN .and. .not. B%big_btd)
       do bb = 1, B%nb
         if (B%axblk(bb)) cycle
         t = 0
         !$ t = omp_get_thread_num()
         n = B%sz(bb)
+        !$omp parallel do schedule(static) private(q, r) if (B%big_btd .and. n >= 1500 .and. .not. omp_in_parallel())
         do q = 1, n
           r = B%rows(B%off(bb) + q)
           if (r < nr) then
@@ -4292,11 +4771,14 @@ contains
             wbuf(q, t) = gp(r - nr + 1)
           endif
         enddo
+        !$omp end parallel do
         call one_solve(bb, wbuf(1, t), t)
+        !$omp parallel do schedule(static) private(q, r) if (B%big_btd .and. n >= 1500 .and. .not. omp_in_parallel())
         do q = 1, n
           r = B%rows(B%off(bb) + q)
           if (r < nr) yp(r + 1) = wbuf(q, t)
         enddo
+        !$omp end parallel do
       enddo
       !$omp end parallel do
       call VecRestoreArrayRead(xx, xp, ie)
@@ -4317,6 +4799,7 @@ contains
       PetscScalar, pointer :: xp(:), yp(:), gp(:)
       PetscErrorCode :: ie
       integer :: bb, q, n, t, c, k, r, nr, zc_
+      real*8  :: v_z
       nr = B%nrow
       ! the axis block (colour 0) depends on x only: first, while the ranks are in step
       call ax_solve(xx, yy)
@@ -4325,28 +4808,30 @@ contains
         call PetscLogEventBegin(gev_lines(cur_inst), ie)
         call VecGetArrayRead(xx, xp, ie)
         call VecGetArray(yy, yp, ie)
-        !$omp parallel do schedule(dynamic, 4) private(bb, q, n, t, k, r, zc_) if (B%nrow >= LINES_OMP_MIN)
+        !$omp parallel do schedule(dynamic, 4) private(bb, q, n, t, k, r, zc_, v_z) if (B%nrow >= LINES_OMP_MIN)
         do bb = 1, B%nb
           if (B%axblk(bb) .or. B%bcol(bb) /= c) cycle
+          if (B%sz(bb) >= 1500) cycle
           t = 0
           !$ t = omp_get_thread_num()
           n = B%sz(bb)
           do q = 1, n
             r = B%rows(B%off(bb) + q)
             if (r < nr) then
-              wbuf(q, t) = xp(r + 1)
+              v_z = xp(r + 1)
             else
-              wbuf(q, t) = gp(r - nr + 1)
+              v_z = gp(r - nr + 1)
             endif
             ! colour 1: minus the couplings to the colour-0 solution
             do k = B%zp(r + 1), B%zp(r + 2) - 1
               zc_ = B%zc(k)
               if (zc_ < nr) then
-                wbuf(q, t) = wbuf(q, t) - B%zv(k) * yp(zc_ + 1)
+                v_z = v_z - B%zv(k) * yp(zc_ + 1)
               else
-                wbuf(q, t) = wbuf(q, t) - B%zv(k) * B%yg(zc_ - nr + 1)
+                v_z = v_z - B%zv(k) * B%yg(zc_ - nr + 1)
               endif
             enddo
+            wbuf(q, t) = v_z
           enddo
           call one_solve(bb, wbuf(1, t), t)
           do q = 1, n
@@ -4359,6 +4844,41 @@ contains
           enddo
         enddo
         !$omp end parallel do
+        do bb = 1, B%nb
+          if (B%axblk(bb) .or. B%bcol(bb) /= c) cycle
+          if (B%sz(bb) < 1500) cycle
+          n = B%sz(bb)
+          !$omp parallel do schedule(dynamic, 16) private(q, r, k, zc_, v_z)
+          do q = 1, n
+            r = B%rows(B%off(bb) + q)
+            if (r < nr) then
+              v_z = xp(r + 1)
+            else
+              v_z = gp(r - nr + 1)
+            endif
+            do k = B%zp(r + 1), B%zp(r + 2) - 1
+              zc_ = B%zc(k)
+              if (zc_ < nr) then
+                v_z = v_z - B%zv(k) * yp(zc_ + 1)
+              else
+                v_z = v_z - B%zv(k) * B%yg(zc_ - nr + 1)
+              endif
+            enddo
+            wbuf(q, 0) = v_z
+          enddo
+          !$omp end parallel do
+          call one_solve(bb, wbuf(1, 0), 0)
+          !$omp parallel do schedule(static) private(q, r)
+          do q = 1, n
+            r = B%rows(B%off(bb) + q)
+            if (r < nr) then
+              yp(r + 1) = wbuf(q, 0)
+            else if (c == 0) then
+              B%yg(r - nr + 1) = wbuf(q, 0)
+            endif
+          enddo
+          !$omp end parallel do
+        enddo
         call VecRestoreArrayRead(xx, xp, ie)
         call VecRestoreArray(yy, yp, ie)
         call PetscLogEventEnd(gev_lines(cur_inst), ie)

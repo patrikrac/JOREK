@@ -12,6 +12,7 @@
 !! the package actually in use.
 module mod_petsc_direct_solver
 #ifdef USE_PETSC
+  use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
   implicit none
@@ -51,8 +52,23 @@ contains
     PetscErrorCode     :: ierr
 
     ! --- JOREK defaults, overridable below
+#if defined(PETSC_HAVE_MUMPS)
     PetscCallA(PCSetType(pc, PCLU, ierr))
     PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr))
+#else
+    block
+      integer :: comm, np, mpierr
+      PetscCallA(PetscObjectGetComm(pc, comm, ierr))
+      call MPI_Comm_size(comm, np, mpierr)
+      if (np == 1) then
+        PetscCallA(PCSetType(pc, PCLU, ierr))
+        PetscCallA(PCFactorSetMatSolverType(pc, MATSOLVERPETSC, ierr))
+      else
+        PetscCallA(PCSetType(pc, PCTELESCOPE, ierr))
+        PetscCallA(PCTelescopeSetReductionFactor(pc, np, ierr))
+      endif
+    end block
+#endif
     PetscCallA(PCSetFromOptions(pc, ierr))
 
     PetscCallA(PCGetType(pc, ptype, ierr))
@@ -124,7 +140,11 @@ contains
 
     if (trim(ptype) /= PCLU .and. trim(ptype) /= PCCHOLESKY .and. trim(ptype) /= PCILU) return
 
+#if defined(PETSC_HAVE_MUMPS)
     call set_default_opt(trim(pfx), 'pc_factor_mat_solver_type', MATSOLVERMUMPS)
+#else
+    call set_default_opt(trim(pfx), 'pc_factor_mat_solver_type', MATSOLVERPETSC)
+#endif
     call petsc_solver_option(trim(pfx), 'pc_factor_mat_solver_type', stype)
 
     select case (trim(stype))
@@ -137,6 +157,7 @@ contains
         ! option works in this direction and not in the direct one, because the
         ! wrapped PC has not run PCSetFromOptions yet whereas `pc` already has.
         call set_default_opt(trim(pfx), 'pc_factor_mat_ordering_type', MATORDERINGND)
+        call set_default_opt(trim(pfx), 'pc_factor_shift_type', 'NONZERO')
       case default
         ! superlu_dist, cudss, ... : PETSc defaults, tunable through
         ! -<prefix>mat_superlu_dist_* / -<prefix>mat_cudss_* etc.
@@ -251,6 +272,7 @@ contains
     PC, intent(inout) :: pc
     PetscErrorCode    :: ierr
     PetscCallA(PCFactorSetMatOrderingType(pc, MATORDERINGND, ierr))
+    PetscCallA(PCFactorSetShiftType(pc, MAT_SHIFT_NONZERO, ierr))
   end subroutine tune_petsc_builtin
 
 

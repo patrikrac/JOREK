@@ -121,12 +121,13 @@ end subroutine zero_bc_rows_pc_matrix
 subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_mat, mhd_sim, W_force, &
                                            W_vv, W_vu, W_uv)
 
-  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_force_fft
+  use mod_pc_elt_matrix_force_fft, only: pc_elt_matrix_force_fft, pc_elt_matrix_force_pfafem
   use mod_parameters,  only: n_tor, n_degrees, n_vertex_max, var_u, var_Vpar
   use data_structure,  only: type_SP_MATRIX, type_element, type_node
   use mod_simulation_data, only: type_MHD_SIM
   use nodes_elements
-  use phys_module,     only: eliminate_boundary_dofs
+  use phys_module,     only: eliminate_boundary_dofs, use_pfafem, refinement
+  use mod_pfafem,      only: pfafem_cache, pfafem_el_lo, pfafem_el_hi
   use omp_lib
 
   implicit none
@@ -149,12 +150,18 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   type(type_element), allocatable :: element_thr(:)
   type(type_node),    allocatable :: nodes_thr(:,:)
   real*8, allocatable :: ELM(:,:), ELMv(:,:,:), buf(:)
+  real*8, allocatable :: W_vp(:,:,:,:,:), WV_vp(:,:,:,:,:,:), ebuf_pf(:), ebuf_v(:,:)
   integer :: idx(NBV), rsel(NBV), nr
-  logical :: do_v
+  logical :: do_v, wv_nz(3)
   integer :: ife, ielm, iv, q, b, t, nthreads
+  integer :: n_u, n_vp, cap_u, cap_vp, u1, u2, ivp, io1, io2, inode1, inode2, r_pf, c_pf
+  integer(8) :: n_ebuf, base_off8
 #ifdef USE_PETSC
   PetscErrorCode :: ierr
-  PetscInt :: idxm(NBV), idxn(NBV)
+  PetscInt :: idxm(NBV), idxn(NBV), nr_p, nc_p, key_col
+  PetscInt, allocatable :: idxm_u(:), idxn_u(:), raw_col(:)
+  integer,  allocatable :: raw_ivp(:), raw_io2(:), raw_slot(:)
+  integer :: rsel_p(n_degrees), n_raw_c, k_c, j_c, key_ivp, key_io2, r_idx, c_slot
   Mat :: Wv(3)
 #endif
 
@@ -173,6 +180,161 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   !$ nthreads = omp_get_max_threads()
   allocate(element_thr(nthreads), nodes_thr(n_vertex_max, nthreads))
 
+  if (use_pfafem) then
+    if (pfafem_el_hi >= pfafem_el_lo) then
+      cap_u  = 16
+      cap_vp = 128
+      do ielm = pfafem_el_lo, pfafem_el_hi
+        if (refinement .and. (element_list%element(ielm)%n_sons /= 0)) cycle
+        cap_u  = max(cap_u,  pfafem_cache(ielm)%n_unodes)
+        cap_vp = max(cap_vp, pfafem_cache(ielm)%n_vpairs)
+      end do
+
+      !$omp parallel default(shared) &
+      !$omp   private(ielm, b, n_u, n_vp, u1, u2, ivp, io1, io2, inode1, inode2, r_pf, c_pf, &
+      !$omp           wv_nz, n_ebuf, base_off8, W_vp, WV_vp, ebuf_pf, ebuf_v &
+#ifdef USE_PETSC
+      !$omp           , ierr, nr_p, nc_p, key_col, idxm_u, idxn_u, raw_col &
+      !$omp           , raw_ivp, raw_io2, raw_slot, rsel_p, n_raw_c, k_c, j_c, key_ivp, key_io2, r_idx, c_slot &
+#endif
+      !$omp          )
+      allocate(W_vp(n_tor, n_tor, n_degrees, n_degrees, cap_vp))
+      n_ebuf = int(cap_u, 8) * int(n_degrees * n_degrees, 8) * int(n_tor * n_tor, 8)
+      allocate(ebuf_pf(n_ebuf))
+      if (do_v) then
+        allocate(WV_vp(n_tor, n_tor, n_degrees, n_degrees, cap_vp, 3))
+        allocate(ebuf_v(n_ebuf, 3))
+      else
+        allocate(WV_vp(1, 1, 1, 1, 1, 1))
+        allocate(ebuf_v(1, 1))
+      end if
+#ifdef USE_PETSC
+      allocate(idxm_u(n_degrees), idxn_u(n_degrees * cap_u), raw_col(n_degrees * cap_u))
+      allocate(raw_ivp(n_degrees * cap_u), raw_io2(n_degrees * cap_u), raw_slot(n_degrees * cap_u))
+#endif
+
+      !$omp do schedule(dynamic, 1)
+      do ielm = pfafem_el_lo, pfafem_el_hi
+        if (refinement .and. (element_list%element(ielm)%n_sons /= 0)) cycle
+        n_u  = pfafem_cache(ielm)%n_unodes
+        n_vp = pfafem_cache(ielm)%n_vpairs
+        if (n_u <= 0 .or. n_vp <= 0) cycle
+
+        if (do_v) then
+          call pc_elt_matrix_force_pfafem(node_list, element_list, ielm, &
+                                          W_vp(:, :, :, :, 1:n_vp), WV_vp=WV_vp(:, :, :, :, 1:n_vp, :))
+          do b = 1, 3
+            wv_nz(b) = any(WV_vp(:, :, :, :, 1:n_vp, b) /= 0.d0)
+          end do
+        else
+          call pc_elt_matrix_force_pfafem(node_list, element_list, ielm, &
+                                          W_vp(:, :, :, :, 1:n_vp))
+          wv_nz = .false.
+        end if
+
+#ifdef USE_PETSC
+        do u1 = 1, n_u
+          inode1 = pfafem_cache(ielm)%unodes(u1)
+          nr_p   = 0
+          do io1 = 1, n_degrees
+            if (node_list%node(inode1)%index(io1) <= 0) cycle
+            nr_p = nr_p + 1
+            rsel_p(nr_p) = io1
+            idxm_u(nr_p) = node_list%node(inode1)%index(io1) - 1
+          end do
+          if (nr_p == 0) cycle
+
+          n_raw_c = 0
+          do u2 = 1, n_u
+            ivp = pfafem_cache(ielm)%pair_map(u1, u2)
+            if (ivp <= 0) cycle
+            inode2 = pfafem_cache(ielm)%unodes(u2)
+            do io2 = 1, n_degrees
+              if (node_list%node(inode2)%index(io2) <= 0) cycle
+              n_raw_c = n_raw_c + 1
+              raw_col(n_raw_c) = node_list%node(inode2)%index(io2) - 1
+              raw_ivp(n_raw_c) = ivp
+              raw_io2(n_raw_c) = io2
+            end do
+          end do
+          if (n_raw_c == 0) cycle
+
+          do k_c = 2, n_raw_c
+            key_col = raw_col(k_c)
+            key_ivp = raw_ivp(k_c)
+            key_io2 = raw_io2(k_c)
+            j_c = k_c - 1
+            do while (j_c >= 1)
+              if (raw_col(j_c) <= key_col) exit
+              raw_col(j_c + 1) = raw_col(j_c)
+              raw_ivp(j_c + 1) = raw_ivp(j_c)
+              raw_io2(j_c + 1) = raw_io2(j_c)
+              j_c = j_c - 1
+            end do
+            raw_col(j_c + 1) = key_col
+            raw_ivp(j_c + 1) = key_ivp
+            raw_io2(j_c + 1) = key_io2
+          end do
+
+          nc_p = 1
+          idxn_u(1)   = raw_col(1)
+          raw_slot(1) = 1
+          do k_c = 2, n_raw_c
+            if (raw_col(k_c) /= idxn_u(nc_p)) then
+              nc_p = nc_p + 1
+              idxn_u(nc_p) = raw_col(k_c)
+            end if
+            raw_slot(k_c) = nc_p
+          end do
+
+          n_ebuf = int(nr_p, 8) * int(nc_p, 8) * int(n_tor * n_tor, 8)
+          ebuf_pf(1_8 : n_ebuf) = 0.d0
+          do b = 1, 3
+            if (wv_nz(b)) ebuf_v(1_8 : n_ebuf, b) = 0.d0
+          end do
+
+          do k_c = 1, n_raw_c
+            ivp    = raw_ivp(k_c)
+            io2    = raw_io2(k_c)
+            c_slot = raw_slot(k_c)
+            do r_idx = 1, int(nr_p)
+              io1 = rsel_p(r_idx)
+              do r_pf = 1, n_tor
+                base_off8 = int((r_idx - 1) * n_tor + (r_pf - 1), 8) * int(nc_p * n_tor, 8) &
+                          + int((c_slot - 1) * n_tor, 8)
+                do c_pf = 1, n_tor
+                  ebuf_pf(base_off8 + c_pf) = ebuf_pf(base_off8 + c_pf) + W_vp(r_pf, c_pf, io1, io2, ivp)
+                end do
+                do b = 1, 3
+                  if (wv_nz(b)) then
+                    do c_pf = 1, n_tor
+                      ebuf_v(base_off8 + c_pf, b) = ebuf_v(base_off8 + c_pf, b) + WV_vp(r_pf, c_pf, io1, io2, ivp, b)
+                    end do
+                  end if
+                end do
+              end do
+            end do
+          end do
+
+          !$omp critical (pc_force_insert)
+          PetscCallA(MatSetValuesBlocked(W_force, nr_p, idxm_u(1:nr_p), nc_p, idxn_u(1:nc_p), ebuf_pf(1_8:n_ebuf), ADD_VALUES, ierr))
+          do b = 1, 3
+            if (wv_nz(b)) then
+              PetscCallA(MatSetValuesBlocked(Wv(b), nr_p, idxm_u(1:nr_p), nc_p, idxn_u(1:nc_p), ebuf_v(1_8:n_ebuf, b), ADD_VALUES, ierr))
+            end if
+          end do
+          !$omp end critical (pc_force_insert)
+        end do
+#endif
+      end do
+      !$omp end do
+#ifdef USE_PETSC
+      deallocate(idxm_u, idxn_u, raw_col, raw_ivp, raw_io2, raw_slot)
+#endif
+      deallocate(W_vp, WV_vp, ebuf_pf, ebuf_v)
+      !$omp end parallel
+    end if
+  else
   !$omp parallel default(shared) &
   !$omp   private(ife, ielm, iv, q, b, t, ELM, ELMv, buf, idx, rsel, nr &
 #ifdef USE_PETSC
@@ -229,6 +391,7 @@ subroutine construct_force_operator_matrix(my_id, local_elms, n_local_elms, a_ma
   !$omp end do
   deallocate(ELM, ELMv, buf)
   !$omp end parallel
+  end if
   deallocate(element_thr, nodes_thr)
 
 #ifdef USE_PETSC

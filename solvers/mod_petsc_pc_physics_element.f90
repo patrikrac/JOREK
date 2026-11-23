@@ -17,6 +17,7 @@ contains
   subroutine petsc_create_pc_matrix(petsc_A, a_mat, n_vars)
     use data_structure,  only: type_SP_MATRIX
     use mod_parameters,  only: n_var
+    use phys_module,     only: use_pfafem
 
     Mat,                   intent(out) :: petsc_A
     type(type_SP_MATRIX),  intent(in)  :: a_mat
@@ -56,6 +57,7 @@ contains
     call MatSetBlockSize(petsc_A, block_size, ierr)
     call MatMPIBAIJSetPreallocation(petsc_A, block_size, 0, d_nnz, 0, o_nnz, ierr)
     if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: petsc_create_pc_matrix ierr=", ierr
+    if (use_pfafem) call MatSetOption(petsc_A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
     deallocate(d_nnz, o_nnz)
 
     if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0,A,I0)') &

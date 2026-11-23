@@ -12,9 +12,10 @@ module equil_info
   use constants,          only: PI, LOWER_XPOINT, UPPER_XPOINT, DOUBLE_NULL,SYMMETRIC_XPOINT
   use data_structure,     only: type_node_list, type_element_list, type_bnd_element_list
   use gauss
+  use mod_parameters,     only: n_tor
   use basis_at_gaussian,  only: H, H_s, H_t, n_degrees
   use phys_module,        only: i_plane_rtree, n_plane, n_period, R_geo, Z_geo, FF_0, psi_axis_t, psi_bnd_t, Z_xpoint_t, index_now, SDN_threshold, &
-                                R_axis_t, Z_axis_t, index_start, tokamak_device, Z_xpoint_limit, xpoint_search_tries
+                                R_axis_t, Z_axis_t, index_start, tokamak_device, Z_xpoint_limit, xpoint_search_tries, pfafem_values_active
   use mod_interp
   
   
@@ -527,8 +528,13 @@ module equil_info
 
             iv = element_list%element(i)%vertex(kv)
 
-            ps_s = ps_s + node_list%node(iv)%values(1,kf,1) * element_list%element(i)%size(kv,kf) * H_s(kv,kf,ms,mt)
-            ps_t = ps_t + node_list%node(iv)%values(1,kf,1) * element_list%element(i)%size(kv,kf) * H_t(kv,kf,ms,mt)
+            if (pfafem_values_active) then
+              P = sum(node_list%node(iv)%values(1:n_tor,kf,1)) / dble(n_tor)
+            else
+              P = node_list%node(iv)%values(1,kf,1)
+            end if
+            ps_s = ps_s + P * element_list%element(i)%size(kv,kf) * H_s(kv,kf,ms,mt)
+            ps_t = ps_t + P * element_list%element(i)%size(kv,kf) * H_t(kv,kf,ms,mt)
 
             R   = R   + node_list%node(iv)%x(1,kf,1) * element_list%element(i)%size(kv,kf) * H(kv,kf,ms,mt)
             Z   = Z   + node_list%node(iv)%x(1,kf,2) * element_list%element(i)%size(kv,kf) * H(kv,kf,ms,mt)

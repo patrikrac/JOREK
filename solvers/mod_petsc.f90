@@ -6,6 +6,7 @@ module mod_petsc
   use mod_petsc_dump,          only: petsc_dump_operator
 #include "petsc/finclude/petsc.h"
   use petsc
+#include "petsc_f90_compat.h"
 #ifdef USE_SLEPC
 #include "slepc/finclude/slepceps.h"
   use slepceps
@@ -53,6 +54,7 @@ module mod_petsc
     !> .true. when A_aij is not a copy but a second reference to the BAIJ matrix A
     !! (the physics PC, which reads A row by row): no MatConvert ever happens.
     logical :: a_alias       = .false.
+    logical :: torfft_ksp    = .false.
     !> Stopping test of the outer solve: ||r|| <= rtol_user * ||b without penalty rows||
     !! (set_outer_tolerance). Penalty boundary rows carry diagonals of zbig = 1e12 and
     !! right-hand sides of zbig times the boundary mismatch; where boundary values are
@@ -594,6 +596,7 @@ contains
   !! (ijA_size, irn_jcn). Does not require iblockptr (block-CSR).
   subroutine petsc_create_matrix(petsc_A, a_mat)
     use data_structure, only: type_SP_MATRIX
+    use phys_module, only: use_pfafem
 
     Mat, intent(out)                    :: petsc_A
     type(type_SP_MATRIX), intent(in)    :: a_mat
@@ -634,6 +637,7 @@ contains
     call MatSetBlockSize(petsc_A, block_size, ierr)
     call MatMPIBAIJSetPreallocation(petsc_A, block_size, 0, d_nnz, 0, o_nnz, ierr)
     if (ierr /= 0) write(*,*) "[RANK ", my_id, "] WARNING: petsc_create_matrix preallocation ierr=", ierr
+    if (use_pfafem) call MatSetOption(petsc_A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
     deallocate(d_nnz, o_nnz)
 
     if (my_id .eq. 0) write(*,'(A,I0,A,I0,A,I0)') &
@@ -713,9 +717,15 @@ contains
     ! Write access, not read-write: the slice is overwritten in full, so
     ! VecGetArray's device->host sync of the previous contents is pure waste on a
     ! device Vec (and the dirty flag it leaves forces a copy back up either way).
+#if PETSC_VERSION_LT(3,23,0)
+    PetscCallA(VecGetArray(petsc_sys%b, b_arr, ierr))
+    b_arr(1:n_local) = rhs_vec%val(i_start+1:i_end)
+    PetscCallA(VecRestoreArray(petsc_sys%b, b_arr, ierr))
+#else
     PetscCallA(VecGetArrayWrite(petsc_sys%b, b_arr, ierr))
     b_arr(1:n_local) = rhs_vec%val(i_start+1:i_end)
     PetscCallA(VecRestoreArrayWrite(petsc_sys%b, b_arr, ierr))
+#endif
 
   end subroutine petsc_update_rhs
 
@@ -745,9 +755,15 @@ contains
     n_local = i_end - i_start
 
     ! Write access for the same reason as petsc_update_rhs.
+#if PETSC_VERSION_LT(3,23,0)
+    PetscCallA(VecGetArray(petsc_sys%x, x_arr, ierr))
+    x_arr(1:n_local) = sol_vec%val(i_start+1:i_end)
+    PetscCallA(VecRestoreArray(petsc_sys%x, x_arr, ierr))
+#else
     PetscCallA(VecGetArrayWrite(petsc_sys%x, x_arr, ierr))
     x_arr(1:n_local) = sol_vec%val(i_start+1:i_end)
     PetscCallA(VecRestoreArrayWrite(petsc_sys%x, x_arr, ierr))
+#endif
 
   end subroutine petsc_update_initial_guess
 
@@ -756,7 +772,7 @@ contains
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
 
     PetscErrorCode :: ierr
-    integer :: comm, my_id, mpierr
+    integer :: comm, my_id, n_cpu, mpierr
     PetscLogDouble :: t1, t2
     PetscReal :: petsc_norm
     PC :: pc ! Maybe should be part of petsc_sys in the future
@@ -766,13 +782,16 @@ contains
 
     PetscCallA(PetscObjectGetComm(petsc_sys%A, comm, ierr))
     call MPI_COMM_RANK(comm, my_id, mpierr)
+    call MPI_COMM_SIZE(comm, n_cpu, mpierr)
 
     PetscCallA(KSPCreate(comm, petsc_sys%ksp, ierr))
     PetscCallA(KSPSetOptionsPrefix(petsc_sys%ksp, PETSC_DIRECT_PREFIX, ierr))
     PetscCallA(KSPSetOperators(petsc_sys%ksp, petsc_sys%A, petsc_sys%A, ierr))
 
-    PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
-    PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
+    if (n_cpu > 1) then
+      PetscCallA(PetscViewerAndFormatCreate(PETSC_VIEWER_STDOUT_WORLD, PETSC_VIEWER_DEFAULT, vf, ierr))
+      PetscCallA(KSPMonitorSet(petsc_sys%ksp, KSPMonitorResidual, vf, PetscViewerAndFormatDestroy, ierr))
+    endif
 
     PetscCallA(KSPSetType(petsc_sys%ksp, KSPPREONLY, ierr))
 
@@ -832,6 +851,7 @@ contains
   !! host-side rebuild of the operator as MATMPIAIJ - measured at 35% of that
   !! path's total runtime - reusing the sparsity after the first call.
   subroutine petsc_refresh_ksp_operator(petsc_sys, first_call)
+    use phys_module, only: use_pfafem
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: first_call
     PetscErrorCode :: ierr
@@ -845,28 +865,147 @@ contains
         PetscCallA(PetscObjectReference(petsc_sys%A, ierr))
         petsc_sys%A_aij = petsc_sys%A
         PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+      else if (petsc_sys%A_aij /= petsc_sys%A) then
+        PetscCallA(MatDestroy(petsc_sys%A_aij, ierr))
+        PetscCallA(PetscObjectReference(petsc_sys%A, ierr))
+        petsc_sys%A_aij = petsc_sys%A
       endif
       return
     endif
 
+    if (petsc_sys%torfft_ksp) call conjugate_baij_torfft(petsc_sys%A, .true.)
     if (first_call) then
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
       PetscCallA(MatCreateVecs(petsc_sys%A_aij, petsc_sys%x_aij, petsc_sys%b_aij, ierr))
+    else if (use_pfafem) then
+      PetscCallA(MatDestroy(petsc_sys%A_aij, ierr))
+      PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_INITIAL_MATRIX, petsc_sys%A_aij, ierr))
     else
       PetscCallA(MatConvert(petsc_sys%A, MATMPIAIJ, MAT_REUSE_MATRIX, petsc_sys%A_aij, ierr))
     endif
+    if (petsc_sys%torfft_ksp) call conjugate_baij_torfft(petsc_sys%A, .false.)
   end subroutine petsc_refresh_ksp_operator
+
+
+  subroutine conjugate_baij_torfft(A_baij, forward)
+    use iso_c_binding, only: c_ptr, c_int, c_intptr_t, c_double, c_f_pointer
+    use mod_parameters, only: n_tor, n_var
+    use mod_pfafem, only: pfafem_Q, pfafem_QT
+    use mod_petsc_raw_csr, only: split_parts, get_ij, put_ij, c_baij_get, c_baij_restore
+    Mat, intent(in) :: A_baij
+    logical, intent(in) :: forward
+    Mat :: Ad, Ao
+    PetscInt, pointer :: ga(:), aia(:), aja(:)
+    PetscInt :: nr
+    type(c_ptr) :: pv
+    real(c_double), pointer :: va(:)
+    integer(c_int) :: rc
+    integer :: nblk, bs
+
+    bs = n_var * n_tor
+    call split_parts(A_baij, .true., Ad, Ao, ga)
+
+    call get_ij(Ad, .true., nr, aia, aja)
+    nblk = int(aia(nr + 1))
+    call put_ij(Ad, .true., nr, aia, aja)
+    if (nblk > 0) then
+      rc = c_baij_get(transfer(Ad%v, 0_c_intptr_t), pv)
+      call c_f_pointer(pv, va, [huge(1)])
+      call conj_blocks(va, nblk, bs, forward)
+      rc = c_baij_restore(transfer(Ad%v, 0_c_intptr_t), pv)
+    endif
+
+    call get_ij(Ao, .true., nr, aia, aja)
+    nblk = int(aia(nr + 1))
+    call put_ij(Ao, .true., nr, aia, aja)
+    if (nblk > 0) then
+      rc = c_baij_get(transfer(Ao%v, 0_c_intptr_t), pv)
+      call c_f_pointer(pv, va, [huge(1)])
+      call conj_blocks(va, nblk, bs, forward)
+      rc = c_baij_restore(transfer(Ao%v, 0_c_intptr_t), pv)
+    endif
+
+  contains
+    subroutine conj_blocks(v, nb, bsz, fwd)
+      real(c_double), intent(inout) :: v(*)
+      integer, intent(in) :: nb, bsz
+      logical, intent(in) :: fwd
+      integer :: ib, ev, vv, p, q
+      integer(8) :: boff, idx8
+      real*8 :: sub(n_tor, n_tor)
+
+      do ib = 0, nb - 1
+        boff = int(ib, 8) * int(bsz, 8) * int(bsz, 8)
+        do vv = 0, n_var - 1
+          do ev = 0, n_var - 1
+            do q = 1, n_tor
+              do p = 1, n_tor
+                idx8 = boff + int((vv * n_tor + q - 1) * bsz + (ev * n_tor + p - 1) + 1, 8)
+                sub(p, q) = v(idx8)
+              enddo
+            enddo
+            if (fwd) then
+              sub = matmul(pfafem_QT, matmul(sub, pfafem_Q))
+            else
+              sub = matmul(pfafem_Q, matmul(sub, pfafem_QT))
+            endif
+            do q = 1, n_tor
+              do p = 1, n_tor
+                idx8 = boff + int((vv * n_tor + q - 1) * bsz + (ev * n_tor + p - 1) + 1, 8)
+                v(idx8) = sub(p, q)
+              enddo
+            enddo
+          enddo
+        enddo
+      enddo
+    end subroutine conj_blocks
+  end subroutine conjugate_baij_torfft
 
 
   !> Move the rhs and the warm-start guess into the vectors the KSP will use, and
   !! (direction = .false.) the solution back out. Both are no-ops on the native AIJ
   !! path, where b_aij/x_aij are b/x. See ksp_operands.
   subroutine petsc_sync_ksp_vectors(petsc_sys, to_ksp)
+    use mod_parameters, only: n_tor
+    use mod_pfafem, only: pfafem_Q, pfafem_QT
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: to_ksp
+    PetscScalar, pointer :: src(:), dst(:)
+    PetscInt :: nl
+    integer :: i
     PetscErrorCode :: ierr
 
     if (petsc_sys%aij_native) return
+
+    if (petsc_sys%torfft_ksp) then
+      PetscCallA(VecGetLocalSize(petsc_sys%x, nl, ierr))
+      if (to_ksp) then
+        PetscCallA(VecGetArrayRead(petsc_sys%b, src, ierr))
+        PetscCallA(VecGetArray(petsc_sys%b_aij, dst, ierr))
+        do i = 0, int(nl) / n_tor - 1
+          dst(i * n_tor + 1 : (i + 1) * n_tor) = matmul(pfafem_QT, src(i * n_tor + 1 : (i + 1) * n_tor))
+        enddo
+        PetscCallA(VecRestoreArray(petsc_sys%b_aij, dst, ierr))
+        PetscCallA(VecRestoreArrayRead(petsc_sys%b, src, ierr))
+
+        PetscCallA(VecGetArrayRead(petsc_sys%x, src, ierr))
+        PetscCallA(VecGetArray(petsc_sys%x_aij, dst, ierr))
+        do i = 0, int(nl) / n_tor - 1
+          dst(i * n_tor + 1 : (i + 1) * n_tor) = matmul(pfafem_QT, src(i * n_tor + 1 : (i + 1) * n_tor))
+        enddo
+        PetscCallA(VecRestoreArray(petsc_sys%x_aij, dst, ierr))
+        PetscCallA(VecRestoreArrayRead(petsc_sys%x, src, ierr))
+      else
+        PetscCallA(VecGetArrayRead(petsc_sys%x_aij, src, ierr))
+        PetscCallA(VecGetArray(petsc_sys%x, dst, ierr))
+        do i = 0, int(nl) / n_tor - 1
+          dst(i * n_tor + 1 : (i + 1) * n_tor) = matmul(pfafem_Q, src(i * n_tor + 1 : (i + 1) * n_tor))
+        enddo
+        PetscCallA(VecRestoreArray(petsc_sys%x, dst, ierr))
+        PetscCallA(VecRestoreArrayRead(petsc_sys%x_aij, src, ierr))
+      endif
+      return
+    endif
 
     if (to_ksp) then
       PetscCallA(VecCopy(petsc_sys%b, petsc_sys%b_aij, ierr))
@@ -891,16 +1030,17 @@ contains
   !! from the previous increment. All of it can be overridden with -jorek_ksp_*.
   !! The preconditioner setup, including every block factorization, is charged to
   !! the setup timer; the solve timer covers KSPSolve only.
-  subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged)
+  subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged, newton_rtol)
     use mod_clock, only: FMT_TIMING
-    use phys_module, only: use_physics_pc
-    use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced
+    use phys_module, only: use_physics_pc, use_pfafem
+    use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced, petsc_physics_pc_refresh_operator
     use mod_petsc_pc_physics_ctx, only: physics_pc_mem
     use mod_petsc_pc_sf, only: sf_report
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     logical, intent(in) :: solve_only
     integer, intent(out) :: n_iter
     logical, intent(out) :: converged
+    real(kind=8), intent(in), optional :: newton_rtol
 
     PetscErrorCode :: ierr
     integer :: comm, my_id, mpierr
@@ -924,6 +1064,8 @@ contains
       ! so both work on JOREK's own BAIJ matrix and the AIJ copy (a second full
       ! Jacobian) is never made.
       petsc_sys%a_alias = (pc_type == PETSC_PC_PHYSICS) .and. (.not. petsc_sys%aij_native)
+      petsc_sys%torfft_ksp = use_pfafem .and. (.not. petsc_sys%aij_native) .and. &
+        (pc_type == PETSC_PC_TOROIDAL_HARMONIC .or. pc_type == PETSC_PC_MODE_SPLIT)
       PetscCallA(PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-jorek_mumps_central_rhs", central_rhs, ierr))
       if (pc_type == PETSC_PC_PHYSICS .or. pc_type == PETSC_PC_FULL_LU .or. central_rhs) &
         call petsc_default_mumps_central_rhs()
@@ -1019,12 +1161,14 @@ contains
       if (my_id .eq. 0) write(*,*) "[PETSc] PC reuse: solve_only, skipping refactorization"
       call petsc_refresh_ksp_operator(petsc_sys, first_call=.false.)
       call ksp_operands(petsc_sys, A_ksp, b_ksp, x_ksp)
+      if (use_physics_pc) call petsc_physics_pc_refresh_operator(A_ksp)
       PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
       PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_TRUE, ierr))
     end if
 
     call petsc_sync_ksp_vectors(petsc_sys, to_ksp=.true.)
-    call set_outer_tolerance(petsc_sys, A_ksp, b_ksp, comm, my_id)
+    if (present(newton_rtol)) petsc_sys%rtol_user = newton_rtol
+    call set_outer_tolerance(petsc_sys, A_ksp, b_ksp, x_ksp, comm, my_id)
 
     call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t1, ierr))
@@ -1041,12 +1185,20 @@ contains
     PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
     PetscCallA(KSPGetIterationNumber(petsc_sys%ksp, its, ierr))
     n_iter    = its
+#if PETSC_VERSION_LT(3,23,0)
+    converged = (reason > 0)
+#else
     converged = (reason%v > 0)
+#endif
 
     if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
 
     if (my_id == 0) write(*,'(A,I5,A,I0)') &
+#if PETSC_VERSION_LT(3,23,0)
+      "[PETSc] outer iterations: ", n_iter, "   converged reason: ", int(reason)
+#else
       "[PETSc] outer iterations: ", n_iter, "   converged reason: ", reason%v
+#endif
     if (use_physics_pc) call sf_report(my_id)
 
     ! Calculate the norm of the solution
@@ -1079,14 +1231,18 @@ contains
   !! b_int = b without the penalty boundary rows (|A_ii| >= penalty_diag), passed to
   !! PETSc as abstol with rtol = 0. Without penalty rows in b (fixed boundary values)
   !! this is the usual test relative to ||b||. Logged every solve.
-  subroutine set_outer_tolerance(petsc_sys, A_ksp, b_ksp, comm, my_id)
+  subroutine set_outer_tolerance(petsc_sys, A_ksp, b_ksp, x_ksp, comm, my_id)
     type(type_PETSC_SYSTEM), intent(inout) :: petsc_sys
     Mat, intent(in) :: A_ksp
     Vec, intent(in) :: b_ksp
+    Vec, intent(inout) :: x_ksp
     integer, intent(in) :: comm, my_id
 
-    PetscScalar, pointer :: d(:), bb(:)
+    PetscScalar, pointer :: d(:), bb(:), xx(:), ww(:)
+    Vec :: w_pen
+    PetscBool :: ig_nz
     PetscInt  :: n, i
+    integer   :: isweep
     real(kind=8) :: loc(3), glob(3)
     PetscReal :: bn_full, bn_int, atol
     integer :: mpierr
@@ -1116,6 +1272,29 @@ contains
     PetscCallA(VecRestoreArrayRead(b_ksp, bb, ierr))
     PetscCallA(VecRestoreArrayRead(petsc_sys%diag, d, ierr))
     call MPI_Allreduce(loc, glob, 3, MPI_DOUBLE_PRECISION, MPI_SUM, comm, mpierr)
+    if (nint(glob(3)) > 0) then
+      PetscCallA(KSPGetInitialGuessNonzero(petsc_sys%ksp, ig_nz, ierr))
+      if (ig_nz .eqv. PETSC_TRUE) then
+        PetscCallA(VecDuplicate(b_ksp, w_pen, ierr))
+        do isweep = 1, 2
+          PetscCallA(MatMult(A_ksp, x_ksp, w_pen, ierr))
+          PetscCallA(VecGetArrayRead(petsc_sys%diag, d, ierr))
+          PetscCallA(VecGetArrayRead(b_ksp, bb, ierr))
+          PetscCallA(VecGetArrayRead(w_pen, ww, ierr))
+          PetscCallA(VecGetArray(x_ksp, xx, ierr))
+          do i = 1, n
+            if (abs(d(i)) >= petsc_sys%penalty_diag) then
+              xx(i) = xx(i) + (bb(i) - ww(i)) / d(i)
+            endif
+          enddo
+          PetscCallA(VecRestoreArray(x_ksp, xx, ierr))
+          PetscCallA(VecRestoreArrayRead(w_pen, ww, ierr))
+          PetscCallA(VecRestoreArrayRead(b_ksp, bb, ierr))
+          PetscCallA(VecRestoreArrayRead(petsc_sys%diag, d, ierr))
+        enddo
+        PetscCallA(VecDestroy(w_pen, ierr))
+      endif
+    endif
     bn_full = sqrt(glob(1)); bn_int = sqrt(glob(2))
     if (bn_int > 0.d0) then
       atol = petsc_sys%rtol_user * bn_int
@@ -1368,7 +1547,7 @@ contains
     PetscInt, allocatable :: idx(:)
     PetscErrorCode :: ierr
 
-    call PetscObjectGetComm(petsc_sys%b, comm, ierr)
+    call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
 
     call VecSet(petsc_sys%b, 0.0d0, ierr)

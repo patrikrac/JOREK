@@ -10,6 +10,7 @@ module mod_petsc_pc_sf_solver
   use mod_petsc_pc_physics_ctx, only: physics_pc_mumps_mem
   use mod_petsc_pc_blocks,      only: pc_print_block_setup
   use mod_petsc_pc_gmg,         only: GMG_SM_RINGS, GMG_SM_LINES, GMG_SM_ZEBRA_RINGS
+#include "petsc_f90_compat.h"
   implicit none
   private
 
@@ -126,11 +127,48 @@ contains
       call KSPSetOperators(slv%ksp, A, A, ierr)
       call KSPSetType(slv%ksp, KSPPREONLY, ierr)
       call KSPGetPC(slv%ksp, pc, ierr)
+#if defined(PETSC_HAVE_MUMPS)
       call PCSetType(pc, PCLU, ierr)
       call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
       call KSPSetUp(slv%ksp, ierr)
       call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS)")
       if (fresh) call physics_pc_mumps_mem(slv%ksp, label, my_id)
+#else
+      block
+        integer :: np, mpierr
+        KSP :: inner_ksp
+        PC  :: inner_pc
+        call MPI_Comm_size(comm, np, mpierr)
+        if (np == 1) then
+          call PCSetType(pc, PCREDUNDANT, ierr)
+          call KSPSetUp(slv%ksp, ierr)
+          call PCRedundantGetKSP(pc, inner_ksp, ierr)
+          call KSPSetType(inner_ksp, KSPPREONLY, ierr)
+          call KSPGetPC(inner_ksp, inner_pc, ierr)
+          call PCSetType(inner_pc, PCLU, ierr)
+          call PCFactorSetMatSolverType(inner_pc, MATSOLVERPETSC, ierr)
+          call PCFactorSetMatOrderingType(inner_pc, MATORDERINGND, ierr)
+          call PCFactorSetShiftType(inner_pc, MAT_SHIFT_NONZERO, ierr)
+          call KSPSetUp(inner_ksp, ierr)
+          call pc_print_block_setup(comm, label, "PREONLY + LU (PETSc)")
+        else
+          call PCSetType(pc, PCTELESCOPE, ierr)
+          call PCTelescopeSetReductionFactor(pc, np, ierr)
+          call KSPSetUp(slv%ksp, ierr)
+          call PCTelescopeGetKSP(pc, inner_ksp, ierr)
+          if (inner_ksp%v /= 0 .and. inner_ksp%v /= -2) then
+            call KSPSetType(inner_ksp, KSPPREONLY, ierr)
+            call KSPGetPC(inner_ksp, inner_pc, ierr)
+            call PCSetType(inner_pc, PCLU, ierr)
+            call PCFactorSetMatSolverType(inner_pc, MATSOLVERPETSC, ierr)
+            call PCFactorSetMatOrderingType(inner_pc, MATORDERINGND, ierr)
+            call PCFactorSetShiftType(inner_pc, MAT_SHIFT_NONZERO, ierr)
+            call KSPSetUp(inner_ksp, ierr)
+          endif
+          call pc_print_block_setup(comm, label, "PREONLY + Telescope LU (PETSc)")
+        endif
+      end block
+#endif
 
     case (SF_GMG)
       o%smoother   = smoother
@@ -212,7 +250,11 @@ contains
     slv%its_max = max(slv%its_max, int(its))
     slv%nsolve  = slv%nsolve + 1
     call KSPGetConvergedReason(slv%ksp, reason, ierr)
+#if PETSC_VERSION_LT(3,23,0)
+    if (reason < 0) slv%nfail = slv%nfail + 1
+#else
     if (reason%v < 0) slv%nfail = slv%nfail + 1
+#endif
   end subroutine sf_solver_apply
 
   subroutine sf_solver_reset_counters(slv)
@@ -276,7 +318,11 @@ contains
   !> 1 + zeta as the Jacobian forms it (zeta rescaled for a variable dt).
   real*8 function sf_opz()
     use phys_module, only: time_evol_zeta, tstep, tstep_prev
-    sf_opz = 1.0d0 + time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
+    if (tstep + tstep_prev > 0.d0) then
+      sf_opz = 1.0d0 + time_evol_zeta * 2.0d0 * tstep / (tstep + tstep_prev)
+    else
+      sf_opz = 1.0d0
+    endif
   end function sf_opz
 
 end module mod_petsc_pc_sf_solver
