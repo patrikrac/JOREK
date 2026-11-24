@@ -53,7 +53,28 @@ module mod_petsc_pc_dual
 
   public :: dual_basis, dual_symmetrize
 
+  !> -log_view events (DUAL_*): the whole dual basis, its plan (blocks,
+  !! patches, halo and its submatrix), the patch solves (the core patch also
+  !! alone: DUAL_Core), Z's assembly, the symmetric form. LAPACK flops are
+  !! logged with PetscLogFlops.
+  PetscLogEvent, save :: dev_basis = -1, dev_plan = -1, dev_solve = -1, dev_core = -1, dev_z = -1, dev_sym = -1
+  logical, save :: dev_ready = .false.
+
 contains
+
+  !> The -log_view events of the module, once.
+  subroutine dual_register_events()
+    PetscErrorCode :: ierr
+    PetscClassId, parameter :: cid = 0
+    if (dev_ready) return
+    call PetscLogEventRegister("DUAL_Basis", cid, dev_basis, ierr)
+    call PetscLogEventRegister("DUAL_Plan",  cid, dev_plan,  ierr)
+    call PetscLogEventRegister("DUAL_Solve", cid, dev_solve, ierr)
+    call PetscLogEventRegister("DUAL_Core",  cid, dev_core,  ierr)
+    call PetscLogEventRegister("DUAL_Z",     cid, dev_z,     ierr)
+    call PetscLogEventRegister("DUAL_Sym",   cid, dev_sym,   ierr)
+    dev_ready = .true.
+  end subroutine dual_register_events
 
   !> Z := the symmetric form `form` (DUAL_AVG | DUAL_SYM) of the local dual
   !! basis Z of the symmetric M; DUAL_PLAIN leaves Z. Collective.
@@ -65,6 +86,8 @@ contains
     PetscErrorCode :: ierr
 
     if (form == DUAL_PLAIN) return
+    call dual_register_events()
+    call PetscLogEventBegin(dev_sym, ierr)
     call MatTranspose(Z, MAT_INITIAL_MATRIX, zt, ierr)
     if (form == DUAL_SYM) then
       call MatPtAP(M, Z, MAT_INITIAL_MATRIX, 2.0d0, ztmz, ierr)
@@ -76,6 +99,7 @@ contains
       call MatScale(Z, 0.5d0, ierr)
     endif
     call MatDestroy(zt, ierr)
+    call PetscLogEventEnd(dev_sym, ierr)
   end subroutine dual_symmetrize
 
   !> Z, the local dual basis of M (MPIAIJ, M's layout and communicator, the
@@ -111,6 +135,9 @@ contains
     PetscInt, allocatable :: zc(:), gl(:)
     real*8, allocatable :: mjj(:, :), y(:, :), zv(:)
 
+    call dual_register_events()
+    call PetscLogEventBegin(dev_basis, ierr)
+    call PetscLogEventBegin(dev_plan, ierr)
     call PetscObjectGetComm(M, comm, ierr)
     call MatGetOwnershipRange(M, rs, re, ierr)
     call MatGetSize(M, ng, PETSC_NULL_INTEGER, ierr)
@@ -203,8 +230,10 @@ contains
     call ISCreateGeneral(PETSC_COMM_SELF, int(nh * ns, kind(rs)), gl, PETSC_COPY_VALUES, isr, ierr)
     call MatCreateSubMatrices(M, one, [isr], [isr], MAT_INITIAL_MATRIX, sub, ierr)
     call ISDestroy(isr, ierr)
+    call PetscLogEventEnd(dev_plan, ierr)
 
     ! the patch solves, per block and slot; Z's rows of mine in CSR (zr0, zc, zv)
+    call PetscLogEventBegin(dev_solve, ierr)
     nloc = re - rs
     allocate(zr0(nloc + 1), d_nnz(nloc), o_nnz(nloc))
     zr0 = 0
@@ -229,6 +258,7 @@ contains
       if (incore(mine(b))) then                         ! the core: one solve for all its blocks
         if (core_done) cycle
         core_done = .true.
+        call PetscLogEventBegin(dev_core, ierr)
         ol = pack(jcore, incore(blk(jcore)))
       else
         ol = bmem(bm0(mine(b)) : bm0(mine(b) + 1) - 1)
@@ -256,6 +286,7 @@ contains
         enddo
         call dgesv(nj, no, mjj, nj, piv, y, nj, info)
         if (info /= 0) call fail("a singular patch matrix")
+        call PetscLogFlops(2.d0 / 3.d0 * dble(nj)**3 + 2.d0 * dble(nj)**2 * dble(no), ierr)
         do k = 1, no
           i = ol(k)
           if (i < i0 .or. i >= i1) cycle
@@ -270,10 +301,13 @@ contains
       do a = 1, nj
         posj(jl(a)) = 0
       enddo
+      if (incore(mine(b))) call PetscLogEventEnd(dev_core, ierr)
     enddo
     call MatDestroySubMatrices(one, sub, ierr)
+    call PetscLogEventEnd(dev_solve, ierr)
 
     ! Z, with M's layout
+    call PetscLogEventBegin(dev_z, ierr)
     do k = 1, int(nloc)
       d_nnz(k) = count(zc(zr0(k) + 1 : zr0(k + 1)) >= rs .and. zc(zr0(k) + 1 : zr0(k + 1)) < re)
       o_nnz(k) = zr0(k + 1) - zr0(k) - d_nnz(k)
@@ -290,6 +324,8 @@ contains
     enddo
     call MatAssemblyBegin(Z, MAT_FINAL_ASSEMBLY, ierr)
     call MatAssemblyEnd(Z, MAT_FINAL_ASSEMBLY, ierr)
+    call PetscLogEventEnd(dev_z, ierr)
+    call PetscLogEventEnd(dev_basis, ierr)
     if (present(name)) then
       call MPI_Allreduce(nmy, nsum, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
       if (my_id == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   local dual basis of "//name//": ", nsum, &

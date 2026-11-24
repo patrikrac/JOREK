@@ -146,6 +146,11 @@
 !!                                     first build creates the file, later
 !!                                     builds append)
 !!   -vs_ss_view <file>                S_s of every build, likewise
+!!   -vs_mem_report                    the first build reports every vs_lumped
+!!                                     matrix (entries, rows, longest row, exact
+!!                                     zeros, entries between |n| families) and
+!!                                     the RSS after it, and the SPD-MG levels
+!!                                     ([VS mem] lines; collective, off)
 !!   -vs_dual_mat_view                 every dual basis (mod_petsc_pc_dual)
 !!   -vs_p_solver default | spdmg      P_lumped's solver: the backend of
 !!                                     physics_pc_sf_pair_w (default: the ring
@@ -228,6 +233,8 @@ module mod_petsc_pc_vs
   !! first build)
   Mat, save :: z_j, t_bzb
   type(sf_op_t), save :: o_pl
+  !> P_lumped is t_bzb itself (assemble_lumped)
+  logical, save :: pl_merged = .false.
   !> vs_lumped with the resistive bending: o_rb(RB_ij) = B_ij; M_eta and K_eta
   !! in the operators' layout (W sources alone); Z_11, K_hyp, the product
   !! T = B_31 Z_11 K_hyp and its transpose, S_s; the masks of psi's and j's
@@ -272,9 +279,34 @@ module mod_petsc_pc_vs
   Vec, save :: zv                              !< zero field
   logical, save :: vecs_ready = .false.
 
+  !> -log_view: the stages of the first build and of the later builds
+  !! (refills), and events of vs_lumped's assembly (the resistive bending's
+  !! S_s and X, the product B_23 X B_12 and P_lumped, the first build's
+  !! checks)
+  PetscLogStage, save :: vst_build1 = -1, vst_buildn = -1
+  PetscLogEvent, save :: vev_resbend = -1, vev_plprod = -1, vev_check = -1
+  logical, save :: vlog_ready = .false.
+  !> -vs_mem_report: the first build reports each vs_lumped matrix (entries,
+  !! rows, longest row; sum, largest rank; exact zeros, entries between |n|
+  !! families) and the RSS after it
+  logical, save :: mem_report = .false.
+
   public :: vs_init, vs_build, vs_apply, vs_report, vs_wants_eta
 
 contains
+
+  !> The stages and events above, once.
+  subroutine vs_register_log()
+    PetscErrorCode :: ierr
+    PetscClassId, parameter :: cid = 0
+    if (vlog_ready) return
+    call PetscLogStageRegister("VS build first", vst_build1, ierr)
+    call PetscLogStageRegister("VS build refill", vst_buildn, ierr)
+    call PetscLogEventRegister("VS_ResBend", cid, vev_resbend, ierr)
+    call PetscLogEventRegister("VS_PLProd",  cid, vev_plprod,  ierr)
+    call PetscLogEventRegister("VS_Check",   cid, vev_check,   ierr)
+    vlog_ready = .true.
+  end subroutine vs_register_log
 
   !> Resolve the namelist and the PETSc options once and refuse
   !! configurations the method cannot run. Called before the first assembly
@@ -320,6 +352,8 @@ contains
       if (.not. is_set) pl_view = ""
       call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_ss_view", ss_view, is_set, ierr)
       if (.not. is_set) ss_view = ""
+      call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_mem_report", flag, is_set, ierr)
+      if (is_set) mem_report = flag
     endif
     bk_pj   = sf_backend(physics_pc_sf_pair_psi, "physics_pc_sf_pair_psi", my_id)
     bk_vort = sf_backend(physics_pc_sf_pair_w,   "physics_pc_sf_pair_w",   my_id)
@@ -476,6 +510,12 @@ contains
     first  = vs_first
     comm_g = comm
     rtol   = physics_pc_sf_rtol
+    call vs_register_log()
+    if (first) then
+      call PetscLogStagePush(vst_build1, ierr)
+    else
+      call PetscLogStagePush(vst_buildn, ierr)
+    endif
 
     if (first) then
       if (.not. (g_ctx%m_rho_ready .and. g_ctx%d_bc_ready)) &
@@ -515,6 +555,25 @@ contains
       call sfo_build(o_mw, A_full, wm, sf_opz(), my_id)
     endif
     call PetscLogEventEnd(pcev_extract, ierr)
+    if (lumped .and. mem_report .and. first) then
+      call mem_line("M_rho + B_24", o_vort%mat)
+      call mem_line("B_23", o_cb(CB_23)%mat)
+      call mem_line("B_12", o_cb(CB_12)%mat)
+      call mem_line("B_33", o_mj%mat)
+      if (res_dual) then
+        call mem_line("B_11", o_rb(RB_11)%mat)
+        call mem_line("B_13", o_rb(RB_13)%mat)
+        call mem_line("B_31", o_rb(RB_31)%mat)
+        call mem_line("M_eta", o_meta%mat)
+        call mem_line("K_eta", o_keta%mat)
+      endif
+      if (vpar) then
+        call mem_line("B_55", o_rho%mat)
+        call mem_line("B_57", o_vc(VC_57)%mat)
+        call mem_line("B_77", o_v77%mat)
+      endif
+      call mem_line("the operators extracted")
+    endif
     if (first) then
       ! on the operators' communicator: B_65 is refilled at every build, the
       ! flag only skips its product, so the families need not agree
@@ -555,7 +614,11 @@ contains
     ! but leave the matrix not symmetric
     if (lumped) then
       call sf_solver_penalty_rows(slv_vort, o_pl, comm_s, my_id)
-      if (first) call report_skew(o_pl%mat, "P_lumped")
+      if (first) then
+        call PetscLogEventBegin(vev_check, ierr)
+        call report_skew(o_pl%mat, "P_lumped")
+        call PetscLogEventEnd(vev_check, ierr)
+      endif
       call view_build(o_pl%mat, pl_view, "P_lumped")
     endif
     ! P_V likewise: its constrained rows are B_77's diagonal alone (P_V^A's
@@ -564,8 +627,10 @@ contains
       call sf_solver_penalty_rows(slv_pv, o_pv, comm_s, my_id)
       if (pv_adv) call pva_boundary_rows()
       if (first) then
+        call PetscLogEventBegin(vev_check, ierr)
         call report_skew(o_pv%mat, "P_V")
         if (pv_adv) call report_skew(pva, "P_V^A")
+        call PetscLogEventEnd(vev_check, ierr)
       endif
       call view_build(o_pv%mat, pv_view, "P_V")
     endif
@@ -632,6 +697,7 @@ contains
       call PetscLogEventEnd(pcev_fact_lap, ierr)
     endif
     call physics_pc_mem("VS build: solvers set up", my_id)
+    if (lumped) call mem_line("the solvers set up")
 
     if (.not. vecs_ready) call create_work_vectors()
     g_ctx%reduced_ready = .true.
@@ -639,31 +705,89 @@ contains
     ! the families finish their setups at different times: wait here, so that
     ! the setup timer holds the slowest one rather than the first apply
     if (famode) call MPI_Barrier(comm, ierr)
+    call PetscLogStagePop(ierr)
 
   contains
 
     !> P_lumped = (M_rho + B_24) - (1/opz) B_23 X B_12: X and the product's
     !! symbolic phase once, the union pattern fixed by the first build, the
     !! numeric product at every build; X at every build for the resistive
-    !! bending.
+    !! bending. Where the pattern of M_rho + B_24 lies inside the product's
+    !! (checked at the first build; the usual case, the product reaching
+    !! further), P_lumped is the product matrix itself, scaled by -1/opz and
+    !! M_rho + B_24 added in place (the same arithmetic as the two additions
+    !! into a zeroed copy): no second matrix of P's size.
     subroutine assemble_lumped()
-      if (res_dual) call resistive_bending()
+      if (res_dual) then
+        call PetscLogEventBegin(vev_resbend, ierr)
+        call resistive_bending()
+        call PetscLogEventEnd(vev_resbend, ierr)
+      endif
+      call PetscLogEventBegin(vev_plprod, ierr)
       if (first) then
         if (.not. res_dual) then
           call dual_basis(o_mj%mat, int(pc_ntor), z_j, my_id, "B_33")
           call dual_symmetrize(z_j, o_mj%mat, dual_form)
         endif
         call MatMatMatMult(o_cb(CB_23)%mat, z_j, o_cb(CB_12)%mat, MAT_INITIAL_MATRIX, 2.0d0, t_bzb, ierr)
-        call MatDuplicate(t_bzb, MAT_COPY_VALUES, o_pl%mat, ierr)
-        call MatAXPY(o_pl%mat, 1.0d0, o_vort%mat, DIFFERENT_NONZERO_PATTERN, ierr)
+        call mem_line("B_23 X B_12", t_bzb)
+        pl_merged = pattern_within(o_vort%mat, t_bzb)
+        if (pl_merged) then
+          o_pl%mat = t_bzb
+          if (my_id == 0) write(*,'(A)') "[Physics PC]   P_lumped: the product B_23 X B_12 holds M_rho + B_24's "// &
+            "pattern, assembled in place"
+        else
+          call MatDuplicate(t_bzb, MAT_COPY_VALUES, o_pl%mat, ierr)
+          call MatAXPY(o_pl%mat, 1.0d0, o_vort%mat, DIFFERENT_NONZERO_PATTERN, ierr)
+        endif
         o_pl%label = "P_lumped"; o_pl%nf = 1
       else
         call MatMatMatMult(o_cb(CB_23)%mat, z_j, o_cb(CB_12)%mat, MAT_REUSE_MATRIX, 2.0d0, t_bzb, ierr)
       endif
-      call MatZeroEntries(o_pl%mat, ierr)
-      call MatAXPY(o_pl%mat, -1.0d0 / sf_opz(), t_bzb, SUBSET_NONZERO_PATTERN, ierr)
+      if (pl_merged) then
+        call MatScale(t_bzb, -1.0d0 / sf_opz(), ierr)
+      else
+        call MatZeroEntries(o_pl%mat, ierr)
+        call MatAXPY(o_pl%mat, -1.0d0 / sf_opz(), t_bzb, SUBSET_NONZERO_PATTERN, ierr)
+      endif
       call MatAXPY(o_pl%mat, 1.0d0, o_vort%mat, SUBSET_NONZERO_PATTERN, ierr)
+      if (first) call mem_line("P_lumped", o_pl%mat)
+      call PetscLogEventEnd(vev_plprod, ierr)
     end subroutine assemble_lumped
+
+    !> Is the pattern of a (its stored entries) inside that of b, on every
+    !! rank of the operators' communicator? Row by row, both sorted.
+    logical function pattern_within(a, b)
+      Mat, intent(in) :: a, b
+      PetscInt :: rs_, re_, r_, na_, nb_, i_, j_
+      PetscInt, pointer :: ca_(:), cb_(:)
+      integer :: mpe
+      logical :: ok_
+      call MatGetOwnershipRange(a, rs_, re_, ierr)
+      ok_ = .true.
+      do r_ = rs_, re_ - 1
+        call MatGetRow(a, r_, na_, ca_, PETSC_NULL_SCALAR_POINTER, ierr)
+        call MatGetRow(b, r_, nb_, cb_, PETSC_NULL_SCALAR_POINTER, ierr)
+        j_ = 1
+        do i_ = 1, na_
+          do while (j_ <= nb_)
+            if (cb_(j_) >= ca_(i_)) exit
+            j_ = j_ + 1
+          enddo
+          if (j_ > nb_) then
+            ok_ = .false.
+          else if (cb_(j_) /= ca_(i_)) then
+            ok_ = .false.
+          endif
+          if (.not. ok_) exit
+        enddo
+        call MatRestoreRow(b, r_, nb_, cb_, PETSC_NULL_SCALAR_POINTER, ierr)
+        call MatRestoreRow(a, r_, na_, ca_, PETSC_NULL_SCALAR_POINTER, ierr)
+        if (.not. ok_) exit
+      enddo
+      call MPI_Allreduce(MPI_IN_PLACE, ok_, 1, MPI_LOGICAL, MPI_LAND, comm_s, mpe)
+      pattern_within = ok_
+    end function pattern_within
 
     !> X (z_j) of the resistive bending, at every build (module header):
     !!   K_hyp = -(B_13 + M_eta),  T = B_31 Z_11 K_hyp,
@@ -683,6 +807,7 @@ contains
           " constrained rows of psi (B_11), ", nm_j, " of j (B_33) leave K_hyp and K_eta"
         call MatDuplicate(o_rb(RB_13)%mat, MAT_COPY_VALUES, k_hyp, ierr)
         call MatAXPY(k_hyp, 1.0d0, o_meta%mat, DIFFERENT_NONZERO_PATTERN, ierr)
+        call mem_line("K_hyp", k_hyp)
       else
         call MatZeroEntries(k_hyp, ierr)
         call MatAXPY(k_hyp, 1.0d0, o_rb(RB_13)%mat, SUBSET_NONZERO_PATTERN, ierr)
@@ -691,18 +816,26 @@ contains
       call MatScale(k_hyp, -1.0d0, ierr)
       call MatDiagonalScale(k_hyp, mask_psi, mask_j, ierr)
       call MatDiagonalScale(o_keta%mat, mask_j, mask_j, ierr)
-      if (first) call eta_self_check()
+      if (first) then
+        call PetscLogEventBegin(vev_check, ierr)
+        call eta_self_check()
+        call PetscLogEventEnd(vev_check, ierr)
+      endif
 
       ! T = B_31 Z_11 K_hyp
       if (first) then
         call dual_basis(o_rb(RB_11)%mat, int(pc_ntor), z_11, my_id, "B_11")
+        call mem_line("Z_11", z_11)
         call MatMatMatMult(o_rb(RB_31)%mat, z_11, k_hyp, MAT_INITIAL_MATRIX, 2.0d0, t_s, ierr)
+        call mem_line("T = B_31 Z_11 K_hyp", t_s)
         call MatTranspose(t_s, MAT_INITIAL_MATRIX, t_st, ierr)
+        call mem_line("T'", t_st)
         ! S_s's pattern: B_33, K_eta, T and T'
         call MatDuplicate(o_mj%mat, MAT_COPY_VALUES, s_res, ierr)
         call MatAXPY(s_res, 1.0d0, o_keta%mat, DIFFERENT_NONZERO_PATTERN, ierr)
         call MatAXPY(s_res, 1.0d0, t_s, DIFFERENT_NONZERO_PATTERN, ierr)
         call MatAXPY(s_res, 1.0d0, t_st, DIFFERENT_NONZERO_PATTERN, ierr)
+        call mem_line("S_s", s_res)
       else
         call dual_basis(o_rb(RB_11)%mat, int(pc_ntor), zn, my_id)
         call MatCopy(zn, z_11, SAME_NONZERO_PATTERN, ierr)
@@ -721,7 +854,9 @@ contains
       ! X
       if (first) then
         call dual_basis(s_res, int(pc_ntor), z_j, my_id, "S_s", core=res_core)
+        call mem_line("Z of S_s", z_j)
         call dual_symmetrize(z_j, s_res, dual_form)
+        call mem_line("X = sym. form of Z", z_j)
       else
         call dual_basis(s_res, int(pc_ntor), zn, my_id, core=res_core)
         call dual_symmetrize(zn, s_res, dual_form)
@@ -782,6 +917,67 @@ contains
       endif
     end subroutine eta_self_check
 
+    !> -vs_mem_report, first build: one line for mat (if given) with its
+    !! stored entries (sum over the ranks and the largest rank), its rows
+    !! and its longest row (largest rank), and a second one with its entries
+    !! that are exactly zero, those between two |n| families (rows and
+    !! columns of different families; JOREK index * slots + slot layout) and
+    !! the exact zeros among them; then the current RSS (rank 0 and the
+    !! largest rank) and the RSS peak (the largest rank). Collective on the
+    !! operators' communicator.
+    subroutine mem_line(tag, mat)
+      use mod_petsc_pc_physics_ctx, only: physics_pc_peak_rss
+      use mod_petsc_pc_harm, only: pc_global_slot, pc_ntor
+      character(len=*), intent(in) :: tag
+      Mat, intent(in), optional :: mat
+      MatInfo :: mi
+      PetscLogDouble :: cur
+      PetscInt :: rs_, re_, r_, nc_, c_
+      PetscInt, pointer :: cl_(:)
+      PetscScalar, pointer :: vl_(:)
+      real*8 :: v(9), vs(9), vm(9), rss(3), rssm(3)
+      integer :: mpe, ns_, fr_, fc_
+      if (.not. (mem_report .and. first)) return
+      if (present(mat)) then
+        call MatGetInfo(mat, MAT_LOCAL, mi, ierr)
+        call MatGetOwnershipRange(mat, rs_, re_, ierr)
+        ns_ = pc_ntor
+        v = 0.d0
+        v(1) = mi%nz_allocated; v(2) = mi%memory; v(3) = dble(re_ - rs_)
+        do r_ = rs_, re_ - 1
+          call MatGetRow(mat, r_, nc_, cl_, vl_, ierr)
+          v(4) = max(v(4), dble(nc_))
+          fr_ = (pc_global_slot(int(mod(r_, int(ns_, kind(r_))))) + 1) / 2
+          do c_ = 1, nc_
+            fc_ = (pc_global_slot(int(mod(cl_(c_), int(ns_, kind(r_))))) + 1) / 2
+            if (vl_(c_) == 0.d0) v(5) = v(5) + 1.d0
+            v(8) = max(v(8), abs(vl_(c_)))
+            if (fc_ /= fr_) then
+              v(6) = v(6) + 1.d0
+              if (vl_(c_) == 0.d0) v(7) = v(7) + 1.d0
+              v(9) = max(v(9), abs(vl_(c_)))
+            endif
+          enddo
+          call MatRestoreRow(mat, r_, nc_, cl_, vl_, ierr)
+        enddo
+        call MPI_Allreduce(v, vs, 9, MPI_DOUBLE_PRECISION, MPI_SUM, comm_s, mpe)
+        call MPI_Allreduce(v, vm, 9, MPI_DOUBLE_PRECISION, MPI_MAX, comm_s, mpe)
+        ! (MatGetInfo's memory is 0 without PETSc's malloc tracing: entries only)
+        if (my_id == 0) write(*,'(A,A,T44,A,ES9.2,A,ES9.2,A,ES9.2,A,ES9.2,A,F7.0)') &
+          "[VS mem] ", tag, "nnz ", vs(1), " (max rank ", vm(1), "), rows ", vs(3), " (max rank ", vm(3), &
+          "), longest row ", vm(4)
+        if (my_id == 0) write(*,'(A,A,T44,A,ES9.2,A,F5.1,A,ES9.2,A,F5.1,A,ES9.2,A,ES9.2)') &
+          "[VS mem] ", "  "//tag, "exact zeros ", vs(5), " (", 100.d0 * vs(5) / max(vs(1), 1.d0), &
+          " %), between |n| families ", vs(6), " (", 100.d0 * vs(6) / max(vs(1), 1.d0), " %), of them zero ", &
+          vs(7), ", their largest |a| / largest |a| ", vm(9) / max(vm(8), tiny(1.d0))
+      endif
+      call PetscMemoryGetCurrentUsage(cur, ierr)
+      rss = [dble(cur), physics_pc_peak_rss(), 0.d0]
+      call MPI_Allreduce(rss, rssm, 3, MPI_DOUBLE_PRECISION, MPI_MAX, comm_s, mpe)
+      if (my_id == 0) write(*,'(A,A,T44,A,F8.3,A,F8.3,A,F8.3,A)') "[VS mem] ", "  RSS after "//tag, &
+        "rank 0 ", rss(1) / 1.d9, " GB, max rank ", rssm(1) / 1.d9, " GB, peak max rank ", rssm(2) / 1.d9, " GB"
+    end subroutine mem_line
+
     !> The skew part of the solved operator mat against the matrix, in the
     !! Frobenius norm. P_lumped: the quadrature error of B_23 = -B_12' with a
     !! symmetric X and no flow; P_V: rounding (symmetric by construction);
@@ -825,7 +1021,9 @@ contains
         call VecDuplicate(mask_rho, w_rho, ierr)
         if (my_id == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   v_par: ", nm_r, &
           " constrained rows of rho (B_55), ", nm_v, " of V (B_77) leave the congruence B_57' X B_57"
+        call PetscLogEventBegin(vev_check, ierr)
         call vpar_self_check()
+        call PetscLogEventEnd(vev_check, ierr)
       endif
       call node_weights(w_rho)
 
@@ -846,8 +1044,10 @@ contains
 
       ! X
       if (first) then
+        call mem_line("Q = W sym(B_55) W", q_pv)
         call dual_basis(q_pv, int(pc_ntor), x_pv, my_id, "W sym(B_55) W", core=pv_core)
         call dual_symmetrize(x_pv, q_pv, DUAL_AVG)
+        call mem_line("X of Q", x_pv)
       else
         call dual_basis(q_pv, int(pc_ntor), zn, my_id, core=pv_core)
         call dual_symmetrize(zn, q_pv, DUAL_AVG)
@@ -864,6 +1064,7 @@ contains
       call MatDiagonalScale(b57m, mask_rho, mask_v, ierr)
       if (first) then
         call MatPtAP(x_pv, b57m, MAT_INITIAL_MATRIX, 2.0d0, t_pv, ierr)
+        call mem_line("B_57' X B_57", t_pv)
       else
         call MatPtAP(x_pv, b57m, MAT_REUSE_MATRIX, 2.0d0, t_pv, ierr)
       endif
@@ -888,6 +1089,7 @@ contains
       call MatDiagonalSet(o_pv%mat, dv, ADD_VALUES, ierr)
       call VecDestroy(dv, ierr)
       call MatAXPY(o_pv%mat, 1.0d0, t_pv, SUBSET_NONZERO_PATTERN, ierr)
+      if (first) call mem_line("P_V", o_pv%mat)
 
       if (.not. pv_adv) return
       ! Q_A = W B_55 W, Z_A, T_A = B_57m' Z_A B_57m, P_V^A = Mv B_77 Mv + T_A;

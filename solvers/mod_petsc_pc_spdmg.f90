@@ -93,14 +93,65 @@
 !!   -vs_pmg_cheb_ratio <r>                interval [safety lmax / r, ..] (10)
 !!   -vs_pmg_cheb_safety <s>               lmax factor                    (1.1)
 !!   -vs_pmg_esteig_its <n>                CG steps of the lmax estimate  (12)
+!!   -vs_pmg_esteig_reuse                  the first build's intervals on every
+!!                                         later build: no estimate there (the
+!!                                         refilled operator's lmax drifts with
+!!                                         the state; off: estimated per build)
 !!   -vs_pmg_transfer mixed | ringharm | linear | const   the transfer along
 !!                                         the ring                       (mixed)
 !!   -vs_pmg_rh_sweeps <k>                 ring-harmonic Jacobi steps     (4)
 !!   -vs_pmg_rh_reach <r>                  its reach along the ring       (3)
 !!   -vs_pmg_rh_omega <w>                  its damping                    (1)
+!!   -vs_pmg_rh_family                     with physics_pc_sf_harm_couple = .f.
+!!                                         (no couplings between |n| families in
+!!                                         the operator, so none in X either):
+!!                                         P(g) leaves out the exact zeros
+!!                                         between families that it would store,
+!!                                         and the Galerkin levels lose them (m3:
+!!                                         C_op 2.46 -> 1.76); the levels'
+!!                                         patterns change, hence the rounding
+!!                                         (no effect with .t.)          (off)
 !!   -vs_pmg_levels <n>                    at most n levels               (all)
 !!   -vs_pmg_min_nj <n>                    fewest ring positions          (3)
 !!   -vs_pmg_dense_max <n>                 largest block with a dense LU  (300)
+!!   -vs_pmg_blockmv                       the levels' operators (the operator
+!!                                         and the Galerkin levels) multiply on
+!!                                         JOREK's OpenMP block kernel
+!!                                         (jorek_blockmv_attach.c, as the ring
+!!                                         GMG's levels) instead of PETSc's
+!!                                         MatMult: threads in the matvecs,
+!!                                         another summation order      (off)
+!!   -vs_pmg_band                          a block whose band in its row order is
+!!                                         narrow (2 kl + ku + 1 <= rows / 2:
+!!                                         the radial lines), whatever its size,
+!!                                         as a LAPACK band LU (dgbtrf / dgbtrs)
+!!                                         instead of a dense LU or a PETSc KSP
+!!                                         with a sparse LU (off): about the
+!!                                         flops of the sparse LU (m4: +16 % per
+!!                                         line solve against nd), no KSP per
+!!                                         block, and solved on the OpenMP
+!!                                         threads as the dense blocks are.
+!!                                         With -vs_pmg_dense_max above the
+!!                                         axis block's rows, that block is a
+!!                                         dense LAPACK LU (MKL's threads in its
+!!                                         factorisation) and the lines band
+!!   -vs_pmg_sparse_ordering nd | natural | rcm | qmd | 1wd   the ordering of
+!!                                         the sparse block LUs, all of them
+!!                                         (m4: natural takes 24 % fewer solve
+!!                                         flops on the radial lines, banded
+!!                                         in their ring-major order, but 15 %
+!!                                         more factor flops on the axis
+!!                                         block)                       (nd)
+!!   -vs_pmg_block_owner first | balanced  the rank that solves a block: the
+!!                                         owner of its smallest DOF, or for a
+!!                                         block across ranks (a radial line,
+!!                                         a wedge, the axis block) the least
+!!                                         loaded of its ranks (first: every
+!!                                         radial line on the rank of ring
+!!                                         line_from). Bitwise the same at np 1;
+!!                                         on more ranks the additive sum of
+!!                                         overlapping blocks is added in
+!!                                         another order               (first)
 !!   -vs_pmg_test                          on the first build: CG with one cycle
 !!                                         on a random right-hand side to 1e-10,
 !!                                         its to 1e-1 / 1e-6 / 1e-10 and the
@@ -140,6 +191,7 @@ module mod_petsc_pc_spdmg
   integer, parameter :: MAXL = 12
   integer, parameter :: BL_NODE = 1, BL_LINE = 2, BL_POINT = 3, BL_LINEWEDGE = 4
   integer, parameter :: TR_LINEAR = 1, TR_CONST = 2, TR_RINGHARM = 3, TR_MIXED = 4
+  integer, parameter :: OWN_FIRST = 1, OWN_BALANCED = 2
 
   !> the configuration (PETSc options, module header)
   type :: spdmg_opts_t
@@ -154,13 +206,19 @@ module mod_petsc_pc_spdmg
     real*8  :: ratio      = 10.d0
     real*8  :: safety     = 1.1d0
     integer :: esteig_its = 12
+    logical :: esteig_reuse = .false.  !< the first build's Chebyshev intervals for every later build
     integer :: transfer   = TR_MIXED
     integer :: rh_sweeps  = 4          !< ring-harmonic transfer: Jacobi steps
     integer :: rh_reach   = 3          !< and the reach of X along the ring
     real*8  :: rh_omega   = 1.d0       !< and the step's damping
+    logical :: rh_family  = .false.    !< -vs_pmg_rh_family: no entries between |n| families in P(g) (harm_couple .f.)
     integer :: max_levels = MAXL
     integer :: min_nj     = 3
     integer :: dense_max  = 300
+    character(len=16) :: sp_order = "nd" !< the ordering of the sparse block LUs (-vs_pmg_sparse_ordering)
+    logical :: band = .false.          !< -vs_pmg_band: LAPACK band LUs for the blocks with a narrow band
+    logical :: blockmv = .false.       !< -vs_pmg_blockmv: the levels' matvecs on the OpenMP block kernel
+    integer :: block_owner = OWN_FIRST !< the rank solving a block (block_members)
     logical :: test       = .false.
     character(len=256) :: view_p = ""  !< -vs_pmg_view_p <prefix>: P(g) of the first build to <prefix>_P<g>.petsc
   end type spdmg_opts_t
@@ -203,7 +261,9 @@ module mod_petsc_pc_spdmg
     VecScatter :: sct
     Vec :: w
     logical, allocatable :: dense(:)
-    integer(8), allocatable :: loff(:)             !< dense block -> offset of its LU in lu
+    logical, allocatable :: band(:)                !< -vs_pmg_band: a LAPACK band LU in lu (kl, ku)
+    integer, allocatable :: kl(:), ku(:)           !< its band widths
+    integer(8), allocatable :: loff(:)             !< dense or band block -> offset of its LU in lu
     real*8, allocatable :: lu(:)
     integer, allocatable :: piv(:)                 !< pivots, at off
     KSP, allocatable :: kb(:)                      !< sparse block -> its LU
@@ -229,12 +289,41 @@ module mod_petsc_pc_spdmg
     real*8, allocatable :: hist(:)                  !< the test's residual history
     real*8, allocatable :: ring_asp(:)              !< (0:n_flux-1) the finest level's ring cell aspect (wedge_last)
     logical, allocatable :: rh_slot(:)              !< (0:ns-1) the slot's F rows are ring-harmonic
+    real*8 :: rh_ab(2, 1:MAXL-1) = 0.d0             !< bytes of the ring-harmonic Ab blocks zeroed, summed over
+                                                    !! the rank's rings and builds: as sized, as nF x nF (before)
+    real*8 :: cheb_iv(2, 0:MAXL-1) = 0.d0           !< -vs_pmg_esteig_reuse: level g's [emax, emin]
+    logical :: cheb_frozen = .false.                !< the intervals are saved (and set on later builds)
   end type spdmg_inst_t
 
   type(spdmg_inst_t), target, save :: inst(NINST)
   type(spdmg_inst_t), pointer, save :: H => null()  !< the active instance
 
+  !> -log_view events (SPDMG_*, shared by the instances): the levels (first
+  !! build), the transfers and Galerkin products, the KSP setup (smoother
+  !! factors, Chebyshev estimates, coarse LU), the additive Schwarz setup and
+  !! apply (its block solves alone: ASMBlk), the test. LAPACK flops are logged
+  !! with PetscLogFlops.
+  PetscLogEvent, save :: sev_levels = -1, sev_transfer = -1, sev_ptap = -1, sev_kspsetup = -1, &
+                         sev_asmsetup = -1, sev_asmapply = -1, sev_asmblk = -1, sev_test = -1
+  logical, save :: sev_ready = .false.
+
 contains
+
+  !> The -log_view events of the module, once.
+  subroutine spdmg_register_events()
+    PetscErrorCode :: ierr
+    PetscClassId, parameter :: cid = 0
+    if (sev_ready) return
+    call PetscLogEventRegister("SPDMG_Levels",   cid, sev_levels,   ierr)
+    call PetscLogEventRegister("SPDMG_Transfer", cid, sev_transfer, ierr)
+    call PetscLogEventRegister("SPDMG_PtAP",     cid, sev_ptap,     ierr)
+    call PetscLogEventRegister("SPDMG_KSPSetUp", cid, sev_kspsetup, ierr)
+    call PetscLogEventRegister("SPDMG_ASMSetup", cid, sev_asmsetup, ierr)
+    call PetscLogEventRegister("SPDMG_ASMApply", cid, sev_asmapply, ierr)
+    call PetscLogEventRegister("SPDMG_ASMBlk",   cid, sev_asmblk,   ierr)
+    call PetscLogEventRegister("SPDMG_Test",     cid, sev_test,     ierr)
+    sev_ready = .true.
+  end subroutine spdmg_register_events
 
   !> Configure ksp as the solver of operator A (one field, ns slots per JOREK
   !! index, rows index * ns + slot; mod_petsc_pc_sf_ops) with instance k's
@@ -257,7 +346,9 @@ contains
 
     H => inst(k)
     first_chain = .not. H%built
+    call spdmg_register_events()
     if (.not. H%built) then
+      call PetscLogEventBegin(sev_levels, ierr)
       H%comm = comm; H%ns = ns
       call MPI_Comm_rank(comm, H%me, ierr)
       call MPI_Comm_size(comm, H%np, ierr)
@@ -266,9 +357,26 @@ contains
       call build_levels(A, my_id)
       call create_prolongations()
       H%built = .true.
+      call PetscLogEventEnd(sev_levels, ierr)
     endif
     ! the levels' transfers (ring-harmonic: from the operators) and Galerkin operators
     call galerkin_chain(A, first_chain)
+    ! -vs_pmg_blockmv: the levels' matvecs on JOREK's OpenMP block kernel (as
+    ! the ring GMG's), attached once (the kernel follows the refills); the
+    ! cycle's operators only, not amat
+    if (first_chain .and. H%o%blockmv) then
+      block
+        use mod_petsc_raw_csr, only: blockmv_attach
+        integer :: g_, nok
+        nok = 0
+        if (blockmv_attach(A, H%ns)) nok = nok + 1
+        do g_ = 1, H%nlev - 1
+          if (blockmv_attach(H%Ag(g_), H%ns)) nok = nok + 1
+        enddo
+        if (H%me == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   "//trim(H%tag)//": ", nok, " of ", H%nlev, &
+          " level operators on the OpenMP block matvec kernel (-"//trim(H%prefix)//"blockmv)"
+      end block
+    endif
     if (fresh) then
       call KSPSetType(ksp, KSPFGMRES, ierr)
       call KSPGMRESSetRestart(ksp, maxits, ierr)
@@ -280,12 +388,21 @@ contains
       call KSPSetFromOptions(ksp, ierr)
     else
       call set_operators()
+      if (H%cheb_frozen) call cheb_freeze(ksp)
     endif
+    call PetscLogEventBegin(sev_kspsetup, ierr)
     call KSPSetUp(ksp, ierr)
+    call PetscLogEventEnd(sev_kspsetup, ierr)
+    if (H%o%esteig_reuse .and. .not. H%cheb_frozen) call cheb_save(ksp)
     if (fresh) then
       call report(ksp, tagged(), my_id)
+      call zero_report(A)
       if (len_trim(H%o%view_p) > 0) call view_transfers()
-      if (H%o%test) call run_test(ksp, A, tagged(), my_id)
+      if (H%o%test) then
+        call PetscLogEventBegin(sev_test, ierr)
+        call run_test(ksp, A, tagged(), my_id)
+        call PetscLogEventEnd(sev_test, ierr)
+      endif
     endif
   contains
     subroutine set_operators()
@@ -320,6 +437,109 @@ contains
       call fatal("an unknown instance")
     end select
   end subroutine instance_defaults
+
+  !> -vs_mem_report (first build): each level operator's stored entries,
+  !! those exactly zero, those between two |n| families (row and column
+  !! slots of different families) and the exact zeros among them, summed
+  !! over the ranks. Collective.
+  subroutine zero_report(A0)
+    use mod_petsc_pc_harm, only: pc_global_slot
+    Mat, intent(in) :: A0
+    PetscBool :: flg
+    PetscErrorCode :: ierr
+    PetscInt :: rs, re, r, nc, c
+    PetscInt, pointer :: cl(:)
+    PetscScalar, pointer :: vl(:)
+    real*8 :: v(6), vs(6)
+    integer :: g, fr, fc
+    Mat :: M
+    call PetscOptionsHasName(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_mem_report", flg, ierr)
+    if (.not. flg) return
+    do g = 0, H%nlev - 1
+      M = A0
+      if (g > 0) M = H%Ag(g)
+      call MatGetOwnershipRange(M, rs, re, ierr)
+      v = 0.d0
+      do r = rs, re - 1
+        call MatGetRow(M, r, nc, cl, vl, ierr)
+        fr = (pc_global_slot(int(mod(r, int(H%ns, kind(r))))) + 1) / 2
+        v(1) = v(1) + dble(nc)
+        do c = 1, nc
+          fc = (pc_global_slot(int(mod(cl(c), int(H%ns, kind(r))))) + 1) / 2
+          if (vl(c) == 0.d0) v(2) = v(2) + 1.d0
+          v(5) = max(v(5), abs(vl(c)))
+          if (fc /= fr) then
+            v(3) = v(3) + 1.d0
+            if (vl(c) == 0.d0) v(4) = v(4) + 1.d0
+            v(6) = max(v(6), abs(vl(c)))
+          endif
+        enddo
+        call MatRestoreRow(M, r, nc, cl, vl, ierr)
+      enddo
+      call MPI_Allreduce(v(1:4), vs(1:4), 4, MPI_DOUBLE_PRECISION, MPI_SUM, H%comm, ierr)
+      call MPI_Allreduce(v(5:6), vs(5:6), 2, MPI_DOUBLE_PRECISION, MPI_MAX, H%comm, ierr)
+      if (H%me == 0) write(*,'(A,A,I0,A,ES9.2,A,ES9.2,A,F5.1,A,ES9.2,A,F5.1,A,ES9.2,A,ES9.2)') "[VS mem] ", &
+        trim(H%tag)//" level ", g, ": stored ", vs(1), ", exact zeros ", vs(2), " (", 100.d0 * vs(2) / max(vs(1), 1.d0), &
+        " %), between |n| families ", vs(3), " (", 100.d0 * vs(3) / max(vs(1), 1.d0), " %), of them zero ", vs(4), &
+        ", their largest |a| / largest |a| ", vs(6) / max(vs(5), tiny(1.d0))
+    enddo
+    do g = 1, H%nlev - 1
+      call MPI_Allreduce(H%rh_ab(:, g), v(1:2), 2, MPI_DOUBLE_PRECISION, MPI_MAX, H%comm, ierr)
+      if (H%me == 0 .and. v(2) > 0.d0) write(*,'(A,A,I0,A,F10.2,A,F10.2,A)') "[VS mem] ", trim(H%tag)//" transfer ", &
+        g, ": ring-harmonic neighbour blocks zeroed per build, largest rank ", v(1) / 1.d6, " MB (as nF x nF: ", &
+        v(2) / 1.d6, " MB)"
+    enddo
+  end subroutine zero_report
+
+  !> -vs_pmg_esteig_reuse: the Chebyshev intervals of the levels' smoothers
+  !! as the first build's estimates set them, [b lmax, d lmax] with lmax the
+  !! largest Lanczos eigenvalue of the estimate and (b, d) = (safety / ratio,
+  !! safety) (PETSc's transform with a = c = 0), saved after that build.
+  subroutine cheb_save(ksp)
+    KSP, intent(in) :: ksp
+    PC :: pc
+    KSP :: ks, kest
+    PetscInt :: L, n, neig
+    PetscErrorCode :: ierr
+    real*8, allocatable :: re(:), im(:)
+    real*8 :: lmax
+    integer :: g
+    call KSPGetPC(ksp, pc, ierr)
+    do g = 0, H%nlev - 2
+      L = H%nlev - 1 - g
+      call PCMGGetSmoother(pc, L, ks, ierr)
+      call KSPChebyshevEstEigGetKSP(ks, kest, ierr)
+      call KSPGetIterationNumber(kest, n, ierr)
+      allocate(re(max(n, 1)), im(max(n, 1)))
+      neig = 0
+      if (n > 0) call KSPComputeEigenvalues(kest, n, re, im, neig, ierr)
+      if (neig < 1) call fatal("-"//trim(H%prefix)//"esteig_reuse: no eigenvalue estimate on a level")
+      lmax = maxval(re(1:neig))
+      H%cheb_iv(1, g) = H%o%safety * lmax
+      H%cheb_iv(2, g) = (H%o%safety / H%o%ratio) * lmax
+      deallocate(re, im)
+    enddo
+    H%cheb_frozen = .true.
+    if (H%me == 0) write(*,'(A,I0,A)') "[Physics PC]   "//trim(H%tag)//": the Chebyshev intervals of the first "// &
+      "build kept for the later builds (-"//trim(H%prefix)//"esteig_reuse), ", H%nlev - 1, " levels"
+  end subroutine cheb_save
+
+  !> The saved intervals on the levels' smoothers, estimation off (later builds).
+  subroutine cheb_freeze(ksp)
+    KSP, intent(in) :: ksp
+    PC :: pc
+    KSP :: ks
+    PetscInt :: L
+    PetscErrorCode :: ierr
+    integer :: g
+    call KSPGetPC(ksp, pc, ierr)
+    do g = 0, H%nlev - 2
+      L = H%nlev - 1 - g
+      call PCMGGetSmoother(pc, L, ks, ierr)
+      call KSPChebyshevEstEigSet(ks, 0.d0, 0.d0, 0.d0, 0.d0, ierr)
+      call KSPChebyshevSetEigenvalues(ks, H%cheb_iv(1, g), H%cheb_iv(2, g), ierr)
+    enddo
+  end subroutine cheb_freeze
 
   !> P(g) in PETSc's binary format to <view_p>_P<g>.petsc (rows of level
   !! g-1, columns of level g, the row numbering of lv). Collective.
@@ -374,6 +594,13 @@ contains
     case ("mixed");    H%o%transfer = TR_MIXED
     case default;      call fatal(trim(pf)//"transfer must be mixed | ringharm | linear | const, got '"//trim(s)//"'")
     end select
+    s = "first"
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"block_owner", s, is_set, ierr)
+    select case (trim(s))
+    case ("first");    H%o%block_owner = OWN_FIRST
+    case ("balanced"); H%o%block_owner = OWN_BALANCED
+    case default;      call fatal(trim(pf)//"block_owner must be first | balanced, got '"//trim(s)//"'")
+    end select
     call get_int("rh_sweeps", H%o%rh_sweeps)
     call get_int("rh_reach", H%o%rh_reach)
     call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"rh_omega", rv, is_set, ierr)
@@ -386,12 +613,26 @@ contains
     call get_int("levels", H%o%max_levels)
     call get_int("min_nj", H%o%min_nj)
     call get_int("dense_max", H%o%dense_max)
+    s = "nd"
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"sparse_ordering", s, is_set, ierr)
+    select case (trim(s))
+    case ("nd", "natural", "rcm", "qmd", "1wd"); H%o%sp_order = trim(s)
+    case default; call fatal(trim(pf)//"sparse_ordering must be nd | natural | rcm | qmd | 1wd, got '"//trim(s)//"'")
+    end select
     call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"cheb_ratio", rv, is_set, ierr)
     if (is_set) H%o%ratio = rv
     call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"cheb_safety", rv, is_set, ierr)
     if (is_set) H%o%safety = rv
     call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"test", flag, is_set, ierr)
     if (is_set) H%o%test = flag
+    call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"esteig_reuse", flag, is_set, ierr)
+    if (is_set) H%o%esteig_reuse = flag
+    call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"band", flag, is_set, ierr)
+    if (is_set) H%o%band = flag
+    call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"blockmv", flag, is_set, ierr)
+    if (is_set) H%o%blockmv = flag
+    call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"rh_family", flag, is_set, ierr)
+    if (is_set) H%o%rh_family = flag
     call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"view_p", H%o%view_p, is_set, ierr)
     if (.not. is_set) H%o%view_p = ""
     H%o%max_levels = min(max(H%o%max_levels, 1), MAXL)
@@ -672,12 +913,16 @@ contains
     PetscErrorCode :: ierr
     af = A0
     do g = 1, H%nlev - 1
+      call PetscLogEventBegin(sev_transfer, ierr)
       if (any(H%rh_slot)) call fill_p(g, af)
+      call PetscLogEventEnd(sev_transfer, ierr)
+      call PetscLogEventBegin(sev_ptap, ierr)
       if (first) then
         call MatPtAP(af, H%P(g), MAT_INITIAL_MATRIX, 2.0d0, H%Ag(g), ierr)
       else
         call MatPtAP(af, H%P(g), MAT_REUSE_MATRIX, 2.0d0, H%Ag(g), ierr)
       endif
+      call PetscLogEventEnd(sev_ptap, ierr)
       af = H%Ag(g)
     enddo
   end subroutine galerkin_chain
@@ -752,12 +997,15 @@ contains
   !! the same kind at J/2, times the orientation). Every rank computes the
   !! whole rings that hold an F row of its own (the rows gathered from af).
   subroutine ringharm_rows(g, af)
-    use phys_module, only: n_flux
+    use phys_module, only: n_flux, physics_pc_sf_harm_couple
+    use mod_petsc_pc_harm, only: pc_global_slot
     integer, intent(in) :: g
     Mat, intent(in) :: af
     external :: dgetrf, dgetri
     integer :: nj, ni, m, nF, i, j, k, s, f, ff, q, qq, c, jc, dd, t, info, nnbmax, ncmax, a, ll, kc, sc, nent
     integer :: jdist, nb_
+    integer(8) :: nmm
+    logical :: fam_only
     logical, allocatable :: myring(:)
     integer, allocatable :: colJ(:), colL(:), nnb(:), nbF(:,:), ncq(:), nearJ(:,:), piv(:)
     real*8, allocatable :: Dinv(:,:,:), Ab(:,:,:,:), Afc(:,:,:,:), X(:,:,:,:), R(:,:,:,:), wk(:)
@@ -768,6 +1016,7 @@ contains
     PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
     one = 1
+    fam_only = H%o%rh_family .and. .not. physics_pc_sf_harm_couple
     associate (LF => H%lv(g - 1), LC => H%lv(g), HR => H%rh(g))
       nj = LF%nj; ni = n_flux; m = 4 * H%ns; nF = nj / 2
       ! the rings with an F row of mine, and their gathered rows (F nodes) and columns (all nodes)
@@ -843,8 +1092,15 @@ contains
             ncq(ff) = ncq(ff) + 1; nearJ(ncq(ff), ff) = jc
           enddo
         enddo
-        ! the blocks: D, the neighbour F nodes, the near C nodes
-        nnbmax = nF
+        ! the blocks: D, the neighbour F nodes, the near C nodes. Ab holds
+        ! nnbmax neighbour blocks per F node, the largest count of distinct
+        ! neighbour F nodes on the ring (a pre-pass over the rows): a few
+        ! along a sparse ring, nF - 1 only where the ring is coupled densely
+        ! (the axis core of vs_lumped's P), rather than nF everywhere (memory
+        ! and zeroing quadratic in the ring length)
+        nnbmax = max(1, ring_nnb_max(i))
+        H%rh_ab(1, g) = H%rh_ab(1, g) + 8.d0 * dble(m)**2 * dble(nnbmax) * dble(nF)
+        H%rh_ab(2, g) = H%rh_ab(2, g) + 8.d0 * dble(m)**2 * dble(nF) * dble(nF)
         allocate(nbF(nnbmax, nF), Ab(m, m, nnbmax, nF))
         nnb = 0; Ab = 0.d0; Afc = 0.d0
         Dinv = 0.d0
@@ -871,6 +1127,7 @@ contains
                     if (nbF(qq, ff) == (colJ(c) + 1) / 2) nb_ = qq
                   enddo
                   if (nb_ == 0) then
+                    if (nnb(ff) >= nnbmax) call fatal("ring-harmonic transfer: more neighbour F nodes than counted")
                     nnb(ff) = nnb(ff) + 1; nb_ = nnb(ff); nbF(nb_, ff) = (colJ(c) + 1) / 2
                   endif
                   Ab(ll, colL(c), nb_, ff) = vals(a)
@@ -888,8 +1145,10 @@ contains
           if (info /= 0) call fatal("a singular node block in the ring-harmonic transfer")
           call dgetri(m, Dinv(:, :, ff), m, piv, wk, m * m, info)
         enddo
+        call PetscLogFlops(2.d0 * dble(m)**3 * dble(nF), ierr)
         ! the sweeps (Jacobi: all R from the last X)
         X = 0.d0
+        nmm = 0
         do t = 1, H%o%rh_sweeps
           do ff = 1, nF
             do q = 1, ncq(ff)
@@ -897,8 +1156,10 @@ contains
               do qq = 1, nnb(ff)
                 f = nbF(qq, ff)
                 do c = 1, ncq(f)
-                  if (nearJ(c, f) == nearJ(q, ff)) &
+                  if (nearJ(c, f) == nearJ(q, ff)) then
                     R(:, :, q, ff) = R(:, :, q, ff) + matmul(Ab(:, :, qq, ff), X(:, :, c, f))
+                    nmm = nmm + 1
+                  endif
                 enddo
               enddo
             enddo
@@ -908,9 +1169,11 @@ contains
             do q = 1, ncq(ff)
               X(:, :, q, ff) = (1.d0 - H%o%rh_omega) * X(:, :, q, ff) - H%o%rh_omega * matmul(Dinv(:, :, ff), &
                                                                                           R(:, :, q, ff))
+              nmm = nmm + 1
             enddo
           enddo
         enddo
+        call PetscLogFlops(2.d0 * dble(m)**3 * dble(nmm), ierr)
         ! the rows of P of my F DOFs: X_f Pc
         allocate(ecol(ncmax * m), evals(ncmax * m))
         do ff = 1, nF
@@ -931,6 +1194,13 @@ contains
                   if (c < 0) cycle
                   if (.not. LF%ok(c)) cycle
                   do sc = 0, H%ns - 1
+                    ! -vs_pmg_rh_family: without the couplings between |n| families
+                    ! (physics_pc_sf_harm_couple = .f.) the operator, its node blocks and
+                    ! so X have none: their exact zeros stay out of P(g) and of the
+                    ! Galerkin levels' patterns
+                    if (fam_only) then
+                      if ((pc_global_slot(sc) + 1) / 2 /= (pc_global_slot(s) + 1) / 2) cycle
+                    endif
                     nent = nent + 1
                     ecol(nent) = LC%row0(LC%d(i, jc / 2, kc)) + sc
                     evals(nent) = X(ll, kc * H%ns + sc + 1, q, ff) * LF%osgn(c)
@@ -957,6 +1227,41 @@ contains
       enddo
     end associate
   contains
+    !> the largest number of distinct F nodes (odd positions other than its
+    !! own) that an F row of ring ii couples to, from the gathered rows (the
+    !! ring's column map colJ set)
+    integer function ring_nnb_max(ii)
+      integer, intent(in) :: ii
+      integer :: ff_, k_, s_, a_, dd_, j_, cnt_, rp_, c_
+      integer, allocatable :: seen_(:)
+      PetscInt :: nc_r
+      PetscInt, pointer :: cl_(:)
+      PetscScalar, pointer :: vl_(:)
+      PetscErrorCode :: ie_
+      allocate(seen_(0:nj - 1)); seen_ = 0
+      ring_nnb_max = 0
+      do ff_ = 1, nF
+        j_ = 2 * ff_ - 1
+        cnt_ = 0
+        do k_ = 0, 3
+          dd_ = H%lv(g - 1)%d(ii, j_, k_)
+          if (dd_ < 0) cycle
+          do s_ = 0, H%ns - 1
+            rp_ = bsearch(H%rh(g)%rrow, H%lv(g - 1)%row0(dd_) + s_)
+            call MatGetRow(H%rh(g)%sub(1), int(rp_, kind(nc_r)), nc_r, cl_, vl_, ie_)
+            do a_ = 1, int(nc_r)
+              c_ = int(cl_(a_))
+              if (colJ(c_) < 0 .or. colJ(c_) == j_ .or. mod(colJ(c_), 2) /= 1) cycle
+              if (seen_(colJ(c_)) == ff_) cycle
+              seen_(colJ(c_)) = ff_; cnt_ = cnt_ + 1
+            enddo
+            call MatRestoreRow(H%rh(g)%sub(1), int(rp_, kind(nc_r)), nc_r, cl_, vl_, ie_)
+          enddo
+        enddo
+        ring_nnb_max = max(ring_nnb_max, cnt_)
+      enddo
+      deallocate(seen_)
+    end function ring_nnb_max
     !> distance of the ring positions a and b (periodic, nj positions)
     integer function cdist(a_, b_)
       integer, intent(in) :: a_, b_
@@ -1051,15 +1356,16 @@ contains
   !! layout (o%blocks) as DOF sets, which may overlap: the axis block (rings
   !! 0..axis_rings), then the nodes, points or radial lines, then the wedges
   !! (linewedge). A block's rows are all slots of its DOFs, ascending; it
-  !! belongs to the owner of its smallest DOF. A new layout is a new case
-  !! here.
+  !! belongs to the owner of its smallest DOF, or (-vs_pmg_block_owner
+  !! balanced) a block across ranks to the least loaded of its ranks. A new
+  !! layout is a new case here.
   subroutine block_members(g, nb, off, gidx, bw)
     integer, intent(in) :: g
     integer, intent(out) :: nb
     integer, allocatable, intent(out) :: off(:)
     PetscInt, allocatable, intent(out) :: gidx(:)
     real*8, allocatable, intent(out) :: bw(:)
-    integer, allocatable :: ab0(:), abd(:), sel(:), key0(:), keyd(:)
+    integer, allocatable :: ab0(:), abd(:), sel(:), key0(:), keyd(:), bown(:)
     real*8, allocatable :: aw(:)
     logical, allocatable :: jin(:)
     integer :: nab, nabd, f, j, j0, k, ax, lf, t, b, s, nsel, p, nmine, nw
@@ -1129,16 +1435,70 @@ contains
         endif
       endif
 
+      ! the owner of every block: the owner of its smallest DOF (-vs_pmg_block_owner
+      ! first), or with -vs_pmg_block_owner balanced, for a block whose DOFs
+      ! more than one rank owns, the least loaded of these ranks (load: the
+      ! sum of rows^2 of its blocks, the dense solve's cost), the largest such
+      ! blocks first; the same on every rank. A radial line spans every rank
+      ! of an onion (ring-major) layout and would otherwise go to the owner of
+      ! its innermost ring, all lines of a level to one rank.
+      allocate(bown(nab))
+      do b = 1, nab
+        bown(b) = L%own(minval(abd(ab0(b) + 1 : ab0(b + 1))))
+      enddo
+      if (H%o%block_owner == OWN_BALANCED .and. H%np > 1) then
+        block
+          real*8, allocatable :: load(:), cost(:)
+          integer, allocatable :: ord(:)
+          logical, allocatable :: multi(:)
+          integer :: q, r, best, nmulti, tmp_
+          allocate(load(0:H%np - 1), cost(nab), multi(nab))
+          load = 0.d0
+          do b = 1, nab
+            cost(b) = (dble(ab0(b + 1) - ab0(b)) * dble(H%ns))**2
+            multi(b) = any(L%own(abd(ab0(b) + 1 : ab0(b + 1))) /= bown(b))
+            if (.not. multi(b)) load(bown(b)) = load(bown(b)) + cost(b)
+          enddo
+          ord = pack([(b, b = 1, nab)], multi)
+          nmulti = size(ord)
+          do q = 2, nmulti                                  ! stable insertion sort, cost descending
+            tmp_ = ord(q); r = q - 1
+            do while (r >= 1)
+              if (cost(ord(r)) >= cost(tmp_)) exit
+              ord(r + 1) = ord(r); r = r - 1
+            enddo
+            ord(r + 1) = tmp_
+          enddo
+          do q = 1, nmulti
+            b = ord(q)
+            best = -1
+            do p = ab0(b) + 1, ab0(b + 1)
+              r = L%own(abd(p))
+              if (best < 0) then
+                best = r
+              else if (load(r) < load(best) .or. (load(r) == load(best) .and. r < best)) then
+                best = r
+              endif
+            enddo
+            bown(b) = best
+            load(best) = load(best) + cost(b)
+          enddo
+          if (H%me == 0 .and. .not. H%as(g)%ready) write(*,'(A,I0,A,I0,A,I0,A,F7.2)') "[Physics PC]   "// &
+            trim(H%tag)//" level ", g, ": ", nmulti, " of ", nab, " blocks across ranks placed by load; "// &
+            "largest rank load / mean ", maxval(load) / max(sum(load) / H%np, tiny(1.d0))
+        end block
+      endif
+
       ! mine: rows (all slots) in w order, sorted inside each block
       nmine = 0
       do b = 1, nab
-        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) == H%me) nmine = nmine + 1
+        if (bown(b) == H%me) nmine = nmine + 1
       enddo
       nb = nmine
       allocate(off(0:nb), bw(0:max(nb - 1, 0)))
       off(0) = 0; k = 0
       do b = 1, nab
-        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) /= H%me) cycle
+        if (bown(b) /= H%me) cycle
         k = k + 1
         off(k) = off(k - 1) + (ab0(b + 1) - ab0(b)) * H%ns
         bw(k - 1) = aw(b)
@@ -1146,7 +1506,7 @@ contains
       allocate(gidx(max(off(nb), 1)))
       k = 0
       do b = 1, nab
-        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) /= H%me) cycle
+        if (bown(b) /= H%me) cycle
         p = off(k)
         do j = ab0(b) + 1, ab0(b + 1)
           do s = 0, H%ns - 1
@@ -1254,7 +1614,7 @@ contains
     type(asm_t), intent(inout) :: S
     integer, intent(in) :: g
     Mat, intent(in) :: Aop
-    external :: dgetrf
+    external :: dgetrf, dgbtrf
     PetscErrorCode :: ierr
     PetscInt :: ncols, nwp, one
     PetscInt, pointer :: cols(:)
@@ -1268,6 +1628,7 @@ contains
     Vec :: xg
     one = 1
 
+    call PetscLogEventBegin(sev_asmsetup, ierr)
     if (.not. S%ready) then
       call block_members(g, S%nb, S%off, S%gidx, S%bw)
       S%nw = S%off(S%nb)
@@ -1300,14 +1661,22 @@ contains
       call ISDestroy(isf, ierr)
       call VecDestroy(xg, ierr)
       call MatCreateSubMatrices(Aop, one, [S%isu], [S%isu], MAT_INITIAL_MATRIX, S%sub, ierr)
-      ! the factor storage: dense blocks in lu, the others sparse
-      allocate(S%dense(0:S%nb - 1), S%loff(0:S%nb - 1), S%piv(max(S%nw, 1)))
+      ! the factor storage: dense blocks in lu, with -vs_pmg_band the blocks
+      ! whose band (in their ascending row order) is narrow (2 kl + ku + 1 <=
+      ! n / 2) as LAPACK band LUs in lu, whatever dense_max, the others sparse
+      allocate(S%dense(0:S%nb - 1), S%band(0:S%nb - 1), S%kl(0:S%nb - 1), S%ku(0:S%nb - 1), &
+               S%loff(0:S%nb - 1), S%piv(max(S%nw, 1)))
+      S%band = .false.; S%kl = 0; S%ku = 0
+      if (H%o%band) call band_widths()
       tot = 0; nsp = 0
       do b = 0, S%nb - 1
-        S%dense(b) = S%sz(b) <= H%o%dense_max
+        if (H%o%band) S%band(b) = 2 * S%kl(b) + S%ku(b) + 1 <= S%sz(b) / 2
+        S%dense(b) = S%sz(b) <= H%o%dense_max .and. .not. S%band(b)
         S%loff(b) = tot
         if (S%dense(b)) then
           tot = tot + int(S%sz(b), 8)**2
+        else if (S%band(b)) then
+          tot = tot + int(2 * S%kl(b) + S%ku(b) + 1, 8) * S%sz(b)
         else
           nsp = nsp + 1
         endif
@@ -1339,8 +1708,29 @@ contains
         enddo
         call dgetrf(n, n, m, n, S%piv(S%off(b) + 1), info)
         if (info /= 0) call fatal("a singular smoother block")
+        call PetscLogFlops(2.d0 / 3.d0 * dble(n)**3, ierr)
         S%lu(S%loff(b) + 1 : S%loff(b) + int(n, 8)**2) = reshape(m, [n * n])
         deallocate(m)
+      else if (S%band(b)) then
+        ! LAPACK general band storage: A(i, j) in ab(kl + ku + 1 + i - j, j), kl rows of fill above
+        block
+          integer :: ldab, kl_, ku_
+          integer(8) :: o_
+          kl_ = S%kl(b); ku_ = S%ku(b); ldab = 2 * kl_ + ku_ + 1
+          o_ = S%loff(b)
+          S%lu(o_ + 1 : o_ + int(ldab, 8) * n) = 0.d0
+          do a = 1, n
+            call MatGetRow(S%sub(1), int(S%upos(S%off(b) + a), kind(one)), ncols, cols, vals, ierr)
+            do c = 1, int(ncols)
+              jj = bpos(int(cols(c)))
+              if (jj > 0) S%lu(o_ + int(jj - 1, 8) * ldab + kl_ + ku_ + 1 + a - jj) = vals(c)
+            enddo
+            call MatRestoreRow(S%sub(1), int(S%upos(S%off(b) + a), kind(one)), ncols, cols, vals, ierr)
+          enddo
+          call dgbtrf(n, n, kl_, ku_, S%lu(o_ + 1), ldab, S%piv(S%off(b) + 1), info)
+          if (info /= 0) call fatal("a singular smoother block (band)")
+          call PetscLogFlops(2.d0 * dble(n) * dble(kl_) * dble(kl_ + ku_ + 1), ierr)
+        end block
       else
         if (.not. S%ready) then
           allocate(isb(n))
@@ -1356,7 +1746,7 @@ contains
             PC :: pcb
             call KSPGetPC(S%kb(b), pcb, ierr)
             call PCSetType(pcb, PCLU, ierr)
-            call PCFactorSetMatOrderingType(pcb, MATORDERINGND, ierr)
+            call PCFactorSetMatOrderingType(pcb, trim(H%o%sp_order), ierr)
           end block
           call KSPSetOperators(S%kb(b), S%mb(b), S%mb(b), ierr)
           call MatCreateVecs(S%mb(b), S%vx(b), S%vb(b), ierr)
@@ -1371,38 +1761,89 @@ contains
     enddo
     deallocate(bpos)
     S%ready = .true.
+    call PetscLogEventEnd(sev_asmsetup, ierr)
+  contains
+    !> kl, ku of every block in its ascending row order, from the pattern of
+    !! sub (first build)
+    subroutine band_widths()
+      integer, allocatable :: bp(:)
+      integer :: bb, nn, aa, cc, j_
+      allocate(bp(0:S%nu - 1)); bp = -1
+      do bb = 0, S%nb - 1
+        nn = S%sz(bb)
+        do aa = 1, nn
+          bp(S%upos(S%off(bb) + aa)) = aa
+        enddo
+        do aa = 1, nn
+          call MatGetRow(S%sub(1), int(S%upos(S%off(bb) + aa), kind(one)), ncols, cols, vals, ierr)
+          do cc = 1, int(ncols)
+            j_ = bp(int(cols(cc)))
+            if (j_ <= 0) cycle
+            S%kl(bb) = max(S%kl(bb), aa - j_)
+            S%ku(bb) = max(S%ku(bb), j_ - aa)
+          enddo
+          call MatRestoreRow(S%sub(1), int(S%upos(S%off(bb) + aa), kind(one)), ncols, cols, vals, ierr)
+        enddo
+        do aa = 1, nn
+          bp(S%upos(S%off(bb) + aa)) = -1
+        enddo
+      enddo
+    end subroutine band_widths
   end subroutine asm_build
 
-  !> y = sum_b R_b' A_bb^-1 R_b x.
+  !> y = sum_b R_b' A_bb^-1 R_b x. The LAPACK blocks (dense, band) solve on
+  !! the rank's OpenMP threads, each in its own part of w (the same arithmetic
+  !! per block as serially); the sparse ones (a PETSc KSP each) one after the
+  !! other.
   subroutine asm_apply(S, x, y)
     type(asm_t), intent(inout) :: S
     Vec :: x, y
-    external :: dgetrs
+    external :: dgetrs, dgbtrs
     PetscErrorCode :: ierr
     PetscScalar, pointer :: wa(:), va(:)
     integer :: b, n, info
+    real*8 :: fl
+    call PetscLogEventBegin(sev_asmapply, ierr)
     call VecScatterBegin(S%sct, x, S%w, INSERT_VALUES, SCATTER_FORWARD, ierr)
     call VecScatterEnd(S%sct, x, S%w, INSERT_VALUES, SCATTER_FORWARD, ierr)
+    call PetscLogEventBegin(sev_asmblk, ierr)
     call VecGetArray(S%w, wa, ierr)
+    fl = 0.d0
+    !$omp parallel do schedule(dynamic, 1) private(n, info) reduction(+:fl) if (S%nb > 1)
     do b = 0, S%nb - 1
       n = S%sz(b)
       if (S%dense(b)) then
         call dgetrs("N", n, 1, S%lu(S%loff(b) + 1), n, S%piv(S%off(b) + 1), wa(S%off(b) + 1), n, info)
+        fl = fl + 2.d0 * dble(n)**2
+      else if (S%band(b)) then
+        call dgbtrs("N", n, S%kl(b), S%ku(b), 1, S%lu(S%loff(b) + 1), 2 * S%kl(b) + S%ku(b) + 1, &
+                    S%piv(S%off(b) + 1), wa(S%off(b) + 1), n, info)
+        fl = fl + 2.d0 * dble(n) * dble(2 * S%kl(b) + S%ku(b) + 1)
       else
-        call VecGetArray(S%vb(b), va, ierr)
-        va(1:n) = wa(S%off(b) + 1 : S%off(b) + n)
-        call VecRestoreArray(S%vb(b), va, ierr)
-        call KSPSolve(S%kb(b), S%vb(b), S%vx(b), ierr)
-        call VecGetArray(S%vx(b), va, ierr)
-        wa(S%off(b) + 1 : S%off(b) + n) = va(1:n)
-        call VecRestoreArray(S%vx(b), va, ierr)
+        cycle
       endif
       if (S%bw(b) /= 1.d0) wa(S%off(b) + 1 : S%off(b) + n) = S%bw(b) * wa(S%off(b) + 1 : S%off(b) + n)
     enddo
+    !$omp end parallel do
+    do b = 0, S%nb - 1
+      if (S%dense(b) .or. S%band(b)) cycle
+      n = S%sz(b)
+      call VecGetArray(S%vb(b), va, ierr)
+      va(1:n) = wa(S%off(b) + 1 : S%off(b) + n)
+      call VecRestoreArray(S%vb(b), va, ierr)
+      call KSPSolve(S%kb(b), S%vb(b), S%vx(b), ierr)
+      call VecGetArray(S%vx(b), va, ierr)
+      wa(S%off(b) + 1 : S%off(b) + n) = va(1:n)
+      call VecRestoreArray(S%vx(b), va, ierr)
+      if (S%bw(b) /= 1.d0) wa(S%off(b) + 1 : S%off(b) + n) = S%bw(b) * wa(S%off(b) + 1 : S%off(b) + n)
+    enddo
     call VecRestoreArray(S%w, wa, ierr)
+    call PetscLogFlops(fl, ierr)
+    call PetscLogEventEnd(sev_asmblk, ierr)
     call VecSet(y, 0.d0, ierr)
     call VecScatterBegin(S%sct, S%w, y, ADD_VALUES, SCATTER_REVERSE, ierr)
     call VecScatterEnd(S%sct, S%w, y, ADD_VALUES, SCATTER_REVERSE, ierr)
+    call PetscLogEventEnd(sev_asmapply, ierr)
   end subroutine asm_apply
 
   !> One report after the first setup: the levels' rows and entries, the
@@ -1417,7 +1858,7 @@ contains
     MatInfo :: info
     PetscInt :: L
     PetscErrorCode :: ierr
-    integer :: g, nbk(2), nbk_g(2), nsp_g
+    integer :: g, nbk(2), nbk_g(2), nsp_g, nbd(2)
     real*8 :: nz(0:MAXL-1), c_op
     character(len=9), parameter :: bn(4) = ["node     ", "line     ", "point    ", "linewedge"]
     character(len=40) :: tg
@@ -1443,6 +1884,12 @@ contains
     call MPI_Allreduce(nbk(1), nbk_g(1), 1, MPI_INTEGER, MPI_SUM, H%comm, ierr)
     call MPI_Allreduce(nbk(2), nbk_g(2), 1, MPI_INTEGER, MPI_MAX, H%comm, ierr)
     call MPI_Allreduce(H%as(0)%nsparse, nsp_g, 1, MPI_INTEGER, MPI_SUM, H%comm, ierr)
+    nbd = [count(H%as(0)%band), maxval(H%as(0)%kl, mask=H%as(0)%band, dim=1)]
+    nbd(2) = max(nbd(2), 0)
+    call MPI_Allreduce(MPI_IN_PLACE, nbd(1), 1, MPI_INTEGER, MPI_SUM, H%comm, ierr)
+    call MPI_Allreduce(MPI_IN_PLACE, nbd(2), 1, MPI_INTEGER, MPI_MAX, H%comm, ierr)
+    if (H%me == 0 .and. nbd(1) > 0) write(*,'(A,I0,A,I0)') trim(tg)//" level 0: ", nbd(1), &
+      " block(s) on LAPACK band LU (-"//trim(H%prefix)//"band), largest kl ", nbd(2)
     if (H%me /= 0) return                                 ! the first rank of the operator's communicator
     write(*,'(A,A,A)', advance="no") trim(tg)//" (", trim(label), ") levels rows (nnz/row):"
     do g = 0, H%nlev - 1
