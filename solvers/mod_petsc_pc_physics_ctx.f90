@@ -70,6 +70,10 @@ module mod_petsc_pc_physics_ctx
   PetscLogEvent, save :: pcev_solve_vort = -1  !< vorticity-system solves
   PetscLogEvent, save :: pcev_solve_lap  = -1  !< Laplacian solves
   PetscLogEvent, save :: pcev_solve_mass = -1  !< mass solves of j and omega
+  PetscLogEvent, save :: pcev_asm_pl     = -1  !< vs_lumped: P_lumped's assembly (X, the products)
+  PetscLogEvent, save :: pcev_asm_pv     = -1  !< vs_lumped with v_par: P_V's assembly
+  PetscLogEvent, save :: pcev_fact_pv    = -1  !< P_V's solver setup
+  PetscLogEvent, save :: pcev_solve_pv   = -1  !< P_V's solves
 
   logical, save, private :: pcev_registered = .false.
 
@@ -145,6 +149,10 @@ contains
     call PetscLogEventRegister("PhysPC_SolveVort", 0, pcev_solve_vort, ierr)
     call PetscLogEventRegister("PhysPC_SolveLap",  0, pcev_solve_lap,  ierr)
     call PetscLogEventRegister("PhysPC_SolveMass", 0, pcev_solve_mass, ierr)
+    call PetscLogEventRegister("PhysPC_AsmPl",     0, pcev_asm_pl,     ierr)
+    call PetscLogEventRegister("PhysPC_AsmPV",     0, pcev_asm_pv,     ierr)
+    call PetscLogEventRegister("PhysPC_FactPV",    0, pcev_fact_pv,    ierr)
+    call PetscLogEventRegister("PhysPC_SolvePV",   0, pcev_solve_pv,   ierr)
 
     pcev_registered = .true.
   end subroutine physics_pc_log_events_register

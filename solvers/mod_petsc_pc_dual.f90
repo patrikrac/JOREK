@@ -8,7 +8,9 @@
 !!   Y = M(J, J)^-1 E_own,   Z(own, J) = Y',   Z(own, not J) = 0,
 !! E_own the columns of the identity on J at own. Then (Z M)(i, j) = delta_ij
 !! for i in own and j in J. The mass matrix does not couple the toroidal
-!! slots: the patch solves run per slot.
+!! slots: the patch solves run per slot. For a non-symmetric M, Y' holds the
+!! rows of M(J, J)^-T: Z is the local dual basis of M', and a caller that
+!! wants M's passes M' (vs_lumped's P_V^A).
 !!
 !! M is a one-field operator of mod_petsc_pc_sf_ops: global row i ns + q for
 !! JOREK index i (0-based) and the operator's slot q, ns slots per index, in

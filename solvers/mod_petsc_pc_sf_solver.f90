@@ -4,7 +4,8 @@
 !! PREONLY + MUMPS LU as the exact reference. The GMG configuration is fixed
 !! here, per block, rather than in the namelist. A third backend, SF_SPDMG,
 !! is the ring-free multigrid of mod_petsc_pc_spdmg for a scalar symmetric
-!! positive definite block (vs_lumped's P, -vs_p_solver spdmg).
+!! positive definite block (vs_lumped's P, -vs_p_solver spdmg, and its P_V,
+!! -vs_pv_solver spdmg).
 module mod_petsc_pc_sf_solver
 #ifdef USE_PETSC
   use mpi_mod
@@ -20,7 +21,8 @@ module mod_petsc_pc_sf_solver
   integer, parameter, public :: SF_LU  = 1
   integer, parameter, public :: SF_GMG = 2
   !> The ring-free multigrid for a scalar SPD block (mod_petsc_pc_spdmg):
-  !! vs_lumped's P with -vs_p_solver spdmg; not a namelist backend.
+  !! vs_lumped's P with -vs_p_solver spdmg, P_V with -vs_pv_solver spdmg;
+  !! not a namelist backend.
   integer, parameter, public :: SF_SPDMG = 3
 
   !> Radial-line blocks: rho, v_par v0.
@@ -120,24 +122,31 @@ contains
   !! sf_gmg<gmg_inst>_. one_cycle (GMG backend, default .false.): PREONLY
   !! around the V-cycle, one cycle per solve, instead of FGMRES to rtol; set
   !! before the options, so -sf_gmg<gmg_inst>_ksp_type still overrides it.
+  !! amat (default A): the operator of the solve when A only builds its
+  !! preconditioner: the Krylov method runs on amat with the V-cycle of A
+  !! (GMG, SPD-MG), LU factors amat itself.
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, nfields, &
-                             smoother, maxits, pre0, post0, nsmooth_c, axis_rings, one_cycle)
+                             smoother, maxits, pre0, post0, nsmooth_c, axis_rings, one_cycle, &
+                             spdmg_inst, amat)
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
-                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
-    use mod_petsc_pc_spdmg, only: spdmg_ksp_setup
+                                gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_pc_apply_6, &
+                                gmg_opts_t
+    use mod_petsc_pc_spdmg, only: spdmg_ksp_setup, SPDMG_P
     use mod_petsc_pc_harm, only: pc_ntor
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
     integer, intent(in)          :: backend, comm, my_id
     character(len=*), intent(in) :: label
     real*8, intent(in)           :: rtol
-    integer, intent(in)          :: gmg_inst   !< hierarchy instance (1..5)
+    integer, intent(in)          :: gmg_inst   !< hierarchy instance (1..6)
     integer, intent(in)          :: nfields    !< fields packed per node in A
     integer, intent(in)          :: smoother   !< SF_GMG_SMOOTHER_*
     integer, intent(in)          :: maxits     !< FGMRES iteration cap
     integer, intent(in), optional :: pre0, post0, nsmooth_c, axis_rings
     logical, intent(in), optional :: one_cycle
+    integer, intent(in), optional :: spdmg_inst !< SF_SPDMG's instance (default SPDMG_P)
+    Mat, intent(in), optional    :: amat
     PC :: pc
     PetscErrorCode :: ierr
     logical :: ok, fresh, one
@@ -145,18 +154,25 @@ contains
     character(len=16) :: prefix
     KSPType :: ktyp
     type(gmg_opts_t) :: o
+    integer :: kinst
 
     fresh       = .not. slv%created
     slv%backend = backend
     slv%label   = label
     one         = .false.
     if (present(one_cycle)) one = one_cycle
+    kinst       = SPDMG_P
+    if (present(spdmg_inst)) kinst = spdmg_inst
 
     select case (backend)
 
     case (SF_LU)
       if (fresh) call KSPCreate(comm, slv%ksp, ierr)
-      call KSPSetOperators(slv%ksp, A, A, ierr)
+      if (present(amat)) then
+        call KSPSetOperators(slv%ksp, amat, amat, ierr)
+      else
+        call KSPSetOperators(slv%ksp, A, A, ierr)
+      endif
       call KSPSetType(slv%ksp, KSPPREONLY, ierr)
       call KSPGetPC(slv%ksp, pc, ierr)
       call PCSetType(pc, PCLU, ierr)
@@ -209,10 +225,15 @@ contains
         case (3); call PCShellSetApply(pc, gmg_pc_apply_3, ierr)
         case (4); call PCShellSetApply(pc, gmg_pc_apply_4, ierr)
         case (5); call PCShellSetApply(pc, gmg_pc_apply_5, ierr)
+        case (6); call PCShellSetApply(pc, gmg_pc_apply_6, ierr)
         end select
         call PCShellSetName(pc, trim(label)//" GMG V-cycle", ierr)
       endif
-      call KSPSetOperators(slv%ksp, A, A, ierr)
+      if (present(amat)) then
+        call KSPSetOperators(slv%ksp, amat, A, ierr)
+      else
+        call KSPSetOperators(slv%ksp, A, A, ierr)
+      endif
       call KSPSetUp(slv%ksp, ierr)
       write(tstr,'(ES9.2)') rtol
       if (.not. one) then
@@ -235,7 +256,7 @@ contains
         call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
       endif
       if (fresh) call KSPCreate(comm, slv%ksp, ierr)
-      call spdmg_ksp_setup(slv%ksp, A, int(pc_ntor), comm, my_id, rtol, maxits, label, fresh)
+      call spdmg_ksp_setup(slv%ksp, A, int(pc_ntor), comm, my_id, rtol, maxits, label, fresh, kinst, amat)
       if (fresh) then
         call KSPGetType(slv%ksp, ktyp, ierr)
         write(tstr,'(ES9.2)') rtol

@@ -1,8 +1,9 @@
 !> A ring-free multigrid for a scalar symmetric positive definite operator on
 !! JOREK's polar flux-surface grid: the P solver of vs_lumped
-!! (mod_petsc_pc_vs, -vs_p_solver spdmg), from the study
-!! studies/spd_multigrid (Python: spdmg/hierarchy.py prolongation_kinds and
-!! level_shapes mode "theta", spdmg/multigrid.py). PETSc's PCMG with
+!! (mod_petsc_pc_vs, -vs_p_solver spdmg) and its P_V solver for v_par
+!! (-vs_pv_solver spdmg), from the study studies/spd_multigrid (Python:
+!! spdmg/hierarchy.py prolongation_kinds and level_shapes mode "theta",
+!! spdmg/multigrid.py). PETSc's PCMG with
 !!
 !!  - levels that halve the nodes along the flux surface only (J, the ring
 !!    position), no radial coarsening: n_tht -> n_tht/2 -> ... while the count
@@ -70,7 +71,17 @@
 !!  - the outer Krylov method of the P solve: FGMRES (restart and iteration cap
 !!    of the caller, rtol physics_pc_sf_rtol); CG with -vs_pmg_ksp_type cg.
 !!
-!! PETSc options (defaults = the study's cycle):
+!! Instances: one hierarchy per operator, each with its own options under its
+!! own prefix and its own defaults:
+!!   SPDMG_P   P_lumped, prefix vs_pmg_   (the defaults below)
+!!   SPDMG_PV  P_V,      prefix vs_pvmg_  (blocks linewedge, axis_rings 3,
+!!                                         line_from 2: the study's R2a, the
+!!                                         cycle of the v_par study)
+!! The routines work on the active instance H, which spdmg_ksp_setup and the
+!! smoothers' shell PCs (by their handle) select.
+!!
+!! PETSc options (shown for vs_pmg_, likewise for vs_pvmg_; defaults = the
+!! study's cycle):
 !!   -vs_pmg_blocks node | line | linewedge | point   block layout        (node)
 !!   -vs_pmg_axis_rings <k>                axis block = rings 0..k        (2)
 !!   -vs_pmg_line_from <i>                 first ring of a radial line    (k + 1)
@@ -107,11 +118,11 @@
 !! KSPs (-vs_pmg_mg_levels_pc_type, or a shell like as_apply).
 !!
 !! Limits: polar grids of n_flux x n_tht nodes only (the gates of
-!! mod_petsc_pc_gmg); one hierarchy (one operator) per run; the operator's
-!! pattern must stay that of the first build (refills only). The Chebyshev
-!! interval is estimated on the whole operator: with several toroidal families
-!! the interval is the union's, not each family's (on m1, n = 0 then gets
-!! kappa 1.5 to 1.6 where its own interval gives 1.3).
+!! mod_petsc_pc_gmg); one hierarchy (one operator) per instance and run; the
+!! operator's pattern must stay that of the first build (refills only). The
+!! Chebyshev interval is estimated on the whole operator: with several toroidal
+!! families the interval is the union's, not each family's (on m1, n = 0 then
+!! gets kappa 1.5 to 1.6 where its own interval gives 1.3).
 module mod_petsc_pc_spdmg
 #ifdef USE_PETSC
   use mpi_mod
@@ -121,6 +132,10 @@ module mod_petsc_pc_spdmg
   private
 
   public :: spdmg_ksp_setup
+
+  !> the instances: P_lumped's and P_V's hierarchies
+  integer, parameter, public :: SPDMG_P = 1, SPDMG_PV = 2
+  integer, parameter :: NINST = 2
 
   integer, parameter :: MAXL = 12
   integer, parameter :: BL_NODE = 1, BL_LINE = 2, BL_POINT = 3, BL_LINEWEDGE = 4
@@ -198,45 +213,59 @@ module mod_petsc_pc_spdmg
     integer :: nsparse = 0
   end type asm_t
 
-  type(spdmg_opts_t), save :: o
-  logical, save :: built = .false.
-  integer, save :: nlev = 0, comm_h = MPI_COMM_NULL, me = 0, np_h = 1, ns_h = 1
-  type(lev_t), save :: lv(0:MAXL-1)
-  Mat, save :: P(1:MAXL-1)                          !< P(g): level g -> level g-1
-  Mat, save :: Ag(1:MAXL-1)                         !< the Galerkin operators P(g)' A(g-1) P(g)
-  type(rh_t), save :: rh(1:MAXL-1)
-  type(asm_t), save :: as(0:MAXL-1)
-  PC, save :: as_pc(0:MAXL-1)                       !< the shell PC of level g's smoother
-  real*8, allocatable, save :: hist(:)              !< the test's residual history
-  real*8, allocatable, save :: ring_asp(:)          !< (0:n_flux-1) the finest level's ring cell aspect (wedge_last)
-  logical, allocatable, save :: rh_slot(:)          !< (0:ns-1) the slot's F rows are ring-harmonic
+  !> One hierarchy (an instance) with its configuration and state.
+  type :: spdmg_inst_t
+    type(spdmg_opts_t) :: o
+    character(len=16) :: prefix = ""                !< the PETSc option prefix (vs_pmg_, vs_pvmg_)
+    character(len=16) :: tag = ""                   !< the log label (SPD-MG, SPD-MG P_V)
+    logical :: built = .false.
+    integer :: nlev = 0, comm = MPI_COMM_NULL, me = 0, np = 1, ns = 1
+    type(lev_t) :: lv(0:MAXL-1)
+    Mat :: P(1:MAXL-1)                              !< P(g): level g -> level g-1
+    Mat :: Ag(1:MAXL-1)                             !< the Galerkin operators P(g)' A(g-1) P(g)
+    type(rh_t) :: rh(1:MAXL-1)
+    type(asm_t) :: as(0:MAXL-1)
+    PC :: as_pc(0:MAXL-1)                           !< the shell PC of level g's smoother
+    real*8, allocatable :: hist(:)                  !< the test's residual history
+    real*8, allocatable :: ring_asp(:)              !< (0:n_flux-1) the finest level's ring cell aspect (wedge_last)
+    logical, allocatable :: rh_slot(:)              !< (0:ns-1) the slot's F rows are ring-harmonic
+  end type spdmg_inst_t
+
+  type(spdmg_inst_t), target, save :: inst(NINST)
+  type(spdmg_inst_t), pointer, save :: H => null()  !< the active instance
 
 contains
 
-  !> Configure ksp as the P solver of operator A (one field, ns slots per
-  !! JOREK index, rows index * ns + slot; mod_petsc_pc_sf_ops). fresh: ksp
-  !! was just created (the hierarchy is built on the first call of the run);
-  !! later calls take the refilled A (same pattern). Collective on comm.
-  subroutine spdmg_ksp_setup(ksp, A, ns, comm, my_id, rtol, maxits, label, fresh)
+  !> Configure ksp as the solver of operator A (one field, ns slots per JOREK
+  !! index, rows index * ns + slot; mod_petsc_pc_sf_ops) with instance k's
+  !! hierarchy. fresh: ksp was just created (the hierarchy is built on the
+  !! instance's first call of the run); later calls take the refilled A (same
+  !! pattern). amat: the Krylov method's operator, if not A (the cycle stays
+  !! A's). Collective on comm.
+  subroutine spdmg_ksp_setup(ksp, A, ns, comm, my_id, rtol, maxits, label, fresh, k, amat)
     KSP, intent(inout)           :: ksp
     Mat, intent(in)              :: A
     integer, intent(in)          :: ns, comm, my_id, maxits
     real*8, intent(in)           :: rtol
     character(len=*), intent(in) :: label
     logical, intent(in)          :: fresh
+    integer, intent(in)          :: k              !< SPDMG_P | SPDMG_PV
+    Mat, intent(in), optional    :: amat
     PC :: pc
     PetscErrorCode :: ierr
     logical :: first_chain
 
-    first_chain = .not. built
-    if (.not. built) then
-      comm_h = comm; ns_h = ns
-      call MPI_Comm_rank(comm, me, ierr)
-      call MPI_Comm_size(comm, np_h, ierr)
+    H => inst(k)
+    first_chain = .not. H%built
+    if (.not. H%built) then
+      H%comm = comm; H%ns = ns
+      call MPI_Comm_rank(comm, H%me, ierr)
+      call MPI_Comm_size(comm, H%np, ierr)
+      call instance_defaults(k)
       call read_options()
       call build_levels(A, my_id)
       call create_prolongations()
-      built = .true.
+      H%built = .true.
     endif
     ! the levels' transfers (ring-harmonic: from the operators) and Galerkin operators
     call galerkin_chain(A, first_chain)
@@ -244,31 +273,53 @@ contains
       call KSPSetType(ksp, KSPFGMRES, ierr)
       call KSPGMRESSetRestart(ksp, maxits, ierr)
       call KSPSetTolerances(ksp, rtol, 1.d-50, 1.d6, maxits, ierr)
-      call KSPSetOptionsPrefix(ksp, "vs_pmg_", ierr)
+      call KSPSetOptionsPrefix(ksp, trim(H%prefix), ierr)
       call KSPGetPC(ksp, pc, ierr)
       call configure_pcmg(pc, A)
-      call KSPSetOperators(ksp, A, A, ierr)
+      call set_operators()
       call KSPSetFromOptions(ksp, ierr)
     else
-      call KSPSetOperators(ksp, A, A, ierr)
+      call set_operators()
     endif
     call KSPSetUp(ksp, ierr)
     if (fresh) then
       call report(ksp, tagged(), my_id)
-      if (len_trim(o%view_p) > 0) call view_transfers()
-      if (o%test) call run_test(ksp, A, tagged(), my_id)
+      if (len_trim(H%o%view_p) > 0) call view_transfers()
+      if (H%o%test) call run_test(ksp, A, tagged(), my_id)
     endif
   contains
+    subroutine set_operators()
+      if (present(amat)) then
+        call KSPSetOperators(ksp, amat, A, ierr)
+      else
+        call KSPSetOperators(ksp, A, A, ierr)
+      endif
+    end subroutine set_operators
     !> the label with the operator's global slots where it holds a part of them (mode split)
     function tagged() result(s)
       use mod_parameters,    only: n_tor
       use mod_petsc_pc_harm, only: pc_global_slot
       character(len=64) :: s
       s = label
-      if (ns_h /= n_tor) write(s, '(A,A,I0,A,I0)') trim(label), ", slots ", pc_global_slot(0), "-", &
-                                                    pc_global_slot(ns_h - 1)
+      if (H%ns /= n_tor) write(s, '(A,A,I0,A,I0)') trim(label), ", slots ", pc_global_slot(0), "-", &
+                                                    pc_global_slot(H%ns - 1)
     end function tagged
   end subroutine spdmg_ksp_setup
+
+  !> Instance k's option prefix, log label and the defaults that differ from
+  !! spdmg_opts_t's (module header).
+  subroutine instance_defaults(k)
+    integer, intent(in) :: k
+    select case (k)
+    case (SPDMG_P)
+      H%prefix = "vs_pmg_";  H%tag = "SPD-MG"
+    case (SPDMG_PV)
+      H%prefix = "vs_pvmg_"; H%tag = "SPD-MG P_V"
+      H%o%blocks = BL_LINEWEDGE; H%o%axis_rings = 3; H%o%line_from = 2
+    case default
+      call fatal("an unknown instance")
+    end select
+  end subroutine instance_defaults
 
   !> P(g) in PETSc's binary format to <view_p>_P<g>.petsc (rows of level
   !! g-1, columns of level g, the row numbering of lv). Collective.
@@ -277,79 +328,97 @@ contains
     PetscErrorCode :: ierr
     integer :: g
     character(len=300) :: fn
-    do g = 1, nlev - 1
-      write(fn, '(A,A,I0,A)') trim(o%view_p), "_P", g, ".petsc"
-      call PetscViewerBinaryOpen(comm_h, trim(fn), FILE_MODE_WRITE, vw, ierr)
-      call MatView(P(g), vw, ierr)
+    do g = 1, H%nlev - 1
+      write(fn, '(A,A,I0,A)') trim(H%o%view_p), "_P", g, ".petsc"
+      call PetscViewerBinaryOpen(H%comm, trim(fn), FILE_MODE_WRITE, vw, ierr)
+      call MatView(H%P(g), vw, ierr)
       call PetscViewerDestroy(vw, ierr)
     enddo
-    if (me == 0) write(*,'(A)') "[Physics PC]   SPD-MG transfers written to "//trim(o%view_p)//"_P<g>.petsc"
+    if (H%me == 0) write(*,'(A)') "[Physics PC]   "//trim(H%tag)//" transfers written to "//trim(H%o%view_p)// &
+                                  "_P<g>.petsc"
   end subroutine view_transfers
 
-  !> The options of the module header.
+  !> The options of the module header, under the instance's prefix.
   subroutine read_options()
     PetscErrorCode :: ierr
     PetscBool :: is_set, flag
     PetscInt :: iv
     PetscReal :: rv
     character(len=16) :: s
-    s = "node"
-    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_blocks", s, is_set, ierr)
+    character(len=24) :: pf
+    pf = "-"//trim(H%prefix)
+    s = blocks_name(H%o%blocks)
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"blocks", s, is_set, ierr)
     select case (trim(s))
-    case ("node");      o%blocks = BL_NODE
-    case ("line");      o%blocks = BL_LINE
-    case ("point");     o%blocks = BL_POINT
-    case ("linewedge"); o%blocks = BL_LINEWEDGE
-    case default;   call fatal("-vs_pmg_blocks must be node | line | point | linewedge, got '"//trim(s)//"'")
+    case ("node");      H%o%blocks = BL_NODE
+    case ("line");      H%o%blocks = BL_LINE
+    case ("point");     H%o%blocks = BL_POINT
+    case ("linewedge"); H%o%blocks = BL_LINEWEDGE
+    case default;   call fatal(trim(pf)//"blocks must be node | line | point | linewedge, got '"//trim(s)//"'")
     end select
-    call get_int("-vs_pmg_line_from", o%line_from)
-    call get_int("-vs_pmg_wedge_lines", o%wedge_lines)
-    call get_int("-vs_pmg_wedge_stride", o%wedge_stride)
-    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_wedge_aspect", rv, is_set, ierr)
-    if (is_set) o%wedge_aspect = rv
-    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_wedge_weight", rv, is_set, ierr)
-    if (is_set) o%wedge_weight = rv
-    if (o%wedge_lines < 1 .or. o%wedge_stride < 1) call fatal("-vs_pmg_wedge_lines, -vs_pmg_wedge_stride must be >= 1")
+    call get_int("line_from", H%o%line_from)
+    call get_int("wedge_lines", H%o%wedge_lines)
+    call get_int("wedge_stride", H%o%wedge_stride)
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"wedge_aspect", rv, is_set, ierr)
+    if (is_set) H%o%wedge_aspect = rv
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"wedge_weight", rv, is_set, ierr)
+    if (is_set) H%o%wedge_weight = rv
+    if (H%o%wedge_lines < 1 .or. H%o%wedge_stride < 1) &
+      call fatal(trim(pf)//"wedge_lines, "//trim(pf)//"wedge_stride must be >= 1")
     s = "mixed"
-    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_transfer", s, is_set, ierr)
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"transfer", s, is_set, ierr)
     select case (trim(s))
-    case ("linear");   o%transfer = TR_LINEAR
-    case ("const");    o%transfer = TR_CONST
-    case ("ringharm"); o%transfer = TR_RINGHARM
-    case ("mixed");    o%transfer = TR_MIXED
-    case default;      call fatal("-vs_pmg_transfer must be mixed | ringharm | linear | const, got '"//trim(s)//"'")
+    case ("linear");   H%o%transfer = TR_LINEAR
+    case ("const");    H%o%transfer = TR_CONST
+    case ("ringharm"); H%o%transfer = TR_RINGHARM
+    case ("mixed");    H%o%transfer = TR_MIXED
+    case default;      call fatal(trim(pf)//"transfer must be mixed | ringharm | linear | const, got '"//trim(s)//"'")
     end select
-    call get_int("-vs_pmg_rh_sweeps", o%rh_sweeps)
-    call get_int("-vs_pmg_rh_reach", o%rh_reach)
-    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_rh_omega", rv, is_set, ierr)
-    if (is_set) o%rh_omega = rv
-    if (o%rh_sweeps < 1 .or. o%rh_reach < 1) call fatal("-vs_pmg_rh_sweeps and -vs_pmg_rh_reach must be >= 1")
-    call get_int("-vs_pmg_axis_rings", o%axis_rings)
-    call get_int("-vs_pmg_degree", o%degree)
-    call get_int("-vs_pmg_esteig_its", o%esteig_its)
-    call get_int("-vs_pmg_levels", o%max_levels)
-    call get_int("-vs_pmg_min_nj", o%min_nj)
-    call get_int("-vs_pmg_dense_max", o%dense_max)
-    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_cheb_ratio", rv, is_set, ierr)
-    if (is_set) o%ratio = rv
-    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_cheb_safety", rv, is_set, ierr)
-    if (is_set) o%safety = rv
-    call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_test", flag, is_set, ierr)
-    if (is_set) o%test = flag
-    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pmg_view_p", o%view_p, is_set, ierr)
-    if (.not. is_set) o%view_p = ""
-    o%max_levels = min(max(o%max_levels, 1), MAXL)
-    if (o%axis_rings < 0) call fatal("-vs_pmg_axis_rings must be >= 0")
-    if (o%degree < 1 .or. o%esteig_its < 1 .or. o%ratio <= 1.d0 .or. o%safety <= 0.d0) &
-      call fatal("-vs_pmg_degree, -vs_pmg_esteig_its >= 1, -vs_pmg_cheb_ratio > 1, -vs_pmg_cheb_safety > 0")
+    call get_int("rh_sweeps", H%o%rh_sweeps)
+    call get_int("rh_reach", H%o%rh_reach)
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"rh_omega", rv, is_set, ierr)
+    if (is_set) H%o%rh_omega = rv
+    if (H%o%rh_sweeps < 1 .or. H%o%rh_reach < 1) &
+      call fatal(trim(pf)//"rh_sweeps and "//trim(pf)//"rh_reach must be >= 1")
+    call get_int("axis_rings", H%o%axis_rings)
+    call get_int("degree", H%o%degree)
+    call get_int("esteig_its", H%o%esteig_its)
+    call get_int("levels", H%o%max_levels)
+    call get_int("min_nj", H%o%min_nj)
+    call get_int("dense_max", H%o%dense_max)
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"cheb_ratio", rv, is_set, ierr)
+    if (is_set) H%o%ratio = rv
+    call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"cheb_safety", rv, is_set, ierr)
+    if (is_set) H%o%safety = rv
+    call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"test", flag, is_set, ierr)
+    if (is_set) H%o%test = flag
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"view_p", H%o%view_p, is_set, ierr)
+    if (.not. is_set) H%o%view_p = ""
+    H%o%max_levels = min(max(H%o%max_levels, 1), MAXL)
+    if (H%o%axis_rings < 0) call fatal(trim(pf)//"axis_rings must be >= 0")
+    if (H%o%degree < 1 .or. H%o%esteig_its < 1 .or. H%o%ratio <= 1.d0 .or. H%o%safety <= 0.d0) &
+      call fatal(trim(pf)//"degree, "//trim(pf)//"esteig_its >= 1, "//trim(pf)//"cheb_ratio > 1, "// &
+                 trim(pf)//"cheb_safety > 0")
   contains
     subroutine get_int(nm, v)
       character(len=*), intent(in) :: nm
       integer, intent(inout) :: v
-      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, nm, iv, is_set, ierr)
+      call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//nm, iv, is_set, ierr)
       if (is_set) v = int(iv)
     end subroutine get_int
   end subroutine read_options
+
+  !> The name of a block layout (-vs_pmg_blocks).
+  function blocks_name(b) result(s)
+    integer, intent(in) :: b
+    character(len=16) :: s
+    select case (b)
+    case (BL_LINE);      s = "line"
+    case (BL_POINT);     s = "point"
+    case (BL_LINEWEDGE); s = "linewedge"
+    case default;        s = "node"
+    end select
+  end function blocks_name
 
   !> The levels' DOFs, owners and rows (lv), from the polar grid and A's row
   !! layout and Dirichlet rows.
@@ -416,8 +485,8 @@ contains
 
     ! the ring cell aspects r dtheta / dr for the wedges (smoothers/smlib.py ring_aspect):
     ! ring i = 1 .. n_flux - 2, the median (numpy's) over the cells between rings i and i + 1
-    allocate(ring_asp(0:n_flux - 1))
-    ring_asp = 0.d0
+    allocate(H%ring_asp(0:n_flux - 1))
+    H%ring_asp = 0.d0
     block
       real*8 :: cell(n_tht), xa(2), xb(2), xc(2)
       integer :: jj
@@ -430,38 +499,38 @@ contains
         enddo
         call sort_real(cell)
         if (mod(n_tht, 2) == 1) then
-          ring_asp(i) = cell((n_tht + 1) / 2)
+          H%ring_asp(i) = cell((n_tht + 1) / 2)
         else
-          ring_asp(i) = 0.5d0 * (cell(n_tht / 2) + cell(n_tht / 2 + 1))
+          H%ring_asp(i) = 0.5d0 * (cell(n_tht / 2) + cell(n_tht / 2 + 1))
         endif
       enddo
-      ring_asp(n_flux - 1) = ring_asp(n_flux - 2)
+      H%ring_asp(n_flux - 1) = H%ring_asp(n_flux - 2)
     end block
 
     ! level 0: the operator's index space and its row layout
     call MatGetOwnershipRange(A, rs, re, ierr)
     call MatGetSize(A, ng, PETSC_NULL_INTEGER, ierr)
-    if (mod(int(rs), ns_h) /= 0 .or. mod(int(re), ns_h) /= 0 .or. mod(int(ng), ns_h) /= 0) &
+    if (mod(int(rs), H%ns) /= 0 .or. mod(int(re), H%ns) /= 0 .or. mod(int(ng), H%ns) /= 0) &
       call fatal("the operator's rows are not whole (index, slots) groups")
-    n_idx = int(ng) / ns_h
-    allocate(i0s(0:np_h))
-    call MPI_Allgather(int(rs) / ns_h, 1, MPI_INTEGER, i0s, 1, MPI_INTEGER, comm_h, mpierr)
-    i0s(np_h) = n_idx
+    n_idx = int(ng) / H%ns
+    allocate(i0s(0:H%np))
+    call MPI_Allgather(int(rs) / H%ns, 1, MPI_INTEGER, i0s, 1, MPI_INTEGER, H%comm, mpierr)
+    i0s(H%np) = n_idx
     ! the free indices: a row that is not a Dirichlet row on some slot
     call penalty_row_mask(A, mask)
     allocate(fl(0:n_idx - 1)); fl = 0
     call VecGetArray(mask, mp, ierr)
-    do i = int(rs) / ns_h, int(re) / ns_h - 1
-      if (any(mp((i - int(rs) / ns_h) * ns_h + 1 : (i - int(rs) / ns_h + 1) * ns_h) > 0.5d0)) fl(i) = 1
+    do i = int(rs) / H%ns, int(re) / H%ns - 1
+      if (any(mp((i - int(rs) / H%ns) * H%ns + 1 : (i - int(rs) / H%ns + 1) * H%ns) > 0.5d0)) fl(i) = 1
     enddo
     call VecRestoreArray(mask, mp, ierr)
     call VecDestroy(mask, ierr)
-    call MPI_Allreduce(MPI_IN_PLACE, fl, n_idx, MPI_INTEGER, MPI_MAX, comm_h, mpierr)
+    call MPI_Allreduce(MPI_IN_PLACE, fl, n_idx, MPI_INTEGER, MPI_MAX, H%comm, mpierr)
     allocate(freeb(0:n_idx - 1)); freeb = fl > 0
     nfree = count(freeb)
 
     ni = n_flux; nj = n_tht
-    associate (L => lv(0))
+    associate (L => H%lv(0))
       L%nj = nj; L%n = n_idx
       allocate(L%d(0:ni - 1, 0:nj - 1, 0:3), L%dI(0:n_idx - 1), L%dJ(0:n_idx - 1), L%dK(0:n_idx - 1), &
                L%own(0:n_idx - 1), L%row0(0:n_idx - 1), L%ok(0:n_idx - 1), L%osgn(0:n_idx - 1))
@@ -485,17 +554,17 @@ contains
           r = r + 1
         enddo
         L%own(f) = r
-        L%row0(f) = int(f, kind(rs)) * ns_h
+        L%row0(f) = int(f, kind(rs)) * H%ns
       enddo
       L%nloc = re - rs
     end associate
 
     ! coarse levels: J halved, a DOF where the finer level's DOF at (I, 2J, k) has a coarse part
-    nlev = 1
-    do g = 1, o%max_levels - 1
-      if (mod(lv(g - 1)%nj, 2) /= 0 .or. lv(g - 1)%nj / 2 < o%min_nj) exit
-      nj = lv(g - 1)%nj / 2
-      associate (L => lv(g), LF => lv(g - 1))
+    H%nlev = 1
+    do g = 1, H%o%max_levels - 1
+      if (mod(H%lv(g - 1)%nj, 2) /= 0 .or. H%lv(g - 1)%nj / 2 < H%o%min_nj) exit
+      nj = H%lv(g - 1)%nj / 2
+      associate (L => H%lv(g), LF => H%lv(g - 1))
         L%nj = nj
         allocate(L%d(0:ni - 1, 0:nj - 1, 0:3))
         L%d = -1
@@ -530,29 +599,29 @@ contains
           enddo
         enddo
         ! rows: each rank's DOFs in DOF order, its block of rows after the lower ranks'
-        allocate(cnt(0:np_h))
+        allocate(cnt(0:H%np))
         cnt = 0
         do f = 0, c - 1
           cnt(L%own(f) + 1) = cnt(L%own(f) + 1) + 1
         enddo
-        do r = 1, np_h
+        do r = 1, H%np
           cnt(r) = cnt(r) + cnt(r - 1)                   ! cnt(r): DOFs of the ranks below r
         enddo
         do f = 0, c - 1
-          L%row0(f) = int(cnt(L%own(f)), kind(rs)) * ns_h
+          L%row0(f) = int(cnt(L%own(f)), kind(rs)) * H%ns
           cnt(L%own(f)) = cnt(L%own(f)) + 1
         enddo
         deallocate(cnt)
-        L%nloc = int(count(L%own == me), kind(rs)) * ns_h
+        L%nloc = int(count(L%own == H%me), kind(rs)) * H%ns
       end associate
-      nlev = nlev + 1
+      H%nlev = H%nlev + 1
     enddo
-    if (nlev < 2) call fatal("the grid has no coarse level along the ring (n_tht must be even, n_tht/2 >= min_nj)")
-    if (me == 0) then                                     ! the first rank of the operator's communicator
-      write(*,'(A,I0,A,I0,A,I0,A)', advance="no") "[Physics PC]   SPD-MG: ", nlev, " levels along the ring, ", &
-        nfree, " of ", n_idx, " indices free; lattice "
-      do g = 0, nlev - 1
-        write(*,'(I0,A,I0,A)', advance="no") n_flux, "x", lv(g)%nj, merge(" -> ", "    ", g < nlev - 1)
+    if (H%nlev < 2) call fatal("the grid has no coarse level along the ring (n_tht must be even, n_tht/2 >= min_nj)")
+    if (H%me == 0) then                                   ! the first rank of the operator's communicator
+      write(*,'(A,A,I0,A,I0,A,I0,A)', advance="no") "[Physics PC]   "//trim(H%tag)//": ", "", H%nlev, &
+        " levels along the ring, ", nfree, " of ", n_idx, " indices free; lattice "
+      do g = 0, H%nlev - 1
+        write(*,'(I0,A,I0,A)', advance="no") n_flux, "x", H%lv(g)%nj, merge(" -> ", "    ", g < H%nlev - 1)
       enddo
       write(*,*)
     endif
@@ -571,24 +640,24 @@ contains
     ! entries of a row: 2 (linear), the coarse nodes within the reach times kinds and slots (ring-harmonic)
     ! the slots whose odd ring positions take the ring-harmonic rows: all (ringharm), the
     ! harmonics' (mixed: n = 0 keeps the linear transfer, whose space holds its kernel)
-    allocate(rh_slot(0:ns_h - 1))
-    do g = 0, ns_h - 1
-      rh_slot(g) = o%transfer == TR_RINGHARM .or. (o%transfer == TR_MIXED .and. pc_global_slot(g) /= 0)
+    allocate(H%rh_slot(0:H%ns - 1))
+    do g = 0, H%ns - 1
+      H%rh_slot(g) = H%o%transfer == TR_RINGHARM .or. (H%o%transfer == TR_MIXED .and. pc_global_slot(g) /= 0)
     enddo
     cap = 2
-    if (any(rh_slot)) cap = max(2, 2 * ((o%rh_reach + 1) / 2) * 4 * ns_h)
-    do g = 1, nlev - 1
-      nl_r = lv(g - 1)%nloc; nl_c = lv(g)%nloc
+    if (any(H%rh_slot)) cap = max(2, 2 * ((H%o%rh_reach + 1) / 2) * 4 * H%ns)
+    do g = 1, H%nlev - 1
+      nl_r = H%lv(g - 1)%nloc; nl_c = H%lv(g)%nloc
       allocate(dnz(nl_r), onz(nl_r))
-      dnz = min(int(cap, 8), int(nl_c, 8)); onz = min(int(cap, 8), int(lv(g)%n, 8) * ns_h - int(nl_c, 8))
+      dnz = min(int(cap, 8), int(nl_c, 8)); onz = min(int(cap, 8), int(H%lv(g)%n, 8) * H%ns - int(nl_c, 8))
       ! MPIAIJ also on one rank, as the operators: their products need it
-      call MatCreate(comm_h, P(g), ierr)
-      call MatSetSizes(P(g), nl_r, nl_c, PETSC_DETERMINE, PETSC_DETERMINE, ierr)
-      call MatSetType(P(g), MATMPIAIJ, ierr)
-      call MatMPIAIJSetPreallocation(P(g), zero, dnz, zero, onz, ierr)
+      call MatCreate(H%comm, H%P(g), ierr)
+      call MatSetSizes(H%P(g), nl_r, nl_c, PETSC_DETERMINE, PETSC_DETERMINE, ierr)
+      call MatSetType(H%P(g), MATMPIAIJ, ierr)
+      call MatMPIAIJSetPreallocation(H%P(g), zero, dnz, zero, onz, ierr)
       deallocate(dnz, onz)
-      call MatSetOption(P(g), MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
-      if (.not. any(rh_slot)) call fill_p(g)
+      call MatSetOption(H%P(g), MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE, ierr)
+      if (.not. any(H%rh_slot)) call fill_p(g)
     enddo
   end subroutine create_prolongations
 
@@ -602,14 +671,14 @@ contains
     integer :: g
     PetscErrorCode :: ierr
     af = A0
-    do g = 1, nlev - 1
-      if (any(rh_slot)) call fill_p(g, af)
+    do g = 1, H%nlev - 1
+      if (any(H%rh_slot)) call fill_p(g, af)
       if (first) then
-        call MatPtAP(af, P(g), MAT_INITIAL_MATRIX, 2.0d0, Ag(g), ierr)
+        call MatPtAP(af, H%P(g), MAT_INITIAL_MATRIX, 2.0d0, H%Ag(g), ierr)
       else
-        call MatPtAP(af, P(g), MAT_REUSE_MATRIX, 2.0d0, Ag(g), ierr)
+        call MatPtAP(af, H%P(g), MAT_REUSE_MATRIX, 2.0d0, H%Ag(g), ierr)
       endif
-      af = Ag(g)
+      af = H%Ag(g)
     enddo
   end subroutine galerkin_chain
 
@@ -628,10 +697,10 @@ contains
     PetscScalar :: vals(2)
     PetscErrorCode :: ierr
     one = 1
-    associate (LF => lv(g - 1), LC => lv(g))
+    associate (LF => H%lv(g - 1), LC => H%lv(g))
       njc = LC%nj
       do f = 0, LF%n - 1
-        if (LF%own(f) /= me) cycle
+        if (LF%own(f) /= H%me) cycle
         if (.not. LF%ok(f)) cycle
         i = LF%dI(f); j = LF%dJ(f); k = LF%dK(f)
         rhrow = i >= 1 .and. mod(j, 2) == 1                 ! an F node: ringharm_rows on the rh_slot slots
@@ -640,7 +709,7 @@ contains
           call add(LC%d(0, 0, 0), 1.d0)
         else if (mod(j, 2) == 0) then
           call add(LC%d(i, j / 2, k), 1.d0)
-        else if (o%transfer == TR_CONST) then
+        else if (H%o%transfer == TR_CONST) then
           call add(LC%d(i, (j - 1) / 2, k), 1.d0)
         else
           call add(LC%d(i, (j - 1) / 2, k), 0.5d0)
@@ -648,21 +717,21 @@ contains
         endif
         if (nc == 0) cycle
         tot = sum(w(1:nc))
-        do s = 0, ns_h - 1
-          if (rhrow .and. rh_slot(s)) cycle
+        do s = 0, H%ns - 1
+          if (rhrow .and. H%rh_slot(s)) cycle
           row = LF%row0(f) + s
           ncol = int(nc, kind(row))
           do q = 1, nc
             cols(q) = LC%row0(cc(q)) + s
             vals(q) = LF%osgn(f) * w(q) / tot
           enddo
-          call MatSetValues(P(g), one, [row], ncol, cols(1:nc), vals(1:nc), INSERT_VALUES, ierr)
+          call MatSetValues(H%P(g), one, [row], ncol, cols(1:nc), vals(1:nc), INSERT_VALUES, ierr)
         enddo
       enddo
     end associate
     if (present(af)) call ringharm_rows(g, af)
-    call MatAssemblyBegin(P(g), MAT_FINAL_ASSEMBLY, ierr)
-    call MatAssemblyEnd(P(g), MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyBegin(H%P(g), MAT_FINAL_ASSEMBLY, ierr)
+    call MatAssemblyEnd(H%P(g), MAT_FINAL_ASSEMBLY, ierr)
   contains
     subroutine add(cdof, wt)
       integer, intent(in) :: cdof
@@ -699,17 +768,17 @@ contains
     PetscScalar, pointer :: vals(:)
     PetscErrorCode :: ierr
     one = 1
-    associate (LF => lv(g - 1), LC => lv(g), H => rh(g))
-      nj = LF%nj; ni = n_flux; m = 4 * ns_h; nF = nj / 2
+    associate (LF => H%lv(g - 1), LC => H%lv(g), HR => H%rh(g))
+      nj = LF%nj; ni = n_flux; m = 4 * H%ns; nF = nj / 2
       ! the rings with an F row of mine, and their gathered rows (F nodes) and columns (all nodes)
-      if (.not. H%ready) then
+      if (.not. HR%ready) then
         allocate(myring(0:ni - 1)); myring = .false.
         do i = 1, ni - 1
           do j = 1, nj - 1, 2
             do k = 0, 3
               dd = LF%d(i, j, k)
               if (dd < 0) cycle
-              if (LF%own(dd) == me) myring(i) = .true.
+              if (LF%own(dd) == H%me) myring(i) = .true.
             enddo
           enddo
         enddo
@@ -723,7 +792,7 @@ contains
               do k = 0, 3
                 dd = LF%d(i, j, k)
                 if (dd < 0) cycle
-                do s = 0, ns_h - 1
+                do s = 0, H%ns - 1
                   nc_ = nc_ + 1
                   if (t == 2) clist(nc_) = LF%row0(dd) + s
                   if (mod(j, 2) == 1) then
@@ -736,20 +805,20 @@ contains
           enddo
         enddo
         call sort_pint(rlist); call sort_pint(clist)
-        H%rrow = rlist; H%rcol = clist
+        HR%rrow = rlist; HR%rcol = clist
         nr_ = int(size(rlist), kind(one)); nc_ = int(size(clist), kind(one))
-        call ISCreateGeneral(PETSC_COMM_SELF, nr_, rlist, PETSC_COPY_VALUES, H%isr, ierr)
-        call ISCreateGeneral(PETSC_COMM_SELF, nc_, clist, PETSC_COPY_VALUES, H%isc, ierr)
-        call MatCreateSubMatrices(af, one, [H%isr], [H%isc], MAT_INITIAL_MATRIX, H%sub, ierr)
-        H%ready = .true.
+        call ISCreateGeneral(PETSC_COMM_SELF, nr_, rlist, PETSC_COPY_VALUES, HR%isr, ierr)
+        call ISCreateGeneral(PETSC_COMM_SELF, nc_, clist, PETSC_COPY_VALUES, HR%isc, ierr)
+        call MatCreateSubMatrices(af, one, [HR%isr], [HR%isc], MAT_INITIAL_MATRIX, HR%sub, ierr)
+        HR%ready = .true.
       else
-        call MatCreateSubMatrices(af, one, [H%isr], [H%isc], MAT_REUSE_MATRIX, H%sub, ierr)
+        call MatCreateSubMatrices(af, one, [HR%isr], [HR%isc], MAT_REUSE_MATRIX, HR%sub, ierr)
       endif
 
-      allocate(colJ(0:max(size(H%rcol), 1) - 1), colL(0:max(size(H%rcol), 1) - 1))
+      allocate(colJ(0:max(size(HR%rcol), 1) - 1), colL(0:max(size(HR%rcol), 1) - 1))
       colJ = -1; colL = 0
       ! C nodes (even positions) within the reach of an odd position: at most 2 ceil(reach / 2)
-      ncmax = max(1, min(nF, 2 * ((o%rh_reach + 1) / 2)))
+      ncmax = max(1, min(nF, 2 * ((H%o%rh_reach + 1) / 2)))
       allocate(ncq(nF), nearJ(ncmax, nF), Dinv(m, m, nF), Afc(m, m, ncmax, nF), X(m, m, ncmax, nF), &
                R(m, m, ncmax, nF), piv(m), wk(m * m), nnb(nF))
       do i = 1, ni - 1
@@ -759,9 +828,9 @@ contains
           do k = 0, 3
             dd = LF%d(i, j, k)
             if (dd < 0) cycle
-            do s = 0, ns_h - 1
-              c = bsearch(H%rcol, LF%row0(dd) + s)
-              colJ(c) = j; colL(c) = k * ns_h + s + 1
+            do s = 0, H%ns - 1
+              c = bsearch(HR%rcol, LF%row0(dd) + s)
+              colJ(c) = j; colL(c) = k * H%ns + s + 1
             enddo
           enddo
         enddo
@@ -770,7 +839,7 @@ contains
           j = 2 * ff - 1
           ncq(ff) = 0
           do jc = 0, nj - 2, 2
-            if (cdist(j, jc) > o%rh_reach) cycle
+            if (cdist(j, jc) > H%o%rh_reach) cycle
             ncq(ff) = ncq(ff) + 1; nearJ(ncq(ff), ff) = jc
           enddo
         enddo
@@ -783,14 +852,14 @@ contains
           j = 2 * ff - 1
           do k = 0, 3
             dd = LF%d(i, j, k)
-            do s = 0, ns_h - 1
-              ll = k * ns_h + s + 1
+            do s = 0, H%ns - 1
+              ll = k * H%ns + s + 1
               if (dd < 0) then
                 Dinv(ll, ll, ff) = 1.d0                    ! no DOF: an identity row, decoupled
                 cycle
               endif
-              rpos = int(bsearch(H%rrow, LF%row0(dd) + s), kind(one))
-              call MatGetRow(H%sub(1), rpos, ncols, cols, vals, ierr)
+              rpos = int(bsearch(HR%rrow, LF%row0(dd) + s), kind(one))
+              call MatGetRow(HR%sub(1), rpos, ncols, cols, vals, ierr)
               do a = 1, int(ncols)
                 c = int(cols(a))
                 if (colJ(c) < 0) cycle                     ! another ring
@@ -811,7 +880,7 @@ contains
                   enddo
                 endif
               enddo
-              call MatRestoreRow(H%sub(1), rpos, ncols, cols, vals, ierr)
+              call MatRestoreRow(HR%sub(1), rpos, ncols, cols, vals, ierr)
             enddo
           enddo
           ! D^-1
@@ -821,7 +890,7 @@ contains
         enddo
         ! the sweeps (Jacobi: all R from the last X)
         X = 0.d0
-        do t = 1, o%rh_sweeps
+        do t = 1, H%o%rh_sweeps
           do ff = 1, nF
             do q = 1, ncq(ff)
               R(:, :, q, ff) = Afc(:, :, q, ff)
@@ -837,7 +906,8 @@ contains
           ! X - omega D^-1 (A_FF X + A_FC) with A_FF = D + the neighbours (R holds the latter and A_FC)
           do ff = 1, nF
             do q = 1, ncq(ff)
-              X(:, :, q, ff) = (1.d0 - o%rh_omega) * X(:, :, q, ff) - o%rh_omega * matmul(Dinv(:, :, ff), R(:, :, q, ff))
+              X(:, :, q, ff) = (1.d0 - H%o%rh_omega) * X(:, :, q, ff) - H%o%rh_omega * matmul(Dinv(:, :, ff), &
+                                                                                          R(:, :, q, ff))
             enddo
           enddo
         enddo
@@ -848,10 +918,10 @@ contains
           do k = 0, 3
             dd = LF%d(i, j, k)
             if (dd < 0) cycle
-            if (LF%own(dd) /= me .or. .not. LF%ok(dd)) cycle
-            do s = 0, ns_h - 1
-              if (.not. rh_slot(s)) cycle                  ! mixed: n = 0 keeps the linear row (fill_p)
-              ll = k * ns_h + s + 1
+            if (LF%own(dd) /= H%me .or. .not. LF%ok(dd)) cycle
+            do s = 0, H%ns - 1
+              if (.not. H%rh_slot(s)) cycle                ! mixed: n = 0 keeps the linear row (fill_p)
+              ll = k * H%ns + s + 1
               row = LF%row0(dd) + s
               nent = 0
               do q = 1, ncq(ff)
@@ -860,14 +930,14 @@ contains
                   c = LF%d(i, jc, kc)
                   if (c < 0) cycle
                   if (.not. LF%ok(c)) cycle
-                  do sc = 0, ns_h - 1
+                  do sc = 0, H%ns - 1
                     nent = nent + 1
                     ecol(nent) = LC%row0(LC%d(i, jc / 2, kc)) + sc
-                    evals(nent) = X(ll, kc * ns_h + sc + 1, q, ff) * LF%osgn(c)
+                    evals(nent) = X(ll, kc * H%ns + sc + 1, q, ff) * LF%osgn(c)
                   enddo
                 enddo
               enddo
-              if (nent > 0) call MatSetValues(P(g), one, [row], int(nent, kind(one)), ecol(1:nent), &
+              if (nent > 0) call MatSetValues(H%P(g), one, [row], int(nent, kind(one)), ecol(1:nent), &
                                               evals(1:nent), INSERT_VALUES, ierr)
             enddo
           enddo
@@ -878,8 +948,8 @@ contains
           do k = 0, 3
             dd = LF%d(i, j, k)
             if (dd < 0) cycle
-            do s = 0, ns_h - 1
-              c = bsearch(H%rcol, LF%row0(dd) + s)
+            do s = 0, H%ns - 1
+              c = bsearch(HR%rcol, LF%row0(dd) + s)
               colJ(c) = -1
             enddo
           enddo
@@ -899,8 +969,8 @@ contains
       integer :: kk
       ring_gathered = .false.
       do kk = 0, 3
-        if (lv(g - 1)%d(ii, 1, kk) < 0) cycle
-        ring_gathered = bsearch(rh(g)%rrow, lv(g - 1)%row0(lv(g - 1)%d(ii, 1, kk))) >= 0
+        if (H%lv(g - 1)%d(ii, 1, kk) < 0) cycle
+        ring_gathered = bsearch(H%rh(g)%rrow, H%lv(g - 1)%row0(H%lv(g - 1)%d(ii, 1, kk))) >= 0
         return
       enddo
     end function ring_gathered
@@ -920,54 +990,58 @@ contains
     integer :: g
     character(len=48) :: nm
     call PCSetType(pc, PCMG, ierr)
-    call PCMGSetLevels(pc, int(nlev, kind(L)), PETSC_NULL_MPI_COMM, ierr)
+    call PCMGSetLevels(pc, int(H%nlev, kind(L)), PETSC_NULL_MPI_COMM, ierr)
     call PCMGSetType(pc, PC_MG_MULTIPLICATIVE, ierr)
     call PCMGSetCycleType(pc, PC_MG_CYCLE_V, ierr)
     ! the Galerkin operators are galerkin_chain's (the ring-harmonic transfer needs them level by level)
     call PCMGSetGalerkin(pc, PC_MG_GALERKIN_NONE, ierr)
-    do g = 1, nlev - 1
-      L = nlev - g
-      call PCMGSetInterpolation(pc, L, P(g), ierr)
+    do g = 1, H%nlev - 1
+      L = H%nlev - g
+      call PCMGSetInterpolation(pc, L, H%P(g), ierr)
     enddo
-    do g = 0, nlev - 2
-      L = nlev - 1 - g
+    do g = 0, H%nlev - 2
+      L = H%nlev - 1 - g
       call PCMGGetSmoother(pc, L, ks, ierr)
       if (g == 0) then
         call KSPSetOperators(ks, A0, A0, ierr)
       else
-        call KSPSetOperators(ks, Ag(g), Ag(g), ierr)
+        call KSPSetOperators(ks, H%Ag(g), H%Ag(g), ierr)
       endif
       call KSPSetType(ks, KSPCHEBYSHEV, ierr)
-      call KSPChebyshevEstEigSet(ks, 0.d0, o%safety / o%ratio, 0.d0, o%safety, ierr)
+      call KSPChebyshevEstEigSet(ks, 0.d0, H%o%safety / H%o%ratio, 0.d0, H%o%safety, ierr)
       call KSPChebyshevEstEigGetKSP(ks, kest, ierr)
       call KSPSetType(kest, KSPCG, ierr)
-      call KSPSetTolerances(kest, 1.d-50, 1.d-50, 1.d10, int(o%esteig_its, kind(L)), ierr)
-      call KSPSetTolerances(ks, 1.d-50, 1.d-50, 1.d10, int(o%degree, kind(L)), ierr)
+      call KSPSetTolerances(kest, 1.d-50, 1.d-50, 1.d10, int(H%o%esteig_its, kind(L)), ierr)
+      call KSPSetTolerances(ks, 1.d-50, 1.d-50, 1.d10, int(H%o%degree, kind(L)), ierr)
       call KSPGetPC(ks, pcs, ierr)
       call PCSetType(pcs, PCSHELL, ierr)
       call PCShellSetApply(pcs, as_apply, ierr)
       call PCShellSetSetUp(pcs, as_setup, ierr)
-      write(nm, '(A,I0)') "SPD-MG additive Schwarz, level ", g
+      write(nm, '(A,A,I0)') trim(H%tag), " additive Schwarz, level ", g
       call PCShellSetName(pcs, trim(nm), ierr)
-      as_pc(g) = pcs
+      H%as_pc(g) = pcs
     enddo
     call PCMGGetCoarseSolve(pc, kc, ierr)
-    call KSPSetOperators(kc, Ag(nlev - 1), Ag(nlev - 1), ierr)
+    call KSPSetOperators(kc, H%Ag(H%nlev - 1), H%Ag(H%nlev - 1), ierr)
     call KSPSetType(kc, KSPPREONLY, ierr)
     call KSPGetPC(kc, pcc, ierr)
     call PCSetType(pcc, PCLU, ierr)
     call PCFactorSetMatSolverType(pcc, MATSOLVERMUMPS, ierr)
   end subroutine configure_pcmg
 
-  !> The level g of the shell PC pc (its handle among as_pc).
+  !> The level of the shell PC pc (its handle among the instances' as_pc);
+  !! makes its instance the active one.
   integer function level_of(pc)
     PC, intent(in) :: pc
-    integer :: g
+    integer :: g, k
     level_of = -1
-    do g = 0, nlev - 2
-      if (as_pc(g)%v == pc%v) then
-        level_of = g; return
-      endif
+    do k = 1, NINST
+      do g = 0, inst(k)%nlev - 2
+        if (inst(k)%as_pc(g)%v == pc%v) then
+          H => inst(k)
+          level_of = g; return
+        endif
+      enddo
     enddo
     call fatal("a shell PC that is not one of the levels' smoothers")
   end function level_of
@@ -989,10 +1063,10 @@ contains
     real*8, allocatable :: aw(:)
     logical, allocatable :: jin(:)
     integer :: nab, nabd, f, j, j0, k, ax, lf, t, b, s, nsel, p, nmine, nw
-    ax = o%axis_rings
-    lf = o%line_from
+    ax = H%o%axis_rings
+    lf = H%o%line_from
     if (lf < 0) lf = ax + 1
-    associate (L => lv(g))
+    associate (L => H%lv(g))
       allocate(ab0(1), abd(max(2 * L%n, 16)), aw(0), sel(L%n))
       ab0(1) = 0; nab = 0; nabd = 0
       ! the axis block
@@ -1001,7 +1075,7 @@ contains
         if (L%dI(f) <= ax) call put(f)
       enddo
       call push(1.d0)
-      select case (o%blocks)
+      select case (H%o%blocks)
       case (BL_NODE)                                        ! the DOFs of a node outside the axis block
         call buckets(.true.)
         do k = 0, size(key0) - 2
@@ -1026,14 +1100,14 @@ contains
           call push(1.d0)
         enddo
       end select
-      if (o%blocks == BL_LINEWEDGE) then                    ! wedge_lines lines every wedge_stride, rings lf..t
+      if (H%o%blocks == BL_LINEWEDGE) then                  ! wedge_lines lines every wedge_stride, rings lf..t
         t = wedge_last(g, lf)
         nw = 0
         if (t >= lf) then
           allocate(jin(0:L%nj - 1))
-          do j0 = 0, L%nj - 1, o%wedge_stride
+          do j0 = 0, L%nj - 1, H%o%wedge_stride
             jin = .false.
-            do k = 0, o%wedge_lines - 1
+            do k = 0, H%o%wedge_lines - 1
               jin(modulo(j0 + k, L%nj)) = .true.
             enddo
             nsel = 0
@@ -1041,15 +1115,16 @@ contains
               if (L%dI(f) >= lf .and. L%dI(f) <= t .and. jin(L%dJ(f))) call put(f)
             enddo
             if (nsel > 0) nw = nw + 1
-            call push(o%wedge_weight)
+            call push(H%o%wedge_weight)
           enddo
         endif
-        if (me == 0 .and. .not. as(g)%ready) then
+        if (H%me == 0 .and. .not. H%as(g)%ready) then
           if (nw > 0) then
-            write(*,'(A,I0,A,I0,A,I0,A,I0,A,F5.2,A)') "[Physics PC]   SPD-MG level ", g, ": ", nw, &
-              " wedges on the rings ", lf, "..", t, " (weight ", o%wedge_weight, ")"
+            write(*,'(A,I0,A,I0,A,I0,A,I0,A,F5.2,A)') "[Physics PC]   "//trim(H%tag)//" level ", g, ": ", nw, &
+              " wedges on the rings ", lf, "..", t, " (weight ", H%o%wedge_weight, ")"
           else
-            write(*,'(A,I0,A)') "[Physics PC]   SPD-MG level ", g, ": no wedge (no ring below the cell aspect)"
+            write(*,'(A,I0,A)') "[Physics PC]   "//trim(H%tag)//" level ", g, &
+              ": no wedge (no ring below the cell aspect)"
           endif
         endif
       endif
@@ -1057,24 +1132,24 @@ contains
       ! mine: rows (all slots) in w order, sorted inside each block
       nmine = 0
       do b = 1, nab
-        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) == me) nmine = nmine + 1
+        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) == H%me) nmine = nmine + 1
       enddo
       nb = nmine
       allocate(off(0:nb), bw(0:max(nb - 1, 0)))
       off(0) = 0; k = 0
       do b = 1, nab
-        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) /= me) cycle
+        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) /= H%me) cycle
         k = k + 1
-        off(k) = off(k - 1) + (ab0(b + 1) - ab0(b)) * ns_h
+        off(k) = off(k - 1) + (ab0(b + 1) - ab0(b)) * H%ns
         bw(k - 1) = aw(b)
       enddo
       allocate(gidx(max(off(nb), 1)))
       k = 0
       do b = 1, nab
-        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) /= me) cycle
+        if (L%own(minval(abd(ab0(b) + 1 : ab0(b + 1)))) /= H%me) cycle
         p = off(k)
         do j = ab0(b) + 1, ab0(b + 1)
-          do s = 0, ns_h - 1
+          do s = 0, H%ns - 1
             p = p + 1
             gidx(p) = L%row0(abd(j)) + s
           enddo
@@ -1109,7 +1184,7 @@ contains
       logical, intent(in) :: by_node
       integer :: nk, ff, kk
       integer, allocatable :: c(:)
-      associate (L => lv(g))
+      associate (L => H%lv(g))
         nk = merge(size(L%d, 1) * L%nj, L%nj, by_node)
         allocate(key0(0:nk), c(0:nk - 1), keyd(L%n))
         c = 0
@@ -1143,9 +1218,9 @@ contains
     integer :: i
     real*8 :: a
     wedge_last = -1
-    do i = max(lf, 1), size(ring_asp) - 1
-      a = ring_asp(i) * dble(n_tht) / dble(lv(g)%nj)
-      if (a < o%wedge_aspect) wedge_last = i
+    do i = max(lf, 1), size(H%ring_asp) - 1
+      a = H%ring_asp(i) * dble(n_tht) / dble(H%lv(g)%nj)
+      if (a < H%o%wedge_aspect) wedge_last = i
     enddo
   end function wedge_last
 
@@ -1158,7 +1233,7 @@ contains
     ierr = 0
     g = level_of(pc)
     call PCGetOperators(pc, amat, pmat, ierr)
-    call asm_build(as(g), g, pmat)
+    call asm_build(H%as(g), g, pmat)
     ierr = 0
   end subroutine as_setup
 
@@ -1170,7 +1245,7 @@ contains
     integer :: g
     ierr = 0
     g = level_of(pc)
-    call asm_apply(as(g), x, y)
+    call asm_apply(H%as(g), x, y)
     ierr = 0
   end subroutine as_apply
 
@@ -1229,7 +1304,7 @@ contains
       allocate(S%dense(0:S%nb - 1), S%loff(0:S%nb - 1), S%piv(max(S%nw, 1)))
       tot = 0; nsp = 0
       do b = 0, S%nb - 1
-        S%dense(b) = S%sz(b) <= o%dense_max
+        S%dense(b) = S%sz(b) <= H%o%dense_max
         S%loff(b) = tot
         if (S%dense(b)) then
           tot = tot + int(S%sz(b), 8)**2
@@ -1345,10 +1420,12 @@ contains
     integer :: g, nbk(2), nbk_g(2), nsp_g
     real*8 :: nz(0:MAXL-1), c_op
     character(len=9), parameter :: bn(4) = ["node     ", "line     ", "point    ", "linewedge"]
+    character(len=40) :: tg
+    tg = "[Physics PC]   "//trim(H%tag)
     call KSPGetPC(ksp, pc, ierr)
-    do g = 0, nlev - 1
-      L = nlev - 1 - g
-      if (g == nlev - 1) then
+    do g = 0, H%nlev - 1
+      L = H%nlev - 1 - g
+      if (g == H%nlev - 1) then
         call PCMGGetCoarseSolve(pc, kl, ierr)
       else
         call PCMGGetSmoother(pc, L, kl, ierr)
@@ -1357,35 +1434,35 @@ contains
       call MatGetInfo(al, MAT_GLOBAL_SUM, info, ierr)
       nz(g) = info%nz_used
     enddo
-    c_op = sum(nz(0:nlev - 1)) / nz(0)
+    c_op = sum(nz(0:H%nlev - 1)) / nz(0)
     nbk = 0
-    do g = 0, nlev - 2
-      nbk(1) = nbk(1) + as(g)%nb
-      nbk(2) = max(nbk(2), maxval(as(g)%sz))
+    do g = 0, H%nlev - 2
+      nbk(1) = nbk(1) + H%as(g)%nb
+      nbk(2) = max(nbk(2), maxval(H%as(g)%sz))
     enddo
-    call MPI_Allreduce(nbk(1), nbk_g(1), 1, MPI_INTEGER, MPI_SUM, comm_h, ierr)
-    call MPI_Allreduce(nbk(2), nbk_g(2), 1, MPI_INTEGER, MPI_MAX, comm_h, ierr)
-    call MPI_Allreduce(as(0)%nsparse, nsp_g, 1, MPI_INTEGER, MPI_SUM, comm_h, ierr)
-    if (me /= 0) return                                   ! the first rank of the operator's communicator
-    write(*,'(A,A,A)', advance="no") "[Physics PC]   SPD-MG (", trim(label), ") levels rows (nnz/row):"
-    do g = 0, nlev - 1
-      write(*,'(A,I0,A,F7.1,A)', advance="no") " ", lv(g)%n * ns_h, " (", nz(g) / max(lv(g)%n * ns_h, 1), ")"
+    call MPI_Allreduce(nbk(1), nbk_g(1), 1, MPI_INTEGER, MPI_SUM, H%comm, ierr)
+    call MPI_Allreduce(nbk(2), nbk_g(2), 1, MPI_INTEGER, MPI_MAX, H%comm, ierr)
+    call MPI_Allreduce(H%as(0)%nsparse, nsp_g, 1, MPI_INTEGER, MPI_SUM, H%comm, ierr)
+    if (H%me /= 0) return                                 ! the first rank of the operator's communicator
+    write(*,'(A,A,A)', advance="no") trim(tg)//" (", trim(label), ") levels rows (nnz/row):"
+    do g = 0, H%nlev - 1
+      write(*,'(A,I0,A,F7.1,A)', advance="no") " ", H%lv(g)%n * H%ns, " (", nz(g) / max(H%lv(g)%n * H%ns, 1), ")"
     enddo
     write(*,'(A,F6.3)') "   C_op = ", c_op
-    write(*,'(A,A,A,I0,A,I0,A,I0,A)') "[Physics PC]   SPD-MG smoother: Chebyshev(", trim(itoa(o%degree)), &
-      ") of additive Schwarz, "//trim(bn(o%blocks))//" blocks, axis block rings 0..", o%axis_rings, &
+    write(*,'(A,A,A,I0,A,I0,A,I0,A)') trim(tg)//" smoother: Chebyshev(", trim(itoa(H%o%degree)), &
+      ") of additive Schwarz, "//trim(bn(H%o%blocks))//" blocks, axis block rings 0..", H%o%axis_rings, &
       "; ", nbk_g(1), " blocks over the levels, largest ", nbk_g(2), " rows"
-    if (o%blocks == BL_LINE .or. o%blocks == BL_LINEWEDGE) write(*,'(A,I0,A)') &
-      "[Physics PC]   SPD-MG radial lines from ring ", merge(o%line_from, o%axis_rings + 1, o%line_from >= 0), &
+    if (H%o%blocks == BL_LINE .or. H%o%blocks == BL_LINEWEDGE) write(*,'(A,I0,A)') &
+      trim(tg)//" radial lines from ring ", merge(H%o%line_from, H%o%axis_rings + 1, H%o%line_from >= 0), &
       merge(" (overlapping the axis block)", "                             ", &
-            o%line_from >= 0 .and. o%line_from <= o%axis_rings)
-    if (o%blocks == BL_LINEWEDGE) write(*,'(A,I0,A,I0,A,F5.2,A,F5.2)') "[Physics PC]   SPD-MG wedges of ", &
-      o%wedge_lines, " lines every ", o%wedge_stride, " lines, rings with a cell aspect below ", o%wedge_aspect, &
-      ", weight ", o%wedge_weight
-    write(*,'(A,F6.2,A,F6.3,A,I0,A,A)') "[Physics PC]   SPD-MG interval [lmax * ", o%safety / o%ratio, &
-      ", lmax * ", o%safety, "], lmax from ", o%esteig_its, " CG steps; transfer ", trim(trname())
-    if (nsp_g > 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   SPD-MG level 0: ", nsp_g, &
-      " block(s) above ", o%dense_max, " rows on sparse LU"
+            H%o%line_from >= 0 .and. H%o%line_from <= H%o%axis_rings)
+    if (H%o%blocks == BL_LINEWEDGE) write(*,'(A,I0,A,I0,A,F5.2,A,F5.2)') trim(tg)//" wedges of ", &
+      H%o%wedge_lines, " lines every ", H%o%wedge_stride, " lines, rings with a cell aspect below ", &
+      H%o%wedge_aspect, ", weight ", H%o%wedge_weight
+    write(*,'(A,F6.2,A,F6.3,A,I0,A,A)') trim(tg)//" interval [lmax * ", H%o%safety / H%o%ratio, &
+      ", lmax * ", H%o%safety, "], lmax from ", H%o%esteig_its, " CG steps; transfer ", trim(trname())
+    if (nsp_g > 0) write(*,'(A,I0,A,I0,A)') trim(tg)//" level 0: ", nsp_g, &
+      " block(s) above ", H%o%dense_max, " rows on sparse LU"
   end subroutine report
 
   !> -vs_pmg_test: CG with one V-cycle as preconditioner, the true residual
@@ -1416,31 +1493,31 @@ contains
     character(len=24) :: what
     real*8, parameter :: tols(3) = [1.d-1, 1.d-6, 1.d-10]
     integer, parameter :: MAXIT = 500
-    if (.not. allocated(hist)) allocate(hist(MAXIT + 1))
+    if (.not. allocated(H%hist)) allocate(H%hist(MAXIT + 1))
     nh = MAXIT + 1
     nfam = 0
-    if (ns_h == n_tor .and. n_tor > 1) nfam = (n_tor + 1) / 2
+    if (H%ns == n_tor .and. n_tor > 1) nfam = (n_tor + 1) / 2
     call KSPGetPC(ksp, pc, ierr)
     call MatCreateVecs(A, x, b, ierr)
     call MatGetOwnershipRange(A, rs, re, ierr)
-    call PetscRandomCreate(comm_h, rnd, ierr)
+    call PetscRandomCreate(H%comm, rnd, ierr)
     call PetscRandomSetInterval(rnd, -1.d0, 1.d0, ierr)
     call PetscRandomSetFromOptions(rnd, ierr)
     do fam = -1, nfam - 1
-      call KSPCreate(comm_h, kt, ierr)
+      call KSPCreate(H%comm, kt, ierr)
       call KSPSetType(kt, KSPCG, ierr)
       call KSPSetNormType(kt, KSP_NORM_UNPRECONDITIONED, ierr)
       call KSPSetOperators(kt, A, A, ierr)
       call KSPSetPC(kt, pc, ierr)
       call KSPSetTolerances(kt, 1.d-10, 1.d-50, 1.d10, int(MAXIT, kind(its)), ierr)
       call KSPSetComputeSingularValues(kt, PETSC_TRUE, ierr)
-      call KSPSetResidualHistory(kt, hist, nh, PETSC_TRUE, ierr)
+      call KSPSetResidualHistory(kt, H%hist, nh, PETSC_TRUE, ierr)
       call VecSetRandom(b, rnd, ierr)
       what = "all slots"
       if (fam >= 0) then
         call VecGetArray(b, ba, ierr)
         do r = rs, re - 1
-          s = int(mod(r, int(ns_h, kind(r))))
+          s = int(mod(r, int(H%ns, kind(r))))
           if ((s + 1) / 2 /= fam) ba(r - rs + 1) = 0.d0
         enddo
         call VecRestoreArray(b, ba, ierr)
@@ -1454,13 +1531,13 @@ contains
       t = -1
       do q = 1, 3
         do k = 1, int(its) + 1
-          if (hist(k) <= tols(q) * hist(1)) then
+          if (H%hist(k) <= tols(q) * H%hist(1)) then
             t(q) = k - 1; exit
           endif
         enddo
       enddo
-      if (me == 0) write(*,'(A,A,A,A,A,3(I0,A),ES10.3,A,ES10.3,A,F9.2,A,I0)') "[Physics PC]   SPD-MG test (", &
-        trim(label), ", ", trim(what), "): CG its to 1e-1 / 1e-6 / 1e-10: ", t(1), " / ", t(2), " / ", t(3), &
+      if (H%me == 0) write(*,'(A,A,A,A,A,3(I0,A),ES10.3,A,ES10.3,A,F9.2,A,I0)') "[Physics PC]   "//trim(H%tag)// &
+        " test (", trim(label), ", ", trim(what), "): CG its to 1e-1 / 1e-6 / 1e-10: ", t(1), " / ", t(2), " / ", t(3), &
         ";  Lanczos lambda in [", emin, ", ", emax, "], kappa ", emax / max(emin, tiny(1.d0)), ", reason ", reason%v
       call KSPDestroy(kt, ierr)
     enddo
@@ -1538,15 +1615,15 @@ contains
   !> the transfer's name for the report
   function trname() result(s)
     character(len=96) :: s
-    select case (o%transfer)
+    select case (H%o%transfer)
     case (TR_LINEAR);   s = "linear (kinds as fields)"
     case (TR_CONST);    s = "const (kinds as fields)"
     case (TR_RINGHARM)
-      write(s, '(A,I0,A,I0,A,F5.2,A)') "ring-harmonic (", o%rh_sweeps, " steps, reach ", o%rh_reach, &
-        ", omega ", o%rh_omega, ")"
+      write(s, '(A,I0,A,I0,A,F5.2,A)') "ring-harmonic (", H%o%rh_sweeps, " steps, reach ", H%o%rh_reach, &
+        ", omega ", H%o%rh_omega, ")"
     case (TR_MIXED)
-      write(s, '(A,I0,A,I0,A,F5.2,A)') "mixed: n = 0 linear, harmonics ring-harmonic (", o%rh_sweeps, &
-        " steps, reach ", o%rh_reach, ", omega ", o%rh_omega, ")"
+      write(s, '(A,I0,A,I0,A,F5.2,A)') "mixed: n = 0 linear, harmonics ring-harmonic (", H%o%rh_sweeps, &
+        " steps, reach ", H%o%rh_reach, ", omega ", H%o%rh_omega, ")"
     case default;       s = "?"
     end select
   end function trname
@@ -1559,8 +1636,10 @@ contains
 
   subroutine fatal(msg)
     character(len=*), intent(in) :: msg
-    integer :: mpierr
-    if (me == 0) write(*,'(A,A)') "[Physics PC]   FATAL: SPD-MG: ", trim(msg)
+    integer :: mpierr, r
+    r = 0
+    if (associated(H)) r = H%me
+    if (r == 0) write(*,'(A,A)') "[Physics PC]   FATAL: SPD-MG: ", trim(msg)
     call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
   end subroutine fatal
 

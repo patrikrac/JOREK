@@ -26,7 +26,7 @@ module mod_petsc_pc_gmg
   private
 
   public :: gmg_build_prolongations, gmg_setup_operator, gmg_is_ready, gmg_select
-  public :: gmg_pc_apply_1, gmg_pc_apply_2, gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5
+  public :: gmg_pc_apply_1, gmg_pc_apply_2, gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_pc_apply_6
   public :: gmg_opts_t
 
   integer, parameter, public :: GMG_SM_RINGS       = 4  !< flux-surface ring blocks
@@ -200,7 +200,7 @@ module mod_petsc_pc_gmg
     logical :: pat_fresh = .false.                  !< this setup's fine pattern differs from the last one's
   end type gmg_hier_t
 
-  integer, parameter :: MAX_INST = 5
+  integer, parameter :: MAX_INST = 6
   type(gmg_hier_t), target, save :: hier(MAX_INST)
   type(gmg_hier_t), pointer, save :: H => null()    !< the active hierarchy, hier(cur_inst)
   integer, save :: cur_inst = 1
@@ -482,6 +482,13 @@ contains
     PetscErrorCode :: ierr
     call vcycle_of(5, b, x, ierr)
   end subroutine gmg_pc_apply_5
+
+  subroutine gmg_pc_apply_6(pc, b, x, ierr)
+    PC  :: pc
+    Vec :: b, x
+    PetscErrorCode :: ierr
+    call vcycle_of(6, b, x, ierr)
+  end subroutine gmg_pc_apply_6
 
   subroutine vcycle_of(k, b, x, ierr)
     integer, intent(in) :: k

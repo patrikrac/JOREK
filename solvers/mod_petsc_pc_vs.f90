@@ -99,6 +99,44 @@
 !! keeps them), so that the stored matrix is the symmetric one; the first
 !! build reports its skew part.
 !!
+!! V_PAR (vs_lumped on model600 with v_par: n_var 7, 7 = V). V's row couples
+!! to psi (B_71, delta B . grad p0), u (B_72, with flow), rho, T and V; V's
+!! column enters the u (B_27, with flow), rho (B_57) and T (B_67) rows only:
+!! B_17, B_37, B_47, B_73 and B_74 are zeros of model600's element matrix. V
+!! is solved after the Alfven group and before rho and T (the order of
+!! vs_alfven's b0), on a symmetric positive definite operator of its own, the
+!! sound wave as a congruence (the v_par study, studies/spd_multigrid/vpar):
+!!   P_V = sym(B_77) + B_57' X B_57,   X = (Z + Z') / 2,
+!!   Z the local dual basis of Q = W sym(B_55) W   (3 x 3 node patches, the
+!!     core patch at the axis as the resistive bending's, -vs_vpar_core),
+!!   W = diag((rho0 / T0)^1/2), the node's n = 0 values of the state for all
+!!     DOFs and slots of the node.
+!! At rest B_57 = B_76 and B_76 = -B_57' up to the quadrature: the (rho, T,
+!! V) coupling is skew-adjoint in the energy inner product, and Q^-1 is the
+!! isothermal compression's (rho0 / T0 the weight of rho), within the factor
+!! gamma of the adiabatic one. P_V is symmetric by construction and positive
+!! definite where sym(B_77) is and X >= 0, which is measured, not proven (the
+!! core patch keeps X definite on fine grids). The rows of B_57 at rho's
+!! constrained DOFs and its columns at V's leave the congruence, Q's
+!! constrained rows and columns are decoupled (unit diagonal), so that P_V's
+!! interior is the free system's operator; P_V's constrained rows are B_77's
+!! diagonal alone, Dirichlet rows decoupled by the block solver like the
+!! other blocks', the full Jacobian's boundary rows of V set by step 7. One
+!! application has the step
+!!   4b. P_V V = x_V - B_71 psi - B_72 u
+!! between steps 4 and 5, and -B_57 V in step 5, -B_67 V in step 6. Left
+!! out: V's feedback on the Alfven group (B_27, with flow) and the upper
+!! couplings B_75, B_76. With flow B_77 and B_55 hold advection;
+!! -vs_vpar_flow adv solves
+!!   P_V^A = B_77 + B_57' Z_A B_57,   Z_A the plain dual basis of W B_55 W,
+!! by FGMRES to the inner rtol with P_V's V-cycle (LU: P_V^A's own LU). The
+!! first build reports |B_57 - B_76|_F and |B_76 + B_57'|_F against |B_57|_F
+!! on the interior rows and columns, and P_V's skew part.
+!! P_V's solver (-vs_pv_solver): the backend of physics_pc_sf_vpar (lu, or
+!! gmg: the ring GMG, instance 6, flux-surface rings, as vs_alfven's b0), or
+!! the second instance of the SPD multigrid (mod_petsc_pc_spdmg, options
+!! -vs_pvmg_*, radial lines and wedges by default).
+!!
 !! PETSc options of vs_lumped (read once, at the first assembly):
 !!   -vs_bending ideal | resistive     the line bending (default ideal)
 !!   -vs_dual_form plain | avg | sym   the form of X (default avg)
@@ -114,6 +152,14 @@
 !!                                     GMG with FGMRES, or LU), or the ring-free
 !!                                     SPD multigrid of mod_petsc_pc_spdmg (its
 !!                                     options -vs_pmg_*)
+!! and with v_par:
+!!   -vs_pv_solver default | spdmg     P_V's solver: the backend of
+!!                                     physics_pc_sf_vpar (default), or the SPD
+!!                                     multigrid's P_V instance (-vs_pvmg_*)
+!!   -vs_vpar_flow sym | adv           the solve on P_V (default), or on P_V^A
+!!                                     with P_V's V-cycle
+!!   -vs_vpar_core <bool>              Z with the core patch (default true)
+!!   -vs_pv_view <file>                P_V of every build, as -vs_pl_view
 !!
 !! Boundary rows: M_rho and the Laplacian's boundary diagonal D_bc carry
 !! Dirichlet rows at u's constrained DOFs (1, or the penalty with penalty
@@ -125,13 +171,14 @@
 module mod_petsc_pc_vs
 #ifdef USE_PETSC
   use mpi_mod
-  use mod_parameters, only: n_var
+  use mod_parameters, only: n_var, var_Vpar
   use mod_model_settings, only: jorek_model
 #include "petsc/finclude/petsc.h"
   use petsc
   use mod_petsc_pc_physics_ctx, only: g_ctx, physics_pc_mem, physics_pc_method_id, PC_METHOD_VS_RESISTIVE, &
        PC_METHOD_VS_LUMPED, pcev_extract, pcev_fact_pj, pcev_fact_rhot, pcev_fact_vort, pcev_fact_lap, pcev_apply, &
-       pcev_solve_pj, pcev_solve_rhot, pcev_solve_vort, pcev_solve_lap, pcev_solve_mass
+       pcev_solve_pj, pcev_solve_rhot, pcev_solve_vort, pcev_solve_lap, pcev_solve_mass, pcev_asm_pl, pcev_asm_pv, &
+       pcev_fact_pv, pcev_solve_pv
   use mod_petsc_pc_blocks, only: penalty_rows_t, full_penalty_rows, penalty_backsub, penalty_row_mask
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_ops, only: sf_op_t, sfo_layout, sfo_build, sfo_fill, sfo_vars_in, sfo_vars_out, &
@@ -139,6 +186,7 @@ module mod_petsc_pc_vs
   use mod_petsc_raw_csr, only: blockmv_attach
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
   use mod_petsc_pc_dual, only: dual_basis, dual_symmetrize, DUAL_PLAIN, DUAL_AVG, DUAL_SYM
+  use mod_petsc_pc_spdmg, only: SPDMG_PV
   implicit none
   private
 
@@ -194,7 +242,30 @@ module mod_petsc_pc_vs
   type(mass_cheb_t), save :: mc_j, mc_w
   type(penalty_rows_t), save :: pen           !< the full Jacobian's penalty rows
 
-  integer, parameter :: NSV = 6
+  !> v_par (vs_lumped, model600 with v_par; module header): P_V's solver and
+  !! options, B_77 and the couplings o_vc(VC_ij) = B_ij, P_V (o_pv%mat) and
+  !! with -vs_vpar_flow adv P_V^A (pva); the pieces kept for the refills: the
+  !! masks of rho's and V's constrained DOFs (1 - mask: cmask), W times rho's
+  !! mask, Q = W sym(B_55) W and B_55', X, B_57 masked, the congruence
+  !! B_57' X B_57, B_77'; for adv Q_A = W B_55 W, Z_A and B_57' Z_A B_57
+  logical, save :: vpar     = .false.
+  logical, save :: pv_adv   = .false.         !< -vs_vpar_flow adv
+  logical, save :: pv_core  = .true.          !< -vs_vpar_core
+  integer, save :: bk_pv    = SF_GMG          !< physics_pc_sf_vpar, or SF_SPDMG (-vs_pv_solver)
+  character(len=512), save :: pv_view = ""    !< -vs_pv_view
+  type(block_solver_t), save :: slv_pv
+  integer, parameter :: VC_57 = 1, VC_67 = 2, VC_71 = 3, VC_72 = 4
+  integer, parameter :: NVC = 4
+  type(sf_op_t), save :: o_v77, o_vc(NVC), o_pv
+  Vec, save :: mask_rho, cmask_rho, mask_v, cmask_v, w_rho
+  Mat, save :: q_pv, b55t, x_pv, b57m, t_pv, b77t, pva, qa_pv, za_pv, ta_pv
+  !> floors of rho0 and T0 in W against their maxima over the grid
+  real*8, parameter :: W_FLOOR = 1.d-6
+
+  !> the variables' pieces of x and y: (psi, u, j, omega, rho, T[, V]); V's
+  !! is NSV with v_par (vs_init checks var_Vpar), T's otherwise, never read
+  integer, parameter :: NSV = merge(7, 6, var_Vpar > 0)
+  integer, parameter :: SV_V = NSV
   Vec, save :: sv_x(NSV), sv_y(NSV)
   Vec, save :: rhs_V, sol_V, rhs_PJ, sol_PJ
   Vec, save :: m_j, w1, w2, w3
@@ -210,7 +281,8 @@ contains
   !! of M_rho.
   subroutine vs_init(my_id)
     use phys_module, only: physics_pc_sf_pair_psi, physics_pc_sf_pair_w, physics_pc_sf_rho, physics_pc_sf_T, &
-                           physics_pc_sf_rtol, physics_pc_sf_harm_couple, physics_pc_sf_mode_split
+                           physics_pc_sf_rtol, physics_pc_sf_harm_couple, physics_pc_sf_mode_split, &
+                           physics_pc_sf_vpar, physics_pc_sf_vpar_stage
     use mod_parameters, only: n_tor, var_T
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
@@ -270,9 +342,35 @@ contains
     if (jorek_model /= 199 .and. jorek_model /= 600) &
       call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped supports model199 and model600 "// &
                  "only (model183's psi row has the mass B_11, not opz B_33)")
-    if (n_var /= 6 .or. var_T /= 6) &
-      call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped supports (psi, u, zj, w, rho, T) "// &
-                 "only: build without v_par, with_TiTe, with_neutrals and with_impurities")
+    ! v_par: vs_lumped on model600 (V = 7 after (psi, u, zj, w, rho, T))
+    vpar = lumped .and. jorek_model == 600 .and. n_var == 7 .and. var_Vpar == 7
+    if (.not. (n_var == 6 .or. vpar) .or. var_T /= 6) &
+      call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped supports (psi, u, zj, w, rho, T), "// &
+                 "and vs_lumped also with v_par on model600, only: build without with_TiTe, with_neutrals and "// &
+                 "with_impurities (and without v_par for vs_ideal and vs_resistive)")
+    if (vpar) then
+      bk_pv = sf_backend(physics_pc_sf_vpar, "physics_pc_sf_vpar", my_id)
+      form = "default"
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pv_solver", form, is_set, ierr)
+      select case (trim(form))
+      case ("default")
+      case ("spdmg");    bk_pv = SF_SPDMG
+      case default
+        call fatal("-vs_pv_solver must be default | spdmg, got '"//trim(form)//"'")
+      end select
+      form = "sym"
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_vpar_flow", form, is_set, ierr)
+      select case (trim(form))
+      case ("sym");  pv_adv = .false.
+      case ("adv");  pv_adv = .true.
+      case default
+        call fatal("-vs_vpar_flow must be sym | adv, got '"//trim(form)//"'")
+      end select
+      call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_vpar_core", flag, is_set, ierr)
+      if (is_set) pv_core = flag
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pv_view", pv_view, is_set, ierr)
+      if (.not. is_set) pv_view = ""
+    endif
     if (mod(n_tor, 2) /= 1) call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped needs n_tor "// &
                                        "odd (n = 0 plus cos/sin pairs)")
     ! -vs_bending resistive: the models above assemble M_eta, K_eta and K_1
@@ -308,6 +406,25 @@ contains
       write(*,'(A,A)') P//"Laplacian: ", trim(physics_pc_sf_pair_w)//" (B_42, once)"
       write(*,'(A,A)') P//"pair_psi : ", trim(physics_pc_sf_pair_psi)
       write(*,'(A,A)') P//"rho / T  : ", trim(physics_pc_sf_rho)//" / "//trim(physics_pc_sf_T)
+      if (vpar) then
+        if (bk_pv == SF_SPDMG) then
+          write(*,'(A)') P//"v_par    : spdmg (ring-free SPD multigrid, -vs_pvmg_*), after pair_psi, before rho and T"
+        else
+          write(*,'(A)') P//"v_par    : "//trim(physics_pc_sf_vpar)//", after pair_psi, before rho and T"
+        endif
+        if (pv_core) then
+          form = "with"
+        else
+          form = "without"
+        endif
+        write(*,'(A)') P//"  P_V = sym(B_77) + B_57' X B_57, X = (Z + Z') / 2, Z the local dual basis of "// &
+                       "W sym(B_55) W, W = (rho0 / T0)^1/2, "//trim(form)//" the core patch (-vs_vpar_core)"
+        if (pv_adv) write(*,'(A)') P//"  -vs_vpar_flow adv: FGMRES on P_V^A = B_77 + B_57' Z_A B_57 (Z_A of "// &
+                                   "W B_55 W) with P_V's preconditioner"
+        write(*,'(A)') P//"  P_V V = x_V - B_71 psi - B_72 u, then B_57 V, B_67 V in the rho, T rows; left out: "// &
+                       "B_27, B_75, B_76 (physics_pc_sf_vpar_stage = "//trim(physics_pc_sf_vpar_stage)// &
+                       " has no effect)"
+      endif
       write(*,'(A,ES9.2)') P//"masses B_33, B_44: Chebyshev, B-norm error bound ", MASS_TARGET
       write(*,'(A,ES9.2)') P//"inner rtol: ", physics_pc_sf_rtol
       if (harm_all) then
@@ -386,6 +503,12 @@ contains
       call build_or_fill(o_meta, [g_ctx%M_eta])
       call build_or_fill(o_keta, [g_ctx%K_eta])
     endif
+    if (vpar) then
+      call build_or_fill(o_v77, wm)
+      do k = 1, NVC
+        call build_or_fill(o_vc(k), wm)
+      enddo
+    endif
     if (first) then
       call sfo_build(o_lap, A_full, wd, sf_opz(), my_id)
       call sfo_build(o_mj, A_full, wm, sf_opz(), my_id)
@@ -400,10 +523,25 @@ contains
       do k = 1, NCB
         if (.not. blockmv_attach(o_cb(k)%mat, int(pc_ntor))) nno = nno + 1
       enddo
+      if (vpar) then
+        do k = 1, NVC
+          if (.not. blockmv_attach(o_vc(k)%mat, int(pc_ntor))) nno = nno + 1
+        enddo
+      endif
       if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   VS: WARNING ", nno, &
         " coupling block(s) not AIJ, left on PETSc's matvec"
     endif
-    if (lumped) call assemble_lumped()
+    if (lumped) then
+      call PetscLogEventBegin(pcev_asm_pl, ierr)
+      call assemble_lumped()
+      call PetscLogEventEnd(pcev_asm_pl, ierr)
+    endif
+    ! P_V from B_55 before its penalty rows are decoupled for rho's solve
+    if (vpar) then
+      call PetscLogEventBegin(pcev_asm_pv, ierr)
+      call assemble_pv()
+      call PetscLogEventEnd(pcev_asm_pv, ierr)
+    endif
     call physics_pc_mem("VS build: operators filled", my_id)
 
     ! the Jacobian's boundary rows, penalty or eliminated (diagonal only), are
@@ -417,8 +555,19 @@ contains
     ! but leave the matrix not symmetric
     if (lumped) then
       call sf_solver_penalty_rows(slv_vort, o_pl, comm_s, my_id)
-      if (first) call report_skew()
+      if (first) call report_skew(o_pl%mat, "P_lumped")
       call view_build(o_pl%mat, pl_view, "P_lumped")
+    endif
+    ! P_V likewise: its constrained rows are B_77's diagonal alone (P_V^A's
+    ! take P_V's decoupled ones)
+    if (vpar) then
+      call sf_solver_penalty_rows(slv_pv, o_pv, comm_s, my_id)
+      if (pv_adv) call pva_boundary_rows()
+      if (first) then
+        call report_skew(o_pv%mat, "P_V")
+        if (pv_adv) call report_skew(pva, "P_V^A")
+      endif
+      call view_build(o_pv%mat, pv_view, "P_V")
     endif
     if (.not. eliminate_boundary_dofs) then
       if (.not. lumped) call sf_solver_penalty_rows(slv_vort, o_vort, comm_s, my_id)
@@ -450,6 +599,20 @@ contains
                            axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
     endif
     call PetscLogEventEnd(pcev_fact_vort, ierr)
+
+    ! P_V, one field, the sound wave as a diffusion along B: T's rings (as
+    ! vs_alfven's b0) or the SPD multigrid's P_V instance
+    if (vpar) then
+      call PetscLogEventBegin(pcev_fact_pv, ierr)
+      if (pv_adv) then
+        call sf_solver_setup(slv_pv, o_pv%mat, bk_pv, "P_V", comm_s, my_id, rtol, gmg_inst=6, nfields=1, &
+                             smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, spdmg_inst=SPDMG_PV, amat=pva)
+      else
+        call sf_solver_setup(slv_pv, o_pv%mat, bk_pv, "P_V", comm_s, my_id, rtol, gmg_inst=6, nfields=1, &
+                             smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, spdmg_inst=SPDMG_PV)
+      endif
+      call PetscLogEventEnd(pcev_fact_pv, ierr)
+    endif
 
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
     call sf_solver_setup(slv_rho, o_rho%mat, bk_rho, "rho", comm_s, my_id, rtol, gmg_inst=3, nfields=1, &
@@ -619,20 +782,233 @@ contains
       endif
     end subroutine eta_self_check
 
-    !> The skew part of the solved P_lumped against the matrix, in the
-    !! Frobenius norm: the quadrature error of B_23 = -B_12' with a symmetric
-    !! X and no flow.
-    subroutine report_skew()
+    !> The skew part of the solved operator mat against the matrix, in the
+    !! Frobenius norm. P_lumped: the quadrature error of B_23 = -B_12' with a
+    !! symmetric X and no flow; P_V: rounding (symmetric by construction);
+    !! P_V^A: the advection.
+    subroutine report_skew(mat, name)
+      Mat, intent(in) :: mat
+      character(len=*), intent(in) :: name
       Mat :: pt
       real*8 :: nskew, np_
-      call MatTranspose(o_pl%mat, MAT_INITIAL_MATRIX, pt, ierr)
-      call MatAXPY(pt, -1.0d0, o_pl%mat, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatTranspose(mat, MAT_INITIAL_MATRIX, pt, ierr)
+      call MatAXPY(pt, -1.0d0, mat, DIFFERENT_NONZERO_PATTERN, ierr)
       call MatNorm(pt, NORM_FROBENIUS, nskew, ierr)
-      call MatNorm(o_pl%mat, NORM_FROBENIUS, np_, ierr)
+      call MatNorm(mat, NORM_FROBENIUS, np_, ierr)
       call MatDestroy(pt, ierr)
-      if (my_id == 0) write(*,'(A,ES9.2,A)') "[Physics PC]   P_lumped: skew part ", 0.5d0 * nskew / np_, &
+      if (my_id == 0) write(*,'(A,ES9.2,A)') "[Physics PC]   "//name//": skew part ", 0.5d0 * nskew / np_, &
         " of its Frobenius norm"
     end subroutine report_skew
+
+    !> P_V = Mv (B_77 + B_77') Mv / 2 + (1 - Mv) diag(B_77) + B_57m' X B_57m
+    !! (module header), B_57m = Mr B_57 Mv, Mr and Mv the masks of rho's and
+    !! V's constrained DOFs (0 there), X = (Z + Z') / 2, Z the local dual basis
+    !! of Q = W sym(B_55) W with Q's constrained rows and columns decoupled
+    !! (unit diagonal), W at every build from the state; with -vs_vpar_flow
+    !! adv also P_V^A = Mv B_77 Mv + B_57m' Z_A B_57m, Z_A the dual basis of
+    !! W B_55 W (pva_boundary_rows sets its constrained rows). The patterns
+    !! are the first build's (the grid's patches), the products' symbolic
+    !! phases are reused.
+    subroutine assemble_pv()
+      Mat :: zn
+      Vec :: dv
+      integer :: nm_r, nm_v
+      if (first) then
+        call penalty_row_mask(o_rho%mat, mask_rho, nm_r)
+        call penalty_row_mask(o_v77%mat, mask_v, nm_v)
+        call VecDuplicate(mask_rho, cmask_rho, ierr)
+        call VecSet(cmask_rho, 1.0d0, ierr)
+        call VecAXPY(cmask_rho, -1.0d0, mask_rho, ierr)
+        call VecDuplicate(mask_v, cmask_v, ierr)
+        call VecSet(cmask_v, 1.0d0, ierr)
+        call VecAXPY(cmask_v, -1.0d0, mask_v, ierr)
+        call VecDuplicate(mask_rho, w_rho, ierr)
+        if (my_id == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   v_par: ", nm_r, &
+          " constrained rows of rho (B_55), ", nm_v, " of V (B_77) leave the congruence B_57' X B_57"
+        call vpar_self_check()
+      endif
+      call node_weights(w_rho)
+
+      ! Q = W sym(B_55) W, Dirichlet rows at rho's constrained DOFs
+      if (first) then
+        call MatTranspose(o_rho%mat, MAT_INITIAL_MATRIX, b55t, ierr)
+        call MatDuplicate(o_rho%mat, MAT_COPY_VALUES, q_pv, ierr)
+        call MatAXPY(q_pv, 1.0d0, b55t, DIFFERENT_NONZERO_PATTERN, ierr)
+      else
+        call MatTranspose(o_rho%mat, MAT_REUSE_MATRIX, b55t, ierr)
+        call MatZeroEntries(q_pv, ierr)
+        call MatAXPY(q_pv, 1.0d0, o_rho%mat, SUBSET_NONZERO_PATTERN, ierr)
+        call MatAXPY(q_pv, 1.0d0, b55t, SUBSET_NONZERO_PATTERN, ierr)
+      endif
+      call MatScale(q_pv, 0.5d0, ierr)
+      call MatDiagonalScale(q_pv, w_rho, w_rho, ierr)
+      call MatDiagonalSet(q_pv, cmask_rho, ADD_VALUES, ierr)
+
+      ! X
+      if (first) then
+        call dual_basis(q_pv, int(pc_ntor), x_pv, my_id, "W sym(B_55) W", core=pv_core)
+        call dual_symmetrize(x_pv, q_pv, DUAL_AVG)
+      else
+        call dual_basis(q_pv, int(pc_ntor), zn, my_id, core=pv_core)
+        call dual_symmetrize(zn, q_pv, DUAL_AVG)
+        call MatCopy(zn, x_pv, SAME_NONZERO_PATTERN, ierr)
+        call MatDestroy(zn, ierr)
+      endif
+
+      ! B_57m, then the congruence T = B_57m' X B_57m
+      if (first) then
+        call MatDuplicate(o_vc(VC_57)%mat, MAT_COPY_VALUES, b57m, ierr)
+      else
+        call MatCopy(o_vc(VC_57)%mat, b57m, SAME_NONZERO_PATTERN, ierr)
+      endif
+      call MatDiagonalScale(b57m, mask_rho, mask_v, ierr)
+      if (first) then
+        call MatPtAP(x_pv, b57m, MAT_INITIAL_MATRIX, 2.0d0, t_pv, ierr)
+      else
+        call MatPtAP(x_pv, b57m, MAT_REUSE_MATRIX, 2.0d0, t_pv, ierr)
+      endif
+
+      ! P_V; its pattern: B_77, B_77' and T
+      if (first) then
+        call MatTranspose(o_v77%mat, MAT_INITIAL_MATRIX, b77t, ierr)
+        call MatDuplicate(t_pv, MAT_COPY_VALUES, o_pv%mat, ierr)
+        call MatAXPY(o_pv%mat, 1.0d0, o_v77%mat, DIFFERENT_NONZERO_PATTERN, ierr)
+        call MatAXPY(o_pv%mat, 1.0d0, b77t, DIFFERENT_NONZERO_PATTERN, ierr)
+        o_pv%label = "P_V"; o_pv%nf = 1
+      else
+        call MatTranspose(o_v77%mat, MAT_REUSE_MATRIX, b77t, ierr)
+      endif
+      call MatZeroEntries(o_pv%mat, ierr)
+      call MatAXPY(o_pv%mat, 0.5d0, o_v77%mat, SUBSET_NONZERO_PATTERN, ierr)
+      call MatAXPY(o_pv%mat, 0.5d0, b77t, SUBSET_NONZERO_PATTERN, ierr)
+      call MatDiagonalScale(o_pv%mat, mask_v, mask_v, ierr)
+      call MatCreateVecs(o_v77%mat, dv, PETSC_NULL_VEC, ierr)
+      call MatGetDiagonal(o_v77%mat, dv, ierr)
+      call VecPointwiseMult(dv, dv, cmask_v, ierr)
+      call MatDiagonalSet(o_pv%mat, dv, ADD_VALUES, ierr)
+      call VecDestroy(dv, ierr)
+      call MatAXPY(o_pv%mat, 1.0d0, t_pv, SUBSET_NONZERO_PATTERN, ierr)
+
+      if (.not. pv_adv) return
+      ! Q_A = W B_55 W, Z_A, T_A = B_57m' Z_A B_57m, P_V^A = Mv B_77 Mv + T_A;
+      ! dual_basis returns the rows of the patch matrices' inverse transposes
+      ! (the dual basis of M' for a non-symmetric M), so it gets Q_A' = W B_55' W
+      if (first) then
+        call MatDuplicate(b55t, MAT_COPY_VALUES, qa_pv, ierr)
+      else
+        call MatCopy(b55t, qa_pv, SAME_NONZERO_PATTERN, ierr)
+      endif
+      call MatDiagonalScale(qa_pv, w_rho, w_rho, ierr)
+      call MatDiagonalSet(qa_pv, cmask_rho, ADD_VALUES, ierr)
+      if (first) then
+        call dual_basis(qa_pv, int(pc_ntor), za_pv, my_id, "W B_55' W (P_V^A)", core=pv_core)
+        call MatPtAP(za_pv, b57m, MAT_INITIAL_MATRIX, 2.0d0, ta_pv, ierr)
+        call MatDuplicate(ta_pv, MAT_COPY_VALUES, pva, ierr)
+        call MatAXPY(pva, 1.0d0, o_v77%mat, DIFFERENT_NONZERO_PATTERN, ierr)
+      else
+        call dual_basis(qa_pv, int(pc_ntor), zn, my_id, core=pv_core)
+        call MatCopy(zn, za_pv, SAME_NONZERO_PATTERN, ierr)
+        call MatDestroy(zn, ierr)
+        call MatPtAP(za_pv, b57m, MAT_REUSE_MATRIX, 2.0d0, ta_pv, ierr)
+      endif
+      call MatZeroEntries(pva, ierr)
+      call MatAXPY(pva, 1.0d0, o_v77%mat, SUBSET_NONZERO_PATTERN, ierr)
+      call MatDiagonalScale(pva, mask_v, mask_v, ierr)
+      call MatAXPY(pva, 1.0d0, ta_pv, SUBSET_NONZERO_PATTERN, ierr)
+    end subroutine assemble_pv
+
+    !> P_V^A's constrained rows: P_V's decoupled diagonal (after
+    !! sf_solver_penalty_rows), so that both have the same Dirichlet rows and
+    !! the penalty rows' right-hand-side factor of slv_pv fits P_V^A.
+    subroutine pva_boundary_rows()
+      Vec :: dv
+      call MatCreateVecs(o_pv%mat, dv, PETSC_NULL_VEC, ierr)
+      call MatGetDiagonal(o_pv%mat, dv, ierr)
+      call VecPointwiseMult(dv, dv, cmask_v, ierr)
+      call MatDiagonalSet(pva, dv, ADD_VALUES, ierr)
+      call VecDestroy(dv, ierr)
+    end subroutine pva_boundary_rows
+
+    !> w = (rho0 / T0)^1/2 at the node of each row's JOREK index (the n = 0
+    !! value DOF of the state, node_list), times rho's mask, in o_rho's
+    !! layout. rho0 and T0 are floored at W_FLOOR times their maxima over
+    !! the grid (a WARNING with the count where the floor acts).
+    subroutine node_weights(w)
+      use nodes_elements, only: node_list
+      use mod_parameters, only: n_degrees, var_rho, var_T
+      Vec, intent(inout) :: w
+      PetscScalar, pointer :: wa(:), ma(:)
+      PetscInt :: rs, re, ng
+      real*8, allocatable :: wi(:)
+      real*8 :: rmax, tmax, r0, t0
+      integer :: n, kd, i, ns, nfl
+      ns = int(pc_ntor)
+      call MatGetSize(o_rho%mat, ng, PETSC_NULL_INTEGER, ierr)
+      allocate(wi(0:int(ng) / ns - 1))
+      wi = 0.d0
+      rmax = 0.d0; tmax = 0.d0
+      do n = 1, node_list%n_nodes
+        rmax = max(rmax, node_list%node(n)%values(1, 1, var_rho))
+        tmax = max(tmax, node_list%node(n)%values(1, 1, var_T))
+      enddo
+      nfl = 0
+      do n = 1, node_list%n_nodes
+        r0 = node_list%node(n)%values(1, 1, var_rho)
+        t0 = node_list%node(n)%values(1, 1, var_T)
+        if (r0 < W_FLOOR * rmax .or. t0 < W_FLOOR * tmax) nfl = nfl + 1
+        r0 = max(r0, W_FLOOR * rmax); t0 = max(t0, W_FLOOR * tmax)
+        do kd = 1, n_degrees
+          wi(node_list%node(n)%index(kd) - 1) = sqrt(r0 / t0)
+        enddo
+      enddo
+      if (nfl > 0 .and. my_id == 0) write(*,'(A,I0,A,ES8.1,A)') "[Physics PC]   v_par: WARNING rho0 or T0 "// &
+        "floored at ", nfl, " nodes (", W_FLOOR, " of the maximum) in W = (rho0 / T0)^1/2"
+      call MatGetOwnershipRange(o_rho%mat, rs, re, ierr)
+      call VecGetArray(w, wa, ierr)
+      call VecGetArrayRead(mask_rho, ma, ierr)
+      do i = int(rs), int(re) - 1
+        wa(i - int(rs) + 1) = wi(i / ns) * ma(i - int(rs) + 1)
+      enddo
+      call VecRestoreArrayRead(mask_rho, ma, ierr)
+      call VecRestoreArray(w, wa, ierr)
+      deallocate(wi)
+    end subroutine node_weights
+
+    !> The first build's check of the structure P_V rests on, on the
+    !! interior rows and columns (B_57m = Mr B_57 Mv, B_76m = Mv B_76 MT):
+    !! |B_57m - B_76m|_F and |B_76m + B_57m'|_F against |B_57m|_F (the study:
+    !! 1e-16 and 1e-5 at rest). B_76 is extracted for the check alone.
+    subroutine vpar_self_check()
+      use mod_parameters, only: var_T
+      type(sf_op_t) :: o_76
+      Mat :: b57i, b76i, dm
+      Vec :: mask_t
+      real*8 :: n57, nd, ns_
+      o_76%label = "B_76"; o_76%nf = 1; o_76%tag = o_vc(NVC)%tag + 1
+      o_76%se(1, 1) = var_Vpar; o_76%sv(1, 1) = var_T
+      call sfo_build(o_76, A_full, wm, sf_opz(), my_id)
+      call penalty_row_mask(o_T%mat, mask_t)
+      call MatDuplicate(o_vc(VC_57)%mat, MAT_COPY_VALUES, b57i, ierr)
+      call MatDiagonalScale(b57i, mask_rho, mask_v, ierr)
+      call MatDuplicate(o_76%mat, MAT_COPY_VALUES, b76i, ierr)
+      call MatDiagonalScale(b76i, mask_v, mask_t, ierr)
+      call MatNorm(b57i, NORM_FROBENIUS, n57, ierr)
+      call MatDuplicate(b57i, MAT_COPY_VALUES, dm, ierr)
+      call MatAXPY(dm, -1.0d0, b76i, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatNorm(dm, NORM_FROBENIUS, nd, ierr)
+      call MatDestroy(dm, ierr)
+      call MatTranspose(b57i, MAT_INITIAL_MATRIX, dm, ierr)
+      call MatAXPY(dm, 1.0d0, b76i, DIFFERENT_NONZERO_PATTERN, ierr)
+      call MatNorm(dm, NORM_FROBENIUS, ns_, ierr)
+      call MatDestroy(dm, ierr)
+      call MatDestroy(b57i, ierr)
+      call MatDestroy(b76i, ierr)
+      call VecDestroy(mask_t, ierr)
+      call sfo_destroy(o_76)
+      if (my_id == 0 .and. n57 > 0.d0) write(*,'(A,ES10.3,A,ES10.3,A,ES10.3,A)') "[Physics PC]   v_par check: "// &
+        "|B_57 - B_76|_F = ", nd / n57, ", |B_76 + B_57'|_F = ", ns_ / n57, " of |B_57|_F = ", n57, &
+        " (interior rows and columns)"
+    end subroutine vpar_self_check
 
     !> mat in PETSc's binary format to file fname, if fname is set (the
     !! operators' layout: JOREK index, slot fastest): the first build creates
@@ -672,6 +1048,9 @@ contains
       integer, parameter :: re(NRB) = [var_psi, var_psi, var_zj]
       integer, parameter :: rv(NRB) = [var_psi, var_zj, var_psi]
       character(len=4), parameter :: rn(NRB) = ["B_11", "B_13", "B_31"]
+      integer, parameter :: ve(NVC) = [var_rho, var_T, var_Vpar, var_Vpar]
+      integer, parameter :: vv(NVC) = [var_Vpar, var_Vpar, var_psi, var_u]
+      character(len=4), parameter :: vn(NVC) = ["B_57", "B_67", "B_71", "B_72"]
       integer, parameter :: NDIAG = 7
       integer :: k_
       ! fields (w, y[, z]): the columns of omega, j[, psi]; the rows of u, then
@@ -708,6 +1087,15 @@ contains
       enddo
       o_meta%label = "M_eta"; o_meta%nf = 1; o_meta%tag = NDIAG + NCB + NRB + 1; o_meta%wid(1, 1) = 1
       o_keta%label = "K_eta"; o_keta%nf = 1; o_keta%tag = NDIAG + NCB + NRB + 2; o_keta%wid(1, 1) = 1
+      ! v_par: B_77 and the couplings B_57, B_67 (V's column in the rho and
+      ! T rows), B_71, B_72 (V's row); tags after K_1's (K_eta's + 1)
+      if (vpar) then
+        call sfo_define(o_v77, "B_77", NDIAG + NCB + NRB + 4, [var_Vpar])
+        do k_ = 1, NVC
+          o_vc(k_)%label = vn(k_); o_vc(k_)%nf = 1; o_vc(k_)%tag = NDIAG + NCB + NRB + 4 + k_
+          o_vc(k_)%se(1, 1) = ve(k_); o_vc(k_)%sv(1, 1) = vv(k_)
+        enddo
+      endif
     end subroutine define_operators
 
     subroutine create_work_vectors()
@@ -788,18 +1176,28 @@ contains
     call sf_solver_solve(slv_pj, rhs_PJ, sol_PJ, pcev_solve_pj)
     call sf_split_parts(sol_PJ, [y_psi, y_j], .false.)
 
-    ! 5. B_55 rho = x_rho - B_51 psi - B_52 u
+    ! 4b. v_par: P_V V = x_V - B_71 psi - B_72 u
+    if (vpar) then
+      call MatMult(o_vc(VC_71)%mat, y_psi, w1, ierr)
+      call VecAYPX(w1, -1.0d0, sv_x(SV_V), ierr)
+      call sub_vmult(VC_72, y_u, w1)
+      call sf_solver_solve(slv_pv, w1, sv_y(SV_V), pcev_solve_pv)
+    endif
+
+    ! 5. B_55 rho = x_rho - B_51 psi - B_52 u [- B_57 V]
     call MatMult(o_cb(CB_51)%mat, y_psi, w1, ierr)
     call VecAYPX(w1, -1.0d0, x_rho, ierr)
     call sub_mult(CB_52, y_u, w1)
+    if (vpar) call sub_vmult(VC_57, sv_y(SV_V), w1)
     call sf_solver_solve(slv_rho, w1, y_rho, pcev_solve_rhot)
 
-    ! 6. B_66 T = x_T - B_61 psi - B_63 j - B_62 u - B_65 rho
+    ! 6. B_66 T = x_T - B_61 psi - B_63 j - B_62 u - B_65 rho [- B_67 V]
     call MatMult(o_cb(CB_61)%mat, y_psi, w1, ierr)
     call VecAYPX(w1, -1.0d0, x_T, ierr)
     call sub_mult(CB_63, y_j, w1)
     call sub_mult(CB_62, y_u, w1)
     if (use_b65) call sub_mult(CB_65, y_rho, w1)
+    if (vpar) call sub_vmult(VC_67, sv_y(SV_V), w1)
     call sf_solver_solve(slv_T, w1, y_T, pcev_solve_rhot)
 
     ! 7.
@@ -821,24 +1219,37 @@ contains
       call VecAXPY(r, -1.0d0, w3, ierr)
     end subroutine sub_mult
 
+    !> r -= B_k v, v_par's couplings
+    subroutine sub_vmult(k, v, r)
+      integer, intent(in) :: k
+      Vec :: v, r
+      call MatMult(o_vc(k)%mat, v, w3, ierr)
+      call VecAXPY(r, -1.0d0, w3, ierr)
+    end subroutine sub_vmult
+
   end subroutine vs_apply
 
   !> Inner-iteration summary, one line per block (mode split: per family),
   !! then reset. Collective.
   subroutine vs_report(my_id)
     integer, intent(in) :: my_id
-    if (famode) then
+    if (famode .and. vpar) then
+      call sf_solver_family_report("VS", [slv_vort, slv_lap, slv_pj, slv_pv, slv_rho, slv_T], t_apply, t_scat, &
+                                   comm_g)
+    else if (famode) then
       call sf_solver_family_report("VS", [slv_vort, slv_lap, slv_pj, slv_rho, slv_T], t_apply, t_scat, comm_g)
     else
       call sf_solver_report(slv_vort, my_id)
       call sf_solver_report(slv_lap,  my_id)
       call sf_solver_report(slv_pj,   my_id)
+      if (vpar) call sf_solver_report(slv_pv, my_id)
       call sf_solver_report(slv_rho,  my_id)
       call sf_solver_report(slv_T,    my_id)
     endif
     call sf_solver_reset_counters(slv_vort)
     call sf_solver_reset_counters(slv_lap)
     call sf_solver_reset_counters(slv_pj)
+    call sf_solver_reset_counters(slv_pv)
     call sf_solver_reset_counters(slv_rho)
     call sf_solver_reset_counters(slv_T)
     t_apply = 0.d0;  t_scat = 0.d0
