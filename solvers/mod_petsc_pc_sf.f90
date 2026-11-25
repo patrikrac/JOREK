@@ -92,10 +92,10 @@ contains
     use phys_module, only: physics_pc_sf_pair_psi, physics_pc_sf_pair_w, physics_pc_sf_rho, physics_pc_sf_T, &
                            physics_pc_sf_rtol, physics_pc_sf_harm_couple, physics_pc_sf_corrector, &
                            physics_pc_sf_mode_split, physics_pc_sf_vpar, physics_pc_sf_vpar_stage, use_pfafem
-    use mod_parameters, only: n_tor
+    use mod_parameters, only: n_tor, n_period, n_coord_period
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
-    logical :: ok_vars
+    logical :: ok_vars, floquet_split
     character(len=*), parameter :: P = "[Physics PC]   "
 
     if (sf_init_done) return
@@ -117,9 +117,10 @@ contains
     if (.not. use_pfafem .and. mod(n_tor, 2) /= 1) &
       call fatal("physics_pc_sf needs n_tor odd (n = 0 plus cos/sin pairs)")
 
-    harm_all    = physics_pc_sf_harm_couple
-    sf_gmg_harm = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
-    famode      = physics_pc_sf_mode_split .and. .not. harm_all
+    harm_all      = physics_pc_sf_harm_couple
+    sf_gmg_harm   = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
+    floquet_split = physics_pc_sf_mode_split .and. harm_all .and. (n_coord_period > n_period)
+    famode        = physics_pc_sf_mode_split .and. ((.not. harm_all) .or. floquet_split)
 
     corr = physics_pc_sf_corrector
     if (corr == -1) corr = 4
@@ -139,8 +140,8 @@ contains
       cb_active(13:16) = .true.
       if (vstage /= SF_VPAR_V0) cb_active(17:18) = .true.
       if (vstage == SF_VPAR_B1) then
-        if (.not. famode) call fatal("physics_pc_sf_vpar_stage = b1 needs the mode split "// &
-                                     "(physics_pc_sf_harm_couple = .f., physics_pc_sf_mode_split = .t.)")
+        if (.not. famode .or. harm_all) call fatal("physics_pc_sf_vpar_stage = b1 needs the mode split "// &
+                                                   "(physics_pc_sf_harm_couple = .f., physics_pc_sf_mode_split = .t.)")
         if (corr /= 1 .and. corr /= 2) &
           call fatal("physics_pc_sf_vpar_stage = b1 needs the Eq. (17) corrector (physics_pc_sf_corrector 1 | 2)")
       endif
@@ -165,12 +166,17 @@ contains
       write(*,'(A,ES9.2)') P//"inner rtol: ", physics_pc_sf_rtol
       if (use_pfafem) &
         write(*,'(A,I0,A)') P//"toroidal : PFAFEM B-spline (n_tor = ", n_tor, ") -> orthogonal Real-DFT (Q^T A Q)"
-      if (harm_all) then
+      if (floquet_split) then
+        write(*,'(A,I0,A)') P//"cross-|n|: Floquet family-coupled (N_fp = ", n_coord_period / max(1, n_period), &
+          "), all family slots per GMG smoother block"
+      else if (harm_all) then
         write(*,'(A)') P//"cross-|n|: all kept, all slots per GMG smoother block"
       else
         write(*,'(A)') P//"cross-|n|: none, |n|-diagonal blocks, cos / sin per GMG smoother block"
       endif
-      if (famode) then
+      if (floquet_split) then
+        write(*,'(A)') P//"layout   : one stellarator Floquet mode family per rank group (mode_split + harm_couple)"
+      else if (famode) then
         write(*,'(A)') P//"layout   : one |n| family per rank group (physics_pc_sf_mode_split)"
       else
         write(*,'(A)') P//"layout   : global operators"

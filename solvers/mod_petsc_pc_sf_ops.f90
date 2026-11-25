@@ -54,15 +54,15 @@ module mod_petsc_pc_sf_ops
   integer, save, public  :: sfo_nfam = 0
   PetscInt, save, public :: sfo_n1 = 0                  !< local rows per variable
 
-  logical, save :: ready = .false., keep_cross = .true.
-  integer, save :: gcomm = MPI_COMM_NULL, gme = -1, gnp = 0
+  logical, save :: ready = .false., keep_cross = .true., sfo_floquet = .false.
+  integer, save :: gcomm = MPI_COMM_NULL, gme = -1, gnp = 0, sfo_nfp = 1
   integer, save :: n_idx = 0                            !< JOREK indices (A's block rows)
   integer, save :: i0 = 0, i1 = 0                       !< my operator indices [i0, i1)
   integer, allocatable, save :: fr0(:)                  !< first global rank of each family, fr0(nfam+1) = gnp
   integer, allocatable, save :: ix0(:)                  !< first operator index of each global rank
   integer, allocatable, save :: idx0(:)                 !< first index of A's rows on each global rank, idx0(gnp) = n_idx
   PetscInt, allocatable, save :: rsx(:)                 !< first full-system row of each global rank
-  integer, allocatable, save :: myslots(:)
+  integer, allocatable, save :: myslots(:), sfo_slot_fam(:)
   VecScatter, save :: scv
   Vec, save :: stagev, xtv
   integer, save :: nsv = 0
@@ -77,25 +77,27 @@ contains
   !> Fix the layout, once: split = the mode split; cross = keep the entries
   !! between different |n| (global layout only).
   subroutine sfo_layout(A, comm, split, cross, my_id)
-    use mod_parameters,    only: n_tor, n_var
+    use mod_parameters,    only: n_tor, n_var, n_period, n_coord_period
     use mod_petsc_pc_harm, only: pc_harm_set
     Mat, intent(in)     :: A
     integer, intent(in) :: comm, my_id
     logical, intent(in) :: split, cross
-    integer, allocatable :: nrk(:), nl(:)
+    integer, allocatable :: nrk(:), nl(:), raw_f(:)
     real*8, allocatable :: ideal(:)
-    integer :: f, r, k, mpierr
+    integer :: f, r, k, m, kh, rmod, nf_max, mpierr
     PetscInt :: rs, re
     PetscErrorCode :: ierr
 
     if (ready) return
-    sfo_split = split
-    keep_cross = cross .and. .not. split
+    sfo_split   = split
+    sfo_nfp     = max(1, n_coord_period / max(1, n_period))
+    sfo_floquet = split .and. cross .and. (sfo_nfp > 1)
+    keep_cross  = cross .and. ((.not. split) .or. sfo_floquet)
     gcomm = comm
     call MPI_Comm_rank(comm, gme, mpierr)
     call MPI_Comm_size(comm, gnp, mpierr)
 
-    allocate(nl(0:gnp - 1), idx0(0:gnp), rsx(0:gnp - 1), ix0(0:gnp - 1))
+    allocate(nl(0:gnp - 1), idx0(0:gnp), rsx(0:gnp - 1), ix0(0:gnp - 1), sfo_slot_fam(0:n_tor - 1))
     call MatGetOwnershipRange(A, rs, re, ierr)
     call MPI_Allgather(int((re - rs) / (n_var * n_tor)), 1, MPI_INTEGER, nl, 1, MPI_INTEGER, comm, mpierr)
     call MPI_Allgather(rs, 1, MPIU_INTEGER, rsx, 1, MPIU_INTEGER, comm, mpierr)
@@ -105,16 +107,47 @@ contains
     enddo
     n_idx = idx0(gnp)
 
-    ! ranks per family in proportion to its slots, largest remainder first
-    sfo_nfam = merge(n_tor / 2 + 1, 1, split)
+    ! Assign each slot 0..n_tor-1 to its family 1..sfo_nfam
+    if (.not. split) then
+      sfo_nfam     = 1
+      sfo_slot_fam = 1
+    else if (sfo_floquet) then
+      allocate(raw_f(0:n_tor - 1))
+      nf_max = sfo_nfp / 2 + 1
+      do m = 0, n_tor - 1
+        kh       = (m + 1) / 2
+        rmod     = modulo(kh, sfo_nfp)
+        raw_f(m) = min(rmod, sfo_nfp - rmod) + 1
+      enddo
+      sfo_nfam = 0
+      sfo_slot_fam = 0
+      do f = 1, nf_max
+        if (any(raw_f == f)) then
+          sfo_nfam = sfo_nfam + 1
+          where (raw_f == f) sfo_slot_fam = sfo_nfam
+        endif
+      enddo
+      deallocate(raw_f)
+    else
+      sfo_nfam = n_tor / 2 + 1
+      do m = 0, n_tor - 1
+        sfo_slot_fam(m) = (m + 1) / 2 + 1
+      enddo
+    endif
+
     if (gnp < sfo_nfam) then
       if (my_id == 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]   FATAL: physics_pc_sf_mode_split needs at "// &
-        "least one rank per |n| family: ", sfo_nfam, " families, ", gnp, " ranks"
+        "least one rank per family: ", sfo_nfam, " families, ", gnp, " ranks"
       call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
     endif
     allocate(nrk(sfo_nfam), ideal(sfo_nfam), fr0(sfo_nfam + 1))
-    ideal = 2.d0; ideal(1) = 1.d0
-    if (split .and. mod(n_tor, 2) == 0) ideal(sfo_nfam) = 1.d0
+    do f = 1, sfo_nfam
+      if (sfo_floquet) then
+        ideal(f) = dble(count(sfo_slot_fam == f))**2
+      else
+        ideal(f) = dble(count(sfo_slot_fam == f))
+      endif
+    enddo
     ideal = gnp * ideal / sum(ideal)
     nrk = max(1, int(ideal))
     do while (sum(nrk) < gnp)
@@ -198,28 +231,51 @@ contains
     use mod_parameters, only: n_tor
     integer, intent(in) :: f
     integer, allocatable :: s(:)
-    integer :: m
+    integer :: m, ns, p
     if (.not. sfo_split) then
       s = [(m, m = 0, n_tor - 1)]
-    else if (f == 1) then
-      s = [0]
-    else if (2 * f - 2 >= n_tor) then
-      s = [2 * f - 3]
-    else
-      s = [2 * f - 3, 2 * f - 2]
+      return
     endif
+    ns = count(sfo_slot_fam == f)
+    allocate(s(ns))
+    p = 0
+    do m = 0, n_tor - 1
+      if (sfo_slot_fam(m) == f) then
+        p = p + 1
+        s(p) = m
+      endif
+    enddo
   end function fslots
 
   !> Is the entry between slots m and q kept? Slot m belongs to |n| group (m+1)/2.
   pure logical function kept(m, q)
     integer, intent(in) :: m, q
-    kept = keep_cross .or. (m + 1) / 2 == (q + 1) / 2
+    if (sfo_floquet) then
+      kept = (sfo_slot_fam(m) == sfo_slot_fam(q))
+    else
+      kept = keep_cross .or. (m + 1) / 2 == (q + 1) / 2
+    endif
   end function kept
 
   subroutine report_layout(my_id, nrk)
     integer, intent(in) :: my_id, nrk(:)
+    integer, allocatable :: sl(:)
     integer :: f, q, nmin, nmax
     if (my_id /= 0) return
+    if (sfo_floquet) then
+      write(*,'(A,I0,A,I0,A,I0,A)') "[Physics PC]   SF Floquet split (N_fp = ", sfo_nfp, "): ", &
+        sfo_nfam, " stellarator mode families on ", gnp, " ranks"
+      do f = 1, sfo_nfam
+        sl = fslots(f)
+        nmin = huge(1); nmax = 0
+        do q = 0, nrk(f) - 1
+          nmin = min(nmin, frange(f, q + 1) - frange(f, q)); nmax = max(nmax, frange(f, q + 1) - frange(f, q))
+        enddo
+        write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0)') "[Physics PC]     Floquet family ", f, ": ", nrk(f), &
+          " rank(s), ", size(sl), " coupled slots, indices/rank ", nmin, "-", nmax
+      enddo
+      return
+    endif
     write(*,'(A,I0,A,I0,A)') "[Physics PC]   SF mode split: ", sfo_nfam, " |n| families on ", gnp, " ranks"
     do f = 1, sfo_nfam
       nmin = huge(1); nmax = 0
