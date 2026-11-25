@@ -5,7 +5,8 @@
 !! here, per block, rather than in the namelist. A third backend, SF_SPDMG,
 !! is the ring-free multigrid of mod_petsc_pc_spdmg for a scalar symmetric
 !! positive definite block (vs_lumped's P, -vs_p_solver spdmg, and its P_V,
-!! -vs_pv_solver spdmg).
+!! -vs_pv_solver spdmg). A fourth, SF_HYPRE ("hypre"), is BoomerAMG for a
+!! scalar block (mod_petsc_pc_hypre).
 module mod_petsc_pc_sf_solver
 #ifdef USE_PETSC
   use mpi_mod
@@ -24,6 +25,9 @@ module mod_petsc_pc_sf_solver
   !! vs_lumped's P with -vs_p_solver spdmg, P_V with -vs_pv_solver spdmg;
   !! not a namelist backend.
   integer, parameter, public :: SF_SPDMG = 3
+  !> BoomerAMG (hypre via PCHYPRE) for a scalar block (mod_petsc_pc_hypre):
+  !! the namelist value "hypre", -vs_p_solver hypre and -vs_pv_solver hypre.
+  integer, parameter, public :: SF_HYPRE = 4
 
   !> Radial-line blocks: rho, v_par v0.
   integer, parameter, public :: SF_GMG_SMOOTHER_LINES = GMG_SM_LINES
@@ -80,18 +84,21 @@ module mod_petsc_pc_sf_solver
 
 contains
 
-  !> A backend name of the namelist ("lu" | "gmg") as SF_LU / SF_GMG; any
-  !! other name stops the run. nm is the namelist variable, for the message.
+  !> A backend name of the namelist ("lu" | "gmg" | "hypre") as SF_LU /
+  !! SF_GMG / SF_HYPRE; any other name stops the run. nm is the namelist
+  !! variable, for the message.
   integer function sf_backend(s, nm, my_id)
     character(len=*), intent(in) :: s, nm
     integer, intent(in) :: my_id
     integer :: mpierr
     select case (trim(adjustl(s)))
-    case ("lu");  sf_backend = SF_LU
-    case ("gmg"); sf_backend = SF_GMG
+    case ("lu");    sf_backend = SF_LU
+    case ("gmg");   sf_backend = SF_GMG
+    case ("hypre"); sf_backend = SF_HYPRE
     case default
       sf_backend = SF_LU
-      if (my_id == 0) write(*,'(A,A)') "[Physics PC]   FATAL: ", trim(nm)//" must be lu | gmg, got '"//trim(s)//"'"
+      if (my_id == 0) write(*,'(A,A)') "[Physics PC]   FATAL: ", trim(nm)//" must be lu | gmg | hypre, got '"// &
+                                       trim(s)//"'"
       call MPI_Abort(MPI_COMM_WORLD, 1, mpierr)
     end select
   end function sf_backend
@@ -133,6 +140,7 @@ contains
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_pc_apply_6, &
                                 gmg_opts_t
     use mod_petsc_pc_spdmg, only: spdmg_ksp_setup, SPDMG_P
+    use mod_petsc_pc_hypre, only: hypre_ksp_setup
     use mod_petsc_pc_harm, only: pc_ntor
     type(block_solver_t), intent(inout) :: slv
     Mat, intent(in)              :: A
@@ -263,6 +271,13 @@ contains
         call pc_print_block_setup(comm, label, trim(ktyp)//" + SPD-MG V-cycle (ring-free), rtol "// &
                                   trim(adjustl(tstr)))
       endif
+
+    case (SF_HYPRE)
+      ! BoomerAMG with the axis block and the flip of mod_petsc_pc_hypre,
+      ! options -sf_amg<gmg_inst>_*
+      if (fresh) call KSPCreate(comm, slv%ksp, ierr)
+      call hypre_ksp_setup(slv%ksp, A, int(pc_ntor), gmg_inst, nfields, label, comm, my_id, rtol, maxits, fresh, &
+                           amat)
 
     case default
       if (my_id == 0) write(*,'(A,I0)') "[Physics PC]   FATAL: sf_solver_setup got an unknown backend ", backend

@@ -135,7 +135,8 @@
 !! P_V's solver (-vs_pv_solver): the backend of physics_pc_sf_vpar (lu, or
 !! gmg: the ring GMG, instance 6, flux-surface rings, as vs_alfven's b0), or
 !! the second instance of the SPD multigrid (mod_petsc_pc_spdmg, options
-!! -vs_pvmg_*, radial lines and wedges by default).
+!! -vs_pvmg_*, radial lines and wedges by default), or BoomerAMG
+!! (mod_petsc_pc_hypre, options -sf_amg6_*).
 !!
 !! PETSc options of vs_lumped (read once, at the first assembly):
 !!   -vs_bending ideal | resistive     the line bending (default ideal)
@@ -146,21 +147,30 @@
 !!                                     first build creates the file, later
 !!                                     builds append)
 !!   -vs_ss_view <file>                S_s of every build, likewise
-!!   -vs_mem_report                    the first build reports every vs_lumped
+!!   -vs_blk_view <prefix>             the solved blocks pair_psi, B_55, B_66 of every
+!!                                     build and the Laplacian (first build) to
+!!                                     <prefix>_{pj,rho,T,lap}.petsc, likewise
+!!   -vs_mem_report                  the first build reports every vs_lumped
 !!                                     matrix (entries, rows, longest row, exact
 !!                                     zeros, entries between |n| families) and
 !!                                     the RSS after it, and the SPD-MG levels
 !!                                     ([VS mem] lines; collective, off)
 !!   -vs_dual_mat_view                 every dual basis (mod_petsc_pc_dual)
-!!   -vs_p_solver default | spdmg      P_lumped's solver: the backend of
+!!   -vs_p_solver default | spdmg | hypre | gmg
+!!                                     P_lumped's solver: the backend of
 !!                                     physics_pc_sf_pair_w (default: the ring
 !!                                     GMG with FGMRES, or LU), or the ring-free
 !!                                     SPD multigrid of mod_petsc_pc_spdmg (its
-!!                                     options -vs_pmg_*)
+!!                                     options -vs_pmg_*), or BoomerAMG
+!!                                     (mod_petsc_pc_hypre, -sf_amg1_*), or the
+!!                                     ring GMG whatever physics_pc_sf_pair_w
+!!                                     (gmg: that one then serves the Laplacian)
 !! and with v_par:
-!!   -vs_pv_solver default | spdmg     P_V's solver: the backend of
+!!   -vs_pv_solver default | spdmg | hypre
+!!                                     P_V's solver: the backend of
 !!                                     physics_pc_sf_vpar (default), or the SPD
-!!                                     multigrid's P_V instance (-vs_pvmg_*)
+!!                                     multigrid's P_V instance (-vs_pvmg_*), or
+!!                                     BoomerAMG (-sf_amg6_*)
 !!   -vs_vpar_flow sym | adv           the solve on P_V (default), or on P_V^A
 !!                                     with P_V's V-cycle
 !!   -vs_vpar_core <bool>              Z with the core patch (default true)
@@ -203,7 +213,8 @@ module mod_petsc_pc_vs
   logical, save :: res_dual     = .false.     !< vs_lumped: the resistive bending S_s (-vs_bending)
   logical, save :: res_core     = .true.      !< and its core patch at the axis (-vs_dual_core)
   character(len=512), save :: pl_view = "", ss_view = ""   !< -vs_pl_view, -vs_ss_view
-  logical, save :: famode       = .false.     !< mode split
+  character(len=512), save :: blk_view = ""                !< -vs_blk_view <prefix>: the solved blocks
+  logical, save :: famode      = .false.     !< mode split
   logical, save :: harm_all     = .true.      !< physics_pc_sf_harm_couple
   integer, save :: comm_g = MPI_COMM_NULL     !< the full system's communicator
   !> this rank's wall time in vs_apply and in its gather / scatter since the
@@ -213,7 +224,8 @@ module mod_petsc_pc_vs
   type(block_solver_t), save :: slv_vort, slv_lap, slv_pj, slv_rho, slv_T
   integer, save :: bk_vort = SF_GMG, bk_pj = SF_GMG, bk_rho = SF_GMG, bk_T = SF_GMG
   !> vs_lumped: the backend of P_lumped's solve (-vs_p_solver): bk_vort
-  !! (physics_pc_sf_pair_w, default) or SF_SPDMG (mod_petsc_pc_spdmg)
+  !! (physics_pc_sf_pair_w, default), SF_SPDMG (mod_petsc_pc_spdmg),
+  !! SF_HYPRE (mod_petsc_pc_hypre) or SF_GMG
   integer, save :: bk_pl = SF_GMG
 
   !> B-norm error bound of the Chebyshev mass solves
@@ -352,6 +364,8 @@ contains
       if (.not. is_set) pl_view = ""
       call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_ss_view", ss_view, is_set, ierr)
       if (.not. is_set) ss_view = ""
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_blk_view", blk_view, is_set, ierr)
+      if (.not. is_set) blk_view = ""
       call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_mem_report", flag, is_set, ierr)
       if (is_set) mem_report = flag
     endif
@@ -366,12 +380,16 @@ contains
       select case (trim(form))
       case ("default");  bk_pl = bk_vort
       case ("spdmg");    bk_pl = SF_SPDMG
+      case ("hypre");    bk_pl = SF_HYPRE
+      case ("gmg");      bk_pl = SF_GMG
       case default
-        call fatal("-vs_p_solver must be default | spdmg, got '"//trim(form)//"'")
+        call fatal("-vs_p_solver must be default | spdmg | hypre | gmg, got '"//trim(form)//"'")
       end select
     endif
     pname = physics_pc_sf_pair_w
     if (bk_pl == SF_SPDMG) pname = "spdmg (ring-free SPD multigrid)"
+    if (bk_pl == SF_HYPRE) pname = "hypre (BoomerAMG, -sf_amg1_*)"
+    if (bk_pl == SF_GMG .and. bk_vort /= SF_GMG) pname = "gmg (-vs_p_solver gmg)"
 
     if (jorek_model /= 199 .and. jorek_model /= 600) &
       call fatal("physics_pc_method = vs_ideal | vs_resistive | vs_lumped supports model199 and model600 "// &
@@ -389,8 +407,9 @@ contains
       select case (trim(form))
       case ("default")
       case ("spdmg");    bk_pv = SF_SPDMG
+      case ("hypre");    bk_pv = SF_HYPRE
       case default
-        call fatal("-vs_pv_solver must be default | spdmg, got '"//trim(form)//"'")
+        call fatal("-vs_pv_solver must be default | spdmg | hypre, got '"//trim(form)//"'")
       end select
       form = "sym"
       call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_vpar_flow", form, is_set, ierr)
@@ -443,6 +462,8 @@ contains
       if (vpar) then
         if (bk_pv == SF_SPDMG) then
           write(*,'(A)') P//"v_par    : spdmg (ring-free SPD multigrid, -vs_pvmg_*), after pair_psi, before rho and T"
+        else if (bk_pv == SF_HYPRE) then
+          write(*,'(A)') P//"v_par    : hypre (BoomerAMG, -sf_amg6_*), after pair_psi, before rho and T"
         else
           write(*,'(A)') P//"v_par    : "//trim(physics_pc_sf_vpar)//", after pair_psi, before rho and T"
         endif
@@ -643,6 +664,13 @@ contains
     endif
     if (.not. lumped) call sf_solver_block_scale(slv_vort, o_vort, comm_s, my_id)
     call sf_solver_block_scale(slv_pj, o_pj, comm_s, my_id)
+    ! -vs_blk_view <prefix>: the solved blocks as their solvers get them
+    if (len_trim(blk_view) > 0) then
+      call view_build(o_pj%mat, trim(blk_view)//"_pj.petsc", "pair_psi")
+      call view_build(o_rho%mat, trim(blk_view)//"_rho.petsc", "B_55")
+      call view_build(o_T%mat, trim(blk_view)//"_T.petsc", "B_66")
+      if (first) call view_build(o_lap%mat, trim(blk_view)//"_lap.petsc", "Laplacian")
+    endif
 
     call PetscLogEventBegin(pcev_fact_pj, ierr)
     call sf_solver_setup(slv_pj, o_pj%mat, bk_pj, "pair_psi", comm_s, my_id, rtol, gmg_inst=2, nfields=2, &
