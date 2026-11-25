@@ -142,6 +142,17 @@
 !!                                         in their ring-major order, but 15 %
 !!                                         more factor flops on the axis
 !!                                         block)                       (nd)
+!!   -vs_pmg_axis_lu mumps | petsc         an axis part's augmented axis block
+!!                                         (spdmg_set_axis): MUMPS's LU (its
+!!                                         orderings), or PETSc's in the
+!!                                         sparse ordering             (mumps)
+!!   -vs_pmg_axis_slots family | all       and its entries, and those of the
+!!                                         coarsest level's augmented matrix:
+!!                                         within a toroidal family (n = 0;
+!!                                         cos and sin of a harmonic), exact at
+!!                                         an axisymmetric state (the global
+!!                                         layout stores its zeros between the
+!!                                         families), or all           (family)
 !!   -vs_pmg_block_owner first | balanced  the rank that solves a block: the
 !!                                         owner of its smallest DOF, or for a
 !!                                         block across ranks (a radial line,
@@ -168,6 +179,17 @@
 !! layout and the polynomial: another smoother is another PC on the levels'
 !! KSPs (-vs_pmg_mg_levels_pc_type, or a shell like as_apply).
 !!
+!! An operator with an axis part, P = A + L K^-1 R (vs_lumped's axis Schur
+!! complement form, -vs_dual_axis schur; spdmg_set_axis before the setup):
+!! the levels P_g = A_g + L_g K^-1 R_g are shells (mod_petsc_pc_axis_schur)
+!! with A_g the Galerkin chain of A and L_g = P(g)' L_(g-1), R_g = R_(g-1)
+!! P(g), i.e. P's Galerkin products; the transfers come from A's levels (the
+!! ring-harmonic rows read A_(g-1)); the Chebyshev smoothers run on P_g, their
+!! Schwarz blocks are A_g's but the axis block, solved through its augmented
+!! matrix [[A_g(a, a), L_g(a, :)], [R_g(:, a), -K]] (exactly P_g(a, a)^-1;
+!! by default within the |n| families, -vs_pmg_axis_slots); the coarsest
+!! level is the MUMPS LU of [[A_c, L_c], [R_c, -K]] (likewise).
+!!
 !! Limits: polar grids of n_flux x n_tht nodes only (the gates of
 !! mod_petsc_pc_gmg); one hierarchy (one operator) per instance and run; the
 !! operator's pattern must stay that of the first build (refills only). The
@@ -182,7 +204,7 @@ module mod_petsc_pc_spdmg
   implicit none
   private
 
-  public :: spdmg_ksp_setup
+  public :: spdmg_ksp_setup, spdmg_set_axis
 
   !> the instances: P_lumped's and P_V's hierarchies
   integer, parameter, public :: SPDMG_P = 1, SPDMG_PV = 2
@@ -216,6 +238,8 @@ module mod_petsc_pc_spdmg
     integer :: min_nj     = 3
     integer :: dense_max  = 300
     character(len=16) :: sp_order = "nd" !< the ordering of the sparse block LUs (-vs_pmg_sparse_ordering)
+    character(len=16) :: axis_lu = "mumps" !< an axis part's augmented axis block: mumps | petsc (-vs_pmg_axis_lu)
+    character(len=16) :: axis_slots = "family" !< and its entries: family (within a |n| family) | all (-vs_pmg_axis_slots)
     logical :: band = .false.          !< -vs_pmg_band: LAPACK band LUs for the blocks with a narrow band
     logical :: blockmv = .false.       !< -vs_pmg_blockmv: the levels' matvecs on the OpenMP block kernel
     integer :: block_owner = OWN_FIRST !< the rank solving a block (block_members)
@@ -263,6 +287,10 @@ module mod_petsc_pc_spdmg
     logical, allocatable :: dense(:)
     logical, allocatable :: band(:)                !< -vs_pmg_band: a LAPACK band LU in lu (kl, ku)
     integer, allocatable :: kl(:), ku(:)           !< its band widths
+    integer, allocatable :: nax(:)                 !< block -> K's rows in its augmented matrix (the axis
+                                                   !! block of an axis Schur operator), 0 otherwise
+    Mat, pointer :: lsub(:) => null(), rsub(:) => null(), ksub(:) => null()   !< L(a, :), R(:, a), K there
+    IS :: isa, isk                                 !< the axis block's rows, all of K's (its owner; empty elsewhere)
     integer(8), allocatable :: loff(:)             !< dense or band block -> offset of its LU in lu
     real*8, allocatable :: lu(:)
     integer, allocatable :: piv(:)                 !< pivots, at off
@@ -293,6 +321,13 @@ module mod_petsc_pc_spdmg
                                                     !! the rank's rings and builds: as sized, as nF x nF (before)
     real*8 :: cheb_iv(2, 0:MAXL-1) = 0.d0           !< -vs_pmg_esteig_reuse: level g's [emax, emin]
     logical :: cheb_frozen = .false.                !< the intervals are saved (and set on later builds)
+    !> an operator with an axis part, P = A + L K^-1 R (spdmg_set_axis; vs_lumped's axis
+    !! Schur complement form): its K object, the coarse level's augmented matrix, L_g
+    !! and R_g of every level (g = 0 the caller's), the level operators as shells
+    logical :: axs = .false.
+    integer :: ax_ik = 0, ax_ia = 0
+    integer :: ax_k = -1                            !< the axis part's rings 0..ax_k (A's own bending is cut there)
+    Mat :: La(0:MAXL-1), Ra(0:MAXL-1), Sh(0:MAXL-1)
   end type spdmg_inst_t
 
   type(spdmg_inst_t), target, save :: inst(NINST)
@@ -354,6 +389,7 @@ contains
       call MPI_Comm_size(comm, H%np, ierr)
       call instance_defaults(k)
       call read_options()
+      call axis_blocks()
       call build_levels(A, my_id)
       call create_prolongations()
       H%built = .true.
@@ -361,6 +397,8 @@ contains
     endif
     ! the levels' transfers (ring-harmonic: from the operators) and Galerkin operators
     call galerkin_chain(A, first_chain)
+    ! an axis part: L_g, R_g, the level shells and the coarse level's augmented matrix
+    if (H%axs) call axis_chain(A, first_chain)
     ! -vs_pmg_blockmv: the levels' matvecs on JOREK's OpenMP block kernel (as
     ! the ring GMG's), attached once (the kernel follows the refills); the
     ! cycle's operators only, not amat
@@ -408,6 +446,8 @@ contains
     subroutine set_operators()
       if (present(amat)) then
         call KSPSetOperators(ksp, amat, A, ierr)
+      else if (H%axs) then
+        call KSPSetOperators(ksp, H%Sh(0), A, ierr)
       else
         call KSPSetOperators(ksp, A, A, ierr)
       endif
@@ -437,6 +477,96 @@ contains
       call fatal("an unknown instance")
     end select
   end subroutine instance_defaults
+
+  !> Instance k's operator has an axis part: P = A + L K^-1 R (A the operator
+  !! of spdmg_ksp_setup, L and R the caller's matrices, K object ik of
+  !! mod_petsc_pc_axis_schur; vs_lumped's axis Schur complement form). Before
+  !! spdmg_ksp_setup, at every build (the handles stay the same). The
+  !! hierarchy then (module header's terms):
+  !!  - the transfers and the Galerkin levels A_g from A alone (the
+  !!    ring-harmonic rows read A_(g-1)'s rings; the axis part only reaches
+  !!    the rings near the axis, and the study's cycle has the same kappa with
+  !!    the transfers from A as from P: m2, m4 and m3 at dt 30,
+  !!    runs_axis/t01_transfer.py), and L_g = P(g)' L_(g-1), R_g = R_(g-1)
+  !!    P(g), so that the level operator P_g = A_g + L_g K^-1 R_g is P's
+  !!    Galerkin product;
+  !!  - the smoothers' Chebyshev on P_g (a shell), the Schwarz blocks from A_g
+  !!    but the axis block, which is solved through its augmented matrix
+  !!    [[A_g(a, a), L_g(a, :)], [R_g(:, a), -K]] (a sparse LU on its owner,
+  !!    -vs_pmg_axis_lu): P_g(a, a)^-1, within the |n| families by default
+  !!    (-vs_pmg_axis_slots; exact at an axisymmetric state);
+  !!  - the coarsest level by the MUMPS LU of [[A_c, L_c], [R_c, -K]]
+  !!    (likewise);
+  !!  - the Krylov method (and -vs_pmg_test) on P (amat, or level 0's shell).
+  !! kring: A has no line bending on the rings 0..kring (vs_lumped: X_R is zero
+  !! there; the bending is all in the axis part), so a Schwarz block from A_g
+  !! must not reach them: the axis block takes at least the rings 0..kring and
+  !! the radial lines and wedges start at ring kring + 1 at the earliest (the
+  !! study's split cycle reads P there; from A_g alone, lines from ring 2 give
+  !! kappa 45 to 80 with kring 2 and 3 on m2 and m4, from ring kring + 1 the
+  !! kappa of kring 1, runs_axis/dev).
+  subroutine spdmg_set_axis(k, L, R, ik, kring)
+    integer, intent(in) :: k, ik, kring
+    Mat, intent(in) :: L, R
+    inst(k)%axs = .true.
+    inst(k)%La(0) = L
+    inst(k)%Ra(0) = R
+    inst(k)%ax_ik = ik
+    inst(k)%ax_k = kring
+  end subroutine spdmg_set_axis
+
+  !> An axis part's rings 0..ax_k (spdmg_set_axis): the axis block takes at
+  !! least the rings 0..ax_k, the lines and wedges start at ring ax_k + 1 at
+  !! the earliest. After read_options; reported where it changes them.
+  subroutine axis_blocks()
+    integer :: lf0, ax0
+    if (.not. H%axs) return
+    ax0 = H%o%axis_rings
+    lf0 = H%o%line_from
+    if (lf0 < 0) lf0 = ax0 + 1
+    H%o%axis_rings = max(ax0, H%ax_k)
+    H%o%line_from = max(lf0, H%ax_k + 1)
+    if (H%me == 0 .and. (H%o%axis_rings /= ax0 .or. H%o%line_from /= lf0)) write(*,'(A,I0,A,I0,A,I0,A)') &
+      "[Physics PC]   "//trim(H%tag)//": the axis part covers the rings 0..", H%ax_k, ": axis block rings 0..", &
+      H%o%axis_rings, ", radial lines from ring ", H%o%line_from, " (A_g has no bending there)"
+  end subroutine axis_blocks
+
+  !> The axis part's levels (spdmg_set_axis): L_g, R_g (first: their symbolic
+  !! products), the level shells (first) and the coarse level's augmented
+  !! matrix and LU (every build).
+  subroutine axis_chain(A0, first)
+    use mod_petsc_pc_axis_schur, only: axs_shell, axa_new, axa_setup
+    Mat, intent(in) :: A0
+    logical, intent(in) :: first
+    integer :: g
+    PetscErrorCode :: ierr
+    do g = 1, H%nlev - 1
+      call PetscLogEventBegin(sev_ptap, ierr)
+      if (first) then
+        call MatTransposeMatMult(H%P(g), H%La(g - 1), MAT_INITIAL_MATRIX, 2.0d0, H%La(g), ierr)
+        call MatMatMult(H%Ra(g - 1), H%P(g), MAT_INITIAL_MATRIX, 2.0d0, H%Ra(g), ierr)
+      else
+        call MatTransposeMatMult(H%P(g), H%La(g - 1), MAT_REUSE_MATRIX, 2.0d0, H%La(g), ierr)
+        call MatMatMult(H%Ra(g - 1), H%P(g), MAT_REUSE_MATRIX, 2.0d0, H%Ra(g), ierr)
+      endif
+      call PetscLogEventEnd(sev_ptap, ierr)
+    enddo
+    if (first) then
+      call axs_shell(A0, H%La(0), H%Ra(0), H%ax_ik, H%Sh(0))
+      do g = 1, H%nlev - 1
+        call axs_shell(H%Ag(g), H%La(g), H%Ra(g), H%ax_ik, H%Sh(g))
+      enddo
+      H%ax_ia = axa_new()
+    endif
+    ! the coarse level as the axis block (-vs_pmg_axis_slots family: within the |n| families)
+    if (trim(H%o%axis_slots) == "family") then
+      call axa_setup(H%ax_ia, H%Ag(H%nlev - 1), H%La(H%nlev - 1), H%Ra(H%nlev - 1), H%ax_ik, &
+                     trim(H%prefix)//"coarse", H%ns)
+    else
+      call axa_setup(H%ax_ia, H%Ag(H%nlev - 1), H%La(H%nlev - 1), H%Ra(H%nlev - 1), H%ax_ik, &
+                     trim(H%prefix)//"coarse")
+    endif
+  end subroutine axis_chain
 
   !> -vs_mem_report (first build): each level operator's stored entries,
   !! those exactly zero, those between two |n| families (row and column
@@ -618,6 +748,18 @@ contains
     select case (trim(s))
     case ("nd", "natural", "rcm", "qmd", "1wd"); H%o%sp_order = trim(s)
     case default; call fatal(trim(pf)//"sparse_ordering must be nd | natural | rcm | qmd | 1wd, got '"//trim(s)//"'")
+    end select
+    s = H%o%axis_lu
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"axis_lu", s, is_set, ierr)
+    select case (trim(s))
+    case ("mumps", "petsc"); H%o%axis_lu = trim(s)
+    case default; call fatal(trim(pf)//"axis_lu must be mumps | petsc, got '"//trim(s)//"'")
+    end select
+    s = H%o%axis_slots
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"axis_slots", s, is_set, ierr)
+    select case (trim(s))
+    case ("family", "all"); H%o%axis_slots = trim(s)
+    case default; call fatal(trim(pf)//"axis_slots must be family | all, got '"//trim(s)//"'")
     end select
     call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, trim(pf)//"cheb_ratio", rv, is_set, ierr)
     if (is_set) H%o%ratio = rv
@@ -1307,7 +1449,13 @@ contains
     do g = 0, H%nlev - 2
       L = H%nlev - 1 - g
       call PCMGGetSmoother(pc, L, ks, ierr)
-      if (g == 0) then
+      if (H%axs) then                                     ! the level's P (shell), its blocks from A_g
+        if (g == 0) then
+          call KSPSetOperators(ks, H%Sh(0), A0, ierr)
+        else
+          call KSPSetOperators(ks, H%Sh(g), H%Ag(g), ierr)
+        endif
+      else if (g == 0) then
         call KSPSetOperators(ks, A0, A0, ierr)
       else
         call KSPSetOperators(ks, H%Ag(g), H%Ag(g), ierr)
@@ -1327,6 +1475,18 @@ contains
       H%as_pc(g) = pcs
     enddo
     call PCMGGetCoarseSolve(pc, kc, ierr)
+    if (H%axs) then                                       ! the augmented matrix's LU (axis_chain)
+      call KSPSetOperators(kc, H%Sh(H%nlev - 1), H%Ag(H%nlev - 1), ierr)
+      call KSPSetType(kc, KSPPREONLY, ierr)
+      call KSPGetPC(kc, pcc, ierr)
+      call PCSetType(pcc, PCSHELL, ierr)
+      call PCShellSetName(pcc, trim(H%tag)//" coarse level: LU of [[A_c, L_c], [R_c, -K]]", ierr)
+      block
+        use mod_petsc_pc_axis_schur, only: axa_set_pc
+        call axa_set_pc(H%ax_ia, pcc)
+      end block
+      return
+    endif
     call KSPSetOperators(kc, H%Ag(H%nlev - 1), H%Ag(H%nlev - 1), ierr)
     call KSPSetType(kc, KSPPREONLY, ierr)
     call KSPGetPC(kc, pcc, ierr)
@@ -1358,17 +1518,19 @@ contains
   !! (linewedge). A block's rows are all slots of its DOFs, ascending; it
   !! belongs to the owner of its smallest DOF, or (-vs_pmg_block_owner
   !! balanced) a block across ranks to the least loaded of its ranks. A new
-  !! layout is a new case here.
-  subroutine block_members(g, nb, off, gidx, bw)
+  !! layout is a new case here. iax: the axis block's place among this
+  !! rank's blocks (0-based), -1 if another rank solves it.
+  subroutine block_members(g, nb, off, gidx, bw, iax)
     integer, intent(in) :: g
     integer, intent(out) :: nb
     integer, allocatable, intent(out) :: off(:)
     PetscInt, allocatable, intent(out) :: gidx(:)
     real*8, allocatable, intent(out) :: bw(:)
+    integer, intent(out) :: iax
     integer, allocatable :: ab0(:), abd(:), sel(:), key0(:), keyd(:), bown(:)
     real*8, allocatable :: aw(:)
     logical, allocatable :: jin(:)
-    integer :: nab, nabd, f, j, j0, k, ax, lf, t, b, s, nsel, p, nmine, nw
+    integer :: nab, nabd, f, j, j0, k, ax, lf, t, b, s, nsel, p, nmine, nw, bax
     ax = H%o%axis_rings
     lf = H%o%line_from
     if (lf < 0) lf = ax + 1
@@ -1381,6 +1543,7 @@ contains
         if (L%dI(f) <= ax) call put(f)
       enddo
       call push(1.d0)
+      bax = nab                                             ! 1, or 0 without an axis block
       select case (H%o%blocks)
       case (BL_NODE)                                        ! the DOFs of a node outside the axis block
         call buckets(.true.)
@@ -1496,12 +1659,13 @@ contains
       enddo
       nb = nmine
       allocate(off(0:nb), bw(0:max(nb - 1, 0)))
-      off(0) = 0; k = 0
+      off(0) = 0; k = 0; iax = -1
       do b = 1, nab
         if (bown(b) /= H%me) cycle
         k = k + 1
         off(k) = off(k - 1) + (ab0(b + 1) - ab0(b)) * H%ns
         bw(k - 1) = aw(b)
+        if (b == bax) iax = k - 1
       enddo
       allocate(gidx(max(off(nb), 1)))
       k = 0
@@ -1621,7 +1785,7 @@ contains
     PetscScalar, pointer :: vals(:)
     PetscInt, allocatable :: uniq(:), isb(:)
     integer, allocatable :: bpos(:)
-    integer :: b, n, a, c, jj, info, k, nsp
+    integer :: b, n, a, c, jj, info, k, nsp, iax
     integer(8) :: tot
     real*8, allocatable :: m(:, :)
     IS :: isf
@@ -1630,7 +1794,16 @@ contains
 
     call PetscLogEventBegin(sev_asmsetup, ierr)
     if (.not. S%ready) then
-      call block_members(g, S%nb, S%off, S%gidx, S%bw)
+      call block_members(g, S%nb, S%off, S%gidx, S%bw, iax)
+      allocate(S%nax(0:max(S%nb - 1, 0))); S%nax = 0
+      if (H%axs .and. iax >= 0) then                      ! the axis block: its augmented matrix
+        block
+          use mod_petsc_pc_axis_schur, only: axk_mat
+          PetscInt :: nk_
+          call MatGetSize(axk_mat(H%ax_ik), nk_, PETSC_NULL_INTEGER, ierr)
+          S%nax(iax) = int(nk_)
+        end block
+      endif
       S%nw = S%off(S%nb)
       allocate(S%sz(0:S%nb - 1))
       do b = 0, S%nb - 1
@@ -1671,7 +1844,8 @@ contains
       tot = 0; nsp = 0
       do b = 0, S%nb - 1
         if (H%o%band) S%band(b) = 2 * S%kl(b) + S%ku(b) + 1 <= S%sz(b) / 2
-        S%dense(b) = S%sz(b) <= H%o%dense_max .and. .not. S%band(b)
+        if (S%nax(b) > 0) S%band(b) = .false.               ! the augmented axis block: a sparse LU
+        S%dense(b) = S%sz(b) <= H%o%dense_max .and. .not. S%band(b) .and. S%nax(b) == 0
         S%loff(b) = tot
         if (S%dense(b)) then
           tot = tot + int(S%sz(b), 8)**2
@@ -1688,6 +1862,8 @@ contains
     else
       call MatCreateSubMatrices(Aop, one, [S%isu], [S%isu], MAT_REUSE_MATRIX, S%sub, ierr)
     endif
+    ! an axis part: L_g(a, :), R_g(:, a) and K on the axis block's owner (collective)
+    if (H%axs) call aug_gather()
 
     ! the blocks' matrices and factors
     allocate(bpos(0:S%nu - 1)); bpos = -1
@@ -1696,7 +1872,9 @@ contains
       do a = 1, n
         bpos(S%upos(S%off(b) + a)) = a
       enddo
-      if (S%dense(b)) then
+      if (S%nax(b) > 0) then
+        call aug_block(b)
+      else if (S%dense(b)) then
         allocate(m(n, n)); m = 0.d0
         do a = 1, n
           call MatGetRow(S%sub(1), int(S%upos(S%off(b) + a), kind(one)), ncols, cols, vals, ierr)
@@ -1763,6 +1941,197 @@ contains
     S%ready = .true.
     call PetscLogEventEnd(sev_asmsetup, ierr)
   contains
+    !> L_g's rows and R_g's columns of the axis block, and K, on the axis
+    !! block's owner (empty elsewhere); first call: the index sets. Collective.
+    subroutine aug_gather()
+      use mod_petsc_pc_axis_schur, only: axk_mat
+      integer :: bb, t_, u_
+      PetscInt, allocatable :: ia_(:), ik_(:)
+      MatReuse :: ru
+      if (.not. associated(S%lsub)) then
+        bb = -1
+        do t_ = 0, S%nb - 1
+          if (S%nax(t_) > 0) bb = t_
+        enddo
+        if (bb >= 0) then
+          ia_ = S%gidx(S%off(bb) + 1 : S%off(bb + 1))
+          ik_ = [(int(u_, kind(one)), u_ = 0, S%nax(bb) - 1)]
+        else
+          allocate(ia_(0), ik_(0))
+        endif
+        call ISCreateGeneral(PETSC_COMM_SELF, int(size(ia_), kind(one)), ia_, PETSC_COPY_VALUES, S%isa, ierr)
+        call ISCreateGeneral(PETSC_COMM_SELF, int(size(ik_), kind(one)), ik_, PETSC_COPY_VALUES, S%isk, ierr)
+        ru = MAT_INITIAL_MATRIX
+      else
+        ru = MAT_REUSE_MATRIX
+      endif
+      call MatCreateSubMatrices(H%La(g), one, [S%isa], [S%isk], ru, S%lsub, ierr)
+      call MatCreateSubMatrices(H%Ra(g), one, [S%isk], [S%isa], ru, S%rsub, ierr)
+      call MatCreateSubMatrices(axk_mat(H%ax_ik), one, [S%isk], [S%isk], ru, S%ksub, ierr)
+    end subroutine aug_gather
+
+    !> Block bb, the axis block of an axis part, as its augmented matrix
+    !! [[A_g(a, a), L_g(a, :)], [R_g(:, a), -K]] (a sequential AIJ, the block's
+    !! rows then K's) with the LU of -vs_pmg_axis_lu: the first block of its
+    !! solution for [r; 0] is P_g(a, a)^-1 r. -vs_pmg_axis_slots family
+    !! (default) leaves out the entries between two |n| families (K has none;
+    !! at an axisymmetric state they are exact zeros or rounding, which the
+    !! global layout stores and which widen the block's band three times for
+    !! n_tor 3; the cos and sin of a harmonic couple through the toroidal
+    !! derivative of B_12 and B_23 and stay). First call: the matrix
+    !! (preallocated from the pieces' rows), the KSP and its vectors; later
+    !! calls refill the values (same pattern).
+    subroutine aug_block(bb)
+      use mod_petsc_pc_harm, only: pc_global_slot
+      integer, intent(in) :: bb
+      integer :: na_, nk_, a_, nn_, nka_, s_
+      PetscInt :: row_, nrow_
+      PetscInt, allocatable :: nzr(:), cc(:)
+      PetscScalar, allocatable :: cv(:)
+      integer, allocatable :: bsl(:), kfam(:)
+      logical :: sdiag
+      PC :: pcb
+      na_ = S%sz(bb); nk_ = S%nax(bb)
+      nrow_ = na_ + nk_
+      allocate(nzr(na_ + nk_), cc(na_ + nk_), cv(na_ + nk_), bsl(na_), kfam(0:H%ns - 1))
+      do s_ = 0, H%ns - 1                                  ! the |n| family of every slot
+        kfam(s_) = (pc_global_slot(s_) + 1) / 2
+      enddo
+      do a_ = 1, na_                                       ! the family of every row of the block
+        bsl(a_) = kfam(int(mod(S%gidx(S%off(bb) + a_), int(H%ns, kind(one)))))
+      enddo
+      nka_ = nk_ / H%ns                                    ! K: slot-major, nka_ rows per slot
+      sdiag = trim(H%o%axis_slots) == "family"
+      if (.not. S%ready) then
+        nzr = 0
+        do a_ = 1, nrow_
+          call aug_row(bb, a_, na_, nka_, bsl, kfam, sdiag, cc, cv, nn_, .false.)
+          nzr(a_) = nn_
+        enddo
+        call MatCreateSeqAIJ(PETSC_COMM_SELF, nrow_, nrow_, nrow_ * 0, nzr, S%mb(bb), ierr)
+        call MatSetOption(S%mb(bb), MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE, ierr)
+        call KSPCreate(PETSC_COMM_SELF, S%kb(bb), ierr)
+        call KSPSetType(S%kb(bb), KSPPREONLY, ierr)
+        call KSPGetPC(S%kb(bb), pcb, ierr)
+        call PCSetType(pcb, PCLU, ierr)
+        if (trim(H%o%axis_lu) == "mumps") then         ! its orderings: PETSc's give 3 to 5 times the fill
+          call PCFactorSetMatSolverType(pcb, MATSOLVERMUMPS, ierr)
+        else
+          call PCFactorSetMatOrderingType(pcb, trim(H%o%sp_order), ierr)
+        endif
+        call MatCreateVecs(S%mb(bb), S%vx(bb), S%vb(bb), ierr)
+      else
+        call MatZeroEntries(S%mb(bb), ierr)
+      endif
+      do a_ = 1, nrow_
+        call aug_row(bb, a_, na_, nka_, bsl, kfam, sdiag, cc, cv, nn_, .true.)
+        row_ = a_ - 1
+        call put_row(S%mb(bb), row_, nn_, cc, cv)
+      enddo
+      call MatAssemblyBegin(S%mb(bb), MAT_FINAL_ASSEMBLY, ierr)
+      call MatAssemblyEnd(S%mb(bb), MAT_FINAL_ASSEMBLY, ierr)
+      call KSPSetOperators(S%kb(bb), S%mb(bb), S%mb(bb), ierr)
+      call KSPSetUp(S%kb(bb), ierr)
+      deallocate(nzr, cc, cv, bsl, kfam)
+      if (.not. S%ready) call aug_report(bb, na_, nk_)
+    end subroutine aug_block
+
+    !> Row r (1-based) of the augmented axis block bb in cc(1:n), cv(1:n)
+    !! (with the values if vals): the block's rows A_g(a, a) then L_g(a, :)
+    !! (K's columns after the block's na rows), K's rows R_g(:, a) then -K;
+    !! with sdiag (-vs_pmg_axis_slots family) only the entries whose row and
+    !! column are in the same |n| family (bsl: the block rows' families; K
+    !! slot-major, nka rows per slot, kfam: the slots' families). bpos holds
+    !! the block's positions in the union.
+    subroutine aug_row(bb, r, na, nka, bsl, kfam, sdiag, cc, cv, n, vals)
+      integer, intent(in) :: bb, r, na, nka, bsl(:), kfam(0:)
+      logical, intent(in) :: sdiag, vals
+      PetscInt, intent(inout) :: cc(:)
+      PetscScalar, intent(inout) :: cv(:)
+      integer, intent(out) :: n
+      integer :: s0, sc, c_, jj_
+      PetscInt :: rr, nc_
+      PetscInt, pointer :: cl_(:)
+      PetscScalar, pointer :: vl_(:)
+      n = 0
+      if (r <= na) then
+        s0 = bsl(r)
+        rr = S%upos(S%off(bb) + r)
+        call MatGetRow(S%sub(1), rr, nc_, cl_, vl_, ierr)
+        do c_ = 1, int(nc_)
+          jj_ = bpos(int(cl_(c_)))
+          if (jj_ <= 0) cycle
+          if (sdiag .and. bsl(jj_) /= s0) cycle
+          n = n + 1; cc(n) = jj_ - 1
+          if (vals) cv(n) = vl_(c_)
+        enddo
+        call MatRestoreRow(S%sub(1), rr, nc_, cl_, vl_, ierr)
+        rr = r - 1
+        call MatGetRow(S%lsub(1), rr, nc_, cl_, vl_, ierr)
+        do c_ = 1, int(nc_)
+          sc = kfam(int(cl_(c_)) / nka)
+          if (sdiag .and. sc /= s0) cycle
+          n = n + 1; cc(n) = cl_(c_) + na
+          if (vals) cv(n) = vl_(c_)
+        enddo
+        call MatRestoreRow(S%lsub(1), rr, nc_, cl_, vl_, ierr)
+      else
+        rr = r - na - 1
+        s0 = kfam(int(rr) / nka)
+        call MatGetRow(S%rsub(1), rr, nc_, cl_, vl_, ierr)
+        do c_ = 1, int(nc_)
+          if (sdiag .and. bsl(int(cl_(c_)) + 1) /= s0) cycle
+          n = n + 1; cc(n) = cl_(c_)
+          if (vals) cv(n) = vl_(c_)
+        enddo
+        call MatRestoreRow(S%rsub(1), rr, nc_, cl_, vl_, ierr)
+        call MatGetRow(S%ksub(1), rr, nc_, cl_, vl_, ierr)
+        do c_ = 1, int(nc_)
+          n = n + 1; cc(n) = cl_(c_) + na
+          if (vals) cv(n) = -vl_(c_)
+        enddo
+        call MatRestoreRow(S%ksub(1), rr, nc_, cl_, vl_, ierr)
+      endif
+    end subroutine aug_row
+
+    !> The first build's line of the augmented axis block bb: rows and the
+    !! factor's entries (MUMPS: INFOG(29) and the flops RINFOG(3)); its owner
+    !! writes it.
+    subroutine aug_report(bb, na_, nk_)
+      integer, intent(in) :: bb, na_, nk_
+      PC :: pcr
+      Mat :: fm
+      MatInfo :: fi
+      PetscInt :: iv
+      PetscReal :: rv
+      call KSPGetPC(S%kb(bb), pcr, ierr)
+      call PCFactorGetMatrix(pcr, fm, ierr)
+      if (trim(H%o%axis_lu) == "mumps") then
+        call MatMumpsGetInfog(fm, int(29, kind(one)), iv, ierr)
+        call MatMumpsGetRinfog(fm, int(3, kind(one)), rv, ierr)
+        write(*,'(A,I0,A,I0,A,I0,A,ES9.2,A,ES9.2,A,I0,A)') "[Physics PC]   "//trim(H%tag)//" level ", g, &
+          ": axis block augmented, ", na_, " + ", nk_, " rows, MUMPS LU entries ", dble(iv), ", flops ", rv, &
+          " (rank ", H%me, ")"
+      else
+        call MatGetInfo(fm, MAT_LOCAL, fi, ierr)
+        write(*,'(A,I0,A,I0,A,I0,A,ES9.2,A,I0,A)') "[Physics PC]   "//trim(H%tag)//" level ", g, &
+          ": axis block augmented, ", na_, " + ", nk_, " rows, LU entries ", fi%nz_used, " (rank ", H%me, ")"
+      endif
+    end subroutine aug_report
+
+    !> row r of the sequential matrix m: the columns cols(1:n), the values vals(1:n)
+    subroutine put_row(m, r, n, cols_, vals_)
+      Mat, intent(in) :: m
+      PetscInt, intent(in) :: r
+      integer, intent(in) :: n
+      PetscInt, intent(in) :: cols_(:)
+      PetscScalar, intent(in) :: vals_(:)
+      PetscInt :: rr(1), nn
+      if (n <= 0) return
+      rr(1) = r; nn = n
+      call MatSetValues(m, one, rr, nn, cols_(1:n), vals_(1:n), INSERT_VALUES, ierr)
+    end subroutine put_row
+
     !> kl, ku of every block in its ascending row order, from the pattern of
     !! sub (first build)
     subroutine band_widths()
@@ -1830,6 +2199,7 @@ contains
       n = S%sz(b)
       call VecGetArray(S%vb(b), va, ierr)
       va(1:n) = wa(S%off(b) + 1 : S%off(b) + n)
+      if (S%nax(b) > 0) va(n + 1 : n + S%nax(b)) = 0.d0      ! the augmented axis block: [r; 0]
       call VecRestoreArray(S%vb(b), va, ierr)
       call KSPSolve(S%kb(b), S%vb(b), S%vx(b), ierr)
       call VecGetArray(S%vx(b), va, ierr)
@@ -1872,7 +2242,7 @@ contains
         call PCMGGetSmoother(pc, L, kl, ierr)
       endif
       call KSPGetOperators(kl, al, pl, ierr)
-      call MatGetInfo(al, MAT_GLOBAL_SUM, info, ierr)
+      call MatGetInfo(pl, MAT_GLOBAL_SUM, info, ierr)    ! (= al but with an axis part: A_g, al its shell)
       nz(g) = info%nz_used
     enddo
     c_op = sum(nz(0:H%nlev - 1)) / nz(0)

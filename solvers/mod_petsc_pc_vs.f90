@@ -99,6 +99,41 @@
 !! keeps them), so that the stored matrix is the symmetric one; the first
 !! build reports its skew part.
 !!
+!! THE AXIS SCHUR COMPLEMENT FORM AS(k) (-vs_dual_axis schur, resistive
+!! bending; the study studies/spd_multigrid/axis). The core patch puts a dense
+!! block of some 190 (n_tht ns)^2 entries into P_lumped, built in O(n_tht^3) on
+!! the axis rank. AS(k) instead: A = the indices of S_s's variable on the
+!! rings 0..k (mod_petsc_pc_dual: the shared axis value included), R the rest,
+!!   X_R = the symmetric form of Z_R, Z_R the local dual basis of S_s(R, R)
+!!         (the patches lose A's indices, A's blocks give no rows),
+!!   W   = (1 - X_R S_d) E_A = [I_A; -X_R S_RA],    K = W' S_d W,
+!!   X   = X_R + W K^-1 W',
+!!   P   = P_s + L K^-1 R,   P_s = M_rho + B_24 - B_23 X_R B_12 / opz,
+!!         L = -B_23 W / opz,  R = W' B_12,
+!! S_d the slot-diagonal part of S_s (as the dual basis reads it: W, K, L and
+!! R do not couple the slots of K). The block LDL' factorization gives S^-1 =
+!! E_R' S_RR^-1 E_R + W S'^-1 W' with the exact W and S' = W' S W: AS replaces
+!! S_RR^-1 by X_R and keeps the rest, so X >= 0 wherever X_R >= 0 (measured,
+!! not proven, as the core's), K >= the exact Schur complement, P >= M_rho +
+!! B_24 > 0, and nothing is approximated on A. P_s is P_lumped of X_R
+!! (bounded rows), P is applied (mod_petsc_pc_axis_schur: a MATSHELL), never
+!! assembled: K and its LU live on one rank, the owner of K's rows (the K
+!! rank: the owner of A's smallest index, the axis), K's order slot-major,
+!! inside a slot poloidal-major with the shared axis value last (no fill by
+!! its dense row with the natural ordering, the default). Z_11 inside S_s then has a block per axis
+!! node and no row of the axis value (-vs_dual_axis_z11 split, default):
+!! S_s has no dense block either. L's rows and R's columns at P's
+!! constrained rows are zero (P_s's are decoupled by the block solver). P's
+!! solvers: the SPD multigrid (-vs_p_solver spdmg; levels P_g = P_s,g + L_g
+!! K^-1 R_g, the axis block through its augmented matrix and over the rings
+!! 0..k at least, the radial lines from ring k + 1 at the earliest (P_s has no
+!! bending on A), the coarse level by the augmented LU; mod_petsc_pc_spdmg
+!! spdmg_set_axis), or with
+!! physics_pc_sf_pair_w = "lu" the exact solve: MUMPS on the augmented
+!! matrix [[P_s, L], [R, -K]]. The ring GMG cannot take it (FATAL). k: the
+!! study's rule k + 1 >= n_tht / 42 (tested up to n_tht 96), k >= 1 (AS(0) is
+!! indefinite).
+!!
 !! V_PAR (vs_lumped on model600 with v_par: n_var 7, 7 = V). V's row couples
 !! to psi (B_71, delta B . grad p0), u (B_72, with flow), rho, T and V; V's
 !! column enters the u (B_27, with flow), rho (B_57) and T (B_67) rows only:
@@ -143,6 +178,21 @@
 !!   -vs_dual_form plain | avg | sym   the form of X (default avg)
 !!   -vs_dual_core <bool>              the core patch of the resistive bending
 !!                                     (default true)
+!!   -vs_dual_axis core | schur        the resistive bending's axis treatment:
+!!                                     the core patch (default, -vs_dual_core)
+!!                                     or the axis Schur complement form AS(k)
+!!   -vs_dual_axis_k <k>               AS(k)'s rings 0..k (default
+!!                                     max(1, ceil(n_tht / 42) - 1))
+!!   -vs_dual_axis_z11 split | node    AS: Z_11 with a block per axis node and
+!!                                     no row of the axis value (default), or
+!!                                     today's axis node block
+!!   -vs_dual_axis_ordering <ord>      AS: the ordering of K's LU (natural = K's
+!!                                     own order, the default: m4 405 k
+!!                                     entries against nd's 453 k; nd, rcm,
+!!                                     qmd, 1wd)
+!!   -vs_axis_view <prefix>            AS: the first build's K, L, R, W and A's
+!!                                     indices in K's order (<prefix>_K.petsc,
+!!                                     _L, _R, _W, _idx: a Vec), PETSc binary
 !!   -vs_pl_view <file>                P_lumped of every build, PETSc binary (the
 !!                                     first build creates the file, later
 !!                                     builds append)
@@ -201,7 +251,9 @@ module mod_petsc_pc_vs
   use mod_petsc_raw_csr, only: blockmv_attach
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
   use mod_petsc_pc_dual, only: dual_basis, dual_symmetrize, DUAL_PLAIN, DUAL_AVG, DUAL_SYM
-  use mod_petsc_pc_spdmg, only: SPDMG_PV
+  use mod_petsc_pc_spdmg, only: SPDMG_PV, SPDMG_P, spdmg_set_axis
+  use mod_petsc_pc_axis_schur, only: axk_set, axk_lu_nnz, axk_rank, axs_shell, axs_axis_mult, axa_new, axa_setup, &
+       axa_set_pc, axa_factor_nnz
   implicit none
   private
 
@@ -214,7 +266,7 @@ module mod_petsc_pc_vs
   logical, save :: res_core     = .true.      !< and its core patch at the axis (-vs_dual_core)
   character(len=512), save :: pl_view = "", ss_view = ""   !< -vs_pl_view, -vs_ss_view
   character(len=512), save :: blk_view = ""                !< -vs_blk_view <prefix>: the solved blocks
-  logical, save :: famode      = .false.     !< mode split
+  logical, save :: famode       = .false.     !< mode split
   logical, save :: harm_all     = .true.      !< physics_pc_sf_harm_couple
   integer, save :: comm_g = MPI_COMM_NULL     !< the full system's communicator
   !> this rank's wall time in vs_apply and in its gather / scatter since the
@@ -256,6 +308,25 @@ module mod_petsc_pc_vs
   type(sf_op_t), save :: o_rb(NRB), o_meta, o_keta
   Mat, save :: z_11, k_hyp, t_s, t_st, s_res
   Vec, save :: mask_psi, mask_j
+  !> the axis treatment of the resistive bending (-vs_dual_axis; module
+  !! header): the core patch, or the axis Schur complement form AS(k) with
+  !! its options; A's indices in K's order (ax_idx); the slot-diagonal part of
+  !! S_s (s_dg), E_A, S_d E_A, X_R S_d E_A, W, W' S_d W and its transpose, K,
+  !! L, R, P as a shell; the mask of P's constrained rows (0 there); K's
+  !! object (mod_petsc_pc_axis_schur) and the augmented matrix of the exact
+  !! P solve
+  integer, parameter :: AX_CORE = 1, AX_SCHUR = 2
+  integer, save :: res_axis = AX_CORE
+  logical, save :: ax_on = .false.            !< lumped, resistive and AX_SCHUR
+  integer, save :: ax_k = -1                  !< -vs_dual_axis_k
+  logical, save :: z11_split = .false.        !< -vs_dual_axis_z11 split
+  character(len=16), save :: ax_order = "natural"  !< -vs_dual_axis_ordering
+  character(len=512), save :: ax_view = ""    !< -vs_axis_view <prefix>
+  integer, allocatable, save :: ax_idx(:)
+  Mat, save :: s_dg, e_a, ax_sa, ax_xsa, ax_w, ax_k0, ax_kt, ax_kk, ax_l, ax_r, p_shell
+  Vec, save :: mask_u
+  integer, parameter :: AX_IK = 1             !< P_lumped's K object
+  integer, save :: ax_ia = 0                  !< the augmented matrix of the exact P solve
   !> B_65 (T row, rho column) vanishes in model199 and is applied only where it does not
   logical, save :: use_b65 = .false.
   type(mass_cheb_t), save :: mc_j, mc_w
@@ -297,6 +368,8 @@ module mod_petsc_pc_vs
   !! checks)
   PetscLogStage, save :: vst_build1 = -1, vst_buildn = -1
   PetscLogEvent, save :: vev_resbend = -1, vev_plprod = -1, vev_check = -1
+  !> AS(k): W and K (VS_AxisK), L and R (VS_AxisLR)
+  PetscLogEvent, save :: vev_axk = -1, vev_axlr = -1
   logical, save :: vlog_ready = .false.
   !> -vs_mem_report: the first build reports each vs_lumped matrix (entries,
   !! rows, longest row; sum, largest rank; exact zeros, entries between |n|
@@ -317,6 +390,8 @@ contains
     call PetscLogEventRegister("VS_ResBend", cid, vev_resbend, ierr)
     call PetscLogEventRegister("VS_PLProd",  cid, vev_plprod,  ierr)
     call PetscLogEventRegister("VS_Check",   cid, vev_check,   ierr)
+    call PetscLogEventRegister("VS_AxisK",   cid, vev_axk,     ierr)
+    call PetscLogEventRegister("VS_AxisLR",  cid, vev_axlr,    ierr)
     vlog_ready = .true.
   end subroutine vs_register_log
 
@@ -326,11 +401,12 @@ contains
   subroutine vs_init(my_id)
     use phys_module, only: physics_pc_sf_pair_psi, physics_pc_sf_pair_w, physics_pc_sf_rho, physics_pc_sf_T, &
                            physics_pc_sf_rtol, physics_pc_sf_harm_couple, physics_pc_sf_mode_split, &
-                           physics_pc_sf_vpar, physics_pc_sf_vpar_stage
+                           physics_pc_sf_vpar, physics_pc_sf_vpar_stage, n_tht
     use mod_parameters, only: n_tor, var_T
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
     PetscBool :: is_set, flag
+    PetscInt :: iv
     character(len=16) :: form
     character(len=48) :: pname
     character(len=*), parameter :: P = "[Physics PC]   "
@@ -360,6 +436,39 @@ contains
       end select
       call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_dual_core", flag, is_set, ierr)
       if (is_set) res_core = flag
+      form = "core"
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_dual_axis", form, is_set, ierr)
+      select case (trim(form))
+      case ("core");  res_axis = AX_CORE
+      case ("schur"); res_axis = AX_SCHUR
+      case default
+        call fatal("-vs_dual_axis must be core | schur, got '"//trim(form)//"'")
+      end select
+      if (res_axis == AX_SCHUR) then
+        if (.not. res_dual) call fatal("-vs_dual_axis schur needs -vs_bending resistive")
+        ax_on = .true.
+        ax_k = max(1, (n_tht + 41) / 42 - 1)
+        call PetscOptionsGetInt(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_dual_axis_k", iv, is_set, ierr)
+        if (is_set) ax_k = int(iv)
+        if (ax_k < 0) call fatal("-vs_dual_axis_k must be >= 0")
+        form = "split"
+        call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_dual_axis_z11", form, is_set, ierr)
+        select case (trim(form))
+        case ("split"); z11_split = .true.
+        case ("node");  z11_split = .false.
+        case default
+          call fatal("-vs_dual_axis_z11 must be split | node, got '"//trim(form)//"'")
+        end select
+        call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_dual_axis_ordering", ax_order, &
+                                   is_set, ierr)
+        select case (trim(ax_order))
+        case ("natural", "nd", "rcm", "qmd", "1wd")
+        case default
+          call fatal("-vs_dual_axis_ordering must be natural | nd | rcm | qmd | 1wd, got '"//trim(ax_order)//"'")
+        end select
+        call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_axis_view", ax_view, is_set, ierr)
+        if (.not. is_set) ax_view = ""
+      endif
       call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pl_view", pl_view, is_set, ierr)
       if (.not. is_set) pl_view = ""
       call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_ss_view", ss_view, is_set, ierr)
@@ -385,6 +494,9 @@ contains
       case default
         call fatal("-vs_p_solver must be default | spdmg | hypre | gmg, got '"//trim(form)//"'")
       end select
+      if (ax_on .and. (bk_pl == SF_GMG .or. bk_pl == SF_HYPRE)) call fatal("-vs_dual_axis schur: P = P_s + "// &
+        "L K^-1 R is applied, not assembled, and the ring GMG and BoomerAMG cannot take it: use -vs_p_solver "// &
+        "spdmg, or physics_pc_sf_pair_w = lu (the exact solve)")
     endif
     pname = physics_pc_sf_pair_w
     if (bk_pl == SF_SPDMG) pname = "spdmg (ring-free SPD multigrid)"
@@ -442,7 +554,15 @@ contains
       else if (lumped .and. res_dual) then
         write(*,'(A)') P//"line bending: resistive, S_s^-1 by its local dual basis Z as X = "// &
                        trim(form_text(dual_form))//", S_s = B_33 + K_eta / opz + sym(B_31 Z_11 K_hyp)"
-        if (res_core) then
+        if (ax_on) then
+          pname = "with the axis node block"
+          if (z11_split) pname = "split at the axis"
+          write(*,'(A,I0,A,A,A)') P//"  axis Schur complement form AS(", ax_k, ") (-vs_dual_axis schur): X = X_R + "// &
+            "W K^-1 W' on the rings 0..k, P = P_s + L K^-1 R applied; Z_11 ", trim(pname), &
+            ", K's LU ordering "//trim(ax_order)
+          pname = "spdmg (ring-free SPD multigrid)"
+          if (bk_pl /= SF_SPDMG) pname = "lu (MUMPS on [[P_s, L], [R, -K]])"
+        else if (res_core) then
           write(*,'(A)') P//"  Z with one core patch at the axis (-vs_dual_core)"
         else
           write(*,'(A)') P//"  Z without the core patch at the axis (-vs_dual_core false)"
@@ -637,10 +757,20 @@ contains
       call sf_solver_penalty_rows(slv_vort, o_pl, comm_s, my_id)
       if (first) then
         call PetscLogEventBegin(vev_check, ierr)
-        call report_skew(o_pl%mat, "P_lumped")
+        if (ax_on) then
+          call report_skew(o_pl%mat, "P_s")
+          call report_skew_applied()
+        else
+          call report_skew(o_pl%mat, "P_lumped")
+        endif
         call PetscLogEventEnd(vev_check, ierr)
       endif
-      call view_build(o_pl%mat, pl_view, "P_lumped")
+      if (ax_on) then
+        call view_build(o_pl%mat, pl_view, "P_s")
+        if (first .and. len_trim(ax_view) > 0) call axis_view()
+      else
+        call view_build(o_pl%mat, pl_view, "P_lumped")
+      endif
     endif
     ! P_V likewise: its constrained rows are B_77's diagonal alone (P_V^A's
     ! take P_V's decoupled ones)
@@ -682,7 +812,9 @@ contains
     ! the vorticity system as pair_w: line bending along the flux surfaces;
     ! P_lumped, one field, as T: a diffusion along B
     call PetscLogEventBegin(pcev_fact_vort, ierr)
-    if (lumped) then
+    if (lumped .and. ax_on) then
+      call axis_p_solver()
+    else if (lumped) then
       call sf_solver_setup(slv_vort, o_pl%mat, bk_pl, "P_lumped", comm_s, my_id, rtol, gmg_inst=1, &
                            nfields=1, smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS)
     else
@@ -779,9 +911,47 @@ contains
         call MatAXPY(o_pl%mat, -1.0d0 / sf_opz(), t_bzb, SUBSET_NONZERO_PATTERN, ierr)
       endif
       call MatAXPY(o_pl%mat, 1.0d0, o_vort%mat, SUBSET_NONZERO_PATTERN, ierr)
-      if (first) call mem_line("P_lumped", o_pl%mat)
+      if (first .and. ax_on) then
+        call mem_line("P_s (P_lumped of X_R)", o_pl%mat)
+      else if (first) then
+        call mem_line("P_lumped", o_pl%mat)
+      endif
       call PetscLogEventEnd(vev_plprod, ierr)
+      if (ax_on) then
+        call PetscLogEventBegin(vev_axlr, ierr)
+        call axis_lr()
+        call PetscLogEventEnd(vev_axlr, ierr)
+      endif
     end subroutine assemble_lumped
+
+    !> AS(k): L = -B_23 W / opz and R = W' B_12, both zero at P's
+    !! constrained rows (the rows of P_s that the block solver decouples:
+    !! the first build's mask), K's LU (mod_petsc_pc_axis_schur), and P = P_s
+    !! + L K^-1 R as a shell (first build). Every build.
+    subroutine axis_lr()
+      integer :: nmu
+      real*8 :: nlu
+      if (first) then
+        call penalty_row_mask(o_pl%mat, mask_u, nmu)
+        call MatMatMult(o_cb(CB_23)%mat, ax_w, MAT_INITIAL_MATRIX, 2.0d0, ax_l, ierr)
+        call MatTransposeMatMult(ax_w, o_cb(CB_12)%mat, MAT_INITIAL_MATRIX, 2.0d0, ax_r, ierr)
+      else
+        call MatMatMult(o_cb(CB_23)%mat, ax_w, MAT_REUSE_MATRIX, 2.0d0, ax_l, ierr)
+        call MatTransposeMatMult(ax_w, o_cb(CB_12)%mat, MAT_REUSE_MATRIX, 2.0d0, ax_r, ierr)
+      endif
+      call MatScale(ax_l, -1.0d0 / sf_opz(), ierr)
+      call MatDiagonalScale(ax_l, mask_u, PETSC_NULL_VEC, ierr)
+      call MatDiagonalScale(ax_r, PETSC_NULL_VEC, mask_u, ierr)
+      call axk_set(AX_IK, ax_kk, ax_order)
+      if (first) then
+        call mem_line("L = -B_23 W / opz", ax_l, kspace=.true.)
+        call mem_line("R = W' B_12", ax_r, kspace=.true.)
+        call axs_shell(o_pl%mat, ax_l, ax_r, AX_IK, p_shell)
+        nlu = axk_lu_nnz(AX_IK)
+        if (my_id == 0) write(*,'(A,ES9.2,A,I0,A)') "[Physics PC]   AS: LU(K) ", nlu, " entries on rank ", &
+          axk_rank(AX_IK), " (ordering "//trim(ax_order)//")"
+      endif
+    end subroutine axis_lr
 
     !> Is the pattern of a (its stored entries) inside that of b, on every
     !! rank of the operators' communicator? Row by row, both sorted.
@@ -850,9 +1020,13 @@ contains
         call PetscLogEventEnd(vev_check, ierr)
       endif
 
-      ! T = B_31 Z_11 K_hyp
+      ! T = B_31 Z_11 K_hyp (AS: Z_11 split at the axis by default)
       if (first) then
-        call dual_basis(o_rb(RB_11)%mat, int(pc_ntor), z_11, my_id, "B_11")
+        if (ax_on .and. z11_split) then
+          call dual_basis(o_rb(RB_11)%mat, int(pc_ntor), z_11, my_id, "B_11", axis_split=.true.)
+        else
+          call dual_basis(o_rb(RB_11)%mat, int(pc_ntor), z_11, my_id, "B_11")
+        endif
         call mem_line("Z_11", z_11)
         call MatMatMatMult(o_rb(RB_31)%mat, z_11, k_hyp, MAT_INITIAL_MATRIX, 2.0d0, t_s, ierr)
         call mem_line("T = B_31 Z_11 K_hyp", t_s)
@@ -865,7 +1039,11 @@ contains
         call MatAXPY(s_res, 1.0d0, t_st, DIFFERENT_NONZERO_PATTERN, ierr)
         call mem_line("S_s", s_res)
       else
-        call dual_basis(o_rb(RB_11)%mat, int(pc_ntor), zn, my_id)
+        if (ax_on .and. z11_split) then
+          call dual_basis(o_rb(RB_11)%mat, int(pc_ntor), zn, my_id, axis_split=.true.)
+        else
+          call dual_basis(o_rb(RB_11)%mat, int(pc_ntor), zn, my_id)
+        endif
         call MatCopy(zn, z_11, SAME_NONZERO_PATTERN, ierr)
         call MatDestroy(zn, ierr)
         call MatMatMatMult(o_rb(RB_31)%mat, z_11, k_hyp, MAT_REUSE_MATRIX, 2.0d0, t_s, ierr)
@@ -879,19 +1057,164 @@ contains
       call MatAXPY(s_res, 0.5d0, t_st, SUBSET_NONZERO_PATTERN, ierr)
       call view_build(s_res, ss_view, "S_s")
 
-      ! X
+      ! X (AS: X_R, the dual basis on the rings > k)
       if (first) then
-        call dual_basis(s_res, int(pc_ntor), z_j, my_id, "S_s", core=res_core)
+        if (ax_on) then
+          call dual_basis(s_res, int(pc_ntor), z_j, my_id, "S_s", axis_cut=ax_k, axis_idx=ax_idx)
+        else
+          call dual_basis(s_res, int(pc_ntor), z_j, my_id, "S_s", core=res_core)
+        endif
         call mem_line("Z of S_s", z_j)
         call dual_symmetrize(z_j, s_res, dual_form)
         call mem_line("X = sym. form of Z", z_j)
       else
-        call dual_basis(s_res, int(pc_ntor), zn, my_id, core=res_core)
+        if (ax_on) then
+          call dual_basis(s_res, int(pc_ntor), zn, my_id, axis_cut=ax_k)
+        else
+          call dual_basis(s_res, int(pc_ntor), zn, my_id, core=res_core)
+        endif
         call dual_symmetrize(zn, s_res, dual_form)
         call MatCopy(zn, z_j, SAME_NONZERO_PATTERN, ierr)
         call MatDestroy(zn, ierr)
       endif
+      if (ax_on) then
+        call PetscLogEventBegin(vev_axk, ierr)
+        call axis_wk()
+        call PetscLogEventEnd(vev_axk, ierr)
+      endif
     end subroutine resistive_bending
+
+    !> AS(k) (module header), at every build after X_R: S_d, the
+    !! slot-diagonal part of S_s; E_A (first build: K's layout, all of it on
+    !! the K rank, the owner of A's smallest index; K's index s nA + p for
+    !! slot s and A's p-th index in ax_idx's order); W = E_A - X_R (S_d E_A);
+    !! K = (W' S_d W + its transpose) / 2. Patterns and symbolic products of
+    !! the first build.
+    subroutine axis_wk()
+      PetscInt, parameter :: zero_ = 0
+      PetscInt :: rs_, re_, nka, nkl, r_, c_
+      PetscInt, allocatable :: dnz(:), onz(:)
+      integer :: ns_, na_, p_, s_, kr_, me_, mpe
+      ns_ = int(pc_ntor)
+      call slot_diagonal(s_res, s_dg)
+      if (first) then
+        call mem_line("S_d (slot-diagonal S_s)", s_dg)
+        na_ = size(ax_idx)
+        ! the K rank: the owner of A's smallest index (the axis)
+        call MPI_Comm_rank(comm_s, me_, mpe)
+        call MatGetOwnershipRange(s_res, rs_, re_, ierr)
+        kr_ = -1
+        r_ = int(minval(ax_idx), kind(rs_)) * ns_
+        if (r_ >= rs_ .and. r_ < re_) kr_ = me_
+        call MPI_Allreduce(MPI_IN_PLACE, kr_, 1, MPI_INTEGER, MPI_MAX, comm_s, mpe)
+        nka = int(na_ * ns_, kind(rs_))
+        nkl = 0
+        if (me_ == kr_) nkl = nka
+        allocate(dnz(re_ - rs_), onz(re_ - rs_)); dnz = 0; onz = 0
+        do p_ = 1, na_
+          r_ = int(ax_idx(p_), kind(rs_)) * ns_
+          if (r_ < rs_ .or. r_ >= re_) cycle
+          do s_ = 0, ns_ - 1
+            if (me_ == kr_) then
+              dnz(r_ - rs_ + s_ + 1) = 1
+            else
+              onz(r_ - rs_ + s_ + 1) = 1
+            endif
+          enddo
+        enddo
+        call MatCreate(comm_s, e_a, ierr)
+        call MatSetSizes(e_a, re_ - rs_, nkl, PETSC_DETERMINE, nka, ierr)
+        call MatSetType(e_a, MATMPIAIJ, ierr)
+        call MatMPIAIJSetPreallocation(e_a, zero_, dnz, zero_, onz, ierr)
+        do p_ = 1, na_
+          r_ = int(ax_idx(p_), kind(rs_)) * ns_
+          if (r_ < rs_ .or. r_ >= re_) cycle
+          do s_ = 0, ns_ - 1
+            c_ = int(s_ * na_ + p_ - 1, kind(rs_))
+            call MatSetValue(e_a, r_ + s_, c_, 1.0d0, INSERT_VALUES, ierr)
+          enddo
+        enddo
+        call MatAssemblyBegin(e_a, MAT_FINAL_ASSEMBLY, ierr)
+        call MatAssemblyEnd(e_a, MAT_FINAL_ASSEMBLY, ierr)
+        call MatMatMult(s_dg, e_a, MAT_INITIAL_MATRIX, 2.0d0, ax_sa, ierr)
+        call MatMatMult(z_j, ax_sa, MAT_INITIAL_MATRIX, 2.0d0, ax_xsa, ierr)
+        ! W = E_A - X_R S_d E_A: X_R has no rows on A, E_A no rows on R
+        call MatDuplicate(ax_xsa, MAT_COPY_VALUES, ax_w, ierr)
+        call MatScale(ax_w, -1.0d0, ierr)
+        call MatAXPY(ax_w, 1.0d0, e_a, DIFFERENT_NONZERO_PATTERN, ierr)
+        call MatPtAP(s_dg, ax_w, MAT_INITIAL_MATRIX, 2.0d0, ax_k0, ierr)
+        call MatTranspose(ax_k0, MAT_INITIAL_MATRIX, ax_kt, ierr)
+        call MatDuplicate(ax_k0, MAT_COPY_VALUES, ax_kk, ierr)
+        call MatAXPY(ax_kk, 1.0d0, ax_kt, DIFFERENT_NONZERO_PATTERN, ierr)
+        call mem_line("W", ax_w, kspace=.true.)
+        if (my_id == 0) write(*,'(A,I0,A,I0,A,I0,A,I0,A)') "[Physics PC]   AS(", ax_k, "): A = ", na_, &
+          " indices on the rings 0..k, K ", nka, " rows on rank ", kr_, " of the operators' communicator"
+      else
+        call MatMatMult(s_dg, e_a, MAT_REUSE_MATRIX, 2.0d0, ax_sa, ierr)
+        call MatMatMult(z_j, ax_sa, MAT_REUSE_MATRIX, 2.0d0, ax_xsa, ierr)
+        call MatZeroEntries(ax_w, ierr)
+        call MatAXPY(ax_w, -1.0d0, ax_xsa, SUBSET_NONZERO_PATTERN, ierr)
+        call MatAXPY(ax_w, 1.0d0, e_a, SUBSET_NONZERO_PATTERN, ierr)
+        call MatPtAP(s_dg, ax_w, MAT_REUSE_MATRIX, 2.0d0, ax_k0, ierr)
+        call MatTranspose(ax_k0, MAT_REUSE_MATRIX, ax_kt, ierr)
+        call MatZeroEntries(ax_kk, ierr)
+        call MatAXPY(ax_kk, 1.0d0, ax_k0, SUBSET_NONZERO_PATTERN, ierr)
+        call MatAXPY(ax_kk, 1.0d0, ax_kt, SUBSET_NONZERO_PATTERN, ierr)
+      endif
+      call MatScale(ax_kk, 0.5d0, ierr)
+      if (first) call mem_line("K = W' S_d W", ax_kk, kspace=.true.)
+    end subroutine axis_wk
+
+    !> sd = the slot-diagonal part of the one-field operator s (the entries
+    !! whose row and column have the same slot), s's layout; the pattern of
+    !! the first call, refilled later.
+    subroutine slot_diagonal(s, sd)
+      Mat, intent(in) :: s
+      Mat, intent(inout) :: sd
+      PetscInt, parameter :: zero_ = 0, one_ = 1
+      PetscInt :: rs_, re_, r_, nc_, cs_, ce_
+      PetscInt, pointer :: cl_(:)
+      PetscScalar, pointer :: vl_(:)
+      PetscInt, allocatable :: dnz(:), onz(:), cc(:)
+      PetscScalar, allocatable :: cv(:)
+      integer :: ns_, q_, n_, c_
+      ns_ = int(pc_ntor)
+      call MatGetOwnershipRange(s, rs_, re_, ierr)
+      call MatGetOwnershipRangeColumn(s, cs_, ce_, ierr)
+      if (first) then
+        allocate(dnz(re_ - rs_), onz(re_ - rs_)); dnz = 0; onz = 0
+        do r_ = rs_, re_ - 1
+          call MatGetRow(s, r_, nc_, cl_, vl_, ierr)
+          q_ = int(mod(r_, int(ns_, kind(r_))))
+          dnz(r_ - rs_ + 1) = count(mod(cl_(1:nc_), int(ns_, kind(r_))) == q_ .and. cl_(1:nc_) >= cs_ .and. &
+                                    cl_(1:nc_) < ce_)
+          onz(r_ - rs_ + 1) = count(mod(cl_(1:nc_), int(ns_, kind(r_))) == q_) - dnz(r_ - rs_ + 1)
+          call MatRestoreRow(s, r_, nc_, cl_, vl_, ierr)
+        enddo
+        call MatCreate(comm_s, sd, ierr)
+        call MatSetSizes(sd, re_ - rs_, ce_ - cs_, PETSC_DETERMINE, PETSC_DETERMINE, ierr)
+        call MatSetType(sd, MATMPIAIJ, ierr)
+        call MatMPIAIJSetPreallocation(sd, zero_, dnz, zero_, onz, ierr)
+        call MatSetOption(sd, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE, ierr)
+      else
+        call MatZeroEntries(sd, ierr)
+      endif
+      do r_ = rs_, re_ - 1
+        call MatGetRow(s, r_, nc_, cl_, vl_, ierr)
+        q_ = int(mod(r_, int(ns_, kind(r_))))
+        allocate(cc(nc_), cv(nc_))
+        n_ = 0
+        do c_ = 1, int(nc_)
+          if (int(mod(cl_(c_), int(ns_, kind(r_)))) /= q_) cycle
+          n_ = n_ + 1; cc(n_) = cl_(c_); cv(n_) = vl_(c_)
+        enddo
+        call MatRestoreRow(s, r_, nc_, cl_, vl_, ierr)
+        if (n_ > 0) call MatSetValues(sd, one_, [r_], int(n_, kind(r_)), cc(1:n_), cv(1:n_), INSERT_VALUES, ierr)
+        deallocate(cc, cv)
+      enddo
+      call MatAssemblyBegin(sd, MAT_FINAL_ASSEMBLY, ierr)
+      call MatAssemblyEnd(sd, MAT_FINAL_ASSEMBLY, ierr)
+    end subroutine slot_diagonal
 
     !> The first build's check of M_eta against the Jacobian: K_hyp - K_1 =
     !! -(B_13 + M_eta + K_1) on the interior rows and columns, against M_eta
@@ -952,12 +1275,14 @@ contains
     !! columns of different families; JOREK index * slots + slot layout) and
     !! the exact zeros among them; then the current RSS (rank 0 and the
     !! largest rank) and the RSS peak (the largest rank). Collective on the
-    !! operators' communicator.
-    subroutine mem_line(tag, mat)
+    !! operators' communicator. kspace: rows or columns in K's index space
+    !! (AS(k)), whose families the layout does not give: none counted.
+    subroutine mem_line(tag, mat, kspace)
       use mod_petsc_pc_physics_ctx, only: physics_pc_peak_rss
       use mod_petsc_pc_harm, only: pc_global_slot, pc_ntor
       character(len=*), intent(in) :: tag
       Mat, intent(in), optional :: mat
+      logical, intent(in), optional :: kspace
       MatInfo :: mi
       PetscLogDouble :: cur
       PetscInt :: rs_, re_, r_, nc_, c_
@@ -965,7 +1290,10 @@ contains
       PetscScalar, pointer :: vl_(:)
       real*8 :: v(9), vs(9), vm(9), rss(3), rssm(3)
       integer :: mpe, ns_, fr_, fc_
+      logical :: fam
       if (.not. (mem_report .and. first)) return
+      fam = .true.
+      if (present(kspace)) fam = .not. kspace
       if (present(mat)) then
         call MatGetInfo(mat, MAT_LOCAL, mi, ierr)
         call MatGetOwnershipRange(mat, rs_, re_, ierr)
@@ -978,6 +1306,7 @@ contains
           fr_ = (pc_global_slot(int(mod(r_, int(ns_, kind(r_))))) + 1) / 2
           do c_ = 1, nc_
             fc_ = (pc_global_slot(int(mod(cl_(c_), int(ns_, kind(r_))))) + 1) / 2
+            if (.not. fam) fc_ = fr_
             if (vl_(c_) == 0.d0) v(5) = v(5) + 1.d0
             v(8) = max(v(8), abs(vl_(c_)))
             if (fc_ /= fr_) then
@@ -1023,6 +1352,121 @@ contains
       if (my_id == 0) write(*,'(A,ES9.2,A)') "[Physics PC]   "//name//": skew part ", 0.5d0 * nskew / np_, &
         " of its Frobenius norm"
     end subroutine report_skew
+
+    !> AS(k): the applied P = P_s + L K^-1 R on two random vectors x, y in
+    !! [-1, 1] on the rows that L reaches (the axis region, zero elsewhere):
+    !! (x'P y - y'P x) / (|x'P y| + |y'P x|) for P and for its axis part
+    !! L K^-1 R alone (L = R' / opz up to the quadrature of B_23 = -B_12'),
+    !! and x'L K^-1 R x / x'P x (>= 0 when the axis part is definite).
+    subroutine report_skew_applied()
+      Vec :: x1, x2, y1, rm
+      PetscRandom :: rnd
+      PetscInt :: rs_, re_, r_, nc_
+      PetscInt, pointer :: cl_(:)
+      PetscScalar, pointer :: vl_(:), ra(:)
+      real*8 :: a12, a21, b12, b21, b11, a11
+      call MatCreateVecs(o_pl%mat, x1, y1, ierr)
+      call VecDuplicate(x1, x2, ierr)
+      call VecDuplicate(x1, rm, ierr)
+      call MatGetOwnershipRange(ax_l, rs_, re_, ierr)
+      call VecGetArray(rm, ra, ierr)
+      do r_ = rs_, re_ - 1
+        call MatGetRow(ax_l, r_, nc_, cl_, vl_, ierr)
+        ra(r_ - rs_ + 1) = merge(1.d0, 0.d0, nc_ > 0)
+        call MatRestoreRow(ax_l, r_, nc_, cl_, vl_, ierr)
+      enddo
+      call VecRestoreArray(rm, ra, ierr)
+      call PetscRandomCreate(comm_s, rnd, ierr)
+      call PetscRandomSetInterval(rnd, -1.d0, 1.d0, ierr)
+      call VecSetRandom(x1, rnd, ierr)
+      call VecSetRandom(x2, rnd, ierr)
+      call VecPointwiseMult(x1, x1, rm, ierr)
+      call VecPointwiseMult(x2, x2, rm, ierr)
+      call MatMult(p_shell, x2, y1, ierr);   call VecDot(x1, y1, a12, ierr)
+      call MatMult(p_shell, x1, y1, ierr);   call VecDot(x2, y1, a21, ierr)
+      call VecDot(x1, y1, a11, ierr)
+      call axs_axis_mult(p_shell, x2, y1);   call VecDot(x1, y1, b12, ierr)
+      call axs_axis_mult(p_shell, x1, y1);   call VecDot(x2, y1, b21, ierr)
+      call VecDot(x1, y1, b11, ierr)
+      if (my_id == 0) write(*,'(A,ES9.2,A,ES9.2,A,ES10.3)') "[Physics PC]   P = P_s + L K^-1 R applied, random "// &
+        "x, y on L's rows: skew (x'Py - y'Px) / (|x'Py| + |y'Px|) ", (a12 - a21) / max(abs(a12) + abs(a21), &
+        tiny(1.d0)), ", of L K^-1 R ", (b12 - b21) / max(abs(b12) + abs(b21), tiny(1.d0)), &
+        "; x'L K^-1 R x / x'Px ", b11 / a11
+      call PetscRandomDestroy(rnd, ierr)
+      call VecDestroy(x1, ierr); call VecDestroy(x2, ierr); call VecDestroy(y1, ierr); call VecDestroy(rm, ierr)
+    end subroutine report_skew_applied
+
+    !> -vs_axis_view <prefix>, first build: K, L, R, W (<prefix>_K.petsc,
+    !! _L, _R, _W) and A's indices in K's order (<prefix>_idx.petsc, a Vec of
+    !! the 0-based JOREK indices) in PETSc's binary format. Global layout only
+    !! (the mode split's families would write the same files).
+    subroutine axis_view()
+      PetscViewer :: vw
+      Vec :: vi
+      PetscScalar, pointer :: va(:)
+      PetscInt :: nvi
+      if (famode) then
+        if (my_id == 0) write(*,'(A)') "[Physics PC]   WARNING: -vs_axis_view ignored under the mode split"
+        return
+      endif
+      call view_mat(ax_kk, trim(ax_view)//"_K.petsc"); call view_mat(ax_l, trim(ax_view)//"_L.petsc")
+      call view_mat(ax_r, trim(ax_view)//"_R.petsc");  call view_mat(ax_w, trim(ax_view)//"_W.petsc")
+      if (my_id == 0) then
+        nvi = size(ax_idx)
+        call VecCreateSeq(PETSC_COMM_SELF, nvi, vi, ierr)
+        call VecGetArray(vi, va, ierr)
+        va = dble(ax_idx)
+        call VecRestoreArray(vi, va, ierr)
+        call PetscViewerBinaryOpen(PETSC_COMM_SELF, trim(ax_view)//"_idx.petsc", FILE_MODE_WRITE, vw, ierr)
+        call VecView(vi, vw, ierr)
+        call PetscViewerDestroy(vw, ierr)
+        call VecDestroy(vi, ierr)
+        write(*,'(A)') "[Physics PC]   AS: K, L, R, W and A's indices written to "//trim(ax_view)//"_*.petsc"
+      endif
+    end subroutine axis_view
+
+    !> m in PETSc's binary format to the file fname (the operators' communicator).
+    subroutine view_mat(m, fname)
+      Mat, intent(in) :: m
+      character(len=*), intent(in) :: fname
+      PetscViewer :: vw
+      call PetscViewerBinaryOpen(comm_s, fname, FILE_MODE_WRITE, vw, ierr)
+      call MatView(m, vw, ierr)
+      call PetscViewerDestroy(vw, ierr)
+    end subroutine view_mat
+
+    !> AS(k)'s P solver: the SPD multigrid with the axis part
+    !! (spdmg_set_axis; Krylov on the shell P), or the exact solve, a PREONLY
+    !! KSP on the shell P whose PCSHELL solves the augmented matrix [[P_s, L],
+    !! [R, -K]] by MUMPS (mod_petsc_pc_axis_schur, refactored at every
+    !! build).
+    subroutine axis_p_solver()
+      use mod_petsc_pc_blocks, only: pc_print_block_setup
+      PC :: pcp
+      character(len=24) :: tstr
+      if (bk_pl == SF_SPDMG) then
+        call spdmg_set_axis(SPDMG_P, ax_l, ax_r, AX_IK, ax_k)
+        call sf_solver_setup(slv_vort, o_pl%mat, bk_pl, "P_lumped", comm_s, my_id, rtol, gmg_inst=1, &
+                             nfields=1, smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, amat=p_shell)
+        return
+      endif
+      if (first) ax_ia = axa_new()
+      call axa_setup(ax_ia, o_pl%mat, ax_l, ax_r, AX_IK, "p")
+      if (.not. slv_vort%created) then
+        call KSPCreate(comm_s, slv_vort%ksp, ierr)
+        call KSPSetType(slv_vort%ksp, KSPPREONLY, ierr)
+        call KSPGetPC(slv_vort%ksp, pcp, ierr)
+        call PCSetType(pcp, PCSHELL, ierr)
+        call PCShellSetName(pcp, "P_lumped: MUMPS LU of [[P_s, L], [R, -K]]", ierr)
+        call axa_set_pc(ax_ia, pcp)
+        call KSPSetOperators(slv_vort%ksp, p_shell, p_shell, ierr)
+        slv_vort%created = .true.; slv_vort%backend = SF_LU; slv_vort%label = "P_lumped"
+        write(tstr, '(ES9.2)') axa_factor_nnz(ax_ia)
+        call pc_print_block_setup(comm_s, "P_lumped", "PREONLY, MUMPS LU of the augmented matrix [[P_s, L], "// &
+                                  "[R, -K]] (factor entries "//trim(adjustl(tstr))//")")
+      endif
+      call KSPSetUp(slv_vort%ksp, ierr)
+    end subroutine axis_p_solver
 
     !> P_V = Mv (B_77 + B_77') Mv / 2 + (1 - Mv) diag(B_77) + B_57m' X B_57m
     !! (module header), B_57m = Mr B_57 Mv, Mr and Mv the masks of rho's and

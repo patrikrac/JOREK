@@ -31,6 +31,24 @@
 !! there (the resistive line bending: without the core its Z has negative
 !! eigenvalues at the axis on fine grids).
 !!
+!! The rings: ring 0 is the blocks of more than one node (the polar axis), ring
+!! d + 1 the blocks in the patches of ring d's that no lower ring holds (on a
+!! polar grid the flux surfaces, counted from the axis). Two options of
+!! dual_basis use them, for the axis Schur complement form of the resistive
+!! bending (mod_petsc_pc_vs, -vs_dual_axis schur):
+!!   axis_cut k   the blocks on the rings 0..k give no rows of Z and their
+!!                indices leave every patch: Z is the local dual basis of
+!!                M(R, R), R the indices on the rings > k, and zero on the rows
+!!                and columns of A, the indices on the rings 0..k; axis_idx
+!!                returns A, ordered poloidal-major (the position along the
+!!                ring, then the ring, then the DOF kind), the shared indices
+!!                (the axis value) last
+!!   axis_split   every node is a block of its own indices; an index of more
+!!                than one node (the shared value of the axis) is in no block
+!!                and in no patch, so its row and column of Z are zero: no
+!!                block of Z spans the axis
+!! The core is not taken with either.
+!!
 !! Symmetric forms of Z (dual_symmetrize), for a product U' Z U that must be
 !! symmetric:
 !!   DUAL_AVG   (Z + Z') / 2        the symmetric part, on Z's pattern. U' Z U
@@ -105,8 +123,9 @@ contains
   !> Z, the local dual basis of M (MPIAIJ, M's layout and communicator, the
   !! options prefix vs_dual_: -vs_dual_mat_view shows it). Collective. With
   !! `name` (the operator's name) rank 0 reports the patches; core: the core
-  !! patch at the axis (module header).
-  subroutine dual_basis(M, ns, Z, my_id, name, core)
+  !! patch at the axis; axis_cut, axis_idx, axis_split: the axis Schur
+  !! complement form's options (module header).
+  subroutine dual_basis(M, ns, Z, my_id, name, core, axis_cut, axis_idx, axis_split)
     use nodes_elements, only: node_list, element_list
     use mod_parameters, only: n_degrees, n_vertex_max
     Mat, intent(in)     :: M
@@ -115,6 +134,9 @@ contains
     integer, intent(in) :: my_id
     character(len=*), intent(in), optional :: name
     logical, intent(in), optional :: core
+    integer, intent(in), optional :: axis_cut     !< the blocks on the rings 0..axis_cut give no rows and leave the patches
+    integer, allocatable, intent(out), optional :: axis_idx(:)  !< with axis_cut: the indices on those rings, K's order
+    logical, intent(in), optional :: axis_split   !< a block per node, the shared indices in no block
     external :: dgesv
     PetscInt, parameter :: zero = 0, one = 1
     PetscInt :: rs, re, ng, ncols, nloc
@@ -124,10 +146,10 @@ contains
     IS :: isr
     PetscErrorCode :: ierr
     integer :: comm, n_idx, i0, i1, nn, ne, n, k, i, e, iv, b, c, p, q, a, j, nj, no, info, mpierr
-    integer :: nmy, nh, ent, stamp, nsum, njc
-    logical :: core_done
-    logical, allocatable :: incore(:)
-    integer, allocatable :: jcore(:)
+    integer :: nmy, nh, ent, stamp, nsum, njc, kcut, ncut
+    logical :: core_done, split
+    logical, allocatable :: incore(:), shared(:), bcut(:)
+    integer, allocatable :: jcore(:), nring(:)
     integer, allocatable :: parent(:), owner(:), root(:), blk(:)
     integer, allocatable :: bn0(:), bnod(:), bm0(:), bmem(:), ne0(:), nel(:), cnt(:)
     integer, allocatable :: mine(:), hal(:), posh(:), posj(:), jl(:), ol(:), piv(:), mark(:), seen(:)
@@ -145,11 +167,19 @@ contains
       call fail("the operator's rows are not whole (index, slots) groups")
     n_idx = int(ng) / ns; i0 = int(rs) / ns; i1 = int(re) / ns
     nn = node_list%n_nodes; ne = element_list%n_elements
+    kcut = -1
+    if (present(axis_cut)) kcut = axis_cut
+    split = .false.
+    if (present(axis_split)) split = axis_split
+    if ((kcut >= 0 .or. split) .and. present(core)) then
+      if (core) call fail("the core patch with axis_cut or axis_split")
+    endif
 
     ! node blocks: nodes that share an index are merged (union-find on nodes)
     allocate(parent(nn), owner(0:n_idx - 1), root(nn), blk(0:n_idx - 1))
     parent = [(n, n = 1, nn)]
     owner = 0
+    allocate(shared(0:n_idx - 1)); shared = .false.
     do n = 1, nn
       do k = 1, n_degrees
         i = node_list%node(n)%index(k) - 1
@@ -158,6 +188,7 @@ contains
           owner(i) = n
         else
           parent(find(n)) = find(owner(i))
+          shared(i) = .true.
         endif
       enddo
     enddo
@@ -171,8 +202,6 @@ contains
 
     ! CSR: the nodes of each block, the indices of each block, the elements of each node
     call csr_count(root, nn, nn, bn0, bnod)
-    call csr_count(blk, n_idx, nn, bm0, bmem)
-    bmem = bmem - 1                                   ! indices are 0-based
     allocate(cnt(nn + 1)); cnt = 0
     do e = 1, ne
       do iv = 1, n_vertex_max
@@ -191,6 +220,29 @@ contains
         nel(ne0(n) + cnt(n)) = e; cnt(n) = cnt(n) + 1
       enddo
     enddo
+    ! the rings of the merged blocks (axis_cut): nring(node)
+    if (kcut >= 0) call make_rings()
+    ! axis_split: a block per node, the shared indices in the extra block nn + 1 (no rows, no patch)
+    if (split) then
+      root = [(n, n = 1, nn)]
+      deallocate(bn0, bnod)
+      call csr_count(root, nn, nn, bn0, bnod)
+      do i = 0, n_idx - 1
+        blk(i) = root(owner(i))
+        if (shared(i)) blk(i) = nn + 1
+      enddo
+      call csr_count(blk, n_idx, nn + 1, bm0, bmem)
+    else
+      call csr_count(blk, n_idx, nn, bm0, bmem)
+    endif
+    bmem = bmem - 1                                   ! indices are 0-based
+    allocate(bcut(nn)); bcut = .false.
+    if (kcut >= 0) then
+      do n = 1, nn
+        if (root(n) == n) bcut(n) = nring(n) <= kcut  ! a merged block's nodes share the ring
+      enddo
+      if (present(axis_idx)) call axis_order()
+    endif
 
     ! my blocks (those holding an index of mine) and the halo of their patches
     allocate(mark(nn), seen(nn), posh(0:n_idx - 1), posj(0:n_idx - 1))
@@ -201,6 +253,8 @@ contains
     endif
     allocate(mine(nn))
     do i = i0, i1 - 1
+      if (blk(i) > nn) cycle                          ! axis_split: a shared index, no row
+      if (bcut(blk(i))) cycle                         ! axis_cut: no rows on the rings 0..k
       if (mark(blk(i)) == 0) then
         mark(blk(i)) = 1; nmy = nmy + 1; mine(nmy) = blk(i)
       endif
@@ -332,6 +386,10 @@ contains
         " block patches (summed over ranks), ", ns, " slot(s) each"
       if (my_id == 0 .and. njc > 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]     core at the axis: ", &
         count(incore), " blocks, one patch of ", njc, " indices"
+      if (my_id == 0 .and. kcut >= 0) write(*,'(A,I0,A,I0,A)') "[Physics PC]     axis cut: the ", ncut, &
+        " indices on the rings 0..", kcut, " give no rows and leave every patch"
+      if (my_id == 0 .and. split) write(*,'(A,I0,A)') "[Physics PC]     axis split: a block per node, ", &
+        count(shared), " shared index (the axis value) in no patch, its row zero"
     endif
 
   contains
@@ -393,8 +451,90 @@ contains
       incore = inc
     end subroutine make_core
 
+    !> nring(node): the ring of the node's merged block (module header), by a
+    !! breadth-first search over the blocks that share an element; ncut, the
+    !! indices on the rings 0..kcut. Before the blocks are split.
+    subroutine make_rings()
+      integer :: t, s, x, w, d, nf, nnext
+      integer, allocatable :: front(:), nxt(:)
+      allocate(nring(nn)); nring = -1
+      allocate(front(nn), nxt(nn))
+      nf = 0
+      do t = 1, nn
+        if (root(t) == t .and. bn0(t + 1) - bn0(t) >= 2) then
+          nf = nf + 1; front(nf) = t; nring(t) = 0
+        endif
+      enddo
+      if (nf == 0) call fail("axis_cut: no block of more than one node (no polar axis)")
+      d = 0
+      do while (nf > 0)
+        nnext = 0
+        do s = 1, nf
+          do t = bn0(front(s)), bn0(front(s) + 1) - 1
+            do x = ne0(bnod(t)), ne0(bnod(t) + 1) - 1
+              do iv = 1, n_vertex_max
+                w = root(element_list%element(nel(x))%vertex(iv))
+                if (nring(w) >= 0) cycle
+                nring(w) = d + 1; nnext = nnext + 1; nxt(nnext) = w
+              enddo
+            enddo
+          enddo
+        enddo
+        front(1:nnext) = nxt(1:nnext); nf = nnext; d = d + 1
+      enddo
+      do t = 1, nn
+        nring(t) = nring(root(t))
+      enddo
+      if (any(nring < 0)) call fail("axis_cut: a node the rings do not reach")
+      ncut = 0
+      do i = 0, n_idx - 1
+        if (nring(owner(i)) <= kcut) ncut = ncut + 1
+      enddo
+    end subroutine make_rings
+
+    !> axis_idx: the indices on the rings 0..kcut, poloidal-major (the node's
+    !! position along its ring in node order, as a fraction of the ring, then
+    !! the ring, then the DOF kind), the shared indices last.
+    subroutine axis_order()
+      integer :: t, s, x, kd, nr
+      integer, allocatable :: jpos(:), rcnt(:), key(:)
+      integer(8), allocatable :: kk(:)
+      integer(8) :: tk
+      nr = maxval(nring) + 1
+      allocate(jpos(nn), rcnt(0:nr - 1)); rcnt = 0
+      do t = 1, nn                                      ! node order runs along the ring
+        jpos(t) = rcnt(nring(t)); rcnt(nring(t)) = rcnt(nring(t)) + 1
+      enddo
+      allocate(axis_idx(ncut), kk(ncut), key(ncut))
+      s = 0
+      do i = 0, n_idx - 1
+        t = owner(i)
+        if (nring(t) > kcut) cycle
+        kd = 0
+        do x = 1, n_degrees
+          if (node_list%node(t)%index(x) - 1 == i) kd = x
+        enddo
+        s = s + 1
+        axis_idx(s) = i
+        if (shared(i)) then
+          kk(s) = huge(1_8)
+        else
+          kk(s) = (int(nint(1.d6 * dble(jpos(t)) / dble(rcnt(nring(t)))), 8) * 64_8 + int(nring(t), 8)) * 8_8 + kd
+        endif
+      enddo
+      do t = 2, ncut                                   ! insertion sort by key, stable
+        tk = kk(t); x = axis_idx(t); s = t - 1
+        do while (s >= 1)
+          if (kk(s) <= tk) exit
+          kk(s + 1) = kk(s); axis_idx(s + 1) = axis_idx(s); s = s - 1
+        enddo
+        kk(s + 1) = tk; axis_idx(s + 1) = x
+      enddo
+    end subroutine axis_order
+
     !> The patch of block bb: the sorted indices of every block of a node that
-    !! shares an element with a node of bb; the core's patch for a core block.
+    !! shares an element with a node of bb; the core's patch for a core block;
+    !! with axis_cut without the blocks on the rings 0..kcut.
     subroutine patch(bb, jl_, nj_)
       integer, intent(in) :: bb
       integer, allocatable, intent(out) :: jl_(:)
@@ -411,6 +551,7 @@ contains
         do s = ne0(bnod(t)), ne0(bnod(t) + 1) - 1
           do x = 1, n_vertex_max
             w = root(element_list%element(nel(s))%vertex(x))
+            if (bcut(w)) cycle
             if (seen(w) /= stamp) then
               seen(w) = stamp; nb_ = nb_ + 1; bl = [bl, w]
             endif
