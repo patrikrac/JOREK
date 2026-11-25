@@ -137,6 +137,7 @@ module mod_pfafem
   public :: pfafem_fieldline_jet
   public :: pfafem_trace_with_hessian
   public :: pfafem_axis_pmat
+  public :: pfafem_init_eval_only
   public :: pfafem_build_cache
   public :: pfafem_eval_qp_basis
   public :: pfafem_eval_point_basis_val
@@ -1410,7 +1411,7 @@ contains
     real*8  :: Rmin, Rmax, Zmin, Zmax, padR, padZ, hR, hZ, dphi_sp
     real*8  :: R, Z, phi, sm, tm, fl2(2), non_axisym_norm, base_norm
     real*8  :: hz_c(n_coord_tor), Rnode, Znode
-    logical :: ok_pt
+    logical :: ok_pt, mpi_is_init
     real*8,  allocatable :: raw_fl(:,:,:,:), tmp_r(:), tmp_c(:), tmp_phi(:), tmp_cphi(:)
     logical, allocatable :: known(:,:,:)
 #if defined(STELLARATOR_MODEL) && defined(USE_DOMM)
@@ -1452,7 +1453,10 @@ contains
     end if
 #endif
 
-    call MPI_Bcast(pfafem_is_axisym_bfield, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_Initialized(mpi_is_init, mpi_ierr)
+    if (mpi_is_init) then
+      call MPI_Bcast(pfafem_is_axisym_bfield, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, mpi_ierr)
+    end if
     if (pfafem_is_axisym_bfield) then
       nphi = 1
     else if (bloating_factor > 1.001d0 .or. n_coord_tor > 1) then
@@ -1608,9 +1612,11 @@ contains
       pfafem_bgrid_coefs = 0.d0
     end if
 
-    call MPI_Bcast(pfafem_bgrid_dims, 3, MPI_INTEGER, 0, MPI_COMM_WORLD, mpi_ierr)
-    call MPI_Bcast(pfafem_bgrid_bounds, 5, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, mpi_ierr)
-    call MPI_Bcast(pfafem_bgrid_coefs, size(pfafem_bgrid_coefs), MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, mpi_ierr)
+    if (mpi_is_init) then
+      call MPI_Bcast(pfafem_bgrid_dims, 3, MPI_INTEGER, 0, MPI_COMM_WORLD, mpi_ierr)
+      call MPI_Bcast(pfafem_bgrid_bounds, 5, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, mpi_ierr)
+      call MPI_Bcast(pfafem_bgrid_coefs, size(pfafem_bgrid_coefs), MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, mpi_ierr)
+    end if
     pfafem_bgrid_valid = .true.
   end subroutine pfafem_fit_bfield_spline
 
@@ -2341,6 +2347,79 @@ contains
       pmat(4, 4) = 0.d0
     end if
   end subroutine pfafem_axis_pmat
+
+  !=============================================================================
+  !> Lightweight initialization for standalone post-processing tools (e.g. jorek2vtk,
+  !! jorek2vtk_3d) that evaluate PFAFEM fields via pfafem_eval_point_jet without
+  !! allocating full 3D element quadrature caches or requiring MPI_Init.
+  !=============================================================================
+  subroutine pfafem_init_eval_only(my_id, node_list, element_list)
+    integer,                 intent(in) :: my_id
+    type(type_node_list),    intent(in) :: node_list
+    type(type_element_list), intent(in) :: element_list
+
+    integer :: nel, ielm, iv, inode, io, jb, r
+    real*8  :: phi_c, R_q, Z_q, Rs, Rt, Zs, Zt, hz_knot(n_coord_tor)
+
+    nel = element_list%n_elements
+    pfafem_phi_per = 2.d0 * pi / dble(n_period)
+    pfafem_dphi    = pfafem_phi_per / dble(n_tor)
+
+    if (allocated(elem_is_bnd)) deallocate(elem_is_bnd)
+    if (allocated(bnd_elem_list)) deallocate(bnd_elem_list)
+    if (allocated(bnd_elem_knot_rz)) deallocate(bnd_elem_knot_rz)
+    if (allocated(pfafem_knot_x)) deallocate(pfafem_knot_x)
+
+    allocate(elem_is_bnd(nel))
+    elem_is_bnd = .false.
+    do ielm = 1, nel
+      do iv = 1, n_vertex_max
+        inode = element_list%element(ielm)%vertex(iv)
+        if (node_list%node(inode)%boundary /= 0) elem_is_bnd(ielm) = .true.
+      end do
+    end do
+    n_bnd_elems = count(elem_is_bnd)
+    allocate(bnd_elem_list(max(1, n_bnd_elems)))
+    allocate(bnd_elem_knot_rz(2, max(1, n_bnd_elems), n_tor))
+    bnd_elem_list    = 0
+    bnd_elem_knot_rz = 0.d0
+    r = 0
+    do ielm = 1, nel
+      if (.not. elem_is_bnd(ielm)) cycle
+      r = r + 1
+      bnd_elem_list(r) = ielm
+      do jb = 1, n_tor
+        phi_c = modulo(dble(jb - 1) * pfafem_dphi, 2.d0 * pi / dble(n_coord_period))
+        call pfafem_eval_elem_geom(node_list, element_list, ielm, 0.5d0, 0.5d0, phi_c, &
+                                   R_q, Z_q, Rs, Rt, Zs, Zt)
+        bnd_elem_knot_rz(1, r, jb) = R_q
+        bnd_elem_knot_rz(2, r, jb) = Z_q
+      end do
+    end do
+
+    allocate(pfafem_knot_x(2, n_degrees, node_list%n_nodes, n_tor))
+    do jb = 1, n_tor
+      phi_c = modulo(dble(jb - 1) * pfafem_dphi, 2.d0 * pi / dble(n_coord_period))
+      if (n_coord_tor == 1) then
+        hz_knot(1) = 1.d0
+      else
+        call pfafem_eval_coord_hz(phi_c, hz_knot)
+      end if
+      do inode = 1, node_list%n_nodes
+        do io = 1, n_degrees
+          pfafem_knot_x(1, io, inode, jb) = dot_product(node_list%node(inode)%x(1:n_coord_tor, io, 1), hz_knot)
+          pfafem_knot_x(2, io, inode, jb) = dot_product(node_list%node(inode)%x(1:n_coord_tor, io, 2), hz_knot)
+        end do
+      end do
+    end do
+
+    if (.not. pfafem_bgrid_valid) then
+      call pfafem_fit_bfield_spline(my_id, node_list, element_list, .true.)
+    else
+      pfafem_is_axisym_bfield = (pfafem_bgrid_dims(3) == 1)
+    end if
+    pfafem_ready = .true.
+  end subroutine pfafem_init_eval_only
 
   !=============================================================================
   !> Build or rebuild the global PFAFEM Shared-Point trace cache across all elements.

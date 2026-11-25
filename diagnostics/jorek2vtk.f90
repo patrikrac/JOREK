@@ -17,6 +17,7 @@ use mod_boundary
 use mod_plasma_functions
 use mod_vtk
 use mod_interp
+use mod_pfafem, only: pfafem_ready, pfafem_init_eval_only, pfafem_eval_point_jet
 use mod_poloidal_currents
 use mod_impurity, only: init_imp_adas, radiation_function, radiation_function_linear
 use mod_atomic_coeff_deuterium, only : atomic_coeff_deuterium
@@ -100,7 +101,12 @@ logical               :: include_fluxes, include_neo, include_gvec_field, includ
 logical               :: include_velocity_field, include_bootstrap, include_psi_norm, include_electric_field, include_Jpol, RphiZ_coords
 logical               :: include_projections, include_saw_ene
 character*80          :: proj_basename, filename_proj
-real*8                :: toroidal_angle
+real*8                :: toroidal_angle, phi_deg
+integer               :: pf_n_act, pf_a, pf_in, pf_io, pf_jb, pf_k, pf_stride, pf_n_stride
+integer               :: pf_inode(64), pf_act_io(64), pf_act_jb(64)
+real*8                :: pf_bval(64), pf_bdR(64), pf_bdZ(64), pf_bdP(64)
+real*8                :: pf_cval, pf_cdel, pf_psi_full, pf_dpsi_sum, pf_du_sum
+real*8, allocatable   :: pf_vsum(:), pf_psum(:)
 
 real*8                :: Er, psi_abs, Vtheta, Btheta, Mach_par,Mach_pol,Vsound, Vneo
 real*8                :: amu_neo_node, aki_neo_node
@@ -163,7 +169,7 @@ real*8  :: stmp(200)
 real*8  :: Rp_start, Zp_start, Rp_end, Zp_end
 real*8  :: Rp, Zp, Rmin, Rmax, Zmin, Zmax, s_out, t_out, R_out, Z_out
 
-namelist /vtk_params/ nsub, i_tor, i_plane, without_n0_mode, SI_units, &
+namelist /vtk_params/ nsub, i_tor, i_plane, phi_deg, without_n0_mode, SI_units, &
                       include_fluxes, include_neo, include_gvec_field, include_magnetic_field, include_vacuum_field,&
                       include_velocity_field, include_bootstrap, include_psi_norm, include_electric_field, include_Jpol, RphiZ_coords,&
                       include_projections, proj_basename
@@ -204,6 +210,7 @@ call initialise_parameters(my_id, "__NO_FILENAME__")
 nsub                   = 5       ! Number of subdivisions of the cubic finite elements into linear pieces
 i_tor                  = -1      ! If i_tor > 0, only this mode will be included in the vtk file...
 i_plane                = -1       ! ... otherwise, all modes will be summed up at the toroidal plane i_plane
+phi_deg                = -999.d0 ! Optional toroidal angle override in degrees (when >= -360.0)
 without_n0_mode        = .false. ! If true, do not include the n=0 mode (i_tor=1)
 SI_units               = .false. ! when true, write variables in SI units
 include_fluxes         = .false. ! include energy and density fluxes (or not)
@@ -485,6 +492,11 @@ call import_restart(node_list,  element_list, 'jorek_restart', rst_format, ierr,
 
 call init_chi_basis
 
+if (use_pfafem) then
+  call pfafem_init_eval_only(my_id, node_list, element_list)
+  allocate(pf_vsum(n_var), pf_psum(n_var))
+endif
+
 nnos = nsub*nsub*element_list%n_elements
 allocate(currdens(nnos),xyz(3,nnos),scalars(nnos,1:n_scalars),vectors(nnos,3,1:n_vectors))
 currdens = 0.
@@ -525,7 +537,12 @@ if ( i_tor .ge. 1 .and. i_plane .eq. -1) then
   write(*,*)  'WARNING: You set i_tor but not i_plane, so a vtk file of the mode structure will be produced, ignoring the toroidal position. For old behavior set i_plane=1)'
 else
   if (i_plane .eq. -1) i_plane=1
-  toroidal_angle = (i_plane - 1) * 2 * PI / n_plane / n_period ! 2*PI / 6
+  if (phi_deg > -900.d0) then
+    toroidal_angle = phi_deg * PI / 180.d0
+    write(*,'(a,f10.4,a)') ' Using exact toroidal angle phi_deg =', phi_deg, ' deg'
+  else
+    toroidal_angle = (i_plane - 1) * 2 * PI / n_plane / n_period ! 2*PI / 6
+  end if
 end if
 
 do i=1,element_list%n_elements
@@ -1065,6 +1082,153 @@ do i=1,element_list%n_elements
         dU_x    = 0.d0; dU_y = 0.d0
         V_sum = 0.d0;
 
+        pf_psi_full = 0.d0
+        if (use_pfafem .and. pfafem_ready) then
+          call pfafem_eval_point_jet(node_list, element_list, BigR, Z, toroidal_angle, &
+                                     .true., pf_n_act, pf_inode, pf_act_io, pf_act_jb, &
+                                     pf_bval, pf_bdR, pf_bdZ, pf_bdP)
+          pf_vsum     = 0.d0
+          pf_psum     = 0.d0
+          pf_dpsi_sum = 0.d0
+          pf_du_sum   = 0.d0
+
+          pf_stride = n_tor
+          if (n_coord_period > n_period .and. mod(n_tor * n_period, n_coord_period) == 0) then
+            pf_stride = (n_tor * n_period) / n_coord_period
+          end if
+          pf_n_stride = max(1, n_tor / max(1, pf_stride))
+
+          do pf_a = 1, pf_n_act
+            pf_in = pf_inode(pf_a)
+            pf_io = pf_act_io(pf_a)
+            pf_jb = pf_act_jb(pf_a)
+
+            pf_psi_full = pf_psi_full + node_list%node(pf_in)%values(pf_jb, pf_io, var_psi) * pf_bval(pf_a)
+
+            do m = 1, n_var
+              pf_cval = node_list%node(pf_in)%values(pf_jb, pf_io, m)
+              if (without_n0_mode) then
+                if (pf_stride == n_tor) then
+                  pf_cval = pf_cval - sum(node_list%node(pf_in)%values(1:n_tor, pf_io, m)) / dble(n_tor)
+                else
+                  do pf_k = 0, pf_n_stride - 1
+                    pf_cval = pf_cval - node_list%node(pf_in)%values(1 + mod(pf_jb - 1 + pf_k * pf_stride, n_tor), pf_io, m) &
+                                      / dble(pf_n_stride)
+                  end do
+                end if
+              end if
+              pf_vsum(m) = pf_vsum(m) + pf_cval * pf_bval(pf_a)
+
+              if (jorek_model >= 100 .and. xjac > 1.d-6) then
+                if (m == var_psi) then
+                  ps_x = ps_x + pf_cval * pf_bdR(pf_a)
+                  ps_y = ps_y + pf_cval * pf_bdZ(pf_a)
+                  ps_p = ps_p + pf_cval * pf_bdP(pf_a)
+                else if (m == var_u) then
+                  u_x  = u_x  + pf_cval * pf_bdR(pf_a)
+                  u_y  = u_y  + pf_cval * pf_bdZ(pf_a)
+                  u_p  = u_p  + pf_cval * pf_bdP(pf_a)
+                else if (m == var_zj) then
+                  zj_x = zj_x + pf_cval * pf_bdR(pf_a)
+                  zj_y = zj_y + pf_cval * pf_bdZ(pf_a)
+                else if (m == var_w) then
+                  w_x  = w_x  + pf_cval * pf_bdR(pf_a)
+                  w_y  = w_y  + pf_cval * pf_bdZ(pf_a)
+                else if (m == var_rho) then
+                  zn_x = zn_x + pf_cval * pf_bdR(pf_a)
+                  zn_y = zn_y + pf_cval * pf_bdZ(pf_a)
+                  zn_p = zn_p + pf_cval * pf_bdP(pf_a)
+                else if (with_TiTe .and. m == var_Ti) then
+                  Ti_x = Ti_x + pf_cval * pf_bdR(pf_a)
+                  Ti_y = Ti_y + pf_cval * pf_bdZ(pf_a)
+                  Ti_p = Ti_p + pf_cval * pf_bdP(pf_a)
+                else if (with_TiTe .and. m == var_Te) then
+                  Te_x = Te_x + pf_cval * pf_bdR(pf_a)
+                  Te_y = Te_y + pf_cval * pf_bdZ(pf_a)
+                  Te_p = Te_p + pf_cval * pf_bdP(pf_a)
+                else if ((.not. with_TiTe) .and. m == var_T) then
+                  TT_x = TT_x + pf_cval * pf_bdR(pf_a)
+                  TT_y = TT_y + pf_cval * pf_bdZ(pf_a)
+                  TT_p = TT_p + pf_cval * pf_bdP(pf_a)
+                end if
+              end if
+            end do
+
+            if (include_projections) then
+              do i_proj = 1, n_var
+                pf_cval = aux_node_list%node(pf_in)%values(pf_jb, pf_io, i_proj)
+                pf_psum(i_proj) = pf_psum(i_proj) + pf_cval * pf_bval(pf_a)
+              end do
+            end if
+
+            if (jorek_model >= 100 .and. xjac > 1.d-6) then
+              pf_cdel = node_list%node(pf_in)%deltas(pf_jb, pf_io, var_psi)
+              if (without_n0_mode) then
+                if (pf_stride == n_tor) then
+                  pf_cdel = pf_cdel - sum(node_list%node(pf_in)%deltas(1:n_tor, pf_io, var_psi)) / dble(n_tor)
+                else
+                  do pf_k = 0, pf_n_stride - 1
+                    pf_cdel = pf_cdel - node_list%node(pf_in)%deltas(1 + mod(pf_jb - 1 + pf_k * pf_stride, n_tor), pf_io, var_psi) &
+                                      / dble(pf_n_stride)
+                  end do
+                end if
+              end if
+              pf_dpsi_sum = pf_dpsi_sum + pf_cdel * pf_bval(pf_a)
+
+              pf_cdel = node_list%node(pf_in)%deltas(pf_jb, pf_io, var_u)
+              if (without_n0_mode) then
+                if (pf_stride == n_tor) then
+                  pf_cdel = pf_cdel - sum(node_list%node(pf_in)%deltas(1:n_tor, pf_io, var_u)) / dble(n_tor)
+                else
+                  do pf_k = 0, pf_n_stride - 1
+                    pf_cdel = pf_cdel - node_list%node(pf_in)%deltas(1 + mod(pf_jb - 1 + pf_k * pf_stride, n_tor), pf_io, var_u) &
+                                      / dble(pf_n_stride)
+                  end do
+                end if
+              end if
+              du_x      = du_x      + pf_cdel * pf_bdR(pf_a)
+              du_y      = du_y      + pf_cdel * pf_bdZ(pf_a)
+              pf_du_sum = pf_du_sum + pf_cdel * pf_bdP(pf_a)
+            end if
+          end do
+
+          do m = 1, n_var
+            scalars(inode, m) = scalars(inode, m) + real(pf_vsum(m), 4)
+          end do
+          if (include_projections) then
+            do i_proj = 1, n_var
+              scalars(inode, iproj(i_proj)) = scalars(inode, iproj(i_proj)) + real(pf_psum(i_proj), 4)
+            end do
+          end if
+
+          psi_sum = pf_vsum(var_psi)
+          u_sum   = pf_vsum(var_u)
+          zj_sum  = pf_vsum(var_zj)
+          w_sum   = pf_vsum(var_w)
+          zn_sum  = pf_vsum(var_rho)
+          if (with_Vpar) V_sum = pf_vsum(var_Vpar)
+          if (with_TiTe) then
+            Ti_sum = pf_vsum(var_Ti)
+            Te_sum = pf_vsum(var_Te)
+            T_sum  = Ti_sum + Te_sum
+            TT_x   = Ti_x + Te_x
+            TT_y   = Ti_y + Te_y
+            TT_p   = Ti_p + Te_p
+          else
+            T_sum  = pf_vsum(var_T)
+            Ti_sum = 0.5d0 * T_sum
+            Te_sum = 0.5d0 * T_sum
+            Ti_x   = 0.5d0 * TT_x
+            Ti_y   = 0.5d0 * TT_y
+            Ti_p   = 0.5d0 * TT_p
+            Te_x   = 0.5d0 * TT_x
+            Te_y   = 0.5d0 * TT_y
+            Te_p   = 0.5d0 * TT_p
+          end if
+          if (jorek_model >= 100 .and. xjac > 1.d-6 .and. abs(tstep) > 0.d0) then
+            E_phi = -pf_dpsi_sum / (tstep * BigR) - F0 * (u_p - 0.5d0 * pf_du_sum) / BigR
+          end if
+        else
         do i_tor = 1, n_tor
 
           if ( ( i_tor == 1 ) .and. ( without_n0_mode ) ) cycle ! Do not include the n=0 mode
@@ -1182,6 +1346,7 @@ do i=1,element_list%n_elements
           endif ! xjac
 
         enddo  ! end loop toroidal harmonics
+        endif  ! use_pfafem .and. pfafem_ready
         ! --- Full toroidal electric field evaluated at t_now - dt/2
         E_R   = - F0 * (U_x - 0.5d0*dU_x)
         E_Z   = - F0 * (U_y - 0.5d0*dU_y)
@@ -1220,10 +1385,14 @@ do i=1,element_list%n_elements
         end if
 
         Psi_tot = 0.d0
-        do i_tor =1, n_tor
-           call interp(node_list,element_list,i,1,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
-           Psi_tot = Psi_tot + P * HZ(i_tor,i_plane)
-        enddo
+        if (use_pfafem .and. pfafem_ready) then
+          Psi_tot = pf_psi_full
+        else
+          do i_tor =1, n_tor
+             call interp(node_list,element_list,i,1,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
+             Psi_tot = Psi_tot + P * HZ(i_tor,i_plane)
+          enddo
+        endif
         
 #if STELLARATOR_MODEL
         call interp_gvec(node_list,element_list,i,4,1,i_tor,s,t,psi_norm,BRg_s,BRg_t,BRg_st,BRg_ss,BRg_tt)
