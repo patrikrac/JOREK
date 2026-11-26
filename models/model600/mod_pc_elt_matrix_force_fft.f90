@@ -234,7 +234,8 @@ subroutine pc_elt_matrix_force_pfafem(node_list, element_list, ielm, W_vp, WV_vp
   use data_structure, only: type_node_list, type_element_list
   use gauss, only: n_gauss, xgauss, wgauss
   use phys_module
-  use mod_pfafem, only: pfafem_cache, pfafem_el_lo, pfafem_el_hi, pfafem_ng_tor, pfafem_tau_q, &
+  use mod_pfafem, only: pfafem_cache, pfafem_el_lo, pfafem_el_hi, pfafem_ng_tor, pfafem_ng_pol, &
+                        pfafem_ep_dim, pfafem_t_pol, pfafem_w_pol, pfafem_tau_q, &
                         pfafem_w_tor, pfafem_dphi, pfafem_qp_cached, pfafem_qp_geom, &
                         pfafem_qp_ngrp, pfafem_qp_gu, pfafem_qp_gjb, pfafem_qp_db, &
                         pfafem_eval_elem_geom, pfafem_eval_qp_basis
@@ -247,12 +248,12 @@ subroutine pc_elt_matrix_force_pfafem(node_list, element_list, ielm, W_vp, WV_vp
   real*8,                  intent(out), optional :: WV_vp(:, :, :, :, :, :)
 
   logical :: do_v, has_axis_u, use_qp_c
-  integer :: eP, ep1, iq, ms, mt, iel_loc, a, b, unode, ivp
+  integer :: eP, ep1, iep_q, iq, ms, mt, iel_loc, a, b, unode, ivp
   integer :: n_grp, g_a, a0, io_a, u_a, jb_a
   integer :: iv_T, iv_Ti, iv_Te
   integer :: n_raw, raw_u(64), raw_io(64), raw_jb(64)
   integer :: n_act, act_u(64), act_io(64), act_jb(64)
-  real*8  :: GAMMA_l, theta, zeta_t, pref, phi_q
+  real*8  :: GAMMA_l, theta, zeta_t, pref, phi_q, t_q, w_t
   real*8  :: BigR, y_g, Rs, Rt, Zs, Zt, xjac, wst_tor, cv
   real*8  :: rv(64), rR(64), rZ(64), rP(64), r_jet4(4)
   real*8  :: bv(64), bR(64), bZ(64), bP(64)
@@ -287,21 +288,29 @@ subroutine pc_elt_matrix_force_pfafem(node_list, element_list, ielm, W_vp, WV_vp
   end if
 
   do eP = 0, n_tor - 1
-    ep1 = eP + 1
+    ep1   = eP + 1
+    iep_q = merge(1, ep1, pfafem_ep_dim == 1)
     do iq = 1, pfafem_ng_tor
       phi_q = (dble(eP) + pfafem_tau_q(iq)) * pfafem_dphi
       do ms = 1, n_gauss
-        do mt = 1, n_gauss
+        do mt = 1, pfafem_ng_pol
+          if (ielm >= pfafem_el_lo .and. ielm <= pfafem_el_hi) then
+            t_q = pfafem_t_pol(ms, mt, iq, iep_q, iel_loc)
+            w_t = pfafem_w_pol(ms, mt, iq, iep_q, iel_loc)
+          else
+            t_q = xgauss(min(n_gauss, mt))
+            w_t = wgauss(min(n_gauss, mt))
+          end if
           if (use_qp_c) then
             BigR = pfafem_qp_geom(1,  ms, mt, iq, ep1, iel_loc)
             y_g  = pfafem_qp_geom(2,  ms, mt, iq, ep1, iel_loc)
             xjac = pfafem_qp_geom(13, ms, mt, iq, ep1, iel_loc)
           else
-            call pfafem_eval_elem_geom(node_list, element_list, ielm, xgauss(ms), xgauss(mt), phi_q, &
+            call pfafem_eval_elem_geom(node_list, element_list, ielm, xgauss(ms), t_q, phi_q, &
                                        BigR, y_g, Rs, Rt, Zs, Zt)
             xjac = Rs * Zt - Rt * Zs
           end if
-          wst_tor = wgauss(ms) * wgauss(mt) * pfafem_w_tor(iq)
+          wst_tor = wgauss(ms) * w_t * pfafem_w_tor(iq)
           cv      = pref * xjac
 
           ps0_x  = 0.d0; ps0_y = 0.d0

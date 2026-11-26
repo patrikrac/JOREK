@@ -7,9 +7,10 @@ module mod_petsc_pc_sf_solver
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
-  use mod_petsc_pc_physics_ctx, only: physics_pc_mumps_mem
-  use mod_petsc_pc_blocks,      only: pc_print_block_setup
-  use mod_petsc_pc_gmg,         only: GMG_SM_RINGS, GMG_SM_LINES, GMG_SM_ZEBRA_RINGS
+  use mod_petsc_pc_physics_ctx,  only: physics_pc_mumps_mem
+  use mod_petsc_pc_blocks,       only: pc_print_block_setup
+  use mod_petsc_direct_solver,   only: petsc_configure_direct_solver, petsc_setup_wrapped_solver
+  use mod_petsc_pc_gmg,          only: GMG_SM_RINGS, GMG_SM_LINES, GMG_SM_ZEBRA_RINGS
 #include "petsc_f90_compat.h"
   implicit none
   private
@@ -123,16 +124,42 @@ contains
     select case (backend)
 
     case (SF_LU)
-      if (fresh) call KSPCreate(comm, slv%ksp, ierr)
+      write(prefix, '(A,I0,A)') "sf_lu", gmg_inst, "_"
+      if (fresh) then
+        call KSPCreate(comm, slv%ksp, ierr)
+        call KSPSetType(slv%ksp, KSPPREONLY, ierr)
+        call KSPSetOptionsPrefix(slv%ksp, trim(prefix), ierr)
+      endif
       call KSPSetOperators(slv%ksp, A, A, ierr)
-      call KSPSetType(slv%ksp, KSPPREONLY, ierr)
       call KSPGetPC(slv%ksp, pc, ierr)
 #if defined(PETSC_HAVE_MUMPS)
-      call PCSetType(pc, PCLU, ierr)
-      call PCFactorSetMatSolverType(pc, MATSOLVERMUMPS, ierr)
-      call KSPSetUp(slv%ksp, ierr)
-      call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS)")
-      if (fresh) call physics_pc_mumps_mem(slv%ksp, label, my_id)
+      block
+        PetscBool        :: has_icntl14
+        PCFailedReason   :: pcreason
+        if (fresh) then
+          call PetscOptionsHasName(PETSC_NULL_OPTIONS, trim(prefix), '-mat_mumps_icntl_14', has_icntl14, ierr)
+          if (.not. has_icntl14) then
+            call PetscOptionsSetValue(PETSC_NULL_OPTIONS, '-'//trim(prefix)//'mat_mumps_icntl_14', '200', ierr)
+          endif
+          call petsc_configure_direct_solver(pc)
+          call KSPSetFromOptions(slv%ksp, ierr)
+        endif
+        call KSPSetUp(slv%ksp, ierr)
+        call petsc_setup_wrapped_solver(pc)
+        call PCGetFailedReason(pc, pcreason, ierr)
+        if (pcreason == PC_FACTOR_OUTMEMORY) then
+          if (my_id == 0) write(*,'(A,A,A)') "[Physics PC]   ", trim(label), &
+            ": MUMPS out of static workspace; expanding ICNTL(14)=500 and retrying."
+          call PetscOptionsSetValue(PETSC_NULL_OPTIONS, '-'//trim(prefix)//'mat_mumps_icntl_14', '500', ierr)
+          call PCReset(pc, ierr)
+          call KSPSetOperators(slv%ksp, A, A, ierr)
+          call petsc_configure_direct_solver(pc)
+          call KSPSetUp(slv%ksp, ierr)
+          call petsc_setup_wrapped_solver(pc)
+        endif
+        call pc_print_block_setup(comm, label, "PREONLY + LU (MUMPS)")
+        if (fresh) call physics_pc_mumps_mem(slv%ksp, label, my_id)
+      end block
 #else
       block
         integer :: np, mpierr

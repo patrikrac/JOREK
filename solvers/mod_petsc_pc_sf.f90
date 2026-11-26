@@ -319,15 +319,23 @@ contains
                            axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
     else
       call sf_solver_setup(slv_T, o_T%mat, bk_T, "T", comm_s, my_id, rtol, gmg_inst=4, nfields=1, &
-                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS_RHOT)
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS_RHOT, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
     endif
     ! v0's B_77 is mass-dominated (rho's setup); b0's W_vv diffuses along B (T's)
     if (with_v .and. vstage == SF_VPAR_V0) then
-      call sf_solver_setup(slv_v, o_v%mat, bk_v, "v_par", comm_s, my_id, rtol, gmg_inst=5, nfields=1, &
-                           smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
+      if (use_pfafem) then
+        call sf_solver_setup(slv_v, o_v%mat, bk_v, "v_par", comm_s, my_id, rtol, gmg_inst=5, nfields=1, &
+                             smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                             axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+      else
+        call sf_solver_setup(slv_v, o_v%mat, bk_v, "v_par", comm_s, my_id, rtol, gmg_inst=5, nfields=1, &
+                             smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
+      endif
     else if (with_v .and. vstage == SF_VPAR_B0) then
       call sf_solver_setup(slv_v, o_v%mat, bk_v, "v_par", comm_s, my_id, rtol, gmg_inst=5, nfields=1, &
-                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS)
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
     endif
     if (corr == 3 .and. first) call mass_cheb_setup(mcm, o_m%mat, comm_s, "rho / T mass B_44", int(pc_ntor))
     call PetscLogEventEnd(pcev_fact_rhot, ierr)

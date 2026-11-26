@@ -5541,9 +5541,11 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
   use mod_sources
   use mod_model_settings
   use mod_plasma_functions
-  use mod_pfafem, only: pfafem_cache, pfafem_el_lo, pfafem_el_hi, pfafem_ng_tor, pfafem_tau_q, &
+  use mod_pfafem, only: pfafem_cache, pfafem_el_lo, pfafem_el_hi, pfafem_ng_tor, pfafem_ng_pol, &
+                        pfafem_ep_dim, pfafem_t_pol, pfafem_w_pol, pfafem_tau_q, &
                         pfafem_w_tor, pfafem_dphi, pfafem_qp_cached, pfafem_qp_ngrp, &
-                        pfafem_qp_gu, pfafem_qp_gjb, pfafem_qp_db, pfafem_eval_qp_basis
+                        pfafem_qp_gu, pfafem_qp_gjb, pfafem_qp_giuj, pfafem_qp_db, &
+                        pfafem_hermite2d_jet, pfafem_eval_qp_basis
 
   implicit none
 
@@ -5560,22 +5562,27 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
   type(type_element) :: element
   type(type_node)    :: nodes(n_vertex_max)
 
-  integer :: i, j, ms, mt, eP, ep1, iq, iel_loc, a, b, unode, iuja, iujb, isp, ij, kl, r_loc
-  integer :: n_grp, g_a, a0, io_a, u_a, jb_a
+  integer :: i, j, ms, mt, eP, ep1, iep_q, iep_cached, iq, iel_loc, a, b, unode, iuja, iujb, isp, ij, kl, r_loc
+  integer :: n_grp, g_a, g_b, a0, b0, io_a, io_b, u_a, jb_a, ip_d, iq_d, k_ij, n_ij, sq
   integer :: n_raw, raw_u(64), raw_io(64), raw_jb(64)
   integer :: n_act, act_u(64), act_io(64), act_jb(64)
+  integer :: grp_u(16), grp_jb(16), grp_iuj(16)
+  integer :: iv_ij(n_var * n_var), jv_ij(n_var * n_var), nq_ij(n_var * n_var), q_ij(9, n_var * n_var)
   real*8  :: rv(64), rR(64), rZ(64), rP(64), rRR(64), rRZ(64), rZZ(64), rRP(64), rZP(64), rPP(64)
   real*8  :: bv(64), bR(64), bZ(64), bP(64), bRR(64), bRZ(64), bZZ(64), bRP(64), bZP(64), bPP(64)
-  real*8  :: r_jet(10)
+  real*8  :: r_jet(10), db9(9, 64), R_p9(n_var, 9), C_pq9(n_var, n_var, 9, 9), T_kqa(64, 9, n_var * n_var)
+  real*8  :: db_val, m44(4, 4), t_q, wt_pol, ps0_nodal(n_vertex_max, n_degrees)
+  real*8  :: H0_q(4, n_degrees), Hs_q(4, n_degrees), Ht_q(4, n_degrees)
+  real*8  :: Hss_q(4, n_degrees), Hst_q(4, n_degrees), Htt_q(4, n_degrees)
   logical :: has_axis_u, use_qp_c
   real*8  :: val_k(n_var), del_k(n_var), delta_q(n_var)
   real*8  :: val_g(n_var), val_x(n_var), val_y(n_var), val_p(n_var)
   real*8  :: val_xx(n_var), val_xy(n_var), val_yy(n_var), val_xp(n_var), val_yp(n_var), val_pp(n_var)
-  real*8  :: ps0_eq(n_gauss, n_gauss), ps0_phi0, phi_q, dt_ratio
+  real*8  :: ps0_eq(n_gauss, pfafem_ng_pol), ps0_phi0, phi_q, dt_ratio
 
   real*8  :: wst, xjac, BigR, phi, delta_phi
-  real*8  :: current_source(n_gauss,n_gauss), particle_source(n_gauss,n_gauss), heat_source(n_gauss,n_gauss)
-  real*8  :: heat_source_i(n_gauss,n_gauss), heat_source_e(n_gauss,n_gauss)
+  real*8  :: current_source(n_gauss,pfafem_ng_pol), particle_source(n_gauss,pfafem_ng_pol), heat_source(n_gauss,pfafem_ng_pol)
+  real*8  :: heat_source_i(n_gauss,pfafem_ng_pol), heat_source_e(n_gauss,pfafem_ng_pol)
   real*8  :: source_pellet, source_volume
   real*8  :: Bgrad_rho_star, Bgrad_rho, Bgrad_vpar, Bgrad_T_star, Bgrad_Ti, Bgrad_Te, Bgrad_T, BB2
   real*8  :: Bgrad_rho_star_psi, Bgrad_rho_psi, Bgrad_rho_rho, Bgrad_vpar_vpar, Bgrad_vpar_vpar_n, Bgrad_vpar_psi
@@ -5635,17 +5642,17 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
   real*8  :: Te0_ps0_x, Te_ps0_x, Te0_psi_x, Te0_ps0_y, Te_ps0_y, Te0_psi_y
 
   real*8  :: Vt0, Omega_tor0_x, Omega_tor0_y, Vt0_x, Vt0_y
-  real*8  :: V_source(n_gauss,n_gauss), Vt_x_psi, Vt_y_psi, Omega_tor_x_psi, Omega_tor_y_psi
-  real*8  :: dV_dpsi_source(n_gauss,n_gauss), dV_dz_source(n_gauss,n_gauss)
+  real*8  :: V_source(n_gauss,pfafem_ng_pol), Vt_x_psi, Vt_y_psi, Omega_tor_x_psi, Omega_tor_y_psi
+  real*8  :: dV_dpsi_source(n_gauss,pfafem_ng_pol), dV_dz_source(n_gauss,pfafem_ng_pol)
   real*8  :: dV_dpsi2, dV_dz2, dV_dpsi_dz, dV_dpsi3, dV_dpsi_dz2, dV_dpsi2_dz
-  real*8  :: eq_zne(n_gauss,n_gauss), eq_zT(n_gauss,n_gauss), eq_zTi(n_gauss,n_gauss), eq_zTe(n_gauss,n_gauss)
-  real*8  :: dn_dpsi(n_gauss,n_gauss), dn_dz, dn_dpsi2, dn_dz2, dn_dpsi_dz, dn_dpsi3, dn_dpsi_dz2, dn_dpsi2_dz
-  real*8  :: dT_dpsi(n_gauss,n_gauss), dT_dz, dT_dpsi2, dT_dz2, dT_dpsi_dz, dT_dpsi3, dT_dpsi_dz2, dT_dpsi2_dz
-  real*8  :: dTi_dpsi(n_gauss,n_gauss), dTi_dz, dTi_dpsi2, dTi_dz2, dTi_dpsi_dz, dTi_dpsi3, dTi_dpsi_dz2, dTi_dpsi2_dz
-  real*8  :: dTe_dpsi(n_gauss,n_gauss), dTe_dz, dTe_dpsi2, dTe_dz2, dTe_dpsi_dz, dTe_dpsi3, dTe_dpsi_dz2, dTe_dpsi2_dz
+  real*8  :: eq_zne(n_gauss,pfafem_ng_pol), eq_zT(n_gauss,pfafem_ng_pol), eq_zTi(n_gauss,pfafem_ng_pol), eq_zTe(n_gauss,pfafem_ng_pol)
+  real*8  :: dn_dpsi(n_gauss,pfafem_ng_pol), dn_dz, dn_dpsi2, dn_dz2, dn_dpsi_dz, dn_dpsi3, dn_dpsi_dz2, dn_dpsi2_dz
+  real*8  :: dT_dpsi(n_gauss,pfafem_ng_pol), dT_dz, dT_dpsi2, dT_dz2, dT_dpsi_dz, dT_dpsi3, dT_dpsi_dz2, dT_dpsi2_dz
+  real*8  :: dTi_dpsi(n_gauss,pfafem_ng_pol), dTi_dz, dTi_dpsi2, dTi_dz2, dTi_dpsi_dz, dTi_dpsi3, dTi_dpsi_dz2, dTi_dpsi2_dz
+  real*8  :: dTe_dpsi(n_gauss,pfafem_ng_pol), dTe_dz, dTe_dpsi2, dTe_dz2, dTe_dpsi_dz, dTe_dpsi3, dTe_dpsi_dz2, dTe_dpsi2_dz
 
   real*8  :: Btheta2, epsil, Btheta2_psi
-  real*8, dimension(n_gauss,n_gauss) :: amu_neo_prof, aki_neo_prof
+  real*8, dimension(n_gauss,pfafem_ng_pol) :: amu_neo_prof, aki_neo_prof
 
   integer :: i_inj, i_imp
   real*8  :: source_neutral, source_neutral_arr(n_inj_max)
@@ -5682,8 +5689,8 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
   real*8  :: fact_conservative_u
   real*8  :: visco_fact_old, visco_fact_new
 
-  real*8, dimension(n_gauss,n_gauss) :: x_g, x_s, x_t, x_ss, x_st, x_tt
-  real*8, dimension(n_gauss,n_gauss) :: y_g, y_s, y_t, y_ss, y_st, y_tt
+  real*8, dimension(n_gauss,pfafem_ng_pol) :: x_g, x_s, x_t, x_ss, x_st, x_tt
+  real*8, dimension(n_gauss,pfafem_ng_pol) :: y_g, y_s, y_t, y_ss, y_st, y_tt
 
   real*8  :: midp_edge1(1:2), midp_edge2(1:2), midp_edge3(1:2), midp_edge4(1:2)
   real*8  :: len1, len2, h_e
@@ -5742,26 +5749,7 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
 
   do i = 1, n_vertex_max
     do j = 1, n_degrees
-      ps0_phi0 = sum(nodes(i)%values(1:n_tor, j, var_psi)) / dble(n_tor)
-      do ms = 1, n_gauss
-        do mt = 1, n_gauss
-          x_g(ms,mt)  = x_g(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * H(i,j,ms,mt)
-          x_s(ms,mt)  = x_s(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * H_s(i,j,ms,mt)
-          x_t(ms,mt)  = x_t(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * H_t(i,j,ms,mt)
-          x_ss(ms,mt) = x_ss(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H_ss(i,j,ms,mt)
-          x_st(ms,mt) = x_st(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H_st(i,j,ms,mt)
-          x_tt(ms,mt) = x_tt(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * H_tt(i,j,ms,mt)
-
-          y_g(ms,mt)  = y_g(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * H(i,j,ms,mt)
-          y_s(ms,mt)  = y_s(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * H_s(i,j,ms,mt)
-          y_t(ms,mt)  = y_t(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * H_t(i,j,ms,mt)
-          y_ss(ms,mt) = y_ss(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H_ss(i,j,ms,mt)
-          y_st(ms,mt) = y_st(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H_st(i,j,ms,mt)
-          y_tt(ms,mt) = y_tt(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * H_tt(i,j,ms,mt)
-
-          ps0_eq(ms,mt) = ps0_eq(ms,mt) + ps0_phi0 * element%size(i,j) * H(i,j,ms,mt)
-        end do
-      end do
+      ps0_nodal(i, j) = sum(nodes(i)%values(1:n_tor, j, var_psi)) / dble(n_tor)
     end do
   end do
 
@@ -5772,58 +5760,6 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
   len1 = sqrt((midp_edge1(1) - midp_edge3(1))**2 + (midp_edge1(2) - midp_edge3(2))**2)
   len2 = sqrt((midp_edge2(1) - midp_edge4(1))**2 + (midp_edge2(2) - midp_edge4(2))**2)
   h_e  = dmin1(len1, len2)
-
-  do ms = 1, n_gauss
-    do mt = 1, n_gauss
-      if (keep_current_prof) &
-        call current(xpoint2, xcase2, x_g(ms,mt), y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, current_source(ms,mt))
-
-      if (with_TiTe) then
-        call sources(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, &
-                     particle_source(ms,mt), heat_source_i(ms,mt), heat_source_e(ms,mt))
-      else
-        call sources(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, &
-                     particle_source(ms,mt), heat_source(ms,mt))
-      end if
-
-      if (fixed_aux_source .and. present(aux_node_list)) then
-        do i = 1, n_vertex_max
-          do j = 1, n_degrees
-            particle_source(ms,mt) = particle_source(ms,mt) &
-              + aux_node_list%node(element%vertex(i))%values(1,j,1) * element%size(i,j) * H(i,j,ms,mt)
-          end do
-        end do
-      end if
-
-      if ((abs(V_0) >= 1.d-12) .or. num_rot) then
-        call velocity(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, V_source(ms,mt), &
-                      dV_dpsi_source(ms,mt), dV_dz_source(ms,mt), dV_dpsi2, dV_dz2, dV_dpsi_dz, dV_dpsi3, dV_dpsi_dz2, dV_dpsi2_dz)
-      end if
-
-      call density(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, eq_zne(ms,mt), &
-                   dn_dpsi(ms,mt), dn_dz, dn_dpsi2, dn_dz2, dn_dpsi_dz, dn_dpsi3, dn_dpsi_dz2, dn_dpsi2_dz)
-
-      if (with_TiTe) then
-        call temperature_i(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, eq_zTi(ms,mt), &
-                           dTi_dpsi(ms,mt), dTi_dz, dTi_dpsi2, dTi_dz2, dTi_dpsi_dz, dTi_dpsi3, dTi_dpsi_dz2, dTi_dpsi2_dz)
-        call temperature_e(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, eq_zTe(ms,mt), &
-                           dTe_dpsi(ms,mt), dTe_dz, dTe_dpsi2, dTe_dz2, dTe_dpsi_dz, dTe_dpsi3, dTe_dpsi_dz2, dTe_dpsi2_dz)
-      else
-        call temperature(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, eq_zT(ms,mt), &
-                         dT_dpsi(ms,mt), dT_dz, dT_dpsi2, dT_dz2, dT_dpsi_dz, dT_dpsi3, dT_dpsi_dz2, dT_dpsi2_dz)
-      end if
-
-      if (NEO) then
-        if (num_neo_file) then
-          call neo_coef(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, &
-                        amu_neo_prof(ms,mt), aki_neo_prof(ms,mt))
-        else
-          amu_neo_prof(ms,mt) = amu_neo_const
-          aki_neo_prof(ms,mt) = aki_neo_const
-        end if
-      end if
-    end do
-  end do
 
   iel_loc    = ielm - pfafem_el_lo + 1
   use_qp_c   = pfafem_qp_cached .and. (ielm >= pfafem_el_lo) .and. (ielm <= pfafem_el_hi)
@@ -5837,14 +5773,125 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
     end do
   end if
 
-  do eP = 0, n_tor - 1
-    ep1 = eP + 1
-    do iq = 1, pfafem_ng_tor
+  do iq = 1, pfafem_ng_tor
+    iep_cached = -1
+    do eP = 0, n_tor - 1
+      ep1   = eP + 1
+      iep_q = merge(1, ep1, pfafem_ep_dim == 1)
       phi_q = (dble(eP) + pfafem_tau_q(iq)) * pfafem_dphi
 
+      if (iep_q /= iep_cached) then
+        iep_cached      = iep_q
+        x_g = 0.d0; x_s = 0.d0; x_t = 0.d0; x_st = 0.d0; x_ss = 0.d0; x_tt = 0.d0
+        y_g = 0.d0; y_s = 0.d0; y_t = 0.d0; y_st = 0.d0; y_ss = 0.d0; y_tt = 0.d0
+        ps0_eq          = 0.d0
+        current_source  = 0.d0
+        particle_source = 0.d0
+        heat_source_i   = 0.d0
+        heat_source_e   = 0.d0
+        heat_source     = 0.d0
+        V_source        = 0.d0
+        dV_dpsi_source  = 0.d0
+        dV_dz_source    = 0.d0
+        eq_zne          = 0.d0
+        eq_zTi          = 0.d0
+        eq_zTe          = 0.d0
+        eq_zT           = 0.d0
+        amu_neo_prof    = 0.d0
+        aki_neo_prof    = 0.d0
+
+        do ms = 1, n_gauss
+          do mt = 1, pfafem_ng_pol
+            if (ielm >= pfafem_el_lo .and. ielm <= pfafem_el_hi) then
+              t_q    = pfafem_t_pol(ms, mt, iq, iep_q, iel_loc)
+              wt_pol = pfafem_w_pol(ms, mt, iq, iep_q, iel_loc)
+            else
+              t_q    = xgauss(min(n_gauss, mt))
+              wt_pol = merge(wgauss(min(n_gauss, mt)), 0.d0, mt <= n_gauss)
+            end if
+            if (wt_pol == 0.d0) cycle
+
+            call pfafem_hermite2d_jet(xgauss(ms), t_q, H0_q, Hs_q, Ht_q, Hss_q, Hst_q, Htt_q)
+            do i = 1, n_vertex_max
+              do j = 1, n_degrees
+                x_g(ms,mt)  = x_g(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * H0_q(i,j)
+                x_s(ms,mt)  = x_s(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * Hs_q(i,j)
+                x_t(ms,mt)  = x_t(ms,mt)  + nodes(i)%x(1,j,1) * element%size(i,j) * Ht_q(i,j)
+                x_ss(ms,mt) = x_ss(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * Hss_q(i,j)
+                x_st(ms,mt) = x_st(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * Hst_q(i,j)
+                x_tt(ms,mt) = x_tt(ms,mt) + nodes(i)%x(1,j,1) * element%size(i,j) * Htt_q(i,j)
+
+                y_g(ms,mt)  = y_g(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * H0_q(i,j)
+                y_s(ms,mt)  = y_s(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * Hs_q(i,j)
+                y_t(ms,mt)  = y_t(ms,mt)  + nodes(i)%x(1,j,2) * element%size(i,j) * Ht_q(i,j)
+                y_ss(ms,mt) = y_ss(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * Hss_q(i,j)
+                y_st(ms,mt) = y_st(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * Hst_q(i,j)
+                y_tt(ms,mt) = y_tt(ms,mt) + nodes(i)%x(1,j,2) * element%size(i,j) * Htt_q(i,j)
+
+                ps0_eq(ms,mt) = ps0_eq(ms,mt) + ps0_nodal(i, j) * element%size(i,j) * H0_q(i,j)
+              end do
+            end do
+
+            if (keep_current_prof) &
+              call current(xpoint2, xcase2, x_g(ms,mt), y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, current_source(ms,mt))
+
+            if (with_TiTe) then
+              call sources(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, &
+                           particle_source(ms,mt), heat_source_i(ms,mt), heat_source_e(ms,mt))
+            else
+              call sources(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, &
+                           particle_source(ms,mt), heat_source(ms,mt))
+            end if
+
+            if (fixed_aux_source .and. present(aux_node_list)) then
+              do i = 1, n_vertex_max
+                do j = 1, n_degrees
+                  particle_source(ms,mt) = particle_source(ms,mt) &
+                    + aux_node_list%node(element%vertex(i))%values(1,j,1) * element%size(i,j) * H0_q(i,j)
+                end do
+              end do
+            end if
+
+            if ((abs(V_0) >= 1.d-12) .or. num_rot) then
+              call velocity(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, V_source(ms,mt), &
+                            dV_dpsi_source(ms,mt), dV_dz_source(ms,mt), dV_dpsi2, dV_dz2, dV_dpsi_dz, dV_dpsi3, dV_dpsi_dz2, dV_dpsi2_dz)
+            end if
+
+            call density(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, eq_zne(ms,mt), &
+                         dn_dpsi(ms,mt), dn_dz, dn_dpsi2, dn_dz2, dn_dpsi_dz, dn_dpsi3, dn_dpsi_dz2, dn_dpsi2_dz)
+
+            if (with_TiTe) then
+              call temperature_i(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, eq_zTi(ms,mt), &
+                                 dTi_dpsi(ms,mt), dTi_dz, dTi_dpsi2, dTi_dz2, dTi_dpsi_dz, dTi_dpsi3, dTi_dpsi_dz2, dTi_dpsi2_dz)
+              call temperature_e(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, eq_zTe(ms,mt), &
+                                 dTe_dpsi(ms,mt), dTe_dz, dTe_dpsi2, dTe_dz2, dTe_dpsi_dz, dTe_dpsi3, dTe_dpsi_dz2, dTe_dpsi2_dz)
+            else
+              call temperature(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, eq_zT(ms,mt), &
+                               dT_dpsi(ms,mt), dT_dz, dT_dpsi2, dT_dz2, dT_dpsi_dz, dT_dpsi3, dT_dpsi_dz2, dT_dpsi2_dz)
+            end if
+
+            if (NEO) then
+              if (num_neo_file) then
+                call neo_coef(xpoint2, xcase2, y_g(ms,mt), Z_xpoint, ps0_eq(ms,mt), psi_axis, psi_bnd, &
+                              amu_neo_prof(ms,mt), aki_neo_prof(ms,mt))
+              else
+                amu_neo_prof(ms,mt) = amu_neo_const
+                aki_neo_prof(ms,mt) = aki_neo_const
+              end if
+            end if
+          end do
+        end do
+      end if
+
       do ms = 1, n_gauss
-        do mt = 1, n_gauss
-          wst    = wgauss(ms) * wgauss(mt) * pfafem_w_tor(iq)
+        do mt = 1, pfafem_ng_pol
+          if (ielm >= pfafem_el_lo .and. ielm <= pfafem_el_hi) then
+            wt_pol = pfafem_w_pol(ms, mt, iq, iep_q, iel_loc)
+          else
+            wt_pol = merge(wgauss(min(n_gauss, mt)), 0.d0, mt <= n_gauss)
+          end if
+          if (wt_pol == 0.d0) cycle
+          wst    = wgauss(ms) * wt_pol * pfafem_w_tor(iq)
           xjac   = x_s(ms,mt) * y_t(ms,mt) - x_t(ms,mt) * y_s(ms,mt)
           BigR   = x_g(ms,mt)
           BigR_x = 1.d0
@@ -6512,26 +6559,54 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
             call pfafem_eval_qp_basis(node_list, element_list, ielm, eP, iq, ms, mt, &
                                       BigR, y_g(ms,mt), phi_q, .true., n_act, act_u, act_io, act_jb, &
                                       bv, bR, bZ, bP, bRR, bRZ, bZZ, bRP, bZP, bPP)
+            do a = 1, n_act
+              db9(1, a) = bv(a);  db9(2, a) = bR(a);  db9(3, a) = bZ(a);  db9(4, a) = bP(a)
+              db9(5, a) = bRR(a); db9(6, a) = bRZ(a); db9(7, a) = bZZ(a)
+              db9(8, a) = bRP(a); db9(9, a) = bZP(a)
+            end do
+          else if (use_qp_c) then
+            n_act = n_raw
+            do g_a = 1, n_grp
+              grp_u(g_a)   = int(pfafem_qp_gu(g_a, ms, mt, iq, ep1, iel_loc))
+              grp_jb(g_a)  = int(pfafem_qp_gjb(g_a, ms, mt, iq, ep1, iel_loc))
+              grp_iuj(g_a) = int(pfafem_qp_giuj(g_a, ms, mt, iq, ep1, iel_loc))
+            end do
+            do a = 1, n_act
+              r_jet     = pfafem_qp_db(1:10, a, ms, mt, iq, ep1, iel_loc)
+              db9(1, a) = r_jet(1);  db9(2, a) = r_jet(2);  db9(3, a) = r_jet(3); db9(4, a) = r_jet(4)
+              db9(5, a) = r_jet(5);  db9(6, a) = r_jet(7);  db9(7, a) = r_jet(6)
+              db9(8, a) = r_jet(9);  db9(9, a) = r_jet(10)
+            end do
           else
             n_act = n_raw
-            act_u(1:n_act)  = raw_u(1:n_act)
-            act_io(1:n_act) = raw_io(1:n_act)
-            act_jb(1:n_act) = raw_jb(1:n_act)
-            bv(1:n_act)  = rv(1:n_act);  bR(1:n_act)  = rR(1:n_act);  bZ(1:n_act)  = rZ(1:n_act);  bP(1:n_act)  = rP(1:n_act)
-            bRR(1:n_act) = rRR(1:n_act); bRZ(1:n_act) = rRZ(1:n_act); bZZ(1:n_act) = rZZ(1:n_act)
-            bRP(1:n_act) = rRP(1:n_act); bZP(1:n_act) = rZP(1:n_act); bPP(1:n_act) = rPP(1:n_act)
+            n_grp = n_act / 4
+            do g_a = 1, n_grp
+              a0           = 4 * (g_a - 1)
+              grp_u(g_a)   = raw_u(a0 + 1)
+              grp_jb(g_a)  = raw_jb(a0 + 1)
+              grp_iuj(g_a) = pfafem_cache(ielm)%uj_map(grp_u(g_a), grp_jb(g_a))
+            end do
+            do a = 1, n_act
+              db9(1, a) = rv(a);  db9(2, a) = rR(a);  db9(3, a) = rZ(a);  db9(4, a) = rP(a)
+              db9(5, a) = rRR(a); db9(6, a) = rRZ(a); db9(7, a) = rZZ(a)
+              db9(8, a) = rRP(a); db9(9, a) = rZP(a)
+            end do
           end if
 
-          do a = 1, n_act
-            v    = bv(a)
-            v_x  = bR(a)
-            v_y  = bZ(a)
-            v_p  = bP(a)
-            v_xx = bRR(a)
-            v_xy = bRZ(a)
-            v_yy = bZZ(a)
-            v_xp = bRP(a)
-            v_yp = bZP(a)
+          if (n_act <= 0) cycle
+          R_p9  = 0.d0
+          C_pq9 = 0.d0
+
+          do ip_d = 1, 9
+            v    = merge(1.d0, 0.d0, ip_d == 1)
+            v_x  = merge(1.d0, 0.d0, ip_d == 2)
+            v_y  = merge(1.d0, 0.d0, ip_d == 3)
+            v_p  = merge(1.d0, 0.d0, ip_d == 4)
+            v_xx = merge(1.d0, 0.d0, ip_d == 5)
+            v_xy = merge(1.d0, 0.d0, ip_d == 6)
+            v_yy = merge(1.d0, 0.d0, ip_d == 7)
+            v_xp = merge(1.d0, 0.d0, ip_d == 8)
+            v_yp = merge(1.d0, 0.d0, ip_d == 9)
             v_s  = v_x * x_s(ms,mt) + v_y * y_s(ms,mt)
             v_t  = v_x * x_t(ms,mt) + v_y * y_t(ms,mt)
 
@@ -7178,23 +7253,18 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
             !#  RHS equations end                                                                              #
             !###################################################################################################
 
-            do ij = 1, n_var
-              r_loc = (ij - 1) * n_tor + act_jb(a)
-              RHS_u(r_loc, act_io(a), act_u(a)) = RHS_u(r_loc, act_io(a), act_u(a)) &
-                + (rhs_ij(ij) + rhs_ij_k(ij)) * wst
-            end do
+            R_p9(1:n_var, ip_d) = rhs_ij(1:n_var) + rhs_ij_k(1:n_var)
 
-            iuja = pfafem_cache(ielm)%uj_map(act_u(a), act_jb(a))
-            do b = 1, n_act
-              psi    = bv(b)
-              psi_x  = bR(b)
-              psi_y  = bZ(b)
-              psi_p  = bP(b)
-              psi_xx = bRR(b)
-              psi_xy = bRZ(b)
-              psi_yy = bZZ(b)
-              psi_xp = bRP(b)
-              psi_yp = bZP(b)
+            do iq_d = 1, 9
+              psi    = merge(1.d0, 0.d0, iq_d == 1)
+              psi_x  = merge(1.d0, 0.d0, iq_d == 2)
+              psi_y  = merge(1.d0, 0.d0, iq_d == 3)
+              psi_p  = merge(1.d0, 0.d0, iq_d == 4)
+              psi_xx = merge(1.d0, 0.d0, iq_d == 5)
+              psi_xy = merge(1.d0, 0.d0, iq_d == 6)
+              psi_yy = merge(1.d0, 0.d0, iq_d == 7)
+              psi_xp = merge(1.d0, 0.d0, iq_d == 8)
+              psi_yp = merge(1.d0, 0.d0, iq_d == 9)
               psi_s  = psi_x * x_s(ms,mt) + psi_y * y_s(ms,mt)
               psi_t  = psi_x * x_t(ms,mt) + psi_y * y_t(ms,mt)
 
@@ -9502,22 +9572,124 @@ subroutine element_matrix_pfafem(node_list, element_list, ielm, xpoint2, xcase2,
                   !# end equations                                                                                   #
                   !###################################################################################################
 
-              iujb = pfafem_cache(ielm)%uj_map(act_u(b), act_jb(b))
-              isp  = pfafem_cache(ielm)%sp_map(iuja, iujb)
-              do kl = 1, n_var
+              C_pq9(1:n_var, 1:n_var, ip_d, iq_d) = &
+                amat(1:n_var, 1:n_var) + amat_k(1:n_var, 1:n_var) + &
+                amat_n(1:n_var, 1:n_var) + amat_kn(1:n_var, 1:n_var)
+            end do ! iq_d
+          end do ! ip_d
+
+          if (.not. has_axis_u) then
+            do g_a = 1, n_grp
+              u_a  = grp_u(g_a)
+              jb_a = grp_jb(g_a)
+              a0   = 4 * (g_a - 1)
+              do io_a = 1, 4
+                a = a0 + io_a
                 do ij = 1, n_var
-                  ELM_sp(act_io(a), act_io(b), ij, kl, isp) = &
-                    ELM_sp(act_io(a), act_io(b), ij, kl, isp) &
-                    + (amat(ij, kl) + amat_k(ij, kl) + amat_n(ij, kl) + amat_kn(ij, kl)) * wst
+                  db_val = dot_product(R_p9(ij, 1:9), db9(1:9, a))
+                  r_loc  = (ij - 1) * n_tor + jb_a
+                  RHS_u(r_loc, io_a, u_a) = RHS_u(r_loc, io_a, u_a) + wst * db_val
                 end do
               end do
-            end do ! b
-          end do ! a
+            end do
+
+            n_ij = 0
+            do kl = 1, n_var
+              do ij = 1, n_var
+                sq = 0
+                do iq_d = 1, 9
+                  if (any(C_pq9(ij, kl, 1:9, iq_d) /= 0.d0)) then
+                    if (sq == 0) then
+                      n_ij = n_ij + 1
+                      iv_ij(n_ij) = ij
+                      jv_ij(n_ij) = kl
+                    end if
+                    sq = sq + 1
+                    q_ij(sq, n_ij) = iq_d
+                    do a = 1, n_act
+                      T_kqa(a, sq, n_ij) = wst * dot_product(C_pq9(ij, kl, 1:9, iq_d), db9(1:9, a))
+                    end do
+                  end if
+                end do
+                if (sq > 0) nq_ij(n_ij) = sq
+              end do
+            end do
+
+            do g_a = 1, n_grp
+              a0   = 4 * (g_a - 1)
+              iuja = grp_iuj(g_a)
+              do g_b = 1, n_grp
+                b0   = 4 * (g_b - 1)
+                iujb = grp_iuj(g_b)
+                isp  = pfafem_cache(ielm)%sp_map(iuja, iujb)
+                do k_ij = 1, n_ij
+                  m44 = 0.d0
+                  do sq = 1, nq_ij(k_ij)
+                    iq_d = q_ij(sq, k_ij)
+                    do io_b = 1, 4
+                      db_val = db9(iq_d, b0 + io_b)
+                      do io_a = 1, 4
+                        m44(io_a, io_b) = m44(io_a, io_b) + T_kqa(a0 + io_a, sq, k_ij) * db_val
+                      end do
+                    end do
+                  end do
+                  ELM_sp(1:4, 1:4, iv_ij(k_ij), jv_ij(k_ij), isp) = &
+                    ELM_sp(1:4, 1:4, iv_ij(k_ij), jv_ij(k_ij), isp) + m44
+                end do
+              end do
+            end do
+          else
+            do a = 1, n_act
+              do ij = 1, n_var
+                db_val = dot_product(R_p9(ij, 1:9), db9(1:9, a))
+                r_loc  = (ij - 1) * n_tor + act_jb(a)
+                RHS_u(r_loc, act_io(a), act_u(a)) = RHS_u(r_loc, act_io(a), act_u(a)) + wst * db_val
+              end do
+            end do
+
+            n_ij = 0
+            do kl = 1, n_var
+              do ij = 1, n_var
+                sq = 0
+                do iq_d = 1, 9
+                  if (any(C_pq9(ij, kl, 1:9, iq_d) /= 0.d0)) then
+                    if (sq == 0) then
+                      n_ij = n_ij + 1
+                      iv_ij(n_ij) = ij
+                      jv_ij(n_ij) = kl
+                    end if
+                    sq = sq + 1
+                    q_ij(sq, n_ij) = iq_d
+                    do a = 1, n_act
+                      T_kqa(a, sq, n_ij) = wst * dot_product(C_pq9(ij, kl, 1:9, iq_d), db9(1:9, a))
+                    end do
+                  end if
+                end do
+                if (sq > 0) nq_ij(n_ij) = sq
+              end do
+            end do
+
+            do a = 1, n_act
+              iuja = pfafem_cache(ielm)%uj_map(act_u(a), act_jb(a))
+              do b = 1, n_act
+                iujb = pfafem_cache(ielm)%uj_map(act_u(b), act_jb(b))
+                isp  = pfafem_cache(ielm)%sp_map(iuja, iujb)
+                do k_ij = 1, n_ij
+                  db_val = 0.d0
+                  do sq = 1, nq_ij(k_ij)
+                    db_val = db_val + T_kqa(a, sq, k_ij) * db9(q_ij(sq, k_ij), b)
+                  end do
+                  ELM_sp(act_io(a), act_io(b), iv_ij(k_ij), jv_ij(k_ij), isp) = &
+                    ELM_sp(act_io(a), act_io(b), iv_ij(k_ij), jv_ij(k_ij), isp) + db_val
+                end do
+              end do
+            end do
+          end if
 
         end do ! mt
       end do ! ms
-    end do ! iq
-  end do ! eP
+    end do ! eP
+  end do ! iq
 
   if (allocated(P_imp)) deallocate(P_imp)
   if (allocated(dP_imp_dT)) deallocate(dP_imp_dT)

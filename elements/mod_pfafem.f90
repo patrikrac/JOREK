@@ -55,11 +55,7 @@ module mod_pfafem
   end type type_pfafem_elem_cache
 
   ! --- Public module state ---
-#ifdef STELLARATOR_MODEL
   integer, parameter, public :: pfafem_ng_pol = 24
-#else
-  integer, parameter, public :: pfafem_ng_pol = n_gauss
-#endif
   logical, public :: pfafem_ready = .false.
   integer, public :: pfafem_cache_epoch = 0
   logical, public :: pfafem_is_axisym_bfield = .true.
@@ -1085,6 +1081,7 @@ contains
     real*8,                  intent(in)    :: s, t, phi
     real*8,                  intent(inout) :: fl_io(2)
 
+#ifdef STELLARATOR_MODEL
     real*8  :: H_l(4, n_degrees), s_norm_pt, s_lcfs, s0_col, s1_col, u_col, w_col
     real*8  :: Rr, Zr, Rs, Rt, Zs, Zt, xjac, xp_m, yp_m, sz, df_R, df_Z, s_dot, phi_c
     real*8  :: hz_c(n_coord_tor), hzp_c(n_coord_tor)
@@ -1145,6 +1142,7 @@ contains
     s_dot = (df_R * Zt - df_Z * Rt) / xjac
     fl_io(1) = fl_io(1) - (1.d0 - w_col) * s_dot * Rs
     fl_io(2) = fl_io(2) - (1.d0 - w_col) * s_dot * Zs
+#endif
   end subroutine apply_bnd_tangent_collar
 
   !=============================================================================
@@ -2829,12 +2827,16 @@ contains
     !$omp         rv, rR, rZ, rP, rRR, rRZ, rZZ, rRP, rZP, rPP)
     do ielm = pfafem_el_lo, pfafem_el_hi
       iel_loc = ielm - pfafem_el_lo + 1
+#ifdef STELLARATOR_MODEL
       do i = 1, n_vertex_max
         inode = element_list%element(ielm)%vertex(i)
         do j = 1, n_order + 1
           rtor_iq(i, j) = element_list%element(ielm)%size(i, j) * node_list%node(inode)%r_tor_eq(j)
         end do
       end do
+#else
+      rtor_iq = 0.d0
+#endif
       do eP = 0, n_tor - 1
         iep = merge(1, eP + 1, pfafem_cache_axisym)
         do iq = 1, ng_t

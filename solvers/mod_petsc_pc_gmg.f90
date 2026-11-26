@@ -3427,7 +3427,9 @@ contains
           if (.not. B%btd(b_)) cycle
           nn0 = B%rg(b_)%nn
           pd  = max(2, max_d(b_))
-          if (B%rg(b_)%meth == RS_HYB .and. nn0 >= 4) pd = min(pd, max(1, min(nn0 / 4, max(2, nn0 / cap_div))))
+          if (B%rg(b_)%meth == RS_HYB .and. B%sz(b_) > 4096 .and. nn0 >= 4) then
+            pd = min(pd, max(2, min(nn0 / 4, max(2, nn0 / cap_div, 2048 / max(1, B%sz(b_) / nn0)))))
+          endif
           if (.not. bad(b_) .or. (nn0 / pd >= 4)) nbtd_ = nbtd_ + 1
         enddo
         nbtd_ = max(nbtd_, 1)
@@ -3438,7 +3440,9 @@ contains
         nn0    = B%rg(b_)%nn
         pd_raw = max(2, max_d(b_))
         pd     = pd_raw
-        if (B%rg(b_)%meth == RS_HYB .and. nn0 >= 4) pd = min(pd_raw, max(1, min(nn0 / 4, max(2, nn0 / cap_div))))
+        if (B%rg(b_)%meth == RS_HYB .and. B%sz(b_) > 4096 .and. nn0 >= 4) then
+          pd = min(pd_raw, max(2, min(nn0 / 4, max(2, nn0 / cap_div, 2048 / max(1, B%sz(b_) / nn0)))))
+        endif
         nn_s = nn0 / pd
         if (nn_s < 4) cycle
         if (pd < pd_raw) then
