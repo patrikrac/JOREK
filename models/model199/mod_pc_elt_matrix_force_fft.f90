@@ -155,7 +155,8 @@ end subroutine pc_elt_matrix_force_fft
 !! density (all harmonics, through the FFT scatter). With B_44 = (v, w R) and
 !! B_42 = (grad v, R grad u), the inertia part of B_22,
 !! -opz (grad v, rho0 R^3 grad u), is -M_rho B_44^-1 B_42 up to the
-!! gradients of rho0 R^2.
+!! gradients of rho0 R^2. With -vs_pressure mass, plus the pressure term as a
+!! mass on the vorticity (mod_pc_pressure_mass).
 subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
 
   use mod_parameters
@@ -163,6 +164,7 @@ subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
   use gauss
   use basis_at_gaussian
   use phys_module
+  use mod_pc_pressure_mass, only: pm_on, pm_element, PM_RHO_ABS
 
   implicit none
 
@@ -236,6 +238,8 @@ subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
     enddo
   enddo
   ELM = 0.5d0 * (1.d0 + zeta_t) * ELM
+  ! -vs_pressure mass: the pressure term on the vorticity (mod_pc_pressure_mass)
+  if (pm_on) call pm_element(element, nodes, PM_RHO_ABS, ELM)
 
 end subroutine pc_elt_matrix_mass_rho
 

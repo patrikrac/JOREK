@@ -231,7 +231,9 @@ end subroutine pc_elt_matrix_force_fft
 
 !> The inertia of the vorticity-space Schur PC, as model199's
 !! (models/model199/mod_pc_elt_matrix_force_fft.f90) with model600's density
-!! weight: M_rho(v, w) = opz int corr_neg_dens(rho0) R^3 v w dR dZ.
+!! weight: M_rho(v, w) = opz int corr_neg_dens(rho0) R^3 v w dR dZ. With
+!! -vs_pressure mass, plus the pressure term on the vorticity
+!! (mod_pc_pressure_mass, gamma from -vs_pressure_gamma).
 subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
 
   use mod_parameters
@@ -240,6 +242,7 @@ subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
   use basis_at_gaussian
   use phys_module
   use corr_neg, only: corr_neg_dens
+  use mod_pc_pressure_mass, only: pm_on, pm_element, PM_RHO_CORR
 
   implicit none
 
@@ -313,6 +316,8 @@ subroutine pc_elt_matrix_mass_rho(element, nodes, ELM)
     enddo
   enddo
   ELM = 0.5d0 * (1.d0 + zeta_t) * ELM
+  ! -vs_pressure mass: the pressure term on the vorticity (mod_pc_pressure_mass)
+  if (pm_on) call pm_element(element, nodes, PM_RHO_CORR, ELM)
 
 end subroutine pc_elt_matrix_mass_rho
 

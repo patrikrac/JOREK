@@ -215,6 +215,18 @@
 !!                                     (mod_petsc_pc_hypre, -sf_amg1_*), or the
 !!                                     ring GMG whatever physics_pc_sf_pair_w
 !!                                     (gmg: that one then serves the Laplacian)
+!! for every VS variant (M_rho):
+!!   -vs_pressure none | mass          the pressure term of the flow row as a
+!!                                     mass on omega in M_rho (default none;
+!!                                     modelPC/mod_pc_pressure_mass): the
+!!                                     compression and the ballooning drive
+!!                                     for grad u along one direction
+!!   -vs_pressure_gamma <g>            its adiabatic index (default 1)
+!!   -vs_pressure_dir0 n | t | iso     the direction in the block of n = 0
+!!                                     (default n = grad psi0 / |grad psi0|)
+!!   -vs_pressure_dirn n | t | iso     elsewhere (default t, the binormal)
+!!   -vs_pressure_clip <kappa>         its weight >= -kappa times the inertia's
+!!                                     (default 0.2, in [0, 1))
 !! and with v_par:
 !!   -vs_pv_solver default | spdmg | hypre
 !!                                     P_V's solver: the backend of
@@ -403,14 +415,17 @@ contains
                            physics_pc_sf_rtol, physics_pc_sf_harm_couple, physics_pc_sf_mode_split, &
                            physics_pc_sf_vpar, physics_pc_sf_vpar_stage, n_tht
     use mod_parameters, only: n_tor, var_T
+    use mod_pc_pressure_mass, only: pm_on, pm_gamma, pm_clip, pm_dir, PM_N, PM_T, PM_ISO
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
     PetscBool :: is_set, flag
     PetscInt :: iv
+    PetscReal :: rv
     character(len=16) :: form
     character(len=48) :: pname
     character(len=*), parameter :: P = "[Physics PC]   "
     character(len=*), parameter :: form_text(0:2) = [character(len=24) :: "Z", "(Z + Z') / 2", "Z + Z' - Z' S Z"]
+    character(len=*), parameter :: dir_text(3) = [character(len=3) :: "n", "t", "iso"]
 
     if (vs_init_done) return
 
@@ -477,6 +492,29 @@ contains
       if (.not. is_set) blk_view = ""
       call PetscOptionsGetBool(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_mem_report", flag, is_set, ierr)
       if (is_set) mem_report = flag
+    endif
+    ! the pressure term as a mass on omega in M_rho (every VS variant; the
+    ! element routine pc_elt_matrix_mass_rho reads mod_pc_pressure_mass)
+    form = "none"
+    call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pressure", form, is_set, ierr)
+    select case (trim(form))
+    case ("none"); pm_on = .false.
+    case ("mass"); pm_on = .true.
+    case default
+      call fatal("-vs_pressure must be none | mass, got '"//trim(form)//"'")
+    end select
+    if (pm_on) then
+      call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pressure_gamma", rv, is_set, ierr)
+      if (is_set) pm_gamma = rv
+      call PetscOptionsGetReal(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pressure_clip", rv, is_set, ierr)
+      if (is_set) pm_clip = rv
+      if (pm_clip < 0.d0 .or. pm_clip >= 1.d0) call fatal("-vs_pressure_clip must lie in [0, 1)")
+      form = "n"
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pressure_dir0", form, is_set, ierr)
+      pm_dir(1) = pm_dir_of(form, "-vs_pressure_dir0")
+      form = "t"
+      call PetscOptionsGetString(PETSC_NULL_OPTIONS, PETSC_NULL_CHARACTER, "-vs_pressure_dirn", form, is_set, ierr)
+      pm_dir(2) = pm_dir_of(form, "-vs_pressure_dirn")
     endif
     bk_pj   = sf_backend(physics_pc_sf_pair_psi, "physics_pc_sf_pair_psi", my_id)
     bk_vort = sf_backend(physics_pc_sf_pair_w,   "physics_pc_sf_pair_w",   my_id)
@@ -576,6 +614,9 @@ contains
         write(*,'(A)') P//"line bending: ideal, B_33^-1"
         write(*,'(A,A)') P//"vorticity: ", trim(physics_pc_sf_pair_w)//" (omega, y; M_rho = inertia)"
       endif
+      if (pm_on) write(*,'(A,F5.3,A,A,A,A,A,F4.2,A)') P//"pressure : a mass on omega in M_rho (-vs_pressure "// &
+        "mass), gamma ", pm_gamma, ", direction ", trim(dir_text(pm_dir(1))), " (n = 0) / ", &
+        trim(dir_text(pm_dir(2))), " (harmonics), clipped at -", pm_clip, " times the inertia"
       write(*,'(A,A)') P//"Laplacian: ", trim(physics_pc_sf_pair_w)//" (B_42, once)"
       write(*,'(A,A)') P//"pair_psi : ", trim(physics_pc_sf_pair_psi)
       write(*,'(A,A)') P//"rho / T  : ", trim(physics_pc_sf_rho)//" / "//trim(physics_pc_sf_T)
@@ -623,6 +664,18 @@ contains
       if (my_id == 0) write(*,'(A,A)') P//"FATAL: ", trim(msg)
       call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
     end subroutine fatal
+
+    integer function pm_dir_of(name, opt)
+      character(len=*), intent(in) :: name, opt
+      select case (trim(name))
+      case ("n");   pm_dir_of = PM_N
+      case ("t");   pm_dir_of = PM_T
+      case ("iso"); pm_dir_of = PM_ISO
+      case default
+        pm_dir_of = PM_N
+        call fatal(opt//" must be n | t | iso, got '"//trim(name)//"'")
+      end select
+    end function pm_dir_of
 
   end subroutine vs_init
 

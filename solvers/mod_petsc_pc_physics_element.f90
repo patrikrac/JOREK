@@ -181,6 +181,7 @@ contains
     use data_structure,  only: type_SP_MATRIX
     use mod_simulation_data, only: type_MHD_SIM
     use phys_module, only: eliminate_boundary_dofs
+    use mod_pc_pressure_mass, only: pm_on, pm_n_pts, pm_n_clip
     !> the penalty of the Jacobian's boundary rows (mod_boundary_conditions)
     real*8, parameter :: D_PENALTY = 1.d12
 
@@ -193,8 +194,11 @@ contains
     PetscErrorCode :: ierr
     real*8 :: d
     logical :: want_k1
+    integer*8 :: cnt(3)
+    integer :: mpierr
 
     call PetscLogEventBegin(pcev_elem_asm, ierr)
+    pm_n_pts = 0; pm_n_clip = 0
     d = merge(1.d0, D_PENALTY, eliminate_boundary_dofs)
     if (g_ctx%m_rho_ready) then
       PetscCallA(MatZeroEntries(g_ctx%M_rho, ierr))
@@ -241,6 +245,14 @@ contains
       else
         write(*,'(A)') "[Physics PC]   M_rho (inertia) assembled"
       endif
+    endif
+    if (pm_on) then
+      cnt = [pm_n_pts, pm_n_clip(1), pm_n_clip(2)]
+      call MPI_Allreduce(MPI_IN_PLACE, cnt, 3, MPI_INTEGER8, MPI_SUM, a_mat%comm, mpierr)
+      ! an element on a rank boundary is evaluated on each of its ranks
+      if (my_id == 0) write(*,'(A,F5.1,A,F5.1,A,I0,A)') "[Physics PC]   M_rho with the pressure mass: clipped "// &
+        "at ", 100.d0 * cnt(2) / max(cnt(1), 1_8), " % / ", 100.d0 * cnt(3) / max(cnt(1), 1_8), &
+        " % of ", cnt(1), " Gauss point evaluations (n = 0 / harmonics)"
     endif
   end subroutine assemble_vs_matrices
 
