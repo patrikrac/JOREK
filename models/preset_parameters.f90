@@ -908,6 +908,11 @@ use_matrix_equilibration = .false.
 use_pfafem         = .false.
 pfafem_n_substeps  = 4
 pfafem_n_gauss_tor = 4
+#ifdef STELLARATOR_MODEL
+pfafem_n_gauss_pol = 24
+#else
+pfafem_n_gauss_pol = 0
+#endif
 pfafem_spline_nr   = 96
 pfafem_spline_nz   = 96
 pfafem_openbc      = .true.

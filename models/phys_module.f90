@@ -170,6 +170,7 @@ module phys_module
   logical :: use_pfafem          !< Enable PFAFEM toroidal discretization (cubic B-splines along traced field lines)
   integer :: pfafem_n_substeps   !< RK4 substeps per toroidal trace interval (default 4)
   integer :: pfafem_n_gauss_tor  !< Gauss-Legendre quadrature points per toroidal cell (default 4)
+  integer :: pfafem_n_gauss_pol  !< Poloidal Gauss points per line: <=n_gauss (default inexact Gauss) or >n_gauss (seam-split Gauss, e.g. 24)
   integer :: pfafem_spline_nr    !< Structured cubic B-spline intervals in R for B-field evaluation (default 96)
   integer :: pfafem_spline_nz    !< Structured cubic B-spline intervals in Z for B-field evaluation (default 96)
   logical :: pfafem_openbc       !< Enable OpenBC boundary Hermite continuation & clamping for open field lines

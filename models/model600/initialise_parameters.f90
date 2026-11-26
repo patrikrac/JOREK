@@ -228,6 +228,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 loop_voltage, export_aux_node_list, fixed_aux_source, &
                 eps_noise, use_matrix_equilibration,                &
                 use_pfafem, pfafem_n_substeps, pfafem_n_gauss_tor,  &
+                pfafem_n_gauss_pol,                                 &
                 pfafem_spline_nr, pfafem_spline_nz, pfafem_openbc,  &
                 pfafem_retrace
 

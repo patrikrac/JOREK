@@ -55,7 +55,12 @@ module mod_pfafem
   end type type_pfafem_elem_cache
 
   ! --- Public module state ---
-  integer, parameter, public :: pfafem_ng_pol = 24
+  integer, parameter, public :: pfafem_ng_pol_max = 64
+#ifdef STELLARATOR_MODEL
+  integer, public :: pfafem_ng_pol = 24
+#else
+  integer, public :: pfafem_ng_pol = n_gauss
+#endif
   logical, public :: pfafem_ready = .false.
   integer, public :: pfafem_cache_epoch = 0
   logical, public :: pfafem_is_axisym_bfield = .true.
@@ -72,8 +77,8 @@ module mod_pfafem
   real*8, allocatable, public :: pfafem_w_pol(:,:,:,:,:) ! (ms, mt=1..pfafem_ng_pol, iq, iep, iel_loc)
   real*8, allocatable, public :: pfafem_Q(:,:)        ! (1:n_tor, 1:n_tor) nodal-from-spectral TorFFT
   real*8, allocatable, public :: pfafem_QT(:,:)       ! (1:n_tor, 1:n_tor) spectral-from-nodal Q^T
-  real*8 :: pfafem_gl_x(pfafem_ng_pol, pfafem_ng_pol) = 0.d0
-  real*8 :: pfafem_gl_w(pfafem_ng_pol, pfafem_ng_pol) = 0.d0
+  real*8 :: pfafem_gl_x(pfafem_ng_pol_max, pfafem_ng_pol_max) = 0.d0
+  real*8 :: pfafem_gl_w(pfafem_ng_pol_max, pfafem_ng_pol_max) = 0.d0
 
   type(type_pfafem_elem_cache), allocatable, public :: pfafem_cache(:) ! (1:n_elements)
 
@@ -2423,7 +2428,7 @@ contains
   !> Build or rebuild the global PFAFEM Shared-Point trace cache across all elements.
   !=============================================================================
   subroutine pfafem_build_cache(my_id, node_list, element_list, build_bgrid, use_current_pfafem)
-    use phys_module, only: pfafem_n_gauss_tor, pfafem_n_substeps, pfafem_openbc
+    use phys_module, only: pfafem_n_gauss_tor, pfafem_n_gauss_pol, pfafem_n_substeps, pfafem_openbc
 #ifdef STELLARATOR_MODEL
     use mod_chi, only: get_chi
 #endif
@@ -2435,7 +2440,7 @@ contains
     integer :: n_cpu, mpi_ierr, nel, ielm, iel_loc, iv, io, inode, ep_dim, ng_t
     integer :: el_lo, el_hi, n_loc, iep, eP, iq, ms, mt, lb, jb, em, status_inv, n_seams_line
     real*8  :: s_q, t_q, phi_q, phi_ref, phi_c, R_q, Z_q, Rs, Rt, Zs, Zt, sm, tm, tr12(12)
-    real*8  :: t_line(pfafem_ng_pol), w_line(pfafem_ng_pol), dummy_r(1)
+    real*8  :: t_line(pfafem_ng_pol_max), w_line(pfafem_ng_pol_max), dummy_r(1)
     real*8  :: hz_knot(n_coord_tor)
     logical :: tr_ok
     integer :: n_int_cnt, n_ext_cnt, n_clmp_cnt, n_drop_cnt, g_counts(4)
@@ -2454,6 +2459,11 @@ contains
     pfafem_phi_per = 2.d0 * pi / dble(n_period)
     pfafem_dphi    = pfafem_phi_per / dble(n_tor)
 
+    if (pfafem_n_gauss_pol <= n_gauss) then
+      pfafem_ng_pol = n_gauss
+    else
+      pfafem_ng_pol = min(pfafem_ng_pol_max, pfafem_n_gauss_pol)
+    end if
     call init_tor_gauss(pfafem_n_gauss_tor)
     ng_t = pfafem_ng_tor
 
@@ -2568,9 +2578,9 @@ contains
           do ms = 1, n_gauss
             s_q = xgauss(ms)
             call pfafem_build_pol_seam_rule(node_list, element_list, ielm, eP, iq, ms, &
-                                            phi_q, t_line, w_line, n_seams_line)
-            pfafem_t_pol(ms, 1:pfafem_ng_pol, iq, iep, iel_loc) = t_line
-            pfafem_w_pol(ms, 1:pfafem_ng_pol, iq, iep, iel_loc) = w_line
+                                            phi_q, t_line(1:pfafem_ng_pol), w_line(1:pfafem_ng_pol), n_seams_line)
+            pfafem_t_pol(ms, 1:pfafem_ng_pol, iq, iep, iel_loc) = t_line(1:pfafem_ng_pol)
+            pfafem_w_pol(ms, 1:pfafem_ng_pol, iq, iep, iel_loc) = w_line(1:pfafem_ng_pol)
             n_seam_sum = n_seam_sum + n_seams_line
             n_seam_max = max(n_seam_max, n_seams_line)
 
@@ -2670,9 +2680,14 @@ contains
     end if
     deallocate(send_i)
 
-    if (my_id == 0 .and. pfafem_ng_pol /= n_gauss) then
-      write(*,'(A,I3,A,F5.2,A,I2)') ' [PFAFEM] Seam-split poloidal rule: ng_pol=', pfafem_ng_pol, &
-        ' avg_seams=', dble(g_seam_sum(1)) / dble(max(1, g_seam_sum(2))), ' max_seams=', g_seam_max
+    if (my_id == 0) then
+      if (pfafem_ng_pol == n_gauss) then
+        write(*,'(A,I3,A,I3)') ' [PFAFEM] Inexact poloidal Gauss rule: ng_pol=', pfafem_ng_pol, &
+          ' ng_tor=', pfafem_ng_tor
+      else
+        write(*,'(A,I3,A,F5.2,A,I2)') ' [PFAFEM] Seam-split poloidal rule: ng_pol=', pfafem_ng_pol, &
+          ' avg_seams=', dble(g_seam_sum(1)) / dble(max(1, g_seam_sum(2))), ' max_seams=', g_seam_max
+      end if
     end if
 
     ! Unpack into pfafem_cache(1:nel) and build unique coupled vertex & pair tables
