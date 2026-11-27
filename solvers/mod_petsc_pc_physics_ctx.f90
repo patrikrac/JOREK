@@ -99,6 +99,7 @@ contains
     KSP, intent(in)              :: ksp
     character(len=*), intent(in) :: label
     integer, intent(in)          :: my_id
+#if defined(PETSC_HAVE_MUMPS)
     PC             :: pc
     Mat            :: F
     MatSolverType  :: stype
@@ -115,6 +116,7 @@ contains
     if (nent < 0) ent = -dble(nent) * 1.d6
     if (my_id == 0) write(*,'(A,A,T52,A,I7,A,ES10.3)') "[Mem] MUMPS ", label, &
       "MB ", mb, ", factor entries ", ent
+#endif
   end subroutine physics_pc_mumps_mem
 
 #endif

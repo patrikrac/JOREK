@@ -14,7 +14,7 @@
 module mod_petsc_pc_sf
 #ifdef USE_PETSC
   use mpi_mod
-  use mod_parameters, only: n_var, var_Vpar
+  use mod_parameters, only: n_var, var_Vpar, var_T, var_Ti, var_Te
   use mod_model_settings, only: jorek_model
 #include "petsc/finclude/petsc.h"
   use petsc
@@ -23,9 +23,13 @@ module mod_petsc_pc_sf
   use mod_petsc_pc_blocks, only: make_field_block_scale, decouple_penalty_rows
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_ops, only: sf_op_t, sfo_layout, sfo_build, sfo_fill, sfo_vars_in, sfo_vars_out, &
-       sfo_comm, sfo_n1
+       sfo_comm, sfo_n1, sfo_fam, sfo_nfam
   use mod_petsc_raw_csr, only: blockmv_attach
+#if PETSC_VERSION_LT(3,23,0)
+  use mod_petsc_raw_csr, only: mat_get_row, mat_restore_row
+#endif
   use mod_petsc_pc_mass_cheb, only: mass_cheb_t, mass_cheb_setup, mass_cheb_solve
+#include "petsc_f90_compat.h"
   implicit none
   private
 
@@ -38,8 +42,11 @@ module mod_petsc_pc_sf
   logical, save :: famode = .false.            !< mode split
   logical, save :: harm_all = .true.           !< physics_pc_sf_harm_couple
 
-  logical, parameter :: with_v = (var_Vpar > 0)
-  integer, parameter :: NSV = merge(7, 6, with_v)     !< variables of the sweep
+  logical, parameter :: with_v    = (var_Vpar > 0)
+  logical, parameter :: with_tite = (var_Ti > 0 .and. var_Te > 0)
+  integer, parameter :: var_T1    = max(var_T, var_Ti)
+  integer, parameter :: var_T2    = max(var_Te, 1)
+  integer, parameter :: NSV       = n_var              !< variables of the sweep
   integer, save :: vstage = SF_VPAR_V0
 
   !> The operators: the diagonal blocks, corrector 3's mass (opz B_44) and
@@ -47,23 +54,25 @@ module mod_petsc_pc_sf
   type(sf_op_t), save :: o_pj, o_w, o_rho, o_T, o_v, o_m
   integer, parameter :: CB_12 = 1, CB_16 = 2, CB_21 = 3, CB_23 = 4, CB_25 = 5, CB_26 = 6, &
                         CB_51 = 7, CB_52 = 8, CB_61 = 9, CB_62 = 10, CB_63 = 11, CB_65 = 12, &
-                        CB_71 = 13, CB_72 = 14, CB_75 = 15, CB_76 = 16, CB_57 = 17, CB_67 = 18
-  integer, parameter :: NCB = 18
+                        CB_71 = 13, CB_72 = 14, CB_75 = 15, CB_76 = 16, CB_57 = 17, CB_67 = 18, &
+                        CB_18 = 19, CB_28 = 20, CB_81 = 21, CB_82 = 22, CB_83 = 23, CB_85 = 24, &
+                        CB_78 = 25, CB_87 = 26
+  integer, parameter :: NCB = 26
   type(sf_op_t), save :: o_cb(NCB)
-  integer, save :: ncb_on = 12                 !< coupling blocks in use: 12, v_par 16 (v0) or 18
+  logical, save :: cb_active(NCB) = .false.
   !> the W sources (sf_op_t wid)
   integer, parameter :: WS_C = 1, WS_VV = 2, WS_VU = 3, WS_UV = 4, WS_N = 4
-  !> B_65 (T row, rho column) vanishes in model199 and is applied only where it does not
-  logical, save :: use_b65 = .false.
+  !> B_65 / B_85 (T row, rho column) vanish in model199 and are applied only where nonzero
+  logical, save :: use_b65 = .false., use_b85 = .false.
   type(mass_cheb_t), save :: mcm
   integer, save :: comm_g = MPI_COMM_NULL      !< the full system's communicator
   real*8, save  :: t_apply = 0.d0, t_scat = 0.d0
 
-  Vec, save :: sv_x(NSV), sv_y(NSV)
-  Vec, save :: rhs_PJ, sol_PJ, rhs_W, sol_W
-  Vec, save :: w3, w4, w5, t_rho, t_T, wv1, wv2
+  Vec, save :: sv_x(NSV), sv_y(NSV), sv_even(NSV), gs_r
+  Vec, save :: rhs_PJ, sol_PJ, rhs_W, sol_W, rhs_T, sol_T
+  Vec, save :: w3, w4, w5, w6, w_scr, t_rho, t_T, t_Te, wv1, wv2
   Vec, save :: zv                              !< zero field
-  logical, save :: vecs_ready = .false.
+  logical, save :: vecs_ready = .false., gs_ready = .false.
 
   !> penalty rows of the full Jacobian (eliminate_boundary_dofs = .f.): local
   !! offsets and diagonals, refreshed on every build
@@ -74,7 +83,7 @@ module mod_petsc_pc_sf
   Vec, save :: pen_w
   logical, save :: pen_w_made = .false.
 
-  public :: sf_build, sf_apply, sf_report
+  public :: sf_build, sf_apply, sf_report, sf_refresh_operator
 
 contains
 
@@ -82,10 +91,11 @@ contains
   subroutine sf_init(my_id)
     use phys_module, only: physics_pc_sf_pair_psi, physics_pc_sf_pair_w, physics_pc_sf_rho, physics_pc_sf_T, &
                            physics_pc_sf_rtol, physics_pc_sf_harm_couple, physics_pc_sf_corrector, &
-                           physics_pc_sf_mode_split, physics_pc_sf_vpar, physics_pc_sf_vpar_stage
-    use mod_parameters, only: n_tor, var_T
+                           physics_pc_sf_mode_split, physics_pc_sf_vpar, physics_pc_sf_vpar_stage, use_pfafem
+    use mod_parameters, only: n_tor, n_period, n_coord_period
     integer, intent(in) :: my_id
     PetscErrorCode :: ierr
+    logical :: ok_vars, floquet_split
     character(len=*), parameter :: P = "[Physics PC]   "
 
     if (sf_init_done) return
@@ -95,17 +105,22 @@ contains
     bk_rho = backend_of(physics_pc_sf_rho,      "physics_pc_sf_rho")
     bk_T   = backend_of(physics_pc_sf_T,        "physics_pc_sf_T")
 
-    if (jorek_model /= 199 .and. jorek_model /= 600 .and. jorek_model /= 183) &
-      call fatal("physics_pc_sf supports model199, model600 and model183 only")
-    if (n_var /= 6 .and. .not. ((jorek_model == 600 .or. jorek_model == 183) .and. n_var == 7 .and. &
-                                var_Vpar == 7 .and. var_T == 6)) &
-      call fatal("physics_pc_sf supports (psi, u, zj, w, rho, T), plus v_par on model600 / model183: build "// &
-                 "with with_TiTe, with_neutrals and with_impurities off")
-    if (mod(n_tor, 2) /= 1) call fatal("physics_pc_sf needs n_tor odd (n = 0 plus cos/sin pairs)")
+    if (jorek_model /= 199 .and. jorek_model /= 600 .and. jorek_model /= 183 .and. jorek_model /= 180) &
+      call fatal("physics_pc_sf supports model199, model600, model180 and model183 only")
+    ok_vars = (n_var == 6 .and. var_T == 6) .or. &
+              ((jorek_model == 600 .or. jorek_model == 183 .or. jorek_model == 180) .and. &
+               ((n_var == 7 .and. var_Vpar == 7 .and. var_T == 6) .or. &
+                (n_var == 7 .and. var_Ti == 6 .and. var_Te == 7 .and. var_Vpar == 0) .or. &
+                (n_var == 8 .and. var_Ti == 6 .and. var_Vpar == 7 .and. var_Te == 8)))
+    if (.not. ok_vars) &
+      call fatal("physics_pc_sf supports (psi, u, zj, w, rho, T or Ti/Te) [+ v_par] with neutrals/impurities off")
+    if (.not. use_pfafem .and. mod(n_tor, 2) /= 1) &
+      call fatal("physics_pc_sf needs n_tor odd (n = 0 plus cos/sin pairs)")
 
-    harm_all    = physics_pc_sf_harm_couple
-    sf_gmg_harm = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
-    famode      = physics_pc_sf_mode_split .and. .not. harm_all
+    harm_all      = physics_pc_sf_harm_couple
+    sf_gmg_harm   = merge(SF_GMG_HARM_ALL, SF_GMG_HARM_PAIR, harm_all)
+    floquet_split = physics_pc_sf_mode_split .and. harm_all .and. (n_coord_period > n_period)
+    famode        = physics_pc_sf_mode_split .and. ((.not. harm_all) .or. floquet_split)
 
     corr = physics_pc_sf_corrector
     if (corr == -1) corr = 4
@@ -113,6 +128,8 @@ contains
     if (corr == 3 .and. jorek_model /= 199) &
       call fatal("physics_pc_sf_corrector = 3 supports model199 only (rho / T mass = opz B_44)")
 
+    cb_active = .false.
+    cb_active(1:12) = .true.
     if (with_v) then
       bk_v   = backend_of(physics_pc_sf_vpar, "physics_pc_sf_vpar")
       vstage = sf_vpar_stage()
@@ -120,12 +137,20 @@ contains
                                  trim(physics_pc_sf_vpar_stage)//"'")
       if (vstage /= SF_VPAR_V0 .and. jorek_model /= 600) &
         call fatal("physics_pc_sf_vpar_stage = b0 | b1 needs model600 (W_vv): run v0")
-      ncb_on = merge(16, 18, vstage == SF_VPAR_V0)
+      cb_active(13:16) = .true.
+      if (vstage /= SF_VPAR_V0) cb_active(17:18) = .true.
       if (vstage == SF_VPAR_B1) then
-        if (.not. famode) call fatal("physics_pc_sf_vpar_stage = b1 needs the mode split "// &
-                                     "(physics_pc_sf_harm_couple = .f., physics_pc_sf_mode_split = .t.)")
+        if (.not. famode .or. harm_all) call fatal("physics_pc_sf_vpar_stage = b1 needs the mode split "// &
+                                                   "(physics_pc_sf_harm_couple = .f., physics_pc_sf_mode_split = .t.)")
         if (corr /= 1 .and. corr /= 2) &
           call fatal("physics_pc_sf_vpar_stage = b1 needs the Eq. (17) corrector (physics_pc_sf_corrector 1 | 2)")
+      endif
+    endif
+    if (with_tite) then
+      cb_active(19:24) = .true.
+      if (with_v) then
+        cb_active(25) = .true.
+        if (vstage /= SF_VPAR_V0) cb_active(26) = .true.
       endif
     endif
 
@@ -133,14 +158,25 @@ contains
       write(*,'(A)') "[Physics PC] ================ split-field (SF) preconditioner ================"
       write(*,'(A,A)') P//"pair_psi : ", trim(physics_pc_sf_pair_psi)
       write(*,'(A,A)') P//"pair_w   : ", trim(physics_pc_sf_pair_w)//" (u, omega, psi, j; W = curvature)"
-      write(*,'(A,A)') P//"rho / T  : ", trim(physics_pc_sf_rho)//" / "//trim(physics_pc_sf_T)
+      if (with_tite) then
+        write(*,'(A,A)') P//"rho / TiTe: ", trim(physics_pc_sf_rho)//" / "//trim(physics_pc_sf_T)//" (coupled Ti, Te)"
+      else
+        write(*,'(A,A)') P//"rho / T  : ", trim(physics_pc_sf_rho)//" / "//trim(physics_pc_sf_T)
+      endif
       write(*,'(A,ES9.2)') P//"inner rtol: ", physics_pc_sf_rtol
-      if (harm_all) then
+      if (use_pfafem) &
+        write(*,'(A,I0,A)') P//"toroidal : PFAFEM B-spline (n_tor = ", n_tor, ") -> orthogonal Real-DFT (Q^T A Q)"
+      if (floquet_split) then
+        write(*,'(A,I0,A)') P//"cross-|n|: Floquet family-coupled (N_fp = ", n_coord_period / max(1, n_period), &
+          "), all family slots per GMG smoother block"
+      else if (harm_all) then
         write(*,'(A)') P//"cross-|n|: all kept, all slots per GMG smoother block"
       else
         write(*,'(A)') P//"cross-|n|: none, |n|-diagonal blocks, cos / sin per GMG smoother block"
       endif
-      if (famode) then
+      if (floquet_split) then
+        write(*,'(A)') P//"layout   : one stellarator Floquet mode family per rank group (mode_split + harm_couple)"
+      else if (famode) then
         write(*,'(A)') P//"layout   : one |n| family per rank group (physics_pc_sf_mode_split)"
       else
         write(*,'(A)') P//"layout   : global operators"
@@ -188,7 +224,7 @@ contains
   !! rebuild. The operators' patterns are fixed by the first build; later
   !! builds refill their values, so MUMPS and the GMG keep their setups.
   subroutine sf_build(A_full, comm, my_id)
-    use phys_module, only: physics_pc_sf_rtol, eliminate_boundary_dofs
+    use phys_module, only: physics_pc_sf_rtol, use_pfafem
     use mod_petsc_pc_harm, only: pc_ntor
     Mat, intent(in)     :: A_full
     integer, intent(in) :: comm, my_id
@@ -222,15 +258,18 @@ contains
     call build_or_fill(o_pj); call build_or_fill(o_w); call build_or_fill(o_rho); call build_or_fill(o_T)
     if (with_v .and. vstage /= SF_VPAR_B1) call build_or_fill(o_v)
     if (corr == 3 .and. first) call build_or_fill(o_m)    ! geometry only
-    do k = 1, ncb_on
-      call build_or_fill(o_cb(k))
+    do k = 1, NCB
+      if (cb_active(k)) call build_or_fill(o_cb(k))
     enddo
     call PetscLogEventEnd(pcev_extract, ierr)
     if (first) then
-      call set_use_b65(o_cb(CB_65)%mat, comm_s)
+      call set_use_b65(o_cb(CB_65)%mat, comm_s, "B_65", use_b65)
+      if (with_tite) call set_use_b65(o_cb(CB_85)%mat, comm_s, "B_85", use_b85)
       nno = 0
-      do k = 1, ncb_on
-        if (.not. blockmv_attach(o_cb(k)%mat, int(pc_ntor))) nno = nno + 1
+      do k = 1, NCB
+        if (cb_active(k)) then
+          if (.not. blockmv_attach(o_cb(k)%mat, int(pc_ntor))) nno = nno + 1
+        endif
       enddo
       if (nno > 0 .and. my_id == 0) write(*,'(A,I0,A)') "[Physics PC]   SF: WARNING ", nno, &
         " coupling block(s) not AIJ, left on PETSc's matvec"
@@ -238,8 +277,9 @@ contains
     call physics_pc_mem("SF build: operators filled", my_id)
 
     ! penalty rows as Dirichlet rows of the diagonal blocks, before the scaling
-    if (.not. eliminate_boundary_dofs) then
-      call full_penalty_rows(A_full)
+    ! (covers both eliminate_boundary_dofs = .f. and fix_axis_nodes = .t.)
+    call full_penalty_rows(A_full)
+    if (npen_full > 0) then
       call penalty_rows(slv_pj, o_pj)
       call penalty_rows(slv_w, o_w)
       call penalty_rows(slv_rho, o_rho)
@@ -248,12 +288,20 @@ contains
     endif
     call block_scale(slv_pj, o_pj)
     call block_scale(slv_w, o_w)
+    if (with_tite) call block_scale(slv_T, o_T)
 
     call PetscLogEventBegin(pcev_fact_pj, ierr)
-    call sf_solver_setup(slv_pj, o_pj%mat, bk_pj, "pair_psi", comm_s, my_id, rtol, gmg_inst=2, nfields=2, &
-                         smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
-                         pre0=SF_PJ_PRE0, post0=SF_PJ_POST0, nsmooth_c=SF_PJ_NSC, &
-                         axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    if (use_pfafem) then
+      call sf_solver_setup(slv_pj, o_pj%mat, bk_pj, "pair_psi", comm_s, my_id, rtol, gmg_inst=2, nfields=2, &
+                           smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=2, post0=2, nsmooth_c=SF_PJ_NSC, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    else
+      call sf_solver_setup(slv_pj, o_pj%mat, bk_pj, "pair_psi", comm_s, my_id, rtol, gmg_inst=2, nfields=2, &
+                           smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=SF_PJ_PRE0, post0=SF_PJ_POST0, nsmooth_c=SF_PJ_NSC, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    endif
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
     call PetscLogEventBegin(pcev_fact_w, ierr)
@@ -264,17 +312,37 @@ contains
     call PetscLogEventEnd(pcev_fact_w, ierr)
 
     call PetscLogEventBegin(pcev_fact_rhot, ierr)
-    call sf_solver_setup(slv_rho, o_rho%mat, bk_rho, "rho", comm_s, my_id, rtol, gmg_inst=3, nfields=1, &
-                         smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
-    call sf_solver_setup(slv_T, o_T%mat, bk_T, "T", comm_s, my_id, rtol, gmg_inst=4, nfields=1, &
-                         smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS_RHOT)
+    if (use_pfafem) then
+      call sf_solver_setup(slv_rho, o_rho%mat, bk_rho, "rho", comm_s, my_id, rtol, gmg_inst=3, nfields=1, &
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    else
+      call sf_solver_setup(slv_rho, o_rho%mat, bk_rho, "rho", comm_s, my_id, rtol, gmg_inst=3, nfields=1, &
+                           smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
+    endif
+    if (with_tite) then
+      call sf_solver_setup(slv_T, o_T%mat, bk_T, "pair_T", comm_s, my_id, rtol, gmg_inst=4, nfields=2, &
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS_RHOT, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    else
+      call sf_solver_setup(slv_T, o_T%mat, bk_T, "T", comm_s, my_id, rtol, gmg_inst=4, nfields=1, &
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS_RHOT, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    endif
     ! v0's B_77 is mass-dominated (rho's setup); b0's W_vv diffuses along B (T's)
     if (with_v .and. vstage == SF_VPAR_V0) then
-      call sf_solver_setup(slv_v, o_v%mat, bk_v, "v_par", comm_s, my_id, rtol, gmg_inst=5, nfields=1, &
-                           smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
+      if (use_pfafem) then
+        call sf_solver_setup(slv_v, o_v%mat, bk_v, "v_par", comm_s, my_id, rtol, gmg_inst=5, nfields=1, &
+                             smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                             axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+      else
+        call sf_solver_setup(slv_v, o_v%mat, bk_v, "v_par", comm_s, my_id, rtol, gmg_inst=5, nfields=1, &
+                             smoother=SF_GMG_SMOOTHER_LINES, maxits=SF_GMG_MAXITS_RHOT)
+      endif
     else if (with_v .and. vstage == SF_VPAR_B0) then
       call sf_solver_setup(slv_v, o_v%mat, bk_v, "v_par", comm_s, my_id, rtol, gmg_inst=5, nfields=1, &
-                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS)
+                           smoother=SF_GMG_SMOOTHER_RINGS, maxits=SF_GMG_MAXITS, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
     endif
     if (corr == 3 .and. first) call mass_cheb_setup(mcm, o_m%mat, comm_s, "rho / T mass B_44", int(pc_ntor))
     call PetscLogEventEnd(pcev_fact_rhot, ierr)
@@ -300,17 +368,23 @@ contains
 
     !> The operators' block layouts.
     subroutine define_operators()
-      use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
+      use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho
       integer, parameter :: NDIAG = 5
-      integer, parameter :: ce(18) = [var_psi, var_psi, var_u, var_u, var_u, var_u, var_rho, var_rho, &
-                                      var_T, var_T, var_T, var_T, max(var_Vpar, 1), max(var_Vpar, 1), &
-                                      max(var_Vpar, 1), max(var_Vpar, 1), var_rho, var_T]
-      integer, parameter :: cv(18) = [var_u, var_T, var_psi, var_zj, var_rho, var_T, var_psi, var_u, &
-                                      var_psi, var_u, var_zj, var_rho, var_psi, var_u, var_rho, var_T, &
-                                      max(var_Vpar, 1), max(var_Vpar, 1)]
-      character(len=4), parameter :: cn(18) = ["B_12", "B_16", "B_21", "B_23", "B_25", "B_26", "B_51", "B_52", &
+      integer, parameter :: ce(NCB) = [var_psi, var_psi, var_u, var_u, var_u, var_u, var_rho, var_rho, &
+                                       var_T1, var_T1, var_T1, var_T1, max(var_Vpar, 1), max(var_Vpar, 1), &
+                                       max(var_Vpar, 1), max(var_Vpar, 1), var_rho, var_T1, &
+                                       var_psi, var_u, var_T2, var_T2, var_T2, var_T2, &
+                                       max(var_Vpar, 1), var_T2]
+      integer, parameter :: cv(NCB) = [var_u, var_T1, var_psi, var_zj, var_rho, var_T1, var_psi, var_u, &
+                                       var_psi, var_u, var_zj, var_rho, var_psi, var_u, var_rho, var_T1, &
+                                       max(var_Vpar, 1), max(var_Vpar, 1), &
+                                       var_T2, var_T2, var_psi, var_u, var_zj, var_rho, &
+                                       var_T2, max(var_Vpar, 1)]
+      character(len=4), parameter :: cn(NCB) = ["B_12", "B_16", "B_21", "B_23", "B_25", "B_26", "B_51", "B_52", &
                                                 "B_61", "B_62", "B_63", "B_65", "B_71", "B_72", "B_75", "B_76", &
-                                                "B_57", "B_67"]
+                                                "B_57", "B_67", &
+                                                "B_18", "B_28", "B_81", "B_82", "B_83", "B_85", &
+                                                "B_78", "B_87"]
       integer :: k
       call full_op(o_pj, "pair_psi", 1, [var_psi, var_zj])
       if (with_v .and. vstage == SF_VPAR_B1) then
@@ -323,15 +397,19 @@ contains
         call full_op(o_w, "pair_w (wpj)", 2, [var_u, var_w, var_psi, var_zj])
         o_w%se(2, 3:4) = 0; o_w%se(3, 2) = 0; o_w%se(4, 1:2) = 0
       endif
-      ! the psi row's mass: opz B_33, in model183 B_11
-      if (jorek_model == 183) then
+      ! the psi row's mass: opz B_33, in model180 / model183 B_11
+      if (jorek_model == 183 .or. jorek_model == 180) then
         o_w%se(3, 3) = var_psi; o_w%sv(3, 3) = var_psi; o_w%scl(3, 3) = 0
       else
         o_w%se(3, 3) = var_zj;  o_w%sv(3, 3) = var_zj;  o_w%scl(3, 3) = 1
       endif
       o_w%wid(1, 1) = WS_C
       call full_op(o_rho, "B_55", 3, [var_rho])
-      call full_op(o_T,   "B_66", 4, [var_T])
+      if (with_tite) then
+        call full_op(o_T, "pair_T (Ti, Te)", 4, [var_T1, var_T2])
+      else
+        call full_op(o_T, "B_66", 4, [var_T1])
+      endif
       if (with_v .and. vstage /= SF_VPAR_B1) then
         call full_op(o_v, "B_77", 5, [var_Vpar])
         if (vstage == SF_VPAR_B0) then
@@ -339,7 +417,8 @@ contains
         endif
       endif
       if (corr == 3) call full_op(o_m, "B_44", NDIAG + NCB + 1, [var_w])
-      do k = 1, ncb_on
+      do k = 1, NCB
+        if (.not. cb_active(k)) cycle
         o_cb(k)%label = cn(k); o_cb(k)%nf = 1; o_cb(k)%tag = NDIAG + k
         o_cb(k)%se(1, 1) = ce(k); o_cb(k)%sv(1, 1) = cv(k)
       enddo
@@ -381,7 +460,7 @@ contains
       Mat :: A
       PetscInt :: rs, re, row, ncols, bs
       PetscInt, pointer :: cols(:)
-      PetscScalar, pointer :: vals(:)
+      PetscScalar, pointer :: vals(:), wp(:)
       integer :: jc, n, iv, mpierr
       real*8 :: dg, off
       integer, allocatable :: tl(:)
@@ -389,48 +468,60 @@ contains
       a_full_s = A
       call MatGetBlockSize(A, bs, ierr)
       call MatGetOwnershipRange(A, rs, re, ierr)
+      if (.not. pen_w_made) then
+        call MatCreateVecs(A, pen_w, PETSC_NULL_VEC, ierr)
+        pen_w_made = .true.
+      endif
+      call MatGetDiagonal(A, pen_w, ierr)
+      call VecGetArrayRead(pen_w, wp, ierr)
       allocate(tl(re - rs), td(re - rs))
       n = 0
       do row = rs, re - 1
+        dg = wp(int(row - rs) + 1)
+        if (abs(dg) < 1.d7) cycle
         iv = int(mod(row, bs)) / n_tor
         call MatGetRow(A, row, ncols, cols, vals, ierr)
-        dg = 0.d0; off = 0.d0
+        off = 0.d0
         do jc = 1, int(ncols)
-          if (cols(jc) == row) then
-            dg = vals(jc)
-          else if (int(mod(cols(jc), bs)) / n_tor == iv) then
+          if (cols(jc) /= row .and. int(mod(cols(jc), bs)) / n_tor == iv) then
             off = max(off, abs(vals(jc)))
           endif
         enddo
         call MatRestoreRow(A, row, ncols, cols, vals, ierr)
-        if (abs(dg) > 0.d0 .and. abs(dg) > 1.d6 * off) then
+        if (abs(dg) > 1.d6 * off) then
           n = n + 1; tl(n) = int(row - rs) + 1; td(n) = dg
         endif
       enddo
+      call VecRestoreArrayRead(pen_w, wp, ierr)
       pen_loc = tl(1:n); pen_d = td(1:n)
       call MPI_Allreduce(n, npen_full, 1, MPI_INTEGER, MPI_SUM, comm, mpierr)
-      if (.not. pen_w_made) call MatCreateVecs(A, pen_w, PETSC_NULL_VEC, ierr)
-      pen_w_made = .true.
-      if (my_id == 0 .and. first) write(*,'(A,I0,A)') "[Physics PC]   full Jacobian: ", npen_full, &
-        " penalty rows, back-substituted after every sweep"
+      if (npen_full > 0) then
+        if (my_id == 0 .and. first) write(*,'(A,I0,A)') "[Physics PC]   full Jacobian: ", npen_full, &
+          " penalty rows, back-substituted after every sweep"
+      endif
     end subroutine full_penalty_rows
 
     subroutine create_work_vectors()
       integer :: k_
       call MatCreateVecs(o_pj%mat, rhs_PJ, sol_PJ, ierr)
       call MatCreateVecs(o_w%mat, rhs_W, sol_W, ierr)
+      if (with_tite) call MatCreateVecs(o_T%mat, rhs_T, sol_T, ierr)
       call MatCreateVecs(o_rho%mat, sv_x(1), PETSC_NULL_VEC, ierr)
       do k_ = 2, NSV
         call VecDuplicate(sv_x(1), sv_x(k_), ierr)
       enddo
       do k_ = 1, NSV
         call VecDuplicate(sv_x(1), sv_y(k_), ierr)
+        call VecDuplicate(sv_x(1), sv_even(k_), ierr)
       enddo
       call VecDuplicate(sv_x(1), w3, ierr)
       call VecDuplicate(sv_x(1), w4, ierr)
       call VecDuplicate(sv_x(1), w5, ierr)
+      call VecDuplicate(sv_x(1), w6, ierr)
+      call VecDuplicate(sv_x(1), w_scr, ierr)
       call VecDuplicate(sv_x(1), t_rho, ierr)
       call VecDuplicate(sv_x(1), t_T, ierr)
+      call VecDuplicate(sv_x(1), t_Te, ierr)
       call VecDuplicate(sv_x(1), wv1, ierr)
       call VecDuplicate(sv_x(1), wv2, ierr)
       call VecDuplicate(sv_x(1), zv, ierr)
@@ -446,52 +537,136 @@ contains
 
   end subroutine sf_build
 
-  !> use_b65 = B_65 has a nonzero entry anywhere on comm.
-  subroutine set_use_b65(a, comm)
+  !> flag = matrix a has a nonzero entry anywhere on comm.
+  subroutine set_use_b65(a, comm, nm, flag)
     Mat :: a
     integer, intent(in) :: comm
+    character(len=*), intent(in) :: nm
+    logical, intent(out) :: flag
     real*8 :: nrm
     integer :: mpierr, me
     PetscErrorCode :: ierr
     call MatNorm(a, NORM_FROBENIUS, nrm, ierr)
     nrm = nrm**2
     call MPI_Allreduce(MPI_IN_PLACE, nrm, 1, MPI_DOUBLE_PRECISION, MPI_MAX, comm, mpierr)
-    use_b65 = (nrm > 0.d0)
+    flag = (nrm > 0.d0)
     call MPI_Comm_rank(comm, me, mpierr)
-    if (me == 0 .and. use_b65) write(*,'(A,ES10.3,A)') "[Physics PC]   SF: |B_65|_F = ", sqrt(nrm), &
+    if (me == 0 .and. flag) write(*,'(A,A,A,ES10.3,A)') "[Physics PC]   SF: |", trim(nm), "|_F = ", sqrt(nrm), &
       " (max over ranks), applied in the rho -> T sweep"
   end subroutine set_use_b65
 
   !> y = P^-1 x, the block-LDU sweep:
-  !!   1. predictor: (psi*, j*) by pair_psi; rho*, T* against them
+  !!   1. predictor: (psi*, j*) by pair_psi; rho*, T* (or coupled Ti*, Te*) against them
   !!   2. pair_w (u, omega, psi_w, j_w) on the rest
   !!   3. corrector: psi, j by a second pair_psi solve (corrector 0) or as
-  !!      psi* + psi_w, j* + j_w (1-4); rho, T by block solves on B_52 u,
-  !!      B_62 u (+ pair_w's psi_w, j_w with corrector 4) or by their mass
+  !!      psi* + psi_w, j* + j_w (1-4); rho, T / (Ti, Te) by block solves on B_52 u,
+  !!      B_62 u / B_82 u (+ pair_w's psi_w, j_w with corrector 4) or by their mass
   !!      inverse (3).
   !! v_par: stage b0 between 2 and 3, b1 inside 2, v0 after 3.
   subroutine sf_apply(x, y, ierr)
-    use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho, var_T
+    use mod_parameters, only: var_psi, var_u, var_zj, var_w, var_rho
     Vec :: x, y
     PetscErrorCode, intent(out) :: ierr
-    Vec :: x_psi, x_u, x_j, x_w, x_rho, x_T, x_v
-    Vec :: y_psi, y_u, y_j, y_w, y_rho, y_T, y_v
-    logical :: vb0, vb1
+    Vec :: x_psi, x_u, x_j, x_w, x_rho, x_T, x_Te, x_v
+    Vec :: y_psi, y_u, y_j, y_w, y_rho, y_T, y_Te, y_v
+    logical :: vb0, vb1, is_even
+    integer :: k_gs
     real*8 :: t0, t1
 
     ierr = 0
     call PetscLogEventBegin(pcev_apply, ierr)
     t0 = MPI_Wtime()
-    call sfo_vars_in(x, sv_x)
-    t_scat = t_scat + (MPI_Wtime() - t0)
+
+    if (famode .and. (.not. harm_all) .and. sfo_nfam >= 2) then
+      ! 3-pass Symmetric Red-Black Harmonic Gauss-Seidel (Even n={0,2,..} -> Odd n={1,3,..} -> Even)
+      ! across mode-split rank groups, capturing bipartite triad couplings (0<->1, 1<->2, 2<->3)
+      ! via two full-Jacobian MatMults while keeping single-|n| block factorizations.
+      if (.not. gs_ready) then
+        call VecDuplicate(x, gs_r, ierr)
+        gs_ready = .true.
+      endif
+      is_even = (mod(sfo_fam, 2) == 1)
+
+      ! Pass 1: Even n = {0, 2, ...}
+      t1 = MPI_Wtime()
+      call sfo_vars_in(x, sv_x)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+      if (is_even) then
+        call run_local_sweep()
+        do k_gs = 1, NSV
+          call VecCopy(sv_y(k_gs), sv_even(k_gs), ierr)
+        enddo
+      else
+        do k_gs = 1, NSV
+          call VecSet(sv_y(k_gs), 0.0d0, ierr)
+        enddo
+      endif
+      t1 = MPI_Wtime()
+      call sfo_vars_out(sv_y, y)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+
+      ! Pass 2: Odd n = {1, 3, ...} against (x - A_full * y_even)
+      call MatMult(a_full_s, y, gs_r, ierr)
+      call VecAYPX(gs_r, -1.0d0, x, ierr)
+      t1 = MPI_Wtime()
+      call sfo_vars_in(gs_r, sv_x)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+      if (.not. is_even) then
+        call run_local_sweep()
+      else
+        do k_gs = 1, NSV
+          call VecCopy(sv_even(k_gs), sv_y(k_gs), ierr)
+        enddo
+      endif
+      t1 = MPI_Wtime()
+      call sfo_vars_out(sv_y, y)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+
+      ! Pass 3: Even n = {0, 2, ...} correction against (x - A_full * y)
+      call MatMult(a_full_s, y, gs_r, ierr)
+      call VecAYPX(gs_r, -1.0d0, x, ierr)
+      t1 = MPI_Wtime()
+      call sfo_vars_in(gs_r, sv_x)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+      if (is_even) then
+        call run_local_sweep()
+        do k_gs = 1, NSV
+          call VecAXPY(sv_y(k_gs), 1.0d0, sv_even(k_gs), ierr)
+        enddo
+      endif
+      t1 = MPI_Wtime()
+      call sfo_vars_out(sv_y, y)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+    else
+      t1 = MPI_Wtime()
+      call sfo_vars_in(x, sv_x)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+      call run_local_sweep()
+      t1 = MPI_Wtime()
+      call sfo_vars_out(sv_y, y)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+    endif
+
+    t_apply = t_apply + (MPI_Wtime() - t0)
+    if (npen_full > 0) call penalty_backsub(x, y)
+    call PetscLogEventEnd(pcev_apply, ierr)
+    ierr = 0
+
+  contains
+
+    subroutine run_local_sweep()
     x_psi = sv_x(var_psi); x_u   = sv_x(var_u);   x_j = sv_x(var_zj)
-    x_w   = sv_x(var_w);   x_rho = sv_x(var_rho); x_T = sv_x(var_T)
+    x_w   = sv_x(var_w);   x_rho = sv_x(var_rho); x_T = sv_x(var_T1)
     y_psi = sv_y(var_psi); y_u   = sv_y(var_u);   y_j = sv_y(var_zj)
-    y_w   = sv_y(var_w);   y_rho = sv_y(var_rho); y_T = sv_y(var_T)
+    y_w   = sv_y(var_w);   y_rho = sv_y(var_rho); y_T = sv_y(var_T1)
+    x_Te = zv; y_Te = zv
+    if (with_tite) then
+      x_Te = sv_x(var_T2); y_Te = sv_y(var_T2)
+    endif
     x_v = zv; y_v = zv                                   ! placeholders without v_par, never read
     vb0 = .false.; vb1 = .false.
     if (with_v) then
-      x_v = sv_x(NSV); y_v = sv_y(NSV)
+      x_v = sv_x(max(var_Vpar, 1)); y_v = sv_y(max(var_Vpar, 1))
       vb0 = (vstage == SF_VPAR_B0)
       vb1 = (vstage == SF_VPAR_B1)
     endif
@@ -507,32 +682,45 @@ contains
     call VecWAXPY(w4, -1.0d0, w3, x_rho, ierr)
     call solve(slv_rho, w4, t_rho, pcev_solve_rhot)
 
-    ! T* = B_66^-1 (x_T - B_61 psi* - B_63 j* - B_65 rho*)
+    ! T* = B_66^-1 (x_T - B_61 psi* - B_63 j* - B_65 rho*), or coupled pair_T (Ti*, Te*)
     call MatMult(o_cb(CB_61)%mat, y_psi, w3, ierr)
     call VecWAXPY(w4, -1.0d0, w3, x_T, ierr)
     call sub_mult(CB_63, y_j, w4)
     if (use_b65) call sub_mult(CB_65, t_rho, w4)
-    call solve(slv_T, w4, t_T, pcev_solve_rhot)
+    if (with_tite) then
+      call MatMult(o_cb(CB_81)%mat, y_psi, w3, ierr)
+      call VecWAXPY(w6, -1.0d0, w3, x_Te, ierr)
+      call sub_mult(CB_83, y_j, w6)
+      if (use_b85) call sub_mult(CB_85, t_rho, w6)
+      call sf_split_parts(rhs_T, [w4, w6], .true.)
+      call solve(slv_T, rhs_T, sol_T, pcev_solve_rhot)
+      call sf_split_parts(sol_T, [t_T, t_Te], .false.)
+    else
+      call solve(slv_T, w4, t_T, pcev_solve_rhot)
+    endif
 
-    ! 2. pair_w on (x_u - B_21 psi* - B_23 j* - B_25 rho* - B_26 T*, x_w,
-    ! -B_16 T* or 0, 0): the omega row has no lower coupling, and x_psi, x_j
+    ! 2. pair_w on (x_u - B_21 psi* - B_23 j* - B_25 rho* - B_26 T* [- B_28 Te*], x_w,
+    ! -B_16 T* [- B_18 Te*] or 0, 0): the omega row has no lower coupling, and x_psi, x_j
     ! went to the predictor
     call VecCopy(x_u, w5, ierr)
     call sub_mult(CB_21, y_psi, w5)
     call sub_mult(CB_23, y_j, w5)
     call sub_mult(CB_25, t_rho, w5)
     call sub_mult(CB_26, t_T, w5)
+    if (with_tite) call sub_mult(CB_28, t_Te, w5)
     if (corr == 1 .or. corr == 4) then
       call MatMult(o_cb(CB_16)%mat, t_T, w4, ierr)
       call VecScale(w4, -1.0d0, ierr)
+      if (with_tite) call sub_mult(CB_18, t_Te, w4)
     else
       call VecSet(w4, 0.0d0, ierr)
     endif
-    if (vb1) then                                        ! x_V - B_71 psi* - B_75 rho* - B_76 T*
+    if (vb1) then                                        ! x_V - B_71 psi* - B_75 rho* - B_76 T* [- B_78 Te*]
       call MatMult(o_cb(CB_71)%mat, y_psi, wv1, ierr)
       call VecWAXPY(wv2, -1.0d0, wv1, x_v, ierr)
       call sub_mult(CB_75, t_rho, wv2)
       call sub_mult(CB_76, t_T, wv2)
+      if (with_tite) call sub_mult(CB_78, t_Te, wv2)
       call sf_split_parts(rhs_W, [w5, x_w, w4, zv, wv2], .true.)
     else
       call sf_split_parts(rhs_W, [w5, x_w, w4, zv], .true.)
@@ -545,23 +733,27 @@ contains
       call sf_split_parts(sol_W, [y_u, y_w, w3, w4], .false.)
     endif
 
-    ! v_par b0: (B_77 + W_vv) V = x_V - B_71 psi* - B_75 rho* - B_76 T* - (B_72 + W_vu) u
+    ! v_par b0: (B_77 + W_vv) V = x_V - B_71 psi* - B_75 rho* - B_76 T* [- B_78 Te*] - (B_72 + W_vu) u
     if (vb0) then
       call MatMult(o_cb(CB_71)%mat, y_psi, wv1, ierr)
       call VecWAXPY(wv2, -1.0d0, wv1, x_v, ierr)
       call sub_mult(CB_75, t_rho, wv2)
       call sub_mult(CB_76, t_T, wv2)
+      if (with_tite) call sub_mult(CB_78, t_Te, wv2)
       call sub_mult(CB_72, y_u, wv2)
       call solve(slv_v, wv2, y_v, pcev_solve_rhot)
     endif
 
     ! corrector 4: pair_w's change of (psi, j) in the rho / T corrections,
-    ! held in y_rho / y_T until step 3
+    ! held in y_rho / y_T / y_Te until step 3
     if (corr == 4) then
       call MatMult(o_cb(CB_51)%mat, w3, y_rho, ierr)
       call MatMult(o_cb(CB_61)%mat, w3, y_T, ierr)
-      call MatMult(o_cb(CB_63)%mat, w4, w5, ierr)
-      call VecAXPY(y_T, 1.0d0, w5, ierr)
+      call add_mult(CB_63, w4, y_T)
+      if (with_tite) then
+        call MatMult(o_cb(CB_81)%mat, w3, y_Te, ierr)
+        call add_mult(CB_83, w4, y_Te)
+      endif
     endif
 
     ! 3. psi, j
@@ -569,10 +761,10 @@ contains
       call VecAXPY(y_psi, 1.0d0, w3, ierr)
       call VecAXPY(y_j,   1.0d0, w4, ierr)
     else
-      ! pair_psi (dpsi, dj) = (B_12 u + B_16 T*, 0): the j row of U is zero
+      ! pair_psi (dpsi, dj) = (B_12 u + B_16 T* [+ B_18 Te*], 0): the j row of U is zero
       call MatMult(o_cb(CB_12)%mat, y_u, w3, ierr)
-      call MatMult(o_cb(CB_16)%mat, t_T, w4, ierr)
-      call VecAXPY(w3, 1.0d0, w4, ierr)
+      call add_mult(CB_16, t_T, w3)
+      if (with_tite) call add_mult(CB_18, t_Te, w3)
       call VecZeroEntries(w4, ierr)
       call sf_split_parts(rhs_PJ, [w3, w4], .true.)
       call solve(slv_pj, rhs_PJ, sol_PJ, pcev_solve_pj)
@@ -581,7 +773,7 @@ contains
       call VecAXPY(y_j,   -1.0d0, w4, ierr)
     endif
 
-    ! 3. rho, T (only u enters: the omega column of U is zero)
+    ! 3. rho, T / (Ti, Te) (only u enters: the omega column of U is zero)
     if (corr == 3) then
       ! (opz B_44)^-1, no block solve (B_65 vanishes in model199)
       call MatMult(o_cb(CB_52)%mat, y_u, w3, ierr)
@@ -603,29 +795,33 @@ contains
       if (corr == 4) call VecAXPY(w3, 1.0d0, y_T, ierr)
       if (vb0 .or. vb1) call add_mult(CB_67, y_v, w3)
       if (use_b65) call sub_mult(CB_65, w5, w3)
-      call solve(slv_T, w3, w5, pcev_solve_rhot)
-      call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
+      if (with_tite) then
+        call MatMult(o_cb(CB_82)%mat, y_u, w6, ierr)
+        if (corr == 4) call VecAXPY(w6, 1.0d0, y_Te, ierr)
+        if (vb0 .or. vb1) call add_mult(CB_87, y_v, w6)
+        if (use_b85) call sub_mult(CB_85, w5, w6)
+        call sf_split_parts(rhs_T, [w3, w6], .true.)
+        call solve(slv_T, rhs_T, sol_T, pcev_solve_rhot)
+        call sf_split_parts(sol_T, [w4, w6], .false.)
+        call VecWAXPY(y_T,  -1.0d0, w4, t_T,  ierr)
+        call VecWAXPY(y_Te, -1.0d0, w6, t_Te, ierr)
+      else
+        call solve(slv_T, w3, w5, pcev_solve_rhot)
+        call VecWAXPY(y_T, -1.0d0, w5, t_T, ierr)
+      endif
     endif
 
-    ! v_par v0: B_77 V = x_V - B_71 psi - B_72 u - B_75 rho - B_76 T
+    ! v_par v0: B_77 V = x_V - B_71 psi - B_72 u - B_75 rho - B_76 T [- B_78 Te]
     if (with_v .and. .not. (vb0 .or. vb1)) then
       call MatMult(o_cb(CB_71)%mat, y_psi, wv1, ierr)
       call VecWAXPY(wv2, -1.0d0, wv1, x_v, ierr)
       call sub_mult(CB_72, y_u, wv2)
       call sub_mult(CB_75, y_rho, wv2)
       call sub_mult(CB_76, y_T, wv2)
+      if (with_tite) call sub_mult(CB_78, y_Te, wv2)
       call solve(slv_v, wv2, y_v, pcev_solve_rhot)
     endif
-
-    t1 = MPI_Wtime()
-    call sfo_vars_out(sv_y, y)
-    t_scat  = t_scat + (MPI_Wtime() - t1)
-    t_apply = t_apply + (MPI_Wtime() - t0)
-    if (npen_full > 0) call penalty_backsub(x, y)
-    call PetscLogEventEnd(pcev_apply, ierr)
-    ierr = 0
-
-  contains
+    end subroutine run_local_sweep
 
     subroutine solve(slv, b, s, ev)
       type(block_solver_t), intent(inout) :: slv
@@ -640,30 +836,17 @@ contains
     subroutine sub_mult(k, v, r)
       integer, intent(in) :: k
       Vec :: v, r
-      call MatMult(o_cb(k)%mat, v, scratch(r), ierr)
-      call VecAXPY(r, -1.0d0, scratch(r), ierr)
+      call MatMult(o_cb(k)%mat, v, w_scr, ierr)
+      call VecAXPY(r, -1.0d0, w_scr, ierr)
     end subroutine sub_mult
 
     !> r += B_k v
     subroutine add_mult(k, v, r)
       integer, intent(in) :: k
       Vec :: v, r
-      call MatMult(o_cb(k)%mat, v, scratch(r), ierr)
-      call VecAXPY(r, 1.0d0, scratch(r), ierr)
+      call MatMult(o_cb(k)%mat, v, w_scr, ierr)
+      call VecAXPY(r, 1.0d0, w_scr, ierr)
     end subroutine add_mult
-
-    !> A work vector distinct from r and from every operand still live.
-    function scratch(r) result(s)
-      Vec, intent(in) :: r
-      Vec :: s
-      if (r == wv2) then
-        s = wv1
-      else if (r == w3) then
-        s = w4
-      else
-        s = w3
-      endif
-    end function scratch
 
     !> The penalty rows' x_b = (r_b - sum_j a_bj y_j) / a_bb with the sweep's
     !! y: their residual is zbig times x_b's error, which the decoupled block
@@ -686,6 +869,26 @@ contains
     end subroutine penalty_backsub
 
   end subroutine sf_apply
+
+  !> Refresh the full-Jacobian handle and penalty-row diagonals on solve_only
+  !! calls (e.g. when solve_newton hands a fresh temporary Mat to KSPSolve
+  !! without rebuilding the preconditioner).
+  subroutine sf_refresh_operator(A_full)
+    Mat, intent(in) :: A_full
+    PetscScalar, pointer :: wp(:)
+    PetscErrorCode :: ierr
+    integer :: q
+    if (.not. g_ctx%reduced_ready) return
+    a_full_s = A_full
+    if (npen_full > 0 .and. pen_w_made .and. allocated(pen_loc)) then
+      call MatGetDiagonal(A_full, pen_w, ierr)
+      call VecGetArrayRead(pen_w, wp, ierr)
+      do q = 1, size(pen_loc)
+        if (abs(wp(pen_loc(q))) > 0.d0) pen_d(q) = wp(pen_loc(q))
+      enddo
+      call VecRestoreArrayRead(pen_w, wp, ierr)
+    endif
+  end subroutine sf_refresh_operator
 
   !> Inner-iteration summary, one line per block (mode split: per family),
   !! then reset. Collective.

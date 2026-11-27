@@ -43,7 +43,7 @@ contains
     PetscCallA(PCSetType(pc, PCFIELDSPLIT, ierr))
     PetscCallA(PCFieldSplitSetBlockSize(pc, block_size, ierr))
     if (autodistribute_modes) then
-      n_split = (n_tor + 1)/2
+      n_split = n_tor / 2 + 1
     else
       n_split = n_mode_families
     endif
@@ -54,6 +54,10 @@ contains
           n_modes_in_fam = 1
           allocate(fam_modes(1))
           fam_modes(1) = 1
+        else if (2*(i-1) + 1 > n_tor) then
+          n_modes_in_fam = 1
+          allocate(fam_modes(1))
+          fam_modes(1) = 2*(i-1)
         else
           n_modes_in_fam = 2
           allocate(fam_modes(2))
@@ -83,7 +87,12 @@ contains
 
     PetscCallA(PCSetUp(pc, ierr))
     PetscCallA(KSPSetUp(ksp, ierr))
+#if PETSC_VERSION_LT(3,23,0)
+    allocate(subksp_array(1024))
     PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
+#else
+    PetscCallA(PCFieldSplitGetSubKSP(pc, n_split, subksp_array, ierr))
+#endif
     do i = 1, n_split
       ! All blocks share one options prefix rather than PETSc's per-split
       ! fieldsplit_<N>_, so that a single option configures every toroidal mode
@@ -101,7 +110,9 @@ contains
       ! here or there - PCSetFromOptions is applied after this in both places.
       PetscCallA(KSPGetPC(subksp_array(i), subpc, ierr))
       PetscCallA(PCSetType(subpc, PCLU, ierr))
+#if defined(PETSC_HAVE_MUMPS)
       PetscCallA(PCFactorSetMatSolverType(subpc, MATSOLVERMUMPS, ierr))
+#endif
       PetscCallA(KSPSetFromOptions(subksp_array(i), ierr))
       call petsc_configure_direct_solver(subpc)
       PetscCallA(KSPSetUp(subksp_array(i), ierr))
@@ -115,7 +126,11 @@ contains
     ! on the parent communicator, so its rank 0 is the right one to print from.
     call MPI_COMM_RANK(comm, my_id, mpierr)
     if (my_id == 0) call petsc_report_solver(subksp_array(1), PC_BLOCK_PREFIX)
+#if PETSC_VERSION_LT(3,23,0)
+    deallocate(subksp_array)
+#else
     PetscCallA(PCFieldSplitRestoreSubKSP(pc, n_split, subksp_array, ierr))
+#endif
   end subroutine petsc_setup_toroidal_harmonic_pc
 
 

@@ -4,6 +4,11 @@ subroutine matrix_vector(x_vec, a_mat, y_vec)
   use mpi_mod
   use mod_integer_types
   use data_structure, only: type_SP_MATRIX, type_RHS
+#ifdef USE_PETSC
+#include "petsc/finclude/petsc.h"
+  use petsc
+#include "../solvers/petsc_f90_compat.h"
+#endif
 
   implicit none
   
@@ -20,6 +25,12 @@ subroutine matrix_vector(x_vec, a_mat, y_vec)
   integer(kind=int_all) :: n_blocksize, n_blocks, iA_start, ix_start, iy_start, index_offset, Int_tmp
   integer               :: ndof_local
   external              :: dgemv
+#ifdef USE_PETSC
+  Vec                   :: vx, vy
+  PetscInt              :: i_lo, i_hi, n_loc
+  PetscScalar, pointer  :: px(:), py(:)
+  PetscErrorCode        :: petsc_ierr
+#endif
   
   call MPI_COMM_SIZE(a_mat%comm, n_cpu, ierr)
   call MPI_COMM_RANK(a_mat%comm, my_id, ierr) 
@@ -27,6 +38,31 @@ subroutine matrix_vector(x_vec, a_mat, y_vec)
   counts = x_vec%n
   if (.not.associated(y_vec%val)) allocate(y_vec%val(y_vec%n))
   y_vec%val(1:y_vec%n)  = 0.d0
+
+#ifdef USE_PETSC
+  if (a_mat%petsc_assembled) then
+    call MatCreateVecs(a_mat%petsc_A, vx, vy, petsc_ierr)
+    call VecGetOwnershipRange(vx, i_lo, i_hi, petsc_ierr)
+    n_loc = i_hi - i_lo
+    call VecGetArray(vx, px, petsc_ierr)
+    if (n_loc > 0) px(1:n_loc) = x_vec%val(i_lo + 1 : i_hi)
+    call VecRestoreArray(vx, px, petsc_ierr)
+    call MatMult(a_mat%petsc_A, vx, vy, petsc_ierr)
+    call VecGetArrayRead(vy, py, petsc_ierr)
+    allocate(recv_counts(n_cpu), recv_disp(n_cpu))
+    call MPI_Allgather(int(n_loc), 1, MPI_INTEGER, recv_counts, 1, MPI_INTEGER, a_mat%comm, ierr)
+    recv_disp(1) = 0
+    do i = 2, n_cpu
+      recv_disp(i) = recv_disp(i - 1) + recv_counts(i - 1)
+    enddo
+    call MPI_Allgatherv(py, int(n_loc), MPI_DOUBLE_PRECISION, y_vec%val, recv_counts, recv_disp, MPI_DOUBLE_PRECISION, a_mat%comm, ierr)
+    deallocate(recv_counts, recv_disp)
+    call VecRestoreArrayRead(vy, py, petsc_ierr)
+    call VecDestroy(vx, petsc_ierr)
+    call VecDestroy(vy, petsc_ierr)
+    return
+  endif
+#endif
   n_blocksize  = a_mat%block_size
   n_blocks     = a_mat%nnz/n_blocksize**2
   ndof_local   = (a_mat%index_max(my_id + 1) - a_mat%index_min(my_id + 1) + 1)*n_blocksize

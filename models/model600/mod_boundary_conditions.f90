@@ -37,7 +37,7 @@ use phys_module, only: F0, GAMMA, freeboundary, RMP_on, psi_RMP_cos, dpsi_RMP_co
        RMP_start_time, tstep, RMP_har_cos, RMP_har_sin, T_min,                                             &
        mach_one_bnd_integral, Vpar_smoothing, vpar_smoothing_coef, no_mach1_bc,                            &
        Number_RMP_harmonics, RMP_har_cos_spectrum,RMP_har_sin_spectrum, grid_to_wall, n_wall_blocks, keep_n0_const, &
-       bcs, loop_voltage, central_density, central_mass 
+       bcs, loop_voltage, central_density, central_mass, use_pfafem 
 use tr_module
 use mpi_mod
 use mod_basisfunctions
@@ -103,7 +103,7 @@ real*8  ::   Mach1BC,   Mach1BC_v,   Mach1BC_T,   Mach1BC_u
 real*8  ::  dMach1BC,  dMach1BC_v,  dMach1BC_T,  dMach1BC_Ti, dMach1BC_Te,  dMach1BC_Tb, dMach1BC_ubb
 real*8  :: d2Mach1BC, d2Mach1BC_v, d2Mach1BC_T, d2Mach1BC_Tb, d2Mach1BC_Tbb
 
-integer :: node_indices( (n_order+1)/2, (n_order+1)/2 ), index_tmp, kk, ll
+integer :: node_indices( (n_order+1)/2, (n_order+1)/2 ), index_tmp, kk, ll, im_eq
 logical, parameter :: include_2nd_derivatives = .false.
 
 RMPspectrum: if (RMP_on .and. (n_tor .ge. 3)) then !*****
@@ -225,7 +225,7 @@ do i=1, n_local_elms !=== do elements
 
       do in=a_mat%i_tor_min, a_mat%i_tor_max  ! === do n_tor
       
-        if (keep_n0_const  .and.  in .eq. 1 ) then
+        if (keep_n0_const .and. (.not. use_pfafem) .and. in .eq. 1 ) then
           zbig = 1.d15
         else
           zbig = zbig_backup
@@ -354,7 +354,7 @@ do i=1, n_local_elms !=== do elements
 
           if ( (.not. is_freebound(in,k)) ) then
             if ( ( loop_voltage .ne. 0.d0 ) ) then
-              if ( (k == var_psi) .and. (in == 1) ) then
+              if ( (k == var_psi) .and. ((in == 1) .or. use_pfafem) ) then
                 index_node = node_list%node(inode)%index(1)
                 call boundary_conditions_add_RHS(       &
                           index_node, k, in,     &
@@ -401,10 +401,17 @@ do i=1, n_local_elms !=== do elements
             index_node3 = node_list%node(inode)%index(iv_dir+3)      ! position of 2nd deriative
 
           ! --- Determine the direction of the BCs and apply smoothing factors if requested
-          ps0       = node_list%node(inode)%values(1,1,var_psi)
-          ps0_b     = node_list%node(inode)%values(1,iv_dir,var_psi)  * element_size_0 
-          ps0_s     = node_list%node(inode)%values(1,2,var_psi)       * element_size_s
-          ps0_t     = node_list%node(inode)%values(1,3,var_psi)       * element_size_t
+          if (use_pfafem) then
+            ps0   = sum(node_list%node(inode)%values(1:n_tor,1,var_psi))      / dble(n_tor)
+            ps0_b = sum(node_list%node(inode)%values(1:n_tor,iv_dir,var_psi)) / dble(n_tor) * element_size_0
+            ps0_s = sum(node_list%node(inode)%values(1:n_tor,2,var_psi))      / dble(n_tor) * element_size_s
+            ps0_t = sum(node_list%node(inode)%values(1:n_tor,3,var_psi))      / dble(n_tor) * element_size_t
+          else
+            ps0   = node_list%node(inode)%values(1,1,var_psi)
+            ps0_b = node_list%node(inode)%values(1,iv_dir,var_psi)  * element_size_0 
+            ps0_s = node_list%node(inode)%values(1,2,var_psi)       * element_size_s
+            ps0_t = node_list%node(inode)%values(1,3,var_psi)       * element_size_t
+          end if
 
           BigR      = node_list%node(inode)%x(1,1,1)
           R_b       = node_list%node(inode)%x(1,iv_dir,1) * element_size_0
@@ -416,10 +423,17 @@ do i=1, n_local_elms !=== do elements
           Z_t       = node_list%node(inode)%x(1,3,2)      * element_size_t    
           Z         = node_list%node(inode)%x(1,1,2)
           
-          ps0_bb = element_list%element(ielm)%size(iv ,1)      * node_list%node(inode )%values(1,1,var_psi)      * H1_ss(1,1) &
-                 + element_list%element(ielm)%size(iv ,iv_dir) * node_list%node(inode )%values(1,iv_dir,var_psi) * H1_ss(1,2) &
-                 + element_list%element(ielm)%size(iv2,1)      * node_list%node(inode2)%values(1,1,var_psi)      * H1_ss(2,1) &
-                 + element_list%element(ielm)%size(iv2,iv_dir) * node_list%node(inode2)%values(1,iv_dir,var_psi) * H1_ss(2,2)
+          if (use_pfafem) then
+            ps0_bb = ( element_list%element(ielm)%size(iv ,1)      * sum(node_list%node(inode )%values(1:n_tor,1,var_psi))      * H1_ss(1,1) &
+                     + element_list%element(ielm)%size(iv ,iv_dir) * sum(node_list%node(inode )%values(1:n_tor,iv_dir,var_psi)) * H1_ss(1,2) &
+                     + element_list%element(ielm)%size(iv2,1)      * sum(node_list%node(inode2)%values(1:n_tor,1,var_psi))      * H1_ss(2,1) &
+                     + element_list%element(ielm)%size(iv2,iv_dir) * sum(node_list%node(inode2)%values(1:n_tor,iv_dir,var_psi)) * H1_ss(2,2) ) / dble(n_tor)
+          else
+            ps0_bb = element_list%element(ielm)%size(iv ,1)      * node_list%node(inode )%values(1,1,var_psi)      * H1_ss(1,1) &
+                   + element_list%element(ielm)%size(iv ,iv_dir) * node_list%node(inode )%values(1,iv_dir,var_psi) * H1_ss(1,2) &
+                   + element_list%element(ielm)%size(iv2,1)      * node_list%node(inode2)%values(1,1,var_psi)      * H1_ss(2,1) &
+                   + element_list%element(ielm)%size(iv2,iv_dir) * node_list%node(inode2)%values(1,iv_dir,var_psi) * H1_ss(2,2)
+          end if
 
           R_bb = + element_list%element(ielm)%size(iv ,1)      * node_list%node(inode )%x(1,1,1)      * H1_ss(1,1)  &
                  + element_list%element(ielm)%size(iv ,iv_dir) * node_list%node(inode )%x(1,iv_dir,1) * H1_ss(1,2)  &
@@ -431,7 +445,11 @@ do i=1, n_local_elms !=== do elements
                  + element_list%element(ielm)%size(iv2,1)      * node_list%node(inode2)%x(1,1,     2) * H1_ss(2,1)  &
                  + element_list%element(ielm)%size(iv2,iv_dir) * node_list%node(inode2)%x(1,iv_dir,2) * H1_ss(2,2)  
 
-          ps2_b     = node_list%node(inode2)%values(1,iv_dir,var_psi) * element_size_2 
+          if (use_pfafem) then
+            ps2_b = sum(node_list%node(inode2)%values(1:n_tor,iv_dir,var_psi)) / dble(n_tor) * element_size_2
+          else
+            ps2_b = node_list%node(inode2)%values(1,iv_dir,var_psi) * element_size_2 
+          end if 
           
           xjac  =  R_s*Z_t - R_t*Z_s
           ps0_x = (   Z_t * ps0_s - Z_s * ps0_t ) / xjac
@@ -493,18 +511,19 @@ do i=1, n_local_elms !=== do elements
           ! --- For the BC's the magnetic field is assumed constant, and we do
           ! --- not take derivatives of psi into account. Vpar, T and U are the
           ! --- only variables that will be used for the linearisation
+          im_eq = merge(in, 1, use_pfafem)
           if ( with_TiTe ) then
-            Ti0        = max(node_list%node(inode)%values(1,1,var_Ti), T_min)
-            Ti0_b      = node_list%node(inode)%values(1,iv_dir,var_Ti)    * element_size_0 
+            Ti0        = max(node_list%node(inode)%values(im_eq,1,var_Ti), T_min)
+            Ti0_b      = node_list%node(inode)%values(im_eq,iv_dir,var_Ti)    * element_size_0 
 
-            Te0        = max(node_list%node(inode)%values(1,1,var_Te), T_min)
-            Te0_b      = node_list%node(inode)%values(1,iv_dir,var_Te)    * element_size_0
+            Te0        = max(node_list%node(inode)%values(im_eq,1,var_Te), T_min)
+            Te0_b      = node_list%node(inode)%values(im_eq,iv_dir,var_Te)    * element_size_0
 
             T0   = Ti0 + Te0
             T0_b = Ti0_b + Te0_b
           else
-            T0        = max(node_list%node(inode)%values(1,1,var_T), T_min)
-            T0_b      = node_list%node(inode)%values(1,iv_dir,var_T)    * element_size_0
+            T0        = max(node_list%node(inode)%values(im_eq,1,var_T), T_min)
+            T0_b      = node_list%node(inode)%values(im_eq,iv_dir,var_T)    * element_size_0
 
             Ti0   = T0   / 2.d0
             Ti0_b = T0_b / 2.d0
@@ -512,23 +531,23 @@ do i=1, n_local_elms !=== do elements
             Te0_b = T0_b / 2.d0
           end if
 
-          Vpar0     = node_list%node(inode)%values(1,1,var_vpar)
-          Vpar0_b   = node_list%node(inode)%values(1,iv_dir,var_Vpar) * element_size_0 
+          Vpar0     = node_list%node(inode)%values(im_eq,1,var_vpar)
+          Vpar0_b   = node_list%node(inode)%values(im_eq,iv_dir,var_Vpar) * element_size_0 
 
-          u0_b      = node_list%node(inode)%values(1,iv_dir,var_u)    * element_size_0 
+          u0_b      = node_list%node(inode)%values(im_eq,iv_dir,var_u)    * element_size_0 
 
           if (n_order .ge. 5) then
             if ( with_TiTe ) then
-              Ti0_bb    = node_list%node(inode)%values(1,iv_dir+3,var_Ti)   * element_size_3 
-              Te0_bb    = node_list%node(inode)%values(1,iv_dir+3,var_Te)   * element_size_3 
+              Ti0_bb    = node_list%node(inode)%values(im_eq,iv_dir+3,var_Ti)   * element_size_3 
+              Te0_bb    = node_list%node(inode)%values(im_eq,iv_dir+3,var_Te)   * element_size_3 
               T0_bb     = Ti0_bb + Te0_bb
             else
-              T0_bb     = node_list%node(inode)%values(1,iv_dir+3,var_T)    * element_size_3 
+              T0_bb     = node_list%node(inode)%values(im_eq,iv_dir+3,var_T)    * element_size_3 
               Ti0_bb = T0_bb / 2.d0
               Te0_bb = T0_bb / 2.d0
             endif
-            Vpar0_bb  = node_list%node(inode)%values(1,iv_dir+3,var_Vpar) * element_size_3 
-            u0_bb     = node_list%node(inode)%values(1,iv_dir+3,var_u)    * element_size_3 
+            Vpar0_bb  = node_list%node(inode)%values(im_eq,iv_dir+3,var_Vpar) * element_size_3 
+            u0_bb     = node_list%node(inode)%values(im_eq,iv_dir+3,var_u)    * element_size_3 
           endif
 
           ! --- Mach1 BC's and derivatives
@@ -605,7 +624,7 @@ do i=1, n_local_elms !=== do elements
                - zbig * Mach1BC_u,                            &
                index_min, index_max, a_mat, my_id)
 
-          if (in .eq. 1) then
+          if ((in .eq. 1) .or. use_pfafem) then
             call boundary_conditions_add_RHS(                        &
                    index_node, kv, in,index_min, index_max, RHS_loc, &
                    Zbig * Mach1BC,                                   &
@@ -662,7 +681,7 @@ do i=1, n_local_elms !=== do elements
                    index_min, index_max, a_mat, my_id)
           endif
 
-          if (in .eq. 1) then
+          if ((in .eq. 1) .or. use_pfafem) then
             call boundary_conditions_add_RHS(                          &
                    index_node2, kv, in, index_min, index_max, RHS_loc, &
                    Zbig * dMach1BC,                                    &
@@ -705,7 +724,7 @@ do i=1, n_local_elms !=== do elements
                    index_node3, kv, in, index_node3, kTe, in,     &
                    - zbig * d2Mach1BC_Tbb,                        &
                    index_min, index_max, a_mat, my_id)
-            if (in .eq. 1) then
+            if ((in .eq. 1) .or. use_pfafem) then
               call boundary_conditions_add_RHS(                           &
                      index_node3, kv, in, index_min, index_max, RHS_loc,  &
                      Zbig * d2Mach1BC,                                    &

@@ -41,7 +41,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 n_pfc, n_tor_fft_thresh, manipulate_psi_map,        &
                 Rmin_pfc, Rmax_pfc, Zmin_pfc, Zmax_pfc, current_pfc,&
                 tokamak_device, gvec_grid_import, extended_boundary,&
-                j_cutoff_rcoord, j_cutoff_sig,                      &
+                j_cutoff_rcoord, j_cutoff_sig, bloating_factor,     &
                 F0, gamma_sheath, density_reflection,               &
                 zjz_0, zjz_1, zj_coef,                              &
                 rho_0, rho_1, rho_coef,                             &
@@ -73,6 +73,14 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 wall_resistivity, wall_resistivity_fact,            &
                 bc_natural_open,                                    &
                 use_mumps_eq, use_pastix_eq, use_strumpack_eq, use_petsc_eq,      &
+                use_physics_pc,                                     &
+                physics_pc_sf_pair_psi, physics_pc_sf_pair_w,       &
+                physics_pc_sf_rho, physics_pc_sf_T,                 &
+                physics_pc_sf_rtol, physics_pc_sf_corrector,        &
+                physics_pc_sf_harm_couple, physics_pc_sf_mode_split, &
+                physics_pc_sf_vpar, physics_pc_sf_vpar_stage,       &
+                eliminate_boundary_dofs,                            &
+                use_newton, maxNewton, gamma_Newton, alpha_Newton,  &
                 use_mumps_prj, use_pastix_prj, use_strumpack_prj,   &
                 use_mumps, mumps_ordering,                          &
                 use_BLR_compression, epsilon_BLR, just_in_time_BLR, &
@@ -128,7 +136,11 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 weights_per_family, autodistribute_ranks,           &
                 ranks_per_family,                                   &
                 use_manual_random_seed, manual_seed,                &
-                use_fixed_rng_value, fixed_rng_value                
+                use_fixed_rng_value, fixed_rng_value,               &
+                use_pfafem, pfafem_n_substeps, pfafem_n_gauss_tor,  &
+                pfafem_n_gauss_pol,                                 &
+                pfafem_spline_nr, pfafem_spline_nz, pfafem_openbc,  &
+                pfafem_retrace
 
                 
 namelist /dommcoef/  R_domm, dcoef
@@ -242,6 +254,17 @@ if (domm .and. my_id .eq. 0 ) then
     stop
   end if
 end if
+
+#ifdef USE_DOMM
+if (.not. domm .and. my_id .eq. 0) then
+  write(*,*) '**************************************************************************'
+  write(*,*) 'WARNING: Compiled with USE_DOMM=1 (Dommaschk-only vacuum field)'
+  write(*,*) '         but domm_file="', trim(domm_file), '"'
+  write(*,*) '         Vacuum field will be ZERO (dcoef array uninitialized)!'
+  write(*,*) '**************************************************************************'
+  stop
+end if
+#endif
   
 ! --- TiTe_ratio has to be between 1 and 0
 if ((with_TiTe) .and. (my_id .eq. 0)) then

@@ -8,6 +8,7 @@ use data_structure
 use phys_module
 use mod_import_restart
 use mod_interp
+use mod_pfafem, only: pfafem_ready, pfafem_init_eval_only, pfafem_eval_point_jet
 use basis_at_gaussian, only: initialise_basis
 implicit none
 
@@ -44,6 +45,9 @@ real*8                :: angle_sign
 logical               :: periodic, density_only
 integer               :: ierr, my_id
 logical               :: without_n0_mode, RphiZ_coords
+integer               :: pf_n_act, pf_a, pf_in, pf_io, pf_jb, pf_k, pf_stride, pf_n_stride
+integer               :: pf_inode(64), pf_act_io(64), pf_act_jb(64)
+real*8                :: pf_bval(64), pf_bdR(64), pf_bdZ(64), pf_bdP(64), pf_cval, pf_vsum(8), P2_s, P2_t, P2_st, P2_ss, P2_tt, P2
 
 namelist /vtk_params/ nsub, without_n0_mode, periodic, RphiZ_coords, density_only, n_toroidal
 
@@ -97,6 +101,9 @@ call init_chi_basis
 
 
 call import_restart(node_list, element_list, 'jorek_restart', rst_format, ierr, .true.)
+if (use_pfafem) then
+  call pfafem_init_eval_only(my_id, node_list, element_list)
+endif
 nnos = n_toroidal * nsub*nsub*node_list%n_nodes
 
 allocate(xyz(3,nnos), scalars(nnos,1:n_scalars), scalar_names(n_scalars))
@@ -203,6 +210,73 @@ do m=1, n_toroidal
 
         ps_x = 0.d0; ps_y = 0.d0; ps_p = 0.d0
         u_x = 0.d0; u_y = 0.d0; u_p = 0.d0
+        if (use_pfafem .and. pfafem_ready) then
+          call pfafem_eval_point_jet(node_list, element_list, R, Z, angle, &
+                                     .true., pf_n_act, pf_inode, pf_act_io, pf_act_jb, &
+                                     pf_bval, pf_bdR, pf_bdZ, pf_bdP)
+          pf_vsum = 0.d0
+          pf_stride = n_tor
+          if (n_coord_period > n_period .and. mod(n_tor * n_period, n_coord_period) == 0) then
+            pf_stride = (n_tor * n_period) / n_coord_period
+          end if
+          pf_n_stride = max(1, n_tor / max(1, pf_stride))
+
+          do pf_a = 1, pf_n_act
+            pf_in = pf_inode(pf_a)
+            pf_io = pf_act_io(pf_a)
+            pf_jb = pf_act_jb(pf_a)
+            if (density_only) then
+              pf_cval = node_list%node(pf_in)%values(pf_jb, pf_io, var_rho)
+              if (without_n0_mode) then
+                do pf_k = 0, pf_n_stride - 1
+                  pf_cval = pf_cval - node_list%node(pf_in)%values(1 + mod(pf_jb - 1 + pf_k * pf_stride, n_tor), pf_io, var_rho) &
+                                    / dble(pf_n_stride)
+                end do
+              end if
+              pf_vsum(1) = pf_vsum(1) + pf_cval * pf_bval(pf_a)
+            else
+              do i_var = 1, n_var
+                pf_cval = node_list%node(pf_in)%values(pf_jb, pf_io, i_var)
+                if (without_n0_mode) then
+                  do pf_k = 0, pf_n_stride - 1
+                    pf_cval = pf_cval - node_list%node(pf_in)%values(1 + mod(pf_jb - 1 + pf_k * pf_stride, n_tor), pf_io, i_var) &
+                                      / dble(pf_n_stride)
+                  end do
+                end if
+                pf_vsum(i_var) = pf_vsum(i_var) + pf_cval * pf_bval(pf_a)
+                if (i_var == var_psi) then
+                  ps_x = ps_x + pf_cval * pf_bdR(pf_a)
+                  ps_y = ps_y + pf_cval * pf_bdZ(pf_a)
+                  ps_p = ps_p + pf_cval * pf_bdP(pf_a)
+                else if (i_var == var_u) then
+                  u_x  = u_x  + pf_cval * pf_bdR(pf_a)
+                  u_y  = u_y  + pf_cval * pf_bdZ(pf_a)
+                  u_p  = u_p  + pf_cval * pf_bdP(pf_a)
+                end if
+              end do
+            end if
+          end do
+
+          if (density_only) then
+            scalars(inode, 1) = real(pf_vsum(1), 4)
+          else
+            scalars(inode, 1) = real(pf_vsum(var_psi), 4)
+            scalars(inode, 2) = real(pf_vsum(var_u), 4)
+            scalars(inode, 3) = real(pf_vsum(var_zj), 4)
+            scalars(inode, 4) = real(pf_vsum(var_w), 4)
+            scalars(inode, 5) = real(pf_vsum(var_rho), 4)
+            if (with_TiTe) then
+              scalars(inode, 6) = real(pf_vsum(var_Ti) + pf_vsum(var_Te), 4)
+            else
+              scalars(inode, 6) = real(pf_vsum(var_T), 4)
+            end if
+            if (with_Vpar) then
+              scalars(inode, 7) = real(pf_vsum(var_Vpar), 4)
+            else
+              scalars(inode, 7) = 0.0
+            end if
+          end if
+        else
         do i_tor = 1,n_tor
 
           if ( ( i_tor == 1 ) .and. ( without_n0_mode ) ) cycle ! Do not include the n=0 mode
@@ -237,7 +311,13 @@ do m=1, n_toroidal
             call interp(node_list,element_list,i,var_rho,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
             scalars(inode,5) = scalars(inode,5) + P * HZ(i_tor,m)
 
-            call interp(node_list,element_list,i,var_T,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
+            if (with_TiTe) then
+              call interp(node_list,element_list,i,var_Ti,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
+              call interp(node_list,element_list,i,var_Te,i_tor,s,t,P2,P2_s,P2_t,P2_st,P2_ss,P2_tt)
+              P = P + P2
+            else
+              call interp(node_list,element_list,i,var_T,i_tor,s,t,P,P_s,P_t,P_st,P_ss,P_tt)
+            endif
             scalars(inode,6) = scalars(inode,6) + P * HZ(i_tor,m)
             
             if (with_Vpar) then
@@ -245,9 +325,10 @@ do m=1, n_toroidal
             else
               P = 0.d0
             end if
-            scalars(inode,var_Vpar) = scalars(inode,var_Vpar) + P * HZ(i_tor,m)
+            scalars(inode,7) = scalars(inode,7) + P * HZ(i_tor,m)
           endif
         enddo
+        endif
 
         if(.not. density_only) then 
           if (     (jorek_model .eq. 180).or. (jorek_model .eq. 183) )then

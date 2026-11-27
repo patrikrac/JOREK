@@ -97,16 +97,27 @@ module mod_newton_solver
           if (verbose) then
             write(*,*) "Newton failed to converge:", inewton - 1, tol_Newton
           endif
+          call node_list_restore(mhd_sim%node_list, solver%newton%store_value, solver%newton%store_delta)
+          solver%iter_tol = solve_tol
+          call a_matk%reset()
+          deallocate(deln%val, rhsk%val)
           solver%step_success = .false.
           return
         endif
 
       endif
 
+      if (inewton.gt.1 .and. associated(deltas%val)) deltas%val(1:deltas%n) = 0.d0
       solver%iter_tol = tol_Gmres
       call solve_sparse_system(a_matk, rhsk, deltas, solver, mhd_sim)
 
-      if (.not.solver%step_success) return
+      if (.not.solver%step_success) then
+        call node_list_restore(mhd_sim%node_list, solver%newton%store_value, solver%newton%store_delta)
+        solver%iter_tol = solve_tol
+        call a_matk%reset()
+        deallocate(deln%val, rhsk%val)
+        return
+      endif
 
       deln%val(1:deln%n) = deln%val(1:deln%n) + deltas%val(1:deltas%n)
 

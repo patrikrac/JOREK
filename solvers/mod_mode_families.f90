@@ -34,7 +34,7 @@ contains
     use mod_parameters, only: n_tor
 
     if (autodistribute_modes) then
-      mode_family_count = (n_tor + 1)/2
+      mode_family_count = n_tor / 2 + 1
     else
       mode_family_count = n_mode_families
     endif
@@ -50,11 +50,11 @@ contains
   !! Both arguments are allocated here and must be unassociated on entry.
   !!
   !! The autodistribute layout is family 1 = the n=0 harmonic alone (mode 1), and
-  !! family i>1 = the sin/cos pair (2(i-1), 2(i-1)+1) of one harmonic. Family 1 is
-  !! therefore half the size of every other one, which is what ranks_per_family
-  !! exists to compensate for.
+  !! family i>1 = the sin/cos pair (2(i-1), 2(i-1)+1) of one harmonic (or the
+  !! single Nyquist mode n_tor when n_tor is even and i == n_fam).
   subroutine mode_family_distribute_modes(n_fam, modes_per_fam, fam_modes)
     use phys_module, only: autodistribute_modes, modes_per_family, mode_families_modes
+    use mod_parameters, only: n_tor
 
     integer, intent(in) :: n_fam
     integer, dimension(:),   pointer :: modes_per_fam
@@ -66,7 +66,10 @@ contains
 
     if (autodistribute_modes) then
       modes_per_fam(1) = 1
-      if (n_fam > 1) modes_per_fam(2:n_fam) = 2
+      if (n_fam > 1) then
+        modes_per_fam(2:n_fam) = 2
+        if (mod(n_tor, 2) == 0) modes_per_fam(n_fam) = 1
+      endif
     else
       do i = 1, n_fam
         modes_per_fam(i) = modes_per_family(i)
@@ -85,7 +88,7 @@ contains
       fam_modes(1,1) = 1
       do i = 2, n_fam
         fam_modes(i,1) = (i - 1)*2
-        fam_modes(i,2) = (i - 1)*2 + 1
+        if (modes_per_fam(i) > 1) fam_modes(i,2) = (i - 1)*2 + 1
       enddo
     else
       do i = 1, n_fam

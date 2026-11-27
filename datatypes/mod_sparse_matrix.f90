@@ -127,10 +127,20 @@ module mod_sparse_matrix
   subroutine copy_to(self, mat_a)
     class(type_SP_MATRIX), intent(inout)    :: self
     class(type_SP_MATRIX), intent(inout)    :: mat_a
+#ifdef USE_PETSC
+    PetscErrorCode :: petsc_ierr
+#endif
 
     call mat_a%reset()
 
     call self%move_to(mat_a, with_data=.false.)
+
+#ifdef USE_PETSC
+    if (self%petsc_assembled) then
+      call MatDuplicate(self%petsc_A, MAT_COPY_VALUES, mat_a%petsc_A, petsc_ierr)
+      mat_a%petsc_assembled = .true.
+    endif
+#endif
 
     if (associated(self%irn)) then
       allocate(mat_a%irn(mat_a%nnz))

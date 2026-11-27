@@ -112,6 +112,7 @@ enddo
 phi = 2.d0*pi*float(i_plane_rtree - 1)/float(n_period*n_plane)
 call interp_RZP(node_list,element_list,1,0.0,0.0,phi,R_axis,Z_axis)
 call interp_RZP(node_list,element_list,element_list%n_elements,1.0,1.0,phi,R_max,dummy)
+R_max = (R_max-R_axis)/bloating_factor + R_axis   ! This will calculate approximately up to the LCFS.
 if ( my_id == 0 ) then
   write(*,*) '*** ...start tracing... ***'
   write(*,*) 'delta_phi        = ', delta_phi

@@ -222,8 +222,14 @@ module mod_sparse
         call petsc_update_rhs(solver%petsc_sys, rhs_vec)
         call petsc_update_initial_guess(solver%petsc_sys, sol_vec)  ! warm-start from previous increment
         solver%iter_prev = solver%iter_gmres
-        call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
-                                                solver%iter_gmres, solver%step_success)
+        if (solver%use_newton) then
+          call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
+                                                  solver%iter_gmres, solver%step_success, &
+                                                  newton_rtol=max(solver%iter_tol, 1.d-13))
+        else
+          call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
+                                                  solver%iter_gmres, solver%step_success)
+        endif
         call petsc_recover_solution(solver%petsc_sys, sol_vec)
       else
 #endif
@@ -252,8 +258,14 @@ module mod_sparse
       call petsc_update_rhs(solver%petsc_sys, rhs_vec)
       call petsc_update_initial_guess(solver%petsc_sys, sol_vec)  ! warm-start from previous increment
       solver%iter_prev = solver%iter_gmres
-      call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
-                                              solver%iter_gmres, solver%step_success)
+      if (solver%use_newton) then
+        call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
+                                                solver%iter_gmres, solver%step_success, &
+                                                newton_rtol=max(solver%iter_tol, 1.d-13))
+      else
+        call petsc_solve_iterative_and_retrieve(solver%petsc_sys, solver%solve_only, &
+                                                solver%iter_gmres, solver%step_success)
+      endif
       call petsc_recover_solution(solver%petsc_sys, sol_vec)
 #else
       if (.not.solver%pc%initialized) then

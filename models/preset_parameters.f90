@@ -65,6 +65,7 @@ subroutine preset_parameters
   extended_boundary = .false.
   j_cutoff_rcoord = 99.0
   j_cutoff_sig = 0.025
+  bloating_factor = 1.0d0
 
   freeboundary_equil = .false. ! use free or fixed boundary equilibrium
   freeboundary       = .false. ! use free or fixed boundary?
@@ -843,7 +844,7 @@ subroutine preset_parameters
   jw3=1.d0  ! outer cut-off
   
   !> @name Mode families preconditioner parameters
-  n_mode_families      = (n_tor + 1)/2
+  n_mode_families      = n_tor / 2 + 1
   autodistribute_modes = .true.
   mode_families_modes  = 0
   modes_per_family     = 0
@@ -902,5 +903,20 @@ use_fixed_rng_value = .false.
 fixed_rng_value = 0.5
 eps_noise = 0.0d0
 use_matrix_equilibration = .false.
+
+! --- PFAFEM defaults
+use_pfafem         = .false.
+pfafem_n_substeps  = 4
+pfafem_n_gauss_tor = 4
+#ifdef STELLARATOR_MODEL
+pfafem_n_gauss_pol = 24
+#else
+pfafem_n_gauss_pol = 0
+#endif
+pfafem_spline_nr   = 96
+pfafem_spline_nz   = 96
+pfafem_openbc      = .true.
+pfafem_retrace     = .true.
+pfafem_values_active = .false.
 
 end subroutine preset_parameters

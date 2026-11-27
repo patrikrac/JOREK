@@ -17,7 +17,7 @@ module mod_pc_elt_matrix_force_fft
   implicit none
   private
 
-  public :: pc_elt_matrix_force_fft
+  public :: pc_elt_matrix_force_fft, pc_elt_matrix_force_pfafem
 
 contains
 
@@ -149,5 +149,25 @@ subroutine pc_elt_matrix_force_fft(element, nodes, ELM, ELM_v)
   ELM = 0.5d0 * ELM
 
 end subroutine pc_elt_matrix_force_fft
+
+subroutine pc_elt_matrix_force_pfafem(node_list, element_list, ielm, W_vp, WV_vp)
+
+  use data_structure, only: type_node_list, type_element_list
+
+  implicit none
+
+  type(type_node_list),    intent(in)            :: node_list
+  type(type_element_list), intent(in)            :: element_list
+  integer,                 intent(in)            :: ielm
+  real*8,                  intent(out)           :: W_vp(:, :, :, :, :)
+  real*8,                  intent(out), optional :: WV_vp(:, :, :, :, :, :)
+
+  if (ielm < 0 .and. node_list%n_nodes < 0 .and. element_list%n_elements < 0) continue
+  W_vp = 0.d0
+  if (present(WV_vp)) WV_vp = 0.d0
+  write(*,'(A)') "[Physics PC] FATAL: pc_elt_matrix_force_pfafem is not implemented for model199"
+  stop 1
+
+end subroutine pc_elt_matrix_force_pfafem
 
 end module mod_pc_elt_matrix_force_fft

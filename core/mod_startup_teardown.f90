@@ -254,8 +254,12 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
 #endif
 
   ! --- Some checks not to waste any cpu time
-  if ( (n_tor < 1) .or. (mod(n_tor,2) == 0) ) then
+  if ( (n_tor < 1) .or. ((.not. use_pfafem) .and. (mod(n_tor,2) == 0)) ) then
     write(*,*) 'FATAL : Hard-coded parameter n_tor has an illegal value', n_tor
+    call MPI_Abort(MPI_COMM_WORLD, 23, ierr)
+    stop
+  else if ( use_pfafem .and. (n_tor < 4) ) then
+    write(*,*) 'FATAL : use_pfafem requires n_tor >= 4 for periodic cubic B-splines, got n_tor =', n_tor
     call MPI_Abort(MPI_COMM_WORLD, 23, ierr)
     stop
   else if ( (n_coord_tor < 1) .or. (mod(n_coord_tor,2) == 0) ) then
@@ -293,11 +297,11 @@ subroutine sanity_checks(my_id, n_cpu, mpi_required, mpi_provided)
     write(*,*) 'FATAL : MPI_THREAD_MULTIPLE (provided < required)', my_id, mpi_required, mpi_provided
     call MPI_Abort(MPI_COMM_WORLD, 2, ierr)
     stop
-  else if ( mod(n_tor,2) == 0 ) then
+  else if ( (.not. use_pfafem) .and. (mod(n_tor,2) == 0) ) then
     write(*,*) ' FATAL: n_tor must be an uneven number.'
     call MPI_Abort(MPI_COMM_WORLD, 4, ierr)
     stop
-  else if ( n_plane < 2*(n_tor-1) ) then
+  else if ( (.not. use_pfafem) .and. (n_plane < 2*(n_tor-1)) ) then
     write(*,*) ' FATAL: n_plane >= 2 * (n_tor-1) required to avoid aliasing.'
     call MPI_Abort(MPI_COMM_WORLD, 4, ierr)
     stop

@@ -6,7 +6,8 @@ use data_structure
 use gauss
 use basis_at_gaussian
 use equil_info,  only: ES
-use phys_module, only: R_geo, Z_geo, axis_srch_radius, R_axis_t, Z_axis_t, index_start, index_now
+use mod_parameters, only: n_tor
+use phys_module, only: R_geo, Z_geo, axis_srch_radius, R_axis_t, Z_axis_t, index_start, index_now, pfafem_values_active
 use mod_interp
 
 implicit none
@@ -109,8 +110,13 @@ do i=1,element_list%n_elements   ! --- loop over elements
 
           iv = element_list%element(i)%vertex(kv)
 
-          ps_s = ps_s + node_list%node(iv)%values(1,kf,1) * element_list%element(i)%size(kv,kf) * H_s(kv,kf,ms,mt)
-          ps_t = ps_t + node_list%node(iv)%values(1,kf,1) * element_list%element(i)%size(kv,kf) * H_t(kv,kf,ms,mt)
+          if (pfafem_values_active) then
+            P = sum(node_list%node(iv)%values(1:n_tor,kf,1)) / dble(n_tor)
+          else
+            P = node_list%node(iv)%values(1,kf,1)
+          end if
+          ps_s = ps_s + P * element_list%element(i)%size(kv,kf) * H_s(kv,kf,ms,mt)
+          ps_t = ps_t + P * element_list%element(i)%size(kv,kf) * H_t(kv,kf,ms,mt)
 
           R   = R   + node_list%node(iv)%x(1,kf,1) * element_list%element(i)%size(kv,kf) * H(kv,kf,ms,mt)
           Z   = Z   + node_list%node(iv)%x(1,kf,2) * element_list%element(i)%size(kv,kf) * H(kv,kf,ms,mt)

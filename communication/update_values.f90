@@ -4,7 +4,7 @@ subroutine update_values(element_list, node_list, rhs_vec)
 !-----------------------------------------------------------------------
 
 use data_structure, only: type_element_list, type_node_list, type_RHS
-use phys_module, only: keep_n0_const, treat_axis
+use phys_module, only: keep_n0_const, treat_axis, use_pfafem
 use mod_parameters, only: n_tor, n_var, n_degrees, n_vertex_max
 use mod_basisfunctions
 use mod_axis_treatment
@@ -30,7 +30,7 @@ integer :: id
 real*8  :: stored_dofs(1:n_degrees*n_var*n_tor), new_dofs(1:4), old_dofs(1:4)
 
 i_tor_min = 1
-if ( keep_n0_const ) i_tor_min = 2 ! Keep equilibrium unchanged during the run
+if ( keep_n0_const .and. (.not. use_pfafem) ) i_tor_min = 2 ! Keep equilibrium unchanged during the run
 
 do i = 1, node_list%n_nodes
   if((.not. node_list%node(i)%constrained) ) then

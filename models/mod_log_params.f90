@@ -180,6 +180,15 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   write(*,*) 'off'
 #endif
 
+write(*,'(1x,a)',advance='no') ' USE_DOMM            : '
+#ifdef USE_DOMM
+  write(*,*) 'on  (Dommaschk-only vacuum field, no FE correction)'
+#elif defined(USE_EXT_FIELD)
+  write(*,*) 'off (External vacuum field from gvec2jorek file)'
+#else
+  write(*,*) 'off (GVEC import + FE correction for vacuum field)'
+#endif
+
   write(*,*)
   write(*,200)
   write(*,*) '* Hard-Coded Parameters:                                                      *'
@@ -421,6 +430,7 @@ write(*,'(1x,a)',advance='no') ' USE_CATALYST : '
   write(*,LOGI_FMT) 'extended_boundary     ', extended_boundary
   write(*,REAL_FMT) 'j_cutoff_rcoord       ', j_cutoff_rcoord
   write(*,REAL_FMT) 'j_cutoff_sig          ', j_cutoff_sig
+  write(*,REAL_FMT) 'bloating_factor       ', bloating_factor
 
   if ( (abs(V_0) .ge. 1.d-19) .or. (num_rot) ) then
      write(*,LOGI_FMT) 'normalized_velocity_profile', normalized_velocity_profile

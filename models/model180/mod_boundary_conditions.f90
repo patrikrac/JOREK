@@ -40,8 +40,9 @@ module mod_boundary_conditions
 implicit none
 
 real*8, dimension(:), allocatable :: Psi_b
+integer, save :: n_chi_bc = 0
 
-private :: Zn, Zn_chi, Zm, Zm_tht, Zm_tht_2, HZn
+private :: Zn, Zn_chi, Zm, Zm_tht, Zm_tht_2, HZn, n_chi_bc
 
 contains
   subroutine boundary_conditions( my_id, node_list, element_list, bnd_node_list, local_elms,& 
@@ -173,7 +174,7 @@ contains
   !---------------------------------------------------------------------------------------------------------------------------------
     use constants, only: pi
     use mod_parameters, only: n_period, n_plane, n_order, n_tor, n_coord_tor
-    use phys_module, only: F0, m_pol_bc, extended_boundary
+    use phys_module, only: F0, m_pol_bc, extended_boundary, use_pfafem
     use gauss
     use basis_at_gaussian
     use data_structure
@@ -205,18 +206,19 @@ contains
     logical :: file_exists
 
 
+    n_chi_bc = merge(2 * (n_tor / 2) + 1, n_tor, use_pfafem)
     write(*,*) "***************************************"
     write(*,*) "*    Solving boundary Psi equation    *"
     write(*,*) "***************************************"
-    write(*,'(A,I4,A,I4)') "Toroidal modes: ", n_tor
+    write(*,'(A,I4,A,I4)') "Toroidal modes: ", n_chi_bc
     write(*,'(A,I4,A,I4)') "Poloidal modes: ", m_pol_bc
 
     N_tht = boundary_list%n_bnd_elements
 
     allocate(x_g(n_plane,n_gauss,N_tht)); allocate(x_s, x_p, mold=x_g)
     allocate(y_g(n_plane,n_gauss,N_tht)); allocate(y_s, y_p, mold=y_g)
-    allocate(Amat(n_tor*m_pol_bc,n_tor*m_pol_bc))
-    allocate(RHS(n_tor*m_pol_bc))
+    allocate(Amat(n_chi_bc*m_pol_bc,n_chi_bc*m_pol_bc))
+    allocate(RHS(n_chi_bc*m_pol_bc))
 
     x_g  = 0.d0; x_s = 0.d0; x_p = 0.d0
     y_g  = 0.d0; y_s = 0.d0; y_p = 0.d0
@@ -337,7 +339,7 @@ contains
             write(69,'(10ES18.10)') Jgrad_ps_cart, B_field, Bp_n, grad_chi_n, 2.d0*pi*(float(ielm-1) + xgauss(ms))/float(N_tht), 2.d0*pi*float(mp-1)/float(n_plane*n_period)
 
             ind1 = 1
-            do n=1,n_tor
+            do n=1,n_chi_bc
               do m=1,m_pol_bc
                 RHS(ind1) = RHS(ind1) + dot_product(Jgrad_ps_cart,B_field)*Zn(n,chi(0,0,0))*Zm(m,theta)*wgauss(ms) ! B-field version
                 ! RHS(ind1) = RHS(ind1) + dot_product(-Jgrad_ps,B_field_cyl)*Zn(n,chi(0,0,0))*Zm(m,theta)*wgauss(ms) ! B_cyl-field version
@@ -365,7 +367,7 @@ contains
             grad_chi_n = dot_product(Jgrad_ps,grad_chi)
 
             ind1 = 1
-            do n=1,n_tor
+            do n=1,n_chi_bc
               do m=1,m_pol_bc
                 RHS(ind1) = RHS(ind1) + dot_product(Jgrad_ps,grad_chi)*Zn(n,chi(0,0,0))*Zm(m,theta)*wgauss(ms) ! grad(chi) version
                 ind1 = ind1 + 1
@@ -382,11 +384,11 @@ contains
     ! Here, it is better to integrate over the original manifold
     ind1 = 1
     ! Loop over test functions (rows in the matrix)
-    do n=1,n_tor
+    do n=1,n_chi_bc
       do m=1,m_pol_bc
         ind2 = 1
         ! Loop over basis functions in the 2D Fourier decomposition of Psi (columns in the matrix)
-        do nn=1,n_tor
+        do nn=1,n_chi_bc
           do mm=1,m_pol_bc
             if (n .eq. nn) then ! The test and basis functions are orthogonal if their chi indices are different (no chi derivatives)
               if (mod(m,2) .eq. 1 .and. mm .eq. m + 1) then ! If theta t.f. is cos, theta b.f. must be sin w/ same mode number (derivative is cos)
@@ -418,7 +420,7 @@ contains
     end if
 
     if (allocated(Psi_b)) deallocate(Psi_b)
-    allocate(Psi_b(n_tor*m_pol_bc))
+    allocate(Psi_b(n_chi_bc*m_pol_bc))
 
     Psi_b = matmul(Amat,RHS)
   end subroutine solve_Psi_boundary_eqn
@@ -469,7 +471,7 @@ contains
         
         ! Using the (theta,chi) 2D Fourier basis, calculate the values of Psi and its derivatives at the current point
         ind = 1
-        do n=1,n_tor
+        do n=1,n_chi_bc
           do m=1,m_pol_bc
             Psi = Psi + Psi_b(ind)*Zn(n,chi(0,0,0))*Zm(m,theta)
             Psi_tht = Psi_tht + Psi_b(ind)*Zn(n,chi(0,0,0))*Zm_tht(m,theta)
@@ -500,6 +502,204 @@ contains
       node_list%node(in)%values(:,j,var_Psi) = F0*Psi_dof2
     end do
   end subroutine setup_boundary_condition
+
+  subroutine setup_boundary_condition_pfafem(my_id, node_list, element_list, bnd_node_list, bnd_elm_list)
+    use constants, only: pi
+    use mod_parameters, only: n_tor, n_order, n_period, var_Psi
+    use phys_module, only: F0, m_pol_bc
+    use gauss, only: n_gauss, xgauss, wgauss
+    use data_structure
+    use mpi_mod
+    use mod_chi, only: get_chi_domm
+    use mod_pfafem, only: pfafem_ng_tor, pfafem_tau_q, pfafem_w_tor, pfafem_dphi, &
+                          pfafem_eval_elem_geom, pfafem_eval_point_basis_val
+    implicit none
+
+    integer,                     intent(in)    :: my_id
+    type(type_node_list),        intent(inout) :: node_list
+    type(type_element_list),     intent(in)    :: element_list
+    type(type_bnd_node_list),    intent(in)    :: bnd_node_list
+    type(type_bnd_element_list), intent(in)    :: bnd_elm_list
+
+    integer :: n_cpu, mpi_ierr, N_tht, ndof_b, ib, ib_lo, ib_hi, in_node, j_dir
+    integer :: ielm, iside, iv1, iv2, v1, v2, eP, iq, ms, n, m, ind
+    integer :: n_act, act_inode(64), act_io(64), act_jb(64), a, b, id_a, id_b, it
+    integer, allocatable :: dof_map(:, :)
+    real*8,  allocatable :: M_loc(:,:), M_glb(:,:), rhs_loc(:), rhs_glb(:)
+    real*8,  allocatable :: u_b(:), r_cg(:), z_cg(:), p_cg(:), Ap(:), diag_inv(:)
+    real*8 :: s_pt, t_pt, u_s, phi_q, theta, R_q, Z_q, Rs, Rt, Zs, Zt, ds_arc, wsurf
+    real*8 :: chi(0:n_order-1, 0:n_order-1, 0:n_order-1), Psi_ex, b_val(64)
+    real*8 :: rz_old, rz_new, alpha, beta, pAp, r_norm0, dmax
+
+    call MPI_Comm_size(MPI_COMM_WORLD, n_cpu, mpi_ierr)
+    call MPI_Bcast(n_chi_bc, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, mpi_ierr)
+    if (n_chi_bc <= 0) return
+
+    if (my_id /= 0) then
+      if (allocated(Psi_b)) deallocate(Psi_b)
+      allocate(Psi_b(n_chi_bc * m_pol_bc))
+    end if
+    call MPI_Bcast(Psi_b, n_chi_bc * m_pol_bc, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, mpi_ierr)
+
+    N_tht  = bnd_elm_list%n_bnd_elements
+    ndof_b = 2 * n_tor * bnd_node_list%n_bnd_nodes
+    if (ndof_b <= 0 .or. N_tht <= 0) return
+
+    allocate(dof_map(4, node_list%n_nodes))
+    dof_map = 0
+    do ib = 1, bnd_node_list%n_bnd_nodes
+      in_node = bnd_node_list%bnd_node(ib)%index_jorek
+      j_dir   = bnd_node_list%bnd_node(ib)%direction(2)
+      dof_map(1,     in_node) = (ib - 1) * (2 * n_tor)
+      dof_map(j_dir, in_node) = (ib - 1) * (2 * n_tor) + n_tor
+    end do
+
+    allocate(M_loc(ndof_b, ndof_b), M_glb(ndof_b, ndof_b))
+    allocate(rhs_loc(ndof_b), rhs_glb(ndof_b))
+    M_loc   = 0.d0
+    rhs_loc = 0.d0
+
+    ib_lo = (my_id * N_tht) / n_cpu + 1
+    ib_hi = ((my_id + 1) * N_tht) / n_cpu
+
+    do ib = ib_lo, ib_hi
+      v1 = bnd_elm_list%bnd_element(ib)%vertex(1)
+      v2 = bnd_elm_list%bnd_element(ib)%vertex(2)
+
+      ! Locate parent 2D element sharing boundary edge (v1, v2)
+      ielm  = 0
+      iside = 0
+      find_el: do a = 1, element_list%n_elements
+        do b = 1, 4
+          iv1 = element_list%element(a)%vertex(b)
+          iv2 = element_list%element(a)%vertex(mod(b, 4) + 1)
+          if ((iv1 == v1 .and. iv2 == v2) .or. (iv1 == v2 .and. iv2 == v1)) then
+            ielm  = a
+            iside = b
+            exit find_el
+          end if
+        end do
+      end do find_el
+      if (ielm == 0) cycle
+
+      do ms = 1, n_gauss
+        theta = 2.d0 * pi * (dble(ib - 1) + xgauss(ms)) / dble(N_tht)
+        iv1 = element_list%element(ielm)%vertex(iside)
+        if (iv1 == v1) then
+          u_s = xgauss(ms)
+        else
+          u_s = 1.d0 - xgauss(ms)
+        end if
+        select case (iside)
+        case (1); s_pt = u_s;  t_pt = 0.d0
+        case (2); s_pt = 1.d0; t_pt = u_s
+        case (3); s_pt = u_s;  t_pt = 1.d0
+        case (4); s_pt = 0.d0; t_pt = u_s
+        end select
+
+        do eP = 0, n_tor - 1
+          do iq = 1, pfafem_ng_tor
+            phi_q = (dble(eP) + pfafem_tau_q(iq)) * pfafem_dphi
+            call pfafem_eval_elem_geom(node_list, element_list, ielm, s_pt, t_pt, phi_q, &
+                                       R_q, Z_q, Rs, Rt, Zs, Zt)
+            if (iside == 1 .or. iside == 3) then
+              ds_arc = hypot(Rs, Zs)
+            else
+              ds_arc = hypot(Rt, Zt)
+            end if
+            wsurf = wgauss(ms) * pfafem_w_tor(iq) * R_q * max(1.d-12, ds_arc)
+
+            chi = get_chi_domm(R_q, Z_q, phi_q, 0)
+            Psi_ex = 0.d0
+            ind = 1
+            do n = 1, n_chi_bc
+              do m = 1, m_pol_bc
+                Psi_ex = Psi_ex + Psi_b(ind) * Zn(n, chi(0, 0, 0)) * Zm(m, theta)
+                ind = ind + 1
+              end do
+            end do
+            Psi_ex = F0 * Psi_ex
+
+            call pfafem_eval_point_basis_val(node_list, element_list, ielm, s_pt, t_pt, eP, iq, &
+                                             .false., n_act, act_inode, act_io, act_jb, b_val)
+
+            ! Subtract already-projected interior/unconstrained DOF contributions
+            do a = 1, n_act
+              if (dof_map(act_io(a), act_inode(a)) == 0) then
+                Psi_ex = Psi_ex - b_val(a) * node_list%node(act_inode(a))%values(act_jb(a), act_io(a), var_Psi)
+              end if
+            end do
+
+            do a = 1, n_act
+              if (dof_map(act_io(a), act_inode(a)) == 0) cycle
+              id_a = dof_map(act_io(a), act_inode(a)) + act_jb(a)
+              rhs_loc(id_a) = rhs_loc(id_a) + wsurf * b_val(a) * Psi_ex
+              do b = 1, n_act
+                if (dof_map(act_io(b), act_inode(b)) == 0) cycle
+                id_b = dof_map(act_io(b), act_inode(b)) + act_jb(b)
+                M_loc(id_a, id_b) = M_loc(id_a, id_b) + wsurf * b_val(a) * b_val(b)
+              end do
+            end do
+          end do
+        end do
+      end do
+    end do
+
+    call MPI_Allreduce(M_loc, M_glb, ndof_b * ndof_b, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_Allreduce(rhs_loc, rhs_glb, ndof_b, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    deallocate(M_loc, rhs_loc)
+
+    allocate(u_b(ndof_b), r_cg(ndof_b), z_cg(ndof_b), p_cg(ndof_b), Ap(ndof_b), diag_inv(ndof_b))
+    dmax = 0.d0
+    do a = 1, ndof_b
+      dmax = max(dmax, M_glb(a, a))
+    end do
+    if (dmax <= 0.d0) dmax = 1.d0
+    do a = 1, ndof_b
+      M_glb(a, a) = M_glb(a, a) + 1.d-12 * dmax
+      diag_inv(a) = 1.d0 / M_glb(a, a)
+    end do
+
+    ! Initialize from already-projected boundary values and run Jacobi-CG
+    do ib = 1, bnd_node_list%n_bnd_nodes
+      in_node = bnd_node_list%bnd_node(ib)%index_jorek
+      j_dir   = bnd_node_list%bnd_node(ib)%direction(2)
+      id_a    = (ib - 1) * (2 * n_tor)
+      u_b(id_a + 1 : id_a + n_tor)         = node_list%node(in_node)%values(1:n_tor, 1,     var_Psi)
+      u_b(id_a + n_tor + 1 : id_a + 2*n_tor) = node_list%node(in_node)%values(1:n_tor, j_dir, var_Psi)
+    end do
+
+    r_cg    = rhs_glb - matmul(M_glb, u_b)
+    r_norm0 = sqrt(max(1.d-60, dot_product(r_cg, r_cg)))
+    z_cg    = diag_inv * r_cg
+    p_cg    = z_cg
+    rz_old  = dot_product(r_cg, z_cg)
+
+    do it = 1, min(400, 2 * ndof_b)
+      if (sqrt(max(0.d0, dot_product(r_cg, r_cg))) <= 1.d-12 * r_norm0) exit
+      Ap  = matmul(M_glb, p_cg)
+      pAp = dot_product(p_cg, Ap)
+      if (abs(pAp) < 1.d-60) exit
+      alpha = rz_old / pAp
+      u_b   = u_b  + alpha * p_cg
+      r_cg  = r_cg - alpha * Ap
+      z_cg  = diag_inv * r_cg
+      rz_new = dot_product(r_cg, z_cg)
+      beta   = rz_new / max(1.d-60, rz_old)
+      p_cg   = z_cg + beta * p_cg
+      rz_old = rz_new
+    end do
+
+    do ib = 1, bnd_node_list%n_bnd_nodes
+      in_node = bnd_node_list%bnd_node(ib)%index_jorek
+      j_dir   = bnd_node_list%bnd_node(ib)%direction(2)
+      id_a    = (ib - 1) * (2 * n_tor)
+      node_list%node(in_node)%values(1:n_tor, 1,     var_Psi) = u_b(id_a + 1 : id_a + n_tor)
+      node_list%node(in_node)%values(1:n_tor, j_dir, var_Psi) = u_b(id_a + n_tor + 1 : id_a + 2*n_tor)
+    end do
+
+    deallocate(dof_map, M_glb, rhs_glb, u_b, r_cg, z_cg, p_cg, Ap, diag_inv)
+  end subroutine setup_boundary_condition_pfafem
 
   pure real*8 function Zn(n, chi)
     use mod_parameters, only: n_period

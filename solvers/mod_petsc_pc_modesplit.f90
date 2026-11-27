@@ -28,6 +28,7 @@ module mod_petsc_pc_modesplit
   use mod_petsc_direct_solver, only: petsc_configure_direct_solver, petsc_report_solver
 #include "petsc/finclude/petsc.h"
   use petsc
+#include "petsc_f90_compat.h"
   implicit none
   private
   public :: petsc_setup_modesplit_pc
@@ -196,6 +197,7 @@ contains
   !! factorization is family-local and is the only part that could ever be moved off
   !! the critical path. One number covering both would hide which of them dominates.
   subroutine modesplit_setup(pc, ierr)
+    use phys_module, only: use_pfafem
     PC :: pc
     PetscErrorCode :: ierr
 
@@ -220,6 +222,13 @@ contains
     if (first) then
       allocate(g_ctx%is_fam(g_ctx%n_fam), g_ctx%B_fam(g_ctx%n_fam), g_ctx%B_loc(g_ctx%n_fam))
       call modesplit_build_index_sets(P)
+      reuse = MAT_INITIAL_MATRIX
+    else if (use_pfafem) then
+      do f = 1, g_ctx%n_fam
+        PetscCallA(MatDestroy(g_ctx%B_loc(f), ierr))
+        PetscCallA(MatDestroy(g_ctx%B_fam(f), ierr))
+      enddo
+      PetscCallA(MatDestroy(g_ctx%A_fam, ierr))
       reuse = MAT_INITIAL_MATRIX
     else
       reuse = MAT_REUSE_MATRIX
@@ -479,9 +488,15 @@ contains
     PetscErrorCode :: ierr
 
     PetscCallA(VecGetArrayRead(from, src, ierr))
+#if PETSC_VERSION_LT(3,23,0)
+    PetscCallA(VecGetArray(to, dst, ierr))
+    dst(1:g_ctx%n_loc) = src(1:g_ctx%n_loc)
+    PetscCallA(VecRestoreArray(to, dst, ierr))
+#else
     PetscCallA(VecGetArrayWrite(to, dst, ierr))
     dst(1:g_ctx%n_loc) = src(1:g_ctx%n_loc)
     PetscCallA(VecRestoreArrayWrite(to, dst, ierr))
+#endif
     PetscCallA(VecRestoreArrayRead(from, src, ierr))
   end subroutine modesplit_copy_local
 

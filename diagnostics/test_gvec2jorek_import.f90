@@ -203,7 +203,7 @@ subroutine compare_gvec_data_points(node_list, element_list, file_name, ierr)
   R_error_max = 0.0;   R_s_error_max=0.0;   R_t_error_max=0.0;   R_st_error_max=0.0
   Z_error_max = 0.0;   Z_s_error_max=0.0;   Z_t_error_max=0.0;   Z_st_error_max=0.0
   B_R_error_max = 0.0; B_Z_error_max = 0.0;
-  s_factor = n_rad_jorek-1                            ! WARNING: this only works for a uniform grid
+  s_factor = (n_rad_jorek-1) / bloating_factor                            ! WARNING: this only works for a uniform grid
   t_factor = (n_theta_jorek) / (2 * PI)
   st_factor = s_factor * t_factor
   do i_rad=1, n_rad

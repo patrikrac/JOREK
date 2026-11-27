@@ -12,7 +12,7 @@ module mod_petsc_pc_physics
   implicit none
   private
   public :: petsc_setup_physics_pc, petsc_assemble_pc_matrices, &
-            petsc_physics_pc_build_reduced
+            petsc_physics_pc_build_reduced, petsc_physics_pc_refresh_operator
 
 contains
 
@@ -46,6 +46,16 @@ contains
     call physics_pc_log_events_register()
     call sf_build(A_full, comm, my_id)
   end subroutine petsc_physics_pc_build_reduced
+
+  !--------------------------------------------------------------------
+  !> Refresh the full-Jacobian handle used by penalty back-substitution
+  !! when solve_only skips refactorization.
+  !--------------------------------------------------------------------
+  subroutine petsc_physics_pc_refresh_operator(A_full)
+    use mod_petsc_pc_sf, only: sf_refresh_operator
+    Mat, intent(in) :: A_full
+    call sf_refresh_operator(A_full)
+  end subroutine petsc_physics_pc_refresh_operator
 
   !--------------------------------------------------------------------
   !> PCSHELL apply callback: y = P^{-1} x.

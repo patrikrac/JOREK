@@ -18,8 +18,20 @@
     real(rk_ring), intent(in)    :: alpha, beta, a(lda, *), x(*)
     real(rk_ring), intent(inout) :: y(*)
     real(rk_ring) :: t
-    integer :: j
+    integer :: j, nthr_mv, tid_mv, i1_mv, i2_mv
     if (m * n > GEMV_SMALL) then
+      !$ if ((.not. omp_in_parallel()) .and. (int(m, 8) * int(n, 8) >= 50000_8)) then
+      !$   nthr_mv = min(omp_get_max_threads(), max(1, m / 32))
+      !$   if (nthr_mv > 1) then
+      !$     !$omp parallel num_threads(nthr_mv) private(tid_mv, i1_mv, i2_mv)
+      !$     tid_mv = omp_get_thread_num()
+      !$     i1_mv  = (tid_mv * m) / nthr_mv + 1
+      !$     i2_mv  = ((tid_mv + 1) * m) / nthr_mv
+      !$     if (i2_mv >= i1_mv) call GEMV_RK('N', i2_mv - i1_mv + 1, n, alpha, a(i1_mv, 1), lda, x, 1, beta, y(i1_mv), 1)
+      !$     !$omp end parallel
+      !$     return
+      !$   endif
+      !$ endif
       call GEMV_RK('N', m, n, alpha, a, lda, x, 1, beta, y, 1)
       return
     endif

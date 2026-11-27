@@ -12,6 +12,8 @@ subroutine global_matrix_structure(node_list, element_list, boundary_list, freeb
   use vacuum, only: sr
   use mod_integer_types
   use mpi_mod
+  use phys_module, only: use_pfafem
+  use mod_pfafem, only: pfafem_cache, pfafem_ready
 
   implicit none
 
@@ -35,6 +37,7 @@ subroutine global_matrix_structure(node_list, element_list, boundary_list, freeb
   logical                            :: freeboundary
   integer(kind=int_all), allocatable :: tmp(:,:)
   integer                            :: my_id, ierr
+  integer                            :: ivp, u1, u2
 
   call MPI_COMM_RANK(a_mat%comm, my_id, ierr)
   
@@ -169,6 +172,56 @@ subroutine global_matrix_structure(node_list, element_list, boundary_list, freeb
         enddo               ! loop over vertices
      endif ! nsons eq 0
   enddo                 ! loop over local elements
+
+  ! --- Extend sparsity with PFAFEM field-line traced vertex pairs across all leaf elements
+  if (use_pfafem .and. pfafem_ready) then
+    do ielm = 1, element_list%n_elements
+      if (element_list%element(ielm)%n_sons .ne. 0) cycle
+      do ivp = 1, pfafem_cache(ielm)%n_vpairs
+        u1 = pfafem_cache(ielm)%vpairs(1, ivp)
+        u2 = pfafem_cache(ielm)%vpairs(2, ivp)
+        inode1 = pfafem_cache(ielm)%unodes(u1)
+        inode2 = pfafem_cache(ielm)%unodes(u2)
+        do ik = 1, n_degrees
+          index1 = node_list%node(inode1)%index(ik)
+          if ((index1 .lt. a_mat%my_ind_min) .or. (index1 .gt. a_mat%my_ind_max)) cycle
+          index1_local = index1 - a_mat%my_ind_min + 1
+          do jk = 1, n_degrees
+            index2 = node_list%node(inode2)%index(jk)
+            if (index2 .le. 0) cycle
+            if (a_mat%ijA_size(index1_local) .eq. 0) then
+              a_mat%ijA_size(index1_local) = 1
+              a_mat%irn_jcn(index1_local, 1) = index2
+            elseif (index2 .gt. a_mat%irn_jcn(index1_local, a_mat%ijA_size(index1_local))) then
+              a_mat%irn_jcn(index1_local, a_mat%ijA_size(index1_local) + 1) = index2
+              a_mat%ijA_size(index1_local) = a_mat%ijA_size(index1_local) + 1
+              if (a_mat%ijA_size(index1_local) .gt. n_max) then
+                write(*,*) ' FATAL error : irn_jcn too small ', a_mat%ijA_size(index1_local)
+              endif
+            else
+              j_larger = 1
+              do j = 1, a_mat%ijA_size(index1_local)
+                if (index2 .le. a_mat%irn_jcn(index1_local, j)) then
+                  j_larger = j
+                  exit
+                endif
+              enddo
+              if (index2 .ne. a_mat%irn_jcn(index1_local, j_larger)) then
+                do j = a_mat%ijA_size(index1_local), j_larger, -1
+                  a_mat%irn_jcn(index1_local, j + 1) = a_mat%irn_jcn(index1_local, j)
+                enddo
+                a_mat%irn_jcn(index1_local, j_larger) = index2
+                a_mat%ijA_size(index1_local) = a_mat%ijA_size(index1_local) + 1
+                if (a_mat%ijA_size(index1_local) .gt. n_max) then
+                  write(*,*) ' FATAL error : irn_jcn too small ', a_mat%ijA_size(index1_local)
+                endif
+              endif
+            endif
+          enddo
+        enddo
+      enddo
+    enddo
+  endif
 
 
   if ( freeboundary .and. (sr%n_tor/=0) ) then      ! add contributions from all boundary nodes

@@ -10,6 +10,7 @@ use equil_info, only : get_psi_n
 use mod_interp
 use mod_chi
 use mod_parameters
+use mod_pfafem, only: pfafem_ready
 
 
 implicit none
@@ -37,6 +38,7 @@ real*8  :: dummy,BR0cos,BR0sin,BZ0cos,BZ0sin,Bp0cos,Bp0sin
 integer :: m, ig1, ig2, i_plane, i_tor, i_harm
 real*8  :: s_phi, c_phi, ndotB, ndotB_gvec, cross_deriv(3), n_perp(3), B_boundary(3), Bgvec_boundary(3)
 real*8  :: chi(0:n_order-1,0:n_order-1,0:n_order-1)
+real*8  :: pf_hz(n_tor), pf_dhz(n_tor)
 real*8  :: ndotB_max=0.0
 
 
@@ -62,18 +64,31 @@ do i_elm=(n_flux-2)*n_tht+1, (n_flux-1)*n_tht
       do ig2 = 1, 4
         p = (i_plane - 1 + 0.5 * (xgs(ig2) + 1.0)) * delta_phi
         
-        call interp(node_list,element_list,i_elm,1,1,ri,si,PSgi,dPSgi_dr,dPSgi_ds,dPSgi_drs,dPSgi_drr,dPSgi_dss)
-        dPSgi_dp = 0.d0
-        do i_tor=1,(n_tor-1)/2
-          call interp(node_list,element_list,i_elm,1,2*i_tor,ri,si,PSgi,dPSgii_dr,dPSgii_ds,dPSgi_drs,dPSgi_drr,dPSgi_dss)
-          dPSgi_dr = dPSgi_dr + dPSgii_dr*cos(mode(2*i_tor)*p)
-          dPSgi_ds = dPSgi_ds + dPSgii_ds*cos(mode(2*i_tor)*p)
-          dPSgi_dp = dPSgi_dp - mode(2*i_tor)*PSgi*sin(mode(2*i_tor)*p)
-          call interp(node_list,element_list,i_elm,1,2*i_tor+1,ri,si,PSgi,dPSgii_dr,dPSgii_ds,dPSgi_drs,dPSgi_drr,dPSgi_dss)
-          dPSgi_dr = dPSgi_dr + dPSgii_dr*sin(mode(2*i_tor+1)*p)
-          dPSgi_ds = dPSgi_ds + dPSgii_ds*sin(mode(2*i_tor+1)*p)
-          dPSgi_dp = dPSgi_dp + mode(2*i_tor+1)*PSgi*cos(mode(2*i_tor+1)*p)
-        end do
+        if (use_pfafem .and. pfafem_ready) then
+          call pfafem_hz_interp(p, pf_hz, pf_dhz)
+          dPSgi_dr = 0.d0
+          dPSgi_ds = 0.d0
+          dPSgi_dp = 0.d0
+          do i_tor = 1, n_tor
+            call interp(node_list,element_list,i_elm,1,i_tor,ri,si,PSgi,dPSgii_dr,dPSgii_ds,dPSgi_drs,dPSgi_drr,dPSgi_dss)
+            dPSgi_dr = dPSgi_dr + dPSgii_dr * pf_hz(i_tor)
+            dPSgi_ds = dPSgi_ds + dPSgii_ds * pf_hz(i_tor)
+            dPSgi_dp = dPSgi_dp + PSgi * pf_dhz(i_tor)
+          end do
+        else
+          call interp(node_list,element_list,i_elm,1,1,ri,si,PSgi,dPSgi_dr,dPSgi_ds,dPSgi_drs,dPSgi_drr,dPSgi_dss)
+          dPSgi_dp = 0.d0
+          do i_tor=1,(n_tor-1)/2
+            call interp(node_list,element_list,i_elm,1,2*i_tor,ri,si,PSgi,dPSgii_dr,dPSgii_ds,dPSgi_drs,dPSgi_drr,dPSgi_dss)
+            dPSgi_dr = dPSgi_dr + dPSgii_dr*cos(mode(2*i_tor)*p)
+            dPSgi_ds = dPSgi_ds + dPSgii_ds*cos(mode(2*i_tor)*p)
+            dPSgi_dp = dPSgi_dp - mode(2*i_tor)*PSgi*sin(mode(2*i_tor)*p)
+            call interp(node_list,element_list,i_elm,1,2*i_tor+1,ri,si,PSgi,dPSgii_dr,dPSgii_ds,dPSgi_drs,dPSgi_drr,dPSgi_dss)
+            dPSgi_dr = dPSgi_dr + dPSgii_dr*sin(mode(2*i_tor+1)*p)
+            dPSgi_ds = dPSgi_ds + dPSgii_ds*sin(mode(2*i_tor+1)*p)
+            dPSgi_dp = dPSgi_dp + mode(2*i_tor+1)*PSgi*cos(mode(2*i_tor+1)*p)
+          end do
+        end if
 
         call interp_RZP(node_list,element_list,i_elm,ri,si,p,   &
                         RRgi,dRRgi_dr,dRRgi_ds,dRRgi_dp,dRRgi_drs,dRRgi_drr,dRRgi_dss,dRRgi_drp, dRRgi_dsp, dRRgi_dpp, &

@@ -5,6 +5,10 @@ module mod_petsc_pc_blocks
   use mpi_mod
 #include "petsc/finclude/petsc.h"
   use petsc
+#if PETSC_VERSION_LT(3,23,0)
+  use mod_petsc_raw_csr, only: mat_get_row, mat_restore_row
+#endif
+#include "petsc_f90_compat.h"
   implicit none
   private
 
@@ -97,7 +101,7 @@ contains
     logical, intent(inout)       :: made     !< pfac exists (refilled in place)
     integer, intent(in)          :: comm, my_id
     character(len=*), intent(in) :: label
-    real*8, parameter :: PEN_TAU = 1.d6
+    real*8, parameter :: PEN_TAU = 1.d6, PEN_DIAG_MIN = 1.d7
     PetscErrorCode :: ierr
     PetscInt :: rs, re, row, ncols, npen
     PetscInt, pointer :: cols(:)
@@ -114,28 +118,33 @@ contains
 
     nf = size(nloc)
     call MatGetOwnershipRange(A, rs, re, ierr)
-    allocate(pen(re - rs), fld(re - rs), prow(re - rs), acc(3 * nf), m(nf))
+    allocate(pen(re - rs), fld(re - rs), prow(max(1, int(re - rs))), acc(3 * nf), m(nf))
     kk = 0
     do f = 1, nf
       fld(kk + 1:kk + nloc(f)) = f
       kk = kk + int(nloc(f))
     enddo
 
-    ! detect, and each field's bulk mean |diag|
+    ! detect, and each field's bulk mean |diag| (require dg >= PEN_DIAG_MIN so
+    ! eliminated Dirichlet rows with diag = 1, off = 0 are not misclassified)
+    call MatCreateVecs(A, dv, PETSC_NULL_VEC, ierr)
+    call MatGetDiagonal(A, dv, ierr)
+    call VecGetArray(dv, dptr, ierr)
     acc = 0.d0
     do row = rs, re - 1
       kk = int(row - rs) + 1
-      call MatGetRow(A, row, ncols, cols, vals, ierr)
-      dg = 0.d0; off = 0.d0
-      do jc = 1, int(ncols)
-        if (cols(jc) == row) then
-          dg = abs(vals(jc))
-        else
-          off = max(off, abs(vals(jc)))
-        endif
-      enddo
-      call MatRestoreRow(A, row, ncols, cols, vals, ierr)
-      pen(kk) = (dg > 0.d0) .and. (dg > PEN_TAU * off)
+      dg = abs(dptr(kk))
+      if (dg >= PEN_DIAG_MIN) then
+        call MatGetRow(A, row, ncols, cols, vals, ierr)
+        off = 0.d0
+        do jc = 1, int(ncols)
+          if (cols(jc) /= row) off = max(off, abs(vals(jc)))
+        enddo
+        call MatRestoreRow(A, row, ncols, cols, vals, ierr)
+        pen(kk) = (dg > PEN_TAU * off)
+      else
+        pen(kk) = .false.
+      endif
       if (pen(kk)) then
         acc(2 * nf + fld(kk)) = acc(2 * nf + fld(kk)) + 1.d0
       else
@@ -149,9 +158,6 @@ contains
 
     if (.not. made) call MatCreateVecs(A, pfac, PETSC_NULL_VEC, ierr)
     made = .true.
-    call MatCreateVecs(A, dv, PETSC_NULL_VEC, ierr)
-    call MatGetDiagonal(A, dv, ierr)
-    call VecGetArray(dv, dptr, ierr)
     call VecGetArray(pfac, pptr, ierr)
     npen = 0
     do kk = 1, size(pen)
@@ -168,7 +174,7 @@ contains
     call VecRestoreArray(dv, dptr, ierr)
 
     call MatSetOption(A, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE, ierr)
-    call MatZeroRowsColumns(A, npen, prow(1:npen), 1.d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
+    call MatZeroRowsColumns(A, npen, prow, 1.d0, PETSC_NULL_VEC, PETSC_NULL_VEC, ierr)
     call MatDiagonalSet(A, dv, INSERT_VALUES, ierr)
     call VecDestroy(dv, ierr)
 

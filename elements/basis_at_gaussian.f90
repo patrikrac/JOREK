@@ -89,6 +89,11 @@ subroutine initialise_basis()
       HZ_p(2*i+1,k)  = + float(mode(2*i+1))    * cos(mode(2*i+1)*phi)
       HZ_pp(2*i+1,k) = - float(mode(2*i+1))**2 * sin(mode(2*i+1)*phi)
     enddo
+    if (mod(n_tor, 2) == 0) then
+      HZ(n_tor,k)    =                           cos(mode(n_tor)*phi)
+      HZ_p(n_tor,k)  = - float(mode(n_tor))    * sin(mode(n_tor)*phi)
+      HZ_pp(n_tor,k) = - float(mode(n_tor))**2 * cos(mode(n_tor)*phi)
+    endif
 
     do i=1,(n_coord_tor-1)/2
       HZ_coord(2*i,k)      =                           cos(mode_coord(2*i)  *phi)

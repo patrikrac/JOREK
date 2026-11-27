@@ -901,11 +901,19 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
 #include "version.h"
 
   use tr_module 
+  use constants, only: pi
   use data_structure
   use phys_module
   use pellet_module
   use vacuum, only: import_HDF5_restart_vacuum, current_FB_fact
   use mod_element_rtree, only: populate_element_rtree
+  use mod_pfafem, only: pfafem_bgrid_valid, pfafem_bgrid_dims, pfafem_bgrid_bounds, &
+                        pfafem_bgrid_coefs, pfafem_restart_needs_projection, &
+                        pfafem_restart_src_type, pfafem_restart_src_ntor, &
+                        pfafem_restart_values, pfafem_restart_deltas
+#if STELLARATOR_MODEL
+  use mod_pfafem, only: pfafem_restart_jsrc
+#endif
 #ifdef USE_HDF5
   use hdf5
   use hdf5_io_module
@@ -938,8 +946,11 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   real*8               :: growth_mag, growth_kin, amplitude
   integer, allocatable :: mode_tmp(:), new_mode(:)
   real*8,  allocatable :: values_tmp(:,:,:), deltas_tmp(:,:,:)
-  character*50         :: version_control, version_control_tmp, t_treat_axis
-  logical              :: kept, modes_changed, import_3xx_4xx
+  character*50         :: version_control, version_control_tmp, t_treat_axis, t_use_pfafem
+  logical              :: kept, modes_changed, import_3xx_4xx, file_pfafem
+  integer              :: ivar_pf, mp_pf, mm_pf, kp_pf
+  real*8               :: ang_pf, c_sum_pf, s_sum_pf, d_csum_pf, d_ssum_pf
+  real*8,  allocatable :: fp_val_pf(:), fp_del_pf(:)
   
 #ifdef USE_HDF5
   integer(HID_T)     :: file_id, datatype, dataset
@@ -956,6 +967,7 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   real(RKIND), allocatable :: t_r_tor_eq(:,:)
   real(RKIND), allocatable :: t_j_field(:,:,:,:)
   real(RKIND), allocatable :: t_b_field(:,:,:,:)
+  real(RKIND), allocatable :: t_b_vac_field(:,:,:,:)
   real(RKIND), allocatable :: t_chi_correction(:,:,:)
   real(RKIND), allocatable :: t_j_source(:,:,:)
 
@@ -1164,6 +1176,7 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   call tr_allocate(t_pressure,1,node_list%n_nodes,1,n_degrees_tmp,                              "node_list%pressure",CAT_UNKNOWN)
   call tr_allocate(t_j_field,1,node_list%n_nodes,1,n_coord_tor_tmp,1,n_degrees_tmp,1,n_dim+1,  "node_list%j_field",CAT_UNKNOWN)
   call tr_allocate(t_b_field,1,node_list%n_nodes,1,n_coord_tor_tmp,1,n_degrees_tmp,1,n_dim+1,    "node_list%b_field",     CAT_UNKNOWN)
+  call tr_allocate(t_b_vac_field,1,node_list%n_nodes,1,n_coord_tor_tmp,1,n_degrees_tmp,1,n_dim+1,"node_list%b_vac_field", CAT_UNKNOWN)
   call tr_allocate(t_chi_correction,1,node_list%n_nodes,1,     n_coord_tor_tmp,1,n_degrees_tmp,            "node_list%chi_correction",CAT_UNKNOWN)
   call tr_allocate(t_j_source,1,node_list%n_nodes,1,     n_tor_tmp,1,n_degrees_tmp,            "node_list%j_source",CAT_UNKNOWN)
 #endif 
@@ -1256,7 +1269,11 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   endif
 
 #ifndef USE_DOMM
+#ifdef USE_EXT_FIELD
+  call HDF5_array4D_reading(file_id,t_b_vac_field,   'b_vac_field')
+#else
   call HDF5_array3D_reading(file_id,t_chi_correction, 'chi_correction')
+#endif
 #endif
 
   call HDF5_array3D_reading(file_id,t_j_source, 'j_source')
@@ -1279,24 +1296,71 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   call HDF5_array1D_reading     (file_id,t_ref_mu,      'ref_mu')
   call HDF5_array1D_reading_char(file_id,t_constrained, 'constrained')
 
+  ! --- Check PFAFEM discretization status and B-field spline grid in restart file
+  file_pfafem = .false.
+  call h5lexists_f(file_id, 'use_pfafem', flag_exists, err_exists)
+  if (flag_exists .and. err_exists == 0) then
+    call HDF5_char_reading(file_id, t_use_pfafem, 'use_pfafem')
+    if (trim(t_use_pfafem) == 'T') file_pfafem = .true.
+  end if
+
+  pfafem_bgrid_valid = .false.
+  pfafem_restart_needs_projection = .false.
+  pfafem_restart_src_type = 0
+  pfafem_restart_src_ntor = 0
+  if (allocated(pfafem_bgrid_coefs)) deallocate(pfafem_bgrid_coefs)
+  if (allocated(pfafem_restart_values)) deallocate(pfafem_restart_values)
+  if (allocated(pfafem_restart_deltas)) deallocate(pfafem_restart_deltas)
+#if STELLARATOR_MODEL
+  if (allocated(pfafem_restart_jsrc)) deallocate(pfafem_restart_jsrc)
+#endif
+
+  if (file_pfafem) then
+    call h5lexists_f(file_id, 'pfafem_bgrid_dims', flag_exists, err_exists)
+    if (flag_exists .and. err_exists == 0) then
+      call HDF5_array1D_reading_int(file_id, pfafem_bgrid_dims, 'pfafem_bgrid_dims')
+      call HDF5_array1D_reading(file_id, pfafem_bgrid_bounds, 'pfafem_bgrid_bounds')
+      allocate(pfafem_bgrid_coefs(2, pfafem_bgrid_dims(1)+2, pfafem_bgrid_dims(2)+2, max(1, pfafem_bgrid_dims(3))))
+      call HDF5_array4D_reading(file_id, pfafem_bgrid_coefs, 'pfafem_bgrid_coefs')
+      pfafem_bgrid_valid = .true.
+    end if
+  end if
+
+  if (.not. file_pfafem .and. use_pfafem) then
+    pfafem_restart_needs_projection = .true.
+    pfafem_restart_src_type = 1
+    pfafem_restart_src_ntor = n_tor_tmp
+  else if (file_pfafem .and. use_pfafem .and. n_tor_tmp /= n_tor) then
+    pfafem_restart_needs_projection = .true.
+    pfafem_restart_src_type = 2
+    pfafem_restart_src_ntor = n_tor_tmp
+  end if
+  if (file_pfafem .and. (.not. use_pfafem)) then
+    allocate(fp_val_pf(n_tor_tmp), fp_del_pf(n_tor_tmp))
+  end if
+  pfafem_values_active = use_pfafem
 
   ! --- Detect new modes that need to be initialized to noise level
   if (allocated(new_mode))   call tr_deallocate(new_mode,"new_mode",CAT_UNKNOWN)
   allocate(new_mode(n_tor))
-  new_mode(:)=1
+  if (file_pfafem .or. use_pfafem) then
+    new_mode(:) = 0
+  else
+    new_mode(:)=1
 
-  do m=1,n_tor_tmp,2
-    do k=1, n_tor,2 
-      if (mode_tmp(m) .eq. mode(k)) then
-        if ((m .eq. 1) .and. (k.eq.1)) then
-          new_mode(k)=0
-        else
-          new_mode(k-1)=0
-          new_mode(k)=0
+    do m=1,n_tor_tmp,2
+      do k=1, n_tor,2 
+        if (mode_tmp(m) .eq. mode(k)) then
+          if ((m .eq. 1) .and. (k.eq.1)) then
+            new_mode(k)=0
+          else
+            new_mode(k-1)=0
+            new_mode(k)=0
+          end if
         end if
-      end if
+      end do
     end do
-  end do
+  end if
   if (any(new_mode .ne. 0)) write(*,'(a,999i4)') ' need initialization  : ', new_mode
   
   do i=1,node_list%n_nodes
@@ -1306,43 +1370,105 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
     node_list%node(i)%values = 0.d0 
     node_list%node(i)%deltas = 0.d0 
 
-    do m=1,n_tor_tmp,2
-      do k=1, n_tor,2
-        do j=1,n_degrees_tmp 
-          if (mode_tmp(m) .eq. mode(k)) then
-            if ((m .eq. 1) .and. (k.eq.1)) then
-
-                
-
-              node_list%node(i)%values(k,j,1:n_var_tmp)   = t_values(i,m,j,1:n_var_tmp)
-              node_list%node(i)%deltas(k,j,1:n_var_tmp)   = t_deltas(i,m,j,1:n_var_tmp)
-            else
-              node_list%node(i)%values(k-1,j,1:n_var_tmp) = t_values(i,m-1,j,1:n_var_tmp)
-              node_list%node(i)%deltas(k-1,j,1:n_var_tmp) = t_deltas(i,m-1,j,1:n_var_tmp) 
-              node_list%node(i)%values(k,j,1:n_var_tmp)   = t_values(i,m,j,1:n_var_tmp) 
-              node_list%node(i)%deltas(k,j,1:n_var_tmp)   = t_deltas(i,m,j,1:n_var_tmp)
+    if (.not. file_pfafem .and. .not. use_pfafem) then
+      do m=1,n_tor_tmp,2
+        do k=1, n_tor,2
+          do j=1,n_degrees_tmp 
+            if (mode_tmp(m) .eq. mode(k)) then
+              if ((m .eq. 1) .and. (k.eq.1)) then
+                node_list%node(i)%values(k,j,1:n_var_tmp)   = t_values(i,m,j,1:n_var_tmp)
+                node_list%node(i)%deltas(k,j,1:n_var_tmp)   = t_deltas(i,m,j,1:n_var_tmp)
+              else
+                node_list%node(i)%values(k-1,j,1:n_var_tmp) = t_values(i,m-1,j,1:n_var_tmp)
+                node_list%node(i)%deltas(k-1,j,1:n_var_tmp) = t_deltas(i,m-1,j,1:n_var_tmp) 
+                node_list%node(i)%values(k,j,1:n_var_tmp)   = t_values(i,m,j,1:n_var_tmp) 
+                node_list%node(i)%deltas(k,j,1:n_var_tmp)   = t_deltas(i,m,j,1:n_var_tmp)
+              end if
             end if
-          end if
-        enddo
+          enddo
+        end do
       end do
-    end do
+    else if (.not. file_pfafem .and. use_pfafem) then
+      ! Populate uniform n=0 equilibrium component temporarily so update_equil_state succeeds
+      ! before pfafem_project_restart projects the full 3D Fourier state onto PFAFEM.
+      do k = 1, n_tor
+        do j = 1, n_degrees_tmp
+          node_list%node(i)%values(k, j, 1:n_var_tmp) = t_values(i, 1, j, 1:n_var_tmp)
+          node_list%node(i)%deltas(k, j, 1:n_var_tmp) = t_deltas(i, 1, j, 1:n_var_tmp)
+        end do
+      end do
+    else if (file_pfafem .and. use_pfafem) then
+      if (n_tor_tmp == n_tor) then
+        node_list%node(i)%values(1:n_tor, 1:n_degrees_tmp, 1:n_var_tmp) = &
+          t_values(i, 1:n_tor, 1:n_degrees_tmp, 1:n_var_tmp)
+        node_list%node(i)%deltas(1:n_tor, 1:n_degrees_tmp, 1:n_var_tmp) = &
+          t_deltas(i, 1:n_tor, 1:n_degrees_tmp, 1:n_var_tmp)
+      else
+        do j = 1, n_degrees_tmp
+          do ivar_pf = 1, n_var_tmp
+            c_sum_pf = sum(t_values(i, 1:n_tor_tmp, j, ivar_pf)) / dble(n_tor_tmp)
+            d_csum_pf = sum(t_deltas(i, 1:n_tor_tmp, j, ivar_pf)) / dble(n_tor_tmp)
+            node_list%node(i)%values(1:n_tor, j, ivar_pf) = c_sum_pf
+            node_list%node(i)%deltas(1:n_tor, j, ivar_pf) = d_csum_pf
+          end do
+        end do
+      end if
+    else
+      ! file_pfafem .and. .not. use_pfafem: sample periodic cubic B-spline at knot planes and DFT to Fourier
+      do j = 1, n_degrees_tmp
+        do ivar_pf = 1, n_var_tmp
+          do m = 1, n_tor_tmp
+            mm_pf = modulo(m - 2, n_tor_tmp) + 1
+            mp_pf = modulo(m,     n_tor_tmp) + 1
+            fp_val_pf(m) = (t_values(i, mm_pf, j, ivar_pf) + 4.d0*t_values(i, m, j, ivar_pf) + t_values(i, mp_pf, j, ivar_pf)) / 6.d0
+            fp_del_pf(m) = (t_deltas(i, mm_pf, j, ivar_pf) + 4.d0*t_deltas(i, m, j, ivar_pf) + t_deltas(i, mp_pf, j, ivar_pf)) / 6.d0
+          end do
+          node_list%node(i)%values(1, j, ivar_pf) = sum(fp_val_pf) / dble(n_tor_tmp)
+          node_list%node(i)%deltas(1, j, ivar_pf) = sum(fp_del_pf) / dble(n_tor_tmp)
+          do kp_pf = 1, (n_tor_tmp - 1) / 2
+            do k = 3, n_tor, 2
+              if (mode(k) == kp_pf * n_period_tmp) then
+                c_sum_pf = 0.d0; s_sum_pf = 0.d0
+                d_csum_pf = 0.d0; d_ssum_pf = 0.d0
+                do m = 1, n_tor_tmp
+                  ang_pf = 2.d0 * pi * dble(kp_pf * (m - 1)) / dble(n_tor_tmp)
+                  c_sum_pf  = c_sum_pf  + fp_val_pf(m) * cos(ang_pf)
+                  s_sum_pf  = s_sum_pf  + fp_val_pf(m) * sin(ang_pf)
+                  d_csum_pf = d_csum_pf + fp_del_pf(m) * cos(ang_pf)
+                  d_ssum_pf = d_ssum_pf + fp_del_pf(m) * sin(ang_pf)
+                end do
+                node_list%node(i)%values(k - 1, j, ivar_pf) = (2.d0 / dble(n_tor_tmp)) * c_sum_pf
+                node_list%node(i)%values(k,     j, ivar_pf) = (2.d0 / dble(n_tor_tmp)) * s_sum_pf
+                node_list%node(i)%deltas(k - 1, j, ivar_pf) = (2.d0 / dble(n_tor_tmp)) * d_csum_pf
+                node_list%node(i)%deltas(k,     j, ivar_pf) = (2.d0 / dble(n_tor_tmp)) * d_ssum_pf
+              end if
+            end do
+          end do
+        end do
+      end do
+    end if
 
     if(aux_values_read) then
      aux_node_list%node(i)%values = 0.d0
-     do m=1,n_tor_tmp,2
-      do k=1, n_tor,2
-        do j=1,n_degrees_tmp 
-          if (mode_tmp(m) .eq. mode(k)) then
-            if ((m .eq. 1) .and. (k.eq.1)) then
-              aux_node_list%node(i)%values(k,j,1:n_var_tmp)   = t_aux_values(i,m,j,1:n_var_tmp)
-            else
-              aux_node_list%node(i)%values(k-1,j,1:n_var_tmp) = t_aux_values(i,m-1,j,1:n_var_tmp)
-              aux_node_list%node(i)%values(k,j,1:n_var_tmp)   = t_aux_values(i,m,j,1:n_var_tmp) 
+     if (file_pfafem .and. use_pfafem .and. n_tor_tmp == n_tor) then
+       aux_node_list%node(i)%values(1:n_tor, 1:n_degrees_tmp, 1:n_var_tmp) = &
+         t_aux_values(i, 1:n_tor, 1:n_degrees_tmp, 1:n_var_tmp)
+     else
+       do m=1,n_tor_tmp,2
+        do k=1, n_tor,2
+          do j=1,n_degrees_tmp 
+            if (mode_tmp(m) .eq. mode(k)) then
+              if ((m .eq. 1) .and. (k.eq.1)) then
+                aux_node_list%node(i)%values(k,j,1:n_var_tmp)   = t_aux_values(i,m,j,1:n_var_tmp)
+              else
+                aux_node_list%node(i)%values(k-1,j,1:n_var_tmp) = t_aux_values(i,m-1,j,1:n_var_tmp)
+                aux_node_list%node(i)%values(k,j,1:n_var_tmp)   = t_aux_values(i,m,j,1:n_var_tmp) 
+              end if
             end if
-          end if
-        enddo
-      end do
-     end do
+          enddo
+        end do
+       end do
+     end if
     endif
  
 #if STELLARATOR_MODEL    
@@ -1353,23 +1479,64 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
     node_list%node(i)%j_field  = t_j_field(i,:,:,:)
 #endif
 #ifndef USE_DOMM
+#ifdef USE_EXT_FIELD
+    node_list%node(i)%b_vac_field     = t_b_vac_field(i,:,:,:)
+#else
     node_list%node(i)%chi_correction  = t_chi_correction(i,:,:)
 #endif
+#endif
     node_list%node(i)%j_source = 0.d0 
-    do m=1,n_tor_tmp,2
-      do k=1, n_tor,2
-        do j=1,n_degrees_tmp 
-          if (mode_tmp(m) .eq. mode(k)) then
-            if ((m .eq. 1) .and. (k.eq.1)) then
-              node_list%node(i)%j_source(k,j)             = t_j_source(i,m,j)
-            else
-              node_list%node(i)%j_source(k-1,j)           = t_j_source(i,m-1,j)
-              node_list%node(i)%j_source(k,j)               = t_j_source(i,m,j)
+    if (.not. file_pfafem .and. .not. use_pfafem) then
+      do m=1,n_tor_tmp,2
+        do k=1, n_tor,2
+          do j=1,n_degrees_tmp 
+            if (mode_tmp(m) .eq. mode(k)) then
+              if ((m .eq. 1) .and. (k.eq.1)) then
+                node_list%node(i)%j_source(k,j)             = t_j_source(i,m,j)
+              else
+                node_list%node(i)%j_source(k-1,j)           = t_j_source(i,m-1,j)
+                node_list%node(i)%j_source(k,j)             = t_j_source(i,m,j)
+              end if
             end if
-          end if
-        enddo
+          enddo
+        end do
       end do
-    end do
+    else if (.not. file_pfafem .and. use_pfafem) then
+      do k = 1, n_tor
+        node_list%node(i)%j_source(k, 1:n_degrees_tmp) = t_j_source(i, 1, 1:n_degrees_tmp)
+      end do
+    else if (file_pfafem .and. use_pfafem) then
+      if (n_tor_tmp == n_tor) then
+        node_list%node(i)%j_source(1:n_tor, 1:n_degrees_tmp) = t_j_source(i, 1:n_tor, 1:n_degrees_tmp)
+      else
+        do j = 1, n_degrees_tmp
+          node_list%node(i)%j_source(1:n_tor, j) = sum(t_j_source(i, 1:n_tor_tmp, j)) / dble(n_tor_tmp)
+        end do
+      end if
+    else
+      do j = 1, n_degrees_tmp
+        do m = 1, n_tor_tmp
+          mm_pf = modulo(m - 2, n_tor_tmp) + 1
+          mp_pf = modulo(m,     n_tor_tmp) + 1
+          fp_val_pf(m) = (t_j_source(i, mm_pf, j) + 4.d0*t_j_source(i, m, j) + t_j_source(i, mp_pf, j)) / 6.d0
+        end do
+        node_list%node(i)%j_source(1, j) = sum(fp_val_pf) / dble(n_tor_tmp)
+        do kp_pf = 1, (n_tor_tmp - 1) / 2
+          do k = 3, n_tor, 2
+            if (mode(k) == kp_pf * n_period_tmp) then
+              c_sum_pf = 0.d0; s_sum_pf = 0.d0
+              do m = 1, n_tor_tmp
+                ang_pf = 2.d0 * pi * dble(kp_pf * (m - 1)) / dble(n_tor_tmp)
+                c_sum_pf = c_sum_pf + fp_val_pf(m) * cos(ang_pf)
+                s_sum_pf = s_sum_pf + fp_val_pf(m) * sin(ang_pf)
+              end do
+              node_list%node(i)%j_source(k - 1, j) = (2.d0 / dble(n_tor_tmp)) * c_sum_pf
+              node_list%node(i)%j_source(k,     j) = (2.d0 / dble(n_tor_tmp)) * s_sum_pf
+            end if
+          end do
+        end do
+      end do
+    end if
 #endif
 
 
@@ -1445,6 +1612,44 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   else
     current_prof_initialized = .false.
   end if
+  if (allocated(fp_val_pf)) deallocate(fp_val_pf, fp_del_pf)
+
+  ! --- Stage full restart fields for distributed PFAFEM L2 projection in jorek2_main
+  if (pfafem_restart_needs_projection) then
+    allocate(pfafem_restart_values(n_tor_tmp, n_degrees, n_var, node_list%n_nodes))
+    pfafem_restart_values = 0.d0
+    do i = 1, node_list%n_nodes
+      do j = 1, n_degrees_tmp
+        pfafem_restart_values(1:n_tor_tmp, j, 1:n_var_tmp, i) = t_values(i, 1:n_tor_tmp, j, 1:n_var_tmp)
+        if (import_3xx_4xx) then
+          pfafem_restart_values(1:n_tor_tmp, j, var_Te, i) = pfafem_restart_values(1:n_tor_tmp, j, 6, i) / 2.d0
+          pfafem_restart_values(1:n_tor_tmp, j, var_Ti, i) = pfafem_restart_values(1:n_tor_tmp, j, 6, i) / 2.d0
+        end if
+      end do
+    end do
+    if (jorek_model_tmp /= 180) then
+      allocate(pfafem_restart_deltas(n_tor_tmp, n_degrees, n_var, node_list%n_nodes))
+      pfafem_restart_deltas = 0.d0
+      do i = 1, node_list%n_nodes
+        do j = 1, n_degrees_tmp
+          pfafem_restart_deltas(1:n_tor_tmp, j, 1:n_var_tmp, i) = t_deltas(i, 1:n_tor_tmp, j, 1:n_var_tmp)
+          if (import_3xx_4xx) then
+            pfafem_restart_deltas(1:n_tor_tmp, j, var_Te, i) = pfafem_restart_deltas(1:n_tor_tmp, j, 6, i) / 2.d0
+            pfafem_restart_deltas(1:n_tor_tmp, j, var_Ti, i) = pfafem_restart_deltas(1:n_tor_tmp, j, 6, i) / 2.d0
+          end if
+        end do
+      end do
+    end if
+#if STELLARATOR_MODEL
+    if (current_prof_initialized) then
+      allocate(pfafem_restart_jsrc(n_tor_tmp, n_degrees, node_list%n_nodes))
+      pfafem_restart_jsrc = 0.d0
+      do i = 1, node_list%n_nodes
+        pfafem_restart_jsrc(1:n_tor_tmp, 1:n_degrees_tmp, i) = t_j_source(i, 1:n_tor_tmp, 1:n_degrees_tmp)
+      end do
+    end if
+#endif
+  end if
   
 
   if (index_start .ge. 1) then
@@ -1462,17 +1667,21 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
     call tr_allocate(energies,1,n_tor,1,2,1,index_start+nstep,"energies",CAT_UNKNOWN)
     energies = 0.d0
 
-    do m=1,n_tor_tmp,2
-      do k=1, n_tor,2 
-        if (mode_tmp(m) .eq. mode(k)) then
-          if ((m .eq. 1) .and. (k.eq.1)) then
-            energies(k,:,:) = t_energies(m,:,:)
-          else
-            energies(k-1:k,:,:) = t_energies(m-1:m,:,:)
+    if (file_pfafem .or. use_pfafem) then
+      energies(1:min(n_tor, n_tor_tmp), :, :) = t_energies(1:min(n_tor, n_tor_tmp), :, :)
+    else
+      do m=1,n_tor_tmp,2
+        do k=1, n_tor,2 
+          if (mode_tmp(m) .eq. mode(k)) then
+            if ((m .eq. 1) .and. (k.eq.1)) then
+              energies(k,:,:) = t_energies(m,:,:)
+            else
+              energies(k-1:k,:,:) = t_energies(m-1:m,:,:)
+            end if
           end if
-        end if
+        end do
       end do
-    end do
+    end if
 
     if (allocated(R_axis_t)) call tr_deallocate(R_axis_t,"R_axis_t",CAT_UNKNOWN)
     call tr_allocate(R_axis_t,1,index_start+nstep,"R_axis_t",CAT_UNKNOWN)
@@ -2249,6 +2458,7 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   call tr_deallocate(t_r_tor_eq,"t_r_tor_eq",CAT_UNKNOWN)
   call tr_deallocate(t_j_field,"t_j_field",CAT_UNKNOWN)
   call tr_deallocate(t_b_field,"t_b_field",CAT_UNKNOWN)
+  call tr_deallocate(t_b_vac_field,"t_b_vac_field",CAT_UNKNOWN)
   call tr_deallocate(t_chi_correction,"t_chi_correction",CAT_UNKNOWN)
   call tr_deallocate(t_j_source,"t_j_source",CAT_UNKNOWN)
 #endif
