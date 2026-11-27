@@ -566,7 +566,7 @@ contains
   !! not one this construction handles.
   subroutine gmg_build_prolongations(Aref, comm, my_id, n_fields, ok, opts)
     use nodes_elements, only: node_list, element_list
-    use phys_module,    only: n_flux, n_tht, treat_axis
+    use phys_module,    only: n_flux, n_tht, treat_axis, use_pfafem
     use mod_parameters, only: n_degrees
     use mod_petsc_pc_harm, only: pc_ntor
     use mod_petsc_pc_xpatch, only: xpatch_is_xgrid
@@ -884,16 +884,20 @@ contains
       call sort_real(asp_sorted)
       ws(i) = asp_sorted((n_tht + 1) / 2)
     enddo
-    H%ring_is = n_flux - 1
-    do i = 1, n_flux - 2
-      if (ws(i) >= RING_ASPECT) then
-        H%ring_is = i; exit
-      endif
-    enddo
+    if (use_pfafem) then
+      H%ring_is = 4 * n_flux
+    else
+      H%ring_is = n_flux - 1
+      do i = 1, n_flux - 2
+        if (ws(i) >= RING_ASPECT) then
+          H%ring_is = i; exit
+        endif
+      enddo
+    endif
     if (my_id == 0) then
       write(*,'(A,F5.2,A,I0,A)', advance="no") "[Physics PC]   GMG ring medians rdtheta/dr (switch at ", &
         RING_ASPECT, ": rings I < ", H%ring_is, "):"
-      do i = 1, min(n_flux - 2, H%ring_is + 2)
+      do i = 1, min(n_flux - 2, merge(6, H%ring_is + 2, use_pfafem))
         write(*,'(A,F6.2)', advance="no") " ", ws(i)
       enddo
       write(*,*)
@@ -969,6 +973,7 @@ contains
   !! separatrix, last the X-point's 9 DOFs), J the position along it.
   subroutine gmg_build_xpoint_prolongations(Aref, comm, my_id, n_fields, ok, semi_req)
     use nodes_elements,      only: node_list, element_list
+    use phys_module,         only: use_pfafem
     use mod_petsc_pc_harm,   only: pc_ntor
     use mod_petsc_pc_xpatch, only: xpatch_t, xpatch_build, xpatch_report, XP_NPATCH, XP_CORE, &
                                    XP_SOL, XP_PRIV
@@ -1258,13 +1263,17 @@ contains
     call move_alloc(lv, H%lvl)
 
     !--- the switch ring of smoother 8: the first core ring whose median
-    !--- aspect reaches RING_ASPECT
-    H%ring_is = xl(0)%p(XP_CORE)%nb
-    do k = 1, xl(0)%p(XP_CORE)%nb - 1
-      if (median_aspect(k) >= RING_ASPECT) then
-        H%ring_is = k; exit
-      endif
-    enddo
+    !--- aspect reaches RING_ASPECT (all rings under PFAFEM poloidal coupling)
+    if (use_pfafem) then
+      H%ring_is = 4 * max(1, xl(0)%nring)
+    else
+      H%ring_is = xl(0)%p(XP_CORE)%nb
+      do k = 1, xl(0)%p(XP_CORE)%nb - 1
+        if (median_aspect(k) >= RING_ASPECT) then
+          H%ring_is = k; exit
+        endif
+      enddo
+    endif
 
     if (my_id == 0) then
       write(*,'(A,I0,A,I0,A)', advance="no") "[Physics PC]   GMG", cur_inst, " X-point hierarchy: ", H%nlev, &

@@ -61,6 +61,7 @@ module mod_pfafem
 #else
   integer, public :: pfafem_ng_pol = n_gauss
 #endif
+  logical, public :: pfafem_pol_adaptive = .false.
   logical, public :: pfafem_ready = .false.
   integer, public :: pfafem_cache_epoch = 0
   logical, public :: pfafem_is_axisym_bfield = .true.
@@ -2113,7 +2114,7 @@ contains
     real*8  :: s_q, ts(N_SAMP), Rsamp(N_SAMP), Zsamp(N_SAMP), Rs, Rt, Zs, Zt
     real*8  :: phi_ref, phi_c, Rtr, Ztr, ta, tb, tm, Rm, Zm, key_s
     real*8  :: raw_s(64), seams(64), knots(0:pfafem_ng_pol)
-    real*8  :: min_gap, max_w, gap, t0, dt_sub
+    real*8  :: min_gap, max_w, gap, t0, dt_sub, tol_bnd, tol_seam
     logical :: tr_ok
 
     if (pfafem_ng_pol == n_gauss) then
@@ -2195,14 +2196,16 @@ contains
       raw_s(j + 1) = key_s
     end do
 
-    ! Deduplicate interior seams in (1e-6, 1 - 1e-6) within 1e-5 tolerance
+    ! Deduplicate interior seams in (tol_bnd, 1 - tol_bnd) within tol_seam tolerance
+    tol_bnd  = merge(1.d-3, 1.d-6, pfafem_pol_adaptive)
+    tol_seam = merge(2.d-3, 1.d-5, pfafem_pol_adaptive)
     n_seams = 0
     do k = 1, n_raw_s
-      if (raw_s(k) <= 1.d-6 .or. raw_s(k) >= 1.d0 - 1.d-6) cycle
+      if (raw_s(k) <= tol_bnd .or. raw_s(k) >= 1.d0 - tol_bnd) cycle
       if (n_seams == 0) then
         n_seams = 1
         seams(1) = raw_s(k)
-      else if (raw_s(k) - seams(n_seams) < 1.d-5) then
+      else if (raw_s(k) - seams(n_seams) < tol_seam) then
         seams(n_seams) = 0.5d0 * (seams(n_seams) + raw_s(k))
       else
         n_seams = n_seams + 1
@@ -2238,39 +2241,61 @@ contains
     end do
     knots(n_sub) = 1.d0
 
-    ! Refine widest sub-interval when n_sub < 3 so h-refinement stays balanced
-    do while (n_sub < 3 .and. 3 * (n_sub + 1) <= pfafem_ng_pol)
-      m_best = 1
-      max_w  = knots(1) - knots(0)
-      do m = 2, n_sub
-        if (knots(m) - knots(m - 1) > max_w) then
-          max_w  = knots(m) - knots(m - 1)
-          m_best = m
-        end if
+    if (pfafem_pol_adaptive) then
+      do m = 1, n_sub
+        n_pt(m) = merge(4, 3, (knots(m) - knots(m - 1)) > 0.25d0)
       end do
-      do m = n_sub, m_best, -1
-        knots(m + 1) = knots(m)
+      do while (sum(n_pt(1:n_sub)) > pfafem_ng_pol)
+        m_best = 0
+        min_gap = 1.d30
+        do m = 1, n_sub
+          if (n_pt(m) <= 2) cycle
+          gap = (knots(m) - knots(m - 1)) / dble(n_pt(m))
+          if (gap < min_gap) then
+            min_gap = gap
+            m_best  = m
+          end if
+        end do
+        if (m_best == 0) exit
+        n_pt(m_best) = n_pt(m_best) - 1
       end do
-      knots(m_best) = 0.5d0 * (knots(m_best - 1) + knots(m_best + 1))
-      n_sub = n_sub + 1
-    end do
+    else
+      ! Refine widest sub-interval when n_sub < 3 so h-refinement stays balanced
+      do while (n_sub < 3 .and. 3 * (n_sub + 1) <= pfafem_ng_pol)
+        m_best = 1
+        max_w  = knots(1) - knots(0)
+        do m = 2, n_sub
+          if (knots(m) - knots(m - 1) > max_w) then
+            max_w  = knots(m) - knots(m - 1)
+            m_best = m
+          end if
+        end do
+        do m = n_sub, m_best, -1
+          knots(m + 1) = knots(m)
+        end do
+        knots(m_best) = 0.5d0 * (knots(m_best - 1) + knots(m_best + 1))
+        n_sub = n_sub + 1
+      end do
 
-    n_base = merge(3, 2, 3 * n_sub <= pfafem_ng_pol)
-    n_pt(1:n_sub) = n_base
-    rem = pfafem_ng_pol - n_base * n_sub
-    do it = 1, rem
-      m_best = 1
-      max_w  = (knots(1) - knots(0)) / dble(n_pt(1))
-      do m = 2, n_sub
-        gap = (knots(m) - knots(m - 1)) / dble(n_pt(m))
-        if (gap > max_w) then
-          max_w  = gap
-          m_best = m
-        end if
+      n_base = merge(3, 2, 3 * n_sub <= pfafem_ng_pol)
+      n_pt(1:n_sub) = n_base
+      rem = pfafem_ng_pol - n_base * n_sub
+      do it = 1, rem
+        m_best = 1
+        max_w  = (knots(1) - knots(0)) / dble(n_pt(1))
+        do m = 2, n_sub
+          gap = (knots(m) - knots(m - 1)) / dble(n_pt(m))
+          if (gap > max_w) then
+            max_w  = gap
+            m_best = m
+          end if
+        end do
+        n_pt(m_best) = n_pt(m_best) + 1
       end do
-      n_pt(m_best) = n_pt(m_best) + 1
-    end do
+    end if
 
+    t_out = 0.5d0
+    w_out = 0.d0
     idx = 0
     do m = 1, n_sub
       t0     = knots(m - 1)
@@ -2459,10 +2484,12 @@ contains
     pfafem_phi_per = 2.d0 * pi / dble(n_period)
     pfafem_dphi    = pfafem_phi_per / dble(n_tor)
 
-    if (pfafem_n_gauss_pol <= n_gauss) then
-      pfafem_ng_pol = n_gauss
+    pfafem_pol_adaptive = (pfafem_n_gauss_pol < 0)
+    if (abs(pfafem_n_gauss_pol) <= n_gauss) then
+      pfafem_ng_pol       = n_gauss
+      pfafem_pol_adaptive = .false.
     else
-      pfafem_ng_pol = min(pfafem_ng_pol_max, pfafem_n_gauss_pol)
+      pfafem_ng_pol = min(pfafem_ng_pol_max, abs(pfafem_n_gauss_pol))
     end if
     call init_tor_gauss(pfafem_n_gauss_tor)
     ng_t = pfafem_ng_tor
@@ -2585,6 +2612,7 @@ contains
             n_seam_max = max(n_seam_max, n_seams_line)
 
             do mt = 1, pfafem_ng_pol
+              if (w_line(mt) == 0.d0) cycle
               t_q = t_line(mt)
               call pfafem_eval_elem_geom(node_list, element_list, ielm, s_q, t_q, phi_q, &
                                          R_q, Z_q, Rs, Rt, Zs, Zt)
@@ -2684,6 +2712,10 @@ contains
       if (pfafem_ng_pol == n_gauss) then
         write(*,'(A,I3,A,I3)') ' [PFAFEM] Inexact poloidal Gauss rule: ng_pol=', pfafem_ng_pol, &
           ' ng_tor=', pfafem_ng_tor
+      else if (pfafem_pol_adaptive) then
+        write(*,'(A,I3,A,F5.2,A,F5.2,A,I2)') ' [PFAFEM] Adaptive seam-split poloidal rule: cap=', pfafem_ng_pol, &
+          ' avg_active=', dble(g_counts(1) + g_counts(2) + g_counts(3)) / dble(max(1, 4 * g_seam_sum(2))), &
+          ' avg_seams=', dble(g_seam_sum(1)) / dble(max(1, g_seam_sum(2))), ' max_seams=', g_seam_max
       else
         write(*,'(A,I3,A,F5.2,A,I2)') ' [PFAFEM] Seam-split poloidal rule: ng_pol=', pfafem_ng_pol, &
           ' avg_seams=', dble(g_seam_sum(1)) / dble(max(1, g_seam_sum(2))), ' max_seams=', g_seam_max
@@ -2879,8 +2911,9 @@ contains
 
           do ms = 1, n_gauss
             do mt = 1, pfafem_ng_pol
-              t_q = pfafem_t_pol(ms, mt, iq, iep, iel_loc)
               w_t = pfafem_w_pol(ms, mt, iq, iep, iel_loc)
+              if (w_t == 0.d0) cycle
+              t_q = pfafem_t_pol(ms, mt, iq, iep, iel_loc)
               call pfafem_hermite2d_jet(xgauss(ms), t_q, H0_q, Hs_q, Ht_q, Hss_q, Hst_q, Htt_q)
 
               x_g = 0.d0; x_s = 0.d0; x_t = 0.d0; x_p = 0.d0
@@ -4121,6 +4154,7 @@ contains
             do ms = 1, n_gauss
               s_q = xgauss(ms)
               do mt = 1, pfafem_ng_pol
+                if (pfafem_w_pol(ms, mt, iq, iep, iel_loc) == 0.d0) cycle
                 t_q = pfafem_t_pol(ms, mt, iq, iep, iel_loc)
                 call basisfunctions(s_q, t_q, H_l, Hs_l, Ht_l)
                 do iv = 1, n_vertex_max
@@ -4257,6 +4291,7 @@ contains
           call pfafem_bspline_eval(tau_s, nb, dnb, ddnb)
           do ms = 1, n_gauss
             do mt = 1, pfafem_ng_pol
+              if (pfafem_w_pol(ms, mt, iq, iep, iel_loc) == 0.d0) cycle
               t_q = pfafem_t_pol(ms, mt, iq, iep, iel_loc)
               call pfafem_eval_elem_geom(node_list, element_list, ielm, xgauss(ms), t_q, phi_q, &
                                          R_q, Z_q, Rs, Rt, Zs, Zt)
@@ -4565,6 +4600,7 @@ contains
           phi_q = (dble(eP) + pfafem_tau_q(iq)) * pfafem_dphi
           do ms = 1, n_gauss
             do mt = 1, pfafem_ng_pol
+              if (pfafem_w_pol(ms, mt, iq, iep, iel_loc) == 0.d0) cycle
               t_q = pfafem_t_pol(ms, mt, iq, iep, iel_loc)
               w_t = pfafem_w_pol(ms, mt, iq, iep, iel_loc)
               call pfafem_eval_elem_geom(node_list, element_list, ielm, xgauss(ms), t_q, phi_q, &

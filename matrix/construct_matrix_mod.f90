@@ -1687,7 +1687,7 @@ subroutine construct_pfafem_elements_petsc_direct(my_id, a_mat, rhs_local, my_in
 
   max_thr_pf = 1
   !$ max_thr_pf = omp_get_max_threads()
-  pf_batch = max(8, min(16, max_thr_pf))
+  pf_batch = max(32, min(128, 4 * max_thr_pf))
   call MPI_Allreduce(MPI_IN_PLACE, pf_batch, 1, MPI_INTEGER, MPI_MAX, a_mat%comm, mpi_ierr)
   n_batches = (max_n_el_glob + pf_batch - 1) / pf_batch
 

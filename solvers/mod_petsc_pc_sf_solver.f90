@@ -97,6 +97,7 @@ contains
   !! sf_gmg<gmg_inst>_.
   subroutine sf_solver_setup(slv, A, backend, label, comm, my_id, rtol, gmg_inst, nfields, &
                              smoother, maxits, pre0, post0, nsmooth_c, axis_rings)
+    use phys_module,    only: use_pfafem
     use mod_petsc_pc_gmg, only: gmg_select, gmg_is_ready, gmg_build_prolongations, &
                                 gmg_setup_operator, gmg_pc_apply_1, gmg_pc_apply_2, &
                                 gmg_pc_apply_3, gmg_pc_apply_4, gmg_pc_apply_5, gmg_opts_t
@@ -203,7 +204,8 @@ contains
       o%harm_pair  = sf_gmg_harm
       o%rich_omega = SF_GMG_RICH_OMEGA_ZEBRA
       if (smoother /= SF_GMG_SMOOTHER_ZEBRA_RINGS) o%rich_omega = SF_GMG_RICH_OMEGA_ADDITIVE
-      if (smoother == SF_GMG_SMOOTHER_RINGS) o%semi_r = SF_GMG_SEMI_R
+      if (smoother == SF_GMG_SMOOTHER_RINGS .or. &
+          (use_pfafem .and. smoother == SF_GMG_SMOOTHER_ZEBRA_RINGS)) o%semi_r = SF_GMG_SEMI_R
       if (present(pre0))       o%pre0       = pre0
       if (present(post0))      o%post0      = post0
       if (present(nsmooth_c))  o%nsmooth_c  = nsmooth_c

@@ -1032,7 +1032,7 @@ contains
   !! the setup timer; the solve timer covers KSPSolve only.
   subroutine petsc_solve_iterative_and_retrieve(petsc_sys, solve_only, n_iter, converged, newton_rtol)
     use mod_clock, only: FMT_TIMING
-    use phys_module, only: use_physics_pc, use_pfafem
+    use phys_module, only: use_physics_pc, use_pfafem, iter_precon
     use mod_petsc_pc_physics, only: petsc_physics_pc_build_reduced, petsc_physics_pc_refresh_operator
     use mod_petsc_pc_physics_ctx, only: physics_pc_mem
     use mod_petsc_pc_sf, only: sf_report
@@ -1047,9 +1047,11 @@ contains
     Mat :: A_ksp
     Vec :: b_ksp, x_ksp
     KSPConvergedReason :: reason
-    PetscLogDouble :: t1, t2
+    PetscLogDouble :: t1, t2, t_prev
     PetscLogDouble :: ts1, ts2
-    PetscInt :: its
+    PetscInt :: its, maxits_orig, maxits_try
+    PetscReal :: rtol_c, abstol_c, dtol_c
+    logical :: did_reuse
     integer :: pc_type
     PetscReal :: petsc_norm
     PetscViewerAndFormat :: vf
@@ -1057,6 +1059,8 @@ contains
 
     call PetscObjectGetComm(petsc_sys%A, comm, ierr)
     call MPI_COMM_RANK(comm, my_id, mpierr)
+
+    did_reuse = (petsc_sys%ksp_ready .and. solve_only)
 
     if (.not. petsc_sys%ksp_ready) then
       pc_type = select_pc_type()
@@ -1170,6 +1174,13 @@ contains
     if (present(newton_rtol)) petsc_sys%rtol_user = newton_rtol
     call set_outer_tolerance(petsc_sys, A_ksp, b_ksp, x_ksp, comm, my_id)
 
+    if (did_reuse) then
+      PetscCallA(KSPGetTolerances(petsc_sys%ksp, rtol_c, abstol_c, dtol_c, maxits_orig, ierr))
+      maxits_try = min(maxits_orig, int(max(50, iter_precon + 15), kind(maxits_orig)))
+      PetscCallA(KSPSetTolerances(petsc_sys%ksp, rtol_c, abstol_c, dtol_c, maxits_try, ierr))
+    end if
+
+    t_prev = 0.0d0
     call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t1, ierr))
     PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
@@ -1177,6 +1188,48 @@ contains
     PetscCallA(PetscLogStagePop(ierr))
     call MPI_Barrier(comm, mpierr)
     PetscCallA(PetscTime(t2, ierr))
+
+    if (did_reuse) then
+      PetscCallA(KSPGetTolerances(petsc_sys%ksp, rtol_c, abstol_c, dtol_c, maxits_try, ierr))
+      PetscCallA(KSPSetTolerances(petsc_sys%ksp, rtol_c, abstol_c, dtol_c, maxits_orig, ierr))
+    end if
+
+    PetscCallA(KSPGetConvergedReason(petsc_sys%ksp, reason, ierr))
+#if PETSC_VERSION_LT(3,23,0)
+    converged = (reason > 0)
+#else
+    converged = (reason%v > 0)
+#endif
+
+    if (did_reuse .and. (.not. converged)) then
+      t_prev = t2 - t1
+      if (my_id == 0) write(*,*) "[PETSc] PC reuse hit cap without converging; refactorizing PC and retrying solve"
+      if (use_physics_pc) call sf_report(my_id)
+      PetscCallA(PetscLogStagePush(petsc_sys%stage_setup, ierr))
+      call MPI_Barrier(comm, mpierr)
+      PetscCallA(PetscTime(ts1, ierr))
+      if (use_physics_pc) call petsc_physics_pc_build_reduced(A_ksp)
+      PetscCallA(KSPSetOperators(petsc_sys%ksp, A_ksp, A_ksp, ierr))
+      PetscCallA(KSPSetReusePreconditioner(petsc_sys%ksp, PETSC_FALSE, ierr))
+      PetscCallA(KSPSetUp(petsc_sys%ksp, ierr))
+      PetscCallA(KSPSetUpOnBlocks(petsc_sys%ksp, ierr))
+      call petsc_setup_pc_blocks(petsc_sys%ksp)
+      call physics_pc_mem("solver: fallback rebuild done", my_id)
+      call MPI_Barrier(comm, mpierr)
+      PetscCallA(PetscTime(ts2, ierr))
+      PetscCallA(PetscLogStagePop(ierr))
+      if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solver setup :', ts2-ts1
+
+      call petsc_sync_ksp_vectors(petsc_sys, to_ksp=.true.)
+      call set_outer_tolerance(petsc_sys, A_ksp, b_ksp, x_ksp, comm, my_id)
+      call MPI_Barrier(comm, mpierr)
+      PetscCallA(PetscTime(t1, ierr))
+      PetscCallA(PetscLogStagePush(petsc_sys%stage_solve, ierr))
+      PetscCallA(KSPSolve(petsc_sys%ksp, b_ksp, x_ksp, ierr))
+      PetscCallA(PetscLogStagePop(ierr))
+      call MPI_Barrier(comm, mpierr)
+      PetscCallA(PetscTime(t2, ierr))
+    end if
 
     call field_residual_report(petsc_sys, A_ksp, b_ksp, x_ksp, comm, my_id)
     call petsc_sync_ksp_vectors(petsc_sys, to_ksp=.false.)
@@ -1191,7 +1244,7 @@ contains
     converged = (reason%v > 0)
 #endif
 
-    if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', t2-t1
+    if (my_id == 0) write(*,FMT_TIMING) my_id, '[PETSc] Elapsed time in solve :', (t2-t1) + t_prev
 
     if (my_id == 0) write(*,'(A,I5,A,I0)') &
 #if PETSC_VERSION_LT(3,23,0)

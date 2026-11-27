@@ -23,7 +23,7 @@ module mod_petsc_pc_sf
   use mod_petsc_pc_blocks, only: make_field_block_scale, decouple_penalty_rows
   use mod_petsc_pc_sf_solver
   use mod_petsc_pc_sf_ops, only: sf_op_t, sfo_layout, sfo_build, sfo_fill, sfo_vars_in, sfo_vars_out, &
-       sfo_comm, sfo_n1
+       sfo_comm, sfo_n1, sfo_fam, sfo_nfam
   use mod_petsc_raw_csr, only: blockmv_attach
 #if PETSC_VERSION_LT(3,23,0)
   use mod_petsc_raw_csr, only: mat_get_row, mat_restore_row
@@ -68,11 +68,11 @@ module mod_petsc_pc_sf
   integer, save :: comm_g = MPI_COMM_NULL      !< the full system's communicator
   real*8, save  :: t_apply = 0.d0, t_scat = 0.d0
 
-  Vec, save :: sv_x(NSV), sv_y(NSV)
+  Vec, save :: sv_x(NSV), sv_y(NSV), sv_even(NSV), gs_r
   Vec, save :: rhs_PJ, sol_PJ, rhs_W, sol_W, rhs_T, sol_T
   Vec, save :: w3, w4, w5, w6, w_scr, t_rho, t_T, t_Te, wv1, wv2
   Vec, save :: zv                              !< zero field
-  logical, save :: vecs_ready = .false.
+  logical, save :: vecs_ready = .false., gs_ready = .false.
 
   !> penalty rows of the full Jacobian (eliminate_boundary_dofs = .f.): local
   !! offsets and diagonals, refreshed on every build
@@ -291,10 +291,17 @@ contains
     if (with_tite) call block_scale(slv_T, o_T)
 
     call PetscLogEventBegin(pcev_fact_pj, ierr)
-    call sf_solver_setup(slv_pj, o_pj%mat, bk_pj, "pair_psi", comm_s, my_id, rtol, gmg_inst=2, nfields=2, &
-                         smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
-                         pre0=SF_PJ_PRE0, post0=SF_PJ_POST0, nsmooth_c=SF_PJ_NSC, &
-                         axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    if (use_pfafem) then
+      call sf_solver_setup(slv_pj, o_pj%mat, bk_pj, "pair_psi", comm_s, my_id, rtol, gmg_inst=2, nfields=2, &
+                           smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=2, post0=2, nsmooth_c=SF_PJ_NSC, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    else
+      call sf_solver_setup(slv_pj, o_pj%mat, bk_pj, "pair_psi", comm_s, my_id, rtol, gmg_inst=2, nfields=2, &
+                           smoother=SF_GMG_SMOOTHER_ZEBRA_RINGS, maxits=SF_GMG_MAXITS, &
+                           pre0=SF_PJ_PRE0, post0=SF_PJ_POST0, nsmooth_c=SF_PJ_NSC, &
+                           axis_rings=SF_GMG_AXIS_RINGS_PAIRS)
+    endif
     call PetscLogEventEnd(pcev_fact_pj, ierr)
 
     call PetscLogEventBegin(pcev_fact_w, ierr)
@@ -505,6 +512,7 @@ contains
       enddo
       do k_ = 1, NSV
         call VecDuplicate(sv_x(1), sv_y(k_), ierr)
+        call VecDuplicate(sv_x(1), sv_even(k_), ierr)
       enddo
       call VecDuplicate(sv_x(1), w3, ierr)
       call VecDuplicate(sv_x(1), w4, ierr)
@@ -561,14 +569,92 @@ contains
     PetscErrorCode, intent(out) :: ierr
     Vec :: x_psi, x_u, x_j, x_w, x_rho, x_T, x_Te, x_v
     Vec :: y_psi, y_u, y_j, y_w, y_rho, y_T, y_Te, y_v
-    logical :: vb0, vb1
+    logical :: vb0, vb1, is_even
+    integer :: k_gs
     real*8 :: t0, t1
 
     ierr = 0
     call PetscLogEventBegin(pcev_apply, ierr)
     t0 = MPI_Wtime()
-    call sfo_vars_in(x, sv_x)
-    t_scat = t_scat + (MPI_Wtime() - t0)
+
+    if (famode .and. (.not. harm_all) .and. sfo_nfam >= 2) then
+      ! 3-pass Symmetric Red-Black Harmonic Gauss-Seidel (Even n={0,2,..} -> Odd n={1,3,..} -> Even)
+      ! across mode-split rank groups, capturing bipartite triad couplings (0<->1, 1<->2, 2<->3)
+      ! via two full-Jacobian MatMults while keeping single-|n| block factorizations.
+      if (.not. gs_ready) then
+        call VecDuplicate(x, gs_r, ierr)
+        gs_ready = .true.
+      endif
+      is_even = (mod(sfo_fam, 2) == 1)
+
+      ! Pass 1: Even n = {0, 2, ...}
+      t1 = MPI_Wtime()
+      call sfo_vars_in(x, sv_x)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+      if (is_even) then
+        call run_local_sweep()
+        do k_gs = 1, NSV
+          call VecCopy(sv_y(k_gs), sv_even(k_gs), ierr)
+        enddo
+      else
+        do k_gs = 1, NSV
+          call VecSet(sv_y(k_gs), 0.0d0, ierr)
+        enddo
+      endif
+      t1 = MPI_Wtime()
+      call sfo_vars_out(sv_y, y)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+
+      ! Pass 2: Odd n = {1, 3, ...} against (x - A_full * y_even)
+      call MatMult(a_full_s, y, gs_r, ierr)
+      call VecAYPX(gs_r, -1.0d0, x, ierr)
+      t1 = MPI_Wtime()
+      call sfo_vars_in(gs_r, sv_x)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+      if (.not. is_even) then
+        call run_local_sweep()
+      else
+        do k_gs = 1, NSV
+          call VecCopy(sv_even(k_gs), sv_y(k_gs), ierr)
+        enddo
+      endif
+      t1 = MPI_Wtime()
+      call sfo_vars_out(sv_y, y)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+
+      ! Pass 3: Even n = {0, 2, ...} correction against (x - A_full * y)
+      call MatMult(a_full_s, y, gs_r, ierr)
+      call VecAYPX(gs_r, -1.0d0, x, ierr)
+      t1 = MPI_Wtime()
+      call sfo_vars_in(gs_r, sv_x)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+      if (is_even) then
+        call run_local_sweep()
+        do k_gs = 1, NSV
+          call VecAXPY(sv_y(k_gs), 1.0d0, sv_even(k_gs), ierr)
+        enddo
+      endif
+      t1 = MPI_Wtime()
+      call sfo_vars_out(sv_y, y)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+    else
+      t1 = MPI_Wtime()
+      call sfo_vars_in(x, sv_x)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+      call run_local_sweep()
+      t1 = MPI_Wtime()
+      call sfo_vars_out(sv_y, y)
+      t_scat = t_scat + (MPI_Wtime() - t1)
+    endif
+
+    t_apply = t_apply + (MPI_Wtime() - t0)
+    if (npen_full > 0) call penalty_backsub(x, y)
+    call PetscLogEventEnd(pcev_apply, ierr)
+    ierr = 0
+
+  contains
+
+    subroutine run_local_sweep()
     x_psi = sv_x(var_psi); x_u   = sv_x(var_u);   x_j = sv_x(var_zj)
     x_w   = sv_x(var_w);   x_rho = sv_x(var_rho); x_T = sv_x(var_T1)
     y_psi = sv_y(var_psi); y_u   = sv_y(var_u);   y_j = sv_y(var_zj)
@@ -735,16 +821,7 @@ contains
       if (with_tite) call sub_mult(CB_78, y_Te, wv2)
       call solve(slv_v, wv2, y_v, pcev_solve_rhot)
     endif
-
-    t1 = MPI_Wtime()
-    call sfo_vars_out(sv_y, y)
-    t_scat  = t_scat + (MPI_Wtime() - t1)
-    t_apply = t_apply + (MPI_Wtime() - t0)
-    if (npen_full > 0) call penalty_backsub(x, y)
-    call PetscLogEventEnd(pcev_apply, ierr)
-    ierr = 0
-
-  contains
+    end subroutine run_local_sweep
 
     subroutine solve(slv, b, s, ev)
       type(block_solver_t), intent(inout) :: slv
